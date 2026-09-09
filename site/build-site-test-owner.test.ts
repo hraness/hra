@@ -236,7 +236,8 @@ describe("owned site compiler case", () => {
     expect(error).toBeInstanceOf(AggregateError);
     if (!(error instanceof AggregateError)) throw new Error("Expected retained request failure");
     expect(error.errors.map((failure: unknown) => failure instanceof Error ? failure.message : String(failure)))
-      .toContain(kind === "builder" ? "retained late failure" : "SITE_COMPILER_PROCESS_FAILED");
+      .toContain(kind === "builder" ? "retained late failure"
+        : "SITE_COMPILER_PROCESS_FAILED stage=terminal_invalid exit_code=1 terminal=unparsed stdout_bytes=0 stderr_bytes=16");
     if (kind === "transport") {
       const retained: unknown = error.errors[0];
       expect(retained).toBeInstanceOf(Error);
@@ -284,6 +285,25 @@ describe("owned site compiler case", () => {
       : result({ status: "success", mismatches: [] }, 1) });
     const task = owner.run(async () => { await owner.buildSite(options); });
     await expect(task).rejects.toThrow("SITE_COMPILER_PROCESS_FAILED");
+    await expect(owner.close()).rejects.toThrow("SITE_COMPILER_PROOF_FAILED");
+  });
+
+  test.each(["output_bound", "terminal_invalid", "terminal_exit_mismatch"] as const)("prints only closed failure diagnostics and retains raw cause: %s", async (stage) => {
+    const arbitraryOutput = "synthetic arbitrary diagnostic text";
+    const stderr = Buffer.from(arbitraryOutput);
+    const stdout = stage === "output_bound" ? Buffer.alloc(1024 * 1024, "x")
+      : stage === "terminal_invalid" ? Buffer.from(arbitraryOutput)
+        : result({ status: "success", mismatches: [] }).stdout;
+    const child: BoundedProcessResult = { cleanup: "proven", exitCode: 7, stdout, stderr };
+    const owner = createSiteCompilerCase(options.sourceRoot, { runProcess: async () => child });
+    const failure = await owner.run(async () => { await owner.buildSite(options); }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    if (!(failure instanceof Error)) throw new Error("Expected diagnostic failure");
+    expect(failure.message).toBe(`SITE_COMPILER_PROCESS_FAILED stage=${stage} exit_code=7 terminal=${stage === "terminal_exit_mismatch" ? "success" : "unparsed"} stdout_bytes=${String(stdout.byteLength)} stderr_bytes=${String(stderr.byteLength)}`);
+    expect(failure.message).toMatch(/^SITE_COMPILER_PROCESS_FAILED stage=(output_bound|terminal_invalid|terminal_exit_mismatch) exit_code=(\d{1,3}|invalid) terminal=(unparsed|success|failure) stdout_bytes=\d{1,10} stderr_bytes=\d{1,10}$/u);
+    expect(failure.message.length).toBeLessThan(200);
+    expect(failure.message).not.toContain(arbitraryOutput);
+    expect(failure.cause).toMatchObject({ exitCode: 7, stdout: stdout.toString("utf8"), stderr: arbitraryOutput });
     await expect(owner.close()).rejects.toThrow("SITE_COMPILER_PROOF_FAILED");
   });
 });
