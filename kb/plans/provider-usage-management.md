@@ -240,6 +240,21 @@ focused checks and fresh integration typecheck are queued. This successor is
 a validation candidate, not accepted source or a released artifact. Complete
 current-base CI, exact installation and compiled browser gates remain pending.
 
+The repair checkpoint `c9571e16c02b4426bb946f1bee525a6cd4568034`, tree
+`15dde7013961be3d9baf0bc84913bb0031cada6f`, passes the complete local app
+suite, 620 cases with 3,851 assertions, and isolated archive installation,
+including local/global consumers, PTY restoration and owned daemon lifecycle.
+Integration typecheck passes. The joined-evidence fixture passes 42 cases with
+170 assertions; the service and lineage slice passes 29 with 183 assertions.
+The storage slice passed eleven unchanged cases, then its new exact-schema
+snapshot identified six additional same-table custody objects removed by the
+malformed-Claude fixture. The correction explicitly names and drops only those
+two indexes and four triggers. Its final case passes with eleven assertions;
+scoped lint and independent review pass. Production storage is unchanged.
+The successor still requires fresh exact-head installation and compiled browser
+acceptance and complete current-base CI. These local results do not establish
+merge, release, deployment, live provider qualification or daemon activation.
+
 The September 8 integration checkpoints now include canonical main through
 schema 50 at `ab56d3bc5034abedd12a20b5b405caf42bfa174f`, then the clean
 release-policy join at `9d6e2e12a42215e9201ae2ed3f64ed1b41e5c47d`, tree

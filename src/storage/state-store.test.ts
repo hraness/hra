@@ -11990,6 +11990,12 @@ describe("StateStore", () => {
         "sessions_claude_process_authority_rebind_guard",
         "session_claude_process_authorities_live_identity",
         "session_claude_process_authorities_session",
+        "claude_process_custody_parent",
+        "claude_process_unreleased_profile_scope",
+        "claude_process_custody_bind",
+        "claude_process_custody_delete",
+        "claude_process_custody_insert",
+        "claude_process_custody_update",
       ]);
       const unrelatedSchema = (schema: typeof pristine.schema) => schema.filter((row) =>
         !changedObjects.has(z.object({ name: z.string() }).parse(row).name));
@@ -12005,6 +12011,12 @@ describe("StateStore", () => {
         DROP TRIGGER IF EXISTS sessions_claude_process_authority_rebind_guard;
         DROP INDEX IF EXISTS session_claude_process_authorities_live_identity;
         DROP INDEX IF EXISTS session_claude_process_authorities_session;
+        DROP INDEX claude_process_custody_parent;
+        DROP INDEX claude_process_unreleased_profile_scope;
+        DROP TRIGGER claude_process_custody_bind;
+        DROP TRIGGER claude_process_custody_delete;
+        DROP TRIGGER claude_process_custody_insert;
+        DROP TRIGGER claude_process_custody_update;
         ALTER TABLE session_claude_process_authorities
           RENAME TO session_claude_process_authorities_scoped_backup;
         CREATE TABLE session_claude_process_authorities (
