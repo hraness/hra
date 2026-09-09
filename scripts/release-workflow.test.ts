@@ -576,7 +576,7 @@ describe("release workflow", () => {
       .not.toThrow();
   });
 
-  test("binds the candidate installer without reusing predecessor admission or claiming runtime rollout", async () => {
+  test("binds the admitted installer to its own evidence without claiming runtime rollout", async () => {
     const [releaseNotes, readme, thirdPartyNotices, changelog, security] = await Promise.all([
       readFile(join(import.meta.dir, "..", "docs", "beta-release-notes.md"), "utf8"),
       readFile(join(import.meta.dir, "..", "README.md"), "utf8"),
@@ -600,10 +600,9 @@ describe("release workflow", () => {
     expect(changelog).not.toContain("## v0.6.3 candidate (unreleased)");
     expect(changelog).toContain("docs/beta-release.md#immutable-v063-successful-release-record");
     expect(readme).toContain(installCommand);
-    expect(readme).toContain("Only after immutable GitHub and npm release admission, install and verify the v0.7.1 candidate CLI artifact. This does not start the daemon:");
-    expect(readme).toContain("The v0.7.1 candidate is not yet admitted");
-    expect(readme).toContain("https://github.com/hraness/hra/tree/v0.7.0#install-and-update");
-    expect(readme).not.toContain("admitted v0.7.1 CLI artifact");
+    expect(readme).toContain("Install and verify the admitted v0.7.1 CLI artifact. This does not start the daemon:");
+    expect(readme).not.toContain("The v0.7.1 candidate is not yet admitted");
+    expect(readme).toContain("https://github.com/hraness/hra/actions/runs/34367591503");
     expect(readme).toContain("[Availability](https://hra.sh/docs/status/)");
     expect(readme).toContain("[ordered update runbook](https://hra.sh/docs/status/#install-and-update)");
     expect(readme).not.toContain("Local CLI v0.7.0 is a release candidate");
@@ -616,13 +615,12 @@ describe("release workflow", () => {
     // release-bound recovery restrictions must survive that relocation intact.
     expect(docsPathForSection("install-and-update")).toBe("/docs/status/#install-and-update");
     expect(availability).toContain(installCommand);
-    expect(availability).toContain("The v0.7.0 CLI passed immutable GitHub and npm artifact admission.");
-    expect(availability).toContain("The v0.7.1 candidate is not yet admitted");
-    expect(availability).not.toContain("v0.7.1 is released");
+    expect(availability).toContain("The v0.7.1 CLI passed immutable GitHub and npm artifact admission.");
+    expect(availability).not.toContain("The v0.7.1 candidate is not yet admitted");
     expect(availability).toContain("their availability does not authorize starting the current daemon or sending new hosted commands");
     for (const document of [readme, availability]) {
       expect(document).toContain("Current daemon and hosted command-writer rollout remains blocked on capacity.");
-      expect(document).toContain("Do not initialize, start, or autostart either the admitted v0.7.0 daemon or the v0.7.1 candidate");
+      expect(document).toContain("Do not initialize, start, or autostart a current daemon until");
       expect(document).toContain("protected two-pass zero-debt capacity evidence and its exact .activated readback receipt");
       expect(document).toContain("Artifact availability and the live sync service do not clear this gate.");
       expect(document).toContain("daemon and target marker-2 proofs before globally enabling hosted writers");
@@ -649,10 +647,10 @@ describe("release workflow", () => {
     expect(releaseNotes).not.toContain("Cloud enrollment is invitation-only");
     expect(releaseNotes).not.toContain("artifact-identity SPDX");
     expect(releaseNotes).not.toContain("runtime SPDX inventory");
-    expect(releaseNotes).toContain("# HRA v0.7.1 local CLI beta candidate\n");
+    expect(releaseNotes).toContain("# HRA v0.7.1 local CLI beta\n");
     expect(thirdPartyNotices).toContain("exact tarball plus `SHA256SUMS`");
-    expect(thirdPartyNotices).toContain("This candidate is not yet admitted");
-    expect(thirdPartyNotices).not.toContain("The admitted `v0.7.1` release records its build graph");
+    expect(thirdPartyNotices).not.toContain("This candidate is not yet admitted");
+    expect(thirdPartyNotices).toContain("The admitted `v0.7.1` release records its build graph");
     expect(thirdPartyNotices).toContain("bound the immutable source tag");
     expect(thirdPartyNotices).toContain("`@hraness/site-footer` v0.6.1");
     expect(thirdPartyNotices).toContain("`@hraness/design-kit` v0.6.2");
@@ -661,10 +659,10 @@ describe("release workflow", () => {
     expect(thirdPartyNotices).not.toContain("`@hraness/design-kit` v0.3.0");
     expect(thirdPartyNotices).not.toContain("SPDX");
     expect(changelog).toContain("## v0.7.0\n");
-    expect(changelog).toContain("## v0.7.1 (unreleased)\n");
+    expect(changelog).toContain("## v0.7.1\n");
     expect(changelog).toContain("Forward repair for the incomplete `v0.6.0` admission");
-    expect(security).toContain("| `v0.7.0` | Fully admitted beta. Supported and receives security fixes. Hosted command-writer rollout remains capacity-gated. |");
-    expect(security).toContain("| `v0.7.1` | Release candidate. Not yet admitted or supported; `v0.7.0` remains the supported beta. |");
+    expect(security).toContain("| `v0.7.1` | Fully admitted beta. Supported and receives security fixes. Hosted command-writer rollout remains capacity-gated. |");
+    expect(security).toContain("| `v0.7.0` | Superseded by `v0.7.1`. Unsupported. Do not bypass the update runbook to migrate. |");
     expect(security).toContain("| `v0.6.3` | Superseded by `v0.7.0`. Unsupported. Do not bypass the update runbook to migrate. |");
     expect(security).toContain("| `v0.6.2` | Superseded by `v0.6.3`. Unsupported. Do not bypass the update runbook to migrate. |");
     expect(security).toContain("Only the latest fully admitted beta receives security fixes");
@@ -817,6 +815,64 @@ describe("release workflow", () => {
     expect(changelog).not.toContain("## v0.7.0 (unreleased)");
   });
 
+  test("binds v0.7.1 admission copy and recovery instructions to their own exact evidence", async () => {
+    const root = join(import.meta.dir, "..");
+    const [releaseRecord, releaseNotes, changelog, routing] = await Promise.all([
+      readFile(join(root, "docs", "beta-release.md"), "utf8"),
+      readFile(join(root, "docs", "beta-release-notes.md"), "utf8"),
+      readFile(join(root, "CHANGELOG.md"), "utf8"),
+      readFile(join(root, "kb", "plans", "model-routing-autonomy.md"), "utf8"),
+    ]);
+    const heading = "## Immutable v0.7.1 successful release record\n";
+    expect(releaseRecord.split(heading)).toHaveLength(2);
+    const admitted = releaseRecord.split(heading)[1]?.split("\n## ")[0];
+    for (const evidence of [
+      "61e22234cebd562a8cbcc1e62aa19e7640aeabaa",
+      "5ab43f11cc597c2f73f7f2c8f276b22f15bfb8b5",
+      "72a26dec74c999db5a5c20d69997474933129e2a",
+      "34365455021", "34367591503", "completed successfully on attempt 2",
+      "2026-09-09T15:31:26Z", "2026-09-09T15:24:22.283Z", "2026-09-09T15:38:01.271Z",
+      "102520216739", "102520740240", "102520740373", "102521422910",
+      "failed before provenance admission", "metadata remained absent",
+      "102529716172", "102530249997", "102530250055", "102530908657",
+      "No republication occurred", "preserved the tag, release and public bytes",
+      "385620163", "552998115", "1,331,554-byte",
+      "2c1a58d9f3a16c542f303668485731d2fd8f49721f5cb7ea7fd2a9d0ccdcf680",
+      "552998162", "88-byte", "1b2669e8a1a54f7d590c237ee89c30592f5957a6b1780e9c309c45c46e918b70",
+      "10111688372", "1,332,298 bytes", "2026-09-16T15:28:53Z",
+      "6feca9bd9eb9b1ad4f915cd764f4235ccd78cca713ee4a9e89bc5395ebd27add",
+      "sha512-ccnQnh1NtumzY3KcjiVbWXxl/tANTLM4P7B7YuvXNO2Wz/24TnRznJMFSToIk7s19iH0pqUzgRevHsmBsKBOmg==",
+      "b4a1f2d7438b65fdc2a368766f5a746cc3453eb8",
+      "npm `latest` names `@hraness/hra@0.7.1`",
+      "cryptographic publication-attempt-1 provenance", "This is artifact admission only",
+      "separate hosted capacity and target gates", "immutable source bytes",
+    ]) expect(admitted).toContain(evidence);
+    expect(releaseNotes).toContain("beta-release.md#immutable-v071-successful-release-record");
+    expect(changelog).toContain("docs/beta-release.md#immutable-v071-successful-release-record");
+    expect(changelog).not.toContain("## v0.7.1 (unreleased)");
+    expect(releaseRecord).toContain("`v0.7.0`, and `v0.7.1` are complete publications");
+    expect(releaseRecord).toContain("`v0.7.1` is the current admitted artifact.");
+    expect(releaseRecord).not.toContain("`v0.7.0` is the current admitted artifact.");
+    expect(routing).toContain("The v0.7.1 artifact is fully admitted");
+    expect(routing).toContain("Operational rollout remains pending");
+    expect(releaseNotes).toContain("../README.md#get-started");
+    expect(releaseNotes).toContain("https://hra.sh/docs/status/#install-and-update");
+    expect(releaseNotes).not.toContain("../README.md#update-runbook");
+    const recovery = releaseRecord.split("## Recover delayed public visibility\n")[1]?.split("\n## ")[0];
+    for (const boundary of [
+      "uncertain publication result, not permission to publish again",
+      "Reconcile public state read-only before a retry",
+      "Missing, mismatched or ambiguous evidence remains a hold",
+      "existing strict branch/comparison helpers and final-ref readback",
+      "gh run rerun <run-id> --repo hraness/hra",
+      "not a new run or a failed-job-only rerun",
+      "A rerun is not inherently read-only", "resulting step evidence proves it",
+      "Require all release jobs and final public admission to pass",
+      "Never update, delete, retag, replace or republish immutable artifacts",
+      "Release admission does not clear operational rollout gates",
+    ]) expect(recovery).toContain(boundary);
+  });
+
   test("closes bounded foundation and persistence delivery without claiming fleet or model admission", async () => {
     const root = join(import.meta.dir, "..", "kb", "plans");
     const [delivery, persistence, routing] = await Promise.all([
@@ -871,7 +927,7 @@ describe("release workflow", () => {
     expect(domainRecord).toContain("unresolved_prior_intent");
     expect(domainRecord).toContain("reasserts only the plan's exact source");
     expect(domainRecord).toContain("unresolved_current_intent");
-    expect(releaseRecord.split("\n")[2]).toContain("Status: `v0.7.1` is a release candidate, not an admitted artifact. `v0.7.0` remains the fully admitted public CLI beta");
+    expect(releaseRecord.split("\n")[2]).toContain("Status: `v0.7.1` is the fully admitted public CLI beta");
     expect(releaseRecord).toContain("Artifact admission does not clear the blocked hosted command-writer rollout or authorize daemon upgrades");
     expect(releaseRecord).toContain("At retirement, `hraness/hra` had no `v0.1.0` tag");
     expect(releaseRecord).toContain("## Immutable v0.1.0 failure record");
@@ -989,11 +1045,11 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("The package gate still scans `rev-list --all`");
     expect(releaseRecord).toContain("coordinate completed its non-executable bootstrap");
     expect(releaseRecord).toContain("npm trusted publishing has exactly one binding");
-    expect(releaseRecord).toContain("Stable `@hraness/hra@0.7.0` is the current admitted artifact");
+    expect(releaseRecord).toContain("Stable `@hraness/hra@0.7.1` is the current admitted artifact");
     expect(releaseRecord).toContain("The canonical README and website use a two-phase local-release surface");
-    expect(releaseRecord).toContain("The `v0.7.0` local CLI artifacts are admitted");
+    expect(releaseRecord).toContain("The `v0.7.1` local CLI artifacts are admitted");
     expect(releaseRecord).toContain("without changing the pre-admission wording captured in the release's immutable README and package metadata");
-    expect(releaseRecord).toContain("The current command names the `v0.7.1` candidate and is conditional on its own immutable GitHub and npm release admission");
+    expect(releaseRecord).toContain("The current command names the admitted `v0.7.1` artifact and verifies its exact immutable bytes before installation");
     expect(releaseRecord).toContain("https://github.com/hraness/hra/tree/v0.7.0#install-and-update");
     expect(releaseRecord).toContain("https://github.com/hraness/hra/blob/v0.6.1/docs/beta-release-notes.md#install");
     expect(releaseRecord).toContain("Hosted sync went live separately on 2026-09-03");
