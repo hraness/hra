@@ -399,6 +399,100 @@ The unchanged archive remains bound to the candidate, but exact-head CI,
 security, installation and compiled browser gates must admit the successor
 before protected merge, release or deployment.
 
+The successor is pushed as `fb1bf7e72dd89ca453dbee2bc51f96b0cfbbf348`,
+tree `720cba4fbd1bcfe018025427d8de915f91fe22e2`. All 214 frozen package
+blobs and modes, manifest, lockfile and archive digest match that committed
+source. Fresh isolated local/global installation, restored PTY and owned
+daemon lifecycle pass. The first package invocation was canceled before
+admission to release spare scheduler capacity; the identical command then
+passed after the finite backlog drained. CI run `34372320476`
+checks synthetic merge `29830d0a6fb0d9cef19620a10df7b68228835683`, with
+the exact head tree. Browser acceptance, both CodeQL analysis jobs and the
+separate Advanced Security check pass. Its completed source failures and
+subsequent repairs are recorded below; fresh local browser acceptance remains
+outstanding.
+
+The superseded run `34371222876` was canceled after reporting a genuine
+site-test defect. Its first complete build exceeded the 30-second deadline
+after approximately 29.36 seconds of compiler work before publication.
+Bun killed the shared esbuild service, ten subsequent cases failed, and
+the original build continued after fixture deletion. Cancellation does not
+dismiss those failures. The repair now runs the unchanged production builder
+inside a test-owned bounded child. One measured 60-second compiler-case work
+budget retains the existing coupled assertions and adds cancellation, positive
+collection and fixture-lifetime regression evidence. The committed repair and
+completed independent review are recorded below. The temporary shared merge
+hold was released until a repaired candidate is ready; no v0.8.0 tag,
+publication, deployment or operational activation has occurred.
+
+The Ubuntu source-1 job reports one separate failure: the combined49
+prepared-switch preservation case exceeds its unchanged five-second limit at
+5,097.88 ms. The other 1,886 cases pass, with no late errors. That case alone
+still uses four reopen operations; its neighboring preservation cases already
+use the three adjacent RO/RW pairs. Commit
+`b249122ba371b585d4a71c3984c4482ae43dfa52` applies only that existing
+registration and explicit pair argument. Independent AST comparison proves
+the original 23 assertion roots and 24 callback statements unchanged. The
+complete nine-case file passes with 38,661 assertions in 12.03 seconds;
+prepared-switch pairs take 1.21 to 1.28 seconds. Scoped lint and whitespace
+checks pass, and independent exact-diff review approves the repair. Complete
+typed-cell, schema, ledger, row, history and no-effect checks after every open
+and close compose the persistent-history proof. This is not a claim of
+literal four-open physical WAL stress equivalence. No migration, runtime,
+fixture bytes or deadline changes.
+
+CI run `34372320476`, attempt 1, completes with a failed `Required` job
+`102548564096`. Browser acceptance, both remainder jobs and four source
+jobs pass. The only other failing source job is macOS source-3: one service
+test exceeds five seconds at 5,199.50 ms, followed by a late matcher error
+from its already-closed SQLite connection. Its remaining 2,134 cases pass.
+That test loops over two independent immutable-send-authority corruptions
+using global fixture cleanup. The scoped repair creates two cases under
+the existing private owner, registers the restarted service before recovery,
+and fences cancellation before further work. It preserves the original
+five assertions, command sequence, authority restoration and five-second
+deadline. The focused lifecycle, positive rollover and repaired-case selection
+passes ten cases with 48 assertions; the exact-final two-case check passes
+ten assertions in 2.97 seconds. Production service and ownership helpers
+remain unchanged. Independent final binding approves the exact file and
+commit `2c2f6f300c019d0553ccc55458046013226c9bfb`. This evidence does
+not replace the repaired candidate's fresh complete CI.
+
+The shared site-test repair is committed as
+`87e110de618eaedd47dbc8bcc92891b74a70cac3`, tree
+`3d6788b978e6d9a9e354b09e4e8ea3ce2d9f63a1`, and published on the
+dedicated `codex/site-compiler-test-ownership-20260909` handoff branch.
+Its isolated seven-file diff changes no production builder, package source,
+lockfile or CI limit. Independent comparison proves all 20 original test
+bodies and 16 build-call argument expressions unchanged. Each compiler case
+has one 60-second work deadline, followed by named finite process collection
+and parent-drain allowances. Pure cases retain five seconds. A closed static
+driver preserves genuine builder errors separately from bounded transport
+diagnostics; cleanup retains fixture and recovery evidence when collection
+cannot be proved. Cancellation before dispatch, between child completion and
+publication, and during delayed parent continuation has regression coverage.
+
+The final deterministic suite passes 18 cases with 1,038 assertions, including
+three seeded protocol properties. Native evidence passes eight assertions:
+a deliberately stalled real Vite/esbuild process group is collected, exact
+`ESRCH` proves leader absence, and a fresh isolated build and check succeed.
+The complete original site file passes 20 cases with 1,049 assertions in
+89.54 seconds, without timeouts or late errors. Scoped lint and integration
+typecheck pass after correcting optional-field typing at the test-driver
+boundary. The earlier successful driver-dependent receipts were repeated
+on those corrected inputs. Independent source and final-evidence reviews
+approve this checkpoint.
+
+PR 164 owns the shared-fix transplant and its fresh integration gates. The
+coordinated routing follow-up will then qualify its conditional v0.7.1
+admission copy and release-verifier repair against that main. This task will
+join the resulting exact actual main before pushing the repaired PR 140
+candidate, avoiding a knowingly obsolete CI cycle. PR 140's published head
+remains `fb1bf7e` at this checkpoint. Upstream focused compiler evidence is
+not an exact-tree final receipt for a different branch's content or metadata.
+Protected merge, fresh main CI, guarded release, artifact readback, deployment
+and applicable operational admission remain separate and incomplete.
+
 The September 8 integration checkpoints now include canonical main through
 schema 50 at `ab56d3bc5034abedd12a20b5b405caf42bfa174f`, then the clean
 release-policy join at `9d6e2e12a42215e9201ae2ed3f64ed1b41e5c47d`, tree
