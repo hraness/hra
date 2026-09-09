@@ -71,7 +71,7 @@
   ],
   "rewrites": [
     {
-      "source": "/((?!assets/|\\.well-known/).*)",
+      "source": "/((?!(?:assets/|graphs/client/assets/|stylex\\.css$|\\.well-known/)).*)",
       "destination": "/index.html"
     }
   ]

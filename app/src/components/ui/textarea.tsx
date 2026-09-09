@@ -1,18 +1,25 @@
 import type { TextareaHTMLAttributes } from "react";
+import * as stylex from "@stylexjs/stylex";
+import type { StyleXStyles } from "@stylexjs/stylex";
 
-import { cn } from "../../lib/cn";
+import { staticStylexClassName } from "../../lib/cn";
+import { fieldStyles } from "./primitives.stylex";
 
-export type TextareaProps = TextareaHTMLAttributes<HTMLTextAreaElement>;
+export type TextareaProps = Omit<TextareaHTMLAttributes<HTMLTextAreaElement>, "style"> & Readonly<{
+  style?: never;
+  xstyle?: StyleXStyles;
+}>;
 
-export function Textarea({ className, rows = 2, ...rest }: TextareaProps) {
+function rejectInlineStyle(style: unknown): void {
+  if (style !== undefined) throw new Error("HRA primitives do not accept caller inline styles.");
+}
+
+export function Textarea({ className, rows = 2, style, xstyle, ...rest }: TextareaProps) {
+  rejectInlineStyle(style);
+  const presentation = stylex.props(fieldStyles.textarea, xstyle);
   return (
     <textarea
-      className={cn(
-        "w-full min-h-11 resize-none rounded-md border border-line bg-surface-input px-3 py-2",
-        "text-base text-ink placeholder:text-ink-muted",
-        "disabled:cursor-not-allowed disabled:opacity-50",
-        className,
-      )}
+      className={staticStylexClassName(presentation, className)}
       rows={rows}
       {...rest}
     />

@@ -2,6 +2,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 
 import { App } from "./app";
+import "@hraness/ui/compiler-foundation.css";
 import "./index.css";
 
 const container = document.getElementById("root");

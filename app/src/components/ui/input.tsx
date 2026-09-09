@@ -1,18 +1,25 @@
 import type { InputHTMLAttributes } from "react";
+import * as stylex from "@stylexjs/stylex";
+import type { StyleXStyles } from "@stylexjs/stylex";
 
-import { cn } from "../../lib/cn";
+import { staticStylexClassName } from "../../lib/cn";
+import { fieldStyles } from "./primitives.stylex";
 
-export type InputProps = InputHTMLAttributes<HTMLInputElement>;
+export type InputProps = Omit<InputHTMLAttributes<HTMLInputElement>, "style"> & Readonly<{
+  style?: never;
+  xstyle?: StyleXStyles;
+}>;
 
-export function Input({ className, ...rest }: InputProps) {
+function rejectInlineStyle(style: unknown): void {
+  if (style !== undefined) throw new Error("HRA primitives do not accept caller inline styles.");
+}
+
+export function Input({ className, style, xstyle, ...rest }: InputProps) {
+  rejectInlineStyle(style);
+  const presentation = stylex.props(fieldStyles.input, xstyle);
   return (
     <input
-      className={cn(
-        "w-full min-h-11 rounded-md border border-line bg-surface-input px-3",
-        "text-base text-ink placeholder:text-ink-muted",
-        "disabled:cursor-not-allowed disabled:opacity-50",
-        className,
-      )}
+      className={staticStylexClassName(presentation, className)}
       {...rest}
     />
   );

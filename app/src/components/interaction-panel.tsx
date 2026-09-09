@@ -1,3 +1,4 @@
+import * as stylex from "@stylexjs/stylex";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import { Badge } from "./ui/badge";
@@ -23,6 +24,7 @@ import {
   interactionReasonCopy,
 } from "../model/session-view";
 import type { PendingInteraction } from "../model/session-model";
+import { interactionPanelStyles } from "./interaction-panel.stylex";
 
 export type InteractionPanelProps = Readonly<{
   /** The command this exact interaction revision submitted, if any. */
@@ -168,27 +170,27 @@ function UserQuestion({
   question: Extract<CompactRemoteInteractionQuestion, { readonly kind: "user_input" }>;
 }>): ReactNode {
   return (
-    <fieldset className="flex flex-col gap-1 text-xs">
-      <legend className="font-medium text-ink break-words">{question.header}</legend>
-      <p className="text-ink-muted break-words">{question.question}</p>
+    <fieldset {...stylex.props(interactionPanelStyles.fieldset)}>
+      <legend {...stylex.props(interactionPanelStyles.legend)}>{question.header}</legend>
+      <p {...stylex.props(interactionPanelStyles.question)}>{question.question}</p>
       {question.options.map((option) => (
         <label
-          className="flex min-h-11 items-start gap-2 rounded-md border border-line p-2"
+          {...stylex.props(interactionPanelStyles.option)}
           key={option.label}
         >
           <input
             checked={draft?.mode === "option" && draft.value === option.label}
-            className="mt-1"
+            {...stylex.props(interactionPanelStyles.radio)}
             disabled={disabled}
             name={`interaction-${question.id}`}
             onChange={() => { onChange({ mode: "option", value: option.label }); }}
             type="radio"
             value={option.label}
           />
-          <span className="flex flex-col gap-0.5 break-words">
+          <span {...stylex.props(interactionPanelStyles.optionText)}>
             <span>{option.label}</span>
             {option.description.length === 0 ? null : (
-              <span className="text-ink-muted">{option.description}</span>
+              <span {...stylex.props(interactionPanelStyles.optionDescription)}>{option.description}</span>
             )}
           </span>
         </label>
@@ -277,10 +279,10 @@ export function InteractionPanel({
   return (
     <section
       aria-label="Pending interaction"
-      className="rounded-md border border-attention bg-surface-raised p-3"
+      {...stylex.props(interactionPanelStyles.root)}
     >
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex flex-wrap items-center gap-2">
+      <div {...stylex.props(interactionPanelStyles.header)}>
+        <div {...stylex.props(interactionPanelStyles.badges)}>
           <Badge tone="attention">
             {interaction.label ?? interactionKindLabel[interaction.interactionKind]}
           </Badge>
@@ -289,18 +291,18 @@ export function InteractionPanel({
           </Badge>
         </div>
         {interaction.blocking ? (
-          <span className="text-xs text-ink-muted">Blocking the turn</span>
+          <span {...stylex.props(interactionPanelStyles.quiet)}>Blocking the turn</span>
         ) : null}
       </div>
-      <p className="mt-2 text-sm break-words">{interaction.headline ?? interaction.summary}</p>
+      <p {...stylex.props(interactionPanelStyles.headline)}>{interaction.headline ?? interaction.summary}</p>
       {interaction.detailMarkdown === null || interaction.detailMarkdown.length === 0 ? null : (
-        <div className="mt-2 text-ink-muted">
+        <div {...stylex.props(interactionPanelStyles.detail)}>
           <StaticMarkdown text={interaction.detailMarkdown} />
         </div>
       )}
 
       {affordance.actions.includes("decline") ? (
-          <div className="mt-3 flex gap-2">
+          <div {...stylex.props(interactionPanelStyles.actionRow, interactionPanelStyles.spacedActionRow)}>
             <Button disabled={disabled} onClick={decline} variant="secondary">
               Decline
             </Button>
@@ -308,7 +310,7 @@ export function InteractionPanel({
         ) : null}
 
       {!affordance.actions.includes("answer") ? null : (
-        <div className="mt-3 flex flex-col gap-3">
+        <div {...stylex.props(interactionPanelStyles.answerStack)}>
           {affordance.questions.map((question) => (
             <UserQuestion
               disabled={disabled}
@@ -320,25 +322,25 @@ export function InteractionPanel({
               question={question}
             />
           ))}
-          <div className="flex gap-2">
+          <div {...stylex.props(interactionPanelStyles.actionRow)}>
             <Button disabled={disabled || !complete} onClick={answer} type="button">Send</Button>
           </div>
         </div>
       )}
 
       {!interactionIsLocalOnly(affordance) && affordance.reasonCodes.length === 0 ? null : (
-        <div className="mt-3 text-xs text-ink-muted">
+        <div {...stylex.props(interactionPanelStyles.reasons)}>
           {interactionIsLocalOnly(affordance) ? (
-            <p>Resolve this one on the machine running the session.</p>
+            <p {...stylex.props(interactionPanelStyles.reason)}>Resolve this one on the machine running the session.</p>
           ) : null}
           {affordance.reasonCodes.map((reason) => (
-            <p key={reason}>{interactionReasonCopy[reason]}</p>
+            <p {...stylex.props(interactionPanelStyles.reason)} key={reason}>{interactionReasonCopy[reason]}</p>
           ))}
         </div>
       )}
 
       {command === null ? null : (
-        <p className="mt-2 text-xs text-ink-muted" role="status">
+        <p {...stylex.props(interactionPanelStyles.quiet, interactionPanelStyles.status)} role="status">
           Decision {command.state}
           {command.resultCode === null ? "" : `: ${command.resultCode}`}.
         </p>

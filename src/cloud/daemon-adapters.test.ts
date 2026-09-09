@@ -170,6 +170,7 @@ class FakeCodex implements CodexRuntimePort {
 }
 
 const temporaryDirectories: string[] = [];
+const ownedFixtureTeardowns: Array<() => Promise<void>> = [];
 
 /**
  * The presentation detail an `mcp_elicitation` interaction projects. The
@@ -198,7 +199,7 @@ const machineOnlyRemotePolicy = (
   version: 2,
 }) as const;
 
-async function fixture(): Promise<Readonly<{
+async function fixture(registerStore?: (store: StateStore) => void): Promise<Readonly<{
   codex: FakeCodex;
   daemonGeneration: number;
   daemonBootId: string;
@@ -214,6 +215,7 @@ async function fixture(): Promise<Readonly<{
   await initializeStatePaths(paths);
   let now = 1_000;
   const store = new StateStore(paths, { now: () => now });
+  registerStore?.(store);
   const daemonBootId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
   const daemonGeneration = store.nextDaemonGeneration(daemonBootId);
   const profile = store.createProfile(`Personal \`${privateRootFixture}/profile\``);
@@ -265,6 +267,64 @@ async function fixture(): Promise<Readonly<{
     },
     store,
   };
+}
+
+function ownedCloudAdapterCase(
+  runCase: (
+    value: Awaited<ReturnType<typeof fixture>>,
+    context: Readonly<{
+      createAdapter: () => StateBackedCloudDaemonAdapter;
+      request: <T>(operation: () => Promise<T>) => Promise<T>;
+      signal: AbortSignal;
+    }>,
+  ) => Promise<void>,
+): Promise<void> {
+  const controller = new AbortController();
+  const adapters: StateBackedCloudDaemonAdapter[] = [];
+  let store: StateStore | undefined;
+  // Defer setup until its owner is registered, including partial setup that
+  // has opened storage but has not returned the completed fixture yet.
+  const setup = Promise.resolve().then(() => fixture((created) => { store = created; }));
+  const caseTask = setup.then(async (value) => {
+    controller.signal.throwIfAborted();
+    await runCase(value, {
+      createAdapter: () => {
+        controller.signal.throwIfAborted();
+        const adapter = new StateBackedCloudDaemonAdapter({
+          readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
+          executeRemote: () => Promise.resolve({}),
+          paths: value.paths,
+          store: value.store,
+        });
+        adapters.push(adapter);
+        return adapter;
+      },
+      request: async <T>(operation: () => Promise<T>): Promise<T> => {
+        controller.signal.throwIfAborted();
+        const result = await operation();
+        controller.signal.throwIfAborted();
+        return result;
+      },
+      signal: controller.signal,
+    });
+    controller.signal.throwIfAborted();
+  });
+  // Observe both promises immediately. Cleanup joins the raw case, never the
+  // returned finally promise, and retains failures before storage/root removal.
+  const settled = Promise.allSettled([setup, caseTask]);
+  let teardownTask: Promise<void> | undefined;
+  const teardown = (): Promise<void> => {
+    controller.abort(new Error("Owned cloud adapter case is closing."));
+    teardownTask ??= settled.then(async () => {
+      for (const adapter of adapters) await adapter.close();
+      store?.close();
+    });
+    return teardownTask;
+  };
+  ownedFixtureTeardowns.push(teardown);
+  const result = caseTask.finally(teardown);
+  void result.catch(() => undefined);
+  return result;
 }
 
 function adoptPersonalCodexSession(
@@ -519,6 +579,8 @@ function admitCloudInteraction(
 }
 
 afterEach(async () => {
+  for (const teardown of ownedFixtureTeardowns) await teardown();
+  ownedFixtureTeardowns.length = 0;
   while (temporaryDirectories.length > 0) {
     const temporary = temporaryDirectories.pop();
     if (temporary !== undefined) await rm(temporary, { force: true, recursive: true });
@@ -2121,32 +2183,26 @@ describe("state-backed cloud daemon adapter", () => {
     }
   });
 
-  test("withholds offline heads when the compact stream ledger is semantically incoherent", async () => {
-    for (const variant of [
-      "epoch",
-      "pending",
-      "recovered_zero",
-      "unsafe_sequence",
-      "scan_cursor",
-      "discovery_cursor",
-    ] as const) {
-      const value = await fixture();
-      const cachePath = join(value.paths.root, "cloud-projection.sqlite");
-      let adapter = new StateBackedCloudDaemonAdapter({
-        readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
-        executeRemote: () => Promise.resolve({}),
-        paths: value.paths,
-        store: value.store,
-      });
-      try {
-        const signal = new AbortController().signal;
-        await adapter.listSessions({ limit: 25, signal });
-        const initial = await adapter.readCompactEvents({
+  test.each([
+    "epoch",
+    "pending",
+    "recovered_zero",
+    "unsafe_sequence",
+    "scan_cursor",
+    "discovery_cursor",
+  ] as const)(
+    "withholds offline heads when the compact stream ledger is semantically incoherent: %s",
+    (variant) => ownedCloudAdapterCase(
+      async (value, { createAdapter, request, signal }) => {
+        const cachePath = join(value.paths.root, "cloud-projection.sqlite");
+        let adapter = createAdapter();
+        await request(() => adapter.listSessions({ limit: 25, signal }));
+        const initial = await request(() => adapter.readCompactEvents({
           afterSequence: 0,
           limit: 128,
           sessionPublicId: value.sessionId,
           signal,
-        });
+        }));
         const checkpoint = {
           cacheId: initial.cacheId,
           digest: "a".repeat(64),
@@ -2155,51 +2211,54 @@ describe("state-backed cloud daemon adapter", () => {
           headSequence: initial.events.at(-1)?.sequence ?? 0,
           sessionPublicId: value.sessionId,
         };
-        await adapter.recordCompactUploadIntent(checkpoint);
-        await adapter.acknowledgeCompactUpload(checkpoint);
-        await adapter.close();
+        await request(() => adapter.recordCompactUploadIntent(checkpoint));
+        await request(() => adapter.acknowledgeCompactUpload(checkpoint));
+        await request(() => adapter.close());
 
         const database = new Database(cachePath, { strict: true });
-        if (variant === "epoch") {
-          database.query(
-            "UPDATE projection_sessions SET stream_epoch=1 WHERE session_id=?",
-          ).run(value.sessionId);
-        } else if (variant === "pending") {
-          database.query(
-            `UPDATE projection_remote_checkpoints
-             SET pending_expected_head=head_sequence,
-                 pending_expected_tail=tail_digest,
-                 pending_head=head_sequence+100,
-                 pending_tail=?
-             WHERE session_id=?`,
-          ).run("b".repeat(64), value.sessionId);
-        } else if (variant === "recovered_zero") {
-          database.query(
-            "UPDATE projection_sessions SET stream_epoch=1 WHERE session_id=?",
-          ).run(value.sessionId);
-          database.query(
-            `UPDATE projection_remote_checkpoints
-             SET stream_epoch=1,head_sequence=0,tail_digest=NULL
-             WHERE session_id=?`,
-          ).run(value.sessionId);
-        } else if (variant === "unsafe_sequence") {
-          database.query(
-            `UPDATE projection_sessions SET next_sequence=9007199254740992
-             WHERE session_id=?`,
-          ).run(value.sessionId);
-        } else if (variant === "scan_cursor") {
-          database.query(
-            `UPDATE projection_sessions
-             SET interaction_scan_sequence=4,interaction_scan_ceiling_sequence=4
-             WHERE session_id=?`,
-          ).run(value.sessionId);
-        } else {
-          database.query(
-            `UPDATE projection_sessions SET interaction_discovery_cursor=?
-             WHERE session_id=?`,
-          ).run("x".repeat(50), value.sessionId);
+        try {
+          if (variant === "epoch") {
+            database.query(
+              "UPDATE projection_sessions SET stream_epoch=1 WHERE session_id=?",
+            ).run(value.sessionId);
+          } else if (variant === "pending") {
+            database.query(
+              `UPDATE projection_remote_checkpoints
+               SET pending_expected_head=head_sequence,
+                   pending_expected_tail=tail_digest,
+                   pending_head=head_sequence+100,
+                   pending_tail=?
+               WHERE session_id=?`,
+            ).run("b".repeat(64), value.sessionId);
+          } else if (variant === "recovered_zero") {
+            database.query(
+              "UPDATE projection_sessions SET stream_epoch=1 WHERE session_id=?",
+            ).run(value.sessionId);
+            database.query(
+              `UPDATE projection_remote_checkpoints
+               SET stream_epoch=1,head_sequence=0,tail_digest=NULL
+               WHERE session_id=?`,
+            ).run(value.sessionId);
+          } else if (variant === "unsafe_sequence") {
+            database.query(
+              `UPDATE projection_sessions SET next_sequence=9007199254740992
+               WHERE session_id=?`,
+            ).run(value.sessionId);
+          } else if (variant === "scan_cursor") {
+            database.query(
+              `UPDATE projection_sessions
+               SET interaction_scan_sequence=4,interaction_scan_ceiling_sequence=4
+               WHERE session_id=?`,
+            ).run(value.sessionId);
+          } else {
+            database.query(
+              `UPDATE projection_sessions SET interaction_discovery_cursor=?
+               WHERE session_id=?`,
+            ).run("x".repeat(50), value.sessionId);
+          }
+        } finally {
+          database.close(false);
         }
-        database.close(false);
         const profile = value.store.requireProfileById(
           value.store.requireSession(value.sessionId).profileId,
         );
@@ -2208,33 +2267,25 @@ describe("state-backed cloud daemon adapter", () => {
           profile.processGeneration,
           "signed_out",
         )).toBe(true);
-        adapter = new StateBackedCloudDaemonAdapter({
-          readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
-          executeRemote: () => Promise.resolve({}),
-          paths: value.paths,
-          store: value.store,
-        });
+        adapter = createAdapter();
 
-        expect((await adapter.listSessions({ limit: 25, signal })).sessions).toEqual([]);
+        expect((await request(() => adapter.listSessions({ limit: 25, signal }))).sessions).toEqual([]);
         expect(adapter.projectionCacheStatus()).toMatchObject({
           affectedSessions: [value.sessionId],
           code: "STREAM_RECOVERY_REQUIRED",
           sessions: 1,
           state: "degraded",
         });
-        await expect(adapter.readCompactEvents({
+        await expect(request(() => adapter.readCompactEvents({
           afterSequence: checkpoint.headSequence,
           limit: 128,
           remoteTailDigest: checkpoint.digest,
           sessionPublicId: value.sessionId,
           signal,
-        })).rejects.toThrow("explicit, potentially history-discarding reseed");
-      } finally {
-        await adapter.close();
-        value.store.close();
-      }
-    }
-  });
+        }))).rejects.toThrow("explicit, potentially history-discarding reseed");
+      },
+    ),
+  );
 
   test("rejects compact rows whose body, count, sequence, or turn identity changed", async () => {
     for (const variant of ["body", "count", "sequence", "turn_id"] as const) {

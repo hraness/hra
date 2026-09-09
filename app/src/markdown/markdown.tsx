@@ -1,8 +1,10 @@
+import * as stylex from "@stylexjs/stylex";
 import { memo, type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import { neutraliseText, safeHref, splitMarkdownBlocks } from "./sanitise";
+import { markdownStyles } from "./markdown.stylex";
 
 /**
  * The rendered markdown surface.
@@ -26,11 +28,11 @@ const components: Components = {
   a({ children, href }) {
     const resolved = safeHref(href);
     if (resolved === null) {
-      return <span className="text-ink-muted underline decoration-dotted">{children}</span>;
+      return <span {...stylex.props(markdownStyles.invalidLink)}>{children}</span>;
     }
     return (
       <a
-        className="text-accent underline underline-offset-2"
+        {...stylex.props(markdownStyles.link)}
         href={resolved}
         rel="noopener noreferrer"
         target="_blank"
@@ -41,7 +43,7 @@ const components: Components = {
   },
   blockquote({ children }) {
     return (
-      <blockquote className="my-2 border-l-2 border-line pl-3 text-ink-muted">
+      <blockquote {...stylex.props(markdownStyles.blockquote)}>
         {children}
       </blockquote>
     );
@@ -50,79 +52,77 @@ const components: Components = {
     const fenced = typeof className === "string" && className.startsWith("language-");
     return (
       <code
-        className={fenced
-          ? "font-mono text-xs"
-          : "rounded bg-surface-input px-1 py-0.5 font-mono text-[0.9em]"}
+        {...stylex.props(fenced ? markdownStyles.codeBlock : markdownStyles.codeInline)}
       >
         {children}
       </code>
     );
   },
   em({ children }) {
-    return <em className="italic">{children}</em>;
+    return <em {...stylex.props(markdownStyles.em)}>{children}</em>;
   },
   h1({ children }) {
-    return <h3 className="mt-3 mb-1 text-base font-semibold first:mt-0">{children}</h3>;
+    return <h3 {...stylex.props(markdownStyles.headingLarge)}>{children}</h3>;
   },
   h2({ children }) {
-    return <h3 className="mt-3 mb-1 text-sm font-semibold first:mt-0">{children}</h3>;
+    return <h3 {...stylex.props(markdownStyles.headingSmall)}>{children}</h3>;
   },
   h3({ children }) {
-    return <h4 className="mt-3 mb-1 text-sm font-semibold first:mt-0">{children}</h4>;
+    return <h4 {...stylex.props(markdownStyles.headingSmall)}>{children}</h4>;
   },
   h4({ children }) {
-    return <h5 className="mt-2 mb-1 text-sm font-semibold first:mt-0">{children}</h5>;
+    return <h5 {...stylex.props(markdownStyles.headingSmall, markdownStyles.headingCompact)}>{children}</h5>;
   },
   h5({ children }) {
-    return <h6 className="mt-2 mb-1 text-sm font-semibold first:mt-0">{children}</h6>;
+    return <h6 {...stylex.props(markdownStyles.headingSmall, markdownStyles.headingCompact)}>{children}</h6>;
   },
   h6({ children }) {
-    return <h6 className="mt-2 mb-1 text-sm font-semibold first:mt-0">{children}</h6>;
+    return <h6 {...stylex.props(markdownStyles.headingSmall, markdownStyles.headingCompact)}>{children}</h6>;
   },
   hr() {
-    return <hr className="my-3 border-line" />;
+    return <hr {...stylex.props(markdownStyles.horizontalRule)} />;
   },
   // Projection text never resolves an image: the alt text is the whole
   // rendering. `img-src data: blob:` exists for attachment thumbnails, not for
   // this surface.
   img({ alt }) {
     const label = typeof alt === "string" && alt.length > 0 ? alt : "image";
-    return <span className="text-ink-muted italic">[{label}]</span>;
+    return <span {...stylex.props(markdownStyles.unavailableImage)}>[{label}]</span>;
   },
   li({ children }) {
-    return <li className="my-0.5">{children}</li>;
+    return <li {...stylex.props(markdownStyles.item)}>{children}</li>;
   },
   ol({ children }) {
-    return <ol className="my-2 list-decimal pl-5">{children}</ol>;
+    return <ol {...stylex.props(markdownStyles.list, markdownStyles.orderedList)}>{children}</ol>;
   },
   p({ children }) {
-    return <p className="my-2 leading-relaxed break-words first:mt-0 last:mb-0">{children}</p>;
+    return <p {...stylex.props(markdownStyles.paragraph)}>{children}</p>;
   },
   pre({ children }) {
     return (
-      <pre className="my-2 overflow-x-auto rounded-md border border-line bg-surface p-2 text-xs">
+      <pre {...stylex.props(markdownStyles.pre)}>
         {children}
       </pre>
     );
   },
   strong({ children }) {
-    return <strong className="font-semibold">{children}</strong>;
+    return <strong {...stylex.props(markdownStyles.strong)}>{children}</strong>;
   },
   table({ children }) {
     return (
-      <div className="my-2 overflow-x-auto">
-        <table className="w-full border-collapse text-xs">{children}</table>
+      <div {...stylex.props(markdownStyles.tableWrapper)}>
+        <table {...stylex.props(markdownStyles.table)}>{children}</table>
       </div>
     );
   },
   td({ children }) {
-    return <td className="border border-line px-2 py-1 align-top">{children}</td>;
+    return <td {...stylex.props(markdownStyles.tableCell)}>{children}</td>;
   },
   th({ children }) {
-    return <th className="border border-line px-2 py-1 text-left font-semibold">{children}</th>;
+    return <th {...stylex.props(markdownStyles.tableHeader)}>{children}</th>;
   },
   ul({ children }) {
-    return <ul className="my-2 list-disc pl-5">{children}</ul>;
+    return <ul {...stylex.props(markdownStyles.list, markdownStyles.unorderedList)}>{children}</ul>;
   },
 };
 
@@ -164,7 +164,7 @@ const CompletedBlock = memo(function CompletedBlock({ text }: MarkdownProps): Re
 export function StreamingMarkdown({ text }: MarkdownProps): ReactNode {
   const blocks = splitMarkdownBlocks(text);
   return (
-    <div className="text-sm">
+    <div {...stylex.props(markdownStyles.root)}>
       {blocks.map((block) => block.complete
         ? <CompletedBlock key={block.key} text={block.text} />
         : <Markdown key={block.key} text={block.text} />)}
@@ -175,7 +175,7 @@ export function StreamingMarkdown({ text }: MarkdownProps): ReactNode {
 /** Markdown that will not change again. */
 export function StaticMarkdown({ text }: MarkdownProps): ReactNode {
   return (
-    <div className="text-sm">
+    <div {...stylex.props(markdownStyles.root)}>
       <Markdown text={text} />
     </div>
   );

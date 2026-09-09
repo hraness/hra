@@ -31,6 +31,7 @@ import {
 } from "./bounded-process";
 import {
   assertPublicSensitiveText,
+  assertPublicCheckout,
   assertPublicText,
   assertPublicTree,
 } from "./public-text-policy";
@@ -528,11 +529,80 @@ export const selectReviewedGitHistoryPatchEvidence = (
   });
 };
 
+type ReviewedSyntheticPackageFixture = "other_ui" | "foreign_package";
+type ReviewedSyntheticPackageEvidence = Readonly<{
+  fixtures: readonly ReviewedSyntheticPackageFixture[];
+  patchSha256: string;
+}>;
+
+// These immutable public-patch receipts cover only synthetic negative-test
+// package names and their removal. Sensitive-text scans never use this registry.
+const reviewedSyntheticPackageHistoryEvidence: Readonly<Record<string, ReviewedSyntheticPackageEvidence>> = Object.freeze({
+  e19458e45523c1ace0e87c7928eb15516db94ccd: Object.freeze({
+    fixtures: Object.freeze(["other_ui"] as const),
+    patchSha256: "5f2599b248dc16d94bc27d980604417398c15ee2e7a981b780954d039f55309f",
+  }),
+  e2fd2d699a9d003e072dc44a613cd823c24f155d: Object.freeze({
+    fixtures: Object.freeze(["foreign_package"] as const),
+    patchSha256: "fa6583ec433c00d10d967214631fb4e04847515bb273cca51548388cb7c6ba7b",
+  }),
+  "52579a5debfe1ee6c31dca0f31733a798c74c6aa": Object.freeze({
+    fixtures: Object.freeze(["other_ui", "foreign_package"] as const),
+    patchSha256: "a93c5c423beacf7ec5068310ae648b994de67506b07d46e523739b8903458beb",
+  }),
+});
+const reviewedSyntheticPackageTokens: Readonly<Record<ReviewedSyntheticPackageFixture, string>> = Object.freeze({
+  other_ui: ["@other", "ui"].join("/"),
+  foreign_package: ["@foreign", "package"].join("/"),
+});
+
+export const selectReviewedGitHistoryPackageEvidence = (
+  commit: string,
+  kind: GitHistoryPatchKind,
+): ReviewedSyntheticPackageEvidence | undefined => {
+  if (kind !== "public_patch" || !Object.hasOwn(reviewedSyntheticPackageHistoryEvidence, commit)) return undefined;
+  return reviewedSyntheticPackageHistoryEvidence[commit];
+};
+
+export const normalizeReviewedSyntheticPackagePatch = (
+  patch: string,
+  expectedPatchSha256: string,
+  fixtures: readonly ReviewedSyntheticPackageFixture[],
+): string => {
+  if (fixtures.length < 1 || fixtures.length > 2 || new Set(fixtures).size !== fixtures.length) {
+    throw new Error("Reviewed Git history synthetic-package fixture selection is invalid.");
+  }
+  if (createHash("sha256").update(patch, "utf8").digest("hex") !== expectedPatchSha256) {
+    throw new Error("Reviewed Git history synthetic-package evidence changed.");
+  }
+  let normalized = patch;
+  for (const fixture of fixtures) {
+    const token = reviewedSyntheticPackageTokens[fixture];
+    if (typeof token !== "string") throw new Error("Reviewed Git history synthetic-package fixture is unknown.");
+    const firstOccurrence = patch.indexOf(token);
+    // Require exactly one complete quoted fixture, not a prefix of an arbitrary
+    // scoped name. Any extra occurrence or any unrelated byte changes the proof.
+    if (firstOccurrence < 1 || patch.indexOf(token, firstOccurrence + token.length) >= 0
+      || patch[firstOccurrence - 1] !== '"' || patch[firstOccurrence + token.length] !== '"') {
+      throw new Error("Reviewed Git history synthetic-package evidence changed.");
+    }
+    normalized = normalized.replace(token, "[reviewed-synthetic-package]");
+  }
+  return normalized;
+};
+
 export const normalizeGitHistoryPatchForPublicScan = (
   commit: string,
   kind: GitHistoryPatchKind,
   patch: string,
 ): string => {
+  const packageEvidence = selectReviewedGitHistoryPackageEvidence(commit, kind);
+  if (packageEvidence !== undefined) {
+    if (selectReviewedGitHistoryPatchEvidence(commit, kind) !== undefined) {
+      throw new Error("Reviewed Git history patch has ambiguous fixture evidence.");
+    }
+    return normalizeReviewedSyntheticPackagePatch(patch, packageEvidence.patchSha256, packageEvidence.fixtures);
+  }
   const evidence = selectReviewedGitHistoryPatchEvidence(commit, kind);
   if (evidence === undefined) return patch;
   return normalizeReviewedSyntheticHistoryPatch(patch, evidence.patchSha256, evidence.fixtures);
@@ -977,7 +1047,7 @@ if (!packageJson.files.includes("!src/storage/legacy-secret-migration.ts")) {
 }
 await access(join(repositoryRoot, "src", "storage", "legacy-secret-migration.ts"), constants.R_OK);
 
-await assertPublicTree(repositoryRoot);
+await assertPublicCheckout(repositoryRoot);
 await assertCompleteGitHistoryPublic(repositoryRoot);
 
 const generated = requireSuccess(

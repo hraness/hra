@@ -24,9 +24,10 @@ remain dormant. Phases 6 through 9 are not complete.
 The September 8 integration checkpoints now include canonical main through
 schema 50 at `ab56d3bc5034abedd12a20b5b405caf42bfa174f`, then the clean
 release-policy join at `9d6e2e12a42215e9201ae2ed3f64ed1b41e5c47d`, tree
-`78189f73fd35407b433b9a8009a23e8f1c5f5cb3`. Runtime and historical-fixture
-repairs continue on that local branch. Integration and delivery gates remain
-incomplete. PR 140 remains a draft at `8f05930`; no
+`78189f73fd35407b433b9a8009a23e8f1c5f5cb3`. The reviewed runtime and historical
+fixture repairs are committed as `4c252d72b5e9f3a90e1897bfd36889a7f3f985a3`,
+tree `313d85318b3533632601f07436b1cfde8d2bd862`. Integration and delivery gates
+remain incomplete. PR 140 remains a draft at `8f05930`; no
 protected-branch merge, usage release or production deployment is claimed.
 Earlier exact-tree checks do not cover this integration. Canonical schema 50
 is now governed by PR 151's merge at
@@ -45,19 +46,19 @@ capacity, identity and intended-target gates remain binding. The release owner
 reports complete immutable admission for the baseline `v0.7.0` and has released
 that main window. The owner also reports PR 157's documentation/site successor
 at `7ad1607df15a112125351ee01fb46fcdd9ccad98`, with actual-main CI and public site
-verification complete. That successor is not yet joined here and does not
+verification complete. That successor is included in the current join and does not
 republish the immutable baseline artifact. This is not usage delivery. A later usage release must own
 its own version, exact-source checks, protected merge and artifact admission.
 
 The latest scoped main fetch confirms
 `5027d21d8e4a128f87f2a78810b3f23929404061`, the separate custody-scoped
-attention-key installer after StyleX successor `3da9744`, is still unjoined
-here. The installer requires its own operational handoff and does not activate
-attention or clear hosted capacity gates. Independent impact review of the
-StyleX successor found no new storage or
-service implementation delta, but the service-fixture teardown join must
-preserve the explicitly expected custody-refusal outcome without a generic
-catch. After the join, frozen dependency installation, the scoped app/site
+attention-key installer after StyleX successor `3da9744`, is the exact current
+join parent. Independent review found no storage or service implementation
+delta in either successor. The installer requires its own operational handoff
+and does not activate attention or clear hosted capacity gates. The reviewed
+test-fixture resolution preserves registered cleanup, daemon-generation
+authority and the explicitly expected Claude custody refusal without a generic
+catch. Its joined runtime checks remain pending. Frozen dependency installation, the scoped app/site
 test commands and the new separate browser acceptance gate are required in
 addition to the unchanged aggregate check.
 
