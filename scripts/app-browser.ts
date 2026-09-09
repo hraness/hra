@@ -6,8 +6,10 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseHTML } from "linkedom";
 import { transform } from "lightningcss";
-import type { BrowserContext, Locator, Page, Response as BrowserResponse } from "playwright-core";
+import type { BrowserContext, Locator, Page, Request as BrowserRequest, Response as BrowserResponse } from "playwright-core";
+import type { DirectBrowserBridge } from "@hraness/direct/web";
 import { browserIoModules } from "../app/fixtures/browser/config";
+import { productIoModules } from "../app/fixtures/product/config";
 import { assertBrowserNode, browserDigest, browserExecutable, browserPublicArtifacts, publishBrowserJson, type BrowserExecutionAdmission } from "./app-browser-handoff.ts";
 import { serveBrowserAssets } from "./app-browser-server.ts";
 import { readRestoredStyleFramePair, settleExactStylesheet, StylesheetSettlementError, type StylesheetSettlementDiagnostics } from "./app-browser-settlement.ts";
@@ -45,6 +47,9 @@ export function browserFailureDetails(value: unknown, depth = 0): BrowserFailure
 }
 type Profile = Readonly<{ name: string; width: number; height: number; coarse: boolean; reduced: boolean; forced: boolean; rtl: boolean; colorScheme?: "dark" | "light" }>;
 const fixtureViews = ["signin", "locked", "enrollment", "grid", "session", "session-long", "retired", "settings", "primitives"] as const;
+const productViews = ["overview", "conversation", "question", "settings"] as const;
+type ProductView = typeof productViews[number];
+const siteRouteLabels = ["home", "privacy", "preview", "docs", "docs-start", "docs-web", "docs-sessions", "docs-reference", "docs-status"] as const;
 const profiles: readonly Profile[] = [
   { name: "desktop", width: 1280, height: 900, coarse: false, reduced: false, forced: false, rtl: false },
   { name: "light-os", width: 1280, height: 900, coarse: false, reduced: false, forced: false, rtl: false, colorScheme: "light" },
@@ -64,12 +69,13 @@ const browserDiagnosticSteps = new Set([
   "production-anonymous:navigation", "production-anonymous:assertions", "production-anonymous:negative-css",
   "asymmetric-safe-area", "isolation:assertions", "cleanup", "complete",
   ...fixtureViews.flatMap((view) => ["navigation", "assertions", "screenshot"].map((step) => `fixture:${view}:${step}`)),
-  ...["home", "privacy", "preview"].flatMap((route) => [
+  "static-site:home:product-previews", "static-site:docs:search", "static-site:docs:legacy-redirects",
+  ...siteRouteLabels.flatMap((route) => [
     "navigation", "document-bytes", "direction", "heading", "settle-before-fonts", "font-load", "settle-after-fonts",
     "document-clean", "stylesheet-links", "stylesheet-inventory", "color-scheme", "background", "heading-style", "inertness",
     "negative-final-css", "negative-foundation-css", "negative-document-clean", "resource-bytes", "mobile-anchors",
   ].map((step) => `static-site:${route}:${step}`)),
-  ...["production-anonymous:negative-css", "fixture:primitives:negative-css", ...["home", "privacy", "preview"].flatMap((route) =>
+  ...["production-anonymous:negative-css", "fixture:primitives:negative-css", ...siteRouteLabels.flatMap((route) =>
     [`static-site:${route}:negative-final-css`, `static-site:${route}:negative-foundation-css`])]
     .flatMap((parent) => negativeStylesheetSubsteps.map((step) => `${parent}:${step}`)),
 ]);
@@ -142,20 +148,30 @@ const fontProvenancePaths = new Set([
 ]);
 const legacyFontPaths = new Set([bracketedFontPath]);
 const siteRoutes = [
-  { path: "index.html", pathname: "/", heading: "h1" },
-  { path: "privacy/index.html", pathname: "/privacy/", heading: "#privacy-heading" },
-  { path: "preview/index.html", pathname: "/preview/", heading: "h1" },
+  { path: "index.html", pathname: "/", heading: "h1", label: "home" },
+  { path: "privacy/index.html", pathname: "/privacy/", heading: "#privacy-heading", label: "privacy" },
+  { path: "preview/index.html", pathname: "/preview/", heading: "h1", label: "preview" },
+  { path: "docs/index.html", pathname: "/docs/", heading: "h1", label: "docs" },
+  { path: "docs/start/index.html", pathname: "/docs/start/", heading: "h1", label: "docs-start" },
+  { path: "docs/web/index.html", pathname: "/docs/web/", heading: "h1", label: "docs-web" },
+  { path: "docs/sessions/index.html", pathname: "/docs/sessions/", heading: "h1", label: "docs-sessions" },
+  { path: "docs/reference/index.html", pathname: "/docs/reference/", heading: "h1", label: "docs-reference" },
+  { path: "docs/status/index.html", pathname: "/docs/status/", heading: "h1", label: "docs-status" },
 ] as const;
+const siteMarkdownPaths = new Set(siteRoutes.filter(({ pathname }) => pathname.startsWith("/docs/")).map(({ path }) => path.replace(/\.html$/u, ".md")));
+const productPreviewCsp = "default-src 'none'; script-src 'self'; style-src 'self'; img-src data: blob:; font-src 'self'; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'; worker-src 'none'";
+const productAssetPath = /^examples\/app\/(?:index\.html|stylex\.css|graphs\/client\/assets\/[A-Za-z0-9_-][A-Za-z0-9_.-]*\.(?:js|css))$/u;
 const sitePublicFonts = [
   ...["Light", "LightItalic", "Book", "BookItalic", "Medium", "MediumItalic", "Semibold", "SemiboldItalic", "Bold", "BoldItalic", "Black", "BlackItalic"]
     .map((cut) => `nebula-sans/NebulaSans-${cut}.woff2`),
   "geist-mono/GeistMono[wght].woff2",
 ];
 const sitePublicSupport = [
-  "analytics.js", "favicon.svg", "social-card.svg", "social-card.png", "robots.txt", "sitemap.xml", "llms.txt",
+  "analytics.js", "site.js", "favicon.svg", "social-card.svg", "social-card.png", "robots.txt", "sitemap.xml", "llms.txt",
   ".well-known/security.txt", ".well-known/hra.json",
   "fonts/nebula-sans/LICENSE.txt", "fonts/nebula-sans/PROVENANCE.md",
   "fonts/geist-mono/OFL.txt", "fonts/geist-mono/PROVENANCE.md",
+  ...siteMarkdownPaths,
 ];
 const diagnosticPath = (path: string) => JSON.stringify(path.slice(0, 160));
 
@@ -190,14 +206,26 @@ export function productionCsp(value: unknown, source: string): string {
   return csp;
 }
 
-export function siteProductionCsp(value: unknown): Readonly<{ siteCsp: string; previewCsp: string }> {
-  const siteCsp = productionCsp(value, "/((?!preview/?$).*)");
+export function siteProductionCsp(value: unknown): Readonly<{ siteCsp: string; previewCsp: string; productPreviewCsp: string }> {
+  const siteCsp = productionCsp(value, "/((?!preview/?$|examples/app(?:/|$)).*)");
   const previewCsp = productionCsp(value, "/preview/");
   for (const csp of [siteCsp, previewCsp]) {
     assert.deepEqual(csp.split(";").map((part) => part.trim()).filter((part) => part.startsWith("font-src")), ["font-src 'self'"]);
   }
   assert.deepEqual(previewCsp.split(";").map((part) => part.trim()).filter((part) => part.startsWith("script-src")), ["script-src 'none'"]);
-  return { siteCsp, previewCsp };
+  assert.deepEqual(siteCsp.split(";").map((part) => part.trim()).filter((part) => part.startsWith("frame-src")), ["frame-src 'self' https://challenges.cloudflare.com"]);
+  const productCsp = productionCsp(value, "/examples/app/:path*");
+  assert.equal(productCsp, `${productPreviewCsp}; frame-ancestors 'self'`, "Product example CSP drifted");
+  const rows = record(value).headers;
+  assert.ok(Array.isArray(rows));
+  const headers = record(rows.map(record).find((row) => row.source === "/examples/app/:path*")).headers;
+  assert.ok(Array.isArray(headers));
+  assert.deepEqual(headers.map(record).map(({ key, value }) => [key, value]).sort(), [
+    ["Content-Security-Policy", productCsp], ["Access-Control-Allow-Origin", "*"],
+    ["Permissions-Policy", "camera=(), geolocation=(), microphone=(), payment=(), usb=()"],
+    ["Referrer-Policy", "no-referrer"], ["X-Content-Type-Options", "nosniff"], ["X-Robots-Tag", "noindex, nofollow"],
+  ].sort(), "Product example headers must permit opaque module loads without credentials or embedding denial");
+  return { siteCsp, previewCsp, productPreviewCsp: productCsp };
 }
 
 /** URL normalization cannot turn a request into an arbitrary filesystem read. */
@@ -345,7 +373,7 @@ export async function inventory(directory: string, fontPaths: ReadonlySet<string
       if (entry.isDirectory()) await walk(child, key);
       else {
         assert.ok(/\.(?:css|html|js|json|svg|png|ico|woff2?|txt|xml)$/u.test(entry.name)
-          || fontProvenancePaths.has(key), `Unexpected public browser output type: ${diagnosticPath(key)}`);
+          || fontProvenancePaths.has(key) || siteMarkdownPaths.has(key), `Unexpected public browser output type: ${diagnosticPath(key)}`);
         const bytes = await ordinary(child);
         total += bytes.byteLength;
         assert.ok(total <= 256 * 1024 * 1024 && files.size < 4096);
@@ -439,7 +467,73 @@ export function siteFoundationFontPaths(path: string, bytes: Buffer): readonly s
   }).sort();
 }
 
-export function snapshotStaticSite(files: ReadonlyMap<string, Buffer>, publicFonts: ReadonlyMap<string, Buffer>) {
+/** This is a distinct compiler generation, never an exception to the parent
+ * site's exact font and stylesheet graph. Its sealed relative URLs stay inside
+ * the public mount; no compiler receipt, source, or additional asset may leak. */
+export function snapshotProductPreview(files: ReadonlyMap<string, Buffer>) {
+  const paths = [...files.keys()].sort();
+  assert.ok(paths.length >= 4 && paths.length <= 4096);
+  assert.ok(paths.every((path) => productAssetPath.test(path)), "Unapproved product example artifact");
+  assert.ok([...files.values()].every((bytes) => bytes.length > 0 && bytes.length <= 64 * 1024 * 1024));
+  assert.ok([...files.values()].reduce((total, bytes) => total + bytes.length, 0) <= 256 * 1024 * 1024);
+  const shell = files.get("examples/app/index.html");
+  assert.ok(shell !== undefined && shell.length > 0 && shell.length <= 64 * 1024);
+  const { document } = parseHTML(new TextDecoder("utf-8", { fatal: true }).decode(shell));
+  assert.equal(document.querySelectorAll("style,[style],base,iframe,form").length, 0);
+  const policies = [...document.querySelectorAll("meta[http-equiv]")];
+  assert.equal(policies.length, 1);
+  assert.equal(policies[0]?.getAttribute("http-equiv")?.toLowerCase(), "content-security-policy");
+  assert.equal(policies[0].getAttribute("content"), productPreviewCsp);
+  assert.equal(policies[0].parentElement, document.head);
+  const styles = [...document.querySelectorAll('link[rel="stylesheet"]')];
+  assert.equal(styles.length, 2);
+  assert.equal(document.querySelectorAll("link").length, 2);
+  for (const link of styles) {
+    assert.equal(link.parentElement, document.head);
+    assert.deepEqual([...link.attributes].map(({ name }) => name).sort(), ["href", "rel"]);
+  }
+  const foundation = styles[0]?.getAttribute("href");
+  assert.ok(typeof foundation === "string");
+  assert.match(foundation, /^\.\/graphs\/client\/assets\/[A-Za-z0-9_-][A-Za-z0-9_.-]*\.css$/u);
+  assert.equal(styles[1]?.getAttribute("href"), "./stylex.css");
+  const stylesheets = [`examples/app/${foundation.slice(2)}`, "examples/app/stylex.css"] as const;
+  assert.deepEqual(paths.filter((path) => path.endsWith(".css")), [...stylesheets].sort());
+  const scripts = [...document.querySelectorAll("script")];
+  assert.equal(scripts.length, 1);
+  assert.equal(scripts[0]?.getAttribute("type"), "module");
+  assert.equal(scripts[0].textContent.trim(), "");
+  assert.equal(scripts[0].parentElement, document.body);
+  assert.deepEqual([...scripts[0].attributes].map(({ name }) => name).sort(), ["src", "type"]);
+  const script = scripts[0].getAttribute("src");
+  assert.ok(typeof script === "string");
+  assert.match(script, /^\.\/graphs\/client\/assets\/[A-Za-z0-9_-][A-Za-z0-9_.-]*\.js$/u);
+  assert.ok(files.has(`examples/app/${script.slice(2)}`));
+  assert.equal(document.querySelectorAll("[srcset]").length, 0);
+  for (const element of document.querySelectorAll("*")) {
+    for (const attribute of element.attributes) assert.ok(!/^on/iu.test(attribute.name));
+    for (const attribute of ["href", "src"]) {
+      const resource = element.getAttribute(attribute);
+      if (resource === null) continue;
+      assert.ok(element.tagName === "LINK" || element.tagName === "SCRIPT");
+      assert.match(resource, /^\.\/(?:stylex\.css|graphs\/client\/assets\/[A-Za-z0-9_-][A-Za-z0-9_.-]*\.(?:js|css))$/u);
+      assert.ok(files.has(`examples/app/${resource.slice(2)}`), "Product shell names an unpublished resource");
+    }
+  }
+  for (const path of stylesheets) {
+    const bytes = files.get(path);
+    assert.ok(bytes !== undefined && bytes.length > 0);
+    const parsed = transform({ filename: path, code: bytes, analyzeDependencies: true, visitor: {
+      Rule: { import() { throw new Error("Product CSS contains an uncollected import"); } },
+    } });
+    assert.equal(parsed.warnings.length, 0);
+    assert.deepEqual(parsed.dependencies, [], "Product CSS gained a resource outside its closed compiler graph");
+  }
+  return { paths, stylesheets, scripts: paths.filter((path) => path.endsWith(".js")) };
+}
+
+export function snapshotStaticSite(allFiles: ReadonlyMap<string, Buffer>, publicFonts: ReadonlyMap<string, Buffer>) {
+  const product = snapshotProductPreview(new Map([...allFiles].filter(([path]) => path.startsWith("examples/app/"))));
+  const files = new Map([...allFiles].filter(([path]) => !path.startsWith("examples/app/")));
   assert.deepEqual([...files.keys()].filter((path) => path.endsWith(".html")).sort(), siteRoutes.map(({ path }) => path).sort());
   const stylesheets = siteStylesheetPaths(files);
   assert.deepEqual([...files.keys()].filter((path) => path.endsWith(".css")).sort(), [...stylesheets].sort());
@@ -464,11 +558,12 @@ export function snapshotStaticSite(files: ReadonlyMap<string, Buffer>, publicFon
   assert.equal(parsedUnion.warnings.length, 0, "Final union CSS inspection emitted warnings");
   assert.ok(parsedUnion.dependencies !== undefined);
   assert.equal(parsedUnion.dependencies.length, 0, "Final union contains an unexpected asset URL");
-  return { routes: siteRoutes, stylesheets, fonts };
+  return { routes: siteRoutes, stylesheets, fonts, product };
 }
 
 export function assetContentType(key: string): string {
   if (fontProvenancePaths.has(key)) return "text/plain; charset=utf-8";
+  if (siteMarkdownPaths.has(key)) return "text/markdown; charset=utf-8";
   const mime: Readonly<Record<string, string>> = {
     css: "text/css; charset=utf-8", html: "text/html; charset=utf-8", js: "text/javascript; charset=utf-8",
     json: "application/json", svg: "image/svg+xml", png: "image/png", ico: "image/x-icon",
@@ -477,11 +572,156 @@ export function assetContentType(key: string): string {
   return mime[key.split(".").at(-1) ?? ""] ?? "application/octet-stream";
 }
 
-async function serve(files: ReadonlyMap<string, Buffer>, csp: string, previewCsp?: string): Promise<Surface> {
+async function serve(files: ReadonlyMap<string, Buffer>, csp: string, previewCsp?: string, productPreviewCsp?: string): Promise<Surface> {
   const server = await serveBrowserAssets({
-    files, csp, ...(previewCsp === undefined ? {} : { previewCsp }), assetPath, contentType: assetContentType,
+    files, csp, ...(previewCsp === undefined ? {} : { previewCsp }),
+    ...(productPreviewCsp === undefined ? {} : { productPreviewCsp }), assetPath, contentType: assetContentType,
   });
   return { artifacts: artifacts(files), bytes: files, origin: server.origin, stop: server.stop };
+}
+
+/** A readiness message alone is not acceptance. Observe the genuine Direct
+ * bridge, fixed clock, native sandbox, and violation counters in the child. */
+export function assertProductPreviewObservation(value: unknown, view: ProductView): void {
+  const observation = record(value);
+  assert.equal(observation.origin, "null", "Product example lost its opaque origin");
+  assert.equal(observation.parentAccessible, false);
+  assert.equal(observation.ready, "true");
+  assert.equal(observation.failed, undefined);
+  assert.equal(observation.inert, true);
+  assert.equal(observation.now, Date.parse("2026-09-08T12:00:00.000Z"));
+  assert.deepEqual(observation.violations, []);
+  assert.equal(observation.inline, 0);
+  assert.equal(observation.bridgeSchema, "direct.browser-bridge/v2");
+  const manifest = record(observation.manifest), active = record(manifest.active), snapshot = record(observation.snapshot);
+  assert.equal(manifest.schema, "direct.session-manifest/v1");
+  assert.equal(active.source, "scenario");
+  assert.equal(active.scenario, `product.${view}`);
+  assert.equal(active.route, "/");
+  assert.ok(typeof active.activationHash === "string" && /^fnv1a-64:[a-f0-9]{16}$/u.test(active.activationHash));
+  assert.equal(snapshot.schema, "direct.probe/v1");
+  assert.equal(snapshot.activationHash, active.activationHash);
+  assert.equal(snapshot.isQuiescent, true);
+  assert.deepEqual(snapshot.activity, { active: 0, started: 0, settled: 0 });
+  assert.ok(Object.values(record(snapshot.pending)).every((count) => count === 0));
+  assert.deepEqual(snapshot.violations, { "example.blockedFetch": 0, "example.browserActivityError": 0, "example.refusedEffect": 0 });
+  assert.deepEqual(observation.stylesheets, [true, true]);
+}
+
+async function verifyProductScene(iframe: Locator, view: ProductView): Promise<unknown> {
+  assert.equal(await iframe.getAttribute("sandbox"), "allow-scripts");
+  assert.equal(await iframe.getAttribute("referrerpolicy"), "no-referrer");
+  assert.equal(await iframe.getAttribute("tabindex"), "-1");
+  assert.equal(await iframe.getAttribute("aria-hidden"), "true");
+  const handle = await iframe.elementHandle();
+  try {
+    const frame = await handle.contentFrame();
+    assert.ok(frame !== null);
+    await frame.waitForURL((url) => url.pathname === "/examples/app/index.html" && url.search === `?view=${view}`);
+    const ready = await frame.waitForFunction(() => {
+      if (document.documentElement.dataset.previewFailed !== undefined) throw new Error("Product example reported failure");
+      return document.documentElement.dataset.previewReady === "true";
+    }, undefined, { polling: "raf", timeout: 15_000 });
+    await ready.dispose();
+    const observation = await frame.evaluate((selected) => {
+      const state = window as typeof window & { __direct?: DirectBrowserBridge; __hraBrowserViolations?: string[] };
+      const bridge = state.__direct;
+      if (bridge === undefined) throw new Error("Missing genuine Direct browser bridge");
+      let parentAccessible = false;
+      try { void window.parent.document; parentAccessible = true; } catch { /* Opaque origin must refuse parent access. */ }
+      return { origin: globalThis.origin, parentAccessible, ready: document.documentElement.dataset.previewReady,
+        failed: document.documentElement.dataset.previewFailed, inert: document.querySelector(`[data-product-preview="${selected}"]`)?.hasAttribute("inert"),
+        now: Date.now(), violations: state.__hraBrowserViolations, inline: document.querySelectorAll("style,[style]").length,
+        bridgeSchema: bridge.schema, manifest: bridge.manifest, snapshot: bridge.snapshot(),
+        stylesheets: [...document.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"]')].map((link) => link.sheet !== null && !link.disabled),
+      };
+    }, view);
+    assertProductPreviewObservation(observation, view);
+    if (view === "overview") {
+      assert.equal(await frame.locator("[data-session-id]").count(), 3);
+      for (const title of ["Polish the checkout", "Choose the export format", "Review the migration"]) {
+        assert.equal(await frame.getByText(title, { exact: true }).count(), 1);
+      }
+    } else {
+      assert.equal(await frame.locator("h1").textContent(), view === "conversation" ? "Polish the checkout" : view === "question" ? "Choose the export format" : "Settings");
+      if (view === "conversation") assert.equal(await frame.getByText("The compact layout is in place. I’m checking the empty cart, delivery choices, and payment error state next.", { exact: true }).count(), 1);
+      if (view === "question") {
+        const question = frame.locator('[aria-label="Pending interaction"]');
+        assert.equal(await question.count(), 1);
+        assert.ok(await question.getByText("Which format should the export use?", { exact: true }).count() > 0);
+        for (const text of ["CSV", "JSON"]) assert.equal(await question.getByText(text, { exact: true }).count(), 1);
+      }
+      if (view === "settings") {
+        assert.ok(await frame.getByText("Studio Mac", { exact: true }).count() > 0);
+        assert.ok(await frame.getByText("Linux workstation", { exact: true }).count() > 0);
+        assert.ok(await frame.getByText("Sets your active hours. Notification delivery and after-hours automatic-response limits each require separate local opt-in; changing this schedule enables neither.", { exact: true }).count() > 0);
+      }
+    }
+    return observation;
+  } finally { await handle.dispose(); }
+}
+
+async function verifyProductPreviews(page: Page): Promise<unknown[]> {
+  const figure = page.locator("figure[data-product-preview]");
+  assert.equal(await figure.count(), 1);
+  assert.equal(await figure.locator("[data-preview-script-notice]").isHidden(), true);
+  const iframe = figure.locator("[data-preview-frame]");
+  await iframe.scrollIntoViewIfNeeded();
+  const observations: unknown[] = [];
+  for (const view of productViews) {
+    const button = figure.locator(`[data-preview-view="${view}"]`);
+    await button.click();
+    assert.equal(await button.getAttribute("aria-pressed"), "true");
+    assert.equal(await figure.locator('[data-preview-view][aria-pressed="true"]').count(), 1);
+    observations.push({ view, observation: await verifyProductScene(iframe, view) });
+    await page.waitForFunction(() => document.querySelector("figure[data-product-preview] [data-preview-status]")?.textContent === "");
+  }
+  const enlarge = figure.locator("[data-preview-enlarge]");
+  await enlarge.click();
+  const dialog = figure.locator("[data-preview-dialog]");
+  assert.equal(await dialog.evaluate((element) => element instanceof HTMLDialogElement && element.open && element.matches(":modal")), true);
+  observations.push({ view: "settings", enlarged: true, observation: await verifyProductScene(dialog.locator("iframe"), "settings") });
+  await page.waitForFunction(() => document.querySelector("[data-preview-dialog] [data-preview-expanded-status]")?.textContent === "");
+  assert.equal(await dialog.locator("[data-preview-close]").evaluate((element) => element === document.activeElement), true);
+  await page.keyboard.press("Escape");
+  await dialog.waitFor({ state: "hidden" });
+  assert.equal(await dialog.locator("iframe").count(), 0, "Closed example kept its child browsing context");
+  assert.equal(await enlarge.evaluate((element) => element === document.activeElement), true);
+  await cleanDocument(page);
+  return observations;
+}
+
+async function verifyDocsSearch(page: Page, origin: string): Promise<void> {
+  await page.goto(`${origin}/docs/`);
+  const search = page.locator("#docs-search"), results = page.locator("#docs-search-results");
+  await search.fill("usage");
+  await results.waitFor({ state: "visible" });
+  assert.equal(await results.locator('a[href="/docs/sessions/"]').count(), 1);
+  await search.fill("no-matching-guide-7f63");
+  assert.equal(await results.locator("a").count(), 0);
+  assert.equal(await results.textContent(), "No matching guide. Try “login”, “usage”, or “recovery”.");
+  await search.press("Escape");
+  assert.equal(await search.inputValue(), "");
+  assert.equal(await results.isHidden(), true);
+  await search.fill("usage");
+  await results.locator('a[href="/docs/sessions/"]').click();
+  await page.waitForURL(`${origin}/docs/sessions/`);
+  assert.equal(await page.locator("h1").textContent(), "Sessions and accounts");
+  await cleanDocument(page);
+}
+
+async function verifyLegacyDocsRedirects(page: Page, origin: string): Promise<unknown[]> {
+  const observations: unknown[] = [];
+  for (const [id, destination] of [["install-and-update", "/docs/status/"], ["first-account", "/docs/sessions/"]] as const) {
+    await page.goto(`${origin}/#${id}`);
+    await page.waitForURL(`${origin}${destination}#${id}`);
+    const section = page.locator(`details#${id}`);
+    assert.equal(await section.evaluate((element) => element instanceof HTMLDetailsElement && element.open), true);
+    await section.locator("summary").waitFor({ state: "visible" });
+    await cleanDocument(page);
+    observations.push({ from: `/#${id}`, to: `${destination}#${id}`, opened: true });
+  }
+  return observations;
 }
 
 async function settle(page: Page): Promise<void> {
@@ -643,9 +883,8 @@ async function verifyMobileSiteAnchors(page: Page, pathname: "/" | "/privacy/", 
         window.scrollTo({ left: 0, top: 0, behavior: "instant" });
       }, pathname);
       await settle(page);
-      const targetId = pathname === "/" ? "install-and-update" : "privacy";
-      if (pathname === "/") await page.locator('a[href="#install-and-update"]').first().click();
-      else await page.evaluate((id) => { location.hash = id; }, targetId);
+      const targetId = pathname === "/" ? "how-it-works" : "privacy";
+      await page.evaluate((id) => { location.hash = id; }, targetId);
       // Await the browser's native smooth-scroll destination, including the
       // existing authored scroll margin and end-of-document clamping.
       const scrollSettled = await page.waitForFunction((id) => {
@@ -966,7 +1205,7 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
   const siteGraph = snapshotStaticSite(siteFiles, publicFonts);
   const appCsp = productionCsp(JSON.parse((await ordinary(join(root, "app/vercel.json"))).toString("utf8")) as unknown, "/(.*)");
   const siteConfiguration: unknown = JSON.parse((await ordinary(join(root, "vercel.json"))).toString("utf8"));
-  const { siteCsp, previewCsp } = siteProductionCsp(siteConfiguration);
+  const { siteCsp, previewCsp, productPreviewCsp } = siteProductionCsp(siteConfiguration);
   const evidence: Evidence[] = [];
   const profileDiagnostics: BrowserProfileDiagnostics[] = [];
   let fixtureArtifacts: readonly Artifact[] = [];
@@ -988,7 +1227,7 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
     const app = await serve(appFiles, appCsp); servers.push(app);
     const fixture = await serve(fixtureFiles, appCsp); servers.push(fixture);
     observeBrowserCustody(observer, { kind: "partial-servers-owned", run, origins: servers.map(({ origin }) => origin) });
-    const site = await serve(siteFiles, siteCsp, previewCsp); servers.push(site);
+    const site = await serve(siteFiles, siteCsp, previewCsp, productPreviewCsp); servers.push(site);
     for (const profile of profiles) {
       assert.ok(!isCancelled(), "Browser acceptance cancelled");
       const profileStartedAt = performance.now();
@@ -1161,15 +1400,31 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
           evidence.push({ name: "asymmetric-safe-area:ltr+rtl", values: { top: 19, left: 31, bottom: 23, right: 47 } });
         }
         for (const route of siteGraph.routes) {
-          const routeLabel = route.pathname === "/" ? "home" : route.pathname === "/privacy/" ? "privacy" : "preview";
+          const routeLabel = route.label;
           const responses: BrowserResponse[] = [];
+          const productRequests: BrowserRequest[] = [];
+          const productResponses: { response: BrowserResponse; body: Promise<{ bytes: Buffer } | { error: unknown }> }[] = [];
           let responseOverflow = false;
           const capture = (response: BrowserResponse) => {
+            if (response.request().frame() !== page.mainFrame()) {
+              // Capture bytes while this child document still exists. Scene
+              // changes and closing the enlarged modal legitimately detach it.
+              if (productResponses.length < 256) productResponses.push({ response,
+                body: response.body().then((bytes) => ({ bytes }), (error: unknown) => ({ error })) });
+              else responseOverflow = true;
+              return;
+            }
             if (new URL(response.url()).origin !== site.origin || !["stylesheet", "font"].includes(response.request().resourceType())) return;
             if (responses.length < 64) responses.push(response);
             else responseOverflow = true;
           };
+          const captureProduct = (request: BrowserRequest) => {
+            if (request.frame() === page.mainFrame()) return;
+            if (productRequests.length < 256) productRequests.push(request);
+            else responseOverflow = true;
+          };
           page.on("response", capture);
+          page.on("request", captureProduct);
           try {
             mark(`static-site:${routeLabel}:navigation`);
             const response = await page.goto(`${site.origin}${route.pathname}`);
@@ -1196,7 +1451,7 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
             assert.ok(fonts.every(({ status }) => status === "loaded"), "A public font did not load natively under font-src self");
             mark(`static-site:${routeLabel}:settle-after-fonts`);
             await settle(page);
-            if (profile.name === "desktop" && route.pathname !== "/preview/") {
+            if (profile.name === "desktop" && (route.pathname === "/" || route.pathname === "/privacy/")) {
               mark(`static-site:${routeLabel}:mobile-anchors`);
               const anchors = await verifyMobileSiteAnchors(page, route.pathname, profile, restorationBoundary);
               evidence.push({ name: `desktop:static-site:${route.path}:mobile-anchors`, values: anchors });
@@ -1224,6 +1479,10 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
             mark(`static-site:${routeLabel}:negative-document-clean`);
             await cleanDocument(page);
             assert.equal(responses.length, countBeforeNegative, "Stylesheet application control reloaded a resource");
+            if (route.pathname === "/") {
+              mark("static-site:home:product-previews");
+              evidence.push({ name: `${profile.name}:product-previews`, values: await verifyProductPreviews(page) });
+            }
             assert.equal(responseOverflow, false, "Static resource census exceeded its bound");
             mark(`static-site:${routeLabel}:resource-bytes`);
             const delivered = await Promise.all(responses.map(async (resource) => {
@@ -1237,8 +1496,41 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
               return { path: key, bytes: bytes.length, sha256: digest(bytes) };
             }));
             assert.deepEqual(delivered.map(({ path }) => path).sort(), [...siteGraph.stylesheets, ...siteGraph.fonts].sort(), "Native CSS/font linkage was incomplete or redundant");
+            for (const request of productRequests) {
+              const url = new URL(request.url()), key = url.pathname.slice(1);
+              assert.equal(url.origin, site.origin, "A product frame requested an external resource");
+              assert.equal(request.method(), "GET");
+              assert.ok(siteGraph.product.paths.includes(key), "Product frame escaped its public compiler graph");
+              assert.equal(request.resourceType(), key.endsWith(".html") ? "document" : key.endsWith(".js") ? "script" : "stylesheet", "Product example attempted non-resource IO");
+              if (key.endsWith(".html")) assert.ok(productViews.some((view) => url.search === `?view=${view}`));
+              else assert.equal(url.search, "");
+            }
+            const productDelivered = await Promise.all(productResponses.map(async ({ response: resource, body }) => {
+              const key = new URL(resource.url()).pathname.slice(1);
+              assert.ok(siteGraph.product.paths.includes(key));
+              assert.equal(resource.status(), 200);
+              assert.equal(resource.headers()["content-security-policy"], productPreviewCsp);
+              assert.equal(resource.headers()["access-control-allow-origin"], "*");
+              assert.equal(resource.headers()["access-control-allow-credentials"], undefined);
+              assert.equal(resource.headers()["x-frame-options"], undefined);
+              assert.equal(resource.headers()["content-type"], assetContentType(key));
+              assert.equal(resource.headers()["x-content-type-options"], "nosniff");
+              const result = await body;
+              if ("error" in result) throw result.error instanceof Error ? result.error : new Error("Product resource body failed", { cause: result.error });
+              const bytes = result.bytes;
+              assert.deepEqual(bytes, siteFiles.get(key), "Product resource differs from its completed output");
+              return { path: key, sha256: digest(bytes) };
+            }));
+            evidence.push({ name: `${profile.name}:static-site:${route.path}:product-resources`, values: { requests: productRequests.length, delivered: productDelivered } });
             evidence.push({ name: `${profile.name}:static-site:${route.path}`, values: { documentSha256: digest(documentBytes), fonts, delivered: delivered.sort((a, b) => a.path.localeCompare(b.path)) } });
-          } finally { page.off("response", capture); }
+          } finally { page.off("response", capture); page.off("request", captureProduct); }
+        }
+        if (profile.name === "desktop") {
+          mark("static-site:docs:search");
+          await verifyDocsSearch(page, site.origin);
+          evidence.push({ name: "desktop:docs-search", values: "matched, empty, Escape, and navigation passed" });
+          mark("static-site:docs:legacy-redirects");
+          evidence.push({ name: "desktop:legacy-docs-redirects", values: await verifyLegacyDocsRedirects(page, site.origin) });
         }
         mark("isolation:assertions");
         assert.deepEqual(isolation.errors, [], "Browser runtime or resource failure");
@@ -1308,9 +1600,9 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
         executionAdmission: admission.evidence,
         packageSha256: digest(packageBytes), lockSha256: digest(lockBytes),
         app: artifacts(appFiles), site: artifacts(siteFiles), fixture: fixtureArtifacts,
-        appCspSha256: digest(appCsp), siteCspSha256: digest(siteCsp), previewCspSha256: digest(previewCsp),
+        appCspSha256: digest(appCsp), siteCspSha256: digest(siteCsp), previewCspSha256: digest(previewCsp), productPreviewCspSha256: digest(productPreviewCsp),
         sitePublicFonts: artifacts(publicFonts),
-        fixtureIoAliases: ["@convex-dev/auth/react", ...browserIoModules], evidence,
+        fixtureIoAliases: ["@convex-dev/auth/react", ...browserIoModules], productIoAliases: ["@convex-dev/auth/react", ...productIoModules], evidence,
         profileDiagnostics, ...(failure === undefined ? {} : { failure: browserFailureDetails(failure) }),
       };
       // The bootstrap joins this result with child collection and the terminal

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { readFile } from "node:fs/promises";
 import { parseHTML } from "linkedom";
 
 import {
@@ -23,11 +24,13 @@ import {
   renderSitemapXml,
   siteDocumentPaths,
 } from "./content.ts";
+import { docsPages, docsPathForSection, docsPaths, findDocsPage, renderDocsMarkdown, type DocsPath } from "./docs-content.ts";
 import {
   HRA_MAILING_TURNSTILE_SITEKEY_ENV,
   hraMailingListConfig,
   renderHraAnalyticsScript,
   renderHraSiteFooter,
+  renderDocsHtml,
   renderPreviewHtml,
   renderPrivacyHtml,
   renderSiteHtml,
@@ -73,9 +76,18 @@ function elementPosition(html: string, selector: string): number {
   return index;
 }
 
+const renderDocumentationHtml = (...paths: readonly DocsPath[]): string => paths.map((path) => {
+  const page = findDocsPage(path);
+  if (page === undefined) throw new Error(`Missing documentation page: ${path}`);
+  return renderDocsHtml(page);
+}).join("\n");
+
+const renderDocumentationMarkdown = (...paths: readonly DocsPath[]): string =>
+  paths.map(renderDocsMarkdown).join("\n");
+
 describe("public content contract", () => {
   test("keeps after-hours consent, legacy reset, and prose limits explicit", () => {
-    const readme = renderReadmeMarkdown();
+    const readme = renderDocumentationMarkdown("/docs/reference/");
     expect(readme).toContain("After-hours protocol budgets were admitted in v0.6.3.");
     expect(readme).toContain("The v0.7.0 release retains this policy without enabling it.");
     expect(readme).toContain("They use a separate local opt-in, disabled on new and upgraded installations.");
@@ -92,8 +104,8 @@ describe("public content contract", () => {
   });
 
   test("keeps durable automatic-approval limits and upgrade holds on both public surfaces", () => {
-    const readme = renderReadmeMarkdown();
-    const html = htmlVisibleText(renderSiteHtml(publicContent));
+    const readme = renderDocumentationMarkdown("/docs/reference/");
+    const html = htmlVisibleText(renderDocumentationHtml("/docs/reference/"));
     for (const surface of [readme, html]) {
       expect(surface).toContain("reserves its budget before provider dispatch");
       expect(surface).toContain("pauses automatic approvals for 24 hours");
@@ -118,31 +130,31 @@ describe("public content contract", () => {
     });
   });
 
-  test("opens the README with the H1, one badge line, the thesis on line 3, the status line, then install", () => {
+  test("opens the concise README with the product, its interfaces, and a guarded install path", () => {
     const markdown = renderReadmeMarkdown();
     const lines = markdown.split("\n");
-    const badgeLine = publicContent.badges
-      .map((badge) => `[![${badge.alt}](${badge.image})](${badge.href})`)
-      .join(" ");
-
-    expect(lines[0]).toBe(`# ${publicContent.productName}`);
+    const badgeLine = publicContent.badges.map((badge) =>
+      `[![${badge.alt}](${badge.image})](${badge.href})`,
+    ).join(" ");
+    expect(lines[0]).toBe("# HRA");
     expect(lines[1]).toBe(`${badgeLine}\\`);
     expect(lines[2]).toBe(publicContent.thesis);
-    expect(lines[3]).toBe("");
-    expect(lines[4]).toBe(publicContent.statusLine);
-    expect(lines[5]).toBe("");
-    expect(lines[6]).toBe("```sh");
-    expect(lines[7]).toBe(publicContent.installCommand);
-    expect(publicContent.thesis).toBe(
-      "HRA runs Codex and Claude Code sessions side by side, keeps them alive in a local daemon, and gives humans and AI agents the same commands to drive them.",
-    );
-    expect(publicContent.statusLine).toContain(`v${publicContent.releaseVersion}`);
-    expect(publicContent.statusLine).toContain("hosted sync is live as an open beta");
+    expect(publicContent.thesis).toContain("browser");
+    expect(publicContent.thesis).toContain("terminal");
+    expect(publicContent.thesis).toContain("execution on your own machines");
+    expect(markdown).toContain(`[Open HRA](${publicContent.links.app})`);
+    expect(markdown).toContain(`[Documentation](${publicContent.links.documentation})`);
+    expect(markdown).toContain(publicContent.hero.summary);
     expect(markdown.indexOf(publicContent.thesis)).toBeLessThan(markdown.indexOf(publicContent.installCommand));
-    expect(markdown.indexOf(publicContent.statusLine)).toBeLessThan(markdown.indexOf(publicContent.installCommand));
-    expect(markdown).toContain(`## ${publicContent.hero.heading}`);
-    expect(markdown.indexOf(publicContent.initCommand)).toBeLessThan(markdown.indexOf(`## ${publicContent.hero.heading}`));
-    expect(markdown).toContain(`1. **Start:** \`${publicContent.hero.steps[0]!.command}\`. ${publicContent.hero.steps[0]!.detail}`);
+    expect(markdown.indexOf(publicContent.installCommand)).toBeLessThan(markdown.indexOf(publicContent.doctorCommand));
+    expect(markdown).toContain(publicContent.daemonRolloutNotice);
+    expect(markdown).toContain("/docs/status/#install-and-update");
+    expect(markdown).not.toContain("## Command reference\n");
+    expect(markdown).not.toContain("### Update runbook\n");
+    expect(markdown).not.toContain("## First account\n");
+    expect(markdown).not.toContain("## Privacy\n");
+    expect(markdown).not.toContain(`\n${publicContent.initCommand}\n`);
+    expect(markdown).toContain("1. **Start:** `" + publicContent.hero.steps[0]!.command + "`.");
   });
 
   test("publishes trust-signal badges pinned to the package manifest", () => {
@@ -177,10 +189,11 @@ describe("public content contract", () => {
     expect(jsonLd).toBeDefined();
     const structured = JSON.parse(jsonLd ?? "{}") as Record<string, unknown>;
 
-    expect(publicContent.tagline).toBe("Control plane for Codex and Claude Code");
+    expect(publicContent.tagline).toBe("Workspace for Codex and Claude Code");
     expect(publicContent.providerRoadmap).toBe("Codex and Claude Code, side by side.");
     expect(packageJson.description).toBe(publicContent.description);
-    expect(publicContent.description).toStartWith(`${publicContent.tagline}.`);
+    expect(publicContent.description).toContain("workspace for Codex and Claude Code");
+    expect(publicContent.description).toContain("browser or terminal");
     expect(structured).toMatchObject({
       "@type": "SoftwareApplication",
       applicationSubCategory: publicContent.tagline,
@@ -189,9 +202,8 @@ describe("public content contract", () => {
       maintainer: { "@type": "Organization", name: "Hraness", url: "https://hraness.com/" },
     });
     expect(structured).not.toHaveProperty("softwareVersion");
-    expect(publicContent.description).toContain("v0.7.0 is the admitted artifact");
     expect(publicContent.description).not.toContain("release candidate");
-    expect(publicContent.description).toContain("daemon and hosted command-writer rollout remains blocked on capacity");
+    expect(html).toContain('href="/docs/status/"');
     expect(html).toContain(`<title>${publicContent.productName} | ${publicContent.tagline}</title>`);
     const eyebrow = oneElement(html, "p.hraness-marketing-hero__eyebrow");
     expect(eyebrow.textContent).toBe(publicContent.tagline);
@@ -200,7 +212,7 @@ describe("public content contract", () => {
     expect(previewEyebrow.textContent).toBe(publicContent.tagline);
     expectCompiledClasses(previewEyebrow);
     expect(publicContent.socialCard).toEqual({
-      alt: "HRA · v0.7.0 artifacts admitted · daemon rollout blocked on capacity · hra.sh",
+      alt: "HRA command-line card showing offline diagnostics and read-only status. Codex and Claude Code, in a web workspace and CLI.",
       height: 630,
       path: "/social-card.png",
       width: 1200,
@@ -223,8 +235,8 @@ describe("public content contract", () => {
   });
 
   test("publishes the stable memory, peer, and exact provider surfaces", () => {
-    const markdown = renderReadmeMarkdown();
-    const html = renderSiteHtml();
+    const markdown = renderDocumentationMarkdown("/docs/reference/", "/docs/sessions/");
+    const html = renderDocumentationHtml("/docs/reference/", "/docs/sessions/");
     const visibleHtml = htmlVisibleText(html);
     const claims = [
       "Stable working and shared project memory",
@@ -269,24 +281,16 @@ describe("public content contract", () => {
     }
   });
 
-  test("names the product and its maintainer once, beside what HRA does", () => {
-    const nameSentence = "HRA is short for harness: the control plane that keeps Codex and Claude Code sessions working together, and ";
-    const maintainerSentence = "The Hraness organization maintains HRA and publishes it under the MIT license.";
+  test("identifies the product maintainer without repeating a brand explanation", () => {
     const markdown = renderReadmeMarkdown();
-    const html = renderSiteHtml();
-
-    expect(markdown).toContain(`${nameSentence}[hraness.com](https://hraness.com/) explains the parent brand. ${maintainerSentence}`);
-    const maintainerParagraphs = [...parseHTML(html).document.querySelectorAll("p")]
-      .filter((paragraph) => paragraph.textContent.startsWith(nameSentence));
-    expect(maintainerParagraphs).toHaveLength(1);
-    const maintainerHtml = maintainerParagraphs[0];
-    expect(maintainerHtml?.textContent).toBe(`${nameSentence}hraness.com explains the parent brand. ${maintainerSentence}`);
-    expect(maintainerHtml?.querySelectorAll('a[href="https://hraness.com/"]')).toHaveLength(1);
-    expect(maintainerHtml?.querySelector('a[href="https://hraness.com/"]')?.textContent).toBe("hraness.com");
-    expect(markdown.match(/short for harness/gu)).toHaveLength(1);
-    const maintainerParagraph = markdown.split("\n").find((line) => line.includes("short for harness")) ?? "";
-    expect(maintainerParagraph).not.toMatch(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/u);
     expect(publicContent.maintainer).toEqual({ name: "Hraness", url: "https://hraness.com/" });
+    expect(markdown).toContain("HRA is maintained by [Hraness](https://hraness.com/) and published under the MIT license.");
+    expect(markdown.match(/HRA is maintained by/gu)).toHaveLength(1);
+    expect(markdown).not.toContain("short for harness");
+    const resources = oneElement(renderSiteHtml(), "aside.project-resources");
+    expect(resources.textContent).toContain("MIT licensed");
+    expect(resources.querySelector('a[href="https://hraness.com/"]')).toBeNull();
+    expect(resources.querySelector(`a[href="${publicContent.links.documentation}"]`)).not.toBeNull();
   });
 
   test("publishes no em dash on any generated public surface", () => {
@@ -298,61 +302,44 @@ describe("public content contract", () => {
       ["privacy page", renderPrivacyHtml()],
       ["preview", renderPreviewHtml()],
       ["package description", packageJson.description],
+      ...docsPages.map((page) => [page.path, renderDocsHtml(page)] as const),
+      ...docsPages.map((page) => [`${page.path}index.md`, renderDocsMarkdown(page.path)] as const),
     ] as const) {
       expect(surface, label).not.toContain("\u2014");
     }
   });
 
-  test("leads the site with the outcome and keeps the README install-first", () => {
-    const markdown = renderReadmeMarkdown();
+  test("leads with a real UI example and sends setup and detailed reference to their guides", () => {
     const html = renderSiteHtml();
-    const installIndex = elementPosition(html, "pre.install-command");
-    const doctorIndex = elementPosition(html, "pre.doctor-command");
-    const initIndex = elementPosition(html, "pre.init-command");
-
-    expect(markdown).toStartWith(`# ${publicContent.productName}\n`);
-    expect(markdown.indexOf("```sh")).toBeLessThan(markdown.indexOf(`## ${publicContent.hero.heading}`));
+    const document = parseHTML(html).document;
     expect(oneElement(html, "h1").textContent).toBe(publicContent.hero.heading);
-    expect(elementPosition(html, "h1")).toBeLessThan(
-      installIndex,
-    );
     expectCompiledClasses(oneElement(html, ".hraness-marketing-hero"));
-    expect(html).toContain('data-hraness-marketing="flow"');
-    expect(html).toContain('data-hraness-marketing="facts"');
-    expect(html).toContain('data-hraness-marketing="install"');
-    expect(elementPosition(html, ".hraness-marketing-flow__step:first-child .hraness-marketing-flow__code")).toBeLessThan(
-      installIndex,
-    );
-    expect(installIndex).toBeGreaterThan(0);
-    expect(installIndex).toBeLessThan(doctorIndex);
-    expect(doctorIndex).toBeLessThan(initIndex);
-    expect(markdown.indexOf(publicContent.installCommand)).toBeLessThan(
-      markdown.indexOf(publicContent.doctorCommand),
-    );
-    expect(markdown.indexOf(publicContent.doctorCommand)).toBeLessThan(
-      markdown.indexOf(publicContent.initCommand),
-    );
-    for (const surface of [markdown, html]) {
-      expect(surface).toContain(publicContent.hero.heading);
-      expect(surface).toContain(publicContent.hero.summary);
-      expect(surface).toContain(publicContent.hero.boundary);
-      expect(surface).toContain(publicContent.hero.proofLabel);
-      for (const step of publicContent.hero.steps) {
-        expect(surface).toContain(html === surface ? htmlText(step.command) : step.command);
-        expect(surface).toContain(step.detail);
-      }
-    }
+    expect(oneElement(html, ".hraness-marketing-hero__summary").textContent).toBe(publicContent.hero.summary);
+    const example = oneElement(html, "#product-preview");
+    expect(example.tagName).toBe("FIGURE");
+    expect(example.hasAttribute("data-product-preview")).toBe(true);
+    expect(example.querySelector('iframe[src="/examples/app/index.html?view=overview"]')).not.toBeNull();
+    expect(elementPosition(html, "#product-preview")).toBeLessThan(elementPosition(html, "#how-it-works"));
+    expect(document.querySelector(`a[href="${publicContent.links.app}"]`)).not.toBeNull();
+    expect(document.querySelector('a[href="/docs/start/"]')).not.toBeNull();
+    expect(document.querySelector('a[href="/docs/status/"]')).not.toBeNull();
+    expect(htmlVisibleText(html)).toContain("New machine setup is temporarily paused");
+    expect(html).not.toContain("preflight requires GitHub repository ID");
+    expect(html).not.toContain("ol.procedure-list");
+    expect(document.querySelector("pre.install-command")).toBeNull();
+    expect(document.querySelector("pre.init-command")).toBeNull();
+    const setup = oneElement(renderDocumentationHtml("/docs/start/"), "#install");
+    expect(setup.querySelector("pre")?.textContent).toBe(publicContent.installCommand);
+    const flows = [...document.querySelectorAll("code.hraness-marketing-flow__code")];
+    expect(flows.map((node) => node.textContent)).toEqual(publicContent.hero.steps.map((step) => step.command));
   });
 
-  test("highlights documentation commands without touching classified hero code", () => {
-    const html = renderSiteHtml();
-    const { document } = parseHTML(html);
-    const versionCodes = [...document.querySelectorAll("code.hra-inline-code")].filter((code) => code.textContent === "v0.7.0");
-    expect(versionCodes.length).toBeGreaterThan(0);
-    for (const code of versionCodes) expectCompiledClasses(code);
-    const commands = document.querySelectorAll("pre.command-list");
+  test("highlights reference commands while keeping the homepage example code classified", () => {
+    const html = renderDocumentationHtml("/docs/reference/");
+    const document = parseHTML(html).document;
+    const commands = [...document.querySelectorAll("pre.command-list")];
     expect(commands.length).toBeGreaterThan(0);
-    for (const command of [...commands, oneElement(html, "pre.install-command")]) {
+    for (const command of commands) {
       expect(command.getAttribute("tabindex")).toBe("0");
       expectCompiledClasses(command);
       const code = command.querySelectorAll(":scope > code.syntax-code.language-shell");
@@ -360,7 +347,8 @@ describe("public content contract", () => {
       expectCompiledClasses(code[0]!);
     }
     expect(document.querySelectorAll(".syntax-token.syntax-token--command").length).toBeGreaterThan(0);
-    const flowCodes = [...document.querySelectorAll("code.hraness-marketing-flow__code")];
+    const home = parseHTML(renderSiteHtml()).document;
+    const flowCodes = [...home.querySelectorAll("code.hraness-marketing-flow__code")];
     expect(flowCodes.map((code) => code.textContent)).toEqual(publicContent.hero.steps.map((step) => step.command));
     for (const code of flowCodes) {
       expectCompiledClasses(code);
@@ -369,64 +357,55 @@ describe("public content contract", () => {
     expect(document.querySelectorAll("code:not([class])")).toHaveLength(0);
   });
 
-  test("admits the exact local release without clearing blocked operational rollout", () => {
+  test("admits the exact artifact while directing operational readiness to the status guide", () => {
     expect(publicReleaseState).toBe("live");
     expect(publicContent.endpoints).toEqual({
-      betaTag: "live",
-      githubRepository: "live",
-      hostedSync: "live",
-      website: "live",
+      betaTag: "live", githubRepository: "live", hostedSync: "live", website: "live",
     });
-    expect(renderReadmeMarkdown()).toContain("Local CLI v0.7.0 is the fully admitted public artifact");
-    for (const surface of [renderReadmeMarkdown(), renderSiteHtml()]) {
-      expect(surface).toContain("Local v0.7.0 artifacts admitted; hosted sync live as an open beta");
-      expect(surface).not.toContain("The last admitted release is v0.6.1.");
-      expect(surface).toContain("https://github.com/hraness/hra/releases/tag/v0.7.0");
-      expect(surface).toContain("https://github.com/hraness/hra/actions/runs/34278486095");
-      expect(surface).toContain("passed immutable GitHub and npm release admission");
+    const markdown = renderDocsMarkdown("/docs/status/");
+    const html = htmlVisibleText(renderDocumentationHtml("/docs/status/"));
+    for (const surface of [markdown, html]) {
+      expect(surface).toContain("v0.7.0");
+      expect(surface).toContain("passed immutable GitHub and npm artifact admission");
       expect(surface).toContain("daemon and hosted command-writer rollout remains blocked on capacity");
+      expect(surface).toContain("Artifact availability and the live sync service do not clear this gate");
       expect(surface).not.toContain("v0.7.0 candidate");
       expect(surface).not.toContain("v0.7.0 is a release candidate");
-      expect(surface).not.toContain("This release candidate is not yet admitted");
-      expect(surface).not.toContain("beta-not-yet-live");
-      expect(surface).toContain("Local release boundary");
-      expect(surface).toContain("admitted local CLI release");
       expect(surface).not.toContain("Beta not yet live");
-      expect(surface).not.toContain("No published `v0.7.0` tag currently exposes these commands");
     }
+    for (const surface of [renderReadmeMarkdown(), renderLlmsText()]) {
+      expect(surface).toContain("admitted v0.7.0");
+      expect(surface).toContain(publicContent.daemonRolloutNotice);
+      expect(surface).toContain("/docs/status/");
+    }
+    expect(renderDocsMarkdown("/docs/reference/")).toContain("admitted local CLI release");
     expect(renderLlmsText()).toContain("Install the admitted v0.7.0 local CLI artifact");
     expect(renderLlmsText()).not.toContain("Only after immutable GitHub and npm release admission");
-    expect(renderLlmsText()).toContain(publicContent.daemonRolloutNotice);
-    const html = renderSiteHtml();
-    expect(oneElement(html, "#install-command-heading").textContent).toBe("Install the admitted release.");
-    expect(elementPosition(html, "#install-command-heading")).toBeLessThan(elementPosition(html, "pre.install-command"));
-    expect(html).toContain("Initialization remains blocked by the rollout prerequisite");
-    expect(elementPosition(html, ".install-note"))
-      .toBeLessThan(elementPosition(html, "pre.install-command"));
+    const notices = [...parseHTML(renderSiteHtml()).document.querySelectorAll("p")]
+      .filter((paragraph) => paragraph.textContent.startsWith("New machine setup is temporarily paused"));
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.querySelector("a")?.getAttribute("href")).toBe("/docs/status/");
   });
 
-  test("places the blocked rollout prerequisite before every prominent initialization and first-session flow", () => {
-    const markdown = renderReadmeMarkdown();
-    const html = htmlVisibleText(renderSiteHtml());
-    const llms = renderLlmsText();
+  test("keeps startup prerequisites adjacent to setup without turning the homepage into a runbook", () => {
     const prerequisite = publicContent.daemonRolloutNotice;
     expect(prerequisite).toContain("Do not initialize, start, or autostart");
-    expect(prerequisite).toContain("protected two-pass zero-debt capacity evidence");
     expect(prerequisite).toContain("protected two-pass zero-debt capacity evidence and its exact .activated readback receipt");
     expect(prerequisite).toContain("target marker-2 proofs before globally enabling hosted writers");
-    for (const surface of [markdown, html, llms]) {
-      expect(surface).toContain(prerequisite);
-      expect(surface.indexOf(prerequisite)).toBeLessThan(surface.indexOf(publicContent.initCommand));
-      expect(surface.indexOf(publicContent.doctorCommand)).toBeLessThan(surface.indexOf(publicContent.initCommand));
-    }
-    expect(html.indexOf(prerequisite)).toBeLessThan(html.indexOf("hra session start personal --provider codex"));
-    expect(markdown.indexOf(prerequisite)).toBeLessThan(markdown.indexOf(publicContent.hero.steps[0]!.command));
-    const installPanel = htmlVisibleText(renderSiteHtml().split('id="install-command"')[1]!.split("</section>")[0]!);
-    expect(installPanel).toContain("Installing and checking the binary does not start the daemon");
-    expect(installPanel.indexOf(prerequisite)).toBeLessThan(installPanel.indexOf(publicContent.initCommand));
-    expect(installPanel).toContain("After the rollout prerequisite is satisfied");
-    expect(html).not.toContain("Then check the host and initialize");
-    expect(html).not.toContain("Install the CLI, add one account, and start a session");
+    const setupHtml = renderDocumentationHtml("/docs/start/");
+    const setup = htmlVisibleText(setupHtml);
+    expect(setup.indexOf("Initialization, daemon startup, and hosted command writers remain blocked on capacity"))
+      .toBeLessThan(setup.indexOf(publicContent.initCommand));
+    expect(setup.indexOf(publicContent.doctorCommand)).toBeLessThan(setup.indexOf(publicContent.initCommand));
+    expect(oneElement(setupHtml, "#connect-an-account aside.notice").textContent).toContain("before the steps below");
+    const readme = renderReadmeMarkdown();
+    expect(readme.indexOf(prerequisite)).toBeLessThan(readme.indexOf(publicContent.hero.steps[0]!.command));
+    const llms = renderLlmsText();
+    expect(llms.indexOf(prerequisite)).toBeLessThan(llms.indexOf(publicContent.initCommand));
+    const home = htmlVisibleText(renderSiteHtml());
+    expect(home.indexOf("New machine setup is temporarily paused")).toBeLessThan(home.indexOf(publicContent.hero.steps[0]!.command));
+    expect(home).toContain("Complete setup first");
+    expect(home).not.toContain(publicContent.initCommand);
   });
 
   test.each([
@@ -442,8 +421,11 @@ describe("public content contract", () => {
       label: "Conditional walkthrough",
       content: [{ kind: "text", value: publicContent.daemonRolloutNotice }],
     });
-    const markdownSection = renderReadmeMarkdown().split(`## ${heading}\n\n`)[1]!.split("\n## ")[0]!;
-    const htmlSection = htmlVisibleText(renderSiteHtml().split(`id="${id}"`)[1]!.split("</section>")[0]!);
+    const path = docsPathForSection(id).split("#")[0]!;
+    const page = findDocsPage(path);
+    expect(page).toBeDefined();
+    const markdownSection = renderDocsMarkdown(path).split(`## ${heading}\n\n`)[1]!.split("\n## ")[0]!;
+    const htmlSection = oneElement(renderDocsHtml(page!), `details#${id}`).textContent;
     for (const surface of [markdownSection, htmlSection]) {
       expect(surface).toContain(publicContent.daemonRolloutNotice);
       expect(surface).toContain(command);
@@ -460,7 +442,7 @@ describe("public content contract", () => {
     ]) {
       expect(surface).not.toContain("invite-only beta");
     }
-    expect(renderReadmeMarkdown()).toContain(
+    expect(renderPrivacyMarkdown()).toContain(
       "Anyone can create an identity with an email address and a one-time code",
     );
     expect(renderPrivacyMarkdown()).toContain(
@@ -478,8 +460,8 @@ describe("public content contract", () => {
   });
 
   test("publishes protected cloud auth and the exact device-pairing path", () => {
-    const markdown = renderReadmeMarkdown();
-    const html = renderSiteHtml();
+    const markdown = renderDocumentationMarkdown("/docs/web/");
+    const html = renderDocumentationHtml("/docs/web/");
     const visibleHtml = htmlVisibleText(html);
     const documents = [
       '{"email":"you@example.com"}',
@@ -557,8 +539,8 @@ describe("public content contract", () => {
   });
 
   test("publishes exact lost-login recovery without retaining provider credentials", () => {
-    const markdown = renderReadmeMarkdown();
-    const html = htmlVisibleText(renderSiteHtml());
+    const markdown = renderDocumentationMarkdown("/docs/sessions/");
+    const html = htmlVisibleText(renderDocumentationHtml("/docs/sessions/"));
     for (const surface of [markdown, html]) {
       expect(surface).toContain("the daemon restarts before completion");
       expect(surface).toContain("hra account show personal");
@@ -581,8 +563,8 @@ describe("public content contract", () => {
   });
 
   test("removes active Devin claims and documents preserved historical data", () => {
-    const markdown = renderReadmeMarkdown();
-    const html = htmlVisibleText(renderSiteHtml());
+    const markdown = renderDocumentationMarkdown("/docs/sessions/");
+    const html = htmlVisibleText(renderDocumentationHtml("/docs/sessions/"));
     for (const surface of [markdown, html]) {
       expect(surface).toContain("Devin support has been removed");
       expect(surface).toContain("Existing Devin history is read-only");
@@ -604,8 +586,8 @@ describe("public content contract", () => {
       "Other standard MCP forms are brokered only when their pinned schema fits HRA's closed primitive-field contract.",
       "Opaque openai/form, unsupported schema constructs, and URL elicitation fail before durable admission",
     ];
-    const markdown = renderReadmeMarkdown();
-    const html = htmlVisibleText(renderSiteHtml());
+    const markdown = renderDocumentationMarkdown("/docs/reference/");
+    const html = htmlVisibleText(renderDocumentationHtml("/docs/reference/"));
     for (const claim of claims) {
       expect(markdown).toContain(claim);
       expect(html).toContain(claim);
@@ -624,8 +606,8 @@ describe("public content contract", () => {
       "refuses every acceptance",
       "does not provide the exact affected paths or change detail needed for informed approval",
     ];
-    const markdown = renderReadmeMarkdown();
-    const html = htmlVisibleText(renderSiteHtml());
+    const markdown = renderDocumentationMarkdown("/docs/reference/");
+    const html = htmlVisibleText(renderDocumentationHtml("/docs/reference/"));
     for (const claim of claims) {
       expect(markdown).toContain(claim);
       expect(html).toContain(claim);
@@ -644,8 +626,8 @@ describe("public content contract", () => {
       "A mid-item join omits ambiguous delta suffixes until the next item starts.",
       "discard undecided tails with an explicit notice",
     ];
-    const markdown = renderReadmeMarkdown();
-    const html = renderSiteHtml();
+    const markdown = renderDocumentationMarkdown("/docs/reference/");
+    const html = renderDocumentationHtml("/docs/reference/");
     for (const claim of claims) {
       expect(markdown).toContain(claim);
       expect(html).toContain(claim.replaceAll("'", "&#39;"));
@@ -653,8 +635,8 @@ describe("public content contract", () => {
   });
 
   test("publishes the protected standard MCP form contract", () => {
-    const markdown = renderReadmeMarkdown();
-    const html = renderSiteHtml();
+    const markdown = renderDocumentationMarkdown("/docs/reference/");
+    const html = renderDocumentationHtml("/docs/reference/");
     for (const claim of [
       "interaction show returns the exact public field contract without defaults or answers",
       '{"content":{...}}',
@@ -674,8 +656,8 @@ describe("public content contract", () => {
   });
 
   test("states the origin-machine execution boundary and exact remote command set", () => {
-    const markdown = renderReadmeMarkdown();
-    const html = htmlVisibleText(renderSiteHtml());
+    const markdown = renderDocumentationMarkdown("/docs/web/");
+    const html = htmlVisibleText(renderDocumentationHtml("/docs/web/"));
     const claims = [
       "The machine that created a provider session remains its only executor in v1.",
       "send, queue, steer, stop, preset, provider-switch, and Codex Fast commands",
@@ -705,33 +687,48 @@ describe("public content contract", () => {
   });
 
   test("publishes append-only projection recovery on every relevant public surface", () => {
-    const markdown = renderReadmeMarkdown();
-    const html = htmlVisibleText(renderSiteHtml());
+    const markdown = renderDocsMarkdown("/docs/web/");
+    const html = htmlVisibleText(renderDocumentationHtml("/docs/web/"));
     const privacy = renderPrivacyMarkdown();
     const command = "hra sync projection recover <local-session> --acknowledge-gap [--idempotency-key <uuidv7>] [--json]";
 
     expect(markdown).toContain(command);
     expect(html).toContain(command);
-    for (const surface of [markdown, html, privacy]) {
-      expect(surface).toContain("Compact-projection recovery is append-only.");
-      expect(surface).toContain("preserves every older encrypted cloud chunk");
+    for (const surface of [markdown, html]) {
+      expect(surface).toContain("Projection recovery is an explicit append-only operation.");
+      expect(surface).toContain("preserves all older encrypted cloud history");
       expect(surface).toContain("recovery gap");
     }
+    expect(privacy).toContain("Compact-projection recovery is append-only.");
+    expect(privacy).toContain("preserves every older encrypted cloud chunk");
+    expect(privacy).toContain("recovery gap");
     expect(publicContent.endpoints.hostedSync).toBe("live");
   });
 
-  test("renders every shared section on both primary surfaces", () => {
-    const markdown = renderReadmeMarkdown();
-    const html = renderSiteHtml();
-
+  test("retains every legacy anchor as a link to its complete canonical reference", () => {
+    const home = renderSiteHtml();
     for (const section of publicContent.sections) {
-      expect(markdown).toContain(`## ${section.heading}`);
-      expect(html).toContain(`id="${section.id}"`);
-      expect(html).toContain(`>${section.heading}</h2>`);
+      const path = docsPathForSection(section.id);
+      const moved = oneElement(home, `a[data-moved-section="${section.id}"]`);
+      expect(moved.getAttribute("href")).toBe(path);
+      expect(moved.textContent).toContain(section.heading);
+      if (section.id === "privacy") {
+        expect(renderPrivacyMarkdown()).toContain("# Privacy");
+        expect(renderPrivacyHtml()).toContain('id="privacy"');
+      } else {
+        const owner = findDocsPage(path.split("#")[0]!);
+        expect(owner).toBeDefined();
+        expect(renderDocsMarkdown(owner!.path)).toContain(`## ${section.heading}\n`);
+        const detail = oneElement(renderDocsHtml(owner!), `details#${section.id}`);
+        expect(detail.querySelector(":scope > summary")?.textContent).toBe(section.heading);
+        expect(detail.textContent.length).toBeGreaterThan(section.heading.length);
+      }
     }
+    expect(parseHTML(home).document.querySelectorAll("section.documentation-section")).toHaveLength(0);
+    expect(renderReadmeMarkdown()).not.toContain("## Command reference\n");
   });
 
-  test("keeps the full privacy boundary on the readme, site, and policy page", () => {
+  test("keeps the full privacy boundary on its canonical HTML and Markdown surfaces", () => {
     const sentinelClaims = [
       "Codex account labels and observed provider email and plan metadata when cloud sync is enabled.",
       "Claude Code account identity and usage are not projected.",
@@ -764,9 +761,7 @@ describe("public content contract", () => {
       "GitHub hosts the source repository, releases, and release downloads",
     ];
     const surfaces = [
-      renderReadmeMarkdown(),
       renderPrivacyMarkdown(),
-      renderSiteHtml(),
       renderPrivacyHtml(),
     ];
 
@@ -775,11 +770,13 @@ describe("public content contract", () => {
         expect(surface).toContain(claim.replaceAll("'", "&#39;"));
       }
     }
+    expect(renderReadmeMarkdown()).toContain(publicContent.links.privacy);
+    expect(renderSiteHtml()).toContain('href="/privacy/"');
   });
 
   test("publishes exact beta prerequisites and package lifecycle limits", () => {
-    const markdown = renderReadmeMarkdown();
-    const html = htmlVisibleText(renderSiteHtml());
+    const markdown = renderDocumentationMarkdown("/docs/status/");
+    const html = htmlVisibleText(renderDocumentationHtml("/docs/status/"));
     const surfaces = [markdown, html];
     expect(publicContent.installCommand).toContain(HRA_INSTALL_PREFLIGHT_SOURCE_URL);
     expect(publicContent.installCommand).toContain("unset BUN_OPTIONS NODE_OPTIONS");
@@ -836,8 +833,8 @@ describe("public content contract", () => {
   });
 
   test("publishes the ordered update runbook with recovery and mixed-version boundaries", () => {
-    const markdown = renderReadmeMarkdown();
-    const rawHtml = renderSiteHtml();
+    const markdown = renderDocumentationMarkdown("/docs/status/");
+    const rawHtml = renderDocumentationHtml("/docs/status/");
     const html = htmlVisibleText(rawHtml);
     const install = publicContent.sections.find((section) => section.id === "install-and-update");
     const procedure = install?.blocks.find(
@@ -970,8 +967,8 @@ describe("public content contract", () => {
   });
 
   test("preserves versioned Work and historical alias-replay guidance on both shared surfaces", () => {
-    const markdown = renderReadmeMarkdown();
-    const html = htmlVisibleText(renderSiteHtml());
+    const markdown = renderDocumentationMarkdown("/docs/reference/", "/docs/status/");
+    const html = htmlVisibleText(renderDocumentationHtml("/docs/reference/", "/docs/status/"));
     const claims: readonly (readonly [visible: string, markdown?: string])[] = [
       ["The versioned source contract defines a narrow local coordination kernel"],
       ["one strict version 1 or version 2 request"],
@@ -1006,8 +1003,8 @@ describe("public content contract", () => {
   });
 
   test("publishes first-session walkthroughs for humans and agents", () => {
-    const markdown = renderReadmeMarkdown();
-    const rawHtml = renderSiteHtml();
+    const markdown = renderDocumentationMarkdown("/docs/sessions/", "/docs/reference/");
+    const rawHtml = renderDocumentationHtml("/docs/sessions/", "/docs/reference/");
     const html = htmlVisibleText(rawHtml);
     const claims = [
       "Human terminal",
@@ -1054,11 +1051,10 @@ describe("public content contract", () => {
     }
     expect(publicContent.hero.steps[0]).toMatchObject({
       command: "hra session start personal --provider codex --json",
-      detail: "Create a Sol Ultra Codex session under the account profile you name.",
     });
     expect(publicContent.hero.steps[2]).toMatchObject({
       command: "hra session switch <session-id> --provider claude --preset fable-max",
-      detail: "Move the next turns to your signed-in Claude Code profile. The bounded retained HRA conversation record remains available, with any retention gap stated explicitly.",
+      detail: "Continue on your signed-in Claude Code profile. HRA carries over the conversation it has retained and flags any missing history.",
     });
     expect(markdown).toContain("New HRA-created Codex sessions that use `high` or `ultra`");
     expect(html).toContain("New HRA-created Codex sessions that use high or ultra");
@@ -1070,8 +1066,8 @@ describe("public content contract", () => {
   });
 
   test("publishes bounded status and cursor-safe observation contracts", () => {
-    const markdown = renderReadmeMarkdown();
-    const html = htmlVisibleText(renderSiteHtml());
+    const markdown = renderDocumentationMarkdown("/docs/reference/");
+    const html = htmlVisibleText(renderDocumentationHtml("/docs/reference/"));
     const claims = [
       "Bounded local status",
       "hra status [--json]",
@@ -1118,8 +1114,8 @@ describe("public content contract", () => {
   });
 
   test("publishes autorespond and provider-profile privacy boundaries", () => {
-    const markdown = renderReadmeMarkdown();
-    const html = htmlVisibleText(renderSiteHtml());
+    const markdown = renderDocumentationMarkdown("/docs/reference/", "/docs/sessions/");
+    const html = htmlVisibleText(renderDocumentationHtml("/docs/reference/", "/docs/sessions/"));
     const claims = [
       "Only an actual human-authored message resets the consecutive counter",
       "peer messages, Work and scheduled automation, autorespond, and provider-switch handoff messages do not",
@@ -1160,8 +1156,8 @@ describe("public content contract", () => {
   });
 
   test("documents safe optional full local-data removal without a recursive command", () => {
-    const markdown = renderReadmeMarkdown();
-    const html = htmlVisibleText(renderSiteHtml());
+    const markdown = renderDocumentationMarkdown("/docs/status/");
+    const html = htmlVisibleText(renderDocumentationHtml("/docs/status/"));
     const claims = [
       "Optional full local-data removal",
       "hra auth delete --acknowledge-erasure",
@@ -1188,8 +1184,8 @@ describe("public content contract", () => {
   });
 
   test("publishes the exact exit-code and JSONL terminal-error contract", () => {
-    const markdown = renderReadmeMarkdown();
-    const html = renderSiteHtml();
+    const markdown = renderDocumentationMarkdown("/docs/reference/");
+    const html = renderDocumentationHtml("/docs/reference/");
     const statuses = [
       ["0", "success. A normally stopped event follower, including a user SIGINT, may also return 0."],
       ["1", "CONFLICT, AMBIGUOUS, INTERNAL, any other closed failure code, or an unhealthy doctor result."],
@@ -1223,7 +1219,7 @@ describe("public content contract", () => {
   });
 
   test("publishes the local interaction deadline boundary", () => {
-    const surfaces = [renderReadmeMarkdown(), htmlVisibleText(renderSiteHtml())];
+    const surfaces = [renderDocumentationMarkdown("/docs/reference/"), htmlVisibleText(renderDocumentationHtml("/docs/reference/"))];
     for (const surface of surfaces) {
       expect(surface).toContain("anchored when the provider delivered it");
       expect(surface).toContain("caps the pending interval at 30 minutes");
@@ -1239,12 +1235,19 @@ describe("public content contract", () => {
     expect(html).toContain('<meta property="og:type" content="website">');
     expect(html).toContain('<link rel="stylesheet" href="/styles.css">');
     expect(html).toContain('<script type="application/ld+json">');
-    expect(html.match(/<script\b/gu)).toHaveLength(2);
-    expect(html.match(/<script[^>]+src=/gu)).toHaveLength(1);
+    expect(html.match(/<script\b/gu)).toHaveLength(3);
+    expect(html.match(/<script[^>]+src=/gu)).toHaveLength(2);
+    expect(html).toContain('<script src="/site.js" type="module"></script>');
     expect(html).toContain(renderHraAnalyticsScript());
     expect(privacy).toContain(renderHraAnalyticsScript());
     expect(renderPreviewHtml()).not.toContain(renderHraAnalyticsScript());
     expect(html).not.toContain("onclick=");
+    for (const page of docsPages) {
+      const document = parseHTML(renderDocsHtml(page)).document;
+      expect(document.querySelector('link[rel="canonical"]')?.getAttribute("href")).toBe(`https://hra.sh${page.path}`);
+      expect([...document.querySelectorAll("script[src]")].map((script) => script.getAttribute("src"))).toEqual(["/analytics.js", "/site.js"]);
+      expect(document.querySelectorAll('script[type="application/ld+json"]')).toHaveLength(1);
+    }
   });
 
   test("renders the canonical Hraness network footer on every HTML page", () => {
@@ -1256,6 +1259,7 @@ describe("public content contract", () => {
     for (const document of [
       renderSiteHtml(),
       renderPrivacyHtml(),
+      ...docsPages.map((page) => renderDocsHtml(page)),
     ]) {
       expect(document.match(/<footer\b/gu)).toHaveLength(1);
       const footer = /<footer\b[\s\S]*?<\/footer>/u.exec(document)?.[0];
@@ -1347,15 +1351,21 @@ describe("public content contract", () => {
   });
 
   test("provides keyboard and landmark structure without inline presentation", () => {
-    const html = renderSiteHtml();
-    expect(html.match(/<h1\b/g)).toHaveLength(1);
-    const skipLink = oneElement(html, 'a.skip-link[href="#content"]');
-    expect(skipLink.textContent).toBe("Skip to content");
-    expectCompiledClasses(skipLink);
-    expect(html).toContain('<main id="content">');
-    expect(html).toContain('aria-label="Documentation"');
-    expect(html).not.toContain("<style>");
-    expect(html).not.toContain(" style=");
+    for (const html of [renderSiteHtml(), ...docsPages.map((page) => renderDocsHtml(page))]) {
+      expect(html.match(/<h1\b/g)).toHaveLength(1);
+      const skipLink = oneElement(html, 'a.skip-link[href="#content"]');
+      expect(skipLink.textContent).toBe("Skip to content");
+      expectCompiledClasses(skipLink);
+      expect(oneElement(html, "main#content")).toBeDefined();
+      expect(html).not.toContain("<style>");
+      expect(html).not.toContain(" style=");
+    }
+    for (const page of docsPages) {
+      const html = renderDocsHtml(page);
+      expect(oneElement(html, 'nav[aria-label="Guides"]')).toBeDefined();
+      expect(oneElement(html, 'nav[aria-label="On this page"]')).toBeDefined();
+      expect(oneElement(html, 'nav[aria-label="Guides"] a[aria-current="page"]').getAttribute("href")).toBe(page.path);
+    }
   });
 
   test("keeps retired adjacent-reading routes out of product discovery", () => {
@@ -1372,11 +1382,24 @@ describe("public content contract", () => {
       renderSitemapXml(),
     ];
 
-    expect(siteDocumentPaths).toEqual(["/", "/privacy/"]);
+    expect(siteDocumentPaths).toEqual(["/", ...docsPaths, "/privacy/"]);
     for (const route of retiredRoutes) {
       for (const document of publicDocuments) {
         expect(document).not.toContain(route);
       }
     }
+  });
+
+  test("keeps linked roadmap and backup guidance consistent with artifact and stop authority", async () => {
+    const roadmap = await readFile(new URL("../docs/roadmap.md", import.meta.url), "utf8");
+    expect(roadmap).not.toContain("current unreleased source");
+    expect(roadmap.match(/Included in the admitted v0\.7\.0 artifact; runtime rollout remains gated\./gu)).toHaveLength(2);
+    const memory = await readFile(new URL("../docs/facts-memory.md", import.meta.url), "utf8");
+    const backup = memory.split("### Backup, restore, and rollback\n")[1]?.split("\n## ")[0];
+    expect(backup).toBeDefined();
+    expect(backup).toContain("Run `hra daemon stop --json` and require that command itself to exit zero before taking or restoring a snapshot");
+    expect(backup).toContain("`hra daemon status --json` reporting `data.running: false` is only a secondary no-listener check");
+    expect(backup).toContain("Stop on any stop or recovery error");
+    expect(backup).toContain("complete private state root at one filesystem checkpoint");
   });
 });

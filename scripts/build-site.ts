@@ -1,9 +1,11 @@
+import assert from "node:assert/strict";
 import { constants, type Stats } from "node:fs";
-import { copyFile, lstat, mkdir, open, readFile, realpath, rm, writeFile } from "node:fs/promises";
-import { dirname, join, relative, resolve } from "node:path";
+import { copyFile, cp, lstat, mkdir, mkdtemp, open, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { z } from "zod";
+import { DIRECT_WIRE_MARKERS } from "@hraness/direct/tooling/bundle-boundary";
 
 import {
   publicContent,
@@ -12,6 +14,7 @@ import {
   renderReadmeMarkdown,
   renderSitemapXml,
 } from "../site/content.ts";
+import { docsPaths, renderDocsMarkdown } from "../site/docs-content.ts";
 import {
   renderSocialCardPng,
   renderSocialCardSvg,
@@ -20,6 +23,7 @@ import {
 } from "../site/social-card.ts";
 import { readPngDimensions } from "../site/social-card-raster.ts";
 import { buildSiteStylex } from "./build-site-stylex.ts";
+import { buildProductPreview } from "./build-product-preview.ts";
 import { HRA_RELEASE_VERSION } from "./release-evidence";
 
 interface BuildOptions {
@@ -98,6 +102,10 @@ const siteTextOutputs = (
   repositoryRoot: string,
   releaseCommit: string,
 ): readonly TextOutput[] => [
+  ...docsPaths.map((path) => ({
+    path: join(repositoryRoot, "dist/site", path.slice(1), "index.md"),
+    content: renderDocsMarkdown(path),
+  })),
   {
     path: join(repositoryRoot, "dist/site/robots.txt"),
     content: `User-agent: *\nAllow: /\nSitemap: ${publicContent.siteUrl}/sitemap.xml\n`,
@@ -140,6 +148,15 @@ const staticAssets = ["favicon.svg"] as const;
 const analyticsEntryPath = fileURLToPath(
   new URL("../site/analytics-entry.ts", import.meta.url),
 );
+const siteEntryPath = fileURLToPath(new URL("../site/site-entry.ts", import.meta.url));
+
+/** Direct is permitted only in the separately compiled public example frame. */
+export function assertSiteBrowserBundle(source: string): void {
+  assert.ok(source.length > 0 && Buffer.byteLength(source) <= 4 * 1024 * 1024, "Site browser bundle exceeded its bound");
+  for (const marker of [...DIRECT_WIRE_MARKERS, "@hraness/direct", "__direct_scenario", "__direct_fixture"]) {
+    assert.ok(!source.includes(marker), "Direct runtime or fixture activation escaped into a parent site bundle");
+  }
+}
 const designKitFontsStylesPath = fileURLToPath(
   import.meta.resolve("@hraness/design-kit/fonts.css"),
 );
@@ -319,6 +336,25 @@ async function buildAnalyticsBundle(
   }
 }
 
+async function buildSiteBrowserBundle(repositoryRoot: string): Promise<void> {
+  const result = await Bun.build({
+    define: { "process.env.NODE_ENV": JSON.stringify("production") },
+    entrypoints: [siteEntryPath], format: "esm", minify: true,
+    naming: "site.js", sourcemap: "none", target: "browser",
+  });
+  if (!result.success) {
+    const details = result.logs.map((log) => log.message).join("\n");
+    throw new Error(`HRA site browser bundle failed.${details.length > 0 ? `\n${details}` : ""}`);
+  }
+  assert.equal(result.outputs.length, 1, "The parent site must have one self-contained browser entry");
+  const output = result.outputs[0];
+  assert.ok(output !== undefined && output.kind === "entry-point");
+  assert.equal(basename(output.path), "site.js");
+  const source = await output.text();
+  assertSiteBrowserBundle(source);
+  await writeFile(join(repositoryRoot, "dist/site/site.js"), source, { flag: "wx", mode: 0o644 });
+}
+
 export const buildSite = async (options: BuildOptions): Promise<readonly string[]> => {
   const mismatches: string[] = [];
 
@@ -344,10 +380,16 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
   const environment = options.environment ?? emptyBuildEnvironment;
   const analyticsProjectToken = resolveHraAnalyticsProjectToken(environment);
   const fonts = await snapshotSiteFonts(dirname(designKitFontsStylesPath));
+  const sourceRoot = await realpath(options.sourceRoot ?? options.repositoryRoot);
   const compiled = await buildSiteStylex({
-    sourceRoot: options.sourceRoot ?? options.repositoryRoot,
+    sourceRoot,
     environment, fonts: fonts.inputs,
   });
+  // Retain failed/completed private receipts under the same ignored build root
+  // as the static compiler. Only the builder's verified public projection moves.
+  const previewRun = await mkdtemp(join(sourceRoot, "tmp/site-product-preview-"));
+  const previewDirectory = await buildProductPreview({ repositoryRoot: sourceRoot, outputDirectory: previewRun });
+  assert.equal(previewDirectory, join(previewRun, "public"));
   await rm(join(options.repositoryRoot, "dist", "site"), {
     force: true,
     recursive: true,
@@ -384,6 +426,11 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
   }
   await writeFile(join(options.repositoryRoot, "dist/site", publicContent.socialCard.path), socialCardPng);
   await buildAnalyticsBundle(options.repositoryRoot, analyticsProjectToken);
+  assertSiteBrowserBundle(await readFile(join(options.repositoryRoot, "dist/site/analytics.js"), "utf8"));
+  await buildSiteBrowserBundle(options.repositoryRoot);
+  await cp(previewDirectory, join(options.repositoryRoot, "dist/site/examples/app"), {
+    recursive: true, errorOnExist: true, force: false,
+  });
 
   for (const asset of staticAssets) {
     const source = join(options.repositoryRoot, "site", asset);

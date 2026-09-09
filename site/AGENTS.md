@@ -1,8 +1,11 @@
 # Contents
 
 - `content.ts` is the shared public content contract for README and website generation.
-- `template.ts` renders the homepage and privacy page.
-- `marketing.tsx` composes public design-kit server components; `render.ts` is the captured build-time entry for all three HTML routes.
+- `docs-content.ts` owns the task-oriented guide registry, canonical Markdown exports, detailed reference ownership, and individual editorial admission records.
+- `template.ts` renders the homepage, privacy page, and six documentation routes.
+- `marketing.tsx` composes public design-kit server components; `render.ts` is the captured build-time entry for all nine HTML routes.
+- `product-preview.tsx` renders inert real-UI frames and their accessible parent controls. `product-scenes.ts` is their closed public scene catalog; Direct itself stays in the separately built fixture app.
+- `site-entry.ts` progressively enhances scene selection, enlargement, local guide search, and moved reference fragments without authentication or persistence.
 - `presentation.stylex.ts` and `marketing.stylex.ts` own local component recipes. `foundation.ts` is the build-only CSS entry; `foundation.css` joins approved document foundations and public fonts, without importing legacy component styles. The empty entry chunk stays private.
 - `analytics-site.ts` defines the exact production host, route taxonomy, and event vocabulary.
 - `analytics-entry.ts` is the self-hosted browser entry that initializes bounded PostHog capture.
@@ -10,10 +13,10 @@
 
 # Guidelines
 
-- Lead with the real install command and the shortest successful first-run path.
+- Lead the homepage with the product and actual interface. Lead the installation guide with the real install command and the shortest safe first-run path. Keep startup restrictions adjacent to affected commands.
 - Keep the site free of server runtime dependencies, responsive, keyboard-readable, and useful when its nonessential analytics JavaScript does not run.
-- Compile local recipes through the public UI build API. Publish only the completed HTML, stylesheet union, captured foundation, approved WOFF2 files and their attribution. Keep renderer JavaScript and build receipts private. Use `bun run test:site` for the scoped test transform.
-- Render the canonical `@hraness/site-footer` markup and styles on every navigable HTML page. Keep the inert iframe preview free of links and other actions, and keep HRA project resources outside the footer.
+- Compile local recipes through the public UI build API. Publish completed HTML, stylesheet unions, captured foundations, approved WOFF2 files and attribution, the bounded parent enhancement bundle, and the closed product-preview projection. Keep renderer JavaScript and build receipts private. Use `bun run test:site` for the scoped test transform.
+- Render the canonical `@hraness/site-footer` markup and styles on every navigable HTML page. Keep `/preview/` free of links and other actions. The separately sandboxed real-UI examples refuse all IO and remain inert. Keep HRA project resources outside the footer.
 - State beta, platform, provider, privacy, and account-switch compatibility limits beside the relevant feature.
 - Keep analytics anonymous, cookieless, memory-only, production-host-gated, and limited to the exact site-owned route vocabulary. Do not add remote scripts, persistent browser analytics state, remote fonts, or a build-time network dependency.
 - Keep `hra.sh` focused on the HRA product. Do not publish adjacent tool summaries, comparison-shaped pages, or generic search-targeted essays unless a named reader job and a non-obvious HRA-specific answer justify a durable indexable route.

@@ -1,0 +1,65 @@
+# HRA product website and documentation
+
+Status: implemented; final integration and delivery pending. Owner: Hraness. Source checked: 2026-09-08. Reassess: 2026-10-20.
+
+## Scope and decision
+
+Present HRA as the web workspace and local CLI it now is. Replace the homepage's complete reference dump with a bounded product explanation and real UI examples. Split public documentation by reader task, retain canonical detailed contracts, and make the README an entry point rather than a second manual.
+
+The user explicitly requested Sponge as a reference and actual Direct-powered UI mockups. Reference: Sponge main `9c1ea788fa6dea9b312799dc4b6194b9606e1d72`. The useful pattern is a static, separately built fixture app using production components, not the authenticated app or an invented dashboard. HRA retains its own Bun, Vite, StyleX, CSP, and deployment architecture.
+
+No provider, account authority, routing, operational activation, or release-version changes are in scope. The admitted v0.7.0 artifact and the current daemon/hosted-writer capacity gate remain separate facts. This work does not grant rollout permission or re-publish that immutable artifact. Shared semantic-theme work remains independently owned.
+
+## Content admission
+
+The six authored per-page admission records live in `site/docs-content.ts`. Each names its reader job, original HRA-specific contribution, overlap decision, checked source, owner, reassessment date, and six scores. These are agent-authored records, not a human editorial approval. Independent agent source/claim-risk review accepted all six after correcting the Claude first-run command and putting the current setup notice before the web guide's local-effect commands.
+
+Homepage decision: revise. Reader job: understand what HRA does and choose a next step. Original contribution: actual HRA screens connect local execution, session supervision, account separation, and browser use. Canonical host: hra.sh owns the product. Nearest URLs: `/docs/` routes readers, `/docs/start/` gives a procedure, `/docs/web/` explains browser tasks. The homepage introduces the product without duplicating those jobs. Scores: utility 2, evidence 2, confidence 2, host fit 2, voice 2, maintenance 1. Human voice is limited to the existing supplied maker biography; no new experience or endorsement is invented.
+
+Privacy decision: keep its canonical `/privacy/` route and full policy; correct heading hierarchy and shared navigation only. README decision: revise to shared product claims, exact installation, adjacent startup restriction, and canonical guide links. Legacy homepage fragments redirect to their owning detailed sections with a native link fallback. Detailed reference remains available without JavaScript and in canonical Markdown exports.
+
+## Implementation boundaries
+
+- Main owner: public content, homepage, docs shell, parent preview controls, README, integration and browser verification.
+- Docs worker: authored guide registry, admission records, focused contracts, identified runbook drift.
+- Preview worker: `app/fixtures/product/`, fixed fictional observations, actual app reducers/components, IO-only aliases, and bounded import-policy exceptions.
+- Preview builder: private compiler completion and closed public projection at `/examples/app/`.
+- Build worker: exact static routes, Markdown publication, analytics taxonomy, strict compilation contracts, and production headers.
+
+Direct is a pinned development dependency and is absent from production application and CLI entry graphs. Public previews are inert, use fictional accounts, refuse all commands and persistence, and have no provider credentials or live connection. A script-only iframe sandbox creates an opaque origin. Parent messages must match the exact frame window, expected view, and opaque origin. Offline CSP, a closed selector, Direct's IO firewall, stable rendering probes, and compiled-output checks are separate safeguards. Preview evidence proves rendering, never real sign-in or provider qualification.
+
+## Acceptance
+
+1. First-time readers can identify the web workspace, local execution, provider support, and next step without reading the reference.
+2. Six docs routes have distinct jobs, exact commands, canonical Markdown, bounded local search, active navigation, valid headings and links, and current availability wording.
+3. Four actual app screens render on light/dark marketing pages and in narrow/wide layouts, with clear fictional disclosure, zero forbidden IO, visible failure handling, and keyboard-operable scene and enlargement controls. The app itself currently has a dark-only theme; previews preserve that real appearance rather than inventing a fixture-only theme.
+4. Existing installation, recovery, privacy, provider, and authority assertions move to the appropriate guide. None is removed merely because the homepage becomes shorter.
+5. Strict StyleX completion, approved fonts, no inline presentation, immutable artifacts, and private renderer/proof separation remain intact.
+6. Focused tests, independent source/editorial review, repository final gate, browser acceptance, and deployment verification pass on their applicable exact trees.
+
+## Evidence
+
+Research and source audit used HRA `3da9744acad51faf898f4d35c78bbe5f5be5dd2e` and the Sponge revision above. Main still named that exact commit at the latest integration check. Parallel semantic-theme PR #158 remains independently owned; no theme source or dependency pin was copied into this change.
+
+Independent review covered public claims and source behavior separately. The docs reviewer accepted the six distinct reader jobs, first-party authority, individual admission records, and bounded maintenance dates. The implementation reviewer accepted the isolated build projection, exact CSP/CORS separation, docs routing, and browser-driver integration. A second source pass accepted the independent enlarged-frame loading lifecycle. The integration owner separately reviewed the worker-owned fixtures, parsed observations, real reducers, IO-only aliases, and private-to-public compiler projection. These are agent reviews, not human approval or live-provider evidence.
+
+Focused evidence before the final gate:
+
+- Full site-build regression suite: 20 tests, 986 assertions, passing.
+- Compiler-route and analytics suite: 15 tests, 224 assertions, passing.
+- Focused CSP and parent-bundle checks: 2 tests, 37 assertions, passing.
+- Docs, parent preview, loading controller, and marketing tests: 22 tests, 802 assertions, passing before the subsequent modal-isolation case and final copy cleanup. The final aggregate must include those additions.
+- Compiled-CSS regressions first reproduced missing border declarations, then passed with explicit physical longhands: 2 tests, 118 assertions. Focused ESLint passed for the style repairs and integration changes.
+- Final public-content contract rerun after copy and anchor repairs: 48 tests, 1,736 assertions, passing. An independent agent accepted the simpler rollout wording and the Settings active-hours correction against their unchanged source contracts.
+- Real site builds passed. The first failed build exposed a forbidden `noscript` element; the fallback now uses ordinary static text hidden only after enhancement initializes. Compiler policy was not weakened.
+- The first typecheck exposed one remaining property-test union mismatch. Its boolean equality repair preserves the assertion; final typecheck acceptance remains pending.
+
+Interactive browser review used the built site with production-equivalent CSP/CORS, at desktop and a 390-by-844 mobile viewport. The actual grid, conversation, and closed-choice question rendered. Guide search, Escape clearing, native modal focus, Escape closure, and focus restoration worked. Mobile docs had no horizontal overflow. The deterministic 1200-by-630 social image was visually inspected. These observations are not final browser acceptance.
+
+That browser pass found and prompted three repairs: bind the browser timer cancellation correctly, preserve separate enlarged-frame readiness and timeout, and replace silently omitted border shorthands with tested compiler-supported longhands. The product anchor also gains sticky-header clearance, and the JavaScript fallback notice disappears when controls become available. A queued, never-admitted browser run was canceled by its owner so the repaired tree could converge; no admitted work or gate was bypassed.
+
+The task changes the public site, docs discovery, static build and test graphs, and development-only preview dependency. The sole production-app edit is factual active-hours help text. Provider execution, account credentials, Effect services, routing, authority policies, runtime dependencies, immutable release version, and deployment identities are unchanged.
+
+Independent script-disabled current and exact-base package archives preserve all 167 files, nine directories, paths, types, and modes. Only README and package-manifest bytes differ. Their sizes change from 107,822 to 7,491 and 6,845 to 6,882 respectively. The updated canonical metadata inventory is 176 rows, 8,316 JSON bytes, SHA-256 `6844d3a7138212b787f7c0c72549c1f8c4d5534ad5e13af605e58c23590b98e1`. Substituting the two base sizes independently reproduces the preceding reviewed digest. All other archive file hashes match the base. The strict inventory check accepts the new archive and rejects the old sizes; no release artifact was published or replaced.
+
+Remaining gates: exact-tree aggregate, pinned native/browser acceptance, final visual readback of the repaired build, task-owned commit and PR, required CI and merge, then guarded website deployment and independent production verification. No final gate, merge, release, deployment, or production acceptance is claimed yet.

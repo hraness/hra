@@ -358,7 +358,7 @@ export function NotificationHoursForm({ machine }: Readonly<{ machine: MachineVi
         <Input aria-label="Notification hours time zone" disabled={!enabled || commandBusy} onChange={(event) => edit(setTimeZone, event.target.value)} value={timeZone} xstyle={styles.timeZoneInput} />
         <Button disabled={!enabled || commandBusy} size="small" type="submit" variant="secondary">Save</Button>
       </div>
-      <p {...stylex.props(styles.quiet)}>Stored for future notification timing only. Notification delivery is not active, and approvals and autonomy do not read this schedule.</p>
+      <p {...stylex.props(styles.quiet)}>Sets your active hours. Notification delivery and after-hours automatic-response limits each require separate local opt-in; changing this schedule enables neither.</p>
       {machine.deviceStatus === "active"
         ? null
         : <p {...stylex.props(styles.attention)}>This device is not active, so its schedule is read-only.</p>}

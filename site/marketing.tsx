@@ -1,22 +1,19 @@
 import {
   MarketingCallToAction,
   MarketingFlow,
-  MarketingInstallPanel,
   MarketingMaker,
   MarketingPage,
   MarketingPillars,
-  MarketingProofFrame,
   MarketingQuestionList,
   MarketingSection,
-  MarketingSectionLabel,
   MarketingSiteHeader,
   MarketingTrustBoundary,
   ProductHero,
-  SyntaxCode,
 } from "@hraness/design-kit/react/server";
 import type { ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { findSection, type ContentBlock, type InlineContent, type PublicContent } from "./content.ts";
+import { type InlineContent, type PublicContent } from "./content.ts";
+import { ProductPreview } from "./product-preview.tsx";
 import { heroExampleMeasureClassName, mobileHeaderFlowClassName } from "./marketing.stylex.ts";
 import { sitePresentationClasses, type SitePresentationSlot } from "./presentation.stylex.ts";
 
@@ -37,73 +34,25 @@ function inlineContent(content: readonly InlineContent[], styleLinks: boolean): 
   });
 }
 
-function ShellCode({ command }: Readonly<{ command: string }>) {
-  return <SyntaxCode className={sitePresentationClasses("codeContent")} code={command} language="shell" />;
-}
-
-function HeroFrame({ content }: Readonly<{ content: PublicContent }>) {
-  const firstSession = findSection(content, "first-session");
-  const humanTerminal = firstSession.blocks.find(
-    (block): block is Extract<ContentBlock, { kind: "commands" }> => block.kind === "commands",
-  );
-  if (humanTerminal === undefined) {
-    throw new Error("Public content must publish the human-terminal first-session commands.");
-  }
-  return (
-    <MarketingProofFrame
-      caption="After the rollout prerequisite is satisfied, start a session, open the shell, select the account and session, then type a request. These conditional first-session commands are documented in the reference below."
-      credit={`v${content.releaseVersion}`}
-      title="hra · persistent shell"
-    >
-      <pre className={classes("shell-transcript", "codeBlock", "shellTranscript", "focusable")} tabIndex={0}>
-        <ShellCode command={humanTerminal.commands.join("\n")} />
-      </pre>
-    </MarketingProofFrame>
-  );
-}
-
-function RolloutNotice({ content, placement }: Readonly<{ content: PublicContent; placement: "hero" | "install" }>) {
-  return (
-    <aside className={classes("notice", "notice")}>
-      <strong className={sitePresentationClasses("noticeStrong")}>
-        {placement === "hero" ? "Current daemon rollout blocked" : "Before initialization"}
-      </strong>
-      <p>{content.daemonRolloutNotice}</p>
-      {placement === "hero"
-        ? <p><a href="#install-and-update">Read the rollout and update runbook</a> before running the examples below.</p>
-        : <p><a href="#install-and-update">Read the rollout and update runbook.</a></p>}
-    </aside>
-  );
-}
-
-export function renderMarketingHeader(content: PublicContent, currentPath: "/" | "/privacy/"): string {
+export function renderMarketingHeader(content: PublicContent, currentPath: string): string {
   return renderToStaticMarkup(
     <MarketingSiteHeader
       className={mobileHeaderFlowClassName()}
-      action={{ emphasis: "primary", href: "/#install-command", label: `Install ${content.productName}` }}
+      action={{ emphasis: "primary", href: content.links.app, label: "Open HRA" }}
       brand={content.productName}
       brandHref="/"
       links={[
-        { href: "/#how-it-works", label: "How it works", current: currentPath === "/" },
-        { href: "/#install-command", label: "Install" },
-        { href: "/#reference", label: "Reference" },
-        { href: "/privacy/", label: "Privacy", current: currentPath === "/privacy/" },
+        { href: "/#product-preview", label: "Product", current: currentPath === "/" },
+        { href: "/docs/", label: "Docs", current: currentPath.startsWith("/docs/") },
+        { href: "/docs/status/", label: "Status" },
         { href: content.links.github, label: "GitHub" },
       ]}
     />,
   );
 }
 
-export function renderReferenceLabel(): string {
-  return renderToStaticMarkup(
-    <MarketingSectionLabel className={sitePresentationClasses("proseMeasure")} size="body">Reference</MarketingSectionLabel>,
-  );
-}
-
-/** Requires the public 0.5.2 marketing slots. The caller supplies only its own
- * already-escaped Reference contents, without an outer #reference wrapper.
- * That existing wrapper is the sole local raw-markup insertion boundary. */
-export function renderMarketingPage(content: PublicContent, referenceMarkup: string): string {
+/** The homepage explains the product; procedural and operator detail lives in docs. */
+export function renderMarketingPage(content: PublicContent): string {
   return renderToStaticMarkup(
     <MarketingPage className={sitePresentationClasses("marketingPage")}>
       <ProductHero
@@ -116,13 +65,11 @@ export function renderMarketingPage(content: PublicContent, referenceMarkup: str
         className={heroExampleMeasureClassName()}
         example={content.hero.example}
         eyebrow={content.hero.eyebrow}
-        facts={content.hero.facts}
-        factsColumns={4}
-        frame={<HeroFrame content={content} />}
+        frame={<ProductPreview />}
         heading={content.hero.heading}
         headingId="hra-title"
         name={content.productName}
-        notice={<RolloutNotice content={content} placement="hero" />}
+        notice={<p className={sitePresentationClasses("installNote")}>New machine setup is temporarily paused. <a href="/docs/status/">Check current availability →</a></p>}
         summary={content.hero.summary}
         tone="paper"
       />
@@ -133,42 +80,24 @@ export function renderMarketingPage(content: PublicContent, referenceMarkup: str
         id="how-it-works"
         label="How it works"
         layout="split"
-        summary="After the rollout prerequisite is satisfied, every step is one command with a JSON form, so a person in the shell and an agent in a subprocess drive the same session the same way."
+        summary="Use the web workspace when you want to see the work. Use the CLI when you want to script it. Both address the same sessions."
       >
+        <p>These commands run on an initialized, authorized machine. <a href="/docs/start/">Complete setup first.</a></p>
         <MarketingFlow
           ariaLabel={`First ${content.productName} request`}
           steps={content.hero.steps.map((step) => ({ code: step.command, detail: step.detail, label: step.label }))}
         />
       </MarketingSection>
-      <MarketingInstallPanel
-        eyebrow={`Local release · v${content.releaseVersion}`}
-        heading="Install the admitted release."
-        headingId="install-command-heading"
-        id="install-command"
-        note={<p className={classes("install-note", "installNote")}>This CLI artifact passed immutable GitHub and npm release admission. The command downloads the immutable release, verifies its digest, and installs it. Installing and checking the binary does not start the daemon. Initialization remains blocked by the rollout prerequisite.</p>}
-      >
-        <pre className={classes("install-command", "codeBlock", "installCommand", "focusable")} tabIndex={0}>
-          <ShellCode command={content.installCommand} />
-        </pre>
-        <pre className={classes("doctor-command", "codeBlock", "focusable")} tabIndex={0}>
-          <ShellCode command={content.doctorCommand} />
-        </pre>
-        <RolloutNotice content={content} placement="install" />
-        <p>After the rollout prerequisite is satisfied, initialize:</p>
-        <pre className={classes("init-command", "codeBlock", "focusable")} tabIndex={0}>
-          <ShellCode command={content.initCommand} />
-        </pre>
-      </MarketingInstallPanel>
       <MarketingTrustBoundary
-        heading="Keep control of the accounts you already have."
+        heading="Your workspace. Your machines."
         headingId="local-by-design-heading"
         id="local-by-design"
         items={content.trust}
         label="Local by design"
-        summary={`${content.productName} is infrastructure around the provider tools you chose, not a proxy in front of them.`}
+        summary="The browser gives you a view of the work. Execution stays with the provider tools on the machine you chose."
       />
       <MarketingQuestionList
-        heading="Before you install."
+        heading="A few things to know."
         headingId="questions-heading"
         id="questions"
         label="Questions"
@@ -186,17 +115,16 @@ export function renderMarketingPage(content: PublicContent, referenceMarkup: str
       </MarketingMaker>
       <MarketingCallToAction
         actions={[
-          { emphasis: "primary", href: "#install-command", label: `Install ${content.productName}` },
-          { emphasis: "secondary", href: content.links.github, label: "Read the source" },
+          { emphasis: "primary", href: "/docs/start/", label: "Set up your first machine" },
+          { emphasis: "secondary", href: content.links.app, label: "Open HRA" },
         ]}
         footnote={content.hero.boundary}
-        heading="Give every session the same terminal."
+        heading="Keep the work in view."
         headingId="closing-heading"
         id="closing"
-        summary="Install and verify the admitted CLI artifact. After the rollout prerequisite is satisfied, initialize it, add one account, and start a session that outlives the tab it began in."
+        summary="Start with one machine and one provider account. The setup guide explains what is available now and walks you through each step."
         tone="paper"
       />
-      <div className={classes("reference", "reference")} id="reference" dangerouslySetInnerHTML={{ __html: referenceMarkup }} />
     </MarketingPage>,
   );
 }

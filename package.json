@@ -1,7 +1,7 @@
 {
   "name": "@hraness/hra",
   "version": "0.7.0",
-  "description": "Control plane for Codex and Claude Code. Local CLI v0.7.0 is the admitted artifact; daemon and hosted command-writer rollout remains blocked on capacity.",
+  "description": "A workspace for Codex and Claude Code. See your sessions, follow conversations, and direct the next turn from your browser or terminal.",
   "license": "MIT",
   "publishConfig": {
     "access": "public",
@@ -108,6 +108,7 @@
     "@convex-dev/auth": "0.0.95",
     "@eslint/js": "9.34.0",
     "@hraness/design-kit": "github:hraness/design-kit#v0.5.2",
+    "@hraness/direct": "github:hraness/direct#v0.7.0",
     "@hraness/posthog": "github:hraness/posthog#v0.1.2",
     "@hraness/site-footer": "github:hraness/site-footer#v0.6.1",
     "@hraness/ui": "github:hraness/ui#v0.5.6",

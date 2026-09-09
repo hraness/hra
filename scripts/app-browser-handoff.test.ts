@@ -2,9 +2,9 @@ import { expect, test } from "bun:test";
 import * as fc from "fast-check";
 import { link, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
-  assertBrowserNode, browserDigest, browserFile, browserInventory, browserLogicalPath,
+  assertBrowserNode, browserDigest, browserFile, browserInventory, browserLogicalPath, browserSources,
   parseBrowserPrepared, parseBrowserRequest, publishBrowserJson, publishBrowserTerminalJson,
   readBrowserFile, verifyBrowserInventory,
   type BrowserPrepared, type BrowserRequest,
@@ -20,6 +20,21 @@ const logicalPath = fc.array(segment, { minLength: 1, maxLength: 5 }).map((parts
 const artifactRows = fc.uniqueArray(fc.record({ path: logicalPath, bytes: fc.integer({ min: 0, max: 4096 }) }), { selector: (value) => value.path, minLength: 1, maxLength: 12 })
   .map((values) => values.map(({ path, bytes }) => ({ ...row, path, bytes, identity: [1, 2, 33152, 1, bytes, 10, 10] }))
     .sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+
+test("browser source capture binds every product fixture input without weakening existing app inputs", async () => {
+  const root = await realpath(resolve(import.meta.dirname, ".."));
+  const captured = await browserSources(root);
+  const product = captured.filter(({ path }) => path.startsWith("app/fixtures/product/"));
+  const expected = (await browserInventory(join(root, "app/fixtures/product")))
+    .map((row) => ({ ...row, path: `app/fixtures/product/${row.path}` }));
+  expect(product).toEqual(expected);
+  for (const path of [
+    "app/fixtures/product/config.ts", "app/fixtures/product/main.tsx", "app/fixtures/product/io.ts",
+    "app/fixtures/product/definition.ts", "app/fixtures/product/fixtures.ts", "app/fixtures/product/index.html",
+    "app/fixtures/browser/config.ts", "app/src/screens/settings-screen.tsx", "scripts/app-browser.ts", "bun.lock",
+  ]) expect(captured.find((row) => row.path === path)).toEqual(await browserFile(root, path));
+  expect(new Set(captured.map(({ path }) => path)).size).toBe(captured.length);
+});
 
 test("logical path law preserves every admitted spelling and refuses traversal extensions", () => {
   fc.assert(fc.property(logicalPath, (path) => {

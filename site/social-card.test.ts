@@ -91,7 +91,7 @@ describe("social card", () => {
     };
     expect(darkPixelsIn(88, 90, 340, 180)).toBeGreaterThan(4_000);
     expect(darkPixelsIn(400, 90, 1100, 180)).toBe(0);
-    // The capacity warning owns the first row; the first bright command now follows it.
+    // The muted description owns the first row; read-only commands follow it.
     expect(lightPixelsIn(128, 280, 700, 306)).toBe(0);
     expect(lightPixelsIn(128, 328, 700, 354)).toBeGreaterThan(500);
     expect(darkPixelsIn(88, 495, 940, 525)).toBeGreaterThan(1_000);
@@ -99,12 +99,12 @@ describe("social card", () => {
 
   test("keeps every card line inside its row and states the exact positioning text", () => {
     const lines = socialCardLines();
-    expect(lines.tagline).toBe("CLI artifacts admitted v0.7.0 · hra.sh");
+    expect(lines.tagline).toBe("Codex + Claude Code · web workspace + CLI · hra.sh");
     expect(lines.title).toBe("HRA");
-    expect(lines.comment).toBe("# Rollout blocked on capacity; conditional examples");
+    expect(lines.comment).toBe("# Your sessions, in view");
     expect(lines.commands).toEqual([
-      `$ ${publicContent.hero.steps[0]!.command}`,
-      `$ ${publicContent.hero.steps[3]!.command}`,
+      `$ ${publicContent.doctorCommand}`,
+      "$ hra status --json",
     ]);
     for (const width of socialCardLineWidths()) {
       expect(width).toBeGreaterThan(0);
@@ -120,12 +120,12 @@ describe("social card", () => {
     expect(svg).toStartWith('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630"');
     expect(svg).toContain("<title id=\"title\">HRA</title>");
     expect(svg).toContain(`<desc id="description">${publicContent.socialCard.alt}</desc>`);
-    expect(svg).toContain("&lt;session-id&gt;");
-    expect(svg.indexOf("# Rollout blocked on capacity; conditional examples")).toBeLessThan(
-      svg.indexOf("$ hra session start"),
+    expect(svg).toContain("$ hra status --json");
+    expect(svg.indexOf("# Your sessions, in view")).toBeLessThan(
+      svg.indexOf("$ hra doctor --offline"),
     );
-    expect(svg).toMatch(/<text x="128" y="302"[^>]*># Rollout blocked on capacity; conditional examples<\/text>/u);
-    expect(svg).toMatch(/<text x="128" y="350"[^>]*>\$ hra session start/u);
+    expect(svg).toMatch(/<text x="128" y="302"[^>]*># Your sessions, in view<\/text>/u);
+    expect(svg).toMatch(/<text x="128" y="350"[^>]*>\$ hra doctor --offline/u);
     expect(svg).toContain('font-family="Nebula Sans, ui-sans-serif, system-ui, sans-serif"');
     expect(svg).not.toContain("<script");
     expect(svg).not.toContain("url(");
