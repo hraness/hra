@@ -493,6 +493,24 @@ not an exact-tree final receipt for a different branch's content or metadata.
 Protected merge, fresh main CI, guarded release, artifact readback, deployment
 and applicable operational admission remain separate and incomplete.
 
+Pre-join review also identifies a delayed shared-teardown risk in PR 164's
+paged-recovery fixture. This candidate uses its existing private service owner
+for that case, preserving all 11 original ordered statements, 103 sessions,
+immutable account authority, the 100-millisecond readiness race and five-second
+test limit. Cancellation fences prevent further admitted work. The affected
+case and existing owner lifecycle tests pass eight cases with 37 assertions
+in 1.89 seconds; scoped lint and whitespace checks pass. This focused evidence
+does not replace the actual-main join review or fresh integration gate.
+
+The September 9 read-only deployment baseline still binds hosted source
+`a75e7487594ce5b68345ccd3536974a10f7a93ee`, with open admission and untouched
+inactive attention controls. Hosted preflight reports the dedicated attention
+key name missing. This observation neither establishes capacity readiness nor
+authorizes key installation, notification enablement or daemon startup. Public
+markers separately identify site source `041a06a16015ff8b270a413b8c10ab9ca89e4ca2`
+and app source `e1edb585eedd0e78dbb558ce72fa7680cc2257ea`, app version `0.7.1`.
+No provider write or deployment occurred during these checks.
+
 The September 8 integration checkpoints now include canonical main through
 schema 50 at `ab56d3bc5034abedd12a20b5b405caf42bfa174f`, then the clean
 release-policy join at `9d6e2e12a42215e9201ae2ed3f64ed1b41e5c47d`, tree
