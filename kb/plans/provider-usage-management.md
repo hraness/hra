@@ -373,6 +373,32 @@ Fresh exact-head CI, local installation and compiled browser acceptance remain
 pending. The successful pre-join local gates above do not admit this new main
 integration or authorize release, deployment or runtime activation.
 
+The reviewed join and test-helper repairs are committed and pushed as
+`e2ac07d122763c37581f77c81a56f3bad7374307`, tree
+`a2b0ab82238ad39815e08968c8de16638de347c9`. The exact committed tree
+matches all 214 reviewed package paths, modes and blobs. Fresh isolated local
+and global installation, restored PTY and owned daemon lifecycle pass.
+CI run `34371222876`, attempt 1, checks synthetic merge
+`0006e118a83eb4c2f922ae6699ffe3f87a139963`, whose current-base tree is
+`71251acc214e77b9bfdeabd0a1e3470700c035bb`. Its browser job passes.
+Both CodeQL analysis jobs and the separate Advanced Security check pass on
+the exact head, reporting no new alerts in the changed code. The matrix is
+still running; neither this partial CI result nor its security clearance is
+substituted for a later integration candidate's final gates.
+
+Main then advances to `e1edb585eedd0e78dbb558ce72fa7680cc2257ea`
+through PR 165's shared provisioning guidance and local-efficiency 0.4.2
+metadata. The normal join is independently reviewed, retaining byte-identical
+package, runtime, application, scheduler, validation and CI workflow source.
+Root guidance was already current; seven incoming files only update plugin
+metadata, managed policy assets and their documentation. The complete focused
+bootstrap and repository-adoption suites pass 28 cases with 181 assertions,
+read-only adoption is current, and fresh final integration typecheck passes.
+No new infrastructure, credential, provider or deployment effect occurs.
+The unchanged archive remains bound to the candidate, but exact-head CI,
+security, installation and compiled browser gates must admit the successor
+before protected merge, release or deployment.
+
 The September 8 integration checkpoints now include canonical main through
 schema 50 at `ab56d3bc5034abedd12a20b5b405caf42bfa174f`, then the clean
 release-policy join at `9d6e2e12a42215e9201ae2ed3f64ed1b41e5c47d`, tree
