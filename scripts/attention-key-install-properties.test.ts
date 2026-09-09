@@ -17,10 +17,10 @@ import { canonicalDigest, withSelfDigest } from "./release-evidence";
 
 // Pure parsers and an injected HTTP double only: no operator, filesystem,
 // credential reader, target verifier, or provider operation is invoked here.
-const token = fc.array(fc.constantFrom(..."abcdefghijklmnopqrstuvwxyz0123456789"), {
+const token = fc.array(fc.constantFrom(...Array.from("abcdefghijklmnopqrstuvwxyz0123456789")), {
   minLength: 1, maxLength: 32,
 }).map((characters) => characters.join(""));
-const hex = (length: number) => fc.array(fc.constantFrom(..."0123456789abcdef"), {
+const hex = (length: number) => fc.array(fc.constantFrom(...Array.from("0123456789abcdef")), {
   minLength: length, maxLength: length,
 }).map((characters) => characters.join(""));
 const targetArbitrary = fc.integer({ min: 7_000_000, max: 8_000_000 }).map((deploymentId): ConvexTarget => ({
@@ -181,7 +181,8 @@ describe("attention key installation synthetic property contracts", () => {
           adminKey: "synthetic-admin", attentionKey: "re_synthetic_attention", target,
           fetcher: async (input) => {
             requests += 1;
-            expect(String(input)).toBe(`${target.deploymentUrl}/api/query`);
+            if (!(input instanceof URL)) throw new Error("SYNTHETIC_QUERY_URL_REQUIRED");
+            expect(input.href).toBe(`${target.deploymentUrl}/api/query`);
             return Response.json(response);
           },
         });

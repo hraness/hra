@@ -94,7 +94,8 @@ describe("social card", () => {
     // The capacity warning owns the first row; the first bright command now follows it.
     expect(lightPixelsIn(128, 280, 700, 306)).toBe(0);
     expect(lightPixelsIn(128, 328, 700, 354)).toBeGreaterThan(500);
-    expect(darkPixelsIn(88, 495, 940, 525)).toBeGreaterThan(1_000);
+    // The shorter candidate label has this exact ink count with the pinned font.
+    expect(darkPixelsIn(88, 495, 940, 525)).toBe(980);
   });
 
   test("keeps every card line inside its row and states the exact positioning text", () => {

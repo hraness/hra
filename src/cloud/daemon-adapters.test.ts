@@ -21,6 +21,7 @@ import { join } from "node:path";
 
 import { Database } from "bun:sqlite";
 
+import { canonical39DevinDatabaseBytes, canonical39DevinFixture } from "../../scripts/fixtures/canonical39-devin";
 import type { LocalCommand } from "../domain/contracts";
 import { presetRequirements } from "../domain/presets";
 import { effectiveRuntimeProfileSchema } from "../domain/runtime-profile";
@@ -199,7 +200,10 @@ const machineOnlyRemotePolicy = (
   version: 2,
 }) as const;
 
-async function fixture(registerStore?: (store: StateStore) => void): Promise<Readonly<{
+async function fixture(
+  registerStore?: (store: StateStore) => void,
+  source?: "canonical39-devin",
+): Promise<Readonly<{
   codex: FakeCodex;
   daemonGeneration: number;
   daemonBootId: string;
@@ -213,11 +217,21 @@ async function fixture(registerStore?: (store: StateStore) => void): Promise<Rea
   temporaryDirectories.push(temporary);
   const paths = resolveStatePaths({ homeDirectory: temporary, platform: "linux" });
   await initializeStatePaths(paths);
-  let now = 1_000;
+  if (source === "canonical39-devin") {
+    await writeFile(paths.database, canonical39DevinDatabaseBytes(), { mode: 0o600, flag: "wx" });
+  }
+  let now = source === "canonical39-devin" ? canonical39DevinFixture.fixedTime : 1_000;
   const store = new StateStore(paths, { now: () => now });
   registerStore?.(store);
   const daemonBootId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
   const daemonGeneration = store.nextDaemonGeneration(daemonBootId);
+  if (source === "canonical39-devin") {
+    return {
+      codex: new FakeCodex(), daemonGeneration, daemonBootId, now: () => now, paths,
+      sessionId: canonical39DevinFixture.cases[0].session.id,
+      setNow: (nextNow) => { now = nextNow; }, store,
+    };
+  }
   const profile = store.createProfile(`Personal \`${privateRootFixture}/profile\``);
   const current = store.nextProfileGeneration(profile.id);
   expect(store.setProfileState(current.id, current.processGeneration, "signed_in", {
@@ -273,27 +287,29 @@ function ownedCloudAdapterCase(
   runCase: (
     value: Awaited<ReturnType<typeof fixture>>,
     context: Readonly<{
-      createAdapter: () => StateBackedCloudDaemonAdapter;
+      createAdapter: (executeRemote?: (command: LocalCommand) => Promise<unknown>) => StateBackedCloudDaemonAdapter;
       request: <T>(operation: () => Promise<T>) => Promise<T>;
       signal: AbortSignal;
     }>,
   ) => Promise<void>,
+  source?: "canonical39-devin",
 ): Promise<void> {
   const controller = new AbortController();
   const adapters: StateBackedCloudDaemonAdapter[] = [];
   let store: StateStore | undefined;
   // Defer setup until its owner is registered, including partial setup that
   // has opened storage but has not returned the completed fixture yet.
-  const setup = Promise.resolve().then(() => fixture((created) => { store = created; }));
+  const setup = Promise.resolve().then(() => fixture((created) => { store = created; }, source));
   const caseTask = setup.then(async (value) => {
     controller.signal.throwIfAborted();
     await runCase(value, {
-      createAdapter: () => {
+      createAdapter: (executeRemote = () => Promise.resolve({})) => {
         controller.signal.throwIfAborted();
         const adapter = new StateBackedCloudDaemonAdapter({
           readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
-          executeRemote: () => Promise.resolve({}),
+          executeRemote,
           paths: value.paths,
+          ...(source === "canonical39-devin" ? { platform: "darwin" as const } : {}),
           store: value.store,
         });
         adapters.push(adapter);
@@ -1021,62 +1037,81 @@ describe("state-backed cloud daemon adapter", () => {
     }
   });
 
-  test("preserves cached retired Devin history without any provider or command effects", async () => {
-    const value = await fixture();
+  test("preserves cached retired Devin history without any provider or command effects", () => ownedCloudAdapterCase(async (
+    value, { createAdapter, request, signal },
+  ) => {
+    const captured = canonical39DevinFixture.cases[0];
+    expect(value.store.requireSession(value.sessionId)).toEqual(captured.session);
+    expect(value.store.latestSessionRuntimeProfile(captured.session.id)).toEqual(captured.runtime);
+    expect(value.store.readMutation(captured.idempotencyKey)).toMatchObject(captured.mutation);
     const commands: LocalCommand[] = [];
-    const adapter = new StateBackedCloudDaemonAdapter({
-      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
-      executeRemote: (command) => { commands.push(command); return Promise.resolve({}); },
-      paths: value.paths,
-      platform: "darwin",
-      store: value.store,
+    const initial = createAdapter();
+    await request(() => initial.close());
+    // The source database is the unchanged archived v39 producer image before
+    // real migration/boot. It contains no compact transcript. Seed only this
+    // separate synthetic cache input, not historical provider output or any
+    // session, runtime, login, or execution-authority row in the source store.
+    const body = { kind: "assistant_message", text: "Synthetic retained offline cache.", turnId: "turn_retired_cache_0001" } as const;
+    const events = [{ ...body, sequence: 1 }];
+    const cache = new Database(join(value.paths.root, "cloud-projection.sqlite"), { create: false, strict: true });
+    try {
+      cache.transaction(() => {
+        cache.query("INSERT INTO projection_sessions(session_id,next_sequence) VALUES (?,?)").run(value.sessionId, 2);
+        cache.query("INSERT INTO projection_turns(session_id,turn_id,start_sequence,event_count,digest,events_json) VALUES (?,?,?,?,?,?)")
+          .run(value.sessionId, body.turnId, 1, 1, sha256(JSON.stringify([body])), JSON.stringify(events));
+      })();
+    } finally { cache.close(false); }
+    const adapter = createAdapter((command) => { commands.push(command); return Promise.resolve({}); });
+    const database = new Database(value.paths.database, { create: false, strict: true });
+    database.exec("PRAGMA query_only=ON");
+    const originalRows = () => ({
+      session: database.query("SELECT * FROM sessions WHERE id=?").get(captured.session.id),
+      runtime: database.query("SELECT * FROM session_runtime_profiles WHERE session_id=? ORDER BY revision").all(captured.session.id),
+      login: database.query("SELECT * FROM mutation_attempts WHERE id=?").get(captured.mutation.id),
+      effect: database.query("SELECT * FROM mutation_effect_evidence WHERE attempt_id=?").get(captured.mutation.id),
+      authority: database.query("SELECT * FROM session_provider_account_authorities WHERE session_id=?").get(captured.session.id),
     });
     try {
-      const signal = new AbortController().signal;
-      await adapter.listSessions({ limit: 25, signal });
-      const before = await adapter.readCompactEvents({
-        afterSequence: 0, limit: 128, sessionPublicId: value.sessionId, signal,
-      });
-      expect(before.events.length).toBeGreaterThan(0);
-      const authority = await adapter.resolveCommandAuthority({ sessionPublicId: value.sessionId, signal });
-      if (authority === null) throw new Error("fixture authority unavailable");
-      // Seed frozen v39 provenance with its current canonical mirror.
-      // New session creation still refuses Devin; this is not an old capture.
-      const database = new Database(value.paths.database, { strict: true });
-      try {
-        database.transaction(() => {
-          // V40 has no provider-account proof for historical Devin sessions.
-          database.query("DELETE FROM session_provider_account_authorities WHERE session_id = ?")
-            .run(value.sessionId);
-          database.query("UPDATE session_account_authorities SET account_key = NULL WHERE session_id = ?")
-            .run(value.sessionId);
-          database.query("UPDATE sessions SET provider_v39 = 'devin', preset = 'ultra', preset_contract = 2, canonical_profile_key = 'devin:gpt-6-astra:provider-default' WHERE id = ?")
-            .run(value.sessionId);
-        })();
-      } finally { database.close(); }
+      const retained = originalRows();
+      expect(retained.authority).toBeNull();
       const calls = value.codex.readSessionCalls;
-      const projected = await adapter.listSessions({ limit: 25, signal });
+      const before = await request(() => adapter.readCompactEvents({
+        afterSequence: 0, limit: 128, sessionPublicId: value.sessionId, signal,
+      }));
+      expect(before.events.length).toBeGreaterThan(0);
+      expect(before.events).toEqual(events);
+      const projected = await request(() => adapter.listSessions({ limit: 25, signal }));
       expect(projected.sessions.find((session) => session.publicId === value.sessionId))
         .toMatchObject({ metadata: { retiredProvider: "devin" }, state: "terminal" });
       expect(value.codex.readSessionCalls).toBe(calls);
-      expect(await adapter.resolveCommandAuthority({ sessionPublicId: value.sessionId, signal })).toBeNull();
-      expect((await adapter.readCompactEvents({
+      expect(await request(() => adapter.resolveCommandAuthority({ sessionPublicId: value.sessionId, signal }))).toBeNull();
+      expect((await request(() => adapter.readCompactEvents({
         afterSequence: 0, limit: 128, sessionPublicId: value.sessionId, signal,
-      })).events).toEqual(before.events);
-      expect(await adapter.execute({
+      }))).events).toEqual(before.events);
+      // An already-decoded, untrusted command is not retained Devin authority.
+      // No modern provider tuple was issued or inserted for this historical row.
+      const authority: CloudLocalCommandAuthority = {
+        bindingGeneration: 1, localSessionId: captured.session.id, processGeneration: captured.generation,
+        profileId: captured.profile.id, provider: "codex", providerAccountId: "acct_ffffffffffffffffffffffffffffffff",
+        providerThreadId: captured.session.providerThreadId,
+      };
+      expect(await request(() => adapter.execute({
         authority,
         idempotencyKey: "00000000-0000-7000-8000-0000000000a4",
-        leaseAuthority: { bootGeneration: 1, bootId: "boot_00000001", fence: 1 },
+        leaseAuthority: { bootGeneration: value.daemonGeneration, bootId: value.daemonBootId, fence: 1 },
         payload: { kind: "send", message: "must not run" },
         sessionPublicId: value.sessionId,
         signal,
-      })).toEqual({ code: "PROVIDER_RETIRED", state: "failed" });
+      }))).toEqual({ code: "PROVIDER_RETIRED", state: "failed" });
       expect(commands).toEqual([]);
+      expect(value.codex.readSessionCalls).toBe(calls);
+      expect(calls).toBe(0);
+      expect(value.codex.usageCalls).toBe(0);
+      expect(originalRows()).toEqual(retained);
     } finally {
-      await adapter.close();
-      value.store.close();
+      database.close(false);
     }
-  });
+  }, "canonical39-devin"));
 
   test("projects and authorizes an actively bound personal Claude session on Darwin", async () => {
     const value = await fixture();

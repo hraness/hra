@@ -118,7 +118,7 @@ describe("public content contract", () => {
     });
   });
 
-  test("opens the README with the H1, one badge line, the thesis on line 3, the status line, then install", () => {
+  test("opens the README with the H1, one badge line, the thesis on line 3, status and candidate notice before install", () => {
     const markdown = renderReadmeMarkdown();
     const lines = markdown.split("\n");
     const badgeLine = publicContent.badges
@@ -131,8 +131,10 @@ describe("public content contract", () => {
     expect(lines[3]).toBe("");
     expect(lines[4]).toBe(publicContent.statusLine);
     expect(lines[5]).toBe("");
-    expect(lines[6]).toBe("```sh");
-    expect(lines[7]).toBe(publicContent.installCommand);
+    expect(lines[6]).toBe(`> ${publicContent.installNotice} [Admitted release installation notes](${publicContent.links.admittedInstall}).`);
+    expect(lines[7]).toBe("");
+    expect(lines[8]).toBe("```sh");
+    expect(lines[9]).toBe(publicContent.installCommand);
     expect(publicContent.thesis).toBe(
       "HRA runs Codex and Claude Code sessions side by side, keeps them alive in a local daemon, and gives humans and AI agents the same commands to drive them.",
     );
@@ -381,7 +383,7 @@ describe("public content contract", () => {
     expect(renderReadmeMarkdown()).toContain("Local CLI v0.8.0 is a release candidate, not an admitted artifact");
     for (const surface of [renderReadmeMarkdown(), renderSiteHtml()]) {
       expect(surface).toContain("Local v0.8.0 candidate; hosted sync live as an open beta");
-      expect(surface).toContain("The last admitted release is v0.7.0.");
+      expect(surface).toContain("The last admitted release is v0.7.0; use its immutable installation notes for the existing artifact.");
       expect(surface).toContain("https://github.com/hraness/hra/releases/tag/v0.7.0");
       expect(surface).toContain("https://github.com/hraness/hra/actions/runs/34278486095");
       expect(surface).toContain("passed immutable GitHub and npm release admission");
