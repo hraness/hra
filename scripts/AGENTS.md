@@ -1,6 +1,7 @@
 # Contents
 
 - `check-effect-architecture.ts` and its paired fixtures constrain the reviewed Effect programs; `check-codex-effect-architecture.ts` owns the Codex module-role policy.
+- `build-appearance.ts` produces the external, browser-only palette bootstrap reused by app and static-site builds; shared palette rules enter their completed StyleX unions.
 - Build scripts compile the CLI, generate the static website, and finalize the browser app's complete StyleX graph.
 - `build-site-stylex.ts` captures the static site's foundation and server-renderer graphs, seals all nine HTML routes, and projects only verified public artifacts from the completed union. `build-site.ts` adds canonical guide Markdown and the isolated parent-control bundle.
 - `build-product-preview.ts` separately compiles actual app components against closed fictional IO. It publishes only verified preview assets; Direct and its private completion records never enter production app or CLI bundles.

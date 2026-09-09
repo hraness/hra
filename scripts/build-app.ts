@@ -8,10 +8,12 @@ import {
 } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { getDesignPaletteTheme } from "@hraness/design-kit";
 
 import { dlopen } from "bun:ffi";
 
 import { assertSafeDarwinInstallAcl } from "../src/install-normalizer";
+import { stageHraAppearance, type HraAppearanceAsset } from "./build-appearance.ts";
 import {
   APP_SOURCE_MARKER_PATH,
   createAppSourceMarker,
@@ -21,6 +23,7 @@ import {
 
 export type AppArtifact = Readonly<{ bytes: number; path: string; sha256: string }>;
 export type AppGraph = Readonly<{
+  appearance: string;
   artifacts: readonly AppArtifact[];
   entry: string;
   foundation: string;
@@ -55,6 +58,7 @@ const COMPLETE = "stylex-complete.json";
 const STYLEX_UNION_POLICY_SHA256 = "1ceced1f1bf6359413ca6425ede61e1fdae272b897f4455c2347e2431d75caa1";
 const PUBLICATION_JOURNAL = "pending-publication.json";
 const ENTRY_TAG = '<script type="module" src="/src/main.tsx"></script>';
+const HTML_TAG = '<html lang="en" data-palette="catppuccin" data-theme="dark">';
 export const APP_CSS_PLACEHOLDER = "__HRANESS_STYLEX_CSS__";
 
 export type AppPublicationFailureBoundary =
@@ -149,11 +153,12 @@ function publicationPath(path: string): boolean {
 }
 
 /** Copy values, not mutable bundler records, and bind the entry to its facade. */
-export function snapshotAppGraph(value: unknown, absoluteEntry: string): AppGraph {
+export function snapshotAppGraph(value: unknown, absoluteEntry: string, appearance: Pick<HraAppearanceAsset, "source">): AppGraph {
   const result = record(value);
   assert.ok(Array.isArray(result.output) && result.output.length > 0 && result.output.length < MAX_FILES);
   const entries: string[] = [];
   const foundations: string[] = [];
+  const bootstraps: string[] = [];
   const output = result.output.map((raw): AppArtifact => {
     const item = record(raw);
     const path = safePath(item.fileName);
@@ -170,20 +175,26 @@ export function snapshotAppGraph(value: unknown, absoluteEntry: string): AppGrap
       bytes = item.code;
     } else {
       assert.equal(item.type, "asset");
-      assert.ok(path.endsWith(".css"), "The app currently owns no other static asset type");
       assert.ok(typeof item.source === "string" || item.source instanceof Uint8Array);
       bytes = item.source;
-      foundations.push(path);
+      if (path.endsWith(".css")) foundations.push(path);
+      else {
+        assert.ok(/^assets\/appearance-[A-Za-z0-9_-]+\.js$/u.test(path), "Unregistered app static asset");
+        assert.deepEqual(Buffer.from(bytes), Buffer.from(appearance.source), "Appearance asset differs from its bound compiler output");
+        bootstraps.push(path);
+      }
     }
     return { bytes: Buffer.byteLength(bytes), path, sha256: appSha256(bytes) };
   }).sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
   assert.equal(entries.length, 1, "The app must have exactly one module entry");
   assert.equal(foundations.length, 1, "The app must have one complete foundation stylesheet");
+  assert.equal(bootstraps.length, 1, "The app must have one bound classic appearance bootstrap");
   const checked = artifacts(output);
   const entry = entries[0];
   const foundation = foundations[0];
-  assert.ok(entry !== undefined && foundation !== undefined);
-  return { artifacts: checked, entry, foundation };
+  const bootstrap = bootstraps[0];
+  assert.ok(entry !== undefined && foundation !== undefined && bootstrap !== undefined);
+  return { appearance: bootstrap, artifacts: checked, entry, foundation };
 }
 
 /** Preserve every authored shell byte except its exact module tag/head join. */
@@ -193,6 +204,7 @@ export function prepareAppShell(
   mount: "/" | "./" = "/",
 ): string {
   assert.equal(source.split(ENTRY_TAG).length - 1, 1, "Authored app entry changed");
+  assert.equal(source.split(HTML_TAG).length - 1, 1, "Authored app theme boundary changed");
   assert.equal((source.match(/<script\b/giu) ?? []).length, 1);
   assert.equal(source.split("</head>").length - 1, 1);
   assert.ok(!/<!--|<\?|<!\[CDATA\[|<(?:template|noscript|svg|math)\b/iu.test(source), "The app shell must retain its active native HTML boundary");
@@ -200,8 +212,12 @@ export function prepareAppShell(
   assert.ok(!source.includes(APP_CSS_PLACEHOLDER));
   assert.ok(compilerPublicPath(`graphs/client/${graph.entry}`) && graph.entry.endsWith(".js"));
   assert.ok(compilerPublicPath(`graphs/client/${graph.foundation}`) && graph.foundation.endsWith(".css"));
-  return source.replace(ENTRY_TAG, `<script type="module" src="${mount}graphs/client/${graph.entry}"></script>`)
-    .replace("</head>", `<link rel="stylesheet" href="${mount}graphs/client/${graph.foundation}">\n    <link rel="stylesheet" href="${APP_CSS_PLACEHOLDER}">\n  </head>`);
+  assert.ok(/^assets\/appearance-[A-Za-z0-9_-]+\.js$/u.test(graph.appearance));
+  const paletteClass = getDesignPaletteTheme("catppuccin", "dark").className;
+  assert.ok(/^[A-Za-z0-9_-]+(?: [A-Za-z0-9_-]+)*$/u.test(paletteClass), "Unsafe default palette class");
+  return source.replace(HTML_TAG, HTML_TAG.replace(">", ` class="${paletteClass}">`))
+    .replace(ENTRY_TAG, `<script type="module" src="${mount}graphs/client/${graph.entry}"></script>`)
+    .replace("</head>", `<link rel="stylesheet" href="${mount}graphs/client/${graph.foundation}">\n    <link rel="stylesheet" href="${APP_CSS_PLACEHOLDER}">\n    <script src="${mount}graphs/client/${graph.appearance}"></script>\n  </head>`);
 }
 
 /** Only public artifact records survive this boundary, never graph inputs. */
@@ -220,18 +236,21 @@ export function parseAppComplete(value: unknown): readonly AppArtifact[] {
   keys(graph, ["id", "receiptSha256"]);
   assert.equal(graph.id, "client");
   hash(graph.receiptSha256);
-  assert.ok(Array.isArray(complete.packages) && complete.packages.length === 1);
-  const dependency = record(complete.packages[0]);
-  keys(dependency, ["manifestSha256", "name", "version"]);
-  assert.equal(dependency.name, "@hraness/ui");
-  assert.ok(typeof dependency.version === "string" && /^\d+\.\d+\.\d+$/u.test(dependency.version));
-  hash(dependency.manifestSha256);
+  assert.ok(Array.isArray(complete.packages) && complete.packages.length === 2);
+  for (const [index, name] of ["@hraness/design-kit", "@hraness/ui"].entries()) {
+    const dependency = record(complete.packages[index]);
+    keys(dependency, ["manifestSha256", "name", "version"]);
+    assert.equal(dependency.name, name);
+    assert.ok(typeof dependency.version === "string" && /^\d+\.\d+\.\d+$/u.test(dependency.version));
+    hash(dependency.manifestSha256);
+  }
   const css = artifact(complete.finalCss);
   assert.equal(css.path, "stylex.css");
   const output = artifacts([...artifacts(complete.artifacts), css].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   assert.ok(output.every(({ path }) => compilerPublicPath(path)), "Non-public output in app generation");
   assert.equal(output.filter(({ path }) => path === "index.html").length, 1);
   assert.equal(output.filter(({ path }) => path.endsWith(".css")).length, 2);
+  assert.equal(output.filter(({ path }) => /^graphs\/client\/assets\/appearance-[A-Za-z0-9_-]+\.js$/u.test(path)).length, 1);
   assert.ok(output.some(({ path }) => path.endsWith(".js")));
   return output;
 }
@@ -1172,26 +1191,28 @@ export async function stageAppBuild(options: Readonly<{
   assert.equal(STYLEX_COMPLETE_RECORD_SCHEMA_VERSION, 2);
   assert.equal(stylexUnionPolicySha256, STYLEX_UNION_POLICY_SHA256);
   const mount = options.profile === "development" ? "./" : "/";
+  const appearance = await stageHraAppearance(root, run);
   const outputDirectory = join(run, "complete");
   const generation = await createStylexGeneration({
     expectedGraphs: [{ adapter: "vite", entrypoints: ["app/src/main.tsx"], id: "client", kind: "client" }],
     finalCssPath: "stylex.css",
     generationId: "hra-app",
     outputDirectory,
-    packageManifests: [import.meta.resolve("@hraness/ui/stylex-manifest.json")],
+    packageManifests: [import.meta.resolve("@hraness/ui/stylex-manifest.json"), import.meta.resolve("@hraness/design-kit/stylex-manifest.json")],
     rootDirectory: root,
     templates: [{ cssHref: `${mount}stylex.css`, graphId: "client", outputPath: "index.html", sourcePath: "app/index.html", stylesheetGraphId: "client" }],
   });
   const configuration = options.profile === "development"
-    ? appDevelopmentConfig(root, generation)
-    : appProductionConfig(root, generation);
-  const graph = snapshotAppGraph(await build(configuration), join(app, "src", "main.tsx"));
+    ? appDevelopmentConfig(root, generation, appearance)
+    : appProductionConfig(root, generation, appearance);
+  const graph = snapshotAppGraph(await build(configuration), join(app, "src", "main.tsx"), appearance);
   const prepared = await prepareStylexProducedTemplate(generation, "index.html");
   const preparedShell = prepareAppShell(authored.toString("utf8"), graph, mount);
   await writeFile(prepared.sourcePath, preparedShell, { flag: "wx", mode: 0o600 });
   await sealStylexProducedTemplate(generation, "index.html");
   assert.deepEqual(await readOrdinary(join(app, "index.html")), authored, "Authored shell changed during build");
   const completed = await finalizeStylexGeneration({ generation, outputDirectory, rootDirectory: root });
+  await appearance.verifyInputs();
   assert.equal(completed, join(outputDirectory, "hra-app"));
   const completeBytes = await readOrdinary(join(completed, COMPLETE));
   const compilerProjected = parseAppComplete(JSON.parse(completeBytes.toString("utf8")) as unknown);

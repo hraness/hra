@@ -1228,16 +1228,17 @@ describe("public content contract", () => {
     }
   });
 
-  test("contains JSON-LD and one owned analytics module on public pages", () => {
+  test("contains JSON-LD, owned appearance bootstrap, and one owned analytics module on public pages", () => {
     const html = renderSiteHtml();
     const privacy = renderPrivacyHtml();
     expect(html).toContain('<link rel="canonical" href="https://hra.sh/">');
     expect(html).toContain('<meta property="og:type" content="website">');
     expect(html).toContain('<link rel="stylesheet" href="/styles.css">');
     expect(html).toContain('<script type="application/ld+json">');
-    expect(html.match(/<script\b/gu)).toHaveLength(3);
-    expect(html.match(/<script[^>]+src=/gu)).toHaveLength(2);
+    expect(html.match(/<script\b/gu)).toHaveLength(4);
+    expect(html.match(/<script[^>]+src=/gu)).toHaveLength(3);
     expect(html).toContain('<script src="/site.js" type="module"></script>');
+    expect(html).toContain('<script src="/appearance.js"></script>');
     expect(html).toContain(renderHraAnalyticsScript());
     expect(privacy).toContain(renderHraAnalyticsScript());
     expect(renderPreviewHtml()).not.toContain(renderHraAnalyticsScript());
@@ -1245,7 +1246,10 @@ describe("public content contract", () => {
     for (const page of docsPages) {
       const document = parseHTML(renderDocsHtml(page)).document;
       expect(document.querySelector('link[rel="canonical"]')?.getAttribute("href")).toBe(`https://hra.sh${page.path}`);
-      expect([...document.querySelectorAll("script[src]")].map((script) => script.getAttribute("src"))).toEqual(["/analytics.js", "/site.js"]);
+      expect([...document.querySelectorAll("script[src]")].map((script) => script.getAttribute("src"))).toEqual(["/appearance.js", "/analytics.js", "/site.js"]);
+      expect(document.documentElement.getAttribute("data-palette")).toBe("catppuccin");
+      expect(document.documentElement.getAttribute("data-theme")).toBe("dark");
+      expect(document.querySelectorAll("details[data-hra-appearance]")).toHaveLength(1);
       expect(document.querySelectorAll('script[type="application/ld+json"]')).toHaveLength(1);
     }
   });

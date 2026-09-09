@@ -1,3 +1,4 @@
+import { AppearanceButton } from "../components/appearance";
 import * as stylex from "@stylexjs/stylex";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
@@ -253,6 +254,7 @@ export function SessionScreen({
         >
           <KebabIcon />
         </Button>
+        <AppearanceButton />
       </header>
 
       <ScheduledTasksBadge sessionPublicId={sessionPublicId} />

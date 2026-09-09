@@ -6,7 +6,7 @@ import {
   createProductPreviewSession, parseProductPreviewSelection, parseProductPreviewWorld, PRODUCT_PREVIEW_VIEWS,
 } from "./definition";
 import { createProductObservations, PRODUCT_PREVIEW_NOW, PRODUCT_SESSION_IDS } from "./fixtures";
-import { installProductPreviewHarness, readProductPreviewHarness, useCustody, useSessionHead, useSessionModel, useSubmitCommand } from "./io";
+import { installProductPreviewHarness, mountHraAppearanceMenu, readProductPreviewHarness, useCustody, useSessionHead, useSessionModel, useSubmitCommand } from "./io";
 
 describe("isolated real-screen product examples", () => {
   test("admits exactly four fixed, quiescent rendering-only scenarios", () => {
@@ -87,5 +87,25 @@ describe("isolated real-screen product examples", () => {
       expect(() => readProductPreviewHarness()).toThrow("closed");
     } finally { release(); session.dispose(); }
     expect(() => readProductPreviewHarness()).toThrow("not installed");
+  });
+
+  test("the real appearance menu acquires no document, storage or event authority in a product example", () => {
+    let accessed = false;
+    const menu = new Proxy({} as HTMLDetailsElement, { get() { accessed = true; throw new Error("Appearance IO was accessed"); } });
+    expect(() => mountHraAppearanceMenu(menu)).toThrow("not installed");
+    const result = createProductPreviewSession("settings");
+    if (!result.ok) throw new Error(result.error.message);
+    const session = result.value;
+    const release = installProductPreviewHarness(session.harness);
+    try {
+      const unmount = mountHraAppearanceMenu(menu);
+      expect(unmount()).toBeUndefined();
+      expect(unmount()).toBeUndefined();
+      expect(accessed).toBe(false);
+      expect(session.harness.refusedEffects()).toBe(0);
+      session.dispose();
+      expect(() => mountHraAppearanceMenu(menu)).toThrow("closed");
+    } finally { release(); session.dispose(); }
+    expect(accessed).toBe(false);
   });
 });

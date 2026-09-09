@@ -35,12 +35,13 @@ export function observeBrowserCustody(observer: BrowserCustodyObserver | undefin
       : Object.freeze({ ...observation, origins: Object.freeze([...observation.origins]), pids: Object.freeze([...observation.pids]) });
   assert.equal(observer(frozen), undefined, "Browser custody observation must finish synchronously");
 }
-type BrowserFailure = Readonly<{ name: string; message: string; cause?: BrowserFailure; errors?: readonly BrowserFailure[]; settlement?: StylesheetSettlementDiagnostics }>;
+type BrowserFailure = Readonly<{ name: string; message: string; cause?: BrowserFailure; errors?: readonly BrowserFailure[]; settlement?: StylesheetSettlementDiagnostics; focus?: ReturnType<typeof focusStripDiagnostics> }>;
 export function browserFailureDetails(value: unknown, depth = 0): BrowserFailure {
   if (!(value instanceof Error)) return { name: "UnknownFailure", message: typeof value === "string" ? value.slice(0, 1000) : typeof value };
   return {
     name: value.name.slice(0, 80), message: value.message.slice(0, 1000),
     ...(value instanceof StylesheetSettlementError ? { settlement: value.diagnostics } : {}),
+    ...(value instanceof FocusStripAssertionError ? { focus: value.diagnostics } : {}),
     ...(depth < 3 && value.cause !== undefined ? { cause: browserFailureDetails(value.cause, depth + 1) } : {}),
     ...(depth < 3 && value instanceof AggregateError ? { errors: value.errors.slice(0, 8).map((error: unknown) => browserFailureDetails(error, depth + 1)) } : {}),
   };
@@ -70,6 +71,7 @@ const browserDiagnosticSteps = new Set([
   "asymmetric-safe-area", "isolation:assertions", "cleanup", "complete",
   ...fixtureViews.flatMap((view) => ["navigation", "assertions", "screenshot"].map((step) => `fixture:${view}:${step}`)),
   "static-site:home:product-previews", "static-site:docs:search", "static-site:docs:legacy-redirects",
+  "static-site:docs-reference:appearance-menu",
   ...siteRouteLabels.flatMap((route) => [
     "navigation", "document-bytes", "direction", "heading", "settle-before-fonts", "font-load", "settle-after-fonts",
     "document-clean", "stylesheet-links", "stylesheet-inventory", "color-scheme", "background", "heading-style", "inertness",
@@ -167,7 +169,7 @@ const sitePublicFonts = [
   "geist-mono/GeistMono[wght].woff2",
 ];
 const sitePublicSupport = [
-  "analytics.js", "site.js", "favicon.svg", "social-card.svg", "social-card.png", "robots.txt", "sitemap.xml", "llms.txt",
+  "analytics.js", "appearance.js", "site.js", "favicon.svg", "social-card.svg", "social-card.png", "robots.txt", "sitemap.xml", "llms.txt",
   ".well-known/security.txt", ".well-known/hra.json",
   "fonts/nebula-sans/LICENSE.txt", "fonts/nebula-sans/PROVENANCE.md",
   "fonts/geist-mono/OFL.txt", "fonts/geist-mono/PROVENANCE.md",
@@ -404,6 +406,23 @@ export function siteStylesheetPaths(documents: ReadonlyMap<string, Buffer>): rea
     assert.ok(bytes !== undefined && bytes.length > 0 && bytes.length <= 8 * 1024 * 1024, `Missing bounded site document: ${path}`);
     const { document } = parseHTML(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
     assert.equal(document.querySelectorAll("style,[style],base").length, 0, "Static document changed its no-inline/base contract");
+    assert.equal(document.documentElement.getAttribute("data-palette"), "catppuccin", "Static default palette changed");
+    assert.equal(document.documentElement.getAttribute("data-theme"), "dark", "Static default theme changed");
+    const appearance = [...document.querySelectorAll('script[src="/appearance.js"]')];
+    const menus = [...document.querySelectorAll("details[data-hra-appearance]")];
+    if (path === "preview/index.html") {
+      assert.equal(document.querySelectorAll("script,details[data-hra-appearance]").length, 0, "Inert preview acquired appearance controls");
+    } else {
+      assert.equal(appearance.length, 1, "Static page must load one bound appearance bootstrap");
+      const bootstrap = appearance[0];
+      assert.ok(bootstrap !== undefined);
+      assert.equal(bootstrap.parentElement, document.head);
+      assert.deepEqual([...bootstrap.attributes].map(({ name }) => name), ["src"], "Appearance must remain a blocking classic script");
+      assert.equal(bootstrap.textContent.trim(), "");
+      assert.equal(menus.length, 1, "Static page must expose exactly one appearance menu");
+      const menu = menus[0];
+      assert.ok(menu !== undefined && menu.closest("header") !== null, "Appearance menu lost its header position");
+    }
     const links = [...document.querySelectorAll("link")].filter((link) => link.getAttribute("rel")?.toLowerCase().split(/\s+/u).includes("stylesheet"));
     assert.equal(links.length, 2, "Static document must link exactly foundation then union");
     for (const link of links) {
@@ -606,6 +625,7 @@ export function assertProductPreviewObservation(value: unknown, view: ProductVie
   assert.ok(Object.values(record(snapshot.pending)).every((count) => count === 0));
   assert.deepEqual(snapshot.violations, { "example.blockedFetch": 0, "example.browserActivityError": 0, "example.refusedEffect": 0 });
   assert.deepEqual(observation.stylesheets, [true, true]);
+  assert.deepEqual(observation.appearance, { palette: "catppuccin", theme: "dark", menus: 1, ready: false, controls: 2, controlsDisabled: true });
 }
 
 async function verifyProductScene(iframe: Locator, view: ProductView): Promise<unknown> {
@@ -634,6 +654,11 @@ async function verifyProductScene(iframe: Locator, view: ProductView): Promise<u
         now: Date.now(), violations: state.__hraBrowserViolations, inline: document.querySelectorAll("style,[style]").length,
         bridgeSchema: bridge.schema, manifest: bridge.manifest, snapshot: bridge.snapshot(),
         stylesheets: [...document.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"]')].map((link) => link.sheet !== null && !link.disabled),
+        appearance: { palette: document.documentElement.dataset.palette, theme: document.documentElement.dataset.theme,
+          menus: document.querySelectorAll("details[data-hra-appearance]").length,
+          ready: document.querySelector('details[data-hra-appearance][data-ready="true"]') !== null,
+          controls: document.querySelectorAll("details[data-hra-appearance] select").length,
+          controlsDisabled: [...document.querySelectorAll<HTMLSelectElement>("details[data-hra-appearance] select")].every((select) => select.disabled) },
       };
     }, view);
     assertProductPreviewObservation(observation, view);
@@ -757,6 +782,52 @@ async function settle(page: Page): Promise<void> {
 }
 
 type ButtonPlacement = "card-content" | "sign-in-form";
+
+/** Independent default-palette contract for the pinned shared package. OS light
+ * preference alone must not override a fresh user's Catppuccin dark choice. */
+export function assertDefaultPalette(value: unknown, forced: boolean): void {
+  const sample = record(value);
+  assert.equal(sample.palette, "catppuccin");
+  assert.equal(sample.theme, "dark");
+  assert.equal(sample.primary, forced ? "Highlight" : "#92bafa", "Shared primary semantic color is missing");
+  assert.equal(sample.foreground, forced ? "CanvasText" : "#dbe1f7", "Shared foreground semantic color is missing");
+  if (!forced) assert.equal(sample.background, "rgb(30, 30, 46)", "Default palette background differs from its semantic role");
+}
+
+async function defaultPalette(page: Page, forced: boolean): Promise<void> {
+  assertDefaultPalette(await page.evaluate(() => {
+    const root = document.documentElement;
+    const css = getComputedStyle(root);
+    return {
+      palette: root.dataset.palette, theme: root.dataset.theme,
+      primary: css.getPropertyValue("--primary").trim(),
+      foreground: css.getPropertyValue("--foreground").trim(),
+      background: css.backgroundColor,
+    };
+  }), forced);
+}
+
+/** One real guide exercises the shared control; restore before any later route. */
+async function verifyGuideAppearance(page: Page): Promise<void> {
+  const menu = page.locator("details[data-hra-appearance]");
+  assert.equal(await menu.count(), 1);
+  const summary = menu.locator("summary");
+  await summary.focus();
+  await page.keyboard.press("Enter");
+  const mode = menu.locator("select[data-hra-mode]");
+  await mode.selectOption("light");
+  await page.waitForFunction(() => document.documentElement.dataset.palette === "catppuccin" && document.documentElement.dataset.theme === "light"
+    && getComputedStyle(document.documentElement).colorScheme === "light");
+  assert.equal(await summary.getAttribute("aria-label"), "Appearance: Catppuccin, Light");
+  await mode.selectOption("dark");
+  await page.waitForFunction(() => document.documentElement.dataset.theme === "dark"
+    && getComputedStyle(document.documentElement).colorScheme === "dark");
+  await defaultPalette(page, false);
+  await mode.focus();
+  await page.keyboard.press("Escape");
+  assert.equal(await menu.evaluate((element) => (element as HTMLDetailsElement).open), false);
+  assert.equal(await summary.evaluate((element) => document.activeElement === element), true);
+}
 
 export function assertAppColorScheme(value: unknown, profile: Pick<Profile, "forced" | "colorScheme">): void {
   const sample = record(value);
@@ -1018,6 +1089,89 @@ export function assertNativeModalFocus(value: unknown): void {
     `Native modal allowed focus on background content: ${JSON.stringify(sample)}`);
 }
 
+/** The fixture's offset ring is visible below the primary button. Its own
+ * Highlight fill is not the paint adjacent to that exposed outline strip. */
+export function assertKeyboardFocusStrip(value: unknown, forced: boolean): void {
+  try { checkKeyboardFocusStrip(value, forced); }
+  catch (error) { throw new FocusStripAssertionError(error, value); }
+}
+
+/** Copy only bounded geometry and paint predicates, never DOM text or URLs. */
+function focusStripDiagnostics(value: unknown) {
+  const object = (value: unknown): Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown> : {};
+  const number = (value: unknown) => typeof value === "number" && Number.isFinite(value) && Math.abs(value) <= 10_000_000 ? value : null;
+  const boolean = (value: unknown) => typeof value === "boolean" ? value : null;
+  const tag = (value: unknown) => typeof value === "string" && /^[A-Z][A-Z0-9-]{0,31}$/u.test(value) ? value : null;
+  const color = (value: unknown) => typeof value === "string" && value.length <= 100 && /^rgba?\([\d., ]+\)$/u.test(value) ? value : null;
+  const overflow = (value: unknown) => typeof value === "string" && ["visible", "hidden", "clip", "scroll", "auto"].includes(value) ? value : null;
+  const rectangle = (value: unknown) => Array.isArray(value) && value.length === 4 ? value.map(number) : null;
+  const rows = (value: unknown, cap: number) => Array.isArray(value) ? value.slice(0, cap).map(object) : [];
+  const sample = object(value);
+  const geometry = object(sample.geometry);
+  return {
+    width: number(sample.width), offset: number(sample.offset), forced: boolean(sample.forced), focusVisible: boolean(sample.focusVisible),
+    exposed: boolean(sample.exposed), target: rectangle(geometry.target), targetOpacity: number(geometry.targetOpacity),
+    points: rows(geometry.points, 3).map((point) => ({ x: number(point.x), y: number(point.y), hitTag: tag(point.hitTag),
+      parentHit: boolean(point.parentHit), targetHit: boolean(point.targetHit), ancestorHit: boolean(point.ancestorHit), siblingHit: boolean(point.siblingHit),
+      hitBounds: rectangle(point.hitBounds), hitBackground: color(point.hitBackground), hitOpacity: number(point.hitOpacity), hitImageNone: boolean(point.hitImageNone) })),
+    ancestors: rows(geometry.ancestors, 16).map((ancestor) => ({ tag: tag(ancestor.tag), bounds: rectangle(ancestor.bounds),
+      opacity: number(ancestor.opacity), imageNone: boolean(ancestor.imageNone), containsStrip: boolean(ancestor.containsStrip),
+      background: color(ancestor.background), overflowX: overflow(ancestor.overflowX), overflowY: overflow(ancestor.overflowY) })),
+    depthExceeded: boolean(geometry.depthExceeded),
+  };
+}
+
+class FocusStripAssertionError extends assert.AssertionError {
+  readonly diagnostics: ReturnType<typeof focusStripDiagnostics>;
+  constructor(error: unknown, sample: unknown) {
+    super({ message: error instanceof Error ? error.message : "Keyboard focus strip verification failed" });
+    this.diagnostics = focusStripDiagnostics(sample);
+  }
+}
+
+function checkKeyboardFocusStrip(value: unknown, forced: boolean): void {
+  const sample = record(value);
+  assert.equal(sample.focusVisible, true, "Keyboard focus did not reach Open sheet");
+  assert.equal(sample.forced, forced, "Focus verification lost its native media mode");
+  assert.equal(sample.outline, "solid", "Keyboard focus ring is not visible");
+  assert.ok(typeof sample.width === "number" && Number.isFinite(sample.width) && sample.width >= 2, "Keyboard focus ring is not visible");
+  assert.ok(typeof sample.offset === "number" && Number.isFinite(sample.offset) && sample.offset >= 2, "Focus ring lost its separation from the button fill");
+  if (!forced) return;
+  assert.equal(sample.exposed, true, "The sampled bottom focus strip is clipped or covered");
+
+  type Color = readonly [number, number, number, number];
+  const color = (value: unknown): Color => {
+    assert.ok(typeof value === "string" && value.length <= 100, "Missing computed focus color");
+    const match = /^rgb(a?)\((\d+(?:\.\d+)?), (\d+(?:\.\d+)?), (\d+(?:\.\d+)?)(?:, (\d+(?:\.\d+)?))?\)$/u.exec(value);
+    assert.ok(match !== null && (match[1] === "a") === (match[5] !== undefined), "Unsupported computed focus color");
+    const channels: Color = [Number(match[2]), Number(match[3]), Number(match[4]), Number(match[5] ?? 1)];
+    assert.ok(channels.every(Number.isFinite) && channels.slice(0, 3).every((channel) => channel >= 0 && channel <= 255)
+      && channels[3] >= 0 && channels[3] <= 1, "Invalid computed focus color");
+    return channels;
+  };
+  const over = (foreground: Color, background: Color): Color => [
+    foreground[0] * foreground[3] + background[0] * (1 - foreground[3]),
+    foreground[1] * foreground[3] + background[1] * (1 - foreground[3]),
+    foreground[2] * foreground[3] + background[2] * (1 - foreground[3]), 1,
+  ];
+  assert.ok(Array.isArray(sample.backgrounds) && sample.backgrounds.length > 0 && sample.backgrounds.length <= 16,
+    "Focus strip has no bounded surrounding surface");
+  const backgrounds = sample.backgrounds.map(color);
+  let surface = backgrounds.pop();
+  assert.ok(surface !== undefined && surface[3] === 1, "Focus strip has no opaque background");
+  for (const background of backgrounds.reverse()) surface = over(background, surface);
+  const luminance = (value: Color): number => value.slice(0, 3).reduce((sum, channel, index) => {
+    const normalized = channel / 255;
+    return sum + (normalized <= 0.04045 ? normalized / 12.92 : ((normalized + 0.055) / 1.055) ** 2.4)
+      * ([0.2126, 0.7152, 0.0722][index] ?? 0);
+  }, 0);
+  const ringLuminance = luminance(over(color(sample.color), surface));
+  const surfaceLuminance = luminance(surface);
+  const contrast = (Math.max(ringLuminance, surfaceLuminance) + 0.05) / (Math.min(ringLuminance, surfaceLuminance) + 0.05);
+  assert.ok(contrast >= 3, `Forced-color focus strip lost contrast (${contrast.toFixed(2)}:1)`);
+}
+
 async function primitives(page: Page, profile: Profile, reportNegative: NegativeStylesheetReporter, boundary: RestorationBoundary): Promise<void> {
   const open = page.getByRole("button", { name: "Open dialog", exact: true });
   await styled(open, "card-content");
@@ -1099,13 +1253,48 @@ async function primitives(page: Page, profile: Profile, reportNegative: Negative
   await menu.waitFor({ state: "hidden" });
   await open.focus();
   await page.keyboard.press("Tab");
-  const focused = await page.locator(":focus").evaluate((element) => {
+  const focused = await page.getByRole("button", { name: "Open sheet", exact: true }).evaluate((element) => {
     const css = getComputedStyle(element);
-    return { outline: css.outlineStyle, width: Number.parseFloat(css.outlineWidth), color: css.outlineColor, background: css.backgroundColor };
+    const box = element.getBoundingClientRect();
+    const width = Number.parseFloat(css.outlineWidth);
+    const offset = Number.parseFloat(css.outlineOffset);
+    // Side strips can meet the fixture's adjacent buttons. Prove this exposed
+    // bottom strip instead, using actual hit testing and its ancestor paint.
+    const points = [0.25, 0.5, 0.75].map((fraction) => {
+      const x = box.left + box.width * fraction;
+      const y = box.bottom + offset + width / 2;
+      const hit = document.elementFromPoint(x, y);
+      const hitPaint = hit === null ? null : getComputedStyle(hit);
+      const hitBounds = hit?.getBoundingClientRect();
+      return { x, y, hitTag: hit?.tagName ?? null, parentHit: hit === element.parentElement,
+        targetHit: hit === element, ancestorHit: hit !== element && hit?.contains(element) === true,
+        siblingHit: hit !== element && hit?.parentElement === element.parentElement,
+        hitBounds: hitBounds === undefined ? null : [hitBounds.left, hitBounds.top, hitBounds.right, hitBounds.bottom],
+        hitBackground: hitPaint?.backgroundColor ?? null, hitOpacity: hitPaint === null ? null : Number(hitPaint.opacity),
+        hitImageNone: hitPaint === null ? null : hitPaint.backgroundImage === "none" };
+    });
+    let exposed = css.opacity === "1"
+      && points.every(({ parentHit }) => parentHit);
+    const backgrounds: string[] = [];
+    const ancestors = [];
+    let depthExceeded = false;
+    for (let ancestor = element.parentElement; ancestor !== null; ancestor = ancestor.parentElement) {
+      if (backgrounds.length === 16) { exposed = false; depthExceeded = true; break; }
+      const paint = getComputedStyle(ancestor);
+      const bounds = ancestor.getBoundingClientRect();
+      const containsStrip = points.every(({ x, y }) => x >= bounds.left && x < bounds.right && y - width / 2 >= bounds.top && y + width / 2 < bounds.bottom);
+      exposed &&= paint.backgroundImage === "none" && paint.opacity === "1" && containsStrip;
+      backgrounds.push(paint.backgroundColor);
+      ancestors.push({ tag: ancestor.tagName, bounds: [bounds.left, bounds.top, bounds.right, bounds.bottom],
+        opacity: Number(paint.opacity), imageNone: paint.backgroundImage === "none", containsStrip,
+        background: paint.backgroundColor, overflowX: paint.overflowX, overflowY: paint.overflowY });
+    }
+    return { outline: css.outlineStyle, width, offset, color: css.outlineColor, backgrounds, exposed,
+      geometry: { target: [box.left, box.top, box.right, box.bottom], targetOpacity: Number(css.opacity), points, ancestors, depthExceeded },
+      focusVisible: document.activeElement === element && element.matches(":focus-visible"),
+      forced: matchMedia("(forced-colors: active)").matches };
   });
-  assert.notEqual(focused.outline, "none");
-  assert.ok(focused.width >= 2, "Keyboard focus ring is not visible");
-  if (profile.forced) assert.notEqual(focused.color, focused.background, "Forced-color focus ring lost contrast");
+  assertKeyboardFocusStrip(focused, profile.forced);
   if (profile.reduced) {
     const duration = await open.evaluate((element) => getComputedStyle(element).transitionDuration);
     assert.ok(duration.split(",").every((part) => Number.parseFloat(part) <= 0.01), "Reduced-motion button transition remains active");
@@ -1401,6 +1590,7 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
             colorScheme: css.colorScheme, forcedColorAdjust: css.forcedColorAdjust,
           };
         }), profile);
+        await defaultPalette(page, profile.forced);
         await cleanDocument(page);
         mark("production-anonymous:negative-css");
         await negativeStylesheet(page, "button", "/stylex.css", negativeReporter("production-anonymous:negative-css"), restorationBoundary);
@@ -1414,6 +1604,7 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
           await page.locator("#root button").first().waitFor();
           await settle(page);
           await cleanDocument(page);
+          await defaultPalette(page, profile.forced);
           if (view === "grid") {
             const cards = page.locator("[data-session-id]");
             assert.equal(await cards.count(), 3);
@@ -1560,7 +1751,7 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
             mark(`static-site:${routeLabel}:color-scheme`);
             assert.equal(await page.evaluate(() => matchMedia("(prefers-color-scheme: light)").matches), profile.colorScheme === "light");
             mark(`static-site:${routeLabel}:background`);
-            if (!profile.forced) assert.equal(await page.locator("html").evaluate((element) => getComputedStyle(element).backgroundColor), profile.colorScheme === "light" ? "rgb(251, 250, 247)" : "rgb(20, 19, 16)");
+            await defaultPalette(page, profile.forced);
             mark(`static-site:${routeLabel}:heading-style`);
             assert.ok(await page.locator(route.heading).evaluate((element) => Number.parseFloat(getComputedStyle(element).fontSize) > 24));
             mark(`static-site:${routeLabel}:inertness`);
@@ -1591,6 +1782,11 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
                   values: await verifyProductScene(iframe, view as ProductView) });
                 await page.waitForFunction(() => document.querySelector("figure[data-product-preview] [data-preview-status]")?.textContent === "");
               }
+            }
+            if (profile.name === "desktop" && route.pathname === "/docs/reference/") {
+              mark("static-site:docs-reference:appearance-menu");
+              await verifyGuideAppearance(page);
+              evidence.push({ name: "desktop:docs-reference:appearance-menu", values: "light, dark restoration, Escape, and focus passed" });
             }
             assert.equal(responseOverflow, false, "Static resource census exceeded its bound");
             mark(`static-site:${routeLabel}:resource-bytes`);

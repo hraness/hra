@@ -12,6 +12,7 @@ import type * as Registries from "../../src/data/registry";
 import type * as Attachments from "../../src/data/composer-attachments";
 import type * as CardOrder from "../../src/data/card-order";
 import type * as Auth from "@convex-dev/auth/react";
+import type * as Appearance from "../../src/appearance";
 import type { ProductPreviewHarness } from "./definition";
 
 let active: ProductPreviewHarness | null = null;
@@ -32,6 +33,12 @@ export function readProductPreviewHarness(): ProductPreviewHarness {
 const noop = () => undefined;
 const refuse = (): never => readProductPreviewHarness().refuse();
 const refuseAsync = async (): Promise<never> => refuse();
+
+/** Keep the real menu disabled and inert: no preference read, write or listener. */
+export const mountHraAppearanceMenu: typeof Appearance.mountHraAppearanceMenu = () => {
+  readProductPreviewHarness();
+  return noop;
+};
 
 export const useSessionHeads: typeof Heads.useSessionHeads = () => ({
   heads: readProductPreviewHarness().observations.heads, isLoading: false, loadMore: noop, status: "Exhausted",

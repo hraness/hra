@@ -1,3 +1,4 @@
+import { AppearanceButton } from "../components/appearance";
 import { useAuthActions } from "@convex-dev/auth/react";
 import * as stylex from "@stylexjs/stylex";
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
@@ -1157,6 +1158,7 @@ export function SettingsScreen({ onBack }: Readonly<{ onBack: () => void }>) {
           <BackIcon />
         </Button>
         <h1 {...stylex.props(styles.title)}>Settings</h1>
+        <AppearanceButton />
       </header>
 
       <main {...stylex.props(styles.main)}>

@@ -7,15 +7,18 @@ import { fileURLToPath } from "node:url";
 
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 const sourceRoot = resolve(repositoryRoot, "site");
-const escapedSourceRoot = sourceRoot.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+const escapePath = (path: string): string => path.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+const sharedMenuFiles = ["appearance-menu.tsx", "appearance-menu.stylex.ts"]
+  .map((name) => escapePath(resolve(repositoryRoot, "app/src/components", name)));
+export const siteStylexTestFilter = new RegExp(`^(?:${escapePath(sourceRoot)}/.*\\.[cm]?[jt]sx?$|${sharedMenuFiles.join("|")})$`, "u");
 const collector = createStylexTransformCollector(repositoryRoot);
 
-// Only the static site's authored modules use this test-time compiler. CLI,
-// provider and cloud tests retain their ordinary module-loading boundary.
+// The site and its two pure native-menu files share this compiler. Other app,
+// CLI, provider and cloud modules retain their ordinary loading boundary.
 Bun.plugin({
   name: "hra-site-stylex-test-transform",
   setup(build) {
-    build.onLoad({ filter: new RegExp(`^${escapedSourceRoot}/.*\\.[cm]?[jt]sx?$`, "u") }, async ({ path }) => {
+    build.onLoad({ filter: siteStylexTestFilter }, async ({ path }) => {
       const contents = (await collector.transform(await Bun.file(path).text(), path)).code;
       const extension = extname(path);
       const loader = extension === ".tsx" ? "tsx"

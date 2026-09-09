@@ -112,7 +112,7 @@ describe("public server marketing composition", () => {
     expect(textsAt(".hraness-marketing-trust-item__detail")).toEqual(publicContent.trust.map((item) => item.detail));
     expect(textAt(".hraness-marketing-trust__summary"))
       .toBe("The browser gives you a view of the work. Execution stays with the provider tools on the machine you chose.");
-    expect(textsAt("details > summary")).toEqual(publicContent.questions.map((question) => question.question));
+    expect(textsAt("#questions details > summary")).toEqual(publicContent.questions.map((question) => question.question));
     expect(textsAt(".hraness-marketing-question__answer")).toEqual(publicContent.questions.map((question) =>
       question.answer.map((part) => part.kind === "link" ? part.label : part.value).join("")));
     expect(textAt("#maker-heading")).toBe(publicContent.maker.heading);
@@ -147,9 +147,9 @@ describe("public server marketing composition", () => {
     expect(document.querySelector(".hraness-marketing-maker__body > p > code")?.textContent).toBe("safe <text>");
     expect(document.querySelector(".hraness-marketing-maker__links a")?.getAttribute("class")).toBe(sitePresentationClasses("proseLink"));
     expect(document.querySelector(".hraness-marketing-question__answer a")?.getAttribute("class")).toBe(sitePresentationClasses("proseLink"));
-    expect(document.querySelectorAll("details > summary")).toHaveLength(1);
-    expect(document.querySelector("details > summary")?.textContent).toBe("A native question?");
-    expect(document.querySelector("details")?.hasAttribute("open")).toBe(false);
+    expect(document.querySelectorAll("#questions details > summary")).toHaveLength(1);
+    expect(document.querySelector("#questions details > summary")?.textContent).toBe("A native question?");
+    expect(document.querySelector("#questions details")?.hasAttribute("open")).toBe(false);
     expect(document.querySelector("[style], style, script")).toBeNull();
   });
 

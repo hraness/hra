@@ -1,22 +1,15 @@
+/* The shared StyleX palette supplies every semantic color. */
 :root {
-  color-scheme: light dark;
-  --background: #fbfaf7;
-  --surface: #ffffff;
-  --foreground: #1b1a17;
-  --muted: #66625a;
-  --rule: rgba(27, 26, 23, 0.12);
-  --line: var(--rule);
-  --link: #1f5eea;
-  --inverse-background: #1b1a17;
-  --inverse-foreground: #f7f3e8;
-  --inverse: var(--inverse-background);
-  --code-background: #1a1916;
-  --code-danger: #f2a090;
-  --code-foreground: #f7f3e8;
-  --code-info: #a9d5f5;
-  --code-muted: #c2bbad;
-  --code-success: #a9d49a;
-  --code-warning: #efc778;
+  --rule: var(--line);
+  --link: var(--info);
+  --inverse-background: var(--inverse);
+  --code-background: var(--surface-raised);
+  --code-danger: var(--danger);
+  --code-foreground: var(--foreground);
+  --code-info: var(--info);
+  --code-muted: var(--muted);
+  --code-success: var(--success);
+  --code-warning: var(--warning);
   --font-sans: "Nebula Sans", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --font-text: var(--font-sans);
   --font-heading: var(--font-sans);
@@ -26,34 +19,12 @@
   --ui-font-sans: var(--font-sans);
   --ui-font-heading: var(--font-heading);
   --ui-font-mono: var(--font-mono);
-  --hraness-site-accent: #1f5eea;
-  --hraness-site-accent-ink: #ffffff;
+  --hraness-site-accent: var(--primary);
+  --hraness-site-accent-ink: var(--primary-foreground);
   --hraness-site-footer-measure: 72rem;
   font-family: var(--font-sans);
   font-synthesis: none;
   line-height: 1.55;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #141310;
-    --surface: #1c1b18;
-    --foreground: #eee9df;
-    --muted: #b3ac9f;
-    --rule: rgba(238, 233, 223, 0.14);
-    --link: #8fb0ff;
-    --inverse-background: #f0ebdf;
-    --inverse-foreground: #171512;
-    --code-background: #090a0c;
-    --code-danger: #ffad9e;
-    --code-foreground: #fbf8f0;
-    --code-info: #acd9ff;
-    --code-muted: #c8c1b5;
-    --code-success: #b4dfa7;
-    --code-warning: #f3ce81;
-    --hraness-site-accent: #8fb0ff;
-    --hraness-site-accent-ink: #0d1a3d;
-  }
 }
 
 * {
@@ -70,8 +41,7 @@ body {
   margin: 0;
 }
 
-/* Marketing grammar bindings. The product palette above is the source of
- * truth; the grammar reads it through these roles. */
+/* Marketing grammar reads the same shared palette as the rest of HRA. */
 :where(.hraness-marketing-page, .hraness-marketing-header) {
   --hraness-marketing-ink: var(--foreground);
   --hraness-marketing-muted: var(--muted);

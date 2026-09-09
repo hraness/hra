@@ -21,7 +21,7 @@ export const sitePresentationStyles = stylex.create({
   },
   askAi: {
     "--ui-border": "var(--rule)", "--ui-foreground": "var(--foreground)", "--ui-muted": "var(--surface)",
-    "--ui-muted-foreground": "var(--muted)", "--ui-primary": "var(--link)", "--ui-ring": "var(--link)",
+    "--ui-muted-foreground": "var(--muted)", "--ui-primary": "var(--primary)", "--ui-ring": "var(--focus)",
     "padding-block-start": "1.25rem", "padding-block-end": "1.25rem",
     borderTopColor: "var(--rule)", borderTopStyle: "solid", borderTopWidth: "1px",
   },
@@ -47,7 +47,7 @@ export const sitePresentationStyles = stylex.create({
   proseMeasure: { maxWidth: "72ch" },
   proseLink: { color: "var(--link)", textDecorationThickness: "1px", textUnderlineOffset: "0.16em" },
   focusable: {
-    outlineColor: { default: null, ":focus-visible": "var(--link)" },
+    outlineColor: { default: null, ":focus-visible": "var(--focus)" },
     outlineStyle: { default: null, ":focus-visible": "solid" },
     outlineWidth: { default: null, ":focus-visible": "2px" },
     outlineOffset: { default: null, ":focus-visible": "0.2rem" },

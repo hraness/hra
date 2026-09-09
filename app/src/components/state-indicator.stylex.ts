@@ -1,7 +1,7 @@
 import * as stylex from "@stylexjs/stylex";
 
 export const stateIndicatorStyles = stylex.create({
-  accent: { color: "var(--color-accent)" },
+  accent: { color: "var(--color-info)" },
   attention: { color: "var(--color-attention)" },
   danger: { color: "var(--color-danger)" },
   dot: {

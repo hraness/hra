@@ -16,6 +16,7 @@ import { type InlineContent, type PublicContent } from "./content.ts";
 import { ProductPreview } from "./product-preview.tsx";
 import { heroExampleMeasureClassName, mobileHeaderFlowClassName } from "./marketing.stylex.ts";
 import { sitePresentationClasses, type SitePresentationSlot } from "./presentation.stylex.ts";
+import { SiteAppearanceMenu } from "./appearance-menu.tsx";
 
 const classes = (hook: string, ...slots: readonly SitePresentationSlot[]): string =>
   [hook, sitePresentationClasses(...slots)].filter(Boolean).join(" ");
@@ -38,6 +39,7 @@ export function renderMarketingHeader(content: PublicContent, currentPath: strin
   return renderToStaticMarkup(
     <MarketingSiteHeader
       className={mobileHeaderFlowClassName()}
+      trailing={<SiteAppearanceMenu />}
       action={{ emphasis: "primary", href: content.links.app, label: "Open HRA" }}
       brand={content.productName}
       brandHref="/"

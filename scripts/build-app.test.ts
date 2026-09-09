@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterAll, describe, expect, test } from "bun:test";
+import { getDesignPaletteTheme } from "@hraness/design-kit";
 
 import { appDevelopmentConfig, appProductionConfig } from "../app/vite.config.ts";
 import {
@@ -25,14 +26,16 @@ afterAll(async () => {
 });
 
 const entry = "/fixture/app/src/main.tsx";
-const shell = '<!doctype html>\n<html lang="en"><head><meta name="viewport" content="width=device-width, viewport-fit=cover"><meta name="color-scheme" content="dark light"><meta name="referrer" content="no-referrer"><meta name="robots" content="noindex, nofollow"><title>HRA</title></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>\n';
+const shell = '<!doctype html>\n<html lang="en" data-palette="catppuccin" data-theme="dark"><head><meta name="viewport" content="width=device-width, viewport-fit=cover"><meta name="color-scheme" content="dark light"><meta name="referrer" content="no-referrer"><meta name="robots" content="noindex, nofollow"><title>HRA</title></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>\n';
 const chunk = (name: string, code: string, isEntry = false) => ({
   code, facadeModuleId: isEntry ? entry : null, fileName: `assets/${name}.js`, isEntry, map: null, type: "chunk",
 });
+const appearance = { sourcePath: "/fixture/tmp/build-app/build-test/appearance.js", source: "(()=>{window.themeReady=true;})();", verifyInputs: () => Promise.resolve() };
 const bundle = () => ({ output: [
   chunk("main-abc", 'import("./lazy-def.js");', true),
   chunk("lazy-def", "export const loaded=true;"),
   { fileName: "assets/style-ghi.css", source: ":root{color-scheme:dark}", type: "asset" },
+  { fileName: "assets/appearance-jkl.js", source: appearance.source, type: "asset" },
 ] });
 const hashed = (path: string, content: string) => ({ bytes: Buffer.byteLength(content), path, sha256: appSha256(content) });
 const packageBytes = Buffer.from('{"name":"@hraness/hra","version":"0.6.1"}\n');
@@ -45,7 +48,7 @@ const publicationOutput = (
 ): readonly AppArtifact[] => [...output, evidence.markerArtifact]
   .sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0);
 const complete = () => {
-  const graph = snapshotAppGraph(bundle(), entry);
+  const graph = snapshotAppGraph(bundle(), entry, appearance);
   return {
     artifacts: [
       ...graph.artifacts.map((item) => ({ ...item, path: `graphs/client/${item.path}` })),
@@ -53,7 +56,7 @@ const complete = () => {
     ],
     compilerSha256: "a".repeat(64), finalCss: hashed("stylex.css", "@layer components.hraness-stylex.priority1{.x{color:red}}"),
     generationId: "hra-app", graphs: [{ id: "client", receiptSha256: "b".repeat(64) }],
-    kind: "hraness-stylex-complete-generation", packages: [{ manifestSha256: "c".repeat(64), name: "@hraness/ui", version: "0.5.6" }],
+    kind: "hraness-stylex-complete-generation", packages: [{ manifestSha256: "e".repeat(64), name: "@hraness/design-kit", version: "0.6.0" }, { manifestSha256: "c".repeat(64), name: "@hraness/ui", version: "0.5.6" }],
     planSha256: "d".repeat(64), schemaVersion: 2, state: "complete",
     unionPolicySha256: "1ceced1f1bf6359413ca6425ede61e1fdae272b897f4455c2347e2431d75caa1",
   };
@@ -65,7 +68,7 @@ describe("app compiler-owned Vite configuration", () => {
     ["development", appDevelopmentConfig],
   ] as const) {
     test(`leaves ${profile} Vite root and graph output ownership to the public adapter`, () => {
-      const config = configure("/fixture", { directory: "/fixture/generation", planSha256: "a".repeat(64) });
+      const config = configure("/fixture", { directory: "/fixture/generation", planSha256: "a".repeat(64) }, appearance);
       expect(config.root).toBeUndefined();
       expect(config.publicDir).toBeUndefined();
       for (const key of ["assetsInlineLimit", "outDir", "assetsDir", "copyPublicDir", "cssCodeSplit", "emptyOutDir", "lib", "write", "sourcemap"] as const) {
@@ -97,10 +100,11 @@ describe("app graph output values", () => {
 
   test("binds the real entry facade, complete foundation, and lazy output bytes", () => {
     const input = bundle();
-    const graph = snapshotAppGraph(input, entry);
+    const graph = snapshotAppGraph(input, entry, appearance);
     expect(graph.entry).toBe("assets/main-abc.js");
     expect(graph.foundation).toBe("assets/style-ghi.css");
-    expect(graph.artifacts.map(({ path }) => path)).toEqual(["assets/lazy-def.js", "assets/main-abc.js", "assets/style-ghi.css"]);
+    expect(graph.appearance).toBe("assets/appearance-jkl.js");
+    expect(graph.artifacts.map(({ path }) => path)).toEqual(["assets/appearance-jkl.js", "assets/lazy-def.js", "assets/main-abc.js", "assets/style-ghi.css"]);
     const prior = JSON.stringify(graph);
     input.output[0] = chunk("changed", "changed", true);
     expect(JSON.stringify(graph)).toBe(prior);
@@ -114,31 +118,50 @@ describe("app graph output values", () => {
       { output: bundle().output.slice(0, 2) },
       { output: [...bundle().output, { fileName: "assets/extra.css", type: "asset", source: "a{}" }] },
       { output: [{ ...chunk("main", "export{}", true), map: {} }, bundle().output[2]] },
-    ]) expect(() => snapshotAppGraph(input, entry)).toThrow();
+    ]) expect(() => snapshotAppGraph(input, entry, appearance)).toThrow();
   });
 
   test("rejects maps, receipts, source assets, path traversal and duplicate files", () => {
     for (const fileName of ["assets/app.js.map", "assets/source.ts", "assets/source.svg", "stylex-complete.json", "../app.js", "/assets/app.js", "assets/%2e%2e.js", "assets\\app.js", "assets/a.js?x", "assets/a.js#x"]) {
-      expect(() => snapshotAppGraph({ output: [...bundle().output, { fileName, type: "asset", source: "x" }] }, entry)).toThrow();
+      expect(() => snapshotAppGraph({ output: [...bundle().output, { fileName, type: "asset", source: "x" }] }, entry, appearance)).toThrow();
     }
-    expect(() => snapshotAppGraph({ output: [...bundle().output, chunk("lazy-def", "different")] }, entry)).toThrow();
+    expect(() => snapshotAppGraph({ output: [...bundle().output, chunk("lazy-def", "different")] }, entry, appearance)).toThrow();
+  });
+
+  test("requires exactly one classic bootstrap with the original compiler bytes", () => {
+    const base = bundle().output.filter((item) => item.fileName !== "assets/appearance-jkl.js");
+    const bootstrap = { fileName: "assets/appearance-jkl.js", source: appearance.source, type: "asset" };
+    for (const output of [
+      base,
+      [...base, { ...bootstrap, source: `${appearance.source}changed` }],
+      [...base, { ...bootstrap, fileName: "assets/other-bootstrap.js" }],
+      [...base, bootstrap, { ...bootstrap, fileName: "assets/appearance-other.js" }],
+      [...base, chunk("appearance-jkl", appearance.source)],
+    ]) expect(() => snapshotAppGraph({ output }, entry, appearance)).toThrow();
+    expect(snapshotAppGraph({ output: [...base, { ...bootstrap, source: Buffer.from(appearance.source) }] }, entry, appearance).appearance)
+      .toBe(bootstrap.fileName);
   });
 });
 
 describe("registered authored shell", () => {
   test("retains metadata and every other authored byte with foundation before recipes", () => {
-    const graph = snapshotAppGraph(bundle(), entry);
+    const graph = snapshotAppGraph(bundle(), entry, appearance);
     const rendered = prepareAppShell(shell, graph);
     const foundation = '<link rel="stylesheet" href="/graphs/client/assets/style-ghi.css">';
     const recipes = `<link rel="stylesheet" href="${APP_CSS_PLACEHOLDER}">`;
+    const bootstrap = '<script src="/graphs/client/assets/appearance-jkl.js"></script>';
+    const paletteClass = getDesignPaletteTheme("catppuccin", "dark").className;
     expect(rendered.indexOf(foundation)).toBeLessThan(rendered.indexOf(recipes));
-    expect(rendered.indexOf(recipes)).toBeLessThan(rendered.indexOf("</head>"));
-    expect(rendered.replace(`${foundation}\n    ${recipes}\n  `, "")
+    expect(rendered.indexOf(recipes)).toBeLessThan(rendered.indexOf(bootstrap));
+    expect(rendered.indexOf(bootstrap)).toBeLessThan(rendered.indexOf("</head>"));
+    expect(rendered).not.toMatch(/<(?:script)[^>]*(?:async|defer)|<style\b|\bstyle=/u);
+    expect(rendered.replace(`${foundation}\n    ${recipes}\n    ${bootstrap}\n  `, "")
+      .replace(` class="${paletteClass}"`, "")
       .replace("/graphs/client/assets/main-abc.js", "/src/main.tsx")).toBe(shell);
   });
 
   test("fails closed on ambiguous entry, metadata joins, or injected styles", () => {
-    const graph = snapshotAppGraph(bundle(), entry);
+    const graph = snapshotAppGraph(bundle(), entry, appearance);
     for (const changed of [
       shell.replace("/src/main.tsx", "/src/other.tsx"),
       shell.replace("</body>", '<script src="/another.js"></script></body>'),
@@ -148,17 +171,21 @@ describe("registered authored shell", () => {
       shell.replace("<head>", '<head><base href="/elsewhere/">'),
       shell.replace('<div id="root">', '<div style="color:red" id="root">'),
       shell.replace("HRA", APP_CSS_PLACEHOLDER),
+      shell.replace('data-palette="catppuccin"', 'data-palette="gruvbox"'),
+      shell.replace('data-theme="dark"', 'data-theme="light"'),
+      shell.replace('<html lang="en"', '<html class="other" lang="en"'),
       shell.replace('<script type="module" src="/src/main.tsx"></script>', '<!--<script type="module" src="/src/main.tsx"></script>-->'),
     ]) expect(() => prepareAppShell(changed, graph)).toThrow();
   });
 
   test("seals relative links for an immutable development revision", () => {
-    const graph = snapshotAppGraph(bundle(), entry);
+    const graph = snapshotAppGraph(bundle(), entry, appearance);
     const rendered = prepareAppShell(shell, graph, "./")
       .replace(APP_CSS_PLACEHOLDER, "./stylex.css");
     expect(rendered).toContain('src="./graphs/client/assets/main-abc.js"');
     expect(rendered).toContain('href="./graphs/client/assets/style-ghi.css"');
     expect(rendered).toContain('href="./stylex.css"');
+    expect(rendered).toContain('src="./graphs/client/assets/appearance-jkl.js"');
     expect(rendered).not.toMatch(/(?:src|href)="\/(?:graphs|stylex\.css)/u);
   });
 });
@@ -167,7 +194,7 @@ describe("closed public projection and prior publication provenance", () => {
   test("keeps compiler output closed while binding one typed marker into publication", () => {
     const input = complete();
     const compilerOutput = parseAppComplete(input);
-    expect(compilerOutput.map(({ path }) => path)).toEqual(["graphs/client/assets/lazy-def.js", "graphs/client/assets/main-abc.js", "graphs/client/assets/style-ghi.css", "index.html", "stylex.css"]);
+    expect(compilerOutput.map(({ path }) => path)).toEqual(["graphs/client/assets/appearance-jkl.js", "graphs/client/assets/lazy-def.js", "graphs/client/assets/main-abc.js", "graphs/client/assets/style-ghi.css", "index.html", "stylex.css"]);
     expect(compilerOutput.some(({ path }) => path === APP_SOURCE_MARKER_PATH)).toBe(false);
     const evidence = sourceMarker({ VERCEL: "1", VERCEL_GIT_COMMIT_SHA: "e".repeat(40) });
     const output = publicationOutput(compilerOutput, evidence);
@@ -185,6 +212,10 @@ describe("closed public projection and prior publication provenance", () => {
       { unionPolicySha256: undefined }, { state: "building" }, { generationId: "other" }, { rootDirectory: "/private/root" },
       { graphs: [] }, { graphs: [{ id: "ssr", receiptSha256: "b".repeat(64) }] },
       { packages: [{ name: ["@other", "ui"].join("/"), version: "0.5.3", manifestSha256: "c".repeat(64) }] },
+      { packages: complete().packages.slice(1) },
+      { packages: [...complete().packages].reverse() },
+      { packages: [complete().packages[0], complete().packages[0]] },
+      { packages: [...complete().packages, complete().packages[0]] },
       { finalCss: hashed("other.css", "x") },
       { artifacts: [...complete().artifacts, hashed("source.ts", "x")] },
       { artifacts: [...complete().artifacts, hashed("stylex-complete.json", "x")] },
@@ -192,6 +223,7 @@ describe("closed public projection and prior publication provenance", () => {
       { artifacts: [...complete().artifacts, hashed("graphs/client/assets/app.js.map", "x")] },
       { artifacts: [...complete().artifacts].reverse() },
       { artifacts: [complete().artifacts[0], ...complete().artifacts] },
+      { artifacts: complete().artifacts.filter(({ path }) => !path.includes("/appearance-")) },
     ]) expect(() => parseAppComplete({ ...complete(), ...patch })).toThrow();
     for (const bad of [NaN, -1, 0, 1.5, 65 * 1024 * 1024]) {
       expect(() => parseAppComplete({ ...complete(), finalCss: { ...complete().finalCss, bytes: bad } })).toThrow();

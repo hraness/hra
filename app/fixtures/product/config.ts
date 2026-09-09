@@ -4,6 +4,7 @@ import type { Plugin } from "vite";
 
 /** Replace only IO. Production screens, reducers, markdown, and recipes stay real. */
 export const productIoModules = Object.freeze([
+  "app/src/appearance.ts",
   "app/src/custody/custody-context.tsx",
   "app/src/data/archived-sessions.ts",
   "app/src/data/card-order.ts",
@@ -24,6 +25,7 @@ export function productIoPlugin(root: string): Plugin {
   const dataRoot = `${resolve(root, "app/src/data")}/`;
   const custodyRoot = `${resolve(root, "app/src/custody")}/`;
   const authRoot = `${resolve(root, "app/src/auth")}/`;
+  const appearanceStems = ["appearance", "appearance-entry"].map((name) => resolve(root, "app/src", name));
   return {
     name: "hra-product-preview-io", enforce: "pre",
     resolveId(source, importer) {
@@ -37,7 +39,12 @@ export function productIoPlugin(root: string): Plugin {
         assert.ok(!candidate.includes("/components/") && !candidate.includes("/model/") && !candidate.includes("/screens/"));
         return adapter;
       }
-      if (candidate.startsWith(dataRoot) || candidate.startsWith(custodyRoot) || candidate.startsWith(authRoot)) {
+      // Vite strips URL postfixes and maps explicit JS extensions back to TS.
+      // Only the exact appearance adapter above may cross this root-level IO seam.
+      const appearanceIo = appearanceStems.some((stem) => candidate === stem
+        || [".", "?", "#", "/"].some((separator) => candidate.startsWith(`${stem}${separator}`)));
+      if (candidate.startsWith(dataRoot) || candidate.startsWith(custodyRoot) || candidate.startsWith(authRoot)
+        || appearanceIo) {
         throw new Error("Unmapped application IO in product example");
       }
       return null;

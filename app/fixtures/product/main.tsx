@@ -9,7 +9,7 @@ import { createProductPreviewSession, parseProductPreviewSelection, type Product
 import { PRODUCT_SESSION_IDS } from "./fixtures";
 import { installProductPreviewHarness } from "./io";
 import { createPreviewStatusRelay } from "../../../site/product-scenes";
-import "@hraness/ui/compiler-foundation.css";
+import "@hraness/design-kit/compiler-palettes.css";
 import "../../src/index.css";
 
 export type ProductPreviewStatusMessage = Readonly<{

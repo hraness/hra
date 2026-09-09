@@ -133,7 +133,7 @@ export async function assertReviewedReleaseInventory(packageRoot: string): Promi
   const expected = Object.freeze({
     count: 176,
     jsonBytes: 8_316,
-    sha256: "56ac62812868a7fe7bc74e58a41bae8f720869683c691dea2218265efdeea588",
+    sha256: "67d370005adcb3267c57939561e4a242eacfdc12680fde5064a4c5e048cda2e4",
   });
   const inventory: Array<readonly [string, "directory" | "file", number, number]> = [];
   const visit = async (path: string): Promise<void> => {

@@ -6,6 +6,7 @@
 - `marketing.tsx` composes public design-kit server components; `render.ts` is the captured build-time entry for all nine HTML routes.
 - `product-preview.tsx` renders inert real-UI frames and their accessible parent controls. `product-scenes.ts` is their closed public scene catalog; Direct itself stays in the separately built fixture app.
 - `site-entry.ts` progressively enhances scene selection, enlargement, local guide search, and moved reference fragments without authentication or persistence.
+- `appearance-menu.tsx` reexports the pure native header menu owned alongside its static recipe in `app/src/components/appearance-menu*`. The shared app appearance bootstrap drives it; the preview remains a fixed, inert Catppuccin dark surface.
 - `presentation.stylex.ts` and `marketing.stylex.ts` own local component recipes. `foundation.ts` is the build-only CSS entry; `foundation.css` joins approved document foundations and public fonts, without importing legacy component styles. The empty entry chunk stays private.
 - `analytics-site.ts` defines the exact production host, route taxonomy, and event vocabulary.
 - `analytics-entry.ts` is the self-hosted browser entry that initializes bounded PostHog capture.
@@ -15,6 +16,7 @@
 
 - Lead the homepage with the product and actual interface. Lead the installation guide with the real install command and the shortest safe first-run path. Keep startup restrictions adjacent to affected commands.
 - Keep the site free of server runtime dependencies, responsive, keyboard-readable, and useful when its nonessential analytics JavaScript does not run.
+- Keep palette initialization in a classic same-origin head script and ship palette recipes through the captured StyleX union and its foundation bridge. Appearance stores only a bounded palette/mode preference; analytics remains memory-only. Never add executable inline scripts, runtime style injection, or a CSP exception for appearance.
 - Compile local recipes through the public UI build API. Publish completed HTML, stylesheet unions, captured foundations, approved WOFF2 files and attribution, the bounded parent enhancement bundle, and the closed product-preview projection. Keep renderer JavaScript and build receipts private. Use `bun run test:site` for the scoped test transform.
 - Render the canonical `@hraness/site-footer` markup and styles on every navigable HTML page. Keep `/preview/` free of links and other actions. The separately sandboxed real-UI examples refuse all IO and remain inert. Keep HRA project resources outside the footer.
 - State beta, platform, provider, privacy, and account-switch compatibility limits beside the relevant feature.

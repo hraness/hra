@@ -3,6 +3,7 @@ import {
   type HranessMailingListConfig,
 } from "@hraness/site-footer";
 import { highlightCode } from "@hraness/design-kit/syntax-highlighting";
+import { getDesignPaletteTheme } from "@hraness/design-kit";
 import { AskAiAboutThis } from "@hraness/ui";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -29,6 +30,8 @@ const escapeHtml = (value: string): string =>
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
 
+const defaultPalette = getDesignPaletteTheme("catppuccin", "dark");
+const paletteAttributes = `class="${escapeHtml(defaultPalette.className)}" data-palette="catppuccin" data-theme="dark"`;
 const classes = (hook: string, ...slots: readonly SitePresentationSlot[]): string =>
   [hook, sitePresentationClasses(...slots)].filter(Boolean).join(" ");
 
@@ -160,6 +163,7 @@ const renderHead = (
     readonly canonicalPath: string;
     readonly description: string;
     readonly includeStructuredData?: boolean;
+    readonly interactiveAppearance?: boolean;
     readonly image?: Readonly<{
       alt: string;
       height?: number;
@@ -225,8 +229,8 @@ ${image.type === undefined ? "" : `<meta property="og:image:type" content="${esc
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:image" content="${escapeHtml(image.src)}">
 <meta name="twitter:image:alt" content="${escapeHtml(image.alt)}">
-<meta name="theme-color" content="#fbfaf7" media="(prefers-color-scheme: light)">
-<meta name="theme-color" content="#141310" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="${escapeHtml(defaultPalette.background)}">
+${options.interactiveAppearance === false ? "" : '<script src="/appearance.js"></script>'}
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/styles.css">${structuredData}`;
 };
@@ -246,7 +250,7 @@ export const renderSiteHtml = (
   environment: Readonly<Record<string, string | undefined>> = emptySiteEnvironment,
 ): string => {
   return `<!doctype html>
-<html lang="en">
+<html ${paletteAttributes} lang="en">
 <head>
 ${renderHead(content, {
   canonicalPath: "/",
@@ -273,12 +277,13 @@ ${renderHraAnalyticsScript()}
 
 export const renderPreviewHtml = (content: PublicContent = publicContent): string =>
   `<!doctype html>
-<html lang="en">
+<html ${paletteAttributes} lang="en">
 <head>
 ${renderHead(content, {
   canonicalPath: "/",
   description: content.description,
   includeStructuredData: false,
+  interactiveAppearance: false,
   robots: "noindex, nofollow",
   title: `${content.productName} | ${content.tagline}`,
 })}
@@ -305,7 +310,7 @@ export const renderPrivacyHtml = (
 ): string => {
   const privacy = findSection(content, "privacy");
   return `<!doctype html>
-<html lang="en">
+<html ${paletteAttributes} lang="en">
 <head>
 ${renderHead(content, {
   canonicalPath: "/privacy/",
@@ -341,7 +346,7 @@ export const renderDocsHtml = (
   const nav = docsPages.map((item) => `<a class="${docsClasses("navLink")}" data-doc-search="${escapeHtml([item.title, item.description, ...item.keywords, ...item.sections.map(({ heading }) => heading)].join(" "))}" href="${item.path}"${item.path === page.path ? ' aria-current="page"' : ""}>${escapeHtml(docsLabel(item))}</a>`).join("");
   const sections = [...page.sections, ...reference];
   return `<!doctype html>
-<html lang="en"><head>
+<html ${paletteAttributes} lang="en"><head>
 ${renderHead(content, { canonicalPath: page.path, description: page.description, title: `${page.title} | HRA`, jsonLd: { "@context": "https://schema.org", "@type": "TechArticle", headline: page.title, description: page.description, url: `${content.siteUrl}${page.path}`, dateModified: page.reviewDate, author: { "@type": "Organization", name: "Hraness", url: content.links.hraness }, isPartOf: { "@type": "WebSite", name: "HRA", url: content.siteUrl } } })}
 <link rel="alternate" type="text/markdown" href="${page.path}index.md" title="Markdown">
 </head><body>

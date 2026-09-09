@@ -6,9 +6,12 @@ import {
   artifactForFile, compilerSha256, createStylexGeneration, finalizeStylexGeneration,
   prepareStylexProducedTemplate, sealStylexProducedTemplate, stylexUnionPolicySha256,
 } from "@hraness/ui/stylex-build";
+import { stylexVite } from "@hraness/ui/stylex-build/vite";
+import { getDesignPaletteTheme } from "@hraness/design-kit";
+import react from "@vitejs/plugin-react";
 import { parseHTML } from "linkedom";
 import { z } from "zod";
-import { APP_CSS_PLACEHOLDER, prepareAppShell, snapshotAppGraph, type AppArtifact, type AppGraph } from "./build-app.ts";
+import { APP_CSS_PLACEHOLDER, type AppArtifact } from "./build-app.ts";
 
 export const PRODUCT_PREVIEW_BASE = "/examples/app/";
 export const PRODUCT_PREVIEW_CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src data: blob:; font-src 'self'; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'; worker-src 'none'";
@@ -20,18 +23,58 @@ const hash = (bytes: Uint8Array | string): string => createHash("sha256").update
 const sha = z.string().regex(/^[a-f0-9]{64}$/u);
 const publicPath = z.string().regex(/^(?:index\.html|stylex\.css|graphs\/client\/assets\/[A-Za-z0-9_-][A-Za-z0-9_.-]*\.(?:js|css))$/u);
 const artifact = z.object({ path: publicPath, bytes: z.number().int().min(1).max(64 * 1024 * 1024), sha256: sha }).strict();
+export type ProductPreviewGraph = Readonly<{ artifacts: readonly AppArtifact[]; entry: string; foundation: string }>;
+const graphPath = z.string().regex(/^assets\/[A-Za-z0-9_-][A-Za-z0-9_.-]*\.(?:js|css)$/u);
+const graphOutput = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("chunk"), fileName: graphPath, code: z.string().min(1), isEntry: z.boolean(), facadeModuleId: z.string().nullable().optional(), map: z.null().optional() }),
+  z.object({ type: z.literal("asset"), fileName: graphPath, source: z.union([z.string().min(1), z.instanceof(Uint8Array)]) }),
+]);
+const packageVersion = z.string().regex(/^\d+\.\d+\.\d+$/u);
 const completeSchema = z.object({
   artifacts: z.array(artifact).min(3).max(4095), compilerSha256: z.literal(compilerSha256),
   finalCss: artifact, generationId: z.literal(generationId),
   graphs: z.array(z.object({ id: z.literal("client"), receiptSha256: sha }).strict()).length(1),
   kind: z.literal("hraness-stylex-complete-generation"),
-  packages: z.array(z.object({ manifestSha256: sha, name: z.literal("@hraness/ui"), version: z.string().regex(/^\d+\.\d+\.\d+$/u) }).strict()).length(1),
+  packages: z.tuple([
+    z.object({ manifestSha256: sha, name: z.literal("@hraness/design-kit"), version: packageVersion }).strict(),
+    z.object({ manifestSha256: sha, name: z.literal("@hraness/ui"), version: packageVersion }).strict(),
+  ]),
   planSha256: sha, schemaVersion: z.literal(2), state: z.literal("complete"),
   unionPolicySha256: z.literal(stylexUnionPolicySha256),
 }).strict();
 
-/** Preserve the production shell join while confining every preview resource. */
-export function prepareProductPreviewShell(source: string, graph: AppGraph): string {
+/** The preview has one real module and no classic storage-capable bootstrap. */
+export function snapshotProductPreviewGraph(value: unknown, absoluteEntry: string): ProductPreviewGraph {
+  assert.ok(isAbsolute(absoluteEntry));
+  const result = z.object({ output: z.array(graphOutput).min(2).max(4094) }).parse(value);
+  const entries: string[] = [], foundations: string[] = [];
+  const artifacts = result.output.map((item): AppArtifact => {
+    if (item.type === "chunk") {
+      assert.ok(item.fileName.endsWith(".js"), "Preview chunks must be JavaScript");
+      if (item.isEntry) {
+        assert.equal(item.facadeModuleId, absoluteEntry, "Unregistered preview entry");
+        entries.push(item.fileName);
+      }
+    } else {
+      assert.ok(item.fileName.endsWith(".css"), "Preview cannot acquire a classic appearance or other static program");
+      foundations.push(item.fileName);
+    }
+    const bytes = item.type === "chunk" ? item.code : item.source;
+    const captured = { path: item.fileName, bytes: Buffer.byteLength(bytes), sha256: hash(bytes) };
+    artifact.parse({ ...captured, path: `graphs/client/${captured.path}` });
+    return captured;
+  }).sort((left, right) => left.path.localeCompare(right.path));
+  assert.equal(entries.length, 1, "The preview must have exactly one module entry");
+  assert.equal(foundations.length, 1, "The preview must have one complete themed foundation stylesheet");
+  assert.equal(new Set(artifacts.map(({ path }) => path)).size, artifacts.length, "Duplicate preview graph artifact");
+  assert.ok(artifacts.reduce((total, item) => total + item.bytes, 0) <= 256 * 1024 * 1024);
+  const entry = entries[0], foundation = foundations[0];
+  assert.ok(entry !== undefined && foundation !== undefined);
+  return { artifacts, entry, foundation };
+}
+
+/** Confine resources and apply the shared default theme without preference IO. */
+export function prepareProductPreviewShell(source: string, graph: ProductPreviewGraph): string {
   assert.ok(Buffer.byteLength(source) > 0 && Buffer.byteLength(source) <= 64 * 1024);
   const { document } = parseHTML(source);
   const policy = document.querySelectorAll("meta[http-equiv]");
@@ -49,17 +92,32 @@ export function prepareProductPreviewShell(source: string, graph: AppGraph): str
       assert.ok(!/^on/iu.test(attribute.name), "Preview shell must not contain inline handlers");
     }
   }
+  const entryTag = '<script type="module" src="/src/main.tsx"></script>';
+  const htmlTag = '<html lang="en" data-theme="dark">';
+  assert.equal(source.split(entryTag).length - 1, 1, "Authored preview entry changed");
+  assert.equal(source.split(htmlTag).length - 1, 1, "Authored preview theme boundary changed");
+  assert.equal((source.match(/<script\b/giu) ?? []).length, 1);
+  assert.equal(source.split("</head>").length - 1, 1);
+  assert.ok(!/<!--|<\?|<!\[CDATA\[|<(?:template|noscript|svg|math)\b/iu.test(source), "Preview must retain its active native HTML boundary");
+  assert.ok(!/<(?:style|link|base)\b|\bstyle\s*=/iu.test(source), "Unexpected preview stylesheet or inline style");
+  assert.ok(!source.includes(APP_CSS_PLACEHOLDER));
+  assert.ok(graphPath.parse(graph.entry).endsWith(".js") && graphPath.parse(graph.foundation).endsWith(".css"));
+  const paletteClass = getDesignPaletteTheme("catppuccin", "dark").className;
+  assert.match(paletteClass, /^[A-Za-z0-9_-]+(?: [A-Za-z0-9_-]+)*$/u);
   // Relative links preserve the compiler's exact graph topology when the
   // complete public directory is mounted at PRODUCT_PREVIEW_BASE. Absolute
   // mount prefixes would name artifacts outside this registered generation.
-  return prepareAppShell(source, graph, "./");
+  const themedHtmlTag = `<html lang="en" data-theme="dark" data-palette="catppuccin" class="${paletteClass}">`;
+  return source.replace(htmlTag, themedHtmlTag)
+    .replace(entryTag, `<script type="module" src="./graphs/client/${graph.entry}"></script>`)
+    .replace("</head>", `<link rel="stylesheet" href="./graphs/client/${graph.foundation}">\n    <link rel="stylesheet" href="${APP_CSS_PLACEHOLDER}">\n  </head>`);
 }
 
 /** Project only the exact compiled graph, sealed shell and finalized stylesheet. */
 export function projectProductPreviewArtifacts(
   value: unknown,
   planSha256: string,
-  graph: AppGraph,
+  graph: ProductPreviewGraph,
   shell: AppArtifact,
   finalCss: AppArtifact,
 ): readonly AppArtifact[] {
@@ -98,29 +156,31 @@ export async function buildProductPreview(options: Readonly<{
   const publicDirectory = join(output, "public");
   await mkdir(publicDirectory, { mode: 0o700 });
   const shell = await readFile(join(root, shellPath), "utf8");
-  const { appProductionConfig } = await import("../app/vite.config.ts");
   const { productIoPlugin } = await import("../app/fixtures/product/config.ts");
   const { build } = await import("vite");
   const generation = await createStylexGeneration({
     expectedGraphs: [{ adapter: "vite", entrypoints: [entry], id: "client", kind: "client" }],
     finalCssPath: "stylex.css", generationId, outputDirectory: completeRoot,
-    packageManifests: [Bun.resolveSync("@hraness/ui/stylex-manifest.json", root)], rootDirectory: root,
+    packageManifests: [Bun.resolveSync("@hraness/ui/stylex-manifest.json", root), Bun.resolveSync("@hraness/design-kit/stylex-manifest.json", root)], rootDirectory: root,
     templates: [{ cssHref: PRODUCT_PREVIEW_CSS_HREF, graphId: "client", outputPath: "index.html", sourcePath: shellPath, stylesheetGraphId: "client" }],
   });
-  const config = appProductionConfig(root, generation);
   const directLicense = (await readFile(join(root, "node_modules/@hraness/direct/LICENSE"), "utf8")).trim();
   assert.ok(directLicense.length > 0 && Buffer.byteLength(directLicense) <= 16 * 1024 && !directLicense.includes("*/"));
   // A source comment can be removed during transforms. Capture attribution in
   // the compiled graph itself, before its artifacts are hashed and sealed.
   // Chunk imports and shell links stay within the mounted preview directory.
   // No production build config or entry is modified.
-  config.base = "./";
-  config.esbuild = { legalComments: "inline" };
-  config.plugins = [productIoPlugin(root), {
-    name: "hra-product-preview-license",
-    banner: () => `/*! @license @hraness/direct\n${directLicense}\n*/`,
-  }, ...(config.plugins ?? [])];
-  const graph = snapshotAppGraph(await build(config), join(root, entry));
+  const graph = snapshotProductPreviewGraph(await build({
+    base: "./", build: { target: "es2022" }, configFile: false,
+    define: { "process.env.NODE_ENV": JSON.stringify("production") }, envFile: false, mode: "production",
+    esbuild: { legalComments: "inline" },
+    // The public adapter still owns root, input, output, no inlining and maps.
+    // No production appearance bootstrap may enter this offline graph.
+    plugins: [productIoPlugin(root), {
+      name: "hra-product-preview-license",
+      banner: () => `/*! @license @hraness/direct\n${directLicense}\n*/`,
+    }, stylexVite({ generation, graphId: "client", rootDirectory: root }), react()],
+  }), join(root, entry));
   const prepared = await prepareStylexProducedTemplate(generation, "index.html");
   const html = prepareProductPreviewShell(shell, graph);
   await writeFile(prepared.sourcePath, html, { flag: "wx", mode: 0o600 });

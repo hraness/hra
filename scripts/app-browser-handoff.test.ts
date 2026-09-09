@@ -32,14 +32,13 @@ test("browser source capture binds every product fixture input without weakening
     "app/fixtures/product/config.ts", "app/fixtures/product/main.tsx", "app/fixtures/product/io.ts",
     "app/fixtures/product/definition.ts", "app/fixtures/product/fixtures.ts", "app/fixtures/product/index.html",
     "app/fixtures/browser/config.ts", "app/src/screens/settings-screen.tsx", "scripts/app-browser.ts", "bun.lock",
-    "site/product-scenes.ts",
+    "site/product-scenes.ts", "scripts/build-appearance.ts", "app/src/appearance.ts", "app/src/appearance-entry.ts",
   ]) expect(captured.find((row) => row.path === path)).toEqual(await browserFile(root, path));
   expect(new Set(captured.map(({ path }) => path)).size).toBe(captured.length);
 });
 
-test("shared preview status source mutation invalidates the original browser request", async () => {
+test.each(["site/product-scenes.ts", "scripts/build-appearance.ts", "app/src/appearance.ts", "app/src/appearance-entry.ts"])("shared preview or appearance source %s mutation invalidates the original browser request", async (sharedPath) => {
   const repository = await realpath(resolve(import.meta.dirname, ".."));
-  const sharedPath = "site/product-scenes.ts";
   const sourcePaths = new Set([...(await browserSources(repository)).map(({ path }) => path), sharedPath]);
   const root = await realpath(await mkdtemp(join(tmpdir(), "browser-shared-source-test-")));
   try {

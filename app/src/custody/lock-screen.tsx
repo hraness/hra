@@ -1,3 +1,4 @@
+import { AppearanceHeader } from "../components/appearance";
 import { useAuthActions } from "@convex-dev/auth/react";
 import * as stylex from "@stylexjs/stylex";
 
@@ -17,6 +18,7 @@ export function LockScreen() {
 
   return (
     <main {...stylex.props(lockStyles.root)}>
+      <AppearanceHeader />
       <Card>
         <CardHeader>
           <CardTitle>Locked</CardTitle>

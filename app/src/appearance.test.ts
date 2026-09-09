@@ -1,39 +1,54 @@
 import { expect, test } from "bun:test";
 import assert from "node:assert/strict";
 
-async function assertDarkShell(source: string): Promise<void> {
-  const roots: (string | null)[] = [];
+async function assertDefaultShell(source: string): Promise<void> {
+  const palettes: (string | null)[] = [];
+  const themes: (string | null)[] = [];
   const schemes: (string | null)[] = [];
   await new HTMLRewriter()
-    .on("html", { element(element) { roots.push(element.getAttribute("data-theme")); } })
+    .on("html", { element(element) {
+      palettes.push(element.getAttribute("data-palette"));
+      themes.push(element.getAttribute("data-theme"));
+    } })
     .on('meta[name="color-scheme"]', { element(element) { schemes.push(element.getAttribute("content")); } })
     .transform(new Response(source)).arrayBuffer();
-  assert.deepEqual(roots, ["dark"], "HRA must explicitly select the public dark foundation");
-  assert.deepEqual(schemes, ["dark"], "HRA must retain its fixed-dark scheme before styles load");
+  assert.deepEqual(palettes, ["catppuccin"], "HRA must select its default palette before bootstrap delivery");
+  assert.deepEqual(themes, ["dark"], "HRA must select dark until a saved preference is applied");
+  assert.deepEqual(schemes, ["dark light"], "HRA must support both selectable appearances");
 }
 
-test("the app shell selects its fixed-dark appearance before and after foundation delivery", async () => {
+test("the authored shell names Catppuccin dark before the saved preference bootstrap", async () => {
   const source = await Bun.file(new URL("../index.html", import.meta.url)).text();
-  await assertDarkShell(source);
+  await assertDefaultShell(source);
 });
 
-test("appearance proof rejects absent or light theme and OS-dependent early schemes", async () => {
+test("appearance proof rejects absent defaults and a fixed light-only or dark-only scheme", async () => {
   const source = await Bun.file(new URL("../index.html", import.meta.url)).text();
   for (const changed of [
+    source.replace(' data-palette="catppuccin"', ""),
+    source.replace('data-palette="catppuccin"', 'data-palette="gruvbox"'),
     source.replace(' data-theme="dark"', ""),
     source.replace('data-theme="dark"', 'data-theme="light"'),
-    source.replace('name="color-scheme" content="dark"', 'name="color-scheme" content="dark light"'),
-    source.replace('name="color-scheme" content="dark"', 'name="color-scheme" content="light"'),
-  ]) await expect(assertDarkShell(changed)).rejects.toThrow();
+    source.replace('name="color-scheme" content="dark light"', 'name="color-scheme" content="dark"'),
+    source.replace('name="color-scheme" content="dark light"', 'name="color-scheme" content="light"'),
+  ]) await expect(assertDefaultShell(changed)).rejects.toThrow();
 });
 
-test("the installed foundation exposes the selected explicit dark token boundary", async () => {
-  const foundationUrl = new URL(import.meta.resolve("@hraness/ui/compiler-foundation.css"));
+test("the compiler palette entry joins shared roles without fonts or standalone recipes", async () => {
+  const foundationUrl = new URL(import.meta.resolve("@hraness/design-kit/compiler-palettes.css"));
   const foundation = await Bun.file(foundationUrl).text();
-  expect(foundation).toContain('@import "./tokens.css";');
-  const tokens = await Bun.file(new URL("./tokens.css", foundationUrl)).text();
-  // These are public selectors, not generated recipe/class-name snapshots.
-  expect(tokens).toMatch(/:root\[data-theme="dark"\],\s*\[data-theme="dark"\],\s*\.dark\s*\{\s*color-scheme:\s*dark;/u);
+  expect(foundation).toContain('@import "@hraness/ui/compiler-foundation.css";');
+  expect(foundation).toContain('@import "./palette-bridge.css";');
+  expect(foundation).not.toContain("dist/stylex.css");
+  expect(foundation).not.toMatch(/@font-face|@import\s+["'][^"']*fonts/iu);
+  expect(foundation).not.toMatch(/@import\s+["'][^"']*compiler-tokens/iu);
+  const bridge = await Bun.file(new URL("./palette-bridge.css", foundationUrl)).text();
+  expect(bridge).toContain("hraness-palette");
+  expect(bridge).toContain("--primary:");
+  expect(bridge).toContain("--focus:");
   const appCss = await Bun.file(new URL("./index.css", import.meta.url)).text();
-  expect(appCss).toMatch(/@layer base\s*\{\s*html\s*\{[^}]*color-scheme:\s*dark;/u);
+  expect(appCss).toContain("--color-surface: var(--background)");
+  expect(appCss).toContain("--color-accent: var(--primary)");
+  expect(appCss).toContain("outline: 2px solid var(--focus)");
+  expect(appCss).not.toMatch(/color-scheme:\s*dark/u);
 });
