@@ -33,12 +33,13 @@ export function observeBrowserCustody(observer: BrowserCustodyObserver | undefin
       : Object.freeze({ ...observation, origins: Object.freeze([...observation.origins]), pids: Object.freeze([...observation.pids]) });
   assert.equal(observer(frozen), undefined, "Browser custody observation must finish synchronously");
 }
-type BrowserFailure = Readonly<{ name: string; message: string; cause?: BrowserFailure; errors?: readonly BrowserFailure[]; settlement?: StylesheetSettlementDiagnostics }>;
+type BrowserFailure = Readonly<{ name: string; message: string; cause?: BrowserFailure; errors?: readonly BrowserFailure[]; settlement?: StylesheetSettlementDiagnostics; focus?: ReturnType<typeof focusStripDiagnostics> }>;
 export function browserFailureDetails(value: unknown, depth = 0): BrowserFailure {
   if (!(value instanceof Error)) return { name: "UnknownFailure", message: typeof value === "string" ? value.slice(0, 1000) : typeof value };
   return {
     name: value.name.slice(0, 80), message: value.message.slice(0, 1000),
     ...(value instanceof StylesheetSettlementError ? { settlement: value.diagnostics } : {}),
+    ...(value instanceof FocusStripAssertionError ? { focus: value.diagnostics } : {}),
     ...(depth < 3 && value.cause !== undefined ? { cause: browserFailureDetails(value.cause, depth + 1) } : {}),
     ...(depth < 3 && value instanceof AggregateError ? { errors: value.errors.slice(0, 8).map((error: unknown) => browserFailureDetails(error, depth + 1)) } : {}),
   };
@@ -781,6 +782,45 @@ export function assertNativeModalFocus(value: unknown): void {
 /** The fixture's offset ring is visible below the primary button. Its own
  * Highlight fill is not the paint adjacent to that exposed outline strip. */
 export function assertKeyboardFocusStrip(value: unknown, forced: boolean): void {
+  try { checkKeyboardFocusStrip(value, forced); }
+  catch (error) { throw new FocusStripAssertionError(error, value); }
+}
+
+/** Copy only bounded geometry and paint predicates, never DOM text or URLs. */
+function focusStripDiagnostics(value: unknown) {
+  const object = (value: unknown): Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown> : {};
+  const number = (value: unknown) => typeof value === "number" && Number.isFinite(value) && Math.abs(value) <= 10_000_000 ? value : null;
+  const boolean = (value: unknown) => typeof value === "boolean" ? value : null;
+  const tag = (value: unknown) => typeof value === "string" && /^[A-Z][A-Z0-9-]{0,31}$/u.test(value) ? value : null;
+  const color = (value: unknown) => typeof value === "string" && value.length <= 100 && /^rgba?\([\d., ]+\)$/u.test(value) ? value : null;
+  const overflow = (value: unknown) => typeof value === "string" && ["visible", "hidden", "clip", "scroll", "auto"].includes(value) ? value : null;
+  const rectangle = (value: unknown) => Array.isArray(value) && value.length === 4 ? value.map(number) : null;
+  const rows = (value: unknown, cap: number) => Array.isArray(value) ? value.slice(0, cap).map(object) : [];
+  const sample = object(value);
+  const geometry = object(sample.geometry);
+  return {
+    width: number(sample.width), offset: number(sample.offset), forced: boolean(sample.forced), focusVisible: boolean(sample.focusVisible),
+    exposed: boolean(sample.exposed), target: rectangle(geometry.target), targetOpacity: number(geometry.targetOpacity),
+    points: rows(geometry.points, 3).map((point) => ({ x: number(point.x), y: number(point.y), hitTag: tag(point.hitTag),
+      parentHit: boolean(point.parentHit), targetHit: boolean(point.targetHit), ancestorHit: boolean(point.ancestorHit), siblingHit: boolean(point.siblingHit),
+      hitBounds: rectangle(point.hitBounds), hitBackground: color(point.hitBackground), hitOpacity: number(point.hitOpacity), hitImageNone: boolean(point.hitImageNone) })),
+    ancestors: rows(geometry.ancestors, 16).map((ancestor) => ({ tag: tag(ancestor.tag), bounds: rectangle(ancestor.bounds),
+      opacity: number(ancestor.opacity), imageNone: boolean(ancestor.imageNone), containsStrip: boolean(ancestor.containsStrip),
+      background: color(ancestor.background), overflowX: overflow(ancestor.overflowX), overflowY: overflow(ancestor.overflowY) })),
+    depthExceeded: boolean(geometry.depthExceeded),
+  };
+}
+
+class FocusStripAssertionError extends assert.AssertionError {
+  readonly diagnostics: ReturnType<typeof focusStripDiagnostics>;
+  constructor(error: unknown, sample: unknown) {
+    super({ message: error instanceof Error ? error.message : "Keyboard focus strip verification failed" });
+    this.diagnostics = focusStripDiagnostics(sample);
+  }
+}
+
+function checkKeyboardFocusStrip(value: unknown, forced: boolean): void {
   const sample = record(value);
   assert.equal(sample.focusVisible, true, "Keyboard focus did not reach Open sheet");
   assert.equal(sample.forced, forced, "Focus verification lost its native media mode");
@@ -910,19 +950,37 @@ async function primitives(page: Page, profile: Profile, reportNegative: Negative
     const offset = Number.parseFloat(css.outlineOffset);
     // Side strips can meet the fixture's adjacent buttons. Prove this exposed
     // bottom strip instead, using actual hit testing and its ancestor paint.
-    const points = [0.25, 0.5, 0.75].map((fraction) => ({ x: box.left + box.width * fraction, y: box.bottom + offset + width / 2 }));
+    const points = [0.25, 0.5, 0.75].map((fraction) => {
+      const x = box.left + box.width * fraction;
+      const y = box.bottom + offset + width / 2;
+      const hit = document.elementFromPoint(x, y);
+      const hitPaint = hit === null ? null : getComputedStyle(hit);
+      const hitBounds = hit?.getBoundingClientRect();
+      return { x, y, hitTag: hit?.tagName ?? null, parentHit: hit === element.parentElement,
+        targetHit: hit === element, ancestorHit: hit !== element && hit?.contains(element) === true,
+        siblingHit: hit !== element && hit?.parentElement === element.parentElement,
+        hitBounds: hitBounds === undefined ? null : [hitBounds.left, hitBounds.top, hitBounds.right, hitBounds.bottom],
+        hitBackground: hitPaint?.backgroundColor ?? null, hitOpacity: hitPaint === null ? null : Number(hitPaint.opacity),
+        hitImageNone: hitPaint === null ? null : hitPaint.backgroundImage === "none" };
+    });
     let exposed = css.opacity === "1"
-      && points.every(({ x, y }) => document.elementFromPoint(x, y) === element.parentElement);
+      && points.every(({ parentHit }) => parentHit);
     const backgrounds: string[] = [];
+    const ancestors = [];
+    let depthExceeded = false;
     for (let ancestor = element.parentElement; ancestor !== null; ancestor = ancestor.parentElement) {
-      if (backgrounds.length === 16) { exposed = false; break; }
+      if (backgrounds.length === 16) { exposed = false; depthExceeded = true; break; }
       const paint = getComputedStyle(ancestor);
       const bounds = ancestor.getBoundingClientRect();
-      exposed &&= paint.backgroundImage === "none" && paint.opacity === "1"
-        && points.every(({ x, y }) => x >= bounds.left && x < bounds.right && y - width / 2 >= bounds.top && y + width / 2 < bounds.bottom);
+      const containsStrip = points.every(({ x, y }) => x >= bounds.left && x < bounds.right && y - width / 2 >= bounds.top && y + width / 2 < bounds.bottom);
+      exposed &&= paint.backgroundImage === "none" && paint.opacity === "1" && containsStrip;
       backgrounds.push(paint.backgroundColor);
+      ancestors.push({ tag: ancestor.tagName, bounds: [bounds.left, bounds.top, bounds.right, bounds.bottom],
+        opacity: Number(paint.opacity), imageNone: paint.backgroundImage === "none", containsStrip,
+        background: paint.backgroundColor, overflowX: paint.overflowX, overflowY: paint.overflowY });
     }
     return { outline: css.outlineStyle, width, offset, color: css.outlineColor, backgrounds, exposed,
+      geometry: { target: [box.left, box.top, box.right, box.bottom], targetOpacity: Number(css.opacity), points, ancestors, depthExceeded },
       focusVisible: document.activeElement === element && element.matches(":focus-visible"),
       forced: matchMedia("(forced-colors: active)").matches };
   });

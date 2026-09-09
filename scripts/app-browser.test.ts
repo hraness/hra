@@ -214,6 +214,34 @@ test("offset focus contrast uses the exposed surface and composites native alpha
   expect(() => assertKeyboardFocusStrip({ ...sample, forced: false, exposed: false }, false)).not.toThrow();
 });
 
+test("focus failure receipts retain the exact failed geometry predicate without arbitrary browser data", () => {
+  const sample = { focusVisible: true, forced: true, outline: "solid", width: 2, offset: 2, exposed: false,
+    geometry: { target: [10, 20, 110, 64], targetOpacity: 1, depthExceeded: false,
+      points: [{ x: 35, y: 67, hitTag: "DIV", parentHit: false, targetHit: false, ancestorHit: false, siblingHit: true,
+        hitBounds: [0, 64, 1280, 90], hitBackground: "rgba(0, 0, 0, 0)", hitOpacity: 1, hitImageNone: true }],
+      ancestors: [{ tag: "DIV", bounds: [0, 0, 1280, 90], opacity: 1, imageNone: true, containsStrip: true,
+        background: "rgb(0, 0, 0)", overflowX: "visible", overflowY: "visible" }],
+      privateText: "must not escape", url: "https://private.invalid" },
+  };
+  const details = (value: unknown) => {
+    try { assertKeyboardFocusStrip(value, true); throw new Error("Expected a focus failure"); }
+    catch (error) { return browserFailureDetails(error); }
+  };
+  const failure = details(sample);
+  expect(failure.name).toBe("AssertionError");
+  expect(failure.message).toContain("clipped or covered");
+  expect(failure.focus).toEqual({ width: 2, offset: 2, forced: true, focusVisible: true, exposed: false,
+    target: sample.geometry.target, targetOpacity: 1, points: sample.geometry.points, ancestors: sample.geometry.ancestors, depthExceeded: false });
+  expect(JSON.stringify(failure)).not.toContain("private");
+  const bounded = details({ ...sample, width: Infinity, geometry: { ...sample.geometry,
+    points: Array(30).fill({ x: NaN, y: 1e20, hitTag: "private text" }), ancestors: Array(100).fill(sample.geometry.ancestors[0]) } });
+  expect(bounded.focus?.width).toBeNull();
+  expect(bounded.focus?.points).toHaveLength(3);
+  expect(bounded.focus?.points[0]).toEqual({ x: null, y: null, hitTag: null, parentHit: null, targetHit: null, ancestorHit: null,
+    siblingHit: null, hitBounds: null, hitBackground: null, hitOpacity: null, hitImageNone: null });
+  expect(bounded.focus?.ancestors).toHaveLength(16);
+});
+
 function stylesheetFixture() {
   class Link {
     isConnected = true;
