@@ -31,6 +31,15 @@ const origin = (index = 1): SessionSwitchAdoptionOrigin => ({
   originalAuthorityRevision: 7, createdAt: 100,
 });
 
+// Deliberate root-only corruption: do not parse/reserialize away duplicate keys
+// or alter nested authority objects and raw numeric spellings under test.
+function prependUnreviewedRootField(document: string, expectedPrefix: string): string {
+  if (!document.startsWith(expectedPrefix) || !document.endsWith("}")) {
+    throw new Error("SYNTHETIC_ADOPTION_INPUT_PREFIX_INVALID");
+  }
+  return '{"unreviewed":true,' + document.slice(1);
+}
+
 // The unit fixture contains the real boundary's queried fields. The StateStore
 // integration suite additionally proves these guards with the complete schema.
 function fixture(personal = false): Database {
@@ -167,6 +176,18 @@ function claudeSourceFixture(runtimeScope: "managed" | "personal"): Readonly<{
 }
 
 describe("switch adoption authority capsule", () => {
+  test.each([
+    ['{"attemptId":"synthetic",', '{"attemptId":"synthetic","nested":{"kept":1.0,"kept":2},"raw":"{}"}'],
+    ['{"version":1,', '{"version":1,"nested":{"kept":1.0,"kept":2},"raw":"{}"}'],
+  ])("root-field corruption preserves the raw suffix after %s", (prefix, document) => {
+    const corrupted = prependUnreviewedRootField(document, prefix);
+    expect(corrupted).toBe(`{"unreviewed":true,${prefix.slice(1)}"nested":{"kept":1.0,"kept":2},"raw":"{}"}`);
+    expect(corrupted.slice('{"unreviewed":true,'.length)).toBe(document.slice(1));
+    for (const invalid of ["[]", "{}", ` ${document}`, document.slice(0, -1), '{"other":1}']) {
+      expect(() => prependUnreviewedRootField(invalid, prefix)).toThrow("SYNTHETIC_ADOPTION_INPUT_PREFIX_INVALID");
+    }
+  });
+
   test("admits an exact personal Claude source without authenticating its managed home", () => {
     const { database, value, processDigest } = claudeSourceFixture("personal");
     prepare(database, value);
@@ -244,13 +265,13 @@ describe("switch adoption authority capsule", () => {
         "SELECT * FROM session_switch_adoption_capsules",
       ).get());
     const changes: readonly Readonly<{ field: "origin_json" | "capsule_json"; mutate: (value: string) => string }>[] = [
-      { field: "origin_json", mutate: (value) => value.replace('{', '{"unreviewed":true,') },
+      { field: "origin_json", mutate: (value) => prependUnreviewedRootField(value, `{"attemptId":${JSON.stringify(row.attempt_id)},`) },
       { field: "origin_json", mutate: (value) => value.replace('"createdAt":100', '"createdAt":"100"') },
       { field: "origin_json", mutate: (value) => value.replace('"createdAt":100', '"createdAt":100.5') },
       { field: "origin_json", mutate: (value) => value.replace('"createdAt":100', '"createdAt":9007199254740992') },
       { field: "origin_json", mutate: (value) => value.replace('"bindingGeneration":2', '"bindingGeneration":"2"') },
       { field: "origin_json", mutate: (value) => value.replace('"processGeneration":3', '"processGeneration":3,"processGeneration":3') },
-      { field: "capsule_json", mutate: (value) => value.replace('{', '{"unreviewed":true,') },
+      { field: "capsule_json", mutate: (value) => prependUnreviewedRootField(value, '{"version":1,') },
       { field: "capsule_json", mutate: (value) => value.replace('"version":1', '"version":1.0') },
       { field: "capsule_json", mutate: (value) => value.replace('"sourceProfileGeneration":3', '"sourceProfileGeneration":"3"') },
       { field: "capsule_json", mutate: (value) => value.replace('"sourcePersonalBindingRevision":null', '"sourcePersonalBindingRevision":0') },

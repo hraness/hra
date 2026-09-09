@@ -54,7 +54,29 @@ const permutedEnvironment = environmentArbitrary.chain((entries) => fc.tuple(
   fc.constant(entries), fc.shuffledSubarray(entries, { minLength: entries.length, maxLength: entries.length }),
 ));
 
+// Deliberately duplicate one root member; retain the original raw JSON suffix,
+// including any nested braces or duplicate spellings, without reserializing it.
+function duplicateLeadingAttentionKey(document: string, key: string): string {
+  const prefix = `{"attentionResendApiKey":${JSON.stringify(key)},`;
+  if (!document.startsWith(prefix) || !document.endsWith("}")) {
+    throw new Error("SYNTHETIC_ATTENTION_INPUT_PREFIX_INVALID");
+  }
+  return prefix + document.slice(1);
+}
+
 describe("attention key installation synthetic property contracts", () => {
+  test("duplicate-key corruption changes only the checked leading root member", () => {
+    const document = '{"attentionResendApiKey":"re_synthetic_{key}","nested":{"attentionResendApiKey":"inner"},"raw":"{}","raw":"{kept}"}';
+    const corrupted = duplicateLeadingAttentionKey(document, "re_synthetic_{key}");
+    const prefix = '{"attentionResendApiKey":"re_synthetic_{key}",';
+    expect(corrupted).toBe('{"attentionResendApiKey":"re_synthetic_{key}","attentionResendApiKey":"re_synthetic_{key}","nested":{"attentionResendApiKey":"inner"},"raw":"{}","raw":"{kept}"}');
+    expect(corrupted.slice(prefix.length)).toBe(document.slice(1));
+    for (const invalid of ["[]", ` ${document}`, document.slice(0, -1), '{"other":"re_synthetic_{key}"}']) {
+      expect(() => duplicateLeadingAttentionKey(invalid, "re_synthetic_{key}")).toThrow("SYNTHETIC_ATTENTION_INPUT_PREFIX_INVALID");
+    }
+    expect(() => duplicateLeadingAttentionKey(document, "different")).toThrow("SYNTHETIC_ATTENTION_INPUT_PREFIX_INVALID");
+  });
+
   test("protected-input roundtrips preserve exact values and refuse ambiguous or out-of-scope spellings", () => {
     fc.assert(fc.property(targetArbitrary, keyArbitrary, token, whitespace, (target, attentionResendApiKey, suffix, space) => {
       const input = { attentionResendApiKey, convexDeploymentAdminKey: `prod:${target.deploymentName}|synthetic_admin_token_${suffix}` };
@@ -64,7 +86,7 @@ describe("attention key installation synthetic property contracts", () => {
       expectValue(parseAttentionKeyInstallationInput(JSON.stringify(parsed), target), input);
       for (const invalid of [
         JSON.stringify({ ...input, extra: suffix }),
-        document.replace("{", `{"attentionResendApiKey":${JSON.stringify(attentionResendApiKey)},`),
+        duplicateLeadingAttentionKey(document, attentionResendApiKey),
         JSON.stringify({ convexDeploymentAdminKey: input.convexDeploymentAdminKey }),
         JSON.stringify({ ...input, attentionResendApiKey: `${attentionResendApiKey} ` }),
         JSON.stringify({ ...input, convexDeploymentAdminKey: `dev:${target.deploymentName}|synthetic_admin_token_${suffix}` }),

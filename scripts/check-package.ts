@@ -616,6 +616,19 @@ export const normalizeGitHistoryPatchForPublicScan = (
   return normalizeReviewedSyntheticHistoryPatch(patch, evidence.patchSha256, evidence.fixtures);
 };
 
+/**
+ * Git truncates generated hunk section labels, including otherwise public package
+ * names. Project only those labels out of the scope scan after exact historical
+ * evidence checks. Authored lines retain their +/-/space prefix; complete raw
+ * patches still receive the separate sensitive-text scan. Split physical LF
+ * lines so CR and Unicode line separators cannot turn authored text into a header.
+ */
+export const stripGitHunkSectionHeadingsForScopeScan = (patch: string): string =>
+  patch.split("\n").map((line) => line.replace(
+    /^(@@ -(?:0|[1-9][0-9]*)(?:,(?:0|[1-9][0-9]*))? \+(?:0|[1-9][0-9]*)(?:,(?:0|[1-9][0-9]*))? @@) [^\r\n\u2028\u2029]*$/u,
+    "$1",
+  )).join("\n");
+
 type GitHistorySpawnResult = Readonly<{
   exitCode: number;
   exitedDueToMaxBuffer: boolean;
@@ -780,14 +793,7 @@ export const parseGitHistoryCommitList = (value: string): readonly string[] => {
 
 export const assertGitHistoryPatchPublicText = (patch: string, label: string): void => {
   assertPublicSensitiveText(patch, label);
-  // Git may truncate its duplicated function heading inside a package name.
-  // Authored lines retain their diff prefix and remain covered across history.
-  const authoredPatch = patch.split("\n").map((line) => {
-    if (/[\r\u2028\u2029]/u.test(line)) return line;
-    const heading = /^(@@ -(?:0|[1-9][0-9]*)(?:,(?:0|[1-9][0-9]*))? \+(?:0|[1-9][0-9]*)(?:,(?:0|[1-9][0-9]*))? @@) [^\n]*$/u.exec(line);
-    return heading?.[1] ?? line;
-  }).join("\n");
-  assertPublicText(authoredPatch, label);
+  assertPublicText(stripGitHunkSectionHeadingsForScopeScan(patch), label);
 };
 
 export const assertCompleteGitHistoryPublic = async (repositoryRoot: string): Promise<void> => {

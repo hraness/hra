@@ -603,14 +603,15 @@ const runStalledStage = async (
   const sentinel = join(root, `${mode}-pids`);
   const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
   const program = [
-    `const module = await import(${JSON.stringify(runtimePath)});`,
-    `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+    "const [runtimePath, archivePath, mode, sentinel] = process.argv.slice(1);",
+    "const module = await import(runtimePath);",
+    "await module.installHraRelease(archivePath, {",
     "  stageDeadlineMilliseconds: 400,",
-    `  stageWorkerTestMode: ${JSON.stringify(mode)},`,
-    `  afterStageWorkerStarted: async (bunPid, workerPid) => { await Bun.write(${JSON.stringify(sentinel)}, String(bunPid) + " " + String(workerPid) + "\\n"); },`,
+    "  stageWorkerTestMode: mode,",
+    '  afterStageWorkerStarted: async (bunPid, workerPid) => { await Bun.write(sentinel, String(bunPid) + " " + String(workerPid) + "\\n"); },',
     "});",
   ].join("\n");
-  const result = await run([process.execPath, "-e", program], {
+  const result = await run([process.execPath, "-e", program, "--", runtimePath, archivePath, mode, sentinel], {
     cwd: root,
     environment: installEnvironment(root),
   });
@@ -709,6 +710,26 @@ afterAll(async () => {
 }, 60_000);
 
 describe("transactional HRA installer", () => {
+  test("passes installer child arguments as data without changing static eval source", async () => {
+    const root = await makeRoot("hra-install-child-arguments-");
+    const values = [
+      "a path with spaces",
+      "\"'; process.exit(73); //",
+      "backslash\\value",
+      "line\nreturn\rseparator\u2028paragraph\u2029",
+      "</script>",
+      "--preload=unreviewed-fixture.ts",
+    ];
+    const program = "process.stdout.write(JSON.stringify(process.argv.slice(1)));";
+    const result = await run([process.execPath, "-e", program, "--", ...values], {
+      cwd: root,
+      environment: installEnvironment(root),
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout) as unknown).toEqual(values);
+  });
+
   test("rejects an ambiguous maximum-length receipt semver within a joined watchdog", () => {
     expect(adversarialReceiptVersion).toHaveLength(128);
     // The child only imports the predicate and evaluates one value. SIGKILL
@@ -1331,6 +1352,16 @@ describe("transactional HRA installer", () => {
       archiveSha256: "b5bc2a9125885c6ace33a70137202e99e1d6774f5d8945fac9bb96b6353c930c",
       normalizerSha256: "2f9851effc7b52f59ee3ef8d0e5e096d33fb7e63bcb1fff1d533c2207d003148",
       cliSha256: "2974ddeb3795f6d896b365c2f2c0bff92e745ccd047e1628ef9acb5f2a5e0f1e",
+    },
+    {
+      tag: "v0.7.0",
+      archive: "https://github.com/hraness/hra/releases/download/v0.7.0/hraness-hra-0.7.0.tgz",
+      archiveAssetId: 551_312_890,
+      archiveBytes: 1_359_243,
+      archiveReleaseId: 385_063_983,
+      archiveSha256: "6a067b5efb48bb9253f132300b09e59ae45a6e90c8f97532b5deabdc802a1061",
+      normalizerSha256: "24cb487fda4dfd9ec1ec9f23048a245f7dfd1dfd60b5fa8c8b3e31193967a31e",
+      cliSha256: "6635ac9aab44cf8e6ae5f833ea063eb080f922de8659b0d9825a2a4c2e9af310",
     },
   ]) {
     test(`refuses and preserves an interrupted intent owned by immutable ${priorRelease.tag}`, async () => {
@@ -2072,14 +2103,15 @@ describe("transactional HRA installer", () => {
     const sentinel = join(root, "bun-link-observed");
     const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
     const program = [
-      `const module = await import(${JSON.stringify(runtimePath)});`,
-      `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      "const [runtimePath, archivePath, sentinel] = process.argv.slice(1);",
+      "const module = await import(runtimePath);",
+      "await module.installHraRelease(archivePath, {",
       "  stageDeadlineMilliseconds: 6000,",
       '  stageWorkerTestMode: "stall-after-ready",',
-      `  afterStageWorkerReady: async (bunPid, lockPid) => { await Bun.write(${JSON.stringify(sentinel)}, String(bunPid) + " " + String(lockPid) + "\\n"); await new Promise(() => {}); },`,
+      '  afterStageWorkerReady: async (bunPid, lockPid) => { await Bun.write(sentinel, String(bunPid) + " " + String(lockPid) + "\\n"); await new Promise(() => {}); },',
       "});",
     ].join("\n");
-    const child = trackDirectTestChild(Bun.spawn([process.execPath, "-e", program], {
+    const child = trackDirectTestChild(Bun.spawn([process.execPath, "-e", program, "--", runtimePath, archivePath, sentinel], {
       cwd: root,
       detached: true,
       env: installEnvironment(root),
@@ -2149,12 +2181,23 @@ describe("transactional HRA installer", () => {
       process.execPath,
       "-e",
       [
-        `const module = await import(${JSON.stringify(runtimePath)});`,
-        `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
-        `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
-        `  ${hook}: () => { throw new Error(${JSON.stringify(`test interruption at ${hook}`)}); },`,
+        "const [runtimePath, archivePath, deadline, hook] = process.argv.slice(1);",
+        "const module = await import(runtimePath);",
+        'const interrupt = () => { throw new Error("test interruption at " + hook); };',
+        'const hooks = hook === "afterNormalized" ? { afterNormalized: interrupt }',
+        '  : hook === "afterPublishRename" ? { afterPublishRename: interrupt }',
+        '  : hook === "beforePublish" ? { beforePublish: interrupt } : undefined;',
+        'if (hooks === undefined) throw new Error("Unexpected installer interruption hook.");',
+        "await module.installHraRelease(archivePath, {",
+        "  stageDeadlineMilliseconds: Number(deadline),",
+        "  ...hooks,",
         "});",
       ].join("\n"),
+      "--",
+      runtimePath,
+      archivePath,
+      String(TEST_STAGING_DEADLINE_MS),
+      hook,
     ], { cwd: root, environment: installEnvironment(root) });
 
     const normalizedInterruption = await runWithHook("afterNormalized");

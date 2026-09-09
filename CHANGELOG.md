@@ -12,6 +12,14 @@ Provider account visibility, local automatic usage policy controls, and recovery
 - Additive local storage migrations retain the admitted schema 50 predecessor and append the provider-usage and custody foundation through schema 60. Genuine historical fixtures and explicitly identified synthetic compatibility cases verify migration and refusal boundaries; they do not prove live provider acceptance.
 - Automatic account movement, managed-send forwarding, account order and activation commands, Claude native fallback, and the planned hosted/browser usage view remain unavailable. Existing explicit account selection and provider-specific platform limits are unchanged.
 
+## v0.7.1 (unreleased)
+
+Read-only exact Codex default observations in Settings. This candidate is not yet admitted; v0.7.0 remains the admitted public artifact. Publication, hosted deployment and browser deployment require their own evidence. Artifact admission does not clear daemon startup, capacity activation or intended-target gates.
+
+- A separately encrypted profile companion binds the publishing daemon's exact default to one registry revision, encrypted-envelope digest and heartbeat. The frozen version-1 registry remains unchanged. A daemon sends the companion only after a successful registry publication advertises support; older servers continue receiving the old request shape.
+- Settings shows the last reported exact Codex model and effort only for an active daemon with coherent current-key evidence and a fresh hosted timestamp. Missing, stale, mismatched or unreadable evidence exposes no exact label. The observation does not relabel established sessions or authorize a command, model, account or Fast mode. Sol Ultra remains the implicit Codex default.
+- Historical profile decoding no longer constructs eager object schemas whose caught code-generation probe violates the browser Content Security Policy. Exact historical identity checks and the strict policy remain intact. This release introduces no SQLite migration or model admission.
+
 ## v0.7.0
 
 Stable working and canonical project memory, attributed peer coordination, encrypted canonical-memory sync, and read-only browser supervision.
