@@ -220,7 +220,7 @@ separate. This removes a duplicate execution without changing CI command coverag
 | Provider setup | Evidence-driven | Ordinary npm publication workflows are present. Change trust, account, GitHub App, or ruleset configuration only for an individually verified remaining gap; no blanket trust update is pending. |
 | Machine-confidence foundation | Complete | HRA PR156 delivered the reviewed canonical global/repository assets, operator guidance and regression tests separating artifact admission from operational activation. |
 | Bounded foundation propagation | Complete | Current-Mac installation and readback plus owner-coordinated HRA, Oh and template delivery are proved. Further fleet propagation is the separate workstream above. |
-| Data-preserving delivery policy | In progress | Local-efficiency 0.4.1 source adds D7 and provider-permitted unattended stable delivery. Focused validation, independent scope review, CI-equivalence tests, fresh complete required CI for the exact final integration candidate, delivery, and installation readback remain required. |
+| Data-preserving delivery policy | In progress | Local-efficiency 0.4.1 source adds D7 and provider-permitted unattended stable delivery. CI exposed separate hardlink-read and fixture-lifecycle defects now included in the change. Focused regressions, independent review, the local full aggregate, fresh complete required CI including browser acceptance, delivery, and installation readback remain required. |
 
 ## Guardrails
 
@@ -237,6 +237,18 @@ separate. This removes a duplicate execution without changing CI command coverag
   evidence that applies; silence is never proof of completion.
 
 ## Progress log
+
+- 2026-09-09: exact-candidate CI exposed two delivery reliability defects after
+  the guidance-only candidate had passed. Browser handoff reads now validate the
+  physical parent and retain exact no-follow leaf identity, so a valid hardlink
+  is not rejected when canonicalization returns its staged alias. Leaf and
+  ancestor symlinks, changed identities, partial bytes, and replacement of
+  write-once records remain rejected. Actor compatibility now uses
+  independently bounded cases with joined fixture ownership to
+  prevent timeout cleanup from deleting a setup still in progress. These
+  executable and test changes require the local full aggregate and fresh
+  complete CI; the guidance-only exception does not apply. Delivery remains
+  pending that evidence.
 
 - 2026-09-08: HRA's reviewed documentation/guidance validation path now uses
   focused local contracts plus fresh complete required CI as its final source

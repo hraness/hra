@@ -1204,22 +1204,21 @@ describe("state-backed cloud daemon adapter", () => {
     }
   });
 
-  test("keeps every non-owner message compatible with the released actor field", async () => {
-    const cases = [
-      { actorKind: undefined, messageActor: "autorespond" as const, text: "Continue after the recorded answer." },
-      { actorKind: "automation" as const, messageActor: "automation" as const, text: "Continue the scheduled task." },
-      { actorKind: "peer_session" as const, messageActor: "peer_session" as const, text: "Check the peer result." },
-      { actorKind: "provider_switch" as const, messageActor: "provider_switch" as const, text: "Continue from the provider-neutral handoff." },
-    ];
-    for (const actorCase of cases) {
-      const value = await fixture();
+  test.each([
+    ["autorespond", undefined, "Continue after the recorded answer."],
+    ["automation", "automation", "Continue the scheduled task."],
+    ["peer_session", "peer_session", "Check the peer result."],
+    ["provider_switch", "provider_switch", "Continue from the provider-neutral handoff."],
+  ] as const)(
+    "keeps non-owner %s messages compatible with the released actor field",
+    (messageActor, actorKind, text) => ownedCloudAdapterCase(async (value, { createAdapter, request, signal }) => {
       const sourceId = "attempt_00000000-0000-4000-8000-0000000000a1";
       value.codex.projection = {
         ...value.codex.projection,
         messages: [{
           clientId: sourceId,
           role: "user",
-          text: actorCase.text,
+          text,
           turnId: "turn_handoff_0001",
         }],
         turnSummaries: [{
@@ -1239,41 +1238,30 @@ describe("state-backed cloud daemon adapter", () => {
         value: (sessionId: SessionId, candidateSourceId: string) => {
           lookups.push(candidateSourceId);
           return candidateSourceId === sourceId
-            ? actorCase.messageActor
+            ? messageActor
             : classify(sessionId, candidateSourceId);
         },
       });
-      const adapter = new StateBackedCloudDaemonAdapter({
-        readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
-        executeRemote: () => Promise.resolve({}),
-        paths: value.paths,
-        store: value.store,
+      const adapter = createAdapter();
+      await request(() => adapter.listSessions({ limit: 25, signal }));
+      const projected = await request(() => adapter.readCompactEvents({
+        afterSequence: 0,
+        limit: 128,
+        sessionPublicId: value.sessionId,
+        signal,
+      }));
+      expect(lookups).toContain(sourceId);
+      expect(projected.events[0]).toEqual({
+        actor: "autorespond",
+        ...(actorKind === undefined ? {} : { actorKind }),
+        kind: "user_message",
+        sequence: 1,
+        text,
+        turnId: "turn_handoff_0001",
       });
-      try {
-        const signal = new AbortController().signal;
-        await adapter.listSessions({ limit: 25, signal });
-        const projected = await adapter.readCompactEvents({
-          afterSequence: 0,
-          limit: 128,
-          sessionPublicId: value.sessionId,
-          signal,
-        });
-        expect(lookups).toContain(sourceId);
-        expect(projected.events[0]).toEqual({
-          actor: "autorespond",
-          ...(actorCase.actorKind === undefined ? {} : { actorKind: actorCase.actorKind }),
-          kind: "user_message",
-          sequence: 1,
-          text: actorCase.text,
-          turnId: "turn_handoff_0001",
-        });
-        expect(JSON.stringify(projected.events)).not.toContain("provider_switched");
-      } finally {
-        await adapter.close();
-        value.store.close();
-      }
-    }
-  });
+      expect(JSON.stringify(projected.events)).not.toContain("provider_switched");
+    }),
+  );
 
   test("omits only confirmed scheduled-task prompts from normal cloud projection", async () => {
     const value = await fixture();
