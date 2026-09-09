@@ -511,6 +511,27 @@ markers separately identify site source `041a06a16015ff8b270a413b8c10ab9ca89e4ca
 and app source `e1edb585eedd0e78dbb558ce72fa7680cc2257ea`, app version `0.7.1`.
 No provider write or deployment occurred during these checks.
 
+The first shared-fix integration on PR 164 fails fresh Linux acceptance.
+Run `34378248569`, attempt 1, checks head
+`eb3700da788ce1ee232df42a7bebe8e9f1f57bfb` through synthetic merge
+`72ed5a11f6854f278791b84c15df713e1c38a2c9`, tree
+`d5dbd7f92ed69a4de5cd7fca5d38f92732170c9a`, on unchanged main `e1edb585`.
+All six source jobs, compiled browser, CodeQL and macOS remainder pass.
+Ubuntu remainder reports 139 passing site cases and 11 failures: the native
+fresh builder and ten original successful-build cases return
+`SITE_COMPILER_PROCESS_FAILED` after approximately 23 to 25 seconds. There
+is no observed work-deadline or stopped-service failure in this run.
+
+The original CI log omits the nested process-result cause, so the actual Linux
+failure path remains unknown. Diagnostic-only commit
+`d0ed6000abb84623b9884eea6d536bc58b8e8729` adds closed failure-stage, exit,
+terminal-status and byte-count fields without printing raw child output.
+Independent AST comparison proves acceptance, parsing, cancellation, cleanup
+and deadlines unchanged. Its focused suite passes 21 cases with 1,059
+assertions; scoped lint and typecheck pass. The isolated two-file commit is
+published on the shared handoff branch for PR 164's owned diagnostic CI.
+It does not fix or admit the Linux failure. No shared merge has occurred.
+
 The September 8 integration checkpoints now include canonical main through
 schema 50 at `ab56d3bc5034abedd12a20b5b405caf42bfa174f`, then the clean
 release-policy join at `9d6e2e12a42215e9201ae2ed3f64ed1b41e5c47d`, tree
