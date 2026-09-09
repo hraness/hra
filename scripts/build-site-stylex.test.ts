@@ -1,7 +1,18 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import fc from "fast-check";
 import { compilerSha256, STYLEX_TEMPLATE_CSS_PLACEHOLDER, stylexUnionPolicySha256 } from "@hraness/ui/stylex-build";
-import { prepareSiteDocument, projectSiteArtifacts as projectCapturedSite, snapshotSiteFoundation as captureSiteFoundation } from "./build-site-stylex.ts";
+import { captureSiteDocuments, prepareSiteDocument, projectSiteArtifacts as projectCapturedSite, snapshotSiteFoundation as captureSiteFoundation } from "./build-site-stylex.ts";
+
+const docsRoutes = ["/docs/", "/docs/start/", "/docs/web/", "/docs/sessions/", "/docs/reference/", "/docs/status/"] as const;
+const htmlRoutes = ["index.html", "privacy/index.html", "preview/index.html", ...docsRoutes.map((route) => `${route.slice(1)}index.html`)];
+const docsMap = () => Object.fromEntries(docsRoutes.map((route) => [route, `<html>${route}</html>`]));
+const renderersFor = (docs: unknown = docsMap()) => ({
+  renderSiteHtml: () => "<html>home</html>",
+  renderPrivacyHtml: () => "<html>privacy</html>",
+  renderPreviewHtml: () => "<html>preview</html>",
+  renderDocsPages: () => docs,
+});
 
 const hash = (value: Uint8Array | string): string => createHash("sha256").update(value).digest("hex");
 const planSha256 = "a".repeat(64);
@@ -35,7 +46,7 @@ const makeComplete = () => {
   const complete = {
     artifacts: [
       ...foundation.artifacts.map((item) => ({ ...item, path: `graphs/foundation/${item.path}` })),
-      ...["index.html", "privacy/index.html", "preview/index.html"].map(artifact),
+      ...htmlRoutes.map(artifact),
       artifact("graphs/renderer/entries/render-abcdefgh.js"),
       artifact("graphs/renderer/chunks/chunk-abcdefgh.js"),
     ],
@@ -50,6 +61,59 @@ const makeComplete = () => {
 };
 
 describe("static site compiler projection", () => {
+  test("captures the three original renderers and six exact documentation paths with one environment", () => {
+    const environment = { HRA_PUBLIC_BUILD: "fixture" };
+    const exports = renderersFor();
+    const captured = captureSiteDocuments({
+      ...exports,
+      renderSiteHtml: (content: undefined, received: unknown) => {
+        expect(content).toBeUndefined();
+        expect(received).toBe(environment);
+        return exports.renderSiteHtml();
+      },
+      renderDocsPages: (received: unknown) => {
+        expect(received).toBe(environment);
+        return docsMap();
+      },
+    }, environment);
+    expect([...captured.keys()]).toEqual(htmlRoutes);
+    expect(captured.get("docs/web/index.html")).toBe("<html>/docs/web/</html>");
+    for (const change of [
+      { renderSiteHtml: undefined }, { renderSiteHtml: () => 1 },
+      { renderPrivacyHtml: undefined }, { renderPreviewHtml: undefined },
+      { renderDocsPages: undefined },
+    ]) expect(() => captureSiteDocuments({ ...exports, ...change }, {})).toThrow();
+  });
+
+  test("rejects incomplete, foreign, accessor, symbolic and non-string documentation outputs", () => {
+    for (const route of docsRoutes) {
+      const docs = Object.fromEntries(Object.entries(docsMap()).filter(([path]) => path !== route));
+      expect(() => captureSiteDocuments(renderersFor(docs), {})).toThrow();
+      expect(() => captureSiteDocuments(renderersFor({ ...docsMap(), [route]: undefined }), {})).toThrow();
+    }
+    let invoked = false;
+    const accessor = Object.defineProperty(docsMap(), "/docs/", { enumerable: true, get() { invoked = true; return "unexpected"; } });
+    for (const value of [
+      null, [], "html", Object.create(docsMap()),
+      { ...docsMap(), "/docs/private/": "html" },
+      { ...docsMap(), [Symbol("hidden")]: "html" },
+      Object.defineProperty(docsMap(), "/docs/", { enumerable: false }), accessor,
+    ]) expect(() => captureSiteDocuments(renderersFor(value), {})).toThrow();
+    expect(invoked).toBe(false);
+  });
+
+  test("route admission is order-independent and no arbitrary extra path can become a public document", () => {
+    fc.assert(fc.property(
+      fc.shuffledSubarray([...docsRoutes], { minLength: docsRoutes.length, maxLength: docsRoutes.length }),
+      fc.string({ minLength: 1, maxLength: 80 }).filter((path) => !(docsRoutes as readonly string[]).includes(path)),
+      (order, foreignPath) => {
+        const docs = Object.fromEntries(order.map((route) => [route, `<html>${route}</html>`]));
+        expect([...captureSiteDocuments(renderersFor(docs), {}).keys()]).toEqual(htmlRoutes);
+        expect(() => captureSiteDocuments(renderersFor({ ...docs, [foreignPath]: "unexpected" }), {})).toThrow();
+      },
+    ), { numRuns: 40 });
+  });
+
   test("joins one exact foundation before the final union without changing document content", () => {
     const html = '<!doctype html><html><head><link rel="stylesheet" href="/styles.css"></head><body><p>Preserved</p></body></html>';
     const path = `graphs/foundation/${foundationCss}`;
@@ -128,12 +192,12 @@ describe("static site compiler projection", () => {
     expect(empty.artifacts.find(({ path }) => path === foundationEntry)).toEqual({ path: foundationEntry, bytes: 0, sha256: hash("") });
   });
 
-  test("publishes only three HTML routes, the final union, foundation and exact fonts", () => {
+  test("publishes only nine HTML routes, the final union, foundation and exact fonts", () => {
     const { complete, foundation } = makeComplete();
     const projected = projectSiteArtifacts(complete, planSha256, foundation);
-    expect(projected).toHaveLength(18);
+    expect(projected).toHaveLength(24);
     expect(projected.filter(({ path }) => path.endsWith(".woff2"))).toHaveLength(13);
-    expect(projected.filter(({ path }) => path.endsWith(".html")).map(({ path }) => path).sort()).toEqual(["index.html", "preview/index.html", "privacy/index.html"]);
+    expect(projected.filter(({ path }) => path.endsWith(".html")).map(({ path }) => path).sort()).toEqual([...htmlRoutes].sort());
     expect(projected.some(({ path }) => /\.(?:js|json|map|ts|tsx|otf)$/u.test(path))).toBe(false);
   });
 
@@ -144,6 +208,9 @@ describe("static site compiler projection", () => {
       "graphs/renderer/entries/render.js.map", "graphs/renderer/source.ts", "../outside.html", "graphs/renderer/../escape.js",
     ]) expect(() => projectSiteArtifacts({ ...complete, artifacts: [...complete.artifacts, { path, bytes: 1, sha256: hash(path) }] }, planSha256, foundation)).toThrow();
     expect(() => projectSiteArtifacts({ ...complete, artifacts: complete.artifacts.filter(({ path }) => path !== "preview/index.html") }, planSha256, foundation)).toThrow();
+    for (const route of docsRoutes) expect(() => projectSiteArtifacts({ ...complete,
+      artifacts: complete.artifacts.filter(({ path }) => path !== `${route.slice(1)}index.html`),
+    }, planSha256, foundation)).toThrow();
     expect(() => projectSiteArtifacts({ ...complete, artifacts: complete.artifacts.map((item, index) => index === 0 ? { ...item, sha256: hash("changed") } : item) }, planSha256, foundation)).toThrow();
     const privateEntryPath = `graphs/foundation/${foundationEntry}`;
     expect(() => projectSiteArtifacts({ ...complete, artifacts: complete.artifacts.filter(({ path }) => path !== privateEntryPath) }, planSha256, foundation)).toThrow();

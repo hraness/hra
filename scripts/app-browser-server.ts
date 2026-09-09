@@ -3,9 +3,10 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { Socket } from "node:net";
 
 type AssetResponse = Readonly<{ status: number; headers: Readonly<Record<string, string>>; body: Buffer | undefined }>;
+const productAssetKey = /^examples\/app\/(?:index\.html|stylex\.css|graphs\/client\/assets\/[A-Za-z0-9_-][A-Za-z0-9_.-]*\.(?:js|css))$/u;
 export function browserAssetResponse(options: Readonly<{
   method: string | undefined; url: string | undefined; files: ReadonlyMap<string, Buffer>;
-  csp: string; previewCsp?: string; assetPath: (path: string, fonts: ReadonlySet<string>) => string | null;
+  csp: string; previewCsp?: string; productPreviewCsp?: string; assetPath: (path: string, fonts: ReadonlySet<string>) => string | null;
   contentType: (key: string) => string;
 }>): AssetResponse {
   if (options.method !== "GET" && options.method !== "HEAD") return { status: 405, headers: {}, body: undefined };
@@ -17,9 +18,22 @@ export function browserAssetResponse(options: Readonly<{
   const fonts = new Set([...options.files.keys()].filter((path) => path.endsWith(".woff2")));
   const key = options.assetPath(pathname, fonts), bytes = key === null ? undefined : options.files.get(key);
   if (key === null || bytes === undefined) return { status: 404, headers: {}, body: undefined };
+  const product = key.startsWith("examples/app/");
+  let csp = pathname === "/preview/" && options.previewCsp !== undefined ? options.previewCsp : options.csp;
+  if (product) {
+    if (options.productPreviewCsp === undefined || !productAssetKey.test(key)) {
+      return { status: 404, headers: {}, body: undefined };
+    }
+    csp = options.productPreviewCsp;
+  }
   return { status: 200, headers: {
-    "Cache-Control": "no-store", "Content-Security-Policy": pathname === "/preview/" && options.previewCsp !== undefined ? options.previewCsp : options.csp,
-    "Content-Type": options.contentType(key), "Cross-Origin-Opener-Policy": "same-origin", "X-Content-Type-Options": "nosniff",
+    "Cache-Control": "no-store", "Content-Security-Policy": csp,
+    "Content-Type": options.contentType(key), "X-Content-Type-Options": "nosniff",
+    ...(product ? {
+      "Access-Control-Allow-Origin": "*",
+      "Permissions-Policy": "camera=(), geolocation=(), microphone=(), payment=(), usb=()",
+      "Referrer-Policy": "no-referrer", "X-Robots-Tag": "noindex, nofollow",
+    } : { "Cross-Origin-Opener-Policy": "same-origin" }),
   }, body: options.method === "HEAD" ? undefined : bytes };
 }
 

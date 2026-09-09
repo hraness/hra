@@ -2,11 +2,11 @@ import { expect, test } from "bun:test";
 import * as fc from "fast-check";
 import { link, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import {
-  assertBrowserNode, browserDigest, browserFile, browserInventory, browserLogicalPath,
+  assertBrowserNode, browserDigest, browserExecutable, browserFile, browserInventory, browserLogicalPath, browserSources,
   parseBrowserPrepared, parseBrowserRequest, publishBrowserJson, publishBrowserTerminalJson,
-  readBrowserFile, verifyBrowserInventory,
+  readBrowserFile, verifyBrowserInventory, verifyBrowserRequest,
   type BrowserPrepared, type BrowserRequest,
 } from "./app-browser-handoff.ts";
 
@@ -20,6 +20,45 @@ const logicalPath = fc.array(segment, { minLength: 1, maxLength: 5 }).map((parts
 const artifactRows = fc.uniqueArray(fc.record({ path: logicalPath, bytes: fc.integer({ min: 0, max: 4096 }) }), { selector: (value) => value.path, minLength: 1, maxLength: 12 })
   .map((values) => values.map(({ path, bytes }) => ({ ...row, path, bytes, identity: [1, 2, 33152, 1, bytes, 10, 10] }))
     .sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+
+test("browser source capture binds every product fixture input without weakening existing app inputs", async () => {
+  const root = await realpath(resolve(import.meta.dirname, ".."));
+  const captured = await browserSources(root);
+  const product = captured.filter(({ path }) => path.startsWith("app/fixtures/product/"));
+  const expected = (await browserInventory(join(root, "app/fixtures/product")))
+    .map((row) => ({ ...row, path: `app/fixtures/product/${row.path}` }));
+  expect(product).toEqual(expected);
+  for (const path of [
+    "app/fixtures/product/config.ts", "app/fixtures/product/main.tsx", "app/fixtures/product/io.ts",
+    "app/fixtures/product/definition.ts", "app/fixtures/product/fixtures.ts", "app/fixtures/product/index.html",
+    "app/fixtures/browser/config.ts", "app/src/screens/settings-screen.tsx", "scripts/app-browser.ts", "bun.lock",
+    "site/product-scenes.ts", "scripts/build-appearance.ts", "app/src/appearance.ts", "app/src/appearance-entry.ts",
+  ]) expect(captured.find((row) => row.path === path)).toEqual(await browserFile(root, path));
+  expect(new Set(captured.map(({ path }) => path)).size).toBe(captured.length);
+});
+
+test.each(["site/product-scenes.ts", "scripts/build-appearance.ts", "app/src/appearance.ts", "app/src/appearance-entry.ts"])("shared preview or appearance source %s mutation invalidates the original browser request", async (sharedPath) => {
+  const repository = await realpath(resolve(import.meta.dirname, ".."));
+  const sourcePaths = new Set([...(await browserSources(repository)).map(({ path }) => path), sharedPath]);
+  const root = await realpath(await mkdtemp(join(tmpdir(), "browser-shared-source-test-")));
+  try {
+    for (const path of [...sourcePaths, "app/dist/index.html", "dist/site/index.html", "runtime"]) {
+      await mkdir(dirname(join(root, path)), { recursive: true });
+      await writeFile(join(root, path), "fixture\n", { mode: path === "runtime" ? 0o700 : 0o600 });
+    }
+    const executable = await browserExecutable(join(root, "runtime"));
+    const captured = await browserSources(root);
+    const original: BrowserRequest = { ...request(), root, run: join(root, "tmp", "app-browser-Test"),
+      node: executable, bun: executable, chromium: executable, sources: captured,
+      app: await browserInventory(join(root, "app/dist")), site: await browserInventory(join(root, "dist/site")) };
+    await mkdir(original.run, { recursive: true });
+    await verifyBrowserRequest(original);
+    await writeFile(join(root, sharedPath), "mutated\n");
+    const after = await browserSources(root);
+    expect(after.filter(({ path }) => path !== sharedPath)).toEqual(captured.filter(({ path }) => path !== sharedPath));
+    await expect(verifyBrowserRequest(original)).rejects.toThrow("Browser source or lock inputs changed");
+  } finally { await rm(root, { recursive: true }); }
+});
 
 test("logical path law preserves every admitted spelling and refuses traversal extensions", () => {
   fc.assert(fc.property(logicalPath, (path) => {
