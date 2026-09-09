@@ -11734,110 +11734,117 @@ describe("HraService", () => {
     });
   }
 
-  test("fences recovery-blocked Claude targets and terminal history under removed profiles", async () => {
-    for (const provider of ["claude"] as const) {
-      for (const profileState of ["recovery_required", "removed"] as const) {
-        const value = await claudeAccountFixture(true);
-        const fence = profileState === "removed" ? "removed" : "recovery-fenced";
-        const { sessionId: actorSessionId } = await createIdleSession(
-          value,
-          `${provider} ${fence} peer actor`,
-        );
-        const idleActor = value.store.requireSession(actorSessionId);
-        if (idleActor.projectId === undefined) throw new Error("Expected a project-bound actor.");
-        const targetProfile = value.store.createProfile(`${provider} ${fence} target`);
-        const targetBase = value.store.createSession({
-          profileId: targetProfile.id,
-          projectId: idleActor.projectId,
-          title: `${provider} ${fence} target`,
-          provider,
-          preset: "fable-max",
-          fastEnabled: false,
+  test.each(["recovery_required", "removed"] as const)(
+    "fences recovery-blocked Claude targets and terminal history under removed profiles (%s)",
+    (profileState) => ownedServiceCase(async ({ createFixture, signal }) => {
+      const provider = "claude";
+      const value = await claudeAccountFixture(true, "linux", createFixture);
+      signal.throwIfAborted();
+      const fence = profileState === "removed" ? "removed" : "recovery-fenced";
+      const { sessionId: actorSessionId } = await createIdleSession(
+        value,
+        `${provider} ${fence} peer actor`,
+      );
+      signal.throwIfAborted();
+      const idleActor = value.store.requireSession(actorSessionId);
+      if (idleActor.projectId === undefined) throw new Error("Expected a project-bound actor.");
+      const targetProfile = value.store.createProfile(`${provider} ${fence} target`);
+      const targetBase = value.store.createSession({
+        profileId: targetProfile.id,
+        projectId: idleActor.projectId,
+        title: `${provider} ${fence} target`,
+        provider,
+        preset: "fable-max",
+        fastEnabled: false,
+      });
+      const target = value.store.bindSession({
+        sessionId: targetBase.id,
+        expectedRevision: targetBase.revision,
+        providerThreadId: `provider-${provider}-${fence}-target`,
+        state: "idle",
+      });
+      if (profileState === "removed") {
+        // Removal requires all owned sessions to be terminal. Do not invent
+        // the impossible current state of a live session on a removed owner.
+        value.store.setSessionTurnState({
+          sessionId: target.id,
+          expectedRevision: target.revision,
+          state: "terminal",
         });
-        const target = value.store.bindSession({
-          sessionId: targetBase.id,
-          expectedRevision: targetBase.revision,
-          providerThreadId: `provider-${provider}-${fence}-target`,
-          state: "idle",
-        });
-        if (profileState === "removed") {
-          // Removal requires all owned sessions to be terminal. Do not invent
-          // the impossible current state of a live session on a removed owner.
-          value.store.setSessionTurnState({
+        value.store.removeProfile(targetProfile.id);
+        expect(value.store.requireProfileById(targetProfile.id, { includeRemoved: true }).state).toBe("removed");
+      } else {
+        expect(value.store.setProfileState(
+          targetProfile.id,
+          targetProfile.processGeneration,
+          profileState,
+        )).toBe(true);
+      }
+
+      // The terminal-session fence precedes profile selection on direct input.
+      const establishedCode = profileState === "removed" ? "CONFLICT" : "RECOVERY_REQUIRED";
+      await expect(value.service.execute({
+        kind: "session.send",
+        session: target.id,
+        message: `Do not dispatch while the profile is ${profileState}.`,
+      }, { signal })).rejects.toMatchObject({ code: establishedCode });
+      signal.throwIfAborted();
+      await expect(value.service.execute({
+        kind: "session.queue",
+        session: target.id,
+        message: `Do not enqueue while the profile is ${profileState}.`,
+      }, { signal })).rejects.toMatchObject({ code: establishedCode });
+      signal.throwIfAborted();
+      expect(value.store.listQueue(target.id)).toEqual([]);
+      expect(value.providerSessionCalls).toEqual([]);
+
+      await value.service.execute({
+        kind: "session.send",
+        session: actorSessionId,
+        message: "Start the peer actor.",
+      }, { signal });
+      signal.throwIfAborted();
+      const actor = value.store.requireSession(actorSessionId);
+      const actorProfile = value.store.requireProfileById(actor.profileId);
+      if (actor.providerThreadId === undefined || actor.activeTurnId === undefined) {
+        throw new Error("Expected an active bound peer actor.");
+      }
+      const authority: ProfileAuthority = liveAuthorityFor(value.store, actorProfile.id, "codex");
+      const base = {
+        authority: hostToolAuthorityFor(liveAuthorityFor(value.store, actorProfile.id)),
+        connectionId: value.codex.observationConnectionId,
+        requestId: { type: "string" as const, value: `${provider}-${fence}-peer` },
+        threadId: actor.providerThreadId,
+        tool: "session_message" as const,
+        turnId: actor.activeTurnId,
+      } as const;
+      for (const delivery of ["send", "queue"] as const) {
+        const result = await value.service.handleHraHostToolCall(authority, {
+          ...base,
+          callId: `${provider}-${fence}-peer-${delivery}`,
+          input: {
             sessionId: target.id,
             expectedRevision: target.revision,
-            state: "terminal",
-          });
-          value.store.removeProfile(targetProfile.id);
-          expect(value.store.requireProfileById(targetProfile.id, { includeRemoved: true }).state).toBe("removed");
-        } else {
-          expect(value.store.setProfileState(
-            targetProfile.id,
-            targetProfile.processGeneration,
-            profileState,
-          )).toBe(true);
-        }
-
-        // The terminal-session fence precedes profile selection on direct input.
-        const establishedCode = profileState === "removed" ? "CONFLICT" : "RECOVERY_REQUIRED";
-        await expect(value.service.execute({
-          kind: "session.send",
-          session: target.id,
-          message: `Do not dispatch while the profile is ${profileState}.`,
-        }, { signal })).rejects.toMatchObject({ code: establishedCode });
-        await expect(value.service.execute({
-          kind: "session.queue",
-          session: target.id,
-          message: `Do not enqueue while the profile is ${profileState}.`,
-        }, { signal })).rejects.toMatchObject({ code: establishedCode });
-        expect(value.store.listQueue(target.id)).toEqual([]);
-        expect(value.providerSessionCalls).toEqual([]);
-
-        await value.service.execute({
-          kind: "session.send",
-          session: actorSessionId,
-          message: "Start the peer actor.",
-        }, { signal });
-        const actor = value.store.requireSession(actorSessionId);
-        const actorProfile = value.store.requireProfileById(actor.profileId);
-        if (actor.providerThreadId === undefined || actor.activeTurnId === undefined) {
-          throw new Error("Expected an active bound peer actor.");
-        }
-        const authority: ProfileAuthority = liveAuthorityFor(value.store, actorProfile.id, "codex");
-        const base = {
-          authority: hostToolAuthorityFor(liveAuthorityFor(value.store, actorProfile.id)),
-          connectionId: value.codex.observationConnectionId,
-          requestId: { type: "string" as const, value: `${provider}-${fence}-peer` },
-          threadId: actor.providerThreadId,
-          tool: "session_message" as const,
-          turnId: actor.activeTurnId,
-        } as const;
-        for (const delivery of ["send", "queue"] as const) {
-          const result = await value.service.handleHraHostToolCall(authority, {
-            ...base,
-            callId: `${provider}-${fence}-peer-${delivery}`,
-            input: {
-              sessionId: target.id,
-              expectedRevision: target.revision,
-              delivery,
-              message: `Do not ${delivery} into a ${fence} target.`,
-              reason: `Target profile is ${profileState}`,
-            },
-            requestDigest: createHash("sha256")
-              .update(`${provider}-${fence}-peer-${delivery}`).digest("hex"),
-          } satisfies HraHostToolCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE);
-          expect(result).toEqual({
-            version: 1,
-            ok: false,
-            code: "RECOVERY_REQUIRED",
-          });
-        }
-        expect(value.store.listUnsettledPeerSessionActions(10)).toEqual([]);
-        expect(value.store.listQueue(target.id)).toEqual([]);
-        expect(value.providerSessionCalls).toEqual([]);
+            delivery,
+            message: `Do not ${delivery} into a ${fence} target.`,
+            reason: `Target profile is ${profileState}`,
+          },
+          requestDigest: createHash("sha256")
+            .update(`${provider}-${fence}-peer-${delivery}`).digest("hex"),
+        } satisfies HraHostToolCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE);
+        signal.throwIfAborted();
+        expect(result).toEqual({
+          version: 1,
+          ok: false,
+          code: "RECOVERY_REQUIRED",
+        });
       }
-    }
-  });
+      expect(value.store.listUnsettledPeerSessionActions(10)).toEqual([]);
+      expect(value.store.listQueue(target.id)).toEqual([]);
+      expect(value.providerSessionCalls).toEqual([]);
+    }),
+    5_000,
+  );
 
   test("revalidates peer actor account authority after its mutation locks are acquired", async () => {
     const cloud = new FakeCloud();
@@ -12596,14 +12603,17 @@ describe("HraService", () => {
     expect(value.personalClaude.rebindings).toEqual([]);
   });
 
-  test("fences peer mutations when either account has durable projection recovery", async () => {
-    for (const recoverySide of ["actor", "target"] as const) {
+  test.each(["actor", "target"] as const)(
+    "fences peer mutations when either account has durable projection recovery (%s)",
+    (recoverySide) => ownedServiceCase(async ({ createFixture, signal }) => {
       const cloud = new FakeCloud();
-      const value = await fixture(undefined, cloud);
+      const value = await createFixture(undefined, cloud);
+      signal.throwIfAborted();
       const { sessionId: actorSessionId } = await createIdleSession(
         value,
         `Peer durable projection ${recoverySide} actor`,
       );
+      signal.throwIfAborted();
       const idleActor = value.store.requireSession(actorSessionId);
       if (idleActor.projectId === undefined) throw new Error("Expected a project-bound peer actor.");
       const targetEmail = `peer-durable-${recoverySide}@example.com`;
@@ -12639,6 +12649,7 @@ describe("HraService", () => {
         session: actorSessionId,
         message: `Start the durable projection ${recoverySide} peer actor.`,
       }, { signal });
+      signal.throwIfAborted();
       const actor = value.store.requireSession(actorSessionId);
       const actorProfile = value.store.requireProfileById(actor.profileId);
       if (actor.providerThreadId === undefined || actor.activeTurnId === undefined) {
@@ -12671,10 +12682,12 @@ describe("HraService", () => {
         provider: "codex",
         source: "managed",
       })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      signal.throwIfAborted();
       expect(value.store.listRecentPeerSessionActions()).toEqual([]);
       expect(providerMutationCalls(value.codex)).toEqual(providerWritesBefore);
-    }
-  });
+    }),
+    5_000,
+  );
 
   test.each(["actor", "target"] as const)(
     "fences peer mutations while a sibling projection recovery owns the %s account",
