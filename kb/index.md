@@ -45,6 +45,6 @@ type: index
 - [[plans/oh-memory-civilization|Oh memory and session civilization]] — Status: in-progress. Active delivery plan for stable two-authority Oh memory, attributed same-project session coordination, provider-native HRA tools for Codex and Claude Code, encrypted…
 - [[plans/canonical-profile-persistence|Persist exact historical profile identity]] — Status: complete. Persist the seven already represented provider/model/effort identities across sessions and Work without changing public selectors, runtime evidence or model admission. This is the…
 - [[plans/session-adoption|Personal-home session adoption]] — Status: completed. Delivery plan for automatically adopting Codex and Claude Code sessions from the owner's normal provider homes without weakening HRA session authority.
-- [[plans/attention-email-key-separation|Separate attention email credentials from sign-in]] — Status: active. Isolate attention delivery credentials and prove configuration before consuming an outbox attempt.
+- [[plans/attention-email-key-separation|Separate attention email credentials from sign-in]] — Status: in-progress. Isolate attention delivery credentials and prove configuration before consuming an outbox attempt.
 
 <!-- kb:catalog:end -->
