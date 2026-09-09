@@ -393,6 +393,10 @@ describe("static-site build", () => {
     expect(previewPaths.filter((path) => path.endsWith(".js")).length).toBeGreaterThan(0);
     for (const path of previewPaths) expect(path).toMatch(/^examples\/app\/(?:index\.html|stylex\.css|graphs\/client\/assets\/[A-Za-z0-9_-][A-Za-z0-9_.-]*\.(?:js|css))$/u);
     const preview = await readFile(join(root, "dist/site/examples/app/index.html"), "utf8");
+    const directLicense = (await readFile(join(sourceRoot, "node_modules/@hraness/direct/LICENSE"), "utf8")).trim();
+    const previewScripts = await Promise.all(previewPaths.filter((path) => path.endsWith(".js"))
+      .map((path) => readFile(join(root, "dist/site", path), "utf8")));
+    expect(previewScripts.some((script) => script.includes(directLicense))).toBe(true);
     const frameDocument = parseHTML(preview).document;
     expect(frameDocument.querySelector('meta[http-equiv="Content-Security-Policy"]')?.getAttribute("content")).toBe(PRODUCT_PREVIEW_CSP);
     expect(preview).not.toContain("/analytics.js");

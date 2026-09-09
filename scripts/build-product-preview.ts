@@ -108,10 +108,17 @@ export async function buildProductPreview(options: Readonly<{
     templates: [{ cssHref: PRODUCT_PREVIEW_CSS_HREF, graphId: "client", outputPath: "index.html", sourcePath: shellPath, stylesheetGraphId: "client" }],
   });
   const config = appProductionConfig(root, generation);
+  const directLicense = (await readFile(join(root, "node_modules/@hraness/direct/LICENSE"), "utf8")).trim();
+  assert.ok(directLicense.length > 0 && Buffer.byteLength(directLicense) <= 16 * 1024 && !directLicense.includes("*/"));
+  // A source comment can be removed during transforms. Capture attribution in
+  // the compiled graph itself, before its artifacts are hashed and sealed.
   // Chunk imports and shell links stay within the mounted preview directory.
   // No production build config or entry is modified.
   config.base = "./";
-  config.plugins = [productIoPlugin(root), ...(config.plugins ?? [])];
+  config.plugins = [productIoPlugin(root), {
+    name: "hra-product-preview-license",
+    banner: () => `/*! @license @hraness/direct\n${directLicense}\n*/`,
+  }, ...(config.plugins ?? [])];
   const graph = snapshotAppGraph(await build(config), join(root, entry));
   const prepared = await prepareStylexProducedTemplate(generation, "index.html");
   const html = prepareProductPreviewShell(shell, graph);

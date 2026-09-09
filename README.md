@@ -40,7 +40,7 @@ These examples require a machine whose setup and rollout prerequisites are satis
 
 1. **Start:** `hra session start personal --provider codex --json`. Create a Codex session under the account profile you choose.
 2. **Inspect:** `hra session status <session-id> --json`. Read the session and the cursor where its event stream continues.
-3. **Switch:** `hra session switch <session-id> --provider claude --preset fable-max`. Move the next turns to your signed-in Claude Code profile. The bounded retained HRA conversation record remains available, with any retention gap stated explicitly.
+3. **Switch:** `hra session switch <session-id> --provider claude --preset fable-max`. Continue on your signed-in Claude Code profile. HRA carries over the conversation it has retained and flags any missing history.
 4. **Direct:** `hra session send <session-id> -- "Review this project."`. Send the next request to that session and provider.
 
 ## Local execution, optional encrypted sync
