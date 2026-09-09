@@ -1,13 +1,15 @@
 import { expect, test } from "bun:test";
 import { assertReviewedRuntimeStyleBoundary } from "./build-runtime-style-boundary.ts";
 
-// Exact parsed acquireResource functions from the two reviewed production
+// Exact parsed acquireResource functions from the reviewed production
 // allocations. They are renderer capability, not requests to emit a style.
 const firstReviewedFunction = String.raw`function Tk(n,r,a){if(r.count++,r.instance===null)switch(r.type){case"style":var l=n.querySelector('style[data-href~="'+Ln(a.href)+'"]');if(l)return r.instance=l,jt(l),l;var d=g({},a,{"data-href":a.href,"data-precedence":a.precedence,href:null,precedence:null});return l=(n.ownerDocument||n).createElement("style"),jt(l),$t(l,"style",d),nu(l,a.precedence,n),r.instance=l;case"stylesheet":d=Ys(a.href);var p=n.querySelector(lo(d));if(p)return r.state.loading|=4,r.instance=p,jt(p),p;l=Ek(a),(d=Qn.get(d))&&md(l,d),p=(n.ownerDocument||n).createElement("link"),jt(p);var k=p;return k._p=new Promise(function(w,j){k.onload=w,k.onerror=j}),$t(p,"link",l),r.state.loading|=4,nu(p,a.precedence,n),r.instance=p;case"script":return p=Fs(a.src),(d=n.querySelector(uo(p)))?(r.instance=d,jt(d),d):(l=a,(d=Qn.get(p))&&(l=g({},a),gd(l,d)),n=n.ownerDocument||n,d=n.createElement("script"),jt(d),$t(d,"link",l),n.head.appendChild(d),r.instance=d);case"void":return null;default:throw Error(s(443,r.type))}else r.type==="stylesheet"&&(r.state.loading&4)===0&&(l=r.instance,r.state.loading|=4,nu(l,a.precedence,n));return r.instance}`;
 const secondReviewedFunction = String.raw`function Rb(n,r,a){if(r.count++,r.instance===null)switch(r.type){case"style":var l=n.querySelector('style[data-href~="'+Pn(a.href)+'"]');if(l)return r.instance=l,Mt(l),l;var d=g({},a,{"data-href":a.href,"data-precedence":a.precedence,href:null,precedence:null});return l=(n.ownerDocument||n).createElement("style"),Mt(l),Ut(l,"style",d),ru(l,a.precedence,n),r.instance=l;case"stylesheet":d=Js(a.href);var m=n.querySelector(ho(d));if(m)return r.state.loading|=4,r.instance=m,Mt(m),m;l=Mb(a),(d=Gn.get(d))&&kd(l,d),m=(n.ownerDocument||n).createElement("link"),Mt(m);var k=m;return k._p=new Promise(function(S,O){k.onload=S,k.onerror=O}),Ut(m,"link",l),r.state.loading|=4,ru(m,a.precedence,n),r.instance=m;case"script":return m=ea(a.src),(d=n.querySelector(po(m)))?(r.instance=d,Mt(d),d):(l=a,(d=Gn.get(m))&&(l=g({},a),xd(l,d)),n=n.ownerDocument||n,d=n.createElement("script"),Mt(d),Ut(d,"link",l),n.head.appendChild(d),r.instance=d);case"void":return null;default:throw Error(s(443,r.type))}else r.type==="stylesheet"&&(r.state.loading&4)===0&&(l=r.instance,r.state.loading|=4,ru(l,a.precedence,n));return r.instance}`;
+const themeReviewedFunction = String.raw`function Wb(n,i,a){if(i.count++,i.instance===null)switch(i.type){case"style":var u=n.querySelector('style[data-href~="'+$n(a.href)+'"]');if(u)return i.instance=u,zt(u),u;var d=y({},a,{"data-href":a.href,"data-precedence":a.precedence,href:null,precedence:null});return u=(n.ownerDocument||n).createElement("style"),zt(u),Bt(u,"style",d),hu(u,a.precedence,n),i.instance=u;case"stylesheet":d=ia(a.href);var m=n.querySelector(vo(d));if(m)return i.state.loading|=4,i.instance=m,zt(m),m;u=Yb(a),(d=Gn.get(d))&&zd(u,d),m=(n.ownerDocument||n).createElement("link"),zt(m);var k=m;return k._p=new Promise(function(S,R){k.onload=S,k.onerror=R}),Bt(m,"link",u),i.state.loading|=4,hu(m,a.precedence,n),i.instance=m;case"script":return m=sa(a.src),(d=n.querySelector(wo(m)))?(i.instance=d,zt(d),d):(u=a,(d=Gn.get(m))&&(u=y({},a),Rd(u,d)),n=n.ownerDocument||n,d=n.createElement("script"),zt(d),Bt(d,"link",u),n.head.appendChild(d),i.instance=d);case"void":return null;default:throw Error(s(443,i.type))}else i.type==="stylesheet"&&(i.state.loading&4)===0&&(u=i.instance,i.state.loading|=4,hu(u,a.precedence,n));return i.instance}`;
 const reviewedFunctions = [
-  { name: "Tk", text: firstReviewedFunction, mark: "jt", properties: "$t", otherMark: "Mt" },
-  { name: "Rb", text: secondReviewedFunction, mark: "Mt", properties: "Ut", otherMark: "jt" },
+  { name: "Tk", text: firstReviewedFunction, mark: "jt", properties: "$t", otherMark: "Mt", resource: "r", element: "l", assign: "g" },
+  { name: "Rb", text: secondReviewedFunction, mark: "Mt", properties: "Ut", otherMark: "jt", resource: "r", element: "l", assign: "g" },
+  { name: "Wb", text: themeReviewedFunction, mark: "zt", properties: "Bt", otherMark: "Mt", resource: "i", element: "u", assign: "y" },
 ] as const;
 const evidence = {
   manifest: { name: "react-dom", version: "19.2.8" },
@@ -15,7 +17,7 @@ const evidence = {
 };
 const artifact = (text: string) => ({ name: "main.js", text });
 
-for (const { name, text: reviewedFunction, mark, properties, otherMark } of reviewedFunctions) {
+for (const { name, text: reviewedFunction, mark, properties, otherMark, resource, element, assign } of reviewedFunctions) {
   test(`${name}: accepts only the dependency-bound parsed renderer capability`, () => {
     expect(() => assertReviewedRuntimeStyleBoundary([artifact(reviewedFunction)], evidence)).not.toThrow();
   });
@@ -37,11 +39,12 @@ for (const { name, text: reviewedFunction, mark, properties, otherMark } of revi
   test(`${name}: rejects changed resource ownership, branch context, and duplicate capabilities`, () => {
     for (const changed of [
       reviewedFunction.replace("n.ownerDocument||n", "document"),
-      reviewedFunction.replace("switch(r.type)", "switch(a.type)"),
+      reviewedFunction.replace(`switch(${resource}.type)`, "switch(a.type)"),
       reviewedFunction.replace('case"style":', 'case"other":'),
       `${reviewedFunction}\n${reviewedFunction}`,
       'document.createElement("style");',
     ]) {
+      expect(changed).not.toBe(reviewedFunction);
       expect(() => assertReviewedRuntimeStyleBoundary([artifact(changed)], evidence))
         .toThrow(/context/u);
     }
@@ -76,13 +79,13 @@ for (const { name, text: reviewedFunction, mark, properties, otherMark } of revi
   test(`${name}: rejects unknown allocations, inconsistent helper reuse and binding collisions`, () => {
     for (const changed of [
       reviewedFunction.replace(`function ${name}(`, "function Unreviewed("),
-      reviewedFunction.replace(`${mark}(l)`, `${otherMark}(l)`),
-      reviewedFunction.replace(`${mark}(l)`, `${properties}(l)`),
-      reviewedFunction.replaceAll(`${mark}(`, "g("),
+      reviewedFunction.replace(`${mark}(${element})`, `${otherMark}(${element})`),
+      reviewedFunction.replace(`${mark}(${element})`, `${properties}(${element})`),
+      reviewedFunction.replaceAll(`${mark}(`, `${assign}(`),
       reviewedFunction.replaceAll(`${mark}(`, "n("),
       // Swap two helper uses without changing either helper's occurrence count.
-      reviewedFunction.replace(`${mark}(l)`, `${properties}(l)`)
-        .replace(`${properties}(l,"style",d)`, `${mark}(l,"style",d)`),
+      reviewedFunction.replace(`${mark}(${element})`, `${properties}(${element})`)
+        .replace(`${properties}(${element},"style",d)`, `${mark}(${element},"style",d)`),
     ]) {
       expect(changed).not.toBe(reviewedFunction);
       expect(() => assertReviewedRuntimeStyleBoundary([artifact(changed)], evidence)).toThrow(/context/u);
@@ -95,13 +98,13 @@ for (const { name, text: reviewedFunction, mark, properties, otherMark } of revi
       reviewedFunction.replace(".ownerDocument", ".document"),
       reviewedFunction.replace('"data-href":', '"data-src":'),
       reviewedFunction.replace("precedence:null", "precedence:0"),
-      reviewedFunction.replace("r.count++", "r.count--"),
+      reviewedFunction.replace(`${resource}.count++`, `${resource}.count--`),
       reviewedFunction.replace("ownerDocument||n", "ownerDocument&&n"),
-      reviewedFunction.replace("r.instance===null", "r.instance!==null"),
-      reviewedFunction.replace("(n,r,a)", "(r,n,a)"),
-      reviewedFunction.replace("{if(r.count++", `{let ${mark};if(r.count++`),
+      reviewedFunction.replace(`${resource}.instance===null`, `${resource}.instance!==null`),
+      reviewedFunction.replace(`(n,${resource},a)`, `(${resource},n,a)`),
+      reviewedFunction.replace(`{if(${resource}.count++`, `{let ${mark};if(${resource}.count++`),
       `const resource = ${reviewedFunction};`,
-      reviewedFunction.replace(`${mark}(l)`, `${escapedMark}(l)`),
+      reviewedFunction.replace(`${mark}(${element})`, `${escapedMark}(${element})`),
       reviewedFunction.replace('createElement("style")', String.raw`createElement("\x73tyle")`),
     ]) {
       expect(changed).not.toBe(reviewedFunction);
@@ -110,11 +113,15 @@ for (const { name, text: reviewedFunction, mark, properties, otherMark } of revi
   });
 }
 
-test("rejects both reviewed allocations occurring together, including separate chunks", () => {
-  for (const artifacts of [
-    [artifact(`${firstReviewedFunction}\n${secondReviewedFunction}`)],
-    [artifact(firstReviewedFunction), { name: "other.js", text: secondReviewedFunction }],
-  ]) {
-    expect(() => assertReviewedRuntimeStyleBoundary(artifacts, evidence)).toThrow(/Duplicate/u);
+test("rejects any two reviewed allocations occurring together, including separate chunks", () => {
+  for (const [index, left] of reviewedFunctions.entries()) {
+    for (const right of reviewedFunctions.slice(index + 1)) {
+      for (const artifacts of [
+        [artifact(`${left.text}\n${right.text}`)],
+        [artifact(left.text), { name: "other.js", text: right.text }],
+      ]) {
+        expect(() => assertReviewedRuntimeStyleBoundary(artifacts, evidence)).toThrow(/Duplicate/u);
+      }
+    }
   }
 });

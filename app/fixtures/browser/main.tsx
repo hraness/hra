@@ -14,6 +14,7 @@ import { Input } from "../../src/components/ui/input";
 import { Sheet } from "../../src/components/ui/sheet";
 import { Switch } from "../../src/components/ui/switch";
 import { browserHead } from "./io";
+import { fixtureStyles } from "./main.stylex";
 import "@hraness/design-kit/compiler-palettes.css";
 import "../../src/index.css";
 
@@ -25,7 +26,7 @@ function Primitives() {
   const [selection, setSelection] = useState("none");
   return <Card>
     <CardHeader><CardTitle>Native fixture controls</CardTitle></CardHeader>
-    <CardContent>
+    <CardContent xstyle={fixtureStyles.controls}>
       <Button onClick={() => { setDialog(true); }}>Open dialog</Button>
       <Button onClick={() => { setSheet(true); }}>Open sheet</Button>
       <Button onClick={() => { setRightSheet(true); }}>Open right sheet</Button>

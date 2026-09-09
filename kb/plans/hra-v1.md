@@ -26,6 +26,8 @@ Both surfaces render the same pure native menu and static StyleX recipe from `ap
 
 The focused checks cover controller adoption, repeated mounting and cleanup, single preference writes, native keyboard behavior, bounded storage, affected screens, public rendering, and the two-file site test-transform admission. They do not establish completed browser or production acceptance.
 
+Compiled browser diagnostics confirmed that an unspaced primitive fixture let a transparent dropdown container intercept the sampled focus strip. The fixture now uses a static wrapping control row with a 12-pixel gap; exposure and 3:1 contrast requirements remain unchanged. The runtime-style boundary admits only the exact independently reviewed React allocation emitted by this integration. Its negative tests cover each allocation and every duplicate pair; package identity, source bytes, CSSOM, and runtime-injection restrictions remain enforced.
+
 Acceptance requires focused storage and rendering tests, the complete `bun run check` and `bun run check:browser` gates, browser evidence for all eight variants and preference changes under the tracked policies, and source-bound canonical website/app delivery. This web update does not activate the daemon or hosted command writer and does not change their capacity gates.
 
 ## Outcome
