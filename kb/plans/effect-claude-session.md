@@ -96,7 +96,7 @@ explicit cleanup strengthenings. Other public behavior remains compatible.
 | Contract and R1 baseline | Independent source and test reviewers | Exact caller/port map, retained red trace, unchanged controls and joined fixture cleanup | Complete on the isolated baseline |
 | Connection programs and client | Client implementer | Shared internal owner API, native initialization/writer/reader/close programs, deleted replaced scheduling, focused client preservation | Complete: 47 tests, 367 assertions |
 | Acquisition and manager | Manager implementer | Same interpreter from pre-acquisition through close, unchanged R1 oracle green, exact authority and all-child cleanup | Complete: 83 tests, 587 assertions |
-| Causal and architecture review | Independent reviewer and integrator | Actual-facade timing, raw failures, held native operations, callback ordering, module roles and deletion review | Final service replay and review readback in progress |
+| Causal and architecture review | Independent reviewer and integrator | Actual-facade timing, raw failures, held native operations, callback ordering, module roles and deletion review | Complete: final service replay passes 2 tests, 33 assertions; independent source review accepted |
 | Current-source integration and delivery | Integration and release owner | Current owner join, exact Required CI, applicable native/install/release and production evidence | Pending |
 
 The client worker owns the local model/platform/program/runtime modules and
@@ -220,3 +220,13 @@ local aggregate when Required CI already owns its authoritative equivalent.
   into the unchanged launch-authority helper, at the same boundaries before and
   after durable identity admission. Only that file's literal count changes from
   11 to 9; both runtime guards and their ordering are preserved.
+- Final service replay passes both cases and 33 assertions on the repaired
+  cleanup source. The actual archive from clean commit `58ff91ee` contains 219
+  regular files and nine directories, all with bytes and modes matching that
+  source. Its five new production modules add 58,084 payload bytes. The measured
+  inventory is 228 entries and 11,337 canonical JSON bytes, SHA-256
+  `fc4baa35c48126b40747d62bd1e54f98863175954b74f12287577d590b211f14`.
+  Reconstructing the owner baseline from its Git blobs exactly recovers all
+  three previous inventory constants. Only the excluded inventory policy and
+  this plan change after measurement; the same archive enters the isolated
+  installation gate. Package/install and final Required CI remain pending.
