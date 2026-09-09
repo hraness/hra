@@ -26,11 +26,15 @@ describe("browser fixture source import boundary", () => {
     for (const path of ["tmp/build-app/input.ts", "tmp/app-browser-fixture/main.js", "tmp/site-stylex-fixture/renderer.js", "tmp/transport-fixture/driver.mjs"]) {
       expect(await eslint.isPathIgnored(path)).toBe(true);
     }
-    for (const path of ["scripts/app-browser.ts", "scripts/build-site-stylex.ts", "site/foundation.ts", "app/fixtures/browser/main.tsx"]) {
+    for (const path of ["scripts/app-browser.ts", "scripts/build-site-stylex.ts", "site/foundation.ts", "app/fixtures/browser/main.tsx", "app/fixtures/product/main.tsx"]) {
       expect(await eslint.isPathIgnored(path)).toBe(false);
     }
   });
-  for (const filePath of ["app/fixtures/browser/io.ts", "app/fixtures/browser/main.tsx"]) {
+  for (const filePath of [
+    "app/fixtures/browser/io.ts", "app/fixtures/browser/main.tsx",
+    "app/fixtures/product/io.ts", "app/fixtures/product/main.tsx",
+    "app/fixtures/product/fixtures.ts", "app/fixtures/product/definition.test.ts",
+  ]) {
     test(`${filePath} admits only canonical app-source imports`, async () => {
       for (const specifier of [
         "../../src/model/session-model", "../../src/custody/custody-context",
@@ -55,7 +59,7 @@ describe("browser fixture source import boundary", () => {
   }
 
   test("the exception does not change other app or fixture-file restrictions", async () => {
-    for (const filePath of ["app/fixtures/browser/config.ts", "app/src/screens/settings-screen.tsx"]) {
+    for (const filePath of ["app/fixtures/browser/config.ts", "app/fixtures/product/config.ts", "app/fixtures/product/definition.ts", "app/src/screens/settings-screen.tsx"]) {
       expect(await restrictedImports(filePath, "../../src/data/wire")).toHaveLength(1);
       expect(await restrictedImports(filePath, "../../../src/storage/paths")).toHaveLength(1);
     }

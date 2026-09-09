@@ -7,9 +7,11 @@ import { fileURLToPath } from "node:url";
 import { parseHTML } from "linkedom";
 import { transform, type Selector } from "lightningcss";
 import { createStylexTransformCollector } from "@hraness/ui/stylex-build";
+import { DIRECT_WIRE_MARKERS } from "@hraness/direct/tooling/bundle-boundary";
 
 import {
   assertSiteFontStyleInventory,
+  assertSiteBrowserBundle,
   buildSite,
   HRA_POSTHOG_PROJECT_TOKEN_ENV,
   publishSiteFonts,
@@ -17,6 +19,8 @@ import {
   resolveHraAnalyticsProjectToken,
 } from "../scripts/build-site.ts";
 import { publicContent } from "./content.ts";
+import { docsPaths, renderDocsMarkdown } from "./docs-content.ts";
+import { PRODUCT_PREVIEW_CSP } from "../scripts/build-product-preview.ts";
 import { renderSocialCardPng, renderSocialCardSvg } from "./social-card.ts";
 import { readPngDimensions } from "./social-card-raster.ts";
 import {
@@ -24,6 +28,7 @@ import {
   renderAskAiAboutThis,
   renderHraAnalyticsScript,
   renderHraSiteFooter,
+  renderDocsPages,
   renderPreviewHtml,
   renderPrivacyHtml,
   renderSiteHtml,
@@ -136,6 +141,15 @@ afterEach(async () => {
 });
 
 describe("static-site build", () => {
+  test("rejects Direct runtime or fixture selectors in parent browser bundles", () => {
+    expect(() => assertSiteBrowserBundle("document.querySelector('[data-product-preview]')")).not.toThrow();
+    for (const marker of [...DIRECT_WIRE_MARKERS, "@hraness/direct", "__direct_scenario", "__direct_fixture"]) {
+      expect(() => assertSiteBrowserBundle(`export const leaked = ${JSON.stringify(marker)};`)).toThrow("Direct runtime or fixture activation");
+    }
+    expect(() => assertSiteBrowserBundle("")).toThrow("bound");
+    expect(() => assertSiteBrowserBundle("x".repeat(4 * 1024 * 1024 + 1))).toThrow("bound");
+  });
+
   test("keeps the wrapping mobile header in document flow through its emitted StyleX atom", async () => {
     const className = mobileHeaderFlowClassName();
     const path = join(sourceRoot, "site/marketing.stylex.ts");
@@ -295,11 +309,13 @@ describe("static-site build", () => {
       "dist/site/.well-known/security.txt",
       "dist/site/.well-known/hra.json",
       "dist/site/analytics.js",
+      "dist/site/site.js",
       "dist/site/appearance.js",
       "dist/site/favicon.svg",
       "dist/site/social-card.svg",
       "dist/site/social-card.png",
       "dist/site/stylex.css",
+      ...docsPaths.flatMap((path) => [`dist/site${path}index.html`, `dist/site${path}index.md`]),
       ...expectedAttributionPaths.map((path) => `dist/site/fonts/${path}`),
     ];
 
@@ -314,6 +330,13 @@ describe("static-site build", () => {
       const route = compiledStylesheetJoin(await readFile(join(root, "dist/site", path), "utf8"));
       expect(route.foundationPath).toBe(foundationPath);
       expect(route.authoredHtml).toBe(render());
+    }
+    for (const [path, expected] of Object.entries(renderDocsPages())) {
+      const route = compiledStylesheetJoin(await readFile(join(root, "dist/site", path.slice(1), "index.html"), "utf8"));
+      expect(route.foundationPath).toBe(foundationPath);
+      expect(route.authoredHtml).toBe(expected);
+      expect(await readFile(join(root, "dist/site", path.slice(1), "index.md"), "utf8"))
+        .toBe(renderDocsMarkdown(path).replace(/\n?$/u, "\n"));
     }
     const foundation = await readFile(join(root, "dist/site", foundationPath), "utf8");
     const union = await readFile(join(root, "dist/site/stylex.css"), "utf8");
@@ -366,12 +389,33 @@ describe("static-site build", () => {
       return decodeURIComponent(resolved.pathname.slice(1));
     });
     expect(resolvedFonts.sort()).toEqual(fontPaths);
+    const previewPaths = inventory.filter((path) => path.startsWith("examples/app/"));
+    expect(previewPaths).toContain("examples/app/index.html");
+    expect(previewPaths).toContain("examples/app/stylex.css");
+    expect(previewPaths.filter((path) => path.endsWith(".css"))).toHaveLength(2);
+    expect(previewPaths.filter((path) => path.endsWith(".js")).length).toBeGreaterThan(0);
+    for (const path of previewPaths) expect(path).toMatch(/^examples\/app\/(?:index\.html|stylex\.css|graphs\/client\/assets\/[A-Za-z0-9_-][A-Za-z0-9_.-]*\.(?:js|css))$/u);
+    const preview = await readFile(join(root, "dist/site/examples/app/index.html"), "utf8");
+    const directLicense = (await readFile(join(sourceRoot, "node_modules/@hraness/direct/LICENSE"), "utf8")).trim();
+    const previewScripts = await Promise.all(previewPaths.filter((path) => path.endsWith(".js"))
+      .map((path) => readFile(join(root, "dist/site", path), "utf8")));
+    expect(previewScripts.some((script) => script.includes(directLicense))).toBe(true);
+    const frameDocument = parseHTML(preview).document;
+    expect(frameDocument.querySelector('meta[http-equiv="Content-Security-Policy"]')?.getAttribute("content")).toBe(PRODUCT_PREVIEW_CSP);
+    expect(preview).not.toContain("/analytics.js");
+    expect(preview).not.toContain("/site.js");
+    for (const element of frameDocument.querySelectorAll("[src],[href]")) {
+      const resource = element.getAttribute("src") ?? element.getAttribute("href");
+      expect(resource).toMatch(/^\.\/(?:stylex\.css|graphs\/client\/assets\/[A-Za-z0-9_-][A-Za-z0-9_.-]*\.(?:js|css))$/u);
+      expect(previewPaths).toContain(`examples/app/${resource?.slice(2)}`);
+    }
     expect(inventory).toEqual([
       ...expectedPaths.filter((path) => path.startsWith("dist/site/")).map((path) => path.slice("dist/site/".length)),
-      foundationPath, ...fontPaths,
+      foundationPath, ...fontPaths, ...previewPaths,
     ].sort());
-    expect(inventory.filter((path) => path.endsWith(".js"))).toEqual(["analytics.js", "appearance.js"]);
-    expect(inventory).not.toContain("stylex-complete.json");
+    expect(inventory.filter((path) => path.endsWith(".js") && !path.startsWith("examples/app/"))).toEqual(["analytics.js", "appearance.js", "site.js"]);
+    for (const path of ["analytics.js", "appearance.js", "site.js"]) assertSiteBrowserBundle(await readFile(join(root, "dist/site", path), "utf8"));
+    expect(inventory.some((path) => path.endsWith("stylex-complete.json") || path.includes("/complete/") || path.endsWith(".map"))).toBe(false);
     expect(inventory.some((path) => /\.(?:map|ts|tsx|otf)$/u.test(path) || path.startsWith("graphs/renderer/"))).toBe(false);
     expect(await inventoryFiles(join(root, "dist/site/fonts"))).toEqual(expectedAttributionPaths);
     for (const path of expectedAttributionPaths) {
@@ -533,6 +577,9 @@ describe("static-site build", () => {
       "dist/site/reading/index.html",
       "dist/site/reading/deepseek-harness/index.html",
       "dist/site/images/editorial/deepseek-harness.webp",
+      "dist/site/docs/removed/index.html",
+      "dist/site/examples/app/complete/stylex-complete.json",
+      "dist/site/examples/app/graphs/client/assets/stale.js",
     ] as const;
     for (const path of stalePaths) {
       await mkdir(dirname(join(root, path)), { recursive: true });
@@ -581,7 +628,7 @@ describe("static-site build", () => {
     expect(await readFile(join(root, "dist/site/stylex.css"), "utf8")).toBe("stale\n");
   }, compilerBuildTimeoutMs);
 
-  test("admits only owned appearance and analytics scripts, configured Turnstile, and restrictive response headers", async () => {
+  test("admits only owned browser entries, configured Turnstile, and restrictive response headers", async () => {
     const repositoryRoot = join(import.meta.dir, "..");
     const html = renderSiteHtml();
     const css = await readFile(join(repositoryRoot, "site/styles.css"), "utf8");
@@ -589,10 +636,13 @@ describe("static-site build", () => {
       await readFile(join(repositoryRoot, "vercel.json"), "utf8"),
     ) as { headers?: unknown };
 
-    expect(html.match(/<script[^>]+src=/gu)).toHaveLength(2);
+    expect(html.match(/<script[^>]+src=/gu)).toHaveLength(3);
     expect(html).toContain('<script src="/appearance.js"></script>');
     expect(html).toContain(renderHraAnalyticsScript());
+    expect(html).toContain('src="/site.js"');
     expect(renderPreviewHtml()).not.toContain(renderHraAnalyticsScript());
+    expect(renderPreviewHtml()).not.toContain('src="/site.js"');
+    expect(renderPreviewHtml()).not.toContain('src="/appearance.js"');
     expect(renderHraSiteFooter({
       [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: "1x00000000000000000000AA",
     })).toContain(
@@ -625,11 +675,28 @@ describe("static-site build", () => {
         ],
       },
       {
-        source: "/((?!preview/?$).*)",
+        source: "/examples/app/:path*",
         headers: [
           {
             key: "Content-Security-Policy",
-            value: "default-src 'none'; base-uri 'none'; connect-src https://us.i.posthog.com; font-src 'self'; form-action https://account.hraness.com; frame-ancestors 'none'; frame-src https://challenges.cloudflare.com; img-src 'self' data:; manifest-src 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self'",
+            value: "default-src 'none'; script-src 'self'; style-src 'self'; img-src data: blob:; font-src 'self'; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'; worker-src 'none'; frame-ancestors 'self'",
+          },
+          { key: "Access-Control-Allow-Origin", value: "*" },
+          {
+            key: "Permissions-Policy",
+            value: "camera=(), geolocation=(), microphone=(), payment=(), usb=()",
+          },
+          { key: "Referrer-Policy", value: "no-referrer" },
+          { key: "X-Content-Type-Options", value: "nosniff" },
+          { key: "X-Robots-Tag", value: "noindex, nofollow" },
+        ],
+      },
+      {
+        source: "/((?!preview/?$|examples/app(?:/|$)).*)",
+        headers: [
+          {
+            key: "Content-Security-Policy",
+            value: "default-src 'none'; base-uri 'none'; connect-src https://us.i.posthog.com; font-src 'self'; form-action https://account.hraness.com; frame-ancestors 'none'; frame-src 'self' https://challenges.cloudflare.com; img-src 'self' data:; manifest-src 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self'",
           },
           { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
           {
@@ -642,5 +709,12 @@ describe("static-site build", () => {
         ],
       },
     ]);
+    const parentRule = new RegExp("^/((?!preview/?$|examples/app(?:/|$)).*)$");
+    for (const path of ["/preview", "/preview/", "/examples/app", "/examples/app/", "/examples/app/graphs/client/assets/main.js"]) {
+      expect(parentRule.test(path)).toBe(false);
+    }
+    for (const path of ["/", "/docs/", "/preview/private", "/examples/application/", "/examples/app-private/", "/examples/app.js"]) {
+      expect(parentRule.test(path)).toBe(true);
+    }
   });
 });

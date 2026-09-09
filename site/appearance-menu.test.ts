@@ -5,7 +5,7 @@ import { parseHTML } from "linkedom";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
-import { renderPreviewHtml, renderPrivacyHtml, renderSiteHtml } from "./template";
+import { renderDocsPages, renderPreviewHtml, renderPrivacyHtml, renderSiteHtml } from "./template";
 
 describe("public appearance delivery", () => {
   test("the public compiler owns every native menu atom and its focus and viewport constraints", async () => {
@@ -27,7 +27,7 @@ describe("public appearance delivery", () => {
   });
 
   test("public pages expose one native header menu and a blocking external bootstrap", () => {
-    for (const html of [renderSiteHtml(), renderPrivacyHtml()]) {
+    for (const html of [renderSiteHtml(), renderPrivacyHtml(), ...Object.values(renderDocsPages())]) {
       const { document } = parseHTML(html);
       const menus = document.querySelectorAll("details[data-hra-appearance]");
       expect(menus.length).toBe(1);

@@ -2,7 +2,7 @@
 
 - `src/` contains the Bun CLI, daemon, local authority, Codex and Claude Code adapters, and cloud client.
 - `convex/` contains the optional encrypted sync and verified-email device authority.
-- `site/` contains the static public website generated from the README content contract.
+- `site/` contains the public product website, task-oriented documentation, and shared README content contract.
 - `scripts/` contains deterministic checks, builds, and release helpers.
 - `kb/` contains maintained product knowledge and executable implementation plans.
 - `.agents/skills/` contains the portable five-skill phased planning and execution pack.

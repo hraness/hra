@@ -28,7 +28,7 @@ const layerRules = (patterns) => ({
   "@typescript-eslint/no-restricted-imports": ["error", { patterns }],
 });
 
-// These two fixture files sit exactly two levels below app/. Only canonical
+// These explicitly owned fixture files sit exactly two levels below app/. Only canonical
 // app-source paths qualify; dot-segment escapes still reach the core boundary.
 const browserFixtureAppSource = "\\.\\./\\.\\./src/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+(?:\\.(?:stylex\\.)?(?:ts|tsx|css))?";
 
@@ -207,7 +207,11 @@ export default tseslint.config(
     ]),
   },
   {
-    files: ["app/fixtures/browser/io.ts", "app/fixtures/browser/main.tsx"],
+    files: [
+      "app/fixtures/browser/io.ts", "app/fixtures/browser/main.tsx",
+      "app/fixtures/product/io.ts", "app/fixtures/product/main.tsx",
+      "app/fixtures/product/fixtures.ts", "app/fixtures/product/definition.test.ts",
+    ],
     rules: layerRules([
       {
         regex: `^(?!${browserFixtureAppSource}$).*(?:^|/)src/`,

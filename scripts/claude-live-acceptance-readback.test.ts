@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
 import { chmod, link, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
@@ -28,9 +28,144 @@ const sha = (value: string) => {
   if (digest === null) throw new Error("fixture_digest_invalid");
   return digest;
 };
-const cleanups: Array<() => Promise<void>> = [];
+type ReadbackCleanup = () => Promise<void>;
+const cleanups: ReadbackCleanup[] = [];
+
+function createOwnedReadbackCase() {
+  const controller = new AbortController();
+  const cancellation = new Error("Owned readback case is closing.");
+  const ownedCleanups: ReadbackCleanup[] = [];
+  const tasks: Array<Promise<{ status: "fulfilled" } | { status: "rejected"; reason: unknown }>> = [];
+  let closing: Promise<void> | undefined;
+  const request = async <T>(operation: () => Promise<T>): Promise<T> => {
+    controller.signal.throwIfAborted();
+    const result = await operation();
+    controller.signal.throwIfAborted();
+    return result;
+  };
+  return {
+    request,
+    registerCleanup: (cleanup: ReadbackCleanup): void => { ownedCleanups.push(cleanup); },
+    run: <T>(operation: () => Promise<T>): Promise<T> => {
+      // Register and observe the raw setup/test task before its callback runs.
+      // Never join a finally wrapper that waits for this same owner's cleanup.
+      const task = Promise.resolve().then(async () => await request(operation));
+      tasks.push(task.then(
+        () => ({ status: "fulfilled" } as const),
+        (reason: unknown) => ({ status: "rejected", reason } as const),
+      ));
+      return task;
+    },
+    close: (): Promise<void> => {
+      if (closing !== undefined) return closing;
+      controller.abort(cancellation);
+      closing = (async () => {
+        const failures: unknown[] = [];
+        for (const result of await Promise.all(tasks)) {
+          // An operation may fail after cancellation; only our exact sentinel
+          // is expected cleanup, never an actual late readback refusal.
+          if (result.status === "rejected" && result.reason !== cancellation) failures.push(result.reason);
+        }
+        // Setup can register resources while it drains. This list belongs only
+        // to this case, including if Bun times out its afterEach hook.
+        for (const cleanup of ownedCleanups.splice(0).reverse()) {
+          try { await cleanup(); } catch (error: unknown) { failures.push(error); }
+        }
+        if (failures.length > 0) throw new AggregateError(failures, "Owned readback teardown failed.");
+      })();
+      return closing;
+    },
+  };
+}
+
+const ownedReadbackCases: Array<ReturnType<typeof createOwnedReadbackCase>> = [];
 afterEach(async () => {
-  for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+  // Capture this case's owners before awaiting anything. A timed-out teardown
+  // cannot take cleanup registrations from a subsequent test.
+  const owners = ownedReadbackCases.splice(0);
+  const unownedCleanups = cleanups.splice(0).reverse();
+  const failures: unknown[] = [];
+  for (const result of await Promise.allSettled(owners.map((owner) => owner.close()))) {
+    if (result.status === "rejected") failures.push(result.reason);
+  }
+  for (const cleanup of unownedCleanups) {
+    try { await cleanup(); } catch (error: unknown) { failures.push(error); }
+  }
+  if (failures.length > 0) throw new AggregateError(failures, "Readback teardown failed.");
+});
+
+describe("owned readback case lifecycle", () => {
+  test("registers before deferred setup and cancels before opening resources", async () => {
+    const owner = createOwnedReadbackCase();
+    let opened = false;
+    const setup = owner.run(async () => { opened = true; });
+    const closing = owner.close();
+    expect(owner.close()).toBe(closing);
+    await closing;
+    await expect(setup).rejects.toThrow("Owned readback case is closing.");
+    expect(opened).toBe(false);
+  });
+
+  test.each(["setup", "test"] as const)("joins paused raw %s work before its late-registered cleanup", async (phase) => {
+    const owner = createOwnedReadbackCase();
+    const nextOwner = createOwnedReadbackCase();
+    const entered = Promise.withResolvers<undefined>();
+    const release = Promise.withResolvers<undefined>();
+    const events: string[] = [];
+    owner.registerCleanup(async () => { events.push("close-initial"); });
+    nextOwner.registerCleanup(async () => { events.push("close-next-case"); });
+    if (phase === "test") await owner.run(async () => undefined);
+    const task = owner.run(async () => {
+      await owner.request(async () => {
+        entered.resolve(undefined);
+        await release.promise;
+        events.push("raw-settled");
+        owner.registerCleanup(async () => { events.push("close-late"); });
+      });
+      events.push("continued-after-close");
+    });
+    await entered.promise;
+    const closing = owner.close();
+    await Promise.resolve();
+    expect(events).toEqual([]);
+    release.resolve(undefined);
+    await closing;
+    await expect(task).rejects.toThrow("Owned readback case is closing.");
+    expect(events).toEqual(["raw-settled", "close-late", "close-initial"]);
+    await nextOwner.close();
+    expect(events).toEqual(["raw-settled", "close-late", "close-initial", "close-next-case"]);
+  });
+
+  test("retains late operation failures and attempts every cleanup after raw work settles", async () => {
+    const owner = createOwnedReadbackCase();
+    const entered = Promise.withResolvers<undefined>();
+    const release = Promise.withResolvers<undefined>();
+    const lateFailure = new Error("late readback refusal");
+    const cleanupFailure = new Error("socket collection failed");
+    const events: string[] = [];
+    owner.registerCleanup(async () => { events.push("close-root"); });
+    owner.registerCleanup(async () => { events.push("close-socket"); throw cleanupFailure; });
+    const task = owner.run(async () => {
+      await owner.request(async () => {
+        entered.resolve(undefined);
+        await release.promise;
+        events.push("raw-failed");
+        throw lateFailure;
+      });
+    });
+    await entered.promise;
+    const closing = owner.close().catch((error: unknown) => error);
+    await Promise.resolve();
+    expect(events).toEqual([]);
+    release.resolve(undefined);
+    const error = await closing;
+    expect(error).toBeInstanceOf(AggregateError);
+    if (!(error instanceof AggregateError)) throw new Error("Expected every teardown failure.");
+    expect(error.errors).toEqual([lateFailure, cleanupFailure]);
+    expect(error.errors[0]).toBe(lateFailure);
+    await expect(task).rejects.toBe(lateFailure);
+    expect(events).toEqual(["raw-failed", "close-socket", "close-root"]);
+  });
 });
 
 // Deliberately differ from the sibling Codex generation; never borrow its counter.
@@ -47,12 +182,15 @@ const admitClaude = (store: StateStore, profileId: Parameters<StateStore["requir
 
 // Real current-schema StateStore records and private filesystem artifacts.
 // OS liveness and argv observations are typed deterministic fixtures; no provider is launched.
-const fixture = async () => {
+const fixture = async (registerCleanup: (cleanup: ReadbackCleanup) => void = (cleanup) => { cleanups.push(cleanup); }) => {
   // A short Unix temporary root keeps the real callback socket below sun_path's bound.
-  const root = await realpath(await mkdtemp("/tmp/hra-clrb-"));
+  const temporaryRoot = await mkdtemp("/tmp/hra-clrb-");
+  registerCleanup(async () => { await rm(temporaryRoot, { recursive: true }); });
+  const root = await realpath(temporaryRoot);
   const paths = resolveStatePaths({ rootDirectory: root });
   await initializeStatePaths(paths);
   const store = new StateStore(paths);
+  registerCleanup(async () => { store.close(); });
   const socketPath = claudeHostToolCallbackSocketPath(paths);
   const server = createServer();
   let socketClosed = false;
@@ -61,7 +199,7 @@ const fixture = async () => {
     socketClosed = true;
     await new Promise<void>((resolveClose, reject) => server.close((error) => error ? reject(error) : resolveClose()));
   };
-  cleanups.push(async () => { if (server.listening) await closeSocket(); store.close(); await rm(root, { recursive: true }); });
+  registerCleanup(async () => { if (server.listening) await closeSocket(); });
   const bootId = `boot_${randomUUID().replaceAll("-", "")}`;
   const daemonGeneration = store.nextDaemonGeneration(bootId);
   const projectRoot = join(root, "project");
@@ -353,51 +491,74 @@ describe("independent Claude private readback", () => {
     expect(checks).toBeGreaterThanOrEqual(3);
   });
 
-  test("corroborates real durable rows and exact artifacts before and after shutdown", async () => {
-    const f = await fixture();
-    expect(f.store.requireProfile(f.profile.id).state).toBe("signed_out");
-    expect(f.providerAuthority.processGeneration).not.toBe(f.profile.processGeneration);
-    expect(f.store.requireProviderAccountForProfile(f.profile.id, "claude").readiness).toBe("signed_in");
-    expect(f.store.readSessionClaudeProcessAuthority(f.session.id)).toMatchObject({
-      profileGeneration: f.profile.processGeneration, providerAuthority: f.providerAuthority, state: "bound",
-    });
-    const oracle = f.oracle();
-    const live = await oracle.captureLive(f.input);
-    expect(live).toMatchObject({ phase: "live", soleRemember: true, managedClaudeSignedIn: true,
-      proofBindingDigest: f.input.receipt.candidateBindingDigest });
-    const stopped = await oracle.verifyStopped({ receipt: await f.stop() });
-    expect(f.store.readSessionClaudeProcessAuthority(f.session.id, true)).toMatchObject({
-      profileGeneration: f.profile.processGeneration, providerAuthority: f.providerAuthority, state: "released",
-    });
-    expect(stopped).toMatchObject({ phase: "stopped", snapshotDigest: live.snapshotDigest,
-      processReleased: true, processNotLive: true, privateArtifactsAbsent: true, lifecycleInvalidated: true });
-    expect(JSON.stringify(stopped)).not.toContain(f.root);
-    expect(JSON.stringify(stopped)).not.toContain(f.session.id);
-    expect(JSON.stringify(stopped)).not.toContain("40001");
-    await expect(oracle.verifyStopped({ receipt: { ...f.input.receipt, lifecycleInvalidated: true } }))
-      .rejects.toThrow("claude_live_acceptance_readback_refused");
-  });
+  describe("coupled live-to-stopped readback", () => {
+    let prepared: Readonly<{ owner: ReturnType<typeof createOwnedReadbackCase>; fixture: Awaited<ReturnType<typeof fixture>> }> | undefined;
+    beforeEach(async () => {
+      prepared = undefined;
+      const owner = createOwnedReadbackCase();
+      ownedReadbackCases.push(owner);
+      const value = await owner.run(async () => await fixture(owner.registerCleanup));
+      prepared = { owner, fixture: value };
+      // A separate, fresh 5-second setup budget is deliberate. The complete
+      // same-oracle live-to-stopped proof still has one 5-second test deadline.
+    }, 5_000);
 
-  test("a sibling Codex generation change does not impersonate Claude lifecycle invalidation", async () => {
-    const f = await fixture();
-    const originalProcess = f.store.readSessionClaudeProcessAuthority(f.session.id);
-    expect(originalProcess).toMatchObject({
-      profileGeneration: f.profile.processGeneration, providerAuthority: f.providerAuthority, state: "bound",
-    });
-    const oracle = f.oracle(async () => {
-      f.store.advanceProfileGeneration(f.profile.id, f.profile.processGeneration);
-    });
-    const live = await oracle.captureLive(f.input);
-    expect(f.store.requireProfile(f.profile.id).processGeneration).toBe(f.profile.processGeneration + 1);
-    expect(f.store.readSessionClaudeProcessAuthority(f.session.id)).toEqual(originalProcess);
-    expect(f.store.requireProviderAccountAuthority(f.profile.id, "claude")).toEqual(f.providerAuthority);
-    expect(await oracle.verifyStopped({ receipt: await f.stop() })).toMatchObject({
-      phase: "stopped", snapshotDigest: live.snapshotDigest,
-    });
-    // The extra tuple checks are private admission, not retroactive V1 fields.
-    expect(live.version).toBe(1);
-    expect(live).not.toHaveProperty("providerAccountId");
-    expect(live).not.toHaveProperty("bindingGeneration");
+    test("corroborates real durable rows and exact artifacts before and after shutdown", () => {
+      if (prepared === undefined) throw new Error("Owned readback fixture is not ready.");
+      const { owner, fixture: f } = prepared;
+      return owner.run(async () => {
+        expect(f.store.requireProfile(f.profile.id).state).toBe("signed_out");
+        expect(f.providerAuthority.processGeneration).not.toBe(f.profile.processGeneration);
+        expect(f.store.requireProviderAccountForProfile(f.profile.id, "claude").readiness).toBe("signed_in");
+        expect(f.store.readSessionClaudeProcessAuthority(f.session.id)).toMatchObject({
+          profileGeneration: f.profile.processGeneration, providerAuthority: f.providerAuthority, state: "bound",
+        });
+        const oracle = f.oracle();
+        const live = await owner.request(async () => await oracle.captureLive(f.input));
+        expect(live).toMatchObject({ phase: "live", soleRemember: true, managedClaudeSignedIn: true,
+          proofBindingDigest: f.input.receipt.candidateBindingDigest });
+        const receipt = await owner.request(f.stop);
+        const stopped = await owner.request(async () => await oracle.verifyStopped({ receipt }));
+        expect(f.store.readSessionClaudeProcessAuthority(f.session.id, true)).toMatchObject({
+          profileGeneration: f.profile.processGeneration, providerAuthority: f.providerAuthority, state: "released",
+        });
+        expect(stopped).toMatchObject({ phase: "stopped", snapshotDigest: live.snapshotDigest,
+          processReleased: true, processNotLive: true, privateArtifactsAbsent: true, lifecycleInvalidated: true });
+        expect(JSON.stringify(stopped)).not.toContain(f.root);
+        expect(JSON.stringify(stopped)).not.toContain(f.session.id);
+        expect(JSON.stringify(stopped)).not.toContain("40001");
+        await owner.request(async () => {
+          await expect(oracle.verifyStopped({ receipt: { ...f.input.receipt, lifecycleInvalidated: true } }))
+            .rejects.toThrow("claude_live_acceptance_readback_refused");
+        });
+      });
+    }, 5_000);
+
+    test("a sibling Codex generation change does not impersonate Claude lifecycle invalidation", () => {
+      if (prepared === undefined) throw new Error("Owned readback fixture is not ready.");
+      const { owner, fixture: f } = prepared;
+      return owner.run(async () => {
+        const originalProcess = f.store.readSessionClaudeProcessAuthority(f.session.id);
+        expect(originalProcess).toMatchObject({
+          profileGeneration: f.profile.processGeneration, providerAuthority: f.providerAuthority, state: "bound",
+        });
+        const oracle = f.oracle(async () => {
+          f.store.advanceProfileGeneration(f.profile.id, f.profile.processGeneration);
+        });
+        const live = await owner.request(async () => await oracle.captureLive(f.input));
+        expect(f.store.requireProfile(f.profile.id).processGeneration).toBe(f.profile.processGeneration + 1);
+        expect(f.store.readSessionClaudeProcessAuthority(f.session.id)).toEqual(originalProcess);
+        expect(f.store.requireProviderAccountAuthority(f.profile.id, "claude")).toEqual(f.providerAuthority);
+        const receipt = await owner.request(f.stop);
+        expect(await owner.request(async () => await oracle.verifyStopped({ receipt }))).toMatchObject({
+          phase: "stopped", snapshotDigest: live.snapshotDigest,
+        });
+        // The extra tuple checks are private admission, not retroactive V1 fields.
+        expect(live.version).toBe(1);
+        expect(live).not.toHaveProperty("providerAccountId");
+        expect(live).not.toHaveProperty("bindingGeneration");
+      });
+    }, 5_000);
   });
 
   test.each(["live", "stopped", "cleanup"] as const)("rechecks Claude authority after the final %s process probe", async (phase) => {

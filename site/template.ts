@@ -8,7 +8,10 @@ import { AskAiAboutThis } from "@hraness/ui";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { sitePresentationClasses, sitePresentationStyles, type SitePresentationSlot } from "./presentation.stylex.ts";
-import { renderMarketingHeader, renderMarketingPage, renderReferenceLabel } from "./marketing.tsx";
+import { renderMarketingHeader, renderMarketingPage } from "./marketing.tsx";
+import { docsPages, docsPathForSection, docsReferenceSections, type DocsPage } from "./docs-content.ts";
+import { renderProductPreview } from "./product-preview.tsx";
+import { docsClasses } from "./docs.stylex.ts";
 
 import {
   findSection,
@@ -143,7 +146,7 @@ const renderSection = (
   surface: "reference" | "privacy" = "reference",
 ): string =>
   `<section class="${classes("documentation-section", "documentationSection", ...(surface === "privacy" ? ["privacySection"] as const : []))}" id="${escapeHtml(section.id)}" aria-labelledby="${escapeHtml(section.id)}-heading">
-  <${headingLevel} class="${classes("", ...(headingLevel === "h2" ? [surface === "privacy" ? "privacyH2" : "referenceH2", ...(surface === "reference" ? ["proseMeasure"] as const : []), "documentationHeading"] as const : ["documentationBody"] as const))}" id="${escapeHtml(section.id)}-heading">${escapeHtml(section.heading)}</${headingLevel}>
+  <${headingLevel} class="${classes("", ...(headingLevel === "h2" ? [surface === "privacy" ? "privacyH2" : "referenceH2", ...(surface === "reference" ? ["proseMeasure"] as const : []), "documentationHeading"] as const : ["privacyH2", "documentationHeading"] as const))}" id="${escapeHtml(section.id)}-heading">${escapeHtml(section.heading)}</${headingLevel}>
   ${afterHeading}
   ${section.blocks.map((block, index) => renderBlock(
     block,
@@ -246,20 +249,6 @@ export const renderSiteHtml = (
   content: PublicContent = publicContent,
   environment: Readonly<Record<string, string | undefined>> = emptySiteEnvironment,
 ): string => {
-  const navigation = content.sections
-    .map((section) => `<a class="${classes("", "proseLink", "sectionNavLink", "focusable")}" href="#${escapeHtml(section.id)}">${escapeHtml(section.heading)}</a>`)
-    .join("");
-
-  const reference = `<div class="${classes("reference__intro", "referenceIntro")}">
-  ${renderReferenceLabel()}
-  <h2 class="${classes("reference__heading", "referenceHeading", "proseMeasure")}">Every command, boundary, and release claim.</h2>
-  <div class="${classes("hero-notes", "heroNotes")}">
-    ${content.introduction.map((block, index) => renderBlock(block, "introduction", index, "h3", "heroNotes")).join("\n    ")}
-  </div>
-</div>
-<nav class="${classes("section-nav", "sectionNav")}" aria-label="Documentation">${navigation}</nav>
-${content.sections.map((section) => renderSection(section)).join("\n")}`;
-
   return `<!doctype html>
 <html ${paletteAttributes} lang="en">
 <head>
@@ -273,12 +262,14 @@ ${renderHead(content, {
 <a class="${classes("skip-link", "skipLink", "focusable")}" href="#content">Skip to content</a>
 ${renderMarketingHeader(content, "/")}
 <main id="content">
-${renderMarketingPage(content, reference)}
+${renderMarketingPage(content)}
+<details class="${docsClasses("legacyLinks")}" id="reference"><summary>Looking for the former reference?</summary><p>The same command and safety reference now lives in the documentation.</p><nav aria-label="Moved reference sections">${content.sections.map((section) => `<p id="${escapeHtml(section.id)}"><a data-moved-section="${escapeHtml(section.id)}" href="${escapeHtml(docsPathForSection(section.id))}">${escapeHtml(section.heading)} →</a></p>`).join("")}</nav></details>
 </main>
 ${renderAskAiAboutThis(`${content.siteUrl}/`)}
 ${renderProjectResources(content)}
 ${renderHraSiteFooter(environment)}
 ${renderHraAnalyticsScript()}
+<script src="/site.js" type="module"></script>
 </body>
 </html>
 `;
@@ -306,7 +297,7 @@ ${renderHead(content, {
     <ul class="${classes("preview-capabilities", "previewCapabilities")}" aria-label="HRA capabilities">
       ${[["Accounts", "Isolated by default"], ["Sessions", "Live and durable"], ["Sync", "Optional and encrypted"]].map(([label, detail], index) => `<li class="${classes("", "previewCapability", ...(index > 0 ? ["previewCapabilityFollowing"] as const : []))}"><strong class="${classes("", "previewCapabilityStrong")}">${label}</strong><span class="${classes("", "previewCapabilityDetail")}">${detail}</span></li>`).join("\n      ")}
     </ul>
-    <p class="${classes("preview-status", "previewStatus")}">Local-first <span aria-hidden="true">·</span> Bun CLI</p>
+    <p class="${classes("preview-status", "previewStatus")}">Web workspace <span aria-hidden="true">·</span> Local CLI</p>
   </article>
 </main>
 </body>
@@ -331,7 +322,7 @@ ${renderHead(content, {
 <a class="${classes("skip-link", "skipLink", "focusable")}" href="#content">Skip to content</a>
 ${renderMarketingHeader(content, "/privacy/")}
 <main id="content" class="${classes("narrow-page", "narrowPage")}">
-  ${renderSection(privacy, "h2", "", "privacy")}
+  ${renderSection(privacy, "h1", "", "privacy")}
   <p class="${classes("", "proseMeasure")}">Report a suspected boundary violation through <a class="${classes("", "proseLink", "focusable")}" href="${escapeHtml(content.links.privateSecurityReport)}">private vulnerability reporting</a>.</p>
 </main>
 ${renderAskAiAboutThis(`${content.siteUrl}/privacy/`)}
@@ -342,3 +333,47 @@ ${renderHraAnalyticsScript()}
 </html>
 `;
 };
+
+const docsLabel = (page: DocsPage): string => ({ "/docs/": "Overview", "/docs/start/": "Get started", "/docs/web/": "Web workspace", "/docs/sessions/": "Sessions & accounts", "/docs/reference/": "CLI reference", "/docs/status/": "Availability" })[page.path];
+
+/** Static, navigable documents. Search and screen controls are progressive enhancements. */
+export const renderDocsHtml = (
+  page: DocsPage,
+  environment: Readonly<Record<string, string | undefined>> = emptySiteEnvironment,
+): string => {
+  const content = publicContent;
+  const reference = docsReferenceSections(page);
+  const nav = docsPages.map((item) => `<a class="${docsClasses("navLink")}" data-doc-search="${escapeHtml([item.title, item.description, ...item.keywords, ...item.sections.map(({ heading }) => heading)].join(" "))}" href="${item.path}"${item.path === page.path ? ' aria-current="page"' : ""}>${escapeHtml(docsLabel(item))}</a>`).join("");
+  const sections = [...page.sections, ...reference];
+  return `<!doctype html>
+<html ${paletteAttributes} lang="en"><head>
+${renderHead(content, { canonicalPath: page.path, description: page.description, title: `${page.title} | HRA`, jsonLd: { "@context": "https://schema.org", "@type": "TechArticle", headline: page.title, description: page.description, url: `${content.siteUrl}${page.path}`, dateModified: page.reviewDate, author: { "@type": "Organization", name: "Hraness", url: content.links.hraness }, isPartOf: { "@type": "WebSite", name: "HRA", url: content.siteUrl } } })}
+<link rel="alternate" type="text/markdown" href="${page.path}index.md" title="Markdown">
+</head><body>
+<a class="${classes("skip-link", "skipLink", "focusable")}" href="#content">Skip to content</a>
+${renderMarketingHeader(content, page.path)}
+<div class="${docsClasses("layout")}">
+<aside class="${docsClasses("sidebar")}" aria-label="Documentation navigation">
+  <a class="${docsClasses("sidebarHeading")}" href="/docs/">Documentation</a>
+  <label class="${docsClasses("searchLabel")}" for="docs-search">Find a guide</label>
+  <input class="${docsClasses("search")}" id="docs-search" type="search" placeholder="Search docs…" autocomplete="off" maxlength="120" aria-controls="docs-search-results">
+  <div id="docs-search-results" class="${docsClasses("searchResults")}" hidden></div>
+  <nav class="${docsClasses("nav")}" aria-label="Guides">${nav}</nav>
+  <nav class="${docsClasses("pageNav")}" aria-label="On this page"><p>On this page</p>${sections.map((section) => `<a class="${docsClasses("sectionLink")}" href="#${escapeHtml(section.id)}">${escapeHtml(section.heading)}</a>`).join("")}</nav>
+</aside>
+<main class="${docsClasses("main")}" id="content">
+  <header class="${docsClasses("header")}"><p class="${docsClasses("eyebrow")}">HRA / ${escapeHtml(docsLabel(page))}</p><h1 class="${docsClasses("title")}">${escapeHtml(page.title)}</h1><p class="${docsClasses("lede")}">${escapeHtml(page.description)}</p><p class="${docsClasses("meta")}">Checked <time datetime="${page.reviewDate}">${page.reviewDate}</time> · <a href="${page.path}index.md">Read as Markdown ↗</a></p></header>
+  ${page.previewId === undefined ? "" : renderProductPreview(page.previewId, "docs-preview")}
+  ${page.sections.map((section) => `<section class="${docsClasses("section")}" id="${escapeHtml(section.id)}" aria-labelledby="${escapeHtml(section.id)}-heading"><h2 id="${escapeHtml(section.id)}-heading">${escapeHtml(section.heading)}</h2>${section.blocks.map((block, index) => renderBlock(block, section.id, index, "h3", "heroNotes")).join("\n")}</section>`).join("\n")}
+  ${reference.length === 0 ? "" : `<section class="${docsClasses("reference")}" aria-label="Detailed reference"><h2>Detailed reference</h2><p>Exact commands, recovery steps, and compatibility details for this guide.</p>${reference.map((section) => `<details class="${docsClasses("details")}" id="${escapeHtml(section.id)}"><summary>${escapeHtml(section.heading)}</summary><div class="${docsClasses("detailBody")}">${section.blocks.map((block, index) => renderBlock(block, section.id, index, "h3", "heroNotes")).join("\n")}</div></details>`).join("\n")}</section>`}
+  <nav class="${docsClasses("related")}" aria-label="Continue reading">${page.related.map((item) => `<a class="${docsClasses("relatedLink")}" href="${escapeHtml(item.path)}">${escapeHtml(item.label)} →</a>`).join("")}</nav>
+</main></div>
+${renderAskAiAboutThis(`${content.siteUrl}${page.path}`)}
+${renderProjectResources(content)}
+${renderHraSiteFooter(environment)}
+${renderHraAnalyticsScript()}
+<script src="/site.js" type="module"></script>
+</body></html>\n`;
+};
+
+export const renderDocsPages = (environment: Readonly<Record<string, string | undefined>> = emptySiteEnvironment): Readonly<Record<string, string>> => Object.fromEntries(docsPages.map((page) => [page.path, renderDocsHtml(page, environment)]));

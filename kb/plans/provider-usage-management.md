@@ -151,6 +151,63 @@ The archive SHA-256 is
 This binds the joined package inputs; exact committed-tree CI, browser and
 installation acceptance remain outstanding.
 
+The joined candidate is committed and pushed as
+`a7a4303e789a80978fe5b26799488442406b31af`, tree
+`ea907e5dbaefbb9857ff8874488b953368ef7377`. Independent readback binds every
+published file and the frozen dependency inputs to that commit. Fresh isolated
+local and global installation, restored PTY and owned test-daemon lifecycle
+pass for its exact archive. CI run `34355008813`, attempt 1, checks the same
+tree through synthetic merge `e39543d33412b9e727c1b71085b9d9c4aa8ed39a`
+on main `041a06a16015ff8b270a413b8c10ab9ca89e4ca2`; its compiled browser job
+passes, while complete Required remains outstanding.
+
+The isolated app build accepts the genuine prior publication and completes,
+with 19 static output cases passing. Two cases refuse the result: the exact
+app marker fixture still expects the predecessor version, and the joined
+minifier allocation has an unreviewed raw React resource-function fingerprint.
+The version fixture now expects `0.8.0` without changing complete marker-byte
+or parsed-object equality. The allocation remains subject to independent
+source and lexical-helper review; no normalization or runtime style permission
+is inferred from identifier similarity. All captured build bytes and prior
+publication receipts remain preserved. These failures must be closed before
+final acceptance, regardless of the separate browser job's result.
+
+The next reviewed join includes main
+`13325ffa8e16a61897c90012b85cede588f6bca4`: a UI-first public site, six
+task-oriented guides and an isolated fictional product preview. It adds no
+CLI, provider or hosted execution authority. Candidate installation remains
+unavailable before its own admission; predecessor evidence and the capacity
+hold remain explicit. Source-backed memory guidance now distinguishes a
+durable cross-account owner transfer, which purges the old working lane and
+opens a fresh epoch, from same-owner continuation. It does not promise copied
+working-memory contents.
+
+Independent review approved the joined release surfaces. Focused site checks
+passed 73 cases with 3,156 assertions; build and browser contracts passed 101
+cases with 2,968 assertions; release-workflow equivalence passed 28 cases with
+993 assertions. Joined typecheck, scoped lint and managed-guidance checks pass.
+The independent archive has 214 files, 223 inventory entries and 11,079
+canonical inventory bytes, digest
+`bd35daa6f9ec32ed7c4135e3c1354e8b18d0779737bec5198430aaa58063c3e0`.
+Archive SHA-256 is
+`e1aa371c67fc5610c8b140e2491566546ee34d9143e47256297193f305ce7094`.
+Compared with the previous archive, only README, notices and package metadata
+change; all other 211 files are byte-identical. This is package review, not
+publication or final installation acceptance.
+
+The previous candidate's Required CI failed. Both first source shards and the
+macOS second shard passed; the remaining source and remainder failures require
+repair and fresh final CI. The two Ubuntu private-readback timeouts now use a
+separately bounded fresh five-second setup hook, while each complete same-oracle
+live-to-stopped proof retains its five-second deadline and every original
+assertion. Private owner lists drain raw work before cleanup, retain late real
+failures and cannot collect another case's resources. Independent review and
+the full focused suite passed, 51 cases with 178 assertions. This deliberately
+adds setup allowance; it is not evidence that setup and proof together fit the
+old deadline. Storage fixture, grouped source-case and exact compiled-app
+qualification repairs remain in progress. No merge, release, production
+deployment or daemon activation has been performed for this candidate.
+
 The September 8 integration checkpoints now include canonical main through
 schema 50 at `ab56d3bc5034abedd12a20b5b405caf42bfa174f`, then the clean
 release-policy join at `9d6e2e12a42215e9201ae2ed3f64ed1b41e5c47d`, tree

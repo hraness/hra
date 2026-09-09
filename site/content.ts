@@ -131,6 +131,7 @@ export interface PublicContent {
   readonly trust: readonly SiteTrustItem[];
   readonly links: {
     readonly admittedInstall: string;
+    readonly app: string;
     readonly contributing: string;
     readonly documentation: string;
     readonly github: string;
@@ -204,8 +205,9 @@ const {
 
 const links = {
   admittedInstall: "https://github.com/hraness/hra/blob/v0.7.0/docs/beta-release-notes.md#install",
+  app: "https://app.hra.sh",
   contributing: "https://github.com/hraness/hra/blob/main/CONTRIBUTING.md",
-  documentation: "https://github.com/hraness/hra#command-reference",
+  documentation: "https://hra.sh/docs/",
   github: "https://github.com/hraness/hra",
   hraness: "https://hraness.com/",
   privateSecurityReport: "https://github.com/hraness/hra/security/advisories/new",
@@ -279,6 +281,12 @@ const privacyBlocks: readonly ContentBlock[] = [
 
 export const siteDocumentPaths: readonly string[] = [
   "/",
+  "/docs/",
+  "/docs/start/",
+  "/docs/web/",
+  "/docs/sessions/",
+  "/docs/reference/",
+  "/docs/status/",
   "/privacy/",
 ];
 
@@ -289,12 +297,27 @@ const betaInstallCommand = buildHraGlobalInstallCommand(
 );
 
 const productName = "HRA";
-const tagline = "Control plane for Codex and Claude Code";
+const tagline = "Workspace for Codex and Claude Code";
 const providerRoadmap = "Codex and Claude Code, side by side.";
 const releaseVersion = "0.8.0";
 const admittedReleaseVersion = "0.7.0";
 const installNotice = `This release candidate is not yet admitted. The v${releaseVersion} install command is unavailable until its immutable GitHub and npm artifacts pass exact release admission. The last admitted release is v${admittedReleaseVersion}; use its immutable installation notes for the existing artifact.`;
 const daemonRolloutNotice = "Current daemon and hosted command-writer rollout remains blocked on capacity. Do not initialize, start, or autostart a current daemon until the hosted operator records protected two-pass zero-debt capacity evidence and its exact .activated readback receipt. Artifact availability and the live sync service do not clear this gate. After activation, complete the update runbook's daemon and target marker-2 proofs before globally enabling hosted writers.";
+
+/** The existing exact release evidence also belongs in the new status guide. */
+export const releaseAdmissionNotice: ContentBlock = {
+  kind: "notice",
+  label: `Local v${releaseVersion} candidate; hosted sync live as an ${hostedBetaLabel}`,
+  content: [
+    text("The "),
+    link(`v${admittedReleaseVersion} artifacts`, `https://github.com/hraness/hra/releases/tag/v${admittedReleaseVersion}`),
+    text(" passed immutable GitHub and npm release admission in "),
+    link("release run 34278486095", "https://github.com/hraness/hra/actions/runs/34278486095"),
+    text(", attempt 2. This evidence admits only that predecessor, not the current candidate. Use its "),
+    link("immutable installation notes", links.admittedInstall),
+    text(". The candidate command below remains unavailable until its own admission. The website and optional hosted sync are live; artifact admission does not authorize current-daemon startup or hosted command writers."),
+  ],
+};
 
 /** Public runtime pins come from their authoritative source modules. */
 export const publicPins = {
@@ -351,8 +374,8 @@ export const publicContent: PublicContent = {
   tagline,
   providerRoadmap,
   releaseVersion,
-  thesis: `${productName} runs Codex and Claude Code sessions side by side, keeps them alive in a local daemon, and gives humans and AI agents the same commands to drive them.`,
-  description: `${tagline}. Local CLI v${releaseVersion} is a release candidate; v${admittedReleaseVersion} remains admitted; daemon and hosted command-writer rollout remains blocked on capacity.`,
+  thesis: `${productName} brings your Codex and Claude Code sessions into one workspace. Follow the work in your browser, direct it from your terminal, and keep execution on your own machines.`,
+  description: `A workspace for Codex and Claude Code, in your browser or terminal. Local CLI v${releaseVersion} is a release candidate; v${admittedReleaseVersion} remains admitted; daemon and hosted command-writer rollout remains blocked on capacity.`,
   daemonRolloutNotice,
   statusLine: `Status: public beta. Local CLI v${releaseVersion} is a release candidate, not an admitted artifact. The last admitted release is v${admittedReleaseVersion}. Codex runs on macOS and Linux, Claude Code on Linux; hosted sync is live as an ${hostedBetaLabel}. Current daemon and hosted command-writer rollout remains blocked on capacity.`,
   badges,
@@ -361,7 +384,7 @@ export const publicContent: PublicContent = {
     url: links.hraness,
   },
   socialCard: {
-    alt: `${productName} · v${releaseVersion} candidate · daemon rollout blocked on capacity · hra.sh`,
+    alt: `${productName} command-line card showing offline diagnostics and read-only status · v${releaseVersion} candidate · daemon rollout blocked on capacity · hra.sh`,
     height: 630,
     path: "/social-card.png",
     width: 1200,
@@ -381,38 +404,38 @@ export const publicContent: PublicContent = {
   links,
   hero: {
     eyebrow: tagline,
-    heading: "One terminal for every Codex and Claude Code session",
-    summary: "HRA keeps sessions alive behind a local daemon, isolates each account, and lets you or your agent direct any of them from a shell or JSON. Sync between machines is optional and encrypted.",
-    example: "After the rollout prerequisite below is satisfied, ask your agent to start a Codex session on your work account, then hand the next turn to Claude Code without losing the conversation.",
-    boundary: `Local v${releaseVersion} candidate · v${admittedReleaseVersion} artifacts admitted · current daemon and hosted command-writer rollout blocked on capacity · Codex on macOS and Linux · Claude Code on Linux · hosted sync live (${hostedBetaLabel})`,
+    heading: "All your agents.\nOne place to keep up.",
+    summary: "See what’s running, follow the conversation, and decide what happens next. HRA brings your Codex and Claude Code sessions together in a web workspace, with a CLI for you and your agents.",
+    example: "Your machines run the work. HRA keeps you in the conversation.",
+    boundary: `Public beta · Local v${releaseVersion} candidate · v${admittedReleaseVersion} artifacts admitted · current daemon and hosted command-writer rollout blocked on capacity · Codex on macOS and Linux · Claude Code on Linux`,
     primaryAction: {
-      href: "#install-command",
-      label: "View release prerequisites",
+      href: links.app,
+      label: "Open HRA",
     },
     secondaryAction: {
-      href: "#how-it-works",
-      label: "See how it works",
+      href: "/docs/start/",
+      label: "Get started",
     },
     pillars: [
       {
-        label: "Isolated accounts",
-        summary: "Each provider profile keeps its own credentials and configuration. Nothing is shared between them.",
+        label: "See the whole workspace",
+        summary: "A grid of sessions shows what is running and what needs your attention. Open a card to read the conversation.",
       },
       {
-        label: "Durable sessions",
-        summary: "A local daemon keeps every session alive after the terminal that started it closes.",
+        label: "Pick up the next turn",
+        summary: "Send a follow-up from the browser or terminal. The session runs on its machine, even after you close the tab.",
       },
       {
-        label: "One interface for people and agents",
-        summary: "The same account and session objects answer to a shell and to versioned JSON.",
+        label: "Keep accounts separate",
+        summary: "Choose the provider profile for the work. Each managed profile has its own configuration; HRA does not rotate accounts for you.",
       },
     ],
-    proofLabel: "One request, one account, one session.",
+    proofLabel: "The same work, from your terminal.",
     steps: [
       {
         label: "Start",
         command: "hra session start personal --provider codex --json",
-        detail: "Create a Sol Ultra Codex session under the account profile you name.",
+        detail: "Create a Codex session under the account profile you choose.",
       },
       {
         label: "Inspect",
@@ -422,7 +445,7 @@ export const publicContent: PublicContent = {
       {
         label: "Switch",
         command: "hra session switch <session-id> --provider claude --preset fable-max",
-        detail: "Move the next turns to your signed-in Claude Code profile. The bounded retained HRA conversation record remains available, with any retention gap stated explicitly.",
+        detail: "Continue on your signed-in Claude Code profile. HRA carries over the conversation it has retained and flags any missing history.",
       },
       {
         label: "Direct",
@@ -443,8 +466,8 @@ export const publicContent: PublicContent = {
       },
       {
         label: "Interfaces",
-        value: "Shell and JSON",
-        detail: "People and agents address the same account and session objects.",
+        value: "Web, shell, JSON",
+        detail: "Follow sessions in the browser or use the CLI and its structured output.",
       },
       {
         label: "Sync",
@@ -455,16 +478,16 @@ export const publicContent: PublicContent = {
   },
   trust: [
     {
-      label: "Your provider credentials stay with the provider",
-      detail: "HRA launches managed Codex and Claude Code sessions inside isolated profiles. Opted-in Codex and Claude Code personal-session adoption uses existing provider credentials without copying or parsing them. HRA never reads, copies, or forwards a Claude credential.",
+      label: "Your accounts, your provider tools",
+      detail: "Codex and Claude Code own their sign-in and execution. HRA keeps managed profiles separate and does not broker model access.",
     },
     {
       label: "Local by default",
-      detail: "Accounts, sessions, and execution live on your machine. Cloud sync is optional, encrypted before upload, and separate from every provider account.",
+      detail: "The local daemon runs the sessions. The CLI works without an HRA cloud identity; optional sync connects the web workspace and your other devices.",
     },
     {
-      label: "Nothing decrypts server-side",
-      detail: "The sync service sees your verified email, device identifiers, and ciphertext sizes. It cannot read session content without a paired device key.",
+      label: "Encrypted before it leaves the machine",
+      detail: "Synced session content is encrypted for paired devices. The service still sees account and delivery metadata, described in the privacy policy.",
     },
     {
       label: "Analytics you can audit",
@@ -474,11 +497,11 @@ export const publicContent: PublicContent = {
   questions: [
     {
       question: "Does HRA need an account?",
-      answer: [text("No. An HRA cloud identity is only needed for optional sync between machines. Once the current-daemon rollout prerequisite is satisfied, add a Codex profile or sign into Claude Code inside its isolated directory and start a session.")],
+      answer: [text("The local CLI does not need an HRA cloud identity. The web workspace does: sign in, pair your machine, and enroll the browser so it can decrypt your synced sessions. Your Codex and Claude Code accounts are separate.")],
     },
     {
-      question: "What is live, and what is still blocked?",
-      answer: [text(`The v${admittedReleaseVersion} local CLI artifacts passed immutable GitHub and npm release admission. The v${releaseVersion} candidate has not. Use the `), link("admitted release's immutable installation notes", links.admittedInstall), text(`. Codex runs on macOS and Linux and Claude Code on Linux. Hosted sync is live as an ${hostedBetaLabel}, but current daemon and hosted command-writer rollout remains blocked on capacity. Wait for the documented rollout prerequisite before initialization or daemon startup.`)],
+      question: "Can I start using it now?",
+      answer: [text(`The website, web app, and hosted sync are available in ${hostedBetaLabel}. The v${admittedReleaseVersion} local CLI artifacts passed immutable GitHub and npm release admission; the v${releaseVersion} candidate has not. Use the `), link("admitted release's immutable installation notes", links.admittedInstall), text(". Current daemon and hosted command-writer rollout remains blocked on capacity. "), link("Check the setup status", "/docs/status/"), text(" before initialization or daemon startup.")],
     },
     {
       question: "Does HRA use my API keys or provider subscription?",
@@ -486,15 +509,15 @@ export const publicContent: PublicContent = {
     },
     {
       question: "How do agents drive it?",
-      answer: [text("Every command that a person runs in the shell has a JSON form. An agent starts a session, reads its status cursor, sends requests, and follows the event stream as a long-running subprocess. The reference below lists the exact commands and protected interaction paths.")],
+      answer: [text("The CLI exposes structured JSON and a cursor-based event stream. An agent can start a session, inspect its status, send a request, and follow progress. "), link("Read the command reference", "/docs/reference/"), text(" for the exact interface.")],
     },
     {
       question: "What if the terminal closes?",
-      answer: [text("The local daemon keeps the session alive. Reopen the shell, select the account and session, and continue. If the daemon restarts or loses a Claude controller, HRA can recover the exact conversation with "), code("--resume"), text(" only after prior-process exit or an already-completed exact process release is proven. Ambiguous custody stays fenced in recovery without launching another process.")],
+      answer: [text("A session can outlive the terminal or browser tab because the local daemon owns its process. If the daemon itself stops, recovery depends on proving the old process is no longer writing. "), link("See session recovery", "/docs/sessions/"), text(" before restarting uncertain work.")],
     },
     {
       question: "Which platforms are supported?",
-      answer: [text("macOS and Linux with Bun 1.3.14. Supported ChatGPT desktop account switching is macOS-only.")],
+      answer: [text(`The CLI requires Bun ${publicPins.bun}. Codex execution supports macOS and Linux; Claude Code execution supports Linux. The web interface can follow paired machines from a browser. ChatGPT desktop account switching is macOS-only.`)],
     },
   ],
   maker: {
@@ -509,19 +532,7 @@ export const publicContent: PublicContent = {
     ],
   },
   introduction: [
-    {
-      kind: "notice",
-      label: `Local v${releaseVersion} candidate; hosted sync live as an ${hostedBetaLabel}`,
-      content: [
-        text("The "),
-        link(`v${admittedReleaseVersion} artifacts`, `https://github.com/hraness/hra/releases/tag/v${admittedReleaseVersion}`),
-        text(" passed immutable GitHub and npm release admission in "),
-        link("release run 34278486095", "https://github.com/hraness/hra/actions/runs/34278486095"),
-        text(", attempt 2. This evidence admits only that predecessor, not the current candidate. Use its "),
-        link("immutable installation notes", links.admittedInstall),
-        text(". The candidate command below remains unavailable until its own admission. The website and optional hosted sync are live; artifact admission does not authorize current-daemon startup or hosted command writers."),
-      ],
-    },
+    releaseAdmissionNotice,
     { kind: "notice", label: "Current daemon rollout blocked", content: [text(daemonRolloutNotice)] },
     paragraph(
       text("HRA is one Bun CLI plus a local daemon. It isolates Codex and Claude Code profiles, gives both providers one compact session interface, and optionally syncs encrypted provider-neutral projections and commands across your enrolled machines."),
@@ -1798,17 +1809,10 @@ const renderMarkdownBlock = (block: ContentBlock, headingLevel: number): string 
   }
 };
 
-const renderMarkdownBlocks = (blocks: readonly ContentBlock[], headingLevel: number): string =>
+export const renderMarkdownBlocks = (blocks: readonly ContentBlock[], headingLevel: number): string =>
   blocks.map((block) => renderMarkdownBlock(block, headingLevel)).join("\n\n");
 
 export const renderReadmeMarkdown = (content: PublicContent = publicContent): string => {
-  const sections = content.sections
-    .map(
-      (section) =>
-        `## ${section.heading}\n\n${renderMarkdownBlocks(section.blocks, 3)}`,
-    )
-    .join("\n\n");
-
   const badgeLine = content.badges
     .map((badge) => `[![${badge.alt}](${badge.image})](${badge.href})`)
     .join(" ");
@@ -1818,16 +1822,20 @@ export const renderReadmeMarkdown = (content: PublicContent = publicContent): st
   return [
     `# ${content.productName}\n${badgeLine}\\\n${content.thesis}`,
     content.statusLine,
+    `[Open HRA](${content.links.app}) · [Documentation](${content.links.documentation}) · [Availability](${content.siteUrl}/docs/status/)`,
+    content.hero.summary,
+    content.hero.pillars.map((pillar) => `- **${pillar.label}.** ${pillar.summary}`).join("\n"),
+    `## Get started\n\nPublic beta. Codex execution supports macOS and Linux; Claude Code execution supports Linux. The local CLI does not need an HRA cloud identity. The web workspace uses optional encrypted sync and requires a paired machine and browser.`,
     `> ${content.installNotice} [Admitted release installation notes](${content.links.admittedInstall}).`,
+    `Only after exact artifact admission, install and verify the v${content.releaseVersion} candidate. Installing and checking the binary does not start the daemon:`,
     `\`\`\`sh\n${content.installCommand}\n\`\`\``,
     `\`\`\`sh\n${content.doctorCommand}\n\`\`\``,
-    `> ${content.daemonRolloutNotice}`,
-    "After the rollout prerequisite is satisfied, initialize:",
-    `\`\`\`sh\n${content.initCommand}\n\`\`\``,
-    `## ${content.hero.heading}\n\n${content.hero.summary}\n\n${content.hero.boundary}`,
-    `### ${content.hero.proofLabel}\n\n${content.hero.steps.map((step, index) => `${index + 1}. **${step.label}:** \`${step.command}\`. ${step.detail}`).join("\n")}`,
-    renderMarkdownBlocks(content.introduction, 3),
-    sections,
+    `> **Before initialization:** ${content.daemonRolloutNotice}`,
+    `Continue with the [setup guide](${content.siteUrl}/docs/start/). For an existing installation, use the [ordered update runbook](${content.siteUrl}/docs/status/#install-and-update).`,
+    `## Use the interface that fits the work\n\n- [Web workspace](${content.siteUrl}/docs/web/): see the session grid, read a conversation, and send a follow-up from a paired browser.\n- [Sessions and accounts](${content.siteUrl}/docs/sessions/): inspect account usage, continue a conversation, switch providers, or recover a stopped session.\n- [CLI reference](${content.siteUrl}/docs/reference/): command families, structured JSON, cursor-based event streams, memory, and automation.`,
+    `### ${content.hero.proofLabel}\n\nThese examples require a machine whose setup and rollout prerequisites are satisfied.\n\n${content.hero.steps.map((step, index) => `${index + 1}. **${step.label}:** \`${step.command}\`. ${step.detail}`).join("\n")}`,
+    `## Local execution, optional encrypted sync\n\n${content.trust.slice(0, 3).map((item) => `**${item.label}.** ${item.detail}`).join("\n\n")}\n\nRead the [privacy policy](${content.links.privacy}) for the local, synced, and website data boundaries.`,
+    `## Project\n\nHRA is maintained by [Hraness](${content.links.hraness}) and published under the MIT license.\n\n[Contributing](${content.links.contributing}) · [Security policy](${content.links.security}) · [Release notes](${content.links.github}/blob/main/docs/beta-release-notes.md)`,
   ].join("\n\n") + "\n";
 };
 
@@ -1866,11 +1874,16 @@ export const renderLlmsText = (content: PublicContent = publicContent): string =
     `Security: ${content.links.security}`,
     `Privacy: ${content.links.privacy}`,
     "",
-    "## Documentation sections",
+    "## Documentation",
     "",
-    ...content.sections.map(
-      (section) => `- [${section.heading}](${content.siteUrl}/#${section.id})`,
-    ),
+    `- [Overview](${content.siteUrl}/docs/)`,
+    `- [Get started](${content.siteUrl}/docs/start/)`,
+    `- [Web workspace](${content.siteUrl}/docs/web/)`,
+    `- [Sessions and accounts](${content.siteUrl}/docs/sessions/)`,
+    `- [Command reference](${content.siteUrl}/docs/reference/)`,
+    `- [Availability and rollout](${content.siteUrl}/docs/status/)`,
+    "",
+    "Each documentation page provides a canonical Markdown version at its index.md path.",
     "",
   ].join("\n");
 

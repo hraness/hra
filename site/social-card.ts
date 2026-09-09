@@ -52,13 +52,9 @@ export interface SocialCardLines {
 }
 
 export const socialCardLines = (content: PublicContent = publicContent): SocialCardLines => {
-  const [start, , , direct] = content.hero.steps;
-  if (start === undefined || direct === undefined) {
-    throw new Error("Public content must publish the start and direct hero steps.");
-  }
   return {
-    commands: [`$ ${start.command}`, `$ ${direct.command}`],
-    comment: "# Rollout blocked on capacity; conditional examples",
+    commands: [`$ ${content.doctorCommand}`, "$ hra status --json"],
+    comment: "# Daemon rollout blocked on capacity",
     tagline: `CLI candidate v${content.releaseVersion} · hra.sh`,
     title: content.productName,
   };
