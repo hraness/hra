@@ -85,6 +85,9 @@ for (const figure of document.querySelectorAll<HTMLElement>("[data-product-previ
   observer.observe(frame);
   // The server already set the selected URL. Reassigning even the same value
   // can abort the initial document while progressive enhancement is loading.
+  // Request an already-settled observation after installing our listener. If
+  // the child is not listening yet, its ordinary completion message arrives later.
+  frame.contentWindow?.postMessage({ type: "hra-preview-status", view: current }, "*");
 }
 
 const search = document.querySelector<HTMLInputElement>("#docs-search");

@@ -11,12 +11,41 @@ export const productPreviewDisclosure = "Real HRA interface, fictional sessions 
 export const isProductScene = (value: unknown): value is ProductScene =>
   typeof value === "string" && Object.hasOwn(productScenes, value);
 
-export function parsePreviewMessage(value: unknown): Readonly<{ type: "hra-preview-ready" | "hra-preview-failed"; view: ProductScene }> | undefined {
+function previewEnvelope(value: unknown): Readonly<{ type: unknown; view: ProductScene }> | undefined {
   if (typeof value !== "object" || value === null || Object.getPrototypeOf(value) !== Object.prototype) return undefined;
   const fields = Object.getOwnPropertyDescriptors(value);
   if (Reflect.ownKeys(fields).length !== 2 || fields.type === undefined || fields.view === undefined
     || !Object.values(fields).every((field) => "value" in field && field.enumerable)) return undefined;
   const type: unknown = fields.type.value;
   const view: unknown = fields.view.value;
-  return (type === "hra-preview-ready" || type === "hra-preview-failed") && isProductScene(view) ? { type, view } : undefined;
+  return isProductScene(view) ? { type, view } : undefined;
+}
+
+export type PreviewStatusMessage = Readonly<{ type: "hra-preview-ready" | "hra-preview-failed"; view: ProductScene }>;
+
+export function parsePreviewMessage(value: unknown): PreviewStatusMessage | undefined {
+  const envelope = previewEnvelope(value);
+  return envelope !== undefined && (envelope.type === "hra-preview-ready" || envelope.type === "hra-preview-failed")
+    ? { type: envelope.type, view: envelope.view } : undefined;
+}
+
+export function parsePreviewStatusRequest(value: unknown): Readonly<{ type: "hra-preview-status"; view: ProductScene }> | undefined {
+  const envelope = previewEnvelope(value);
+  return envelope?.type === "hra-preview-status" ? { type: envelope.type, view: envelope.view } : undefined;
+}
+
+/** A late parent can request the same public observation without restarting
+ * the child. No request changes the scene, clears failure or starts any work. */
+export function createPreviewStatusRelay(view: ProductScene, send: (message: PreviewStatusMessage) => void) {
+  let status: PreviewStatusMessage | undefined;
+  return {
+    publish(type: PreviewStatusMessage["type"]): void {
+      if (status?.type === "hra-preview-failed") return;
+      status = { type, view };
+      send(status);
+    },
+    replay(request: unknown): void {
+      if (status !== undefined && parsePreviewStatusRequest(request)?.view === view) send(status);
+    },
+  };
 }

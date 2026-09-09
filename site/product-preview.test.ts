@@ -1,14 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { runInNewContext } from "node:vm";
+import { createContext, runInContext } from "node:vm";
 import { parseHTML } from "linkedom";
 import { renderProductPreview } from "./product-preview.tsx";
-import { isProductScene, parsePreviewMessage, productPreviewDisclosure, productScenes } from "./product-scenes.ts";
+import { createPreviewStatusRelay, isProductScene, parsePreviewMessage, parsePreviewStatusRequest, productPreviewDisclosure, productScenes } from "./product-scenes.ts";
 import { docsPages } from "./docs-content.ts";
 import { renderDocsHtml } from "./template.ts";
 
 describe("public real-UI examples", () => {
-  test("enhances the server-rendered scene without restarting its initial navigation", async () => {
-    const build = await Bun.build({ entrypoints: [new URL("./site-entry.ts", import.meta.url).pathname], target: "browser", format: "iife", write: false });
+  test("recovers cached readiness after registering its listener without restarting initial navigation", async () => {
+    const build = await Bun.build({ entrypoints: [new URL("./site-entry.ts", import.meta.url).pathname], target: "browser", format: "iife" });
     expect(build.success).toBe(true);
     const code = await build.outputs[0]!.text();
     for (const view of Object.keys(productScenes)) {
@@ -19,9 +19,30 @@ describe("public real-UI examples", () => {
       const navigations: string[] = [];
       Object.defineProperty(frame, "src", { get: () => initial, set: (value: string) => { navigations.push(value); } });
       const observers: Element[] = [];
-      runInNewContext(code, { document, window: { addEventListener() {}, location: { hash: "" } },
+      type PreviewEvent = Readonly<{ data: unknown; source: unknown; origin: string }>;
+      const messageListeners: ((event: PreviewEvent) => void)[] = [];
+      const requests: unknown[] = [];
+      const frameWindow = {
+        postMessage(request: unknown, targetOrigin: string) {
+          requests.push(request);
+          expect(request).toEqual({ type: "hra-preview-status", view });
+          expect(targetOrigin).toBe("*");
+          expect(messageListeners).toHaveLength(1);
+          // A real postMessage clones data into the receiving window's realm.
+          const data: unknown = runInContext(`(${JSON.stringify({ type: "hra-preview-ready", view })})`, context);
+          for (const listener of messageListeners) listener({ data, source: frameWindow, origin: "null" });
+        },
+      };
+      Object.defineProperty(frame, "contentWindow", { value: frameWindow });
+      const context = createContext({ document, window: {
+        addEventListener(type: string, listener: (event: PreviewEvent) => void) { if (type === "message") messageListeners.push(listener); },
+        location: { hash: "" },
+      },
         IntersectionObserver: class { observe(target: Element) { observers.push(target); } disconnect() {} },
         setTimeout: () => 1, clearTimeout() {} });
+      runInContext(code, context);
+      expect(requests).toEqual([{ type: "hra-preview-status", view }]);
+      expect(document.querySelector("[data-preview-status]")?.textContent).toBe("");
       expect(navigations).toEqual([]);
       expect(observers).toEqual([frame]);
       expect(document.querySelector("[data-preview-script-notice]")?.hasAttribute("hidden")).toBe(true);
@@ -31,6 +52,75 @@ describe("public real-UI examples", () => {
       document.querySelector(`[data-preview-view="${next}"]`)!.dispatchEvent(new window.Event("click"));
       expect(navigations).toEqual([`/examples/app/index.html?view=${next}`]);
     }
+  });
+
+  test("parses only exact status requests without evaluating accessors", () => {
+    for (const view of Object.keys(productScenes)) {
+      if (!isProductScene(view)) throw new Error("Unregistered test scene");
+      expect(parsePreviewStatusRequest({ type: "hra-preview-status", view })).toEqual({ type: "hra-preview-status", view });
+    }
+    let reads = 0;
+    const accessor = { get type() { reads += 1; return "hra-preview-status"; }, view: "overview" };
+    const hiddenField = Object.defineProperty({ type: "hra-preview-status" }, "view", { value: "overview", enumerable: false });
+    const extraSymbol = { type: "hra-preview-status", view: "overview", [Symbol("extra")]: true };
+    for (const request of [
+      null, undefined, "hra-preview-status", [], {},
+      { type: "hra-preview-ready", view: "overview" }, { type: "hra-preview-status", view: "constructor" },
+      { type: "hra-preview-status", view: "overview", account: "real" },
+      Object.create({ type: "hra-preview-status", view: "overview" }), accessor, hiddenField, extraSymbol,
+    ]) expect(parsePreviewStatusRequest(request)).toBeUndefined();
+    expect(reads).toBe(0);
+  });
+
+  test("replays readiness settled before the parent requested it", () => {
+    const sent: unknown[] = [];
+    const relay = createPreviewStatusRelay("overview", (message) => { sent.push(message); });
+    relay.publish("hra-preview-ready");
+    expect(sent).toEqual([{ type: "hra-preview-ready", view: "overview" }]);
+    sent.length = 0;
+    relay.replay({ type: "hra-preview-status", view: "overview" });
+    expect(sent).toEqual([{ type: "hra-preview-ready", view: "overview" }]);
+  });
+
+  test("does not invent readiness when the parent requests it before the scene settles", () => {
+    const sent: unknown[] = [];
+    const relay = createPreviewStatusRelay("conversation", (message) => { sent.push(message); });
+    relay.replay({ type: "hra-preview-status", view: "conversation" });
+    expect(sent).toEqual([]);
+    relay.publish("hra-preview-ready");
+    expect(sent).toEqual([{ type: "hra-preview-ready", view: "conversation" }]);
+  });
+
+  test("keeps failure authoritative after an earlier ready or a later ready callback", () => {
+    const sent: unknown[] = [];
+    const relay = createPreviewStatusRelay("settings", (message) => { sent.push(message); });
+    relay.publish("hra-preview-ready");
+    relay.publish("hra-preview-failed");
+    expect(sent.at(-1)).toEqual({ type: "hra-preview-failed", view: "settings" });
+    sent.length = 0;
+    relay.publish("hra-preview-ready");
+    expect(sent.every((message) => parsePreviewMessage(message)?.type === "hra-preview-failed")).toBe(true);
+    sent.length = 0;
+    relay.replay({ type: "hra-preview-status", view: "settings" });
+    expect(sent).toEqual([{ type: "hra-preview-failed", view: "settings" }]);
+  });
+
+  test("refuses malformed, cross-scene, extended, inherited and accessor replay requests", () => {
+    const sent: unknown[] = [];
+    const relay = createPreviewStatusRelay("question", (message) => { sent.push(message); });
+    relay.publish("hra-preview-ready");
+    sent.length = 0;
+    let reads = 0;
+    for (const request of [
+      null, [], {}, { type: "hra-preview-ready", view: "question" },
+      { type: "hra-preview-status", view: "overview" },
+      { type: "hra-preview-status", view: "question", extra: true },
+      Object.create({ type: "hra-preview-status", view: "question" }),
+      { type: "hra-preview-status", get view() { reads += 1; return "question"; } },
+      Object.defineProperty({ view: "question" }, "type", { value: "hra-preview-status", enumerable: false }),
+    ]) relay.replay(request);
+    expect(sent).toEqual([]);
+    expect(reads).toBe(0);
   });
 
   test("parses only exact public readiness messages without evaluating accessors", () => {

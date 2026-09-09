@@ -8,6 +8,7 @@ import { SettingsScreen } from "../../src/screens/settings-screen";
 import { createProductPreviewSession, parseProductPreviewSelection, type ProductPreviewSession, type ProductPreviewView } from "./definition";
 import { PRODUCT_SESSION_IDS } from "./fixtures";
 import { installProductPreviewHarness } from "./io";
+import { createPreviewStatusRelay } from "../../../site/product-scenes";
 import "@hraness/ui/compiler-foundation.css";
 import "../../src/index.css";
 
@@ -16,10 +17,13 @@ export type ProductPreviewStatusMessage = Readonly<{
   view: ProductPreviewView | null;
 }>;
 
+let statusRelay: ReturnType<typeof createPreviewStatusRelay> | undefined;
+
 function notify(message: ProductPreviewStatusMessage): void {
   // The iframe has an opaque origin. The payload is public and contains no
   // authority; the parent must match contentWindow and its expected view.
-  window.parent.postMessage(message, "*");
+  if (statusRelay !== undefined && message.view !== null) statusRelay.publish(message.type);
+  else window.parent.postMessage(message, "*");
 }
 
 function Screen({ session }: Readonly<{ session: ProductPreviewSession }>) {
@@ -72,6 +76,12 @@ if (container === null) throw new Error("Missing product example root.");
 const root = createRoot(container);
 let selected: ProductPreviewView | null = null;
 let session: ProductPreviewSession | null = null;
+const parentOrigin = new URL(window.location.href).origin;
+const replayStatus = (event: MessageEvent<unknown>): void => {
+  if (event.source === window.parent && event.origin === parentOrigin) statusRelay?.replay(event.data);
+};
+window.addEventListener("message", replayStatus);
+window.addEventListener("pagehide", () => { window.removeEventListener("message", replayStatus); }, { once: true });
 const failed = () => {
   session?.harness.recordBrowserActivityError();
   document.documentElement.dataset.previewFailed = "true";
@@ -81,6 +91,7 @@ const failed = () => {
 
 try {
   selected = parseProductPreviewSelection(window.location.search);
+  statusRelay = createPreviewStatusRelay(selected, (message) => window.parent.postMessage(message, parentOrigin));
   const result = createProductPreviewSession(selected);
   if (!result.ok) throw new Error(result.error.message);
   const admitted = result.value;
