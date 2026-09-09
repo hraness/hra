@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import fc from "fast-check";
 import { createHash } from "node:crypto";
 import { chmod, mkdtemp, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -12,6 +13,7 @@ import {
   gitHistoryCommandArguments,
   normalizeGitHistoryPatchForPublicScan,
   normalizeReviewedSyntheticHistoryPatch,
+  normalizeReviewedSyntheticPackagePatch,
   packageDependencyCacheDiscoveryEnvironment,
   parsePackageDependencyCache,
   parseGitHistoryCommitList,
@@ -19,6 +21,7 @@ import {
   requireGitHistoryOutput,
   runPackageCommand,
   selectReviewedGitHistoryPatchEvidence,
+  selectReviewedGitHistoryPackageEvidence,
   waitForOwnedInstalledDaemonReady,
   withPackageDependencyCacheCustody,
 } from "./check-package";
@@ -29,6 +32,114 @@ import {
   pseudoTerminalScriptArguments,
   runInPseudoTerminal,
 } from "./pty-acceptance";
+
+describe("reviewed historical synthetic package fixtures", () => {
+  const fixtures = [
+    { fixture: "other_ui", token: ["@other", "ui"].join("/") },
+    { fixture: "foreign_package", token: ["@foreign", "package"].join("/") },
+  ] as const;
+  const digest = (value: string): string => createHash("sha256").update(value, "utf8").digest("hex");
+  const expected = [
+    { commit: "e19458e45523c1ace0e87c7928eb15516db94ccd", fixtures: ["other_ui"],
+      patchSha256: "5f2599b248dc16d94bc27d980604417398c15ee2e7a981b780954d039f55309f" },
+    { commit: "e2fd2d699a9d003e072dc44a613cd823c24f155d", fixtures: ["foreign_package"],
+      patchSha256: "fa6583ec433c00d10d967214631fb4e04847515bb273cca51548388cb7c6ba7b" },
+    { commit: "52579a5debfe1ee6c31dca0f31733a798c74c6aa", fixtures: ["other_ui", "foreign_package"],
+      patchSha256: "a93c5c423beacf7ec5068310ae648b994de67506b07d46e523739b8903458beb" },
+  ] as const;
+
+  test("binds the exact public-patch inventory without requiring branch ancestors in a squash clone", async () => {
+    const source = await readFile(join(import.meta.dir, "check-package.ts"), "utf8");
+    const inventory = source.slice(source.indexOf("const reviewedSyntheticPackageHistoryEvidence:"),
+      source.indexOf("const reviewedSyntheticPackageTokens:"));
+    expect([...inventory.matchAll(/^ {2}"?([0-9a-f]{40})"?: Object\.freeze\(/gmu)].map((match) => match[1]))
+      .toEqual(expected.map(({ commit }) => commit));
+    for (const row of expected) {
+      const evidence = selectReviewedGitHistoryPackageEvidence(row.commit, "public_patch");
+      expect(evidence).toEqual({ fixtures: row.fixtures, patchSha256: row.patchSha256 });
+      expect(Object.isFrozen(evidence)).toBe(true);
+      expect(Object.isFrozen(evidence?.fixtures)).toBe(true);
+      expect(selectReviewedGitHistoryPackageEvidence(row.commit, "sensitive_patch")).toBeUndefined();
+      expect(selectReviewedGitHistoryPackageEvidence(row.commit.toUpperCase(), "public_patch")).toBeUndefined();
+      expect(selectReviewedGitHistoryPackageEvidence(row.commit.slice(0, 39), "public_patch")).toBeUndefined();
+      expect(selectReviewedGitHistoryPackageEvidence(row.commit,
+        "public_patch " as unknown as Parameters<typeof selectReviewedGitHistoryPackageEvidence>[1])).toBeUndefined();
+      expect(() => normalizeGitHistoryPatchForPublicScan(row.commit, "public_patch", "changed patch\n"))
+        .toThrow("synthetic-package evidence changed");
+      for (const { token } of fixtures) {
+        const patch = `+ name: "${token}"\n`;
+        expect(normalizeGitHistoryPatchForPublicScan(row.commit, "sensitive_patch", patch)).toBe(patch);
+      }
+    }
+    for (const commit of ["a".repeat(40), "constructor", "toString", "__proto__", "hasOwnProperty"]) {
+      expect(selectReviewedGitHistoryPackageEvidence(commit, "public_patch")).toBeUndefined();
+      const patch = `+ name: "${fixtures[0].token}"\n`;
+      expect(normalizeGitHistoryPatchForPublicScan(commit, "public_patch", patch)).toBe(patch);
+      expect(() => assertPublicText(patch, "unreviewed historical package fixture")).toThrow("PRIVATE_SCOPE");
+    }
+  });
+
+  test("replaces only once-only complete quoted fixtures and preserves every other byte", () => {
+    for (const { fixture, token } of fixtures) {
+      const patch = `before\n+ name: "${token}", retained: true\nafter\n`;
+      expect(normalizeReviewedSyntheticPackagePatch(patch, digest(patch), [fixture]))
+        .toBe("before\n+ name: \"[reviewed-synthetic-package]\", retained: true\nafter\n");
+      expect(() => normalizeReviewedSyntheticPackagePatch(`${patch}changed\n`, digest(patch), [fixture]))
+        .toThrow("synthetic-package evidence changed");
+      for (const invalid of [
+        "missing fixture\n", `${token}\n`, `"${token}-unreviewed"\n`, `"${token}/extra"\n`,
+        `"${token}"\n"${token}"\n`, `${patch}${token}\n`,
+      ]) {
+        expect(() => normalizeReviewedSyntheticPackagePatch(invalid, digest(invalid), [fixture]))
+          .toThrow("synthetic-package evidence changed");
+      }
+    }
+    const patch = fixtures.map(({ token }) => `- "${token}"\n`).join("");
+    expect(normalizeReviewedSyntheticPackagePatch(patch, digest(patch), fixtures.map(({ fixture }) => fixture)))
+      .toBe('- "[reviewed-synthetic-package]"\n- "[reviewed-synthetic-package]"\n');
+    for (const selection of [[], ["other_ui", "other_ui"], ["other_ui", "foreign_package", "other_ui"]] as const) {
+      expect(() => normalizeReviewedSyntheticPackagePatch(patch, digest(patch), selection))
+        .toThrow("fixture selection is invalid");
+    }
+    expect(() => normalizeReviewedSyntheticPackagePatch(patch, digest(patch),
+      ["unknown"] as unknown as Parameters<typeof normalizeReviewedSyntheticPackagePatch>[2]))
+      .toThrow("fixture is unknown");
+  });
+
+  test("normalizing package fixtures cannot launder other private text or sensitive history", () => {
+    const secret = ["github", "pat", "abcdefghijklmnopqrstuvwxyz123456"].join("_");
+    const privatePath = ["", "Users", "fixture", "private", "source.ts"].join("/");
+    const unreviewed = ["@unreviewed", "package"].join("/");
+    for (const [tail, code] of [[secret, "SECRET_SHAPE"], [privatePath, "ABSOLUTE_USER_PATH"], [unreviewed, "PRIVATE_SCOPE"]] as const) {
+      const patch = `+ "${fixtures[0].token}"\n${tail}\n`;
+      const normalized = normalizeReviewedSyntheticPackagePatch(patch, digest(patch), ["other_ui"]);
+      expect(normalized).toBe(`+ "[reviewed-synthetic-package]"\n${tail}\n`);
+      expect(() => assertPublicText(normalized, "remaining unreviewed history text")).toThrow(code);
+      for (const row of expected) {
+        expect(normalizeGitHistoryPatchForPublicScan(row.commit, "sensitive_patch", patch)).toBe(patch);
+      }
+    }
+    const patch = `"${fixtures[0].token}"\n"${fixtures[1].token}"\n`;
+    const normalized = normalizeReviewedSyntheticPackagePatch(patch, digest(patch), ["other_ui"]);
+    expect(() => assertPublicText(normalized, "unselected fixture remains public text")).toThrow("PRIVATE_SCOPE");
+    const sensitivePatch = `"${fixtures[0].token}"\n${secret}\n`;
+    expect(() => assertPublicSensitiveText(normalizeGitHistoryPatchForPublicScan(expected[0].commit,
+      "sensitive_patch", sensitivePatch), "unchanged sensitive history")).toThrow("SECRET_SHAPE");
+  });
+
+  test("fixture normalization preserves bounded arbitrary surrounding public text", () => {
+    fc.assert(fc.property(fc.constantFrom(...fixtures),
+      fc.stringMatching(/^[a-z0-9 ]{0,32}$/u), fc.stringMatching(/^[a-z0-9 ]{0,32}$/u),
+      ({ fixture, token }, before, after) => {
+        const patch = `${before}"${token}"${after}\n`;
+        const normalized = normalizeReviewedSyntheticPackagePatch(patch, digest(patch), [fixture]);
+        expect(normalized).toBe(`${before}"[reviewed-synthetic-package]"${after}\n`);
+        expect(() => assertPublicText(normalized, "reviewed synthetic package vector")).not.toThrow();
+        expect(() => normalizeReviewedSyntheticPackagePatch(`${patch}"${token}"`, digest(patch), [fixture]))
+          .toThrow("synthetic-package evidence changed");
+      }), { numRuns: 40 });
+  });
+});
 
 const identity = (pid: number): DaemonIdentity => ({
   bootId: `boot_${"a".repeat(32)}`,

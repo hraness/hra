@@ -1,26 +1,35 @@
 import type { HTMLAttributes } from "react";
+import * as stylex from "@stylexjs/stylex";
+import type { StyleXStyles } from "@stylexjs/stylex";
 
-import { cn } from "../../lib/cn";
+import { staticStylexClassName } from "../../lib/cn";
+import { badgeStyles } from "./primitives.stylex";
 
 export type BadgeTone = "neutral" | "accent" | "attention" | "danger";
 
-const toneClasses: Readonly<Record<BadgeTone, string>> = {
-  accent: "border-accent text-accent",
-  attention: "border-attention text-attention",
-  danger: "border-danger text-danger",
-  neutral: "border-line text-ink-muted",
+const toneStyles: Readonly<Record<BadgeTone, StyleXStyles>> = {
+  accent: badgeStyles.accent,
+  attention: badgeStyles.attention,
+  danger: badgeStyles.danger,
+  neutral: badgeStyles.neutral,
 };
 
-export type BadgeProps = HTMLAttributes<HTMLSpanElement> & Readonly<{ tone?: BadgeTone }>;
+export type BadgeProps = Omit<HTMLAttributes<HTMLSpanElement>, "style"> & Readonly<{
+  style?: never;
+  tone?: BadgeTone;
+  xstyle?: StyleXStyles;
+}>;
 
-export function Badge({ className, tone = "neutral", ...rest }: BadgeProps) {
+function rejectInlineStyle(style: unknown): void {
+  if (style !== undefined) throw new Error("HRA primitives do not accept caller inline styles.");
+}
+
+export function Badge({ className, style, tone = "neutral", xstyle, ...rest }: BadgeProps) {
+  rejectInlineStyle(style);
+  const presentation = stylex.props(badgeStyles.root, toneStyles[tone], xstyle);
   return (
     <span
-      className={cn(
-        "inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium",
-        toneClasses[tone],
-        className,
-      )}
+      className={staticStylexClassName(presentation, className)}
       {...rest}
     />
   );

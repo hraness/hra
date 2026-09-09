@@ -1,3 +1,4 @@
+import * as stylex from "@stylexjs/stylex";
 import {
   useCallback,
   useEffect,
@@ -50,6 +51,7 @@ import {
   resolveComposerTarget,
   type SessionCardSummary,
 } from "../model/session-view";
+import { gridScreenStyles } from "./grid-screen.stylex";
 
 function sameSummary(left: SessionCardSummary, right: SessionCardSummary): boolean {
   return left.archived === right.archived
@@ -403,14 +405,11 @@ export function GridScreen({
       : `Steers ${steerTarget.title}. Clear the selection to start a new session.`;
 
   return (
-    <div className="mx-auto flex min-h-dvh w-full max-w-6xl flex-col pt-[env(safe-area-inset-top)]">
+    <div {...stylex.props(gridScreenStyles.root)}>
       <header
-        className={[
-          "sticky top-0 z-20 flex flex-col gap-2 border-b border-line bg-surface",
-          "px-[max(1rem,env(safe-area-inset-left))] py-3",
-        ].join(" ")}
+        {...stylex.props(gridScreenStyles.header)}
       >
-        <div className="flex items-center gap-2">
+        <div {...stylex.props(gridScreenStyles.headerRow)}>
           <Button
             aria-label="Settings"
             onClick={() => { navigate(settingsRoute); }}
@@ -420,7 +419,7 @@ export function GridScreen({
             <SettingsIcon />
           </Button>
           <form
-            className="flex flex-1 items-center gap-2"
+            {...stylex.props(gridScreenStyles.form)}
             onDragLeave={attach.onDragLeave}
             onDragOver={starting ? undefined : attach.onDragOver}
             onDrop={starting ? undefined : attach.onDrop}
@@ -429,7 +428,7 @@ export function GridScreen({
             <input
               accept={attachmentAcceptAttribute}
               aria-hidden="true"
-              className="hidden"
+              {...stylex.props(gridScreenStyles.fileInput)}
               multiple
               onChange={attach.onPick}
               ref={pickerRef}
@@ -462,11 +461,11 @@ export function GridScreen({
           <Button onClick={custody.lock} size="small" variant="ghost">Lock</Button>
         </div>
         {starting && startTarget !== null ? (
-          <div className="flex flex-wrap items-center gap-2">
-            <label className="flex items-center gap-1 text-xs text-ink-muted">
+          <div {...stylex.props(gridScreenStyles.controls)}>
+            <label {...stylex.props(gridScreenStyles.label)}>
               <span>Account</span>
               <select
-                className="min-h-11 rounded-md border border-line bg-surface-input px-2 text-sm text-ink"
+                {...stylex.props(gridScreenStyles.select)}
                 onChange={(event) => {
                   setTargetKey(event.target.value);
                   setProjectPublicId(null);
@@ -483,10 +482,10 @@ export function GridScreen({
                 ))}
               </select>
             </label>
-            <label className="flex items-center gap-1 text-xs text-ink-muted">
+            <label {...stylex.props(gridScreenStyles.label)}>
               <span>Project</span>
               <select
-                className="min-h-11 rounded-md border border-line bg-surface-input px-2 text-sm text-ink"
+                {...stylex.props(gridScreenStyles.select)}
                 onChange={(event) => { setProjectPublicId(event.target.value); }}
                 value={project?.publicId ?? ""}
               >
@@ -503,41 +502,39 @@ export function GridScreen({
             />
           </div>
         ) : null}
-        <p className="text-xs text-ink-muted">{hint}</p>
+        <p {...stylex.props(gridScreenStyles.quiet)}>{hint}</p>
         {startNotice === null ? null : (
           <p
-            className={startNotice.tone === "error"
-              ? "text-xs text-danger"
-              : "text-xs text-ink-muted"}
+            {...stylex.props(startNotice.tone === "error" ? gridScreenStyles.danger : gridScreenStyles.quiet)}
             role="status"
           >
             {startNotice.text}
           </p>
         )}
         {startObservation.protocolWarning === null ? null : (
-          <p className="text-xs text-danger" role="status">
+          <p {...stylex.props(gridScreenStyles.danger)} role="status">
             {startObservation.protocolWarning}
           </p>
         )}
         {notice === null ? null : (
-          <p className="text-xs text-ink-muted" role="status">{notice}</p>
+          <p {...stylex.props(gridScreenStyles.quiet)} role="status">{notice}</p>
         )}
         {attach.notice === null ? null : (
-          <p className="text-xs text-danger" role="status">{attach.notice}</p>
+          <p {...stylex.props(gridScreenStyles.danger)} role="status">{attach.notice}</p>
         )}
         <ComposerAttachmentChips attachments={attach.attachments} onRemove={attach.remove} />
       </header>
 
-      <main className="flex-1 px-[max(1rem,env(safe-area-inset-left))] py-4 pb-[calc(1rem+env(safe-area-inset-bottom))]">
+      <main {...stylex.props(gridScreenStyles.main)}>
         {isLoading && heads.length === 0 ? (
-          <p className="text-sm text-ink-muted">Loading sessions.</p>
+          <p {...stylex.props(gridScreenStyles.quietBody)}>Loading sessions.</p>
         ) : null}
         {!isLoading && heads.length === 0 ? (
-          <p className="text-sm text-ink-muted">
+          <p {...stylex.props(gridScreenStyles.quietBody)}>
             No sessions yet. Type a prompt above to start one on a machine.
           </p>
         ) : null}
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-[repeat(auto-fill,minmax(20rem,1fr))]">
+        <div {...stylex.props(gridScreenStyles.cardGrid)}>
           {rendered.map((head) => (
             <SessionCard
               head={head}
@@ -561,7 +558,7 @@ export function GridScreen({
           ))}
         </div>
         {status === "CanLoadMore" ? (
-          <div className="mt-4 flex justify-center">
+          <div {...stylex.props(gridScreenStyles.loadMore)}>
             <Button onClick={() => { loadMore(24); }} variant="secondary">Load more</Button>
           </div>
         ) : null}

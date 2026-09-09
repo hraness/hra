@@ -1,3 +1,4 @@
+import * as stylex from "@stylexjs/stylex";
 import { useCallback, useEffect, useMemo, useState, type PointerEvent, type ReactNode } from "react";
 
 import { Button } from "./ui/button";
@@ -12,8 +13,8 @@ import { SubagentChips } from "./subagent-chips";
 import { useSubmitCommand } from "../data/commands";
 import { useSessionModel } from "../data/session-model-hook";
 import type { SessionHead } from "../data/wire";
-import { cn } from "../lib/cn";
 import { shortSessionLabel, type SessionCardSummary } from "../model/session-view";
+import { sessionCardStyles } from "./session-card.stylex";
 
 /**
  * What the grid tells one card about the reader's arrangement.
@@ -162,15 +163,15 @@ export function SessionCard({
 
   return (
     <Card
-      className={cn(
-        "flex min-w-0 flex-col overflow-hidden",
-        model.attention ? "border-attention attention-glow" : selected ? "border-accent" : "",
-        ordering.dragging ? "opacity-60" : "",
-        ordering.dropTarget ? "border-accent" : "",
-      )}
       data-session-id={publicId}
+      xstyle={[
+        sessionCardStyles.card,
+        model.attention ? sessionCardStyles.attention : selected ? sessionCardStyles.selected : null,
+        ordering.dragging ? sessionCardStyles.dragging : null,
+        ordering.dropTarget ? sessionCardStyles.selected : null,
+      ]}
     >
-      <div className="flex items-start gap-1 p-3 pb-2">
+      <div {...stylex.props(sessionCardStyles.header)}>
         {/*
           The handle is the only place a drag starts, so a tap anywhere else on
           the card still opens the session. `touch-none` hands the gesture to
@@ -179,7 +180,7 @@ export function SessionCard({
         */}
         <button
           aria-label={`Reorder ${title}. Use the arrow keys, or the card menu.`}
-          className="flex min-h-11 min-w-11 shrink-0 cursor-grab touch-none items-center justify-center rounded-md text-ink-muted hover:text-ink"
+          {...stylex.props(sessionCardStyles.dragHandle)}
           onKeyDown={(event) => {
             if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
             event.preventDefault();
@@ -191,18 +192,18 @@ export function SessionCard({
           <DragHandleIcon />
         </button>
         <button
-          className="flex min-w-0 flex-1 flex-col gap-1.5 text-left"
+          {...stylex.props(sessionCardStyles.openButton)}
           onClick={() => { onOpen(publicId); }}
           type="button"
         >
-          <span className="truncate text-sm font-semibold">{title}</span>
+          <span {...stylex.props(sessionCardStyles.title)}>{title}</span>
           <StateIndicator state={model.state} />
-          {retired ? <span className="text-xs text-ink-muted">Devin retired · read-only</span> : null}
+          {retired ? <span {...stylex.props(sessionCardStyles.quiet)}>Devin retired · read-only</span> : null}
           {model.lastPrompt === null ? null : (
-            <span className="line-clamp-2 text-xs text-ink-muted">{model.lastPrompt}</span>
+            <span {...stylex.props(sessionCardStyles.lastPrompt)}>{model.lastPrompt}</span>
           )}
         </button>
-        <div className="flex shrink-0 items-center gap-1">
+        <div {...stylex.props(sessionCardStyles.menu)}>
           <DropdownMenu
             items={menuItems}
             label={`Session actions for ${title}`}
@@ -214,7 +215,7 @@ export function SessionCard({
       <SubagentChips sessionTitle={title} subagents={model.subagents} />
 
       {notice === null ? null : (
-        <p className="px-3 pb-2 text-xs text-ink-muted" role="status">{notice}</p>
+        <p {...stylex.props(sessionCardStyles.notice)} role="status">{notice}</p>
       )}
 
       <StreamingTail label={`Streaming output for ${title}`} text={model.streamingText} />
@@ -238,7 +239,7 @@ export function SessionCard({
         >
           <Input
             aria-label="Session name"
-            className="mt-3"
+            xstyle={sessionCardStyles.dialogInput}
             maxLength={200}
             onChange={(event) => { setRenameValue(event.target.value); }}
             placeholder="Leave empty to clear the name"
@@ -253,7 +254,7 @@ export function SessionCard({
 
       <Dialog label="Session id" onClose={() => { setShowId(false); }} open={showId}>
         <DialogTitle>Session id</DialogTitle>
-        <p className="mt-3 font-mono text-xs break-all select-all">{publicId}</p>
+        <p {...stylex.props(sessionCardStyles.dialogValue)}>{publicId}</p>
         <DialogFooter>
           <Button onClick={() => { setShowId(false); }} variant="secondary">Close</Button>
         </DialogFooter>

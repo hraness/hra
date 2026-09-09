@@ -1,7 +1,8 @@
+import * as stylex from "@stylexjs/stylex";
 import { useId, useMemo, useState, type ReactNode } from "react";
 
-import { cn } from "../lib/cn";
 import { subagentChips, type SubagentChipInput } from "../model/session-view";
+import { subagentChipStyles } from "./subagent-chips.stylex";
 
 export type SubagentChipsProps = Readonly<{
   /** The card this row belongs to, so two cards never share a chip's open state. */
@@ -31,22 +32,21 @@ export function SubagentChips({ sessionTitle, subagents }: SubagentChipsProps): 
   const open = chips.find((chip) => chip.agentId === openAgentId) ?? null;
 
   return (
-    <div className="flex flex-col gap-1 px-3 pb-2">
+    <div {...stylex.props(subagentChipStyles.root)}>
       <div
         aria-label={`Subagents of ${sessionTitle}`}
-        className="flex flex-wrap items-center gap-1"
+        {...stylex.props(subagentChipStyles.group)}
         role="group"
       >
         {chips.map((chip) => (
           <button
             aria-controls={open?.agentId === chip.agentId ? detailId : undefined}
             aria-expanded={open?.agentId === chip.agentId}
-            className={cn(
-              "inline-flex min-h-11 max-w-full items-center rounded-full border px-2.5",
-              "text-xs font-medium",
+            {...stylex.props(
+              subagentChipStyles.chip,
               open?.agentId === chip.agentId
-                ? "border-accent text-accent"
-                : "border-line text-ink-muted hover:text-ink",
+                ? subagentChipStyles.open
+                : [subagentChipStyles.closed, subagentChipStyles.closedInteractive],
             )}
             key={chip.agentId}
             onClick={() => {
@@ -55,12 +55,12 @@ export function SubagentChips({ sessionTitle, subagents }: SubagentChipsProps): 
             title={`${chip.label} — ${chip.detail}`}
             type="button"
           >
-            <span className="truncate">{chip.label}</span>
+            <span {...stylex.props(subagentChipStyles.truncate)}>{chip.label}</span>
           </button>
         ))}
         {overflow > 0 ? (
           <span
-            className="inline-flex min-h-11 items-center rounded-full border border-line px-2.5 text-xs font-medium text-ink-muted"
+            {...stylex.props(subagentChipStyles.chip, subagentChipStyles.closed)}
             title={`${String(overflow)} more running subagent${overflow === 1 ? "" : "s"}`}
           >
             {`+${String(overflow)}`}
@@ -68,7 +68,7 @@ export function SubagentChips({ sessionTitle, subagents }: SubagentChipsProps): 
         ) : null}
       </div>
       {open === null ? null : (
-        <p className="text-xs text-ink-muted" id={detailId}>
+        <p {...stylex.props(subagentChipStyles.detail)} id={detailId}>
           {`${open.label}: ${open.detail}`}
         </p>
       )}

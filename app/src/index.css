@@ -1,13 +1,12 @@
-@import "tailwindcss";
-
 /*
  * The Content Security Policy is `style-src 'self'`, so every rule here has to
- * arrive as this one same-origin stylesheet. Nothing in the app may set a style
- * attribute or inject a style element, and no font is fetched: `font-src 'self'`
+ * arrive through the same-origin foundation and finalized recipe stylesheets.
+ * Nothing in the app may set a style attribute or inject a style element, and
+ * no font is fetched: `font-src 'self'`
  * with a system stack keeps the page to one origin.
  */
 
-@theme {
+:root {
   --font-sans:
     ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
     "Noto Sans", sans-serif;
@@ -29,6 +28,9 @@
   html {
     background-color: var(--color-surface);
     color-scheme: dark;
+    line-height: 1.5;
+    tab-size: 4;
+    -webkit-tap-highlight-color: transparent;
   }
 
   body {
@@ -48,33 +50,48 @@
     font: inherit;
   }
 
+  /* Retain Tailwind 4.3.3's native date/time control normalization. */
+  ::-webkit-date-and-time-value {
+    min-height: 1lh;
+    text-align: inherit;
+  }
+
+  ::-webkit-datetime-edit {
+    display: inline-flex;
+  }
+
+  ::-webkit-datetime-edit-fields-wrapper {
+    padding: 0;
+  }
+
+  ::-webkit-datetime-edit,
+  ::-webkit-datetime-edit-year-field,
+  ::-webkit-datetime-edit-month-field,
+  ::-webkit-datetime-edit-day-field,
+  ::-webkit-datetime-edit-hour-field,
+  ::-webkit-datetime-edit-minute-field,
+  ::-webkit-datetime-edit-second-field,
+  ::-webkit-datetime-edit-millisecond-field,
+  ::-webkit-datetime-edit-meridiem-field {
+    padding-block: 0;
+  }
+
+  ::-webkit-calendar-picker-indicator {
+    line-height: 1;
+  }
+
+  :-moz-ui-invalid {
+    box-shadow: none;
+  }
+
   :focus-visible {
     outline: 2px solid var(--color-accent);
     outline-offset: 2px;
   }
-}
 
-@layer components {
-  /* A card that needs a human is outlined, and glows unless the reader has
-     asked for reduced motion. */
-  .attention-glow {
-    animation: attention-pulse 2.4s ease-in-out infinite;
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    .attention-glow {
-      animation: none;
+  @media (forced-colors: active) {
+    :focus-visible {
+      outline-color: Highlight;
     }
-  }
-}
-
-@keyframes attention-pulse {
-  0%,
-  100% {
-    box-shadow: 0 0 0 1px var(--color-attention);
-  }
-
-  50% {
-    box-shadow: 0 0 0 3px color-mix(in oklab, var(--color-attention) 45%, transparent);
   }
 }

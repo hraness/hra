@@ -1,5 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { closeSync, fstatSync, openSync } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, realpath, rm, rmdir, writeFile } from "node:fs/promises";
@@ -57,6 +56,12 @@ import {
   observePrivateDirectory,
 } from "./live-acceptance-private-custody";
 import { canonicalDigest } from "./release-evidence";
+import {
+  privateDescriptorFixtureEnvironment,
+  privateDescriptorFixtureFailure,
+  privateDescriptorFixtureFailureMessage,
+  runPrivateDescriptorFixture,
+} from "./private-descriptor-test-fixture";
 
 const profileId = `acct_${"1".repeat(32)}` as const;
 const projectId = `proj_${"2".repeat(32)}` as const;
@@ -795,6 +800,34 @@ describe("dedicated Claude live acceptance runner", () => {
   });
 });
 
+describe("private descriptor cleanup fixture controls", () => {
+  test("forwards only the home and temporary identities required by the real cleanup policy", () => {
+    const operation = { candidate, kind: "claude-cleanup" } as const;
+    expect(privateDescriptorFixtureEnvironment(operation, "/fixture/home", "/fixture/home", "/fixture/tmp"))
+      .toEqual({ HOME: "/fixture/home", LANG: "C", LC_ALL: "C", TMPDIR: "/fixture/tmp", TZ: "UTC" });
+    for (const home of [undefined, "/different/home", "relative", "/fixture/./home", "/fixture/home\n"]) {
+      expect(() => privateDescriptorFixtureEnvironment(operation, home, "/fixture/home", "/fixture/tmp")).toThrow();
+    }
+    for (const temporaryRoot of ["relative", "/fixture/../tmp", "/fixture/tmp\n", "/"]) {
+      expect(() => privateDescriptorFixtureEnvironment(operation, "/fixture/home", "/fixture/home", temporaryRoot)).toThrow();
+    }
+    expect(privateDescriptorFixtureEnvironment({ kind: "provider-activity" }, undefined, "/fixture/home", "/fixture/tmp"))
+      .toEqual({ LANG: "C", LC_ALL: "C", TZ: "UTC" });
+  });
+
+  test("reports only finite child failure stages and codes without private content", () => {
+    const known = privateDescriptorFixtureFailure({ code: "cleanup_unproven", recoveryReceiptPath: "/private/receipt", message: "credential" }, "claude-cleanup");
+    expect(known).toEqual({ code: "cleanup_unproven", stage: "claude-cleanup" });
+    expect(privateDescriptorFixtureFailureMessage(JSON.stringify(known))).toBe(JSON.stringify(known));
+    expect(privateDescriptorFixtureFailure({ code: "credential", message: "secret" }, "claude-import"))
+      .toEqual({ code: "unclassified", stage: "claude-import" });
+    for (const stderr of ["credential", "x".repeat(1025), JSON.stringify({ ...known, path: "/private/receipt" }),
+      JSON.stringify({ ...known, stage: "/private/receipt" }), JSON.stringify({ ...known, code: "credential" })]) {
+      expect(privateDescriptorFixtureFailureMessage(stderr)).toBe("unclassified");
+    }
+  });
+});
+
 describe("Claude cleanup-only recovery", () => {
   function openHighRecoveryDescriptor(path: string): number {
     // Exercise the allocator state of a long-running suite without retaining
@@ -810,43 +843,6 @@ describe("Claude cleanup-only recovery", () => {
     } finally {
       for (const descriptor of heldDescriptors) closeSync(descriptor);
     }
-  }
-
-  function runMappedRecovery(descriptor: number) {
-    const source = `
-      import { closeSync } from "node:fs";
-      import { runClaudeLiveAcceptance } from "./scripts/claude-live-acceptance";
-      let workerEffects = 0;
-      const forbidden = () => {
-        workerEffects += 1;
-        throw new Error("cleanup fixture effect forbidden");
-      };
-      try {
-        const result = await runClaudeLiveAcceptance(["--resume-fd", "3"], {
-          createLogout: forbidden,
-          createReadback: forbidden,
-          recoverProcessJournal: async () => undefined,
-          sourceAttestation: async () => (${JSON.stringify(candidate)}),
-          startWorker: async () => forbidden(),
-        });
-        process.stdout.write(JSON.stringify({ result, workerEffects }));
-      } catch {
-        process.stdout.write(JSON.stringify({ failed: true, workerEffects }));
-        process.exitCode = 1;
-      } finally {
-        closeSync(3);
-      }
-    `;
-    // The child owns only FD3, duplicated from our exact receipt. A synchronous
-    // joined child avoids adding asynchronous exit/pipe listeners to this test.
-    return spawnSync(process.execPath, ["--eval", source], {
-      cwd: join(import.meta.dir, ".."),
-      encoding: "utf8",
-      killSignal: "SIGKILL",
-      maxBuffer: 1_024,
-      stdio: ["ignore", "pipe", "pipe", descriptor],
-      timeout: 10_000,
-    });
   }
 
   const cleanupAuthorization = (
@@ -942,13 +938,8 @@ describe("Claude cleanup-only recovery", () => {
             },
             worker: { pid: 91_002, state: "ready" },
           })).toThrow("Cleanup authorization scope does not match this run");
-          const child = runMappedRecovery(descriptor);
-          expect(child.error).toBeUndefined();
-          expect(child.signal).toBeNull();
-          expect(child.status).toBe(0);
-          expect(child.stderr).toBe("");
-          const result: unknown = JSON.parse(child.stdout);
-          expect(result).toEqual({ result: null, workerEffects: 0 });
+          expect(runPrivateDescriptorFixture(descriptor, { candidate, kind: "claude-cleanup" }))
+            .toEqual({ closure: "fixture", descriptor: 3, effects: 0, kind: "claude-cleanup", outcome: "cleaned", sha256: null, version: 1 });
           // Child closure cannot close the owned parent descriptor. Its unlinked
           // inode proves cleanup reached the actual protected receipt.
           expect(fstatSync(descriptor).nlink).toBe(0);

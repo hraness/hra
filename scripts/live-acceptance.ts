@@ -484,6 +484,17 @@ export class LiveAcceptanceError extends Error {
   }
 }
 
+export class LiveAcceptanceSourceGitError extends LiveAcceptanceError {
+  constructor(
+    readonly exitCode: number,
+    readonly stdoutByteLength: number,
+    readonly stderrByteLength: number,
+  ) {
+    super("input_invalid");
+    this.name = "LiveAcceptanceSourceGitError";
+  }
+}
+
 export const assertCurrentLiveAcceptancePackageVersion = (
   packageVersion: string,
 ): void => {
@@ -2764,9 +2775,9 @@ export const sourceGitOutput = async (
     arguments: arguments_,
     containment: "local",
     cwd: repositoryRoot,
-    environment: {
-      ...(process.env.PATH === undefined ? {} : { PATH: process.env.PATH }),
-    },
+    // Apple's /usr/bin/git launcher may dispatch trusted developer-tool helpers.
+    // Caller PATH must not influence that helper chain either.
+    environment: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
     executable: "/usr/bin/git",
     outputMaximumBytes: 64 * 1024,
     phase,
@@ -2774,7 +2785,11 @@ export const sourceGitOutput = async (
     timeoutMs: 5_000,
   }));
   if (result.exitCode !== 0 || result.stderr.byteLength !== 0) {
-    throw new LiveAcceptanceError("input_invalid");
+    throw new LiveAcceptanceSourceGitError(
+      result.exitCode,
+      result.stdout.byteLength,
+      result.stderr.byteLength,
+    );
   }
   return result.stdout.toString("utf8");
 };

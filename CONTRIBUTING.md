@@ -9,6 +9,19 @@ HRA is in public beta development. Open an issue before a large change so the au
 3. Run the focused test beside the code you change.
 4. Run `bun run check` before submitting a change.
 
+Browser acceptance also requires Node 24.18.1 and the Chromium revision provided
+by the pinned Playwright package. Run `node node_modules/playwright-core/cli.js
+install chromium` to provision it. Set `BUN_EXECUTABLE_PATH` and
+`CHROMIUM_EXECUTABLE_PATH` to the explicit installed executables, then run
+`bun run check:browser`. Bun builds the app, site and isolated fixture; the Node
+driver verifies their compiled output with fresh browser profiles. Before
+acceptance, `test:browser:custody` exercises real cancellation during preparation
+and connected browser ownership, plus failure after partial server setup. These
+native cases are skipped by ordinary script tests and run only through the
+explicit custody command. The runner retains evidence under `tmp/app-browser-*/`
+and `tmp/browser-custody-*/` and requires every owned process and listener to
+close before reporting acceptance. Uncertain collection stays failed.
+
 ## Continuous integration
 
 CI runs the complete gate in four isolated jobs on both macOS and Ubuntu.
@@ -18,7 +31,8 @@ those jobs, retaining serial tests and isolated file globals. The fourth job,
 `bun run check:ci-remainder`, runs every other command from `bun run check`,
 in its original order. All jobs retain the same pinned dependencies, complete
 governed Git history, Linux native verification and 20-minute job limit.
-The `Required` check succeeds only when all eight jobs succeed.
+The `Required` check succeeds only when all eight jobs and the separate
+compiled app/site browser job succeed.
 
 The workflow regression tests compare the expanded phase commands with the
 full gate and reject omitted or duplicated commands. They also require all

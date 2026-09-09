@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
@@ -11,6 +11,14 @@ import {
   PINNED_CODEX_SERVER_REQUEST_MATRIX,
   codexMatrixDigest,
 } from "../src/codex/protocol";
+import {
+  isBoundedProcessCleanupUnprovenError,
+  isBoundedProcessRecoveryJournalError,
+  requireBoundedProcessCleanup,
+  retainBoundedProcessRecoveryPath,
+  rethrowBoundedProcessTerminalError,
+  runBoundedProcess,
+} from "./bounded-process";
 
 /**
  * Rewrites `src/codex/pin.ts` for one exact Codex release: the pin constant,
@@ -56,7 +64,9 @@ export const CODEX_BUMP_EXIT = Object.freeze({
 
 const SEMVER_PATTERN = /^(0|[1-9]\d{0,4})\.(0|[1-9]\d{0,4})\.(0|[1-9]\d{0,4})$/u;
 const DIGEST_PATTERN = /^[a-f0-9]{64}$/u;
-const GENERATE_TIMEOUT_MS = 120_000;
+const GENERATE_TIMEOUT_MS = 90_000;
+const GENERATE_TERMINATION_GRACE_MS = 2_000;
+const GENERATE_KILL_SETTLEMENT_MS = 5_000;
 const GENERATE_MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 const SCHEMA_FILE_MAX_BYTES = 8 * 1024 * 1024;
 const MANIFEST_MAX_BYTES = 256 * 1024;
@@ -205,20 +215,36 @@ export type GeneratedCodexSchemas = Readonly<{
 export async function generateCodexSchemas(input: Readonly<{
   bunExecutable: string;
   launcher: string;
-}>): Promise<GeneratedCodexSchemas> {
+  signal?: AbortSignal;
+}>, run: typeof runBoundedProcess = runBoundedProcess): Promise<GeneratedCodexSchemas> {
   if (!isAbsolute(input.bunExecutable) || !isAbsolute(input.launcher)) {
     throw new CodexBumpRefusedError("Executable paths must be absolute.");
   }
-  const outputDirectory = await mkdtemp(join(tmpdir(), "hra-codex-bump-"));
+  assertCodexBumpActive(input.signal);
+  const outputDirectory = await realpath(await mkdtemp(join(tmpdir(), "hra-codex-bump-")));
+  let cleanupProven = true;
   try {
-    const generated = Bun.spawnSync({
-      cmd: [input.bunExecutable, input.launcher, "app-server", "generate-ts", "--experimental", "--out", outputDirectory],
-      stdout: "pipe",
-      stderr: "pipe",
-      stdin: "ignore",
-      timeout: GENERATE_TIMEOUT_MS,
-      maxBuffer: GENERATE_MAX_OUTPUT_BYTES,
-    });
+    assertCodexBumpActive(input.signal);
+    cleanupProven = false;
+    const generated = requireBoundedProcessCleanup(await run({
+      arguments: [input.launcher, "app-server", "generate-ts", "--experimental", "--out", outputDirectory],
+      containment: "local",
+      cwd: process.cwd(),
+      environment: process.env,
+      executable: input.bunExecutable,
+      killSettlementMs: GENERATE_KILL_SETTLEMENT_MS,
+      outputMaximumBytes: GENERATE_MAX_OUTPUT_BYTES,
+      phase: "codex-schema-generation",
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
+      terminationGraceMs: GENERATE_TERMINATION_GRACE_MS,
+      timeoutMs: GENERATE_TIMEOUT_MS,
+    }, {
+      // A fresh physical run owns both output and journals. Recovery cannot
+      // encounter another invocation's live process or shared user state.
+      recoveryDirectory: join(outputDirectory, "process-recovery"),
+    }));
+    cleanupProven = true;
+    assertCodexBumpActive(input.signal);
     if (generated.exitCode !== 0) {
       throw new CodexBumpRefusedError(
         `codex app-server generate-ts failed with exit code ${generated.exitCode}.`,
@@ -234,6 +260,7 @@ export async function generateCodexSchemas(input: Readonly<{
         throw new CodexBumpRefusedError(`Generated ${file} is missing or exceeds ${SCHEMA_FILE_MAX_BYTES} bytes.`);
       }
       const source = await readFile(path, "utf8");
+      assertCodexBumpActive(input.signal);
       digests[file] = sha256(source);
       if (file === "ServerNotification.ts") notificationMethods = methodsInGeneratedUnion(source);
       if (file === "ServerRequest.ts") serverRequestMethods = methodsInGeneratedUnion(source);
@@ -243,15 +270,27 @@ export async function generateCodexSchemas(input: Readonly<{
       notificationMethods,
       serverRequestMethods,
     };
+  } catch (error: unknown) {
+    if (!cleanupProven) {
+      const retained = retainBoundedProcessRecoveryPath(error, outputDirectory);
+      rethrowBoundedProcessTerminalError(retained);
+      throw new Error(`Codex schema cleanup was not proven; output retained at ${outputDirectory}`, { cause: error });
+    }
+    throw error;
   } finally {
-    await rm(outputDirectory, { recursive: true, force: true });
+    if (cleanupProven) await rm(outputDirectory, { recursive: true, force: true });
   }
+}
+
+function assertCodexBumpActive(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw new CodexBumpRefusedError("Codex schema generation was cancelled.");
 }
 
 export type CodexBumpIo = Readonly<{
   repoRoot: string;
   bunExecutable: string;
   stdout: (line: string) => void;
+  signal?: AbortSignal;
 }>;
 
 const readBoundedJson = async (path: string, label: string): Promise<unknown> => {
@@ -276,6 +315,7 @@ const changedKeys = <Key extends string>(
 export async function runCodexBump(args: CodexBumpArguments, io: CodexBumpIo): Promise<number> {
   const { stdout } = io;
   try {
+    assertCodexBumpActive(io.signal);
     if (!isAbsolute(io.repoRoot)) throw new CodexBumpRefusedError("The repository root must be absolute.");
     const dependency = parseRepositoryCodexDependency(
       await readBoundedJson(join(io.repoRoot, "package.json"), "package.json"),
@@ -305,7 +345,10 @@ export async function runCodexBump(args: CodexBumpArguments, io: CodexBumpIo): P
       PINNED_CODEX_MATRIX_DIGESTS: CodexMatrixDigests;
     }>;
 
-    const generated = await generateCodexSchemas({ bunExecutable: io.bunExecutable, launcher: manifest.launcher });
+    const generated = await generateCodexSchemas({
+      bunExecutable: io.bunExecutable, launcher: manifest.launcher,
+      ...(io.signal === undefined ? {} : { signal: io.signal }),
+    });
     const matrixDigests: CodexMatrixDigests = {
       serverRequest: codexMatrixDigest(args.version, PINNED_CODEX_SERVER_REQUEST_MATRIX),
       notification: codexMatrixDigest(args.version, PINNED_CODEX_NOTIFICATION_MATRIX),
@@ -340,6 +383,7 @@ export async function runCodexBump(args: CodexBumpArguments, io: CodexBumpIo): P
     if (args.mode === "check") {
       stdout(changed ? `  ${CODEX_PIN_RELATIVE_PATH}: stale` : `  ${CODEX_PIN_RELATIVE_PATH}: current`);
     } else if (changed) {
+      assertCodexBumpActive(io.signal);
       await writeFile(pinPath, nextSource, "utf8");
       stdout(`  ${CODEX_PIN_RELATIVE_PATH}: written`);
     } else {
@@ -354,6 +398,7 @@ export async function runCodexBump(args: CodexBumpArguments, io: CodexBumpIo): P
     stdout("  - Prose that names the pin: README.md, site/content.ts, kb/plans, docs/live-acceptance.md plan vocabulary.");
     stdout("  - Run `bun test src/codex --isolate --max-concurrency=1`, then the docs/live-acceptance.md gate before release.");
 
+    assertCodexBumpActive(io.signal);
     if (drifted) return CODEX_BUMP_EXIT.reviewRequired;
     if (args.mode === "check" && changed) return CODEX_BUMP_EXIT.reviewRequired;
     return CODEX_BUMP_EXIT.ok;
@@ -374,10 +419,22 @@ if (import.meta.main) {
     process.stderr.write(`${error instanceof Error ? error.message : USAGE}\n`);
     process.exit(CODEX_BUMP_EXIT.refused);
   }
-  const exitCode = await runCodexBump(args, {
-    repoRoot: resolve(import.meta.dir, ".."),
-    bunExecutable: process.execPath,
-    stdout: (line) => process.stdout.write(`${line}\n`),
-  });
-  process.exit(exitCode);
+  const cancellation = new AbortController();
+  const onSignal = (): void => cancellation.abort();
+  process.on("SIGINT", onSignal); process.on("SIGTERM", onSignal);
+  try {
+    process.exitCode = await runCodexBump(args, {
+      repoRoot: resolve(import.meta.dir, ".."),
+      bunExecutable: process.execPath,
+      signal: cancellation.signal,
+      stdout: (line) => process.stdout.write(`${line}\n`),
+    });
+  } catch (error: unknown) {
+    if (isBoundedProcessCleanupUnprovenError(error) || isBoundedProcessRecoveryJournalError(error)) {
+      process.stderr.write(`codex:bump retained recovery paths: ${JSON.stringify(error.recoveryPaths)}\n`);
+    }
+    throw error;
+  } finally {
+    process.off("SIGINT", onSignal); process.off("SIGTERM", onSignal);
+  }
 }

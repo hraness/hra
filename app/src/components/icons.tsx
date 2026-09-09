@@ -1,4 +1,7 @@
+import * as stylex from "@stylexjs/stylex";
 import type { ReactNode } from "react";
+
+import { iconStyles } from "./icons.stylex";
 
 /**
  * Icons as inline SVG.
@@ -22,7 +25,7 @@ function Glyph({ children }: Readonly<{ children: ReactNode }>): ReactNode {
   return (
     <svg
       aria-hidden="true"
-      className="h-5 w-5"
+      {...stylex.props(iconStyles.glyph)}
       focusable="false"
       viewBox="0 0 24 24"
       xmlns="http://www.w3.org/2000/svg"
