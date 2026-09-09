@@ -199,6 +199,14 @@ coordination or safety need. Prefer current integration-candidate checks, indepe
 review, and atomic or conditional integration. Replace redundant waits and checks through
 reviewed policy changes with evidence for the integrated result; do not skip an existing gate.
 
+HRA's [final validation policy](../../CONTRIBUTING.md#final-validation) assigns the complete
+required CI gate as the final source aggregate for independently reviewed documentation and
+guidance changes, version-only plugin metadata, and corresponding prose assertions. Focused
+local contracts and existing CI coverage/equivalence tests still run. The final PR head and
+current-base integration candidate need fresh matching CI evidence. Other changes retain the
+local full gate, and explicit local, native, live, installation, and delivery acceptance remains
+separate. This removes a duplicate execution without changing CI command coverage.
+
 ## Workstreams
 
 | Workstream | State | Acceptance evidence |
@@ -212,7 +220,7 @@ reviewed policy changes with evidence for the integrated result; do not skip an 
 | Provider setup | Evidence-driven | Ordinary npm publication workflows are present. Change trust, account, GitHub App, or ruleset configuration only for an individually verified remaining gap; no blanket trust update is pending. |
 | Machine-confidence foundation | Complete | HRA PR156 delivered the reviewed canonical global/repository assets, operator guidance and regression tests separating artifact admission from operational activation. |
 | Bounded foundation propagation | Complete | Current-Mac installation and readback plus owner-coordinated HRA, Oh and template delivery are proved. Further fleet propagation is the separate workstream above. |
-| Data-preserving delivery policy | In progress | Local-efficiency 0.4.1 source adds D7 and provider-permitted unattended stable delivery. Focused validation, independent review, the exact-tree repository gate, delivery, and installation readback remain required. |
+| Data-preserving delivery policy | In progress | Local-efficiency 0.4.1 source adds D7 and provider-permitted unattended stable delivery. Focused validation, independent scope review, CI-equivalence tests, fresh complete required CI for the exact final integration candidate, delivery, and installation readback remain required. |
 
 ## Guardrails
 
@@ -229,6 +237,13 @@ reviewed policy changes with evidence for the integrated result; do not skip an 
   evidence that applies; silence is never proof of completion.
 
 ## Progress log
+
+- 2026-09-08: HRA's reviewed documentation/guidance validation path now uses
+  focused local contracts plus fresh complete required CI as its final source
+  aggregate. CI still covers every full-gate command on macOS and Linux, with
+  command-coverage and shard-equivalence regressions unchanged. Runtime and other
+  executable changes retain the local full gate. Fresh CI for the updated source
+  and installation readback remain pending.
 
 - 2026-09-08, revision 4: the 0.4.1 policy update adds data-preserving autonomous
   delivery and proportional integration gates. It removes the generic recommendation

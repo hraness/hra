@@ -128,6 +128,10 @@ package or command.
   waiter. Do not hold a compute lease while waiting on external state.
 - Run the repository's aggregate/final gate once after convergence. Never use a
   receipt to skip a repository-required final replayed-tree or delivery gate.
+  Where reviewed repository policy assigns complete required CI as the final
+  aggregate for a narrow change class, verify its scope and fresh exact-head,
+  current-base CI result; preserve separate local, native, live, and installation
+  acceptance and do not add a duplicate local aggregate.
 - The host scheduler is an outer layer. Jungle and HRA keep their repository
   schedulers underneath it; invoke `hra-host-run` only around top-level
   commands. Nested `hra-host-run` calls inherit the outer lease and do not
