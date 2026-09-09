@@ -13,8 +13,8 @@ export async function finishSiteTestBuild(
     outcome = { status: "failure", error };
   }
   try {
-    // This requests shutdown only. The unchanged parent still requires
-    // process exit and proven collection before accepting this terminal.
+    // The isolated adapter joins its observed native children's close events.
+    // The unchanged parent still requires process exit and group collection.
     await stop();
   } catch (error: unknown) {
     throw new AggregateError([
