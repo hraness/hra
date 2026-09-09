@@ -6,6 +6,7 @@
 - Autorespond decides who answers an approval: the protocol path answers provider requests, the prose path answers an assistant turn that asks only for consent through the responder port.
 - Gateway key custody keeps the responder credential in one user-only file, never in a journal, log, or projection.
 - Attachment ingest resolves a filesystem path into local content-addressed custody; attachment resolution turns a message's digest references back into bytes for the provider adapters.
+- Claude-runtime-program composes connection acquisition, capability and deferred-notice cleanup on the provider's one prepared Effect owner. Claude-runtime-adapter retains reviews, exact authority maps and public Promise operations.
 
 # Guidelines
 

@@ -9,8 +9,9 @@ status: in-progress
 Design: [issue 166](https://github.com/hraness/hra/issues/166).
 
 Status: source implementation in progress. The current isolated baseline is
-`82637bb9a5423adffb5185dc175fd74eb5dd2c89`. It is not a release candidate or a
-replacement for the active provider-usage integration. The completed
+`82637bb9a5423adffb5185dc175fd74eb5dd2c89`, an ancestor of
+[the provider-usage candidate](https://github.com/hraness/hra/pull/140).
+This work depends on that integration and retains its release ownership. The completed
 [Codex migration](effect-provider-session.md) remains a separate provider contract.
 
 ## Problem and boundary
@@ -54,6 +55,11 @@ fallback, credential policy or account-routing change is part of this plan.
   bounded result that retains the exact retry owner. Do not dispose the only
   handle to unfinished native work. Joining a provider identity inspector's
   exposed Promise does not add proof about its private inspection subprocess.
+- Reconcile custody after admission joins, including a binding that arrives
+  after the initial close snapshot. Report retained cleanup failure separately
+  from an ordinary failed start. A failed revoke must retain its exact binding
+  and make close incomplete; it cannot become success merely because no
+  resource existed in the earlier snapshot.
 - Bound observation of manager-owned acquisition, capabilities and deferred
   continuations with a separately named `connectionShutdownSettlementMs`,
   default 1,000 ms and valid from 1 to 30,000 ms. Expiry reports incomplete
@@ -134,3 +140,9 @@ local aggregate when Required CI already owns its authoritative equivalent.
   with native process identity without invoking the public client facade or a
   nested runtime. Causal tie and abort checks remain required; construction
   alone does not establish ordering equivalence.
+- The two existing client files pass 39 tests and 253 assertions after repairing
+  two observed synchronous TERM regressions. Independent actual-facade tests
+  pass eight cases and 114 assertions for turn admission, deferred FIFO writes
+  and falsey diagnostic failure precedence. These focused receipts precede the
+  additive manager platform helpers and do not replace current-source review,
+  manager/service checks or final CI.

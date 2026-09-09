@@ -5,9 +5,23 @@ import { createArchitectureProgram, inspectEffectArchitecture } from "./check-ef
 const root = resolve(import.meta.dir, "..");
 const findings = inspectEffectArchitecture(createArchitectureProgram(resolve(root, "tsconfig.json")), {
   root,
-  modules: ["src/codex/session-program.ts", "src/codex/session-effects.ts"],
-  adapters: ["src/codex/session-effects.ts"],
-  runtimeRoots: ["src/codex/session-effects.ts"],
+  modules: [
+    "src/codex/session-program.ts",
+    "src/codex/session-effects.ts",
+    "src/claude/client.ts",
+    "src/claude/session-model.ts",
+    "src/claude/session-platform.ts",
+    "src/claude/session-program.ts",
+    "src/claude/session-effects.ts",
+    "src/daemon/claude-runtime-adapter.ts",
+    "src/daemon/claude-runtime-program.ts",
+  ],
+  adapters: [
+    "src/codex/session-effects.ts",
+    "src/claude/session-platform.ts",
+    "src/daemon/claude-runtime-adapter.ts",
+  ],
+  runtimeRoots: ["src/codex/session-effects.ts", "src/claude/session-effects.ts"],
   ignoredDirectories: ["scripts"],
 });
 for (const finding of findings) {

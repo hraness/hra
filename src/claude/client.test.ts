@@ -464,11 +464,14 @@ describe("Claude stream client", () => {
         expect(facts.some((fact) => fact.type === "turnStarted")).toBe(false);
         if (disposition === "accepted") resolveWrite();
         else if (disposition === "closed_after_result") {
-          // close must drain truthful staged facts without waiting on the
-          // unresolved stdin promise or inventing a successful start.
-          await client.close();
+          // Drain observed history, but do not claim the original native write
+          // joined until it settles. Retry retains this exact closed connection.
+          await expect(client.close()).rejects.toMatchObject({ code: "TIMEOUT" });
+          expect(client.state).toBe("closing");
           expect(facts.some((fact) => fact.type === "turnCompleted")).toBe(true);
           resolveWrite();
+          await settledStart;
+          await client.close();
         } else rejectWrite(writeError);
         const outcome = await settledStart;
         if (disposition === "accepted") {

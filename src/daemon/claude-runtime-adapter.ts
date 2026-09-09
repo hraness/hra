@@ -30,6 +30,29 @@ import {
   type PinnedClaudeRuntime,
   type ResolvePinnedClaudeRuntimeOptions,
 } from "../claude/index";
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- The Claude runtime adapter submits programs to its prepared provider connection owner.
+import { ClaudeConnectionEffects } from "../claude/session-effects.ts";
+import type { ClaudeProgram } from "../claude/session-platform.ts";
+import {
+  acquireClaudeSession,
+  admitClaudeFact,
+  boundedClaudeWork,
+  callClaudeHostTool,
+  requireClaudeHostToolSession,
+  closeUnboundClaudeClient,
+  closeUnboundClaudeProcess,
+  joinClaudeConnection,
+  revokeUnboundClaudeBinding,
+  completeClaudeOperation,
+  observeClaudeFact,
+  resolveClaudeInteraction,
+  withClaudeSessionConfig,
+  activateClaudeSessionTools,
+  closeClaudeSession,
+  revokeClaudeSessionTools,
+  type ClaudeRuntimeConnection,
+  type ClaudeRuntimeSessionWork,
+} from "./claude-runtime-program.ts";
 import type { HraHostToolCall } from "../codex/protocol";
 import type { PreparedAttachment } from "../domain/attachments";
 import { claudeProviderAccountIdSchema } from "../domain/provider-accounts";
@@ -53,7 +76,6 @@ import {
 } from "../domain/runtime-profile";
 import type { ClaudeSessionFact } from "./claude-session-facts";
 import {
-  ClaudeProcessExitUnprovenError,
   ClaudeSessionObservationError,
 } from "./ports";
 import type {
@@ -79,24 +101,6 @@ const CLOSED_SESSION_PROOF_LIMIT = 1_024;
 const HOST_TOOL_CALL_LIMIT = 256;
 
 const encoder = new TextEncoder();
-
-const processExitSettledWithin = async (
-  process: ClaudeProcess,
-  milliseconds: number,
-): Promise<boolean> => {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      process.exited.then(() => true, () => false),
-      new Promise<false>((resolve) => {
-        timer = setTimeout(() => resolve(false), milliseconds);
-        timer.unref();
-      }),
-    ]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
-};
 
 /** Validates and bounds the durable title supplied when resuming a conversation. */
 const projectedTitle = (value: unknown): string => {
@@ -141,7 +145,7 @@ const projectedText = (value: string): Pick<CodexProjectedMessage, "text" | "omi
 };
 
 /** One live Claude session: its process, its client, and its projection. */
-type RunningSession = {
+type RunningSession = ClaudeRuntimeSessionWork & {
   authority: ProfileAuthority;
   readonly client: ClaudeStreamClient;
   closeState: "open" | "closing" | "failed";
@@ -154,8 +158,6 @@ type RunningSession = {
   readonly hostToolBinding: ClaudeHostToolBindingLease | undefined;
   readonly hostToolCalls: Map<string, RetainedHostToolCall>;
   readonly hostToolCallTombstones: Map<string, string>;
-  hostToolActivationTask: Promise<void> | undefined;
-  hostToolRevocationTask: Promise<void> | undefined;
   hostToolState: "disabled" | "inactive" | "active" | "revoking" | "revoked";
   status: "active" | "idle" | "terminal";
   activeTurnId: string | undefined;
@@ -335,8 +337,12 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
   readonly #reviews = new Map<string, PendingClaudeReview>();
   readonly #startingSessionIds = new Set<string>();
   readonly #initializingClients = new Map<ClaudeStreamClient, string>();
+  /** Exact connection custody exists before configuration/provision can await. */
+  readonly #connections = new Set<ClaudeRuntimeConnection>();
+  readonly #connectionShutdownSettlementMs: number;
   #resolvedRuntime: PinnedClaudeRuntime | undefined;
   #state: "open" | "closed" = "open";
+  #closeTask: Promise<void> | undefined;
 
   constructor(input: {
     isCurrent: (authority: ProfileAuthority) => boolean;
@@ -349,6 +355,8 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     /** Testable bounds forwarded to the exact child client; production uses its defaults. */
     clientShutdownTermGraceMs?: number;
     clientShutdownSettlementMs?: number;
+    /** Bounds observation of manager-owned connection work; expiry retains custody. */
+    connectionShutdownSettlementMs?: number;
     now?: () => number;
     initializationTimeoutMs?: number;
     /** Truthful authority classification recorded in every runtime review. */
@@ -375,6 +383,9 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
       input.clientShutdownSettlementMs,
       "Claude shutdown settlement",
     );
+    this.#connectionShutdownSettlementMs = optionalClientShutdownDuration(
+      input.connectionShutdownSettlementMs, "Claude connection shutdown settlement",
+    ) ?? 1_000;
     this.#now = input.now ?? Date.now;
     this.#configHome = claudeConfigHomeSchema.parse(input.configHome);
     this.#initializationTimeoutMs = input.initializationTimeoutMs
@@ -705,44 +716,14 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
   }): Promise<void> {
     this.#assertLaunchAuthority(input.authority, input.signal);
     const session = this.#requireSession(input.authority, input.providerThreadId);
-    if (session.hostToolState === "active") return;
-    const binding = session.hostToolBinding;
-    if (session.hostToolState === "disabled" || binding === undefined) {
-      throw new ClaudeError("AUTHORITY_STALE", "This legacy Claude session has no admitted host tools.");
-    }
-    if (session.hostToolState === "revoked" || session.hostToolState === "revoking") {
-      throw new ClaudeError("AUTHORITY_STALE", "Claude host-tool binding was revoked.");
-    }
-    const existingTask = session.hostToolActivationTask;
-    if (existingTask !== undefined) {
-      await existingTask;
-      this.#assertLaunchAuthority(input.authority, input.signal);
-      return;
-    }
-    const task = (async () => {
-      await this.#hostTools.bindingAuthority.activate(binding.bindingId);
-      if (input.signal.aborted) {
-        await this.#revokeSessionHostTools(session);
-        input.signal.throwIfAborted();
-      }
-      if (
-        session.closeState !== "open"
-        || session.hostToolState !== "inactive"
-        || this.#sessions.get(session.providerThreadId) !== session
-        || !this.#isCurrent(session.authority)
-      ) {
-        await this.#revokeSessionHostTools(session);
-        throw new ClaudeError("AUTHORITY_STALE", "Claude host-tool binding activation became stale.");
-      }
-      session.hostToolState = "active";
-    })();
-    session.hostToolActivationTask = task;
-    try {
-      await task;
-      this.#assertLaunchAuthority(input.authority, input.signal);
-    } finally {
-      if (session.hostToolActivationTask === task) session.hostToolActivationTask = undefined;
-    }
+    return await session.connection.effects.run("capabilities", activateClaudeSessionTools({
+      session, signal: input.signal,
+      activate: bindingId => this.#hostTools.bindingAuthority.activate(bindingId),
+      assertAuthority: () => { this.#assertLaunchAuthority(input.authority, input.signal); },
+      isCurrent: () => session.closeState === "open"
+        && this.#sessions.get(session.providerThreadId) === session && this.#isCurrent(session.authority),
+      revoke: () => this.#revokeSessionHostToolsProgram(session),
+    }));
   }
 
   async startTurn(input: {
@@ -773,34 +754,34 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     if (session.activeTurnId !== undefined) {
       throw new ClaudeError("INVALID_INPUT", "The Claude session already has an active turn.");
     }
-    await this.#assertSessionConfig(session, input.signal);
-    // HRA mints the turn id: Claude's own `result` line is the only turn
-    // boundary it publishes, and it carries no id of its own.
-    const turnId = randomUUID();
-    const startAttachments = input.attachments ?? [];
-    await session.client.startTurn({
-      ...(startAttachments.length === 0 ? {} : { attachments: startAttachments }),
-      message: input.message,
-      turnId,
-    });
-    this.#appendUserMessage(session, turnId, input.message, input.clientMessageId);
-    const activeTurnId = session.client.activeTurnId;
-    const summary = session.turnSummaries.find((value) => value.id === turnId);
-    if (activeTurnId !== null && activeTurnId !== turnId) {
-      throw new ClaudeError("PROTOCOL_ERROR", "Claude turn admission observed another active turn.");
-    }
-    if (activeTurnId === null && summary === undefined) {
-      throw new ClaudeError("PROTOCOL_ERROR", "Claude turn admission lost its exact terminal result.");
-    }
-    session.activeTurnId = activeTurnId ?? undefined;
-    if (session.status !== "terminal") session.status = activeTurnId === null ? "idle" : "active";
-    session.updatedAt = this.#now();
-    input.signal.throwIfAborted();
-    return {
-      effectiveRuntimeProfile: pending.review.effectiveRuntimeProfile,
-      status: summary?.status ?? "inProgress",
-      turnId,
-    };
+    return await session.connection.effects.run("writes",
+      this.#sessionConfigProgram(session, input.signal, () => {
+        // HRA mints the turn ID after the original configuration boundary.
+        const turnId = randomUUID();
+        const startAttachments = input.attachments ?? [];
+        return completeClaudeOperation(() => session.client.programs.startTurn({
+          ...(startAttachments.length === 0 ? {} : { attachments: startAttachments }),
+          message: input.message, turnId,
+        }), () => {
+          this.#appendUserMessage(session, turnId, input.message, input.clientMessageId);
+          const activeTurnId = session.client.activeTurnId;
+          const summary = session.turnSummaries.find(value => value.id === turnId);
+          if (activeTurnId !== null && activeTurnId !== turnId) {
+            throw new ClaudeError("PROTOCOL_ERROR", "Claude turn admission observed another active turn.");
+          }
+          if (activeTurnId === null && summary === undefined) {
+            throw new ClaudeError("PROTOCOL_ERROR", "Claude turn admission lost its exact terminal result.");
+          }
+          session.activeTurnId = activeTurnId ?? undefined;
+          if (session.status !== "terminal") session.status = activeTurnId === null ? "idle" : "active";
+          session.updatedAt = this.#now();
+          input.signal.throwIfAborted();
+          return {
+            effectiveRuntimeProfile: pending.review.effectiveRuntimeProfile,
+            status: summary?.status ?? "inProgress", turnId,
+          };
+        });
+      }));
   }
 
   async steer(input: {
@@ -817,10 +798,14 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     if (session.activeTurnId !== input.activeTurnId) {
       throw new ClaudeError("INVALID_INPUT", "That Claude turn is no longer active.");
     }
-    await this.#assertSessionConfig(session, input.signal);
-    await session.client.steer(input.message, input.attachments ?? []);
-    this.#appendUserMessage(session, input.activeTurnId, input.message, input.clientMessageId);
-    input.signal.throwIfAborted();
+    return await session.connection.effects.run("writes",
+      this.#sessionConfigProgram(session, input.signal, () => completeClaudeOperation(
+        () => session.client.programs.steer(input.message, input.attachments ?? []),
+        () => {
+          this.#appendUserMessage(session, input.activeTurnId, input.message, input.clientMessageId);
+          input.signal.throwIfAborted();
+        },
+      )));
   }
 
   async interrupt(input: {
@@ -832,9 +817,11 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     this.#assertLaunchAuthority(input.authority, input.signal);
     const session = this.#requireSession(input.authority, input.providerThreadId);
     if (session.activeTurnId !== input.activeTurnId) return;
-    await this.#assertSessionConfig(session, input.signal);
-    await session.client.interrupt();
-    input.signal.throwIfAborted();
+    return await session.connection.effects.run("writes",
+      this.#sessionConfigProgram(session, input.signal, () => completeClaudeOperation(
+        () => session.client.programs.interrupt(),
+        () => { input.signal.throwIfAborted(); },
+      )));
   }
 
   async observeSession(input: {
@@ -973,84 +960,93 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
   }
 
   async handleSessionHostToolCall(call: ClaudeHostToolCall): Promise<ClaudeHostToolPublicResult> {
-    const session = await this.#requireHostToolSession(call);
-    const key = this.#hostToolCallKey(call.callId);
-    const existing = session.hostToolCalls.get(key);
-    if (existing !== undefined) {
-      throw new ClaudeError(
-        "AUTHORITY_STALE",
-        existing.requestDigest === call.requestDigest
-          ? "Claude host-tool call is already pending."
-          : "Claude host-tool call id was reused.",
-      );
-    }
-    const completedDigest = session.hostToolCallTombstones.get(key);
-    if (completedDigest !== undefined) {
-      throw new ClaudeError(
-        "AUTHORITY_STALE",
-        completedDigest === call.requestDigest
-          ? "Claude host-tool call was already completed."
-          : "Claude host-tool call id was reused.",
-      );
-    }
-    if (
-      session.hostToolCalls.size + session.hostToolCallTombstones.size
-      >= CLAUDE_HOST_TOOL_SESSION_HISTORY_LIMIT
-    ) {
-      throw new ClaudeError("PROTOCOL_LIMIT", "Claude host-tool call history is exhausted.");
-    }
-    if (session.activeTurnId === undefined) {
-      throw new ClaudeError("AUTHORITY_STALE", "Claude host-tool call has no active turn.");
-    }
-    if (session.hostToolCalls.size >= HOST_TOOL_CALL_LIMIT) {
-      throw new ClaudeError("PROTOCOL_LIMIT", "Claude host-tool call retention exceeded its limit.");
-    }
-    const normalized = this.#normalizeHostToolCall(session, session.activeTurnId, call);
-    session.hostToolCalls.set(key, {
-      bindingId: call.bindingId,
-      call: normalized,
-      requestDigest: call.requestDigest,
-    });
-    try {
-      if (this.#observer.hraHostTool === undefined) {
-        throw new ClaudeError("UNSUPPORTED_CAPABILITY", "The HRA host-tool service is unavailable.");
-      }
-      return await this.#observer.hraHostTool(session.authority, normalized);
-    } catch (error: unknown) {
-      session.hostToolCalls.delete(key);
-      this.#rememberHostToolCall(session, key, call.requestDigest);
-      throw error;
-    }
+    const connection = this.#hostToolConnection(call);
+    return await connection.effects.run("capabilities", this.#hostToolSessionProgram(call, session =>
+      callClaudeHostTool({
+        connection: connection.effects,
+        prepare: () => {
+          const key = this.#hostToolCallKey(call.callId);
+          const existing = session.hostToolCalls.get(key);
+          if (existing !== undefined) {
+            throw new ClaudeError("AUTHORITY_STALE", existing.requestDigest === call.requestDigest
+              ? "Claude host-tool call is already pending." : "Claude host-tool call id was reused.");
+          }
+          const completedDigest = session.hostToolCallTombstones.get(key);
+          if (completedDigest !== undefined) {
+            throw new ClaudeError("AUTHORITY_STALE", completedDigest === call.requestDigest
+              ? "Claude host-tool call was already completed." : "Claude host-tool call id was reused.");
+          }
+          if (session.hostToolCalls.size + session.hostToolCallTombstones.size >= CLAUDE_HOST_TOOL_SESSION_HISTORY_LIMIT) {
+            throw new ClaudeError("PROTOCOL_LIMIT", "Claude host-tool call history is exhausted.");
+          }
+          if (session.activeTurnId === undefined) {
+            throw new ClaudeError("AUTHORITY_STALE", "Claude host-tool call has no active turn.");
+          }
+          if (session.hostToolCalls.size >= HOST_TOOL_CALL_LIMIT) {
+            throw new ClaudeError("PROTOCOL_LIMIT", "Claude host-tool call retention exceeded its limit.");
+          }
+          const normalized = this.#normalizeHostToolCall(session, session.activeTurnId, call);
+          session.hostToolCalls.set(key, { bindingId: call.bindingId, call: normalized, requestDigest: call.requestDigest });
+          return { key, normalized };
+        },
+        invoke: ({ normalized }) => {
+          if (this.#observer.hraHostTool === undefined) {
+            throw new ClaudeError("UNSUPPORTED_CAPABILITY", "The HRA host-tool service is unavailable.");
+          }
+          return this.#observer.hraHostTool(session.authority, normalized);
+        },
+        failed: ({ key }) => {
+          session.hostToolCalls.delete(key);
+          this.#rememberHostToolCall(session, key, call.requestDigest);
+        },
+      })));
   }
 
-  async handleSessionHostToolResponseWritten(
-    receipt: ClaudeHostToolResponseWritten,
-  ): Promise<void> {
-    const session = await this.#requireHostToolSession(receipt);
-    const key = this.#hostToolCallKey(receipt.callId);
-    const retained = session.hostToolCalls.get(key);
-    if (
-      retained === undefined
-      || retained.bindingId !== receipt.bindingId
-      || retained.requestDigest !== receipt.requestDigest
-    ) {
-      throw new ClaudeError("AUTHORITY_STALE", "Claude host-tool response receipt is stale.");
-    }
-    await this.#observer.hraHostToolResponseWritten?.(session.authority, retained.call);
-    session.hostToolCalls.delete(key);
-    this.#rememberHostToolCall(session, key, receipt.requestDigest);
+  async handleSessionHostToolResponseWritten(receipt: ClaudeHostToolResponseWritten): Promise<void> {
+    const connection = this.#hostToolConnection(receipt);
+    return await connection.effects.run("capabilities", this.#hostToolSessionProgram(receipt, session =>
+      callClaudeHostTool({
+        connection: connection.effects,
+        prepare: () => {
+          const key = this.#hostToolCallKey(receipt.callId);
+          const retained = session.hostToolCalls.get(key);
+          if (retained === undefined || retained.bindingId !== receipt.bindingId
+            || retained.requestDigest !== receipt.requestDigest) {
+            throw new ClaudeError("AUTHORITY_STALE", "Claude host-tool response receipt is stale.");
+          }
+          return { key, retained };
+        },
+        invoke: ({ retained }) => this.#observer.hraHostToolResponseWritten?.(session.authority, retained.call),
+        complete: ({ key }) => {
+          session.hostToolCalls.delete(key);
+          this.#rememberHostToolCall(session, key, receipt.requestDigest);
+        },
+      })));
   }
 
-  async #requireHostToolSession(call: ClaudeHostToolCall): Promise<RunningSession> {
+  #hostToolConnection(call: ClaudeHostToolCall): ClaudeRuntimeConnection {
     const session = this.#sessions.get(call.providerThreadId);
-    if (!this.ownsSessionHostToolBinding(call) || session === undefined) {
+    if (session === undefined || !this.ownsSessionHostToolBinding(call)) {
       throw new ClaudeError("AUTHORITY_STALE", "Claude host-tool call authority is stale.");
     }
-    if (!this.#isCurrent(session.authority)) {
-      await this.#closeSession(session.providerThreadId, session);
-      throw new ClaudeError("AUTHORITY_STALE", "Claude host-tool account generation changed.");
-    }
-    return session;
+    return session.connection;
+  }
+
+  #hostToolSessionProgram<A>(
+    call: ClaudeHostToolCall, operation: (session: RunningSession) => ClaudeProgram<A>,
+  ): ClaudeProgram<A> {
+    return requireClaudeHostToolSession({
+      select: () => {
+        const session = this.#sessions.get(call.providerThreadId);
+        if (session === undefined || !this.ownsSessionHostToolBinding(call)) {
+          throw new ClaudeError("AUTHORITY_STALE", "Claude host-tool call authority is stale.");
+        }
+        return session;
+      },
+      isCurrent: session => this.#isCurrent(session.authority),
+      closeStale: session => this.#closeSessionProgram(session.providerThreadId, session),
+      operation,
+    });
   }
 
   #normalizeHostToolCall(
@@ -1187,11 +1183,17 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     if (this.#now() > input.deadlineAt) {
       throw new ClaudeError("DEADLINE_EXPIRED", "The Claude interaction deadline passed.");
     }
-    await this.#assertSessionConfig(session, input.signal);
-    await session.client.resolveInteraction(requestId, decisionFor(input.kind, input.resolution, request));
-    this.#reportInteractionSettled(session, requestId);
-    input.signal.throwIfAborted();
-    return { responseWritten: true };
+    return await session.connection.effects.run("writes",
+      this.#sessionConfigProgram(session, input.signal, () => resolveClaudeInteraction({
+        connection: session.connection.effects,
+        response: () => session.client.programs.resolveInteraction(
+          requestId, decisionFor(input.kind, input.resolution, request),
+        ),
+        report: () => this.#onFactProgram(session.authority, session.providerThreadId, session.connectionId, {
+          requestId, type: "interactionCanceled",
+        }),
+        after: () => { input.signal.throwIfAborted(); },
+      })));
   }
 
   async validateInteractionTimeout(input: {
@@ -1218,74 +1220,135 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
   }): Promise<{ responseWritten: true }> {
     input.signal.throwIfAborted();
     const { session, requestId } = this.#requirePending(input.authority, input.provider);
-    await this.#assertSessionConfig(session, input.signal);
-    await session.client.resolveInteraction(requestId, {
-      kind: "deny",
-      message: "HRA did not receive a decision in time",
-    });
-    this.#reportInteractionSettled(session, requestId);
-    input.signal.throwIfAborted();
-    return { responseWritten: true };
-  }
-
-  /**
-   * Claude publishes no resolution notification of its own: one control
-   * response is the whole exchange. The bridge therefore reports the request
-   * as no longer pending, which is the same fact a provider-side cancellation
-   * produces, so the daemon can settle its durable interaction row.
-   *
-   * Codex delivers its equivalent on the notification stream, outside the
-   * resolving call. This one is published the same way: the caller still
-   * holds that interaction's serialization while it awaits the write, so the
-   * fact is handed over after that call returns, never inside it.
-   */
-  #reportInteractionSettled(session: RunningSession, requestId: string): void {
-    const timer = setTimeout(() => {
-      void Promise.resolve(this.#onFact(
-        session.authority,
-        session.providerThreadId,
-        session.connectionId,
-        {
-          requestId,
-          type: "interactionCanceled",
-        },
-      )).catch(() => {
-        // The daemon's own fact path records and escalates its failures; a
-        // settle notice must never reject into the runtime as an unowned task.
-      });
-    }, 0);
-    timer.unref();
+    return await session.connection.effects.run("writes",
+      this.#sessionConfigProgram(session, input.signal, () => resolveClaudeInteraction({
+        connection: session.connection.effects,
+        response: () => session.client.programs.resolveInteraction(requestId, {
+          kind: "deny", message: "HRA did not receive a decision in time",
+        }),
+        report: () => this.#onFactProgram(session.authority, session.providerThreadId, session.connectionId, {
+          requestId, type: "interactionCanceled",
+        }),
+        after: () => { input.signal.throwIfAborted(); },
+      })));
   }
 
   async close(): Promise<void> {
+    // A native callback must return to its owner before that owner can join it.
+    // Refusal precedes every admission/review mutation.
+    if ([...this.#connections].some(connection => connection.effects.callbackActive())) {
+      throw new ClaudeError("INVALID_INPUT", "Claude callbacks cannot join their own manager cleanup.");
+    }
     this.#state = "closed";
     this.#reviews.clear();
-    const settlements = await Promise.allSettled(
-      [
-        ...[...this.#sessions.entries()].map(async ([providerThreadId, session]) => {
-          await this.#closeSession(providerThreadId, session);
-        }),
-        ...[...this.#unboundClients].map(async (client) => {
-          await client.close();
-          this.#unboundClients.delete(client);
-          const providerThreadId = this.#initializingClients.get(client);
-          this.#initializingClients.delete(client);
-          if (providerThreadId !== undefined) this.#startingSessionIds.delete(providerThreadId);
-        }),
-        ...[...this.#unboundHostToolBindings].map(async ([bindingId]) => {
-          await this.#hostTools.bindingAuthority.revoke(bindingId);
-          this.#unboundHostToolBindings.delete(bindingId);
-        }),
-      ],
-    );
-    const failures = settlements.flatMap((settlement) =>
-      settlement.status === "rejected" ? [settlement.reason as unknown] : []);
-    if (failures.length > 0) {
-      throw new AggregateError(
-        failures,
-        "One or more Claude session children could not be joined, or host-tool binding cleanup remained unresolved during shutdown.",
-      );
+    if (this.#closeTask !== undefined) return await this.#closeTask;
+    const closing = this.#closeConnections();
+    this.#closeTask = closing;
+    try {
+      await closing;
+    } finally {
+      if (this.#closeTask === closing) this.#closeTask = undefined;
     }
+  }
+
+  async #closeConnections(): Promise<void> {
+    const connections = [...this.#connections];
+    const connectionFor = (client: ClaudeStreamClient): ClaudeRuntimeConnection => {
+      const connection = connections.find(candidate => candidate.client === client);
+      if (connection === undefined) throw new Error("Claude client has no exact connection owner");
+      return connection;
+    };
+    // Preserve the original ordered all-child native failure collection at the
+    // public fan-out boundary. Each child composes on its own prepared runtime.
+    const own = (connection: ClaudeRuntimeConnection, promise: Promise<void>) => ({ connection, promise });
+    const tasks = [
+      ...[...this.#sessions.entries()].map(([providerThreadId, session]) =>
+        own(session.connection, this.#closeSession(providerThreadId, session))),
+      ...[...this.#unboundClients].map(client => {
+        const connection = connectionFor(client);
+        return own(connection, this.#boundedConnectionCleanup(connection, () => closeUnboundClaudeClient({
+          connection, client,
+          released: () => {
+            this.#unboundClients.delete(client);
+            const providerThreadId = this.#initializingClients.get(client);
+            this.#initializingClients.delete(client);
+            if (providerThreadId !== undefined) this.#startingSessionIds.delete(providerThreadId);
+          },
+        })));
+      }),
+      ...[...this.#unboundHostToolBindings.entries()].map(([bindingId, binding]) => {
+        const connection = connections.find(candidate => candidate.binding === binding.lease);
+        if (connection === undefined) throw new Error("Claude binding has no exact connection owner");
+        return own(connection, connection.effects.run("control", boundedClaudeWork({
+          connection: connection.effects,
+          get: () => connection.bindingCleanup,
+          set: task => { connection.bindingCleanup = task; },
+          program: () => revokeUnboundClaudeBinding({
+            connection, binding: binding.lease,
+            revoke: id => this.#hostTools.bindingAuthority.revoke(id),
+            released: () => {
+              if (this.#unboundHostToolBindings.get(bindingId) === binding) {
+                this.#unboundHostToolBindings.delete(bindingId);
+              }
+            },
+          }),
+          settlementMs: this.#connectionShutdownSettlementMs,
+          message: "Claude host-tool cleanup has not settled; its exact binding owner is retained.",
+        })));
+      }),
+      ...connections.filter(connection => connection.process !== undefined
+        && connection.client === undefined && !connection.processExitProven)
+        .map(connection => own(connection, this.#boundedConnectionCleanup(connection, () => completeClaudeOperation(
+          () => closeUnboundClaudeProcess(connection,
+            this.#clientShutdownSettlementMs ?? PROCESS_CONSTRUCTOR_FAILURE_SETTLEMENT_MS),
+          () => { this.#startingSessionIds.delete(connection.providerThreadId); },
+        )))),
+      ...connections.map(connection => own(connection, connection.effects.run("control",
+        joinClaudeConnection(connection, this.#connectionShutdownSettlementMs)))),
+    ];
+    const settlements = await Promise.allSettled(tasks.map(task => task.promise));
+    const failedConnections = new Set<ClaudeRuntimeConnection>();
+    const failures = settlements.flatMap((settlement, index) => {
+      if (settlement.status === "fulfilled") return [];
+      const task = tasks[index];
+      if (task !== undefined) failedConnections.add(task.connection);
+      return [settlement.reason as unknown];
+    });
+    for (const connection of connections) {
+      if (connection.acquisitionSettled && connection.binding === undefined
+        && (connection.process === undefined || connection.processExitProven)) {
+        try {
+          await connection.effects.dispose();
+          this.#connections.delete(connection);
+        } catch (reason: unknown) {
+          failures.push(reason);
+        }
+      } else if (!failedConnections.has(connection)) {
+        // A lease/client can arrive after the initial resource snapshot. The
+        // completion-only admission join must not turn failed cleanup into a
+        // successful manager close merely because its start also rejected.
+        failures.push(connection.retainedFailure === undefined
+          ? new ClaudeError("TIMEOUT", "Claude connection custody remains unresolved after shutdown.")
+          : connection.retainedFailure.reason);
+      }
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(failures,
+        "One or more Claude session children could not be joined, or host-tool binding cleanup remained unresolved during shutdown.");
+    }
+  }
+
+  #boundedConnectionCleanup(
+    connection: ClaudeRuntimeConnection, program: () => ClaudeProgram<void>,
+  ): Promise<void> {
+    return connection.effects.run("control", boundedClaudeWork({
+      connection: connection.effects,
+      get: () => connection.cleanup,
+      set: task => { connection.cleanup = task; },
+      program,
+      settlementMs: this.#connectionShutdownSettlementMs,
+      message: "Claude connection cleanup has not settled; its exact resource owner is retained.",
+    }));
   }
 
   /** True for a current owned process whose required tools are active, or explicitly absent on legacy resume. */
@@ -1420,23 +1483,33 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     this.#assertCurrent(authority, true);
   }
 
-  async #assertSessionConfig(session: RunningSession, signal: AbortSignal): Promise<void> {
+  #sessionConfigProgram<A>(
+    session: RunningSession, signal: AbortSignal, operation: () => ClaudeProgram<A>,
+  ): ClaudeProgram<A> {
     this.#assertLaunchAuthority(session.authority, signal);
-    const configDir = await this.#configDirFor(session.authority);
-    this.#assertLaunchAuthority(session.authority, signal);
-    if (configDir !== session.client.configDir) {
-      throw new ClaudeError(
-        "CONFIG_DIR_MISMATCH",
-        "Claude's isolated config authority changed before provider use.",
-      );
-    }
+    return withClaudeSessionConfig({
+      configDir: () => this.#configDirFor(session.authority),
+      assert: configDir => {
+        this.#assertLaunchAuthority(session.authority, signal);
+        if (configDir !== session.client.configDir) {
+          throw new ClaudeError("CONFIG_DIR_MISMATCH", "Claude's isolated config authority changed before provider use.");
+        }
+      },
+      operation,
+    });
   }
 
-  #assertNoUnboundSessionChild(options: Readonly<{ allowBindingId?: string }> = {}): void {
+  #assertNoUnboundSessionChild(options: Readonly<{
+    allowBindingId?: string;
+    allowConnection?: ClaudeRuntimeConnection;
+  }> = {}): void {
     const unresolvedBinding = [...this.#unboundHostToolBindings.keys()].some(
       (bindingId) => bindingId !== options.allowBindingId,
     );
-    if (this.#unboundClients.size > 0 || unresolvedBinding
+    const unresolvedRawProcess = [...this.#connections].some(connection =>
+      connection !== options.allowConnection && connection.process !== undefined
+      && connection.client === undefined && !connection.processExitProven);
+    if (this.#unboundClients.size > 0 || unresolvedBinding || unresolvedRawProcess
       || [...this.#sessions.values()].some((session) =>
         session.closeState !== "open" || session.client.state !== "open")) {
       throw new ClaudeError(
@@ -1485,30 +1558,37 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     this.#assertOpen();
     input.signal.throwIfAborted();
     this.#assertCurrent(input.authority);
-    if (
-      this.#sessions.has(input.providerThreadId)
-      || this.#startingSessionIds.has(input.providerThreadId)
-    ) {
-      throw new ClaudeError(
-        "AUTHORITY_STALE",
-        "That Claude session already has a runtime owner on this daemon.",
-      );
+    if (this.#sessions.has(input.providerThreadId) || this.#startingSessionIds.has(input.providerThreadId)) {
+      throw new ClaudeError("AUTHORITY_STALE", "That Claude session already has a runtime owner on this daemon.");
     }
+    // Prepare before reservation so preparation failure cannot strand an ID.
+    // run(admission) immediately reaches the original first configuration call.
+    const effects = new ClaudeConnectionEffects();
+    const connection: ClaudeRuntimeConnection = {
+      effects, providerThreadId: input.providerThreadId,
+      binding: undefined, process: undefined, client: undefined, rawExit: undefined,
+      processExitProven: false, admitted: false, acquisitionSettled: false, cleanup: undefined,
+      bindingRevocation: undefined, bindingCleanup: undefined, admissionJoin: undefined, retainedFailure: undefined,
+    };
     this.#startingSessionIds.add(input.providerThreadId);
-
-    let ready = false;
+    this.#connections.add(connection);
     const initializationFacts: ClaudeFact[] = [];
-    let binding: ClaudeHostToolBindingLease | undefined;
-    let process: ClaudeProcess | undefined;
-    let client: ClaudeStreamClient | undefined;
-    let admitted = false;
     try {
-      const connectionId = randomUUID();
-      const configDir = await this.#configDirFor(input.authority);
-      this.#assertLaunchAuthority(input.authority, input.signal);
-      this.#assertNoUnboundSessionChild();
-      if (input.hostTools !== "disabled") {
-        binding = await this.#hostTools.bindingAuthority.provision({
+      return await effects.run("admission", acquireClaudeSession({
+        connection, signal: input.signal,
+        initializationTimeoutMs: this.#initializationTimeoutMs,
+        rawProcessSettlementMs: this.#clientShutdownSettlementMs ?? PROCESS_CONSTRUCTOR_FAILURE_SETTLEMENT_MS,
+        toolsRequired: input.hostTools !== "disabled",
+        connectionId: randomUUID,
+        configDir: () => this.#configDirFor(input.authority),
+        assertAuthority: () => { this.#assertLaunchAuthority(input.authority, input.signal); },
+        assertNoUnbound: binding => {
+          this.#assertNoUnboundSessionChild({
+            ...(binding === undefined ? {} : { allowBindingId: binding.bindingId }),
+            allowConnection: connection,
+          });
+        },
+        provision: () => this.#hostTools.bindingAuthority.provision({
           callbackSocketPath: this.#hostTools.callbackSocketPath,
           identity: {
             processGeneration: input.authority.generation,
@@ -1517,196 +1597,109 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
             providerThreadId: input.providerThreadId,
           },
           privateRoot: this.#hostTools.privateRoot,
-        });
-        this.#unboundHostToolBindings.set(binding.bindingId, {
-          authority: input.authority,
-          lease: binding,
-          providerThreadId: input.providerThreadId,
-        });
-      }
-      this.#assertLaunchAuthority(input.authority, input.signal);
-      this.#assertNoUnboundSessionChild(binding === undefined
-        ? undefined
-        : { allowBindingId: binding.bindingId });
-      const hostToolRuntime = binding === undefined
-        ? input.runtime
-        : withClaudeHostToolRuntime(input.runtime, {
-            mcpConfigPath: binding.mcpConfigPath,
+        }),
+        retainBinding: binding => {
+          this.#unboundHostToolBindings.set(binding.bindingId, {
+            authority: input.authority, lease: binding, providerThreadId: input.providerThreadId,
           });
-      process = this.#processFactory({
-        argv: claudeSessionArgv(hostToolRuntime, {
-          kind: input.launch,
-          providerThreadId: input.providerThreadId,
-        }),
-        configDir,
-        configHome: this.#configHome,
-        launch: input.launch,
-        projectRoot: input.projectRoot,
-        runtime: hostToolRuntime,
-      });
-      client = new ClaudeStreamClient({
-        configDir,
-        onFact: (fact) => {
-          if (ready) return this.#onFact(input.authority, input.providerThreadId, connectionId, fact);
-          if (initializationFacts.length >= INITIALIZATION_FACT_LIMIT) {
-            throw new ClaudeError(
-              "PROTOCOL_LIMIT",
-              "Claude published too many facts before initialization completed.",
-            );
-          }
-          initializationFacts.push(fact);
         },
-        process,
-        now: this.#now,
-        ...(this.#clientShutdownSettlementMs === undefined
-          ? {}
-          : { shutdownSettlementMs: this.#clientShutdownSettlementMs }),
-        ...(this.#clientShutdownTermGraceMs === undefined
-          ? {}
-          : { shutdownTermGraceMs: this.#clientShutdownTermGraceMs }),
-      });
-      // Establish custody before any post-spawn await. Failed admission keeps
-      // this exact client here until its process exit and output drains prove
-      // clean, so another session cannot launch across an ambiguous child.
-      this.#unboundClients.add(client);
-      this.#initializingClients.set(client, input.providerThreadId);
-      const [initialization, processIdentity] = await Promise.all([
-        client.waitForInitialization({
-          signal: input.signal,
-          timeoutMs: this.#initializationTimeoutMs,
-        }),
-        process.identity.then((value) => parseClaudeProcessIdentity(value)),
-      ]);
-      this.#assertInitialization(input.providerThreadId, input.runtime, initialization);
-      // Let an EOF already queued behind `system/init` fence this admission
-      // before the session enters the live map. A later exit is handled by
-      // the same client's provider-disconnect path and evicted immediately.
-      await Promise.resolve();
-      input.signal.throwIfAborted();
-      this.#assertOpen();
-      this.#assertCurrent(input.authority);
-      if (client.state !== "open") {
-        throw new ClaudeError(
-          "PROCESS_EXITED",
-          "Claude exited before its runtime authority could be admitted.",
-        );
-      }
-      const unexpected = initializationFacts.find(
-        (fact) => fact.type !== "sessionBootstrapped" && fact.type !== "protocolNotice",
-      );
-      if (unexpected !== undefined) {
-        throw new ClaudeError(
-          "PROTOCOL_ERROR",
-          "Claude published session activity before its initialization identity was admitted.",
-        );
-      }
-      if (this.#sessions.has(input.providerThreadId)) {
-        throw new ClaudeError(
-          "AUTHORITY_STALE",
-          "That Claude session acquired another runtime owner during initialization.",
-        );
-      }
-      // A caller that owns durable process custody commits the exact PID/start
-      // identity before this child becomes addressable in the live session
-      // map. If that commit fails, the catch path proves the child closed.
-      await input.admitProcessIdentity?.(processIdentity);
-      input.signal.throwIfAborted();
-      this.#assertOpen();
-      this.#assertCurrent(input.authority);
-      if (!isClaudeClientOpen(client) || this.#sessions.has(input.providerThreadId)) {
-        throw new ClaudeError(
-          "AUTHORITY_STALE",
-          "Claude authority changed while its exact process identity was admitted.",
-        );
-      }
-      const session: RunningSession = {
-        activeTurnId: undefined,
-        assistantItems: new Map(),
-        authority: input.authority,
-        client,
-        closeState: "open",
-        connectionId,
-        droppedMessages: 0,
-        droppedTurns: 0,
-        hostToolActivationTask: undefined,
-        hostToolBinding: binding,
-        hostToolCalls: new Map(),
-        hostToolCallTombstones: new Map(),
-        hostToolRevocationTask: undefined,
-        hostToolState: binding === undefined ? "disabled" : "inactive",
-        messages: [],
-        profile: input.profile,
-        processIdentity,
-        projectRoot: input.projectRoot,
-        providerThreadId: input.providerThreadId,
-        resumed: input.launch === "resume",
-        status: "idle",
-        title: input.title,
-        truncatedMessages: 0,
-        turnSummaries: [],
-        updatedAt: this.#now(),
-      };
-      this.#closedSessionProofs.delete(input.providerThreadId);
-      this.#sessions.set(input.providerThreadId, session);
-      if (binding !== undefined) this.#unboundHostToolBindings.delete(binding.bindingId);
-      this.#unboundClients.delete(client);
-      this.#initializingClients.delete(client);
-      admitted = true;
-      ready = true;
-      return session;
-    } catch (error: unknown) {
-      const cleanupFailures: unknown[] = [];
-      let processExitUnproven = false;
-      if (client !== undefined) {
-        try {
-          await client.close();
+        revokeBinding: binding => this.#hostTools.bindingAuthority.revoke(binding.bindingId),
+        releaseBinding: binding => { this.#unboundHostToolBindings.delete(binding.bindingId); },
+        spawn: (configDir, binding) => {
+          const runtime = binding === undefined ? input.runtime
+            : withClaudeHostToolRuntime(input.runtime, { mcpConfigPath: binding.mcpConfigPath });
+          return this.#processFactory({
+            argv: claudeSessionArgv(runtime, { kind: input.launch, providerThreadId: input.providerThreadId }),
+            configDir, configHome: this.#configHome, launch: input.launch,
+            projectRoot: input.projectRoot, runtime,
+          });
+        },
+        construct: (process, configDir, connectionId) => new ClaudeStreamClient({
+          configDir, process,
+          onFact: () => undefined,
+          ...(this.#clientShutdownTermGraceMs === undefined ? {}
+            : { shutdownTermGraceMs: this.#clientShutdownTermGraceMs }),
+          ...(this.#clientShutdownSettlementMs === undefined ? {}
+            : { shutdownSettlementMs: this.#clientShutdownSettlementMs }),
+        }, effects, fact => this.#admissionFactProgram(
+          connection, initializationFacts, input.authority, input.providerThreadId, connectionId, fact,
+        )),
+        retainClient: client => {
+          this.#unboundClients.add(client);
+          this.#initializingClients.set(client, input.providerThreadId);
+        },
+        releaseClient: client => {
           this.#unboundClients.delete(client);
           this.#initializingClients.delete(client);
-        } catch (cause: unknown) {
-          processExitUnproven = true;
-          cleanupFailures.push(cause);
-        }
-      } else if (process !== undefined) {
+        },
+        parseIdentity: parseClaudeProcessIdentity,
+        assertInitialization: initialization => {
+          this.#assertInitialization(input.providerThreadId, input.runtime, initialization);
+        },
+        assertBeforeCommit: client => {
+          this.#assertLaunchAuthority(input.authority, input.signal);
+          if (client.state !== "open") {
+            throw new ClaudeError("PROCESS_EXITED", "Claude exited before its runtime authority could be admitted.");
+          }
+          const unexpected = initializationFacts.find(fact =>
+            fact.type !== "sessionBootstrapped" && fact.type !== "protocolNotice");
+          if (unexpected !== undefined) {
+            throw new ClaudeError("PROTOCOL_ERROR", "Claude published session activity before its initialization identity was admitted.");
+          }
+          if (this.#sessions.has(input.providerThreadId)) {
+            throw new ClaudeError("AUTHORITY_STALE", "That Claude session acquired another runtime owner during initialization.");
+          }
+        },
+        commitIdentity: identity => input.admitProcessIdentity?.(identity),
+        assertAfterCommit: client => {
+          this.#assertLaunchAuthority(input.authority, input.signal);
+          if (!isClaudeClientOpen(client) || this.#sessions.has(input.providerThreadId)) {
+            throw new ClaudeError("AUTHORITY_STALE", "Claude authority changed while its exact process identity was admitted.");
+          }
+        },
+        publish: ({ client, binding, connectionId, identity }) => {
+          const session: RunningSession = {
+            activeTurnId: undefined, assistantItems: new Map(), authority: input.authority,
+            client, connection, closeState: "open", connectionId,
+            droppedMessages: 0, droppedTurns: 0,
+            hostToolActivationTask: undefined, hostToolBinding: binding,
+            hostToolCalls: new Map(), hostToolCallTombstones: new Map(),
+            hostToolRevocationTask: undefined, hostToolState: binding === undefined ? "disabled" : "inactive",
+            messages: [], profile: input.profile, processIdentity: identity,
+            projectRoot: input.projectRoot, providerThreadId: input.providerThreadId,
+            resumed: input.launch === "resume", status: "idle", title: input.title,
+            truncatedMessages: 0, turnSummaries: [], updatedAt: this.#now(),
+          };
+          this.#closedSessionProofs.delete(input.providerThreadId);
+          this.#sessions.set(input.providerThreadId, session);
+          if (binding !== undefined) this.#unboundHostToolBindings.delete(binding.bindingId);
+          this.#unboundClients.delete(client);
+          this.#initializingClients.delete(client);
+          connection.admitted = true;
+          return session;
+        },
+        finalize: () => {
+          const client = connection.client;
+          const released = client === undefined
+            ? connection.process === undefined || connection.processExitProven
+            : connection.admitted || client.state === "closed";
+          if (released) {
+            this.#startingSessionIds.delete(input.providerThreadId);
+            if (client !== undefined) this.#initializingClients.delete(client);
+          }
+        },
+      }));
+    } catch (reason: unknown) {
+      // Only an outer public edge can dispose. A simultaneous close/control
+      // retains the same owner and will finish its disposal itself.
+      if ((connection.process === undefined || connection.processExitProven)
+        && connection.binding === undefined) {
         try {
-          process.forceTerminate();
-        } catch {
-          // Settlement below is the authority result.
-        }
-        const settled = await processExitSettledWithin(
-          process,
-          this.#clientShutdownSettlementMs ?? PROCESS_CONSTRUCTOR_FAILURE_SETTLEMENT_MS,
-        );
-        if (!settled) processExitUnproven = true;
+          await effects.dispose();
+          this.#connections.delete(connection);
+        } catch { /* Exact work/custody remains available to manager.close. */ }
       }
-      if (binding !== undefined) {
-        try {
-          await this.#hostTools.bindingAuthority.revoke(binding.bindingId);
-          this.#unboundHostToolBindings.delete(binding.bindingId);
-        } catch (cause: unknown) {
-          cleanupFailures.push(cause);
-        }
-      }
-      if (processExitUnproven) {
-        throw new ClaudeProcessExitUnprovenError({
-          cause: new AggregateError(
-            [error, ...cleanupFailures],
-            "Claude admission and cleanup both failed.",
-          ),
-        });
-      }
-      if (cleanupFailures.length > 0) {
-        throw new AggregateError(
-          [error, ...cleanupFailures],
-          "Claude admission failed and its host-tool binding cleanup is unresolved.",
-          { cause: error },
-        );
-      }
-      throw error;
-    } finally {
-      if (client === undefined || admitted || client.state === "closed") {
-        this.#startingSessionIds.delete(input.providerThreadId);
-        if (client !== undefined) this.#initializingClients.delete(client);
-      }
+      throw reason;
     }
   }
 
@@ -1755,62 +1748,42 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
   }
 
   async #closeSession(providerThreadId: string, session: RunningSession): Promise<void> {
+    if (session.connection.effects.callbackActive()) {
+      throw new ClaudeError("INVALID_INPUT", "Claude callbacks cannot join their own session cleanup.");
+    }
+    // endSession must fence the exact session before its public Promise returns;
+    // admission cannot wait for the cleanup fiber to begin executing.
     if (this.#sessions.get(providerThreadId) === session) session.closeState = "closing";
-    const [hostToolCleanup, processCleanup] = await Promise.allSettled([
-      this.#revokeSessionHostTools(session),
-      session.client.close(),
-    ]);
-    const settlements = [hostToolCleanup, processCleanup] as const;
-    const failures = settlements.flatMap((settlement) =>
-      settlement.status === "rejected" ? [settlement.reason as unknown] : []);
-    if (failures.length > 0) {
-      if (this.#sessions.get(providerThreadId) === session) session.closeState = "failed";
-      const hostToolCleanupSucceeded = hostToolCleanup.status === "fulfilled";
-      if (hostToolCleanupSucceeded && processCleanup.status === "rejected") {
-        // Preserve the provider client's typed TIMEOUT/PROCESS_EXITED custody
-        // error when host-tool cleanup added no second failure.
-        throw processCleanup.reason;
-      }
-      throw new AggregateError(
-        failures,
-        "Claude session process or host-tool binding could not be joined; cleanup was incomplete.",
-      );
-    }
-    // Delete only the exact entry whose process was just proven joined. A
-    // concurrent close shares the client's close task, while an impossible id
-    // replacement cannot be deleted by the stale closer.
-    if (this.#sessions.get(providerThreadId) === session) {
-      this.#rememberClosedSession(providerThreadId, session.authority);
-      this.#sessions.delete(providerThreadId);
-    }
+    return await this.#boundedConnectionCleanup(session.connection, () => this.#closeSessionProgram(providerThreadId, session));
   }
 
-  async #revokeSessionHostTools(session: RunningSession): Promise<void> {
-    if (session.hostToolState === "revoked") return;
-    const existing = session.hostToolRevocationTask;
-    if (existing !== undefined) {
-      await existing;
-      return;
-    }
-    session.hostToolState = "revoking";
-    session.hostToolCalls.clear();
-    session.hostToolCallTombstones.clear();
-    const binding = session.hostToolBinding;
-    if (binding === undefined) {
-      session.hostToolState = "revoked";
-      return;
-    }
-    const task = this.#hostTools.bindingAuthority.revoke(binding.bindingId);
-    session.hostToolRevocationTask = task;
-    try {
-      await task;
-      session.hostToolState = "revoked";
-    } catch (error: unknown) {
-      session.hostToolState = "revoking";
-      throw error;
-    } finally {
-      if (session.hostToolRevocationTask === task) session.hostToolRevocationTask = undefined;
-    }
+  #closeSessionProgram(providerThreadId: string, session: RunningSession): ClaudeProgram<void> {
+    return closeClaudeSession({
+      session,
+      markClosing: () => {
+        if (this.#sessions.get(providerThreadId) === session) session.closeState = "closing";
+      },
+      markFailed: () => {
+        if (this.#sessions.get(providerThreadId) === session) session.closeState = "failed";
+      },
+      revoke: () => this.#revokeSessionHostToolsProgram(session),
+      released: () => {
+        if (this.#sessions.get(providerThreadId) === session) {
+          this.#rememberClosedSession(providerThreadId, session.authority);
+          this.#sessions.delete(providerThreadId);
+        }
+      },
+    });
+  }
+
+  #revokeSessionHostToolsProgram(session: RunningSession): ClaudeProgram<void> {
+    return revokeClaudeSessionTools({
+      session, revoke: bindingId => this.#hostTools.bindingAuthority.revoke(bindingId),
+      clearCalls: () => {
+        session.hostToolCalls.clear();
+        session.hostToolCallTombstones.clear();
+      },
+    });
   }
 
   #rememberClosedSession(providerThreadId: string, authority: ProfileAuthority): void {
@@ -1956,57 +1929,67 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     }
   }
 
-  async #onFact(
+  #admissionFactProgram(
+    connection: ClaudeRuntimeConnection,
+    initializationFacts: ClaudeFact[],
     authority: ProfileAuthority,
     providerThreadId: string,
     connectionId: string,
     fact: ClaudeFact,
-  ): Promise<void> {
-    const session = this.#sessions.get(providerThreadId);
-    if (
-      session === undefined
-      || session.connectionId !== connectionId
-      || !sameProfileAuthority(session.authority, authority)
-      || !this.#isCurrent(authority)
-    ) return;
-    if (fact.type === "providerDisconnected") {
-      session.activeTurnId = undefined;
-      session.status = "terminal";
-      session.updatedAt = this.#now();
-      // Retain the exact client until endSession/manager shutdown proves its
-      // process joined and both output streams drained. The disconnect fact
-      // fences effects, but is not itself complete release proof.
-      session.closeState = "failed";
-      // The synchronous state change above already fences callbacks. Revoke
-      // the external capability too so a disconnected child cannot retain a
-      // usable MCP route while process settlement awaits its owner.
-      let revocationFailure: Error | undefined;
-      try {
-        await this.#revokeSessionHostTools(session);
-      } catch (error: unknown) {
-        revocationFailure = error instanceof Error
-          ? error
-          : new ClaudeError("PROTOCOL_ERROR", "Claude host-tool revocation failed");
-      }
-      await this.#observer.fact(session.authority, { ...fact, connectionId, providerThreadId });
-      if (revocationFailure !== undefined) throw revocationFailure;
-      return;
-    }
-    if (fact.type === "assistantDelta") {
-      this.#appendAssistantDelta(session, fact.turnId, fact.itemId, fact.text);
-    }
-    if (fact.type === "turnSummary") this.#recordTurnSummary(session, fact);
-    if (fact.type === "turnCompleted") {
-      session.activeTurnId = undefined;
-      if (session.status !== "terminal") session.status = "idle";
-      session.assistantItems.clear();
-    }
-    if (fact.type === "providerError" && fact.terminal) {
-      session.status = "terminal";
-      await this.#revokeSessionHostTools(session);
-    }
-    session.updatedAt = this.#now();
-    await this.#observer.fact(session.authority, { ...fact, connectionId, providerThreadId });
+  ): ClaudeProgram<void> {
+    return admitClaudeFact({
+      isAdmitted: () => connection.admitted,
+      buffer: () => {
+        if (initializationFacts.length >= INITIALIZATION_FACT_LIMIT) {
+          throw new ClaudeError("PROTOCOL_LIMIT", "Claude published too many facts before initialization completed.");
+        }
+        initializationFacts.push(fact);
+      },
+      consume: () => this.#onFactProgram(authority, providerThreadId, connectionId, fact),
+    });
+  }
+
+  #onFactProgram(
+    authority: ProfileAuthority,
+    providerThreadId: string,
+    connectionId: string,
+    fact: ClaudeFact,
+  ): ClaudeProgram<void> {
+    return observeClaudeFact({
+      select: () => {
+        const session = this.#sessions.get(providerThreadId);
+        return session !== undefined && session.connectionId === connectionId
+          && sameProfileAuthority(session.authority, authority) && this.#isCurrent(authority)
+          ? session : undefined;
+      },
+      prepare: session => {
+        if (fact.type === "providerDisconnected") {
+          session.activeTurnId = undefined;
+          session.status = "terminal";
+          session.updatedAt = this.#now();
+          session.closeState = "failed";
+          return "disconnected";
+        }
+        if (fact.type === "assistantDelta") {
+          this.#appendAssistantDelta(session, fact.turnId, fact.itemId, fact.text);
+        }
+        if (fact.type === "turnSummary") this.#recordTurnSummary(session, fact);
+        if (fact.type === "turnCompleted") {
+          session.activeTurnId = undefined;
+          if (session.status !== "terminal") session.status = "idle";
+          session.assistantItems.clear();
+        }
+        if (fact.type === "providerError" && fact.terminal) {
+          session.status = "terminal";
+          return "terminalError";
+        }
+        return "ordinary";
+      },
+      revoke: session => this.#revokeSessionHostToolsProgram(session),
+      finish: session => { session.updatedAt = this.#now(); },
+      observer: session => session.connection.effects.callback(() =>
+        this.#observer.fact(session.authority, { ...fact, connectionId, providerThreadId })),
+    });
   }
 
   #assertOpen(): void {

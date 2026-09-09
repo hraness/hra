@@ -3112,3 +3112,296 @@ describe("Claude pre-acquisition reservation cleanup", () => {
   );
 
 });
+
+type ClaudeCausalOutcome<A> = Readonly<{ status: "fulfilled"; value: A }>
+  | Readonly<{ status: "rejected"; reason: unknown }>;
+
+const claudeCausalObserve = <A>(promise: Promise<A>): Promise<ClaudeCausalOutcome<A>> => promise.then(
+  value => ({ status: "fulfilled", value }),
+  (reason: unknown) => ({ status: "rejected", reason }),
+);
+
+const claudeCausalGate = <A>() => {
+  let resolve!: (value: A) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<A>((accept, refuse) => { resolve = accept; reject = refuse; });
+  const observed = claudeCausalObserve(promise);
+  return { promise, observed, resolve, reject };
+};
+
+const claudeCausalReview = (manager: PinnedClaudeRuntimeManager) => manager.reviewSessionStart({
+  authority, fast: false, preset: "fable-max", requirement: presetRequirements["fable-max"],
+  projectRoot: PROJECT_ROOT, signal: signal(),
+});
+
+describe("Claude native initialization arbitration causal reference", () => {
+  test.each([
+    { schedule: "already-rejected", expected: "initialization" },
+    { schedule: "abort-then-identity-same-batch", expected: "identity" },
+    { schedule: "identity-then-abort-same-batch", expected: "identity" },
+    { schedule: "abort-before-later-identity", expected: "initialization" },
+    { schedule: "identity-before-later-abort", expected: "identity" },
+  ] as const)("preserves native initialization/identity selection: $schedule", async (scenario) => {
+    const events: string[] = [];
+    const initializationReason = new Error("Synthetic initialization abort");
+    // Distinguish presence from truthiness at the actual manager projection.
+    const identityReason: unknown = undefined;
+    const identity = claudeCausalGate<ClaudeProcessIdentity>();
+    const identityRead = claudeCausalGate<void>();
+    const deadline = claudeCausalGate<never>();
+    const timer = setTimeout(() => deadline.reject(new Error("Native arbitration milestone was not reached")), 2_000);
+    const controller = new AbortController();
+    const scheduled: Promise<void>[] = [];
+    const child = new FakeClaudeProcess({ identity: identity.promise });
+    let identityReads = 0;
+    const queue = (name: string, hops: number, action: () => void): void => {
+      scheduled.push(new Promise<void>(resolve => {
+        const step = (remaining: number): void => queueMicrotask(() => {
+          if (remaining > 1) { step(remaining - 1); return; }
+          events.push(name);
+          action();
+          resolve();
+        });
+        step(hops);
+      }));
+    };
+    const abort = (): void => { controller.abort(initializationReason); };
+    const rejectIdentity = (): void => { identity.reject(identityReason); };
+    const process: ClaudeProcess = {
+      get identity() {
+        identityReads += 1;
+        events.push("identity-observation-entered");
+        identityRead.resolve();
+        if (scenario.schedule === "abort-then-identity-same-batch") {
+          queue("abort-triggered", 1, abort); queue("identity-rejected", 1, rejectIdentity);
+        } else if (scenario.schedule === "identity-then-abort-same-batch") {
+          queue("identity-rejected", 1, rejectIdentity); queue("abort-triggered", 1, abort);
+        } else if (scenario.schedule === "abort-before-later-identity") {
+          queue("abort-triggered", 1, abort); queue("identity-rejected", 6, rejectIdentity);
+        } else if (scenario.schedule === "identity-before-later-abort") {
+          queue("identity-rejected", 1, rejectIdentity); queue("abort-triggered", 6, abort);
+        }
+        return identity.promise;
+      },
+      exited: child.exited,
+      stdout: child.stdout,
+      stderr: child.stderr,
+      write: bytes => child.write(bytes),
+      terminate: () => { events.push("term"); child.terminate(); },
+      forceTerminate: () => { events.push("kill"); child.forceTerminate(); },
+    };
+    const { manager, launches, bindingAuthority } = harness({
+      initialization: "silent", clientShutdownTermGraceMs: 5, clientShutdownSettlementMs: 20,
+      processFactory: () => {
+        events.push("factory-entered");
+        if (scenario.schedule === "already-rejected") {
+          events.push("abort-before-observation"); abort();
+          events.push("identity-rejected-before-observation"); rejectIdentity();
+        }
+        return process;
+      },
+    });
+    let started: Promise<ClaudeCausalOutcome<unknown>> | undefined;
+    let selected: "initialization" | "identity" | "other" | undefined;
+    try {
+      const review = await claudeCausalReview(manager);
+      events.push("review-completed");
+      started = claudeCausalObserve(manager.startSession({
+        authority, review, providerThreadId: ADOPTED_PROVIDER_THREAD_ID, signal: controller.signal,
+      }));
+      events.push("start-returned");
+      await Promise.race([
+        identityRead.promise,
+        started.then(() => { throw new Error("Start settled before the native identity observation"); }),
+        deadline.promise,
+      ]);
+      const result = await Promise.race([started, deadline.promise]);
+      events.push("start-observed");
+      expect(result.status).toBe("rejected");
+      if (result.status === "rejected") {
+        selected = result.reason === initializationReason ? "initialization"
+          : result.reason === identityReason ? "identity" : "other";
+        expect(selected).toBe(scenario.expected);
+        expect(result.reason).toBe(scenario.expected === "initialization" ? initializationReason : identityReason);
+      }
+      expect(identityReads).toBe(1);
+      expect(launches).toHaveLength(1);
+      expect(bindingAuthority.provisions).toHaveLength(1);
+      expect(bindingAuthority.revocations).toEqual(["clhb_00000000000000000000000000000001"]);
+      expect(manager.hasLiveSession({ authority, providerThreadId: ADOPTED_PROVIDER_THREAD_ID })).toBe(false);
+      expect(child.terminated).toBe(true);
+    } finally {
+      // Every explicitly queued operation and original native observation is
+      // joined, even if a predicted winner differs on the frozen reference.
+      await Promise.all(scheduled);
+      abort();
+      rejectIdentity();
+      child.end();
+      await identity.observed;
+      await started;
+      await child.exited;
+      await manager.close();
+      clearTimeout(timer);
+      console.info(JSON.stringify({
+        schema: "hra-native-initialization-arbitration-v1", schedule: scenario.schedule,
+        expected: scenario.expected, selected, identityReasonPresent: true,
+        identityReasonIsUndefined: identityReason === undefined, events,
+        cleanup: { nativeIdentityJoined: true, nativeExitJoined: true, queuedOperationsJoined: true,
+          startedJoined: started !== undefined, managerClosed: true },
+      }));
+    }
+  });
+});
+
+describe("Claude raw constructor custody causal contracts", () => {
+  test.each(["held", "rejected"] as const)(
+    "retains the exact raw process after a constructor failure with %s exit", async (disposition) => {
+      const events: string[] = [];
+      const constructorReason: unknown = undefined;
+      const nativeExitReason: unknown = false;
+      const nativeExit = claudeCausalGate<number>();
+      const exitRead = claudeCausalGate<void>();
+      const deadline = claudeCausalGate<never>();
+      const timer = setTimeout(() => deadline.reject(new Error("Raw-process cleanup milestone was not reached")), 2_000);
+      const child = new FakeClaudeProcess({ ignoreTerm: true, ignoreKill: true });
+      const returnedExitHandles: Promise<number>[] = [];
+      let exitReads = 0;
+      const process: ClaudeProcess = {
+        identity: child.identity,
+        get exited() {
+          exitReads += 1;
+          if (exitReads === 1) {
+            events.push("constructor-exited-access-threw");
+            throw constructorReason;
+          }
+          events.push("native-exit-observed");
+          returnedExitHandles.push(nativeExit.promise);
+          exitRead.resolve();
+          return nativeExit.promise;
+        },
+        stdout: child.stdout,
+        stderr: child.stderr,
+        write: bytes => child.write(bytes),
+        terminate: () => { events.push("term"); child.terminate(); },
+        forceTerminate: () => { events.push("kill"); child.forceTerminate(); },
+      };
+      const { manager, launches, bindingAuthority } = harness({
+        initialization: "silent", clientShutdownSettlementMs: 20, clientShutdownTermGraceMs: 5,
+        processFactory: () => {
+          events.push("factory-returned-raw-process");
+          if (disposition === "rejected") nativeExit.reject(nativeExitReason);
+          return process;
+        },
+      });
+      let started: Promise<ClaudeCausalOutcome<unknown>> | undefined;
+      let firstClose: ClaudeCausalOutcome<void> | undefined;
+      let lastClose: ClaudeCausalOutcome<void> | undefined;
+      let fenceObserved = false;
+      try {
+        const review = await claudeCausalReview(manager);
+        started = claudeCausalObserve(manager.startSession({
+          authority, review, providerThreadId: ADOPTED_PROVIDER_THREAD_ID, signal: signal(),
+        }));
+        await Promise.race([
+          exitRead.promise,
+          started.then(() => { throw new Error("Admission settled before observing its raw native process"); }),
+          deadline.promise,
+        ]);
+        const result = await Promise.race([started, deadline.promise]);
+        expect(result.status).toBe("rejected");
+        if (result.status === "rejected") {
+          expect(result.reason).toBeInstanceOf(ClaudeProcessExitUnprovenError);
+          const cause = result.reason instanceof Error ? result.reason.cause : undefined;
+          expect(cause).toBeInstanceOf(AggregateError);
+          if (cause instanceof AggregateError) {
+            // Presence is separate from the original falsey constructor reason.
+            expect(cause.errors.length).toBeGreaterThan(0);
+            expect(0 in cause.errors).toBe(true);
+            expect(cause.errors[0]).toBe(constructorReason);
+          }
+        }
+        expect(launches).toHaveLength(1);
+        expect(exitReads).toBeGreaterThanOrEqual(2);
+        expect(returnedExitHandles.every(handle => handle === nativeExit.promise)).toBe(true);
+        expect(bindingAuthority.provisions).toHaveLength(1);
+        expect(bindingAuthority.revocations).toEqual(["clhb_00000000000000000000000000000001"]);
+        expect(child.signals).toContain("SIGKILL");
+        expect(manager.hasLiveSession({ authority, providerThreadId: ADOPTED_PROVIDER_THREAD_ID })).toBe(false);
+
+        // Probe while admission is still open: a terminal manager-close fence
+        // must not conceal loss of the raw process's own pre-close reservation.
+        const reviewAgain = await claudeCausalObserve(claudeCausalReview(manager));
+        fenceObserved = reviewAgain.status === "rejected";
+        expect(reviewAgain.status).toBe("rejected");
+        if (reviewAgain.status === "rejected") {
+          expect(reviewAgain.reason).toBeInstanceOf(Error);
+          expect((reviewAgain.reason as Error).message).toContain("still unjoined");
+        }
+        expect(launches).toHaveLength(1);
+        firstClose = await claudeCausalObserve(manager.close());
+        expect(firstClose.status).toBe("rejected");
+        events.push("first-close-incomplete");
+        if (disposition === "held") {
+          events.push("original-native-exit-fulfilled");
+          nativeExit.resolve(0);
+          expect(await nativeExit.observed).toEqual({ status: "fulfilled", value: 0 });
+          lastClose = await claudeCausalObserve(manager.close());
+          expect(lastClose.status).toBe("fulfilled");
+        } else {
+          expect(await nativeExit.observed).toEqual({ status: "rejected", reason: nativeExitReason });
+          // Re-observing rejection never manufactures physical exit proof.
+          lastClose = await claudeCausalObserve(manager.close());
+          expect(lastClose.status).toBe("rejected");
+        }
+        expect(launches).toHaveLength(1);
+        expect(returnedExitHandles.every(handle => handle === nativeExit.promise)).toBe(true);
+        expect(bindingAuthority.revocations).toEqual(["clhb_00000000000000000000000000000001"]);
+      } finally {
+        clearTimeout(timer);
+        if (disposition === "held") nativeExit.resolve(0);
+        else nativeExit.reject(nativeExitReason);
+        child.end();
+        const nativeOutcome = await nativeExit.observed;
+        await started;
+        await child.exited;
+        if (lastClose === undefined) lastClose = await claudeCausalObserve(manager.close());
+        console.info(JSON.stringify({
+          schema: "hra-raw-constructor-custody-v1", disposition, events, fenceObserved,
+          constructorReasonPresent: true, constructorReasonIsUndefined: constructorReason === undefined,
+          factoryCalls: launches.length, returnedExitHandlesAllOriginal: returnedExitHandles.every(handle => handle === nativeExit.promise),
+          firstClose: firstClose?.status, finalClose: lastClose.status,
+          cleanup: { syntheticStreamsEnded: true, syntheticFixtureExitJoined: true,
+            originalNativeExitObservationJoined: true, originalNativeExitOutcome: nativeOutcome.status,
+            physicalExitProven: nativeOutcome.status === "fulfilled",
+            intentionallyRetainedUnprovenOwner: disposition === "rejected",
+            startedJoined: started !== undefined },
+        }));
+      }
+    },
+  );
+
+  test("factory rejection creates no raw process and releases the reviewed reservation", async () => {
+    const factoryReason: unknown = null;
+    const { manager, launches, bindingAuthority } = harness({
+      processFactory: () => { throw factoryReason; },
+    });
+    let started: Promise<ClaudeCausalOutcome<unknown>> | undefined;
+    try {
+      const review = await claudeCausalReview(manager);
+      started = claudeCausalObserve(manager.startSession({
+        authority, review, providerThreadId: ADOPTED_PROVIDER_THREAD_ID, signal: signal(),
+      }));
+      expect(await started).toEqual({ status: "rejected", reason: factoryReason });
+      expect(launches).toHaveLength(1);
+      expect(bindingAuthority.provisions).toHaveLength(1);
+      expect(bindingAuthority.revocations).toEqual(["clhb_00000000000000000000000000000001"]);
+      const freshReview = await claudeCausalReview(manager);
+      expect(freshReview.reviewId).not.toBe(review.reviewId);
+      manager.discardRuntimeReview(freshReview);
+      expect(launches).toHaveLength(1);
+    } finally {
+      await started;
+      await manager.close();
+    }
+  });
+});
