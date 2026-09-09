@@ -1,6 +1,6 @@
 {
   "name": "@hraness/hra",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "A workspace for Codex and Claude Code. See your sessions, follow conversations, and direct the next turn from your browser or terminal.",
   "license": "MIT",
   "publishConfig": {

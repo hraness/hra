@@ -19,6 +19,7 @@ import {
   publicPins,
   publicReleaseState,
   renderLlmsText,
+  renderMarkdownBlocks,
   renderPrivacyMarkdown,
   renderReadmeMarkdown,
   renderSitemapXml,
@@ -86,6 +87,40 @@ const renderDocumentationMarkdown = (...paths: readonly DocsPath[]): string =>
   paths.map(renderDocsMarkdown).join("\n");
 
 describe("public content contract", () => {
+  test("keeps the unadmitted candidate separate from the exact admitted predecessor", () => {
+    expect(publicContent.releaseVersion).toBe("0.7.1");
+    expect(publicReleaseState).toBe("staged");
+    expect(publicContent.endpoints.betaTag).toBe("beta-not-yet-live");
+    const readme = renderReadmeMarkdown();
+    const llms = renderLlmsText();
+    expect(llms).toContain(publicContent.statusLine);
+    expect(llms).toContain("Local CLI v0.7.1 is a release candidate");
+    expect(llms).toContain("v0.7.0 remains the fully admitted public artifact");
+    expect(readme).toContain("The v0.7.1 candidate is not yet admitted.");
+    expect(readme).toContain("For the admitted v0.7.0 artifact, use its [immutable README](https://github.com/hraness/hra/tree/v0.7.0#install-and-update).");
+    expect(readme.indexOf("The v0.7.1 candidate is not yet admitted.")).toBeLessThan(readme.indexOf(publicContent.installCommand));
+    const visibleSite = htmlVisibleText(renderSiteHtml());
+    expect(visibleSite).toContain("The v0.7.1 candidate is not yet admitted.");
+    expect(visibleSite).toContain("The admitted v0.7.0 CLI has its own");
+    expect(visibleSite).toContain("Starting or upgrading a daemon and enabling hosted commands are paused until the capacity checks pass.");
+    expect(visibleSite).not.toContain("v0.7.1 artifacts admitted");
+    for (const surface of [readme, llms]) {
+      expect(surface).toContain("Only after immutable GitHub and npm release admission");
+      expect(surface).not.toContain("v0.7.1 artifacts admitted");
+      expect(surface).toContain(publicContent.daemonRolloutNotice);
+    }
+    for (const surface of [renderDocumentationMarkdown("/docs/status/"), htmlVisibleText(renderDocumentationHtml("/docs/status/"))]) {
+      expect(surface).toContain("v0.7.1 is a candidate. v0.7.0 remains admitted.");
+      expect(surface).toContain("The v0.7.1 candidate is not yet admitted and requires its own immutable GitHub and npm proof.");
+      expect(surface).toContain(publicContent.daemonRolloutNotice);
+      expect(surface).not.toContain("v0.7.1 artifacts admitted");
+    }
+    const historicalAdmission = renderMarkdownBlocks(publicContent.introduction, 2);
+    expect(historicalAdmission).toContain("https://github.com/hraness/hra/actions/runs/34278486095");
+    expect(historicalAdmission).toContain("https://github.com/hraness/hra/releases/tag/v0.7.0");
+    expect(historicalAdmission).toContain("does not admit v0.7.1");
+  });
+
   test("keeps after-hours consent, legacy reset, and prose limits explicit", () => {
     const readme = renderDocumentationMarkdown("/docs/reference/");
     expect(readme).toContain("After-hours protocol budgets were admitted in v0.6.3.");
@@ -120,7 +155,7 @@ describe("public content contract", () => {
       doctorCommand: "hra doctor --offline",
       initCommand: "hra init --yes",
       installCommand: buildHraGlobalInstallCommand(
-        "https://github.com/hraness/hra/releases/download/v0.7.0/hraness-hra-0.7.0.tgz",
+        "https://github.com/hraness/hra/releases/download/v0.7.1/hraness-hra-0.7.1.tgz",
       ),
       links: {
         github: "https://github.com/hraness/hra",
@@ -357,16 +392,18 @@ describe("public content contract", () => {
     expect(document.querySelectorAll("code:not([class])")).toHaveLength(0);
   });
 
-  test("admits the exact artifact while directing operational readiness to the status guide", () => {
-    expect(publicReleaseState).toBe("live");
+  test("keeps candidate admission distinct from predecessor and runtime status in the owning guide", () => {
+    expect(publicReleaseState).toBe("staged");
     expect(publicContent.endpoints).toEqual({
-      betaTag: "live", githubRepository: "live", hostedSync: "live", website: "live",
+      betaTag: "beta-not-yet-live", githubRepository: "live", hostedSync: "live", website: "live",
     });
     const markdown = renderDocsMarkdown("/docs/status/");
     const html = htmlVisibleText(renderDocumentationHtml("/docs/status/"));
     for (const surface of [markdown, html]) {
       expect(surface).toContain("v0.7.0");
       expect(surface).toContain("passed immutable GitHub and npm artifact admission");
+      expect(surface).toContain("The v0.7.1 candidate is not yet admitted");
+      expect(surface).not.toContain("v0.7.1 is released");
       expect(surface).toContain("daemon and hosted command-writer rollout remains blocked on capacity");
       expect(surface).toContain("Artifact availability and the live sync service do not clear this gate");
       expect(surface).not.toContain("v0.7.0 candidate");
@@ -379,8 +416,9 @@ describe("public content contract", () => {
       expect(surface).toContain("/docs/status/");
     }
     expect(renderDocsMarkdown("/docs/reference/")).toContain("admitted local CLI release");
-    expect(renderLlmsText()).toContain("Install the admitted v0.7.0 local CLI artifact");
-    expect(renderLlmsText()).not.toContain("Only after immutable GitHub and npm release admission");
+    expect(renderLlmsText()).toContain("Only after immutable GitHub and npm release admission, install the v0.7.1 local CLI artifact");
+    expect(renderReadmeMarkdown()).toContain("Only after immutable GitHub and npm release admission, install and verify the v0.7.1 candidate CLI artifact. This does not start the daemon:");
+    expect(renderReadmeMarkdown()).toContain("The v0.7.1 candidate is not yet admitted");
     const notices = [...parseHTML(renderSiteHtml()).document.querySelectorAll("p")]
       .filter((paragraph) => paragraph.textContent.startsWith("New machine setup is temporarily paused"));
     expect(notices).toHaveLength(1);
@@ -390,6 +428,7 @@ describe("public content contract", () => {
   test("keeps startup prerequisites adjacent to setup without turning the homepage into a runbook", () => {
     const prerequisite = publicContent.daemonRolloutNotice;
     expect(prerequisite).toContain("Do not initialize, start, or autostart");
+    expect(prerequisite).toContain("either the admitted v0.7.0 daemon or the v0.7.1 candidate");
     expect(prerequisite).toContain("protected two-pass zero-debt capacity evidence and its exact .activated readback receipt");
     expect(prerequisite).toContain("target marker-2 proofs before globally enabling hosted writers");
     const setupHtml = renderDocumentationHtml("/docs/start/");
@@ -784,7 +823,7 @@ describe("public content contract", () => {
       "| command bun --no-env-file --config=/dev/null -e '",
     );
     expect(publicContent.installCommand).toContain(
-      "-- https://github.com/hraness/hra/releases/download/v0.7.0/hraness-hra-0.7.0.tgz",
+      "-- https://github.com/hraness/hra/releases/download/v0.7.1/hraness-hra-0.7.1.tgz",
     );
     expect(publicContent.installCommand).toContain("hra-install-safe");
     expect(publicContent.installCommand).not.toContain("bun add --global");
@@ -802,7 +841,7 @@ describe("public content contract", () => {
       expect(surface).toContain("hra-install-safe");
       expect(surface).toContain("fresh random private staging root");
       expect(surface).toContain("GitHub repository ID 1343008607");
-      expect(surface).toContain("published immutable v0.7.0 release");
+      expect(surface).toContain("published immutable v0.7.1 release");
       expect(surface).toContain("removes ambient Bun, Node, and native-library injection variables");
       expect(surface).toContain("disables Bun dotenv loading");
       expect(surface).toContain("/dev/null as the only Bun configuration");
@@ -826,7 +865,7 @@ describe("public content contract", () => {
       expect(surface).toContain("hra daemon stop");
       expect(surface).toContain("hra daemon status --json");
       expect(surface).toContain("hra daemon start");
-      expect(surface).toContain("Install the admitted v0.7.0 release, then verify the installed version and offline health");
+      expect(surface).toContain("Only after immutable GitHub and npm release admission, install the v0.7.1 candidate's exact release, then verify the installed version and offline health");
       expect(surface).not.toContain("bun remove --global hra");
       expect(surface).not.toContain("uninstall the package");
     }
