@@ -30,16 +30,17 @@ async function sourceFiles(root: string): Promise<readonly string[]> {
 }
 
 /**
- * The one module allowed to name `localStorage`, and what it is allowed to keep
+ * The modules allowed to name `localStorage`, and what they may keep
  * there: a bounded list of opaque session public ids that is the reader's own
- * grid arrangement. No projection text, no session name, no authentication
+ * grid arrangement, plus a bounded finite palette/mode appearance preference.
+ * No projection text, no session name, no authentication
  * token, and no key material — those stay in memory and in the non-extractable
  * IndexedDB key store. A second entry here needs the same argument.
  */
-const localStorageUsers = ["data/card-order.ts"];
+const localStorageUsers = ["appearance.ts", "data/card-order.ts"];
 
 describe("browser storage discipline", () => {
-  test("only the grid arrangement reaches localStorage, and nothing reaches sessionStorage or document.cookie", async () => {
+  test("only appearance and grid arrangement reach localStorage, and nothing reaches sessionStorage or document.cookie", async () => {
     const offenders: string[] = [];
     const users: string[] = [];
     for (const path of await sourceFiles(appSource)) {
@@ -56,6 +57,14 @@ describe("browser storage discipline", () => {
     const text = await readFile(join(appSource, "model", "card-order.ts"), "utf8");
     expect(text).toContain("export const maximumOrderedCards = 200");
     expect(text).toContain("normaliseCardOrder");
+  });
+
+  test("appearance stores only its bounded shared preference and never reads legacy keys", async () => {
+    const text = await readFile(join(appSource, "appearance.ts"), "utf8");
+    expect(text).toContain('hraAppearanceStorageKey = "hraness-design-palette-v1"');
+    expect(text).toContain("maximumPreferenceLength = 256");
+    expect(text).toContain("parseDesignPalettePreference");
+    expect(text).toContain("legacyStorageKey: null");
   });
 
   test("the only persistent store is IndexedDB, and only for device key pairs", async () => {

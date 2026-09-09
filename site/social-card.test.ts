@@ -1,3 +1,4 @@
+import { paletteColors } from "@hraness/design-kit";
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { inflateSync } from "node:zlib";
@@ -62,23 +63,13 @@ describe("social card", () => {
       .toBe(createHash("sha256").update(second).digest("hex"));
   });
 
-  test("paints the background, the command panel, and dark glyph pixels where the text sits", () => {
+  test("paints the default dark theme with visible glyphs where the text sits", () => {
     const image = decodeRgb(renderSocialCardPng());
     expect(image.width).toBe(1200);
     expect(image.height).toBe(630);
-    expect(pixelAt(image, 4, 4)).toEqual([...parseHexColor("#f4f1e9")]);
-    expect(pixelAt(image, 600, 420)).toEqual([...parseHexColor("#1a1916")]);
+    expect(pixelAt(image, 4, 4)).toEqual([...parseHexColor(paletteColors.catppuccin.dark.background)]);
+    expect(pixelAt(image, 600, 420)).toEqual([...parseHexColor(paletteColors.catppuccin.dark.surfaceRaised)]);
 
-    const darkPixelsIn = (x0: number, y0: number, x1: number, y1: number): number => {
-      let count = 0;
-      for (let y = y0; y < y1; y += 1) {
-        for (let x = x0; x < x1; x += 1) {
-          const [red] = pixelAt(image, x, y);
-          if (red < 96) count += 1;
-        }
-      }
-      return count;
-    };
     const lightPixelsIn = (x0: number, y0: number, x1: number, y1: number): number => {
       let count = 0;
       for (let y = y0; y < y1; y += 1) {
@@ -89,13 +80,45 @@ describe("social card", () => {
       }
       return count;
     };
-    expect(darkPixelsIn(88, 90, 340, 180)).toBeGreaterThan(4_000);
-    expect(darkPixelsIn(400, 90, 1100, 180)).toBe(0);
-    // The capacity warning owns the first row; the first bright command now follows it.
-    expect(lightPixelsIn(128, 280, 700, 306)).toBe(0);
+    expect(lightPixelsIn(88, 90, 340, 180)).toBeGreaterThan(4_000);
+    expect(lightPixelsIn(400, 90, 1100, 180)).toBe(0);
+    // Both the capacity warning and the command must remain readable.
+    expect(lightPixelsIn(128, 280, 700, 306)).toBeGreaterThan(300);
     expect(lightPixelsIn(128, 328, 700, 354)).toBeGreaterThan(500);
-    // The shorter candidate label has this exact ink count with the pinned font.
-    expect(darkPixelsIn(88, 495, 940, 525)).toBe(980);
+    // Brightness thresholds select different anti-aliased edge pixels after a
+    // palette change. Pin this literal candidate's geometry independently of
+    // its colors, then compare the actual row against the same coverage.
+    const mask = new Canvas(1200, 630, parseHexColor("#000000"));
+    drawText(mask, socialCardFonts().book, "CLI candidate v0.8.0 · hra.sh", 88, 520, 30, parseHexColor("#ffffff"));
+    const coverage = new Uint8Array((940 - 88) * (525 - 495));
+    const background = parseHexColor(paletteColors.catppuccin.dark.background);
+    const foreground = parseHexColor(paletteColors.catppuccin.dark.muted);
+    let offset = 0;
+    let mismatchedChannels = 0;
+    for (let y = 495; y < 525; y += 1) {
+      for (let x = 88; x < 940; x += 1) {
+        const alphaByte = mask.pixels[(y * mask.width + x) * 3]!;
+        coverage[offset++] = alphaByte;
+        const actual = pixelAt(image, x, y);
+        for (const channel of [0, 1, 2] as const) {
+          const expected = Math.round(background[channel] + (foreground[channel] - background[channel]) * alphaByte / 255);
+          // The independent 8-bit coverage mask introduces at most one channel
+          // unit of rounding relative to the rasterizer's full-precision alpha.
+          if (Math.abs(actual[channel] - expected) > 1) mismatchedChannels += 1;
+        }
+      }
+    }
+    expect(createHash("sha256").update(coverage).digest("hex"))
+      .toBe("5c731ae6d34c3ee86b50ae7890c986d2350b0c76e40f772a28c4be6106028b75");
+    expect(mismatchedChannels).toBe(0);
+    const luminance = (color: readonly [number, number, number]): number => color.reduce((sum, channel, index) => {
+      const value = channel / 255;
+      const linear = value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+      return sum + linear * [0.2126, 0.7152, 0.0722][index]!;
+    }, 0);
+    const ink = luminance(foreground);
+    const surface = luminance(background);
+    expect((Math.max(ink, surface) + 0.05) / (Math.min(ink, surface) + 0.05)).toBeGreaterThanOrEqual(4.5);
   });
 
   test("keeps every card line inside its row and states the exact positioning text", () => {

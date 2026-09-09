@@ -28,11 +28,11 @@ export const badgeStyles = stylex.create({
     paddingTop: "0.125rem",
   },
   accent: {
-    borderBottomColor: "var(--color-accent)",
-    borderLeftColor: "var(--color-accent)",
-    borderRightColor: "var(--color-accent)",
-    borderTopColor: "var(--color-accent)",
-    color: "var(--color-accent)",
+    borderBottomColor: "var(--color-info)",
+    borderLeftColor: "var(--color-info)",
+    borderRightColor: "var(--color-info)",
+    borderTopColor: "var(--color-info)",
+    color: "var(--color-info)",
   },
   attention: {
     borderBottomColor: "var(--color-attention)",
@@ -117,7 +117,7 @@ export const buttonStyles = stylex.create({
       opacity: { default: null, [hoverCapable]: 0.9 },
     },
     backgroundColor: "var(--color-accent)",
-    color: "var(--color-surface)",
+    color: "var(--color-accent-ink)",
   },
   secondary: {
     ":hover": {
@@ -154,7 +154,7 @@ export const buttonStyles = stylex.create({
       opacity: { default: null, [hoverCapable]: 0.9 },
     },
     backgroundColor: "var(--color-danger)",
-    color: "var(--color-surface)",
+    color: "var(--color-danger-ink)",
   },
 });
 
@@ -227,7 +227,7 @@ export const cardStyles = stylex.create({
 export const dialogStyles = stylex.create({
   root: {
     "::backdrop": {
-      backgroundColor: "rgb(0 0 0 / 0.6)",
+      backgroundColor: "var(--scrim)",
     },
     backgroundColor: "var(--color-surface-raised)",
     borderBottomColor: "var(--color-line)",
@@ -393,18 +393,18 @@ export const fieldStyles = stylex.create({
   input: {
     "::placeholder": { color: "var(--color-ink-muted)", opacity: 1 },
     backgroundColor: "var(--color-surface-input)",
-    borderBottomColor: "var(--color-line)",
+    borderBottomColor: "var(--color-control)",
     borderBottomLeftRadius: "0.375rem",
     borderBottomRightRadius: "0.375rem",
     borderBottomStyle: "solid",
     borderBottomWidth: "1px",
-    borderLeftColor: "var(--color-line)",
+    borderLeftColor: "var(--color-control)",
     borderLeftStyle: "solid",
     borderLeftWidth: "1px",
-    borderRightColor: "var(--color-line)",
+    borderRightColor: "var(--color-control)",
     borderRightStyle: "solid",
     borderRightWidth: "1px",
-    borderTopColor: "var(--color-line)",
+    borderTopColor: "var(--color-control)",
     borderTopLeftRadius: "0.375rem",
     borderTopRightRadius: "0.375rem",
     borderTopStyle: "solid",
@@ -424,18 +424,18 @@ export const fieldStyles = stylex.create({
   textarea: {
     "::placeholder": { color: "var(--color-ink-muted)", opacity: 1 },
     backgroundColor: "var(--color-surface-input)",
-    borderBottomColor: "var(--color-line)",
+    borderBottomColor: "var(--color-control)",
     borderBottomLeftRadius: "0.375rem",
     borderBottomRightRadius: "0.375rem",
     borderBottomStyle: "solid",
     borderBottomWidth: "1px",
-    borderLeftColor: "var(--color-line)",
+    borderLeftColor: "var(--color-control)",
     borderLeftStyle: "solid",
     borderLeftWidth: "1px",
-    borderRightColor: "var(--color-line)",
+    borderRightColor: "var(--color-control)",
     borderRightStyle: "solid",
     borderRightWidth: "1px",
-    borderTopColor: "var(--color-line)",
+    borderTopColor: "var(--color-control)",
     borderTopLeftRadius: "0.375rem",
     borderTopRightRadius: "0.375rem",
     borderTopStyle: "solid",
@@ -458,7 +458,7 @@ export const fieldStyles = stylex.create({
 export const sheetStyles = stylex.create({
   root: {
     "::backdrop": {
-      backgroundColor: "rgb(0 0 0 / 0.6)",
+      backgroundColor: "var(--scrim)",
     },
     backgroundColor: "var(--color-surface-raised)",
     borderBottomColor: "var(--color-line)",
@@ -565,6 +565,6 @@ export const switchStyles = stylex.create({
     transitionTimingFunction: "cubic-bezier(0.4, 0, 0.2, 1)",
     width: "1rem",
   },
-  knobChecked: { insetInlineStart: "1.5rem" },
+  knobChecked: { backgroundColor: "var(--color-accent-ink)", insetInlineStart: "1.5rem" },
   knobUnchecked: { insetInlineStart: "0.25rem" },
 });

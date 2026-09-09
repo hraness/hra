@@ -1,3 +1,4 @@
+import { AppearanceHeader } from "../components/appearance";
 import { useAuthActions } from "@convex-dev/auth/react";
 import * as stylex from "@stylexjs/stylex";
 
@@ -86,6 +87,7 @@ export function EnrollmentScreen() {
 
   return (
     <main {...stylex.props(enrollmentStyles.root)}>
+      <AppearanceHeader />
       <Card>
         <CardHeader>{body()}</CardHeader>
         <CardContent xstyle={enrollmentStyles.cardContent}>

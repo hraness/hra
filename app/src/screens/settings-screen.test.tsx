@@ -5,8 +5,9 @@ import { parseHTML } from "linkedom";
 import { fileURLToPath } from "node:url";
 import { renderToStaticMarkup } from "react-dom/server";
 
-import type { AccountRowView, MachineView } from "../model/settings-view";
-import { AccountBrowserLoginControls, MemorySupervision } from "./settings-screen";
+import { decodeHistoricalProfileKey } from "../hra/cloud";
+import type { AccountRowView, MachineView, ProfileBindingView } from "../model/settings-view";
+import { AccountBrowserLoginControls, DefaultProfileObservation, MemorySupervision } from "./settings-screen";
 import { settingsScreenStyles } from "./settings-screen.stylex";
 
 function account(
@@ -76,6 +77,48 @@ describe("browser account login controls", () => {
   });
 });
 
+describe("read-only default profile observation", () => {
+  for (const [key, expected] of [
+    ["codex:gpt-5.6-luna:max", "gpt-5.6-luna / max"],
+    ["codex:gpt-5.6-sol:max", "gpt-5.6-sol / max"],
+    ["codex:gpt-5.6-sol:ultra", "gpt-5.6-sol / ultra"],
+    ["codex:gpt-6-astra:max", "gpt-6-astra / max"],
+    ["codex:gpt-6-astra:ultra", "gpt-6-astra / ultra"],
+  ] as const) {
+    test(`renders ${expected} as reported configuration with no action`, () => {
+      const profile = decodeHistoricalProfileKey(key);
+      if (profile?.provider !== "codex") throw new Error("invalid Codex profile fixture");
+      const markup = renderToStaticMarkup(<DefaultProfileObservation observation={{ profile, status: "current" }} />);
+      const { document } = parseHTML(markup);
+      expect(markup).toContain("Last reported Codex default");
+      expect(markup).toContain(expected);
+      expect(markup).toContain("Reported configuration only, not session state or runtime capability.");
+      expect(document.querySelector("button, input, select, a, [role=radio], [role=switch]")).toBeNull();
+      expect(document.querySelector("[class]")).not.toBeNull();
+      expect(document.querySelector("[style], style")).toBeNull();
+      if (profile.model === "gpt-6-astra") expect(markup).not.toContain("gpt-5.6-sol");
+    });
+  }
+
+  for (const status of ["inactive", "stale", "unreadable", "unsupported"] as const) {
+    test(`renders ${status} explicitly without retaining a previous exact label`, () => {
+      // Even a malformed view retaining an old profile cannot bypass the status.
+      const observation = {
+        profile: decodeHistoricalProfileKey("codex:gpt-5.6-sol:ultra"),
+        status,
+      } as unknown as ProfileBindingView;
+      const markup = renderToStaticMarkup(<DefaultProfileObservation observation={observation} />);
+      const { document } = parseHTML(markup);
+      expect(markup).toContain("Last reported Codex default");
+      expect(markup).toContain(status);
+      expect(markup).toContain("Unavailable:");
+      expect(markup).not.toMatch(/gpt-|claude-|\bultra\b|\bmax\b/u);
+      expect(document.querySelector("button, input, select, a, [role=radio], [role=switch]")).toBeNull();
+      expect(document.querySelector("[style], style")).toBeNull();
+    });
+  }
+});
+
 describe("read-only memory supervision", () => {
   const now = 1_760_000_000_000;
   const digest = (scalar: string) => scalar.repeat(64);
@@ -130,6 +173,7 @@ describe("read-only memory supervision", () => {
     notificationPolicyRevision: null,
     online: true,
     projects: [],
+    profileBinding: { profile: null, status: "unsupported" },
     proseAutorespondConfigured: false,
     revision: 1,
     scheduledTasks: [],

@@ -119,6 +119,38 @@ source invalidates earlier final browser and installation receipts. A fresh
 joined archive, exact-tree final gates, protected merge, immutable release
 admission and applicable deployment evidence remain required.
 
+The reviewed join onto repair checkpoint
+`f953e9b22fbc22bdcfd74854f1ec950ed697ea75` preserves the authentic observed-v20
+archive test while adding incoming raw-task cleanup ownership. The five
+storage join cases pass with 2,511 assertions. Canonical profile decoding,
+the read-only profile companion, daemon adapters and bridge, and the Convex
+device registry pass 374 tests with 3,347 assertions. Frozen dependencies,
+typecheck, installer pins, all 47 security inventory files and Effect
+architecture pass. The companion remains a revision- and digest-bound display
+observation, never execution authority.
+
+The app suite passes 583 cases; its build-output setup correctly refuses an
+older output directory without publication provenance. That output remains
+untouched, and the missing build-output acceptance will run in the isolated
+final checkout. Ninety build and browser contract cases pass. The site suite
+passes 99 cases and exposes one invalid palette-sensitive pixel oracle. The
+repaired card suite passes all eight cases using a fixed literal glyph-coverage
+fingerprint, actual RGB comparison and a minimum contrast check. Independent
+review confirms that it retains candidate wording, geometry, warning and
+command readability without accepting the observed brightness count as its
+oracle. This focused evidence does not replace fresh joined final acceptance.
+
+The fresh joined release-workflow contract passes 28 cases with 946 assertions,
+including both-system command equivalence and native shard failure propagation.
+Independent inspection of the new actual archive confirms 214 files, exact
+frozen source bytes, modes and exclusions. Its reviewed inventory is 223 entries
+and 11,081 canonical bytes with digest
+`9d41a72f043897aab535dbfd2836bbc8da719b2d9d762b2a60ed150f0222a969`.
+The archive SHA-256 is
+`a4862f01883b735904816aa75dd9dcc14039ee9d63925634611bb505ea80729a`.
+This binds the joined package inputs; exact committed-tree CI, browser and
+installation acceptance remain outstanding.
+
 The September 8 integration checkpoints now include canonical main through
 schema 50 at `ab56d3bc5034abedd12a20b5b405caf42bfa174f`, then the clean
 release-policy join at `9d6e2e12a42215e9201ae2ed3f64ed1b41e5c47d`, tree

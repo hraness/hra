@@ -223,7 +223,7 @@ describe("static-site build", () => {
     for (const [shared, product] of [
       ["foreground", "foreground"], ["border", "rule"],
       ["muted", "surface"], ["muted-foreground", "muted"],
-      ["primary", "link"], ["ring", "link"],
+      ["primary", "primary"], ["ring", "focus"],
     ]) expect(recipes).toContain(`"--ui-${shared}": "var(--${product})"`);
   });
 
@@ -236,9 +236,9 @@ describe("static-site build", () => {
     expect(styles).toContain("--hraness-marketing-inverse: var(--inverse-background)");
     expect(styles).toContain("--hraness-marketing-inverse-ink: var(--inverse-foreground)");
     expect(recipes).toContain('"--foreground": "var(--code-foreground)"');
-    expect(styles).toContain("--code-background: #090a0c");
-    expect(styles).toContain("--code-foreground: #fbf8f0");
-    expect(styles).toContain("--inverse-background: #f0ebdf");
+    expect(styles).toContain("--code-background: var(--surface-raised)");
+    expect(styles).toContain("--code-foreground: var(--foreground)");
+    expect(styles).toContain("--inverse-background: var(--inverse)");
   });
 
   test("renders one crawlable Ask AI row on each public page with exact provider prompts", () => {
@@ -295,6 +295,7 @@ describe("static-site build", () => {
       "dist/site/.well-known/security.txt",
       "dist/site/.well-known/hra.json",
       "dist/site/analytics.js",
+      "dist/site/appearance.js",
       "dist/site/favicon.svg",
       "dist/site/social-card.svg",
       "dist/site/social-card.png",
@@ -326,6 +327,8 @@ describe("static-site build", () => {
     // its shared document defaults. Exact HTML parity above preserves the full
     // canonical footer, and the atom closure below binds its emitted classes.
     expect(union).toContain("--hraness-site-footer-social-target");
+    expect(union).toContain("--hraness-palette-background");
+    expect(foundation).toContain(".hraness-palette");
     const { document } = parseHTML(html);
     const atomClasses = new Set([...document.querySelectorAll("[class]")]
       .flatMap((element) => [...element.classList])
@@ -367,7 +370,7 @@ describe("static-site build", () => {
       ...expectedPaths.filter((path) => path.startsWith("dist/site/")).map((path) => path.slice("dist/site/".length)),
       foundationPath, ...fontPaths,
     ].sort());
-    expect(inventory.filter((path) => path.endsWith(".js"))).toEqual(["analytics.js"]);
+    expect(inventory.filter((path) => path.endsWith(".js"))).toEqual(["analytics.js", "appearance.js"]);
     expect(inventory).not.toContain("stylex-complete.json");
     expect(inventory.some((path) => /\.(?:map|ts|tsx|otf)$/u.test(path) || path.startsWith("graphs/renderer/"))).toBe(false);
     expect(await inventoryFiles(join(root, "dist/site/fonts"))).toEqual(expectedAttributionPaths);
@@ -578,7 +581,7 @@ describe("static-site build", () => {
     expect(await readFile(join(root, "dist/site/stylex.css"), "utf8")).toBe("stale\n");
   }, compilerBuildTimeoutMs);
 
-  test("admits only owned analytics, configured Turnstile, and restrictive response headers", async () => {
+  test("admits only owned appearance and analytics scripts, configured Turnstile, and restrictive response headers", async () => {
     const repositoryRoot = join(import.meta.dir, "..");
     const html = renderSiteHtml();
     const css = await readFile(join(repositoryRoot, "site/styles.css"), "utf8");
@@ -586,7 +589,8 @@ describe("static-site build", () => {
       await readFile(join(repositoryRoot, "vercel.json"), "utf8"),
     ) as { headers?: unknown };
 
-    expect(html.match(/<script[^>]+src=/gu)).toHaveLength(1);
+    expect(html.match(/<script[^>]+src=/gu)).toHaveLength(2);
+    expect(html).toContain('<script src="/appearance.js"></script>');
     expect(html).toContain(renderHraAnalyticsScript());
     expect(renderPreviewHtml()).not.toContain(renderHraAnalyticsScript());
     expect(renderHraSiteFooter({

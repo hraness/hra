@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import fc from "fast-check";
 
-import { parseDeviceRegistryPayload, type DeviceRegistryPayload } from "../hra/cloud";
+import { parseDeviceRegistryPayload, type DeviceRegistryPayload, type ProfileBindingPayload } from "../hra/cloud";
 import {
   accountBrowserLoginAllowed,
   accountRows,
@@ -21,6 +21,7 @@ import {
   sortMachines,
   toMachineView,
   type SessionHeadSummary,
+  type MachineViewInput,
 } from "./settings-view";
 
 const now = 1_760_000_000_000;
@@ -276,6 +277,115 @@ describe("toMachineView", () => {
 
   test("names the public HRA conversation task kind", () => {
     expect(scheduledTaskKindLabel("hra_conversation")).toBe("HRA");
+  });
+});
+
+describe("last reported Codex default", () => {
+  const observation: ProfileBindingPayload = {
+    observedAt: now,
+    preset: "ultra",
+    profileKey: "codex:gpt-5.6-sol:ultra",
+    registryEnvelopeDigest: "a".repeat(64),
+    registryRevision: 7,
+    version: 1,
+  };
+  const input = (overrides: Partial<MachineViewInput> = {}): MachineViewInput => ({
+    device: { deviceClass: "daemon", keyVersion: 1, online: true, status: "active" },
+    devicePublicId: "dev_one",
+    keyVersion: 1,
+    now,
+    payload: registry({ heartbeatAt: now }),
+    profileBinding: observation,
+    profileBindingReady: true,
+    profileBindingStatus: "available",
+    revision: 7,
+    updatedAt: now,
+    ...overrides,
+  });
+
+  test("decodes both exact historical models without consulting the reader's active binding", () => {
+    for (const profile of [
+      { effort: "ultra", key: "codex:gpt-5.6-sol:ultra", model: "gpt-5.6-sol", provider: "codex" },
+      { effort: "ultra", key: "codex:gpt-6-astra:ultra", model: "gpt-6-astra", provider: "codex" },
+    ] as const) {
+      const machine = toMachineView(input({ profileBinding: { ...observation, profileKey: profile.key } }));
+      expect(machine.profileBinding).toEqual({
+        profile,
+        status: "current",
+      });
+      expect(machine.defaultPreset).toBe("ultra");
+    }
+  });
+
+  test("requires an active daemon and the current matching device key", () => {
+    for (const device of [
+      null,
+      { deviceClass: "browser", keyVersion: 1, online: true, status: "active" },
+      { deviceClass: "daemon", keyVersion: 1, online: true, status: "pending" },
+      { deviceClass: "daemon", keyVersion: 1, online: true, status: "revoked" },
+      { deviceClass: "daemon", keyVersion: 2, online: true, status: "active" },
+    ] as const) {
+      expect(toMachineView(input({ device })).profileBinding).toEqual({ profile: null, status: "inactive" });
+    }
+    for (const device of [
+      { online: true, status: "active" },
+      { deviceClass: "daemon", online: true, status: "active" },
+      { keyVersion: 1, online: true, status: "active" },
+    ] as const) {
+      expect(toMachineView(input({ device })).profileBinding).toEqual({ profile: null, status: "unsupported" });
+    }
+    const missingRegistryKey = { ...input() };
+    delete missingRegistryKey.keyVersion;
+    expect(toMachineView(missingRegistryKey).profileBinding).toEqual({ profile: null, status: "unsupported" });
+  });
+
+  test("does not infer availability from online presence or absent hosted time", () => {
+    for (const profileBindingReady of [false, undefined]) {
+      const candidate = { ...input() };
+      if (profileBindingReady === undefined) delete candidate.profileBindingReady;
+      else candidate.profileBindingReady = profileBindingReady;
+      expect(toMachineView(candidate).profileBinding).toEqual({ profile: null, status: "unsupported" });
+    }
+    for (const badNow of [NaN, Infinity, -Infinity, 0, -1]) {
+      expect(toMachineView(input({ now: badNow })).profileBinding).toEqual({ profile: null, status: "unsupported" });
+    }
+    for (const offset of [-registryHeartbeatToleranceMs - 1, registryHeartbeatToleranceMs + 1]) {
+      const machine = toMachineView(input({ now: now + offset }));
+      expect(machine.online).toBe(true);
+      expect(machine.profileBinding).toEqual({ profile: null, status: "stale" });
+    }
+    for (const offset of [-registryHeartbeatToleranceMs, registryHeartbeatToleranceMs]) {
+      expect(toMachineView(input({ now: now + offset })).profileBinding.status).toBe("current");
+    }
+  });
+
+  test("missing and unreadable observations expose no exact model", () => {
+    expect(toMachineView(input({ profileBindingStatus: "unreadable" })).profileBinding)
+      .toEqual({ profile: null, status: "unreadable" });
+    for (const override of [
+      { profileBindingStatus: "unsupported" as const },
+      { profileBinding: null },
+    ]) {
+      expect(toMachineView(input(override)).profileBinding).toEqual({ profile: null, status: "unsupported" });
+    }
+  });
+
+  test("refuses bad timestamps and incoherent profile, alias, or revision pairs", () => {
+    for (const profileBinding of [
+      { ...observation, observedAt: 0 },
+      { ...observation, observedAt: -1 },
+      { ...observation, observedAt: Infinity },
+      { ...observation, observedAt: NaN },
+      { ...observation, observedAt: now + 1 },
+      { ...observation, registryRevision: 6 },
+      { ...observation, preset: "high", profileKey: "codex:gpt-5.6-sol:max" },
+      { ...observation, profileKey: "codex:gpt-6-astra:max" },
+      { ...observation, profileKey: "devin:gpt-6-astra:provider-default" },
+    ] as const) {
+      expect(toMachineView(input({ profileBinding })).profileBinding).toEqual({ profile: null, status: "unreadable" });
+    }
+    expect(toMachineView(input({ payload: registry({ defaultPreset: "astra", heartbeatAt: now }) })).profileBinding)
+      .toEqual({ profile: null, status: "unreadable" });
   });
 });
 

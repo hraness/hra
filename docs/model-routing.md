@@ -63,6 +63,38 @@ rollout does not make an unchanged supported route unavailable. Devin and its
 `astra` alias remain historical decoder and storage values only. Current remote
 commands cannot select or execute them.
 
+Settings can separately show a machine's **Last reported Codex default** when
+the daemon publishes an exact profile observation. This read-only companion is
+encrypted independently from the unchanged registry v1. It records the preset
+alias, canonical profile key, observation time, next registry revision, and a
+digest of that exact encrypted registry. The publishing daemon reads its
+default tier once and resolves it under its own active Codex binding. It does
+not infer the default from an established session or ask a provider to run.
+
+The daemon first publishes the existing registry shape. Only a successful
+response advertising companion version 1 enables a companion on the next
+publication. Support is scoped to the exact account, device, key version, and
+key bytes. A server that has not advertised support receives the existing
+argument shape. After a server rollback, a previously negotiated companion can
+be refused once before negotiation resets. A failed or ambiguous write,
+including cancellation after a commit, drops the cached support and revision;
+a later cycle reads the current
+revision and starts negotiation again. Omitting the companion clears it in the
+same registry transaction, including after a producer downgrade.
+
+The browser shows an exact profile only when the decrypted observation agrees
+with the registry's alias, heartbeat, revision, and envelope digest, and the
+current hosted device is an active daemon with the same key version. Hosted
+time must be available and within three registry heartbeat intervals of the
+observation, including the future-skew bound. Missing, stale, inactive, and
+unreadable observations have explicit unavailable states. An old companion
+cannot survive a registry-envelope replacement while decryption is pending.
+This observation does not establish provider availability, describe an
+existing session, or authorize a remote preset choice. All selectors and
+command contracts above remain unchanged. See the
+[implementation and delivery status](../kb/plans/model-routing-autonomy.md#read-only-machine-default-observation)
+before treating source support as a deployed capability.
+
 The local CLI and persistent daemon have the same independent-rollout problem.
 Their strict socket envelope therefore has a build fence. It conditionally
 carries the current active preset contract for `session.start` or
@@ -132,7 +164,7 @@ mixed-version interval.
 
 ## Work project authority during an update
 
-The unreleased schema49 candidate adds a null-safe project guard alongside the
+Released schema49 adds a null-safe project guard alongside the
 unchanged historical Work guards. A session with a claimed, dispatching, running,
 or recovery-required attempt cannot change or clear its project while that
 attempt owns different project authority. The supported metadata API performs
@@ -144,10 +176,11 @@ An upgrade refuses pre-existing contradictory live project authority with
 back, including any legacy quarantine. Preserve the state root and its backup
 for reviewed recovery; do not assign a project, release an attempt, or edit the
 migration ledger with SQL to make the upgrade pass. A missing or modified guard
-on a current schema49 root also refuses opening instead of being reconstructed.
+on a schema49 or later root also refuses opening instead of being reconstructed.
 
 The first current-daemon start remains the no-downgrade boundary. An older
-schema48 writer cannot open schema49. Restore a whole-root pre-upgrade backup
+schema48 writer cannot open schema49, and schema50 adds the separately validated
+canonical-profile identity columns. Restore a whole-root pre-upgrade backup
 when returning to an older release; never decrement `user_version` or remove
 the guard. These local migration checks do not clear the separate
 [hosted-capacity and target-marker gates](hosted-sync.md#converge-command-lifecycle-capacity-before-writer-rollout).

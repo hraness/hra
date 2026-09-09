@@ -961,6 +961,7 @@ function publicRegistry(registry: Readonly<{
   notificationEmailEnvelope?: Parameters<typeof parseEncryptedEnvelope>[0];
   notificationHoursEnvelope?: Parameters<typeof parseEncryptedEnvelope>[0];
   notificationPolicyRevision?: number;
+  profileBindingEnvelope?: Parameters<typeof parseEncryptedEnvelope>[0];
   revision: number;
   updatedAt: number;
 }>) {
@@ -986,6 +987,9 @@ function publicRegistry(registry: Readonly<{
     ...(registry.notificationPolicyRevision === undefined
       ? {}
       : { notificationPolicyRevision: registry.notificationPolicyRevision }),
+    ...(registry.profileBindingEnvelope === undefined
+      ? {}
+      : { profileBindingEnvelope: registry.profileBindingEnvelope }),
     revision: registry.revision,
     updatedAt: registry.updatedAt,
   };
@@ -1004,13 +1008,21 @@ export const updateRegistry = mutation({
     notificationEmailEnvelope: v.optional(encryptedEnvelope),
     notificationHoursEnvelope: v.optional(encryptedEnvelope),
     notificationPolicyRevision: v.optional(v.number()),
+    profileBindingEnvelope: v.optional(encryptedEnvelope),
   },
   handler: async (ctx, args) => {
-    const authority = await requireDeviceAuthority(ctx);
+    const authority = args.profileBindingEnvelope === undefined
+      ? await requireDeviceAuthority(ctx)
+      : await requireDaemonDevice(ctx);
     if (
       parseEncryptedEnvelope(args.envelope, cloudLimits.registryCiphertextCharacters) === null
       || !isSafePositiveInteger(args.keyVersion)
       || args.keyVersion !== args.envelope.keyVersion
+      || (args.profileBindingEnvelope !== undefined
+        && (parseEncryptedEnvelope(
+          args.profileBindingEnvelope,
+          cloudLimits.profileBindingCiphertextCharacters,
+        ) === null || args.profileBindingEnvelope.keyVersion !== args.keyVersion))
       || (args.notificationEmailEnvelope !== undefined
         && (parseEncryptedEnvelope(
           args.notificationEmailEnvelope,
@@ -1029,7 +1041,11 @@ export const updateRegistry = mutation({
         && (args.notificationEmailEnvelope === undefined
           || args.notificationHoursEnvelope === undefined))
       || !isSafeNonNegativeInteger(args.expectedRevision)
+      || Object.is(args.expectedRevision, -0)
     ) rejectAuthority();
+    if (args.expectedRevision === Number.MAX_SAFE_INTEGER) {
+      throw new Error("DEVICE_REGISTRY_REVISION_EXHAUSTED");
+    }
     const matches = await ctx.db
       .query("deviceRegistries")
       .withIndex("by_device", (builder) => builder.eq("deviceId", authority.deviceId))
@@ -1065,6 +1081,9 @@ export const updateRegistry = mutation({
         ...(args.notificationPolicyRevision === undefined
           ? {}
           : { notificationPolicyRevision: args.notificationPolicyRevision }),
+        ...(args.profileBindingEnvelope === undefined
+          ? {}
+          : { profileBindingEnvelope: args.profileBindingEnvelope }),
         revision: 1,
         updatedAt: now,
         userId: authority.userId,
@@ -1073,11 +1092,13 @@ export const updateRegistry = mutation({
       await ctx.db.insert("deviceRegistries", document);
       return {
         devicePublicId: document.devicePublicId,
+        // Response-only format negotiation: old publishers keep their argument shape.
+        profileBindingProjectionVersion: 1 as const,
         revision: document.revision,
         updatedAt: document.updatedAt,
       };
     }
-    if (existing.revision !== args.expectedRevision) {
+    if (!isSafePositiveInteger(existing.revision) || existing.revision !== args.expectedRevision) {
       throw new Error("DEVICE_REGISTRY_REVISION_CONFLICT");
     }
     const patch = {
@@ -1092,6 +1113,8 @@ export const updateRegistry = mutation({
       notificationEmailEnvelope: args.notificationEmailEnvelope,
       notificationHoursEnvelope: args.notificationHoursEnvelope,
       notificationPolicyRevision: args.notificationPolicyRevision,
+      // Omission also clears this read-only observation, never execution authority.
+      profileBindingEnvelope: args.profileBindingEnvelope,
       revision: existing.revision + 1,
       updatedAt: now,
     } as const;
@@ -1099,6 +1122,7 @@ export const updateRegistry = mutation({
     await ctx.db.patch(existing._id, patch);
     return {
       devicePublicId: existing.devicePublicId,
+      profileBindingProjectionVersion: 1 as const,
       revision: patch.revision,
       updatedAt: patch.updatedAt,
     };

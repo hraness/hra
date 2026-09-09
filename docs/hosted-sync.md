@@ -1355,7 +1355,7 @@ the forward-only boundary described below.
    receipts are accepted.
    After starting the current daemon on each
    intended target, run `hra sync now --json` on that machine. Do not declare
-   current command availability or enable release admission until every
+   current hosted command availability until every
    intended target's result has `ok: true`, `data.online: true`,
    `data.errorCount: 0`, and
    `data.commandRequestVersion: 2`. A pending device identity or failed
@@ -1363,13 +1363,18 @@ the forward-only boundary described below.
    successful marker-2 registry publication cycle; a current daemon publishes
    marker 2 before it processes either command queue. A downgrade clears
    eligibility on the next successful old-shaped registry write.
-4. Declare the global marker-emitting browser and CLI release ready only after
+4. Declare the global marker-emitting browser and CLI hosted command path ready only after
    the capacity activation receipt and intended-target proofs above. Refresh already-open
    browser tabs so their requester-only receipt recovery runs. If the release
    deliberately exposes an ungated target, record that exception and monitor
    its expected marker-mismatch refusals; the hosted gate rejects them before
    command insertion. A stale matching marker may admit during a transition,
    but the executor checks stop it before prepare or effect start.
+
+   Artifact admission is separate: a reviewed release may complete its
+   [machine-enforced publication gates](beta-release.md) before hosted runtime
+   readiness. Publishing that artifact does not clear capacity, activation or
+   intended-target requirements, and does not authorize a daemon upgrade.
 5. Let current daemons automatically classify and reconcile pre-existing
    legacy journals, outboxes, and hosted rows through the recovery-only paths
    above. Observe the result with `hra sync now --json`, retained local command

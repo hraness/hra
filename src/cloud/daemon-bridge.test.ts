@@ -77,9 +77,11 @@ import {
   decryptMemorySummary,
   decryptDeviceCommandResult,
   decryptNotificationEmail,
+  decryptProfileBinding,
   encryptDeviceCommand,
   encryptDeviceCommandResult,
   encryptRemoteCommand,
+  profileBindingRegistryDigest,
   type DeviceCommandPayload,
   type DeviceRegistryPayload,
   type MemorySummaryPayload,
@@ -6749,12 +6751,17 @@ describe("device registry publication", () => {
       notificationEmailEnvelope?: EncryptedEnvelope;
       notificationHoursEnvelope?: EncryptedEnvelope;
       notificationPolicyRevision?: number;
+      profileBindingEnvelope?: EncryptedEnvelope;
       revision: number;
     }>>();
     const writes: Array<Readonly<{ expectedRevision: number }>> = [];
     const summaryWrites: Array<Readonly<{ expectedRevision: number }>> = [];
     const timeline: string[] = [];
     let rejectMemorySummary = false;
+    let profileBindingProjectionVersion: unknown;
+    let rejectProfileBinding = false;
+    let incorrectResponseRevision = false;
+    const profileBindingWrites: Array<EncryptedEnvelope | undefined> = [];
     const local: CloudDaemonLocalSourcePort = Object.assign(new EmptyLocal(sessionPublicId), {
       readDeviceRegistry,
       ...(readNotificationHours === undefined ? {} : { readNotificationHours }),
@@ -6790,6 +6797,10 @@ describe("device registry publication", () => {
         if (name === "devices:updateRegistry") {
           const expectedRevision = args.expectedRevision as number;
           writes.push({ expectedRevision });
+          profileBindingWrites.push(args.profileBindingEnvelope as EncryptedEnvelope | undefined);
+          if (rejectProfileBinding && args.profileBindingEnvelope !== undefined) {
+            throw new Error("UNKNOWN_PROFILE_BINDING_ARGUMENT");
+          }
           const current = rows.get(device);
           if ((current?.revision ?? 0) !== expectedRevision) {
             throw new Error("DEVICE_REGISTRY_REVISION_CONFLICT");
@@ -6817,10 +6828,18 @@ describe("device registry publication", () => {
             ...(args.notificationPolicyRevision === undefined
               ? {}
               : { notificationPolicyRevision: args.notificationPolicyRevision as number }),
+            ...(args.profileBindingEnvelope === undefined
+              ? {}
+              : { profileBindingEnvelope: args.profileBindingEnvelope as EncryptedEnvelope }),
             revision,
           });
           timeline.push("registry-published");
-          return { devicePublicId: device, revision, updatedAt: cloud.now };
+          return {
+            devicePublicId: device,
+            ...(profileBindingProjectionVersion === undefined ? {} : { profileBindingProjectionVersion }),
+            revision: incorrectResponseRevision ? revision + 1 : revision,
+            updatedAt: cloud.now,
+          };
         }
         return await inner.mutation(name, args);
       },
@@ -6834,14 +6853,274 @@ describe("device registry publication", () => {
       cloud,
       device,
       local,
+      profileBindingWrites,
       rows,
+      set incorrectResponseRevision(value: boolean) { incorrectResponseRevision = value; },
+      set profileBindingProjectionVersion(value: unknown) { profileBindingProjectionVersion = value; },
       set rejectMemorySummary(value: boolean) { rejectMemorySummary = value; },
+      set rejectProfileBinding(value: boolean) { rejectProfileBinding = value; },
       summaryWrites,
       timeline,
       transport,
       writes,
     };
   }
+
+  function defaultProfileProjection(): CloudDeviceRegistryProjection {
+    return {
+      notificationEmail: { enabled: false, revision: 1, version: 1 },
+      notificationHours: { endMinute: 1_320, revision: 1, startMinute: 600, timeZone: "UTC", version: 1 },
+      notificationPolicyRevision: 1,
+      profileBinding: { preset: "ultra", profileKey: "codex:gpt-5.6-sol:ultra" },
+      registry: { ...registry, defaultPreset: "ultra", heartbeatAt: fixedNow },
+    };
+  }
+
+  test("negotiates the exact default companion without changing registry v1 or waiting a heartbeat", async () => {
+    let projection = defaultProfileProjection();
+    const world = registryWorld(() => Promise.resolve(projection.registry), undefined, () => Promise.resolve(projection));
+    world.profileBindingProjectionVersion = 1;
+    const daemon = bridge({ cloud: world.cloud, device: world.device, local: world.local, transport: world.transport });
+    const signal = new AbortController().signal;
+    expect((await daemon.cycle(signal)).errors).toEqual([]);
+    expect(world.profileBindingWrites).toEqual([undefined]);
+    expect((await daemon.cycle(signal)).errors).toEqual([]);
+    expect(world.writes).toEqual([{ expectedRevision: 0 }, { expectedRevision: 1 }]);
+    const row = world.rows.get(world.device);
+    const authority = { entityPublicId: world.device, keyVersion: 1, userPublicId };
+    expect(await decryptDeviceRegistry(row?.envelope as EncryptedEnvelope, key, {
+      ...authority, kind: "device_registry",
+    })).toEqual(projection.registry);
+    expect(await decryptProfileBinding(row?.profileBindingEnvelope as EncryptedEnvelope, key, {
+      ...authority, kind: "profile_binding",
+    })).toEqual({
+      preset: "ultra",
+      profileKey: "codex:gpt-5.6-sol:ultra",
+      observedAt: fixedNow,
+      registryEnvelopeDigest: await profileBindingRegistryDigest(row?.envelope as EncryptedEnvelope),
+      registryRevision: 2,
+      version: 1,
+    });
+    expect((await daemon.cycle(signal)).errors).toEqual([]);
+    expect(world.writes).toHaveLength(2);
+    projection = {
+      ...projection,
+      profileBinding: { preset: "high", profileKey: "codex:gpt-5.6-sol:max" },
+      registry: { ...projection.registry, defaultPreset: "high" },
+    };
+    expect((await daemon.cycle(signal)).errors).toEqual([]);
+    expect(world.writes.at(-1)).toEqual({ expectedRevision: 2 });
+    // A producer downgrade clears the companion atomically, not on another timer.
+    const { profileBinding: omitted, ...legacy } = projection;
+    expect(omitted).toBeDefined();
+    projection = legacy;
+    expect((await daemon.cycle(signal)).errors).toEqual([]);
+    expect(world.rows.get(world.device)?.profileBindingEnvelope).toBeUndefined();
+    expect(world.rows.get(world.device)?.revision).toBe(4);
+  });
+
+  test.each([undefined, 2, "1", null])("does not infer support from an absent or unknown response version %p", async (version) => {
+    const projection = defaultProfileProjection();
+    const world = registryWorld(() => Promise.resolve(projection.registry), undefined, () => Promise.resolve(projection));
+    world.profileBindingProjectionVersion = version;
+    world.rejectProfileBinding = true;
+    const daemon = bridge({ cloud: world.cloud, device: world.device, local: world.local, transport: world.transport });
+    const signal = new AbortController().signal;
+    for (let cycle = 0; cycle < 3; cycle += 1) {
+      expect((await daemon.cycle(signal)).errors).toEqual([]);
+      world.cloud.now += 60_000;
+    }
+    expect(world.profileBindingWrites).toEqual([undefined, undefined, undefined]);
+  });
+
+  test("a server rollback loses support and revision before retrying the old publication shape", async () => {
+    const projection = defaultProfileProjection();
+    const world = registryWorld(() => Promise.resolve(projection.registry), undefined, () => Promise.resolve(projection));
+    world.profileBindingProjectionVersion = 1;
+    const daemon = bridge({ cloud: world.cloud, device: world.device, local: world.local, transport: world.transport });
+    const signal = new AbortController().signal;
+    expect((await daemon.cycle(signal)).errors).toEqual([]);
+    world.profileBindingProjectionVersion = undefined;
+    world.rejectProfileBinding = true;
+    const refused = await daemon.cycle(signal);
+    expect(refused.errors).toEqual(["device registry: UNKNOWN_PROFILE_BINDING_ARGUMENT"]);
+    expect(refused.commandRequestVersion).toBeNull();
+    expect(world.writes).toHaveLength(2);
+    expect(world.rows.get(world.device)?.revision).toBe(1);
+    expect((await daemon.cycle(signal)).errors).toEqual([]);
+    expect(world.writes.at(-1)).toEqual({ expectedRevision: 1 });
+    expect(world.profileBindingWrites.at(-1)).toBeUndefined();
+    expect(world.rows.get(world.device)?.revision).toBe(2);
+  });
+
+  test("an ambiguous successful mutation does not seed support or trust a different returned revision", async () => {
+    const projection = defaultProfileProjection();
+    const world = registryWorld(() => Promise.resolve(projection.registry), undefined, () => Promise.resolve(projection));
+    world.profileBindingProjectionVersion = 1;
+    world.incorrectResponseRevision = true;
+    const daemon = bridge({ cloud: world.cloud, device: world.device, local: world.local, transport: world.transport });
+    const signal = new AbortController().signal;
+    expect((await daemon.cycle(signal)).errors).toEqual(["device registry: Device registry publish response is invalid."]);
+    world.incorrectResponseRevision = false;
+    expect((await daemon.cycle(signal)).errors).toEqual([]);
+    expect(world.writes).toEqual([{ expectedRevision: 0 }, { expectedRevision: 1 }]);
+    expect(world.profileBindingWrites).toEqual([undefined, undefined]);
+  });
+
+  test("refuses revision exhaustion before encrypting or publishing a new registry", async () => {
+    const projection = defaultProfileProjection();
+    const world = registryWorld(() => Promise.resolve(projection.registry), undefined, () => Promise.resolve(projection));
+    const daemon = bridge({ cloud: world.cloud, device: world.device, local: world.local, transport: world.transport });
+    const signal = new AbortController().signal;
+    expect((await daemon.cycle(signal)).errors).toEqual([]);
+    const row = world.rows.get(world.device);
+    world.rows.set(world.device, { ...row as NonNullable<typeof row>, revision: Number.MAX_SAFE_INTEGER });
+    await daemon.close();
+    const restarted = bridge({ cloud: world.cloud, device: world.device, local: world.local, transport: world.transport });
+    expect((await restarted.cycle(signal)).errors).toEqual(["device registry: Device registry revision is exhausted."]);
+    expect(world.writes).toHaveLength(1);
+  });
+
+  test("cancellation after a committed companion resets negotiation and reads the committed revision", async () => {
+    const projection = defaultProfileProjection();
+    const world = registryWorld(() => Promise.resolve(projection.registry), undefined, () => Promise.resolve(projection));
+    world.profileBindingProjectionVersion = 1;
+    const controller = new AbortController();
+    let cancelAfterCommit = false;
+    const transport: CloudTransport = {
+      ...world.transport,
+      mutation: async (name, args) => {
+        const result = await world.transport.mutation(name, args);
+        if (name === "devices:updateRegistry" && cancelAfterCommit) {
+          controller.abort(new Error("cancelled after registry commit"));
+        }
+        return result;
+      },
+    };
+    const daemon = bridge({ cloud: world.cloud, device: world.device, local: world.local, transport });
+    expect((await daemon.cycle(controller.signal)).errors).toEqual([]);
+    cancelAfterCommit = true;
+    const interrupted = await daemon.cycle(controller.signal);
+    expect(interrupted.errors).toContain("cancelled after registry commit");
+    expect(interrupted.commandRequestVersion).toBeNull();
+    expect(world.rows.get(world.device)?.revision).toBe(2);
+    expect(world.rows.get(world.device)?.profileBindingEnvelope).toBeDefined();
+    cancelAfterCommit = false;
+    expect((await daemon.cycle(new AbortController().signal)).errors).toEqual([]);
+    expect(world.writes).toEqual([{ expectedRevision: 0 }, { expectedRevision: 1 }, { expectedRevision: 2 }]);
+    expect(world.profileBindingWrites.at(-1)).toBeUndefined();
+    expect(world.rows.get(world.device)?.profileBindingEnvelope).toBeUndefined();
+  });
+
+  test("rechecks identity after awaited daemon fences before a registry mutation", async () => {
+    const projection = defaultProfileProjection();
+    const mutable = new MutableIdentity({
+      activeIdentity: { accountKey: Uint8Array.from(key), devicePublicId: "device_registry_1", keyVersion: 1, userPublicId },
+      authEpoch: 1, credentialGeneration: 1, devicePublicId: "device_registry_1", status: "active", userPublicId,
+    });
+    const world = registryWorld(() => Promise.resolve(projection.registry), undefined, () => Promise.resolve(projection));
+    let registryRead = false;
+    const transport: CloudTransport = {
+      ...world.transport,
+      query: async (name, args) => {
+        const result = await world.transport.query(name, args);
+        if (name === "devices:getRegistry") registryRead = true;
+        return result;
+      },
+    };
+    const daemon = bridge({
+      cloud: world.cloud, device: world.device, identity: mutable, local: world.local, transport,
+      daemonAuthorityFence: { assertCurrent: async () => {
+        if (registryRead && mutable.current.status === "active") {
+          mutable.current = { ...mutable.current, activeIdentity: { ...mutable.current.activeIdentity, accountKey: new Uint8Array(32) } };
+          registryRead = false;
+        }
+      } },
+    });
+    expect((await daemon.cycle(new AbortController().signal)).errors)
+      .toContain("device registry: Cloud identity changed during registry publication.");
+    expect(world.writes).toHaveLength(0);
+  });
+
+  test("captures key bytes and rejects an identity change during the awaited projection read", async () => {
+    const projection = defaultProfileProjection();
+    const accountKey = Uint8Array.from(key);
+    const mutable = new MutableIdentity({
+      activeIdentity: { accountKey, devicePublicId: "device_registry_1", keyVersion: 1, userPublicId },
+      authEpoch: 1, credentialGeneration: 1, devicePublicId: "device_registry_1", status: "active", userPublicId,
+    });
+    let changeKey = false;
+    const world = registryWorld(() => Promise.resolve(projection.registry), undefined, () => {
+      if (changeKey) accountKey[0] = (accountKey[0] ?? 0) ^ 1;
+      return Promise.resolve(projection);
+    });
+    world.profileBindingProjectionVersion = 1;
+    const daemon = bridge({ cloud: world.cloud, device: world.device, identity: mutable, local: world.local, transport: world.transport });
+    const signal = new AbortController().signal;
+    expect((await daemon.cycle(signal)).errors).toEqual([]);
+    changeKey = true;
+    const refused = await daemon.cycle(signal);
+    expect(refused.errors).toContain("device registry: Cloud identity changed during registry publication.");
+    expect(refused.commandRequestVersion).toBeNull();
+    expect(world.writes).toHaveLength(1);
+    changeKey = false;
+    expect((await daemon.cycle(signal)).errors).toEqual([]);
+    expect(world.profileBindingWrites).toEqual([undefined, undefined]);
+  });
+
+  test("retains the immediate daemon fence after the final identity acquisition", async () => {
+    const projection = defaultProfileProjection();
+    const world = registryWorld(() => Promise.resolve(projection.registry), undefined, () => Promise.resolve(projection));
+    const baseIdentity = identity(world.device);
+    let daemonCurrent = true;
+    const daemon = bridge({
+      cloud: world.cloud, device: world.device, local: world.local, transport: world.transport,
+      daemonAuthorityFence: { assertCurrent: async () => {
+        if (!daemonCurrent) throw new Error("daemon authority replaced during identity acquisition");
+      } },
+      identity: {
+        ...baseIdentity,
+        requireActive: async (signal) => {
+          const active = await baseIdentity.requireActive(signal);
+          daemonCurrent = false;
+          return active;
+        },
+      },
+    });
+    const result = await daemon.cycle(new AbortController().signal);
+    expect(result.commandRequestVersion).toBeNull();
+    expect(result.errors).toContain("device registry: daemon authority replaced during identity acquisition");
+    expect(world.writes).toHaveLength(0);
+  });
+
+  test("changing account key bytes between cycles drops negotiated support and the cached revision", async () => {
+    const projection = defaultProfileProjection();
+    const accountKey = Uint8Array.from(key);
+    const mutable = new MutableIdentity({
+      activeIdentity: { accountKey, devicePublicId: "device_registry_1", keyVersion: 1, userPublicId },
+      authEpoch: 1, credentialGeneration: 1, devicePublicId: "device_registry_1", status: "active", userPublicId,
+    });
+    const world = registryWorld(() => Promise.resolve(projection.registry), undefined, () => Promise.resolve(projection));
+    world.profileBindingProjectionVersion = 1;
+    const daemon = bridge({ cloud: world.cloud, device: world.device, identity: mutable, local: world.local, transport: world.transport });
+    const signal = new AbortController().signal;
+    expect((await daemon.cycle(signal)).errors).toEqual([]);
+    accountKey[0] = (accountKey[0] ?? 0) ^ 1;
+    expect((await daemon.cycle(signal)).errors).toEqual([]);
+    expect(world.profileBindingWrites).toEqual([undefined, undefined]);
+    expect(world.writes).toEqual([{ expectedRevision: 0 }, { expectedRevision: 1 }]);
+  });
+
+  test("refuses incoherent producer aliases without publishing any profile claim", async () => {
+    const projection = defaultProfileProjection();
+    const world = registryWorld(() => Promise.resolve(projection.registry), undefined, () => Promise.resolve({
+      ...projection, registry: { ...projection.registry, defaultPreset: "low" },
+    }));
+    const daemon = bridge({ cloud: world.cloud, device: world.device, local: world.local, transport: world.transport });
+    expect((await daemon.cycle(new AbortController().signal)).errors)
+      .toEqual(["device registry: Local default profile projection is incoherent."]);
+    expect(world.writes).toHaveLength(0);
+  });
 
   test("publishes on start, republishes on change, and otherwise heartbeats at most once a minute", async () => {
     let projection: DeviceRegistryPayload = { ...registry, heartbeatAt: 1_000 };

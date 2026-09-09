@@ -248,6 +248,9 @@ const privacyBlocks: readonly ContentBlock[] = [
     text("A browser device holds the account key and decrypted projection only in that tab's memory by default. HRA does not programmatically write decrypted provider or session text to the clipboard, but browser extensions, accessibility APIs, screenshots, and explicit user selection can observe rendered text."),
   ),
   paragraph(
+    text("The website and app save your theme and appearance choices in this browser. This record contains only those two choices and is not sent to HRA."),
+  ),
+  paragraph(
     text("HRA uses Convex to authenticate the HRA identity and store server-visible metadata plus encrypted projections. Convex receives the verified email address and the service metadata described above, but not the keys required to decrypt session content."),
   ),
   paragraph(

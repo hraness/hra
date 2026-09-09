@@ -402,10 +402,10 @@ test("owned primitives route every class attribute through compiled presentation
   expect(globalCss).not.toContain('@import "tailwindcss"');
   expect(globalCss).not.toContain("@theme");
   expect(globalCss).not.toContain(".attention-glow");
-  expect(globalCss).toContain("--color-accent: oklch(0.72 0.14 220)");
-  expect(main).toContain('import "@hraness/ui/compiler-foundation.css"');
+  expect(globalCss).toContain("--color-accent: var(--primary)");
+  expect(main).toContain('import "@hraness/design-kit/compiler-palettes.css"');
   expect(main).toContain('import "./index.css"');
-  expect(main.indexOf('import "@hraness/ui/compiler-foundation.css"')).toBeLessThan(
+  expect(main.indexOf('import "@hraness/design-kit/compiler-palettes.css"')).toBeLessThan(
     main.indexOf('import "./index.css"'),
   );
 });

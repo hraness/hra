@@ -29,7 +29,8 @@ import type {
   ProviderAccountId,
   ProviderAccountReadiness,
 } from "../domain/provider-accounts";
-import type { Provider } from "../domain/presets";
+import { activePresetBinding, type Provider } from "../domain/presets";
+import { decodeHistoricalPresetProfile } from "../domain/canonical-profile";
 import {
   classifyPermissionCategory,
   computeInteractionPresentation,
@@ -3733,12 +3734,24 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
     if (notificationHours.revision !== notificationEmail.revision) {
       throw new Error("NOTIFICATION_POLICY_REVISION_DIVERGED");
     }
+    // Read the tier once. Its current Codex interpretation belongs to this
+    // publishing binary, not to a browser build or any established session.
+    const defaultPreset = this.#store.readDefaultPreset();
+    if (defaultPreset !== "low" && defaultPreset !== "high" && defaultPreset !== "ultra") {
+      throw new Error("DEFAULT_CODEX_PROFILE_INVALID");
+    }
+    const defaultProfile = decodeHistoricalPresetProfile({
+      contract: activePresetBinding(defaultPreset).contract,
+      preset: defaultPreset,
+      provider: "codex",
+    });
+    if (defaultProfile === null) throw new Error("DEFAULT_CODEX_PROFILE_INVALID");
     const registry = {
       accountLinkingAllowed: deviceCommandPolicy.accountLinkingAllowed,
       accounts,
       daemonVersion: registryLabel(HRA_VERSION, "unknown", deviceRegistryLimits.versionCharacters),
       defaultApprovalMode: this.#store.readDefaultApprovalMode(),
-      defaultPreset: this.#store.readDefaultPreset(),
+      defaultPreset,
       deviceCommandsAllowed: deviceCommandPolicy.deviceCommandsAllowed,
       heartbeatAt: this.#registryNow(),
       machineLabel: this.#machineLabel,
@@ -3753,6 +3766,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
       notificationEmail,
       notificationHours,
       notificationPolicyRevision: notificationEmail.revision,
+      profileBinding: { preset: defaultPreset, profileKey: defaultProfile.key },
       registry,
     };
   }

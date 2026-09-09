@@ -269,6 +269,7 @@ export default defineSchema({
     notificationEmailEnvelope: v.optional(encryptedEnvelope),
     notificationHoursEnvelope: v.optional(encryptedEnvelope),
     notificationPolicyRevision: v.optional(v.number()),
+    profileBindingEnvelope: v.optional(encryptedEnvelope),
     revision: v.number(),
     updatedAt: v.number(),
     userId: v.id("users"),

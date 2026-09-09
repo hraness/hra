@@ -19,6 +19,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { findSection, type ContentBlock, type InlineContent, type PublicContent } from "./content.ts";
 import { heroExampleMeasureClassName, mobileHeaderFlowClassName } from "./marketing.stylex.ts";
 import { sitePresentationClasses, type SitePresentationSlot } from "./presentation.stylex.ts";
+import { SiteAppearanceMenu } from "./appearance-menu.tsx";
 
 const classes = (hook: string, ...slots: readonly SitePresentationSlot[]): string =>
   [hook, sitePresentationClasses(...slots)].filter(Boolean).join(" ");
@@ -80,6 +81,7 @@ export function renderMarketingHeader(content: PublicContent, currentPath: "/" |
   return renderToStaticMarkup(
     <MarketingSiteHeader
       className={mobileHeaderFlowClassName()}
+      trailing={<SiteAppearanceMenu />}
       action={{ emphasis: "primary", href: "/#install-command", label: `Install ${content.productName}` }}
       brand={content.productName}
       brandHref="/"

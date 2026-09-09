@@ -1,10 +1,6 @@
 import { z } from "zod";
 
-import {
-  presetContractSchema,
-  presetSchema,
-  providerSchema,
-} from "./presets";
+import type { Preset, PresetContract } from "./presets";
 
 /**
  * Immutable historical identities, not selectors or capability receipts.
@@ -53,21 +49,9 @@ const historicalPresetKeys = Object.freeze({
     astra: "devin:gpt-6-astra:provider-default",
   }),
 } as const satisfies Readonly<Record<
-  z.infer<typeof presetContractSchema>,
-  Readonly<Record<z.infer<typeof presetSchema>, CanonicalProfileKey | null>>
+  PresetContract,
+  Readonly<Record<Preset, CanonicalProfileKey | null>>
 >>);
-
-const historicalTupleSchema = z.object({
-  provider: providerSchema,
-  model: z.enum(["gpt-5.6-luna", "gpt-5.6-sol", "gpt-6-astra", "claude-fable-5-1"]),
-  effort: z.enum(["max", "ultra", "provider-default"]),
-}).strict();
-
-const historicalPresetSchema = z.object({
-  provider: providerSchema,
-  preset: presetSchema,
-  contract: presetContractSchema,
-}).strict();
 
 /**
  * Snapshot exactly the expected own enumerable scalar data properties.
@@ -112,20 +96,22 @@ export const decodeHistoricalProfileKey = (input: unknown): CanonicalProfile | n
 /** Decode a complete historical tuple without inferring provider or effort. */
 export const decodeHistoricalProfileTuple = (input: unknown): CanonicalProfile | null => {
   const snapshot = snapshotFields(input, ["provider", "model", "effort"]);
-  const parsed = historicalTupleSchema.safeParse(snapshot);
-  if (!parsed.success) return null;
+  if (snapshot === null) return null;
+  // Match the closed catalog directly. Eager object-schema construction probes
+  // dynamic code generation and violates the browser's strict CSP on import.
   return canonicalProfileCatalog.find((profile) =>
-    profile.provider === parsed.data.provider
-    && profile.model === parsed.data.model
-    && profile.effort === parsed.data.effort) ?? null;
+    profile.provider === snapshot.provider
+    && profile.model === snapshot.model
+    && profile.effort === snapshot.effort) ?? null;
 };
 
 /** Decode a row's own frozen provider/alias/contract, never active defaults. */
 export const decodeHistoricalPresetProfile = (input: unknown): CanonicalProfile | null => {
   const snapshot = snapshotFields(input, ["provider", "preset", "contract"]);
-  const parsed = historicalPresetSchema.safeParse(snapshot);
-  if (!parsed.success) return null;
-  const key = historicalPresetKeys[parsed.data.contract][parsed.data.preset];
+  if (snapshot === null || (snapshot.contract !== 1 && snapshot.contract !== 2)) return null;
+  const bindings = historicalPresetKeys[snapshot.contract];
+  if (typeof snapshot.preset !== "string" || !Object.hasOwn(bindings, snapshot.preset)) return null;
+  const key = bindings[snapshot.preset as keyof typeof bindings];
   const profile = decodeHistoricalProfileKey(key);
-  return profile?.provider === parsed.data.provider ? profile : null;
+  return profile?.provider === snapshot.provider ? profile : null;
 };

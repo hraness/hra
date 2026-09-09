@@ -1,3 +1,4 @@
+import { AppearanceButton } from "../components/appearance";
 import * as stylex from "@stylexjs/stylex";
 import {
   useCallback,
@@ -459,6 +460,7 @@ export function GridScreen({
             </Button>
           </form>
           <Button onClick={custody.lock} size="small" variant="ghost">Lock</Button>
+          <AppearanceButton />
         </div>
         {starting && startTarget !== null ? (
           <div {...stylex.props(gridScreenStyles.controls)}>
