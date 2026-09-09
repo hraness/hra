@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import fc from "fast-check";
+import { spawnSync } from "node:child_process";
 
 import {
   canonicalProfileCatalog,
@@ -37,6 +38,48 @@ const decoders = [
 ] as const;
 
 describe("canonical historical profile identities", () => {
+  test("cold browser-safe imports and decoders never attempt dynamic code generation", () => {
+    const result = spawnSync(process.execPath, ["--eval", `
+      import assert from "node:assert/strict";
+      let attempts = 0;
+      const refuse = () => { attempts += 1; throw new EvalError("CSP probe refused"); };
+      globalThis.Function = new Proxy(globalThis.Function, { apply: refuse, construct: refuse });
+      assert.throws(() => Reflect.construct(globalThis.Function, [""]), EvalError);
+      assert.throws(() => Reflect.apply(globalThis.Function, undefined, [""]), EvalError);
+      assert.equal(attempts, 2, "The sentinel must detect both code-generation entry points");
+      attempts = 0;
+      const profiles = await import(${JSON.stringify(new URL("./canonical-profile.ts", import.meta.url).href)});
+      const payloads = await import(${JSON.stringify(new URL("../cloud/payloads.ts", import.meta.url).href)});
+      for (const profile of profiles.canonicalProfileCatalog) {
+        assert.equal(profiles.decodeHistoricalProfileKey(profile.key), profile);
+        assert.equal(profiles.decodeHistoricalProfileTuple({
+          provider: profile.provider, model: profile.model, effort: profile.effort,
+        }), profile);
+      }
+      const observation = {
+        version: 1, preset: "ultra", profileKey: "codex:gpt-5.6-sol:ultra",
+        observedAt: 1, registryRevision: 1, registryEnvelopeDigest: "a".repeat(64),
+      };
+      assert.deepEqual(payloads.parseProfileBindingPayload(observation), observation);
+      assert.equal(payloads.parseProfileBindingPayload({ ...observation, preset: "low" }), null);
+      assert.equal(profiles.decodeHistoricalPresetProfile({
+        provider: "codex", preset: "ultra", contract: 1,
+      })?.key, observation.profileKey);
+      assert.equal(profiles.decodeHistoricalPresetProfile({
+        provider: "codex", preset: "constructor", contract: 1,
+      }), null);
+      const accessor = Object.defineProperty({}, "provider", {
+        enumerable: true, get() { throw new Error("Accessor invoked"); },
+      });
+      assert.equal(profiles.decodeHistoricalProfileTuple(accessor), null);
+      assert.equal(profiles.decodeHistoricalPresetProfile(accessor), null);
+      assert.equal(attempts, 0, "Browser-safe profile imports must not probe or compile dynamic code");
+    `], { encoding: "utf8", timeout: 10_000, maxBuffer: 64 * 1024 });
+    expect(result.error).toBeUndefined();
+    expect(result.signal).toBeNull();
+    expect(result.status, result.stderr).toBe(0);
+  });
+
   test("pins seven unique immutable keys and exact tuples", () => {
     expect(canonicalProfileCatalog).toEqual(expectedCatalog);
     expect(canonicalProfileKeySchema.options).toEqual(expectedCatalog.map((profile) => profile.key));

@@ -5102,6 +5102,71 @@ describe("remote interaction detail and the decisions it licenses", () => {
 describe("settings commands and the device registry", () => {
   const leaseAuthority = { bootGeneration: 1, bootId: "boot_00000001", fence: 1 } as const;
 
+  test("captures one Codex default binding without deriving it from an established session", async () => {
+    const value = await fixture();
+    let reads = 0;
+    const readDefault = value.store.readDefaultPreset.bind(value.store);
+    Object.defineProperty(value.store, "readDefaultPreset", {
+      configurable: true,
+      value: () => { reads += 1; return readDefault(); },
+    });
+    const adapter = new StateBackedCloudDaemonAdapter({
+      executeRemote: () => { throw new Error("default observation must not invoke a command"); },
+      gatewayKeyCustody: { hasKey: () => Promise.resolve(false), setKey: () => Promise.resolve() },
+      paths: value.paths,
+      readSessionProjectionForCloud: () => { throw new Error("default observation must not read a session"); },
+      store: value.store,
+    });
+    try {
+      expect(value.store.requireSession(value.sessionId).preset).toBe("high");
+      const signal = new AbortController().signal;
+      expect(await adapter.readDeviceRegistryProjection({ signal })).toMatchObject({
+        profileBinding: { preset: "ultra", profileKey: "codex:gpt-5.6-sol:ultra" },
+        registry: { defaultPreset: "ultra" },
+      });
+      expect(reads).toBe(1);
+      value.store.setDefaultPreset("low");
+      expect(await adapter.readDeviceRegistryProjection({ signal })).toMatchObject({
+        profileBinding: { preset: "low", profileKey: "codex:gpt-5.6-luna:max" },
+        registry: { defaultPreset: "low" },
+      });
+      expect(reads).toBe(2);
+      value.store.setDefaultPreset("fable-max");
+      expect(await adapter.readDeviceRegistryProjection({ signal })).toMatchObject({
+        profileBinding: { preset: "ultra", profileKey: "codex:gpt-5.6-sol:ultra" },
+        registry: { defaultPreset: "ultra" },
+      });
+      expect(reads).toBe(3);
+    } finally {
+      await adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("captures the current tier after asynchronous custody work completes", async () => {
+    const value = await fixture();
+    const adapter = new StateBackedCloudDaemonAdapter({
+      executeRemote: () => Promise.resolve({}),
+      gatewayKeyCustody: {
+        hasKey: () => { value.store.setDefaultPreset("high"); return Promise.resolve(false); },
+        setKey: () => Promise.resolve(),
+      },
+      paths: value.paths,
+      readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
+      store: value.store,
+    });
+    try {
+      expect(value.store.readDefaultPreset()).toBe("ultra");
+      expect(await adapter.readDeviceRegistryProjection({ signal: new AbortController().signal })).toMatchObject({
+        profileBinding: { preset: "high", profileKey: "codex:gpt-5.6-sol:max" },
+        registry: { defaultPreset: "high" },
+      });
+    } finally {
+      await adapter.close();
+      value.store.close();
+    }
+  });
+
   test("applies every settings command locally and never reaches the provider", async () => {
     const value = await fixture();
     const commands: LocalCommand[] = [];

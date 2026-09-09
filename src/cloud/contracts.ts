@@ -30,6 +30,7 @@ export const cloudLimits = Object.freeze({
   notificationEmailCiphertextCharacters: 2_048,
   notificationHoursCiphertextCharacters: 4_096,
   pageSize: 100,
+  profileBindingCiphertextCharacters: 2_048,
   registryCiphertextCharacters: 65_536,
   resultCodeCharacters: 64,
 } as const);

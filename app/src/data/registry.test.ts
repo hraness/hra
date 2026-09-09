@@ -3,10 +3,13 @@ import { describe, expect, test } from "bun:test";
 import {
   encryptBytes,
   parseDeviceRegistryPayload,
+  profileBindingRegistryDigest,
   randomKeyBytes,
   type DeviceRegistryPayload,
   type EncryptedEnvelope,
+  type ProfileBindingPayload,
 } from "../hra/cloud";
+import { createCancellation } from "../lib/cancellation";
 import {
   decryptRegistryProjection,
   memorySummaryAad,
@@ -14,8 +17,10 @@ import {
   notificationHoursAad,
   parseRegistryRow,
   parseRegistryRows,
+  profileBindingAad,
   registryAad,
   registryProjectionCacheKey,
+  registryProjectionFromCache,
   type RegistryRow,
 } from "./registry";
 
@@ -59,7 +64,213 @@ function parseRow(value: unknown): RegistryRow {
   return parsed;
 }
 
+describe("read-only exact default companion", () => {
+  const authority = { devicePublicId, keyVersion: 1, userPublicId } as const;
+  const wireRow = (row: RegistryRow) => ({
+    devicePublicId: row.devicePublicId,
+    envelope: row.envelope,
+    keyVersion: row.keyVersion,
+    profileBindingEnvelope: row.profileBindingEnvelope,
+    revision: row.revision,
+    updatedAt: row.updatedAt,
+  });
+  async function fixture(registry = registryPayload()) {
+    const key = randomKeyBytes();
+    const envelope = await encryptedJson(registry, key, registryAad(authority));
+    const payload = {
+      observedAt: registry.heartbeatAt,
+      preset: "ultra",
+      profileKey: "codex:gpt-5.6-sol:ultra",
+      registryEnvelopeDigest: await profileBindingRegistryDigest(envelope),
+      registryRevision: 1,
+      version: 1,
+    } satisfies ProfileBindingPayload;
+    const profileBindingEnvelope = await encryptedJson(payload, key, profileBindingAad(authority));
+    const row = parseRow({ devicePublicId, envelope, keyVersion: 1, profileBindingEnvelope, revision: 1, updatedAt: 1 });
+    return { key, payload, registry, row };
+  }
+
+  test("distinguishes absent and malformed companions without dropping the registry", async () => {
+    const { key, row } = await fixture();
+    const legacy: Record<string, unknown> = wireRow(row);
+    delete legacy.profileBindingEnvelope;
+    const absent = parseRow(legacy);
+    expect(absent.profileBindingEnvelopeStatus).toBe("absent");
+    expect(await decryptRegistryProjection({ key, row: absent, userPublicId })).toMatchObject({
+      profileBinding: null,
+      profileBindingStatus: "unsupported",
+      registry: registryPayload(),
+    });
+    for (const profileBindingEnvelope of [
+      null,
+      {},
+      { ...row.profileBindingEnvelope, ciphertext: "not base64!" },
+      { ...row.profileBindingEnvelope, ciphertext: "A".repeat(2_049) },
+      { ...row.profileBindingEnvelope, keyVersion: 2 },
+      { ...row.profileBindingEnvelope, extra: true },
+    ]) {
+      const invalid = parseRow({ ...wireRow(row), profileBindingEnvelope });
+      expect(invalid.profileBindingEnvelopeStatus).toBe("invalid");
+      expect(await decryptRegistryProjection({ key, row: invalid, userPublicId })).toMatchObject({
+        profileBinding: null,
+        profileBindingStatus: "unreadable",
+        registry: registryPayload(),
+      });
+    }
+    expect(parseRegistryRow({ ...wireRow(row), profileBindingEnvelope: undefined })).toBeNull();
+  });
+
+  for (const [preset, profileKey] of [
+    ["low", "codex:gpt-5.6-luna:max"],
+    ["high", "codex:gpt-5.6-sol:max"],
+    ["ultra", "codex:gpt-5.6-sol:ultra"],
+    ["high", "codex:gpt-6-astra:max"],
+    ["ultra", "codex:gpt-6-astra:ultra"],
+  ] as const) {
+    test(`reads the publisher's ${profileKey} without rebinding ${preset}`, async () => {
+      const { key, payload, registry, row } = await fixture({ ...registryPayload(), defaultPreset: preset });
+      const observation = { ...payload, preset, profileKey };
+      const profileBindingEnvelope = await encryptedJson(observation, key, profileBindingAad(authority));
+      const projection = await decryptRegistryProjection({ key, row: parseRow({ ...wireRow(row), profileBindingEnvelope }), userPublicId });
+      expect(projection.profileBinding).toEqual(observation);
+      expect(projection.profileBindingStatus).toBe("available");
+      expect(projection.registry).toEqual(registry);
+      expect(projection.registry).not.toHaveProperty("profileKey");
+    });
+  }
+
+  test("refuses incoherent payloads and every registry association mismatch", async () => {
+    const { key, payload, row } = await fixture();
+    for (const change of [
+      { registryRevision: 2 },
+      { observedAt: payload.observedAt + 1 },
+      { registryEnvelopeDigest: "f".repeat(64) },
+      { preset: "high", profileKey: "codex:gpt-5.6-sol:max" },
+      { preset: "ultra", profileKey: "codex:gpt-6-astra:max" },
+      { profileKey: "claude:claude-fable-5-1:max" },
+      { profileKey: "codex:unknown:ultra" },
+      { version: 2 },
+      { observedAt: 0 },
+      { selectable: true },
+    ]) {
+      const profileBindingEnvelope = await encryptedJson({ ...payload, ...change }, key, profileBindingAad(authority));
+      const result = await decryptRegistryProjection({ key, row: parseRow({ ...wireRow(row), profileBindingEnvelope }), userPublicId });
+      expect(result.profileBinding).toBeNull();
+      expect(result.profileBindingStatus).toBe("unreadable");
+      expect(result.registry).toEqual(registryPayload());
+    }
+  });
+
+  test("refuses re-encrypted or replaced registry bytes even at the same revision", async () => {
+    const { key, row } = await fixture();
+    for (const registry of [
+      registryPayload(),
+      { ...registryPayload(), heartbeatAt: registryPayload().heartbeatAt + 1 },
+      { ...registryPayload(), defaultPreset: "high" as const },
+    ]) {
+      const envelope = await encryptedJson(registry, key, registryAad(authority));
+      const result = await decryptRegistryProjection({ key, row: parseRow({ ...wireRow(row), envelope }), userPublicId });
+      expect(result).toMatchObject({ profileBinding: null, profileBindingStatus: "unreadable", registry });
+    }
+  });
+
+  test("refuses tampering, wrong user, device, key, and AAD kind independently", async () => {
+    const { key, payload, row } = await fixture();
+    if (row.profileBindingEnvelope === null) throw new Error("missing companion fixture");
+    const ciphertext = row.profileBindingEnvelope.ciphertext;
+    const first = ciphertext[0] === "A" ? "B" : "A";
+    const companions = [
+      { ...row.profileBindingEnvelope, ciphertext: first + ciphertext.slice(1) },
+      await encryptedJson(payload, key, profileBindingAad({ ...authority, userPublicId: "user_foreign" })),
+      await encryptedJson(payload, key, profileBindingAad({ ...authority, devicePublicId: "device_foreign" })),
+      await encryptedJson(payload, randomKeyBytes(), profileBindingAad(authority)),
+      await encryptedJson(payload, key, registryAad(authority)),
+      await encryptedJson(payload, key, notificationHoursAad(authority)),
+    ];
+    for (const profileBindingEnvelope of companions) {
+      expect(await decryptRegistryProjection({ key, row: parseRow({ ...wireRow(row), profileBindingEnvelope }), userPublicId }))
+        .toMatchObject({ profileBinding: null, profileBindingStatus: "unreadable", registry: registryPayload() });
+    }
+  });
+
+  test("immediately invalidates cached display on exact row replacement or authority change", async () => {
+    const { key, payload, row } = await fixture();
+    const projection = await decryptRegistryProjection({ key, row, userPublicId });
+    const cancellation = createCancellation();
+    const cache = {
+      key,
+      keyBytes: new Uint8Array(key),
+      live: cancellation.live,
+      projections: new Map([[registryProjectionCacheKey(row), projection]]),
+      userPublicId,
+    };
+    const read = (candidate: RegistryRow) => registryProjectionFromCache(cache, { key, row: candidate, userPublicId });
+    expect(read(row)).toBe(projection);
+    const replacement = await encryptedJson(payload, key, profileBindingAad(authority));
+    const replacementRegistry = await encryptedJson(registryPayload(), key, registryAad(authority));
+    const legacy: Record<string, unknown> = wireRow(row);
+    delete legacy.profileBindingEnvelope;
+    for (const candidate of [
+      parseRow({ ...wireRow(row), profileBindingEnvelope: replacement }),
+      parseRow({ ...wireRow(row), envelope: replacementRegistry }),
+      parseRow(legacy),
+      parseRow({ ...wireRow(row), profileBindingEnvelope: null }),
+      parseRow({ ...wireRow(row), revision: 2 }),
+      parseRow({ ...wireRow(row), devicePublicId: "device_foreign" }),
+      parseRow({ ...wireRow(row), envelope: { ...row.envelope, keyVersion: 2 }, keyVersion: 2 }),
+    ]) {
+      expect(registryProjectionCacheKey(candidate)).not.toBe(registryProjectionCacheKey(row));
+      expect(read(candidate)).toBeUndefined();
+    }
+    for (const current of [
+      { key: null, userPublicId },
+      { key, userPublicId: null },
+      { key, userPublicId: "user_foreign" },
+      { key: randomKeyBytes(), userPublicId },
+      { key: new Uint8Array(key), userPublicId },
+    ]) expect(registryProjectionFromCache(cache, { ...current, row })).toBeUndefined();
+    expect(registryProjectionFromCache(null, { key, row, userPublicId })).toBeUndefined();
+    expect(registryProjectionCacheKey(parseRow({ ...wireRow(row), envelope: {
+      nonce: row.envelope.nonce,
+      keyVersion: row.envelope.keyVersion,
+      ciphertext: row.envelope.ciphertext,
+      algorithm: row.envelope.algorithm,
+    } }))).toBe(registryProjectionCacheKey(row));
+    const firstByte = key[0];
+    if (firstByte === undefined) throw new Error("invalid key fixture");
+    key[0] = firstByte ^ 1;
+    expect(read(row)).toBeUndefined();
+    key[0] = firstByte;
+    expect(read(row)).toBe(projection);
+    cancellation.cancel();
+    expect(read(row)).toBeUndefined();
+    // Cleanup and custody can wipe both arrays in place; matching zeros must
+    // not revive a cancelled read or expose its already-decrypted projection.
+    cache.keyBytes.fill(0);
+    key.fill(0);
+    expect(read(row)).toBeUndefined();
+  });
+});
+
 describe("notification policy registry compatibility", () => {
+  test("keeps an old registry readable without claiming an exact default profile", () => {
+    expect(parseRow({
+      devicePublicId,
+      envelope: {
+        algorithm: "A256GCM",
+        ciphertext: "A".repeat(32),
+        keyVersion: 1,
+        nonce: "B".repeat(16),
+      },
+      keyVersion: 1,
+      revision: 1,
+      updatedAt: 1,
+    })).toMatchObject({
+      profileBindingEnvelope: null,
+      profileBindingEnvelopeStatus: "absent",
+    });
+  });
+
   test("distinguishes absent legacy fields from malformed and wrong-key envelopes", () => {
     const envelope = {
       algorithm: "A256GCM",
