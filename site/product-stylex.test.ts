@@ -82,3 +82,8 @@ test("real-UI frames have no native border and their controls preserve selected 
   expect(await cssFor("product-preview.stylex.ts", "figure")).toContain("scroll-margin-top:5rem");
   expect(await cssFor("product-preview.stylex.ts", "viewport")).toContain("@media(max-width:48rem)");
 });
+
+test("the expanded dialog restores centering after the document resets native margins", async () => {
+  const dialog = await cssFor("product-preview.stylex.ts", "dialog");
+  for (const side of allSides) expect(dialog).toContain(`margin-${side}:auto`);
+});

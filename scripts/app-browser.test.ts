@@ -3,8 +3,48 @@ import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { assertAppColorScheme, assertDefaultButtonPresentation, assertNativeModalFocus, assertProductPreviewObservation, assetContentType, assetPath, boundedBrowserOperation, browserExecutableSha256, browserFailureDetails, inventory, loadedStylesheetControl, productionCsp, siteFoundationFontPaths, siteProductionCsp, siteStylesheetPaths, snapshotProductPreview, snapshotStaticSite } from "./app-browser";
+import { runInNewContext } from "node:vm";
+import { assertAppColorScheme, assertDefaultButtonPresentation, assertNativeModalFocus, assertProductPreviewObservation, assetContentType, assetPath, boundedBrowserOperation, browserExecutableSha256, browserFailureDetails, installBrowserServiceWorkerRefusal, inventory, loadedStylesheetControl, productionCsp, siteFoundationFontPaths, siteProductionCsp, siteStylesheetPaths, snapshotProductPreview, snapshotStaticSite } from "./app-browser";
 import { browserIoModules } from "../app/fixtures/browser/config";
+
+describe("browser service-worker refusal", () => {
+  test("the exact initializer never reads the opaque-frame getter and cannot reach native registration", async () => {
+    let getterReads = 0, nativeCalls = 0;
+    const errors: string[] = [];
+    const navigator = Object.defineProperty({}, "serviceWorker", { get() {
+      getterReads += 1;
+      throw new DOMException("Service worker is disabled because the context is sandboxed", "SecurityError");
+    } });
+    class NativeContainer { register() { nativeCalls += 1; return Promise.resolve(); } }
+    runInNewContext(`(${installBrowserServiceWorkerRefusal.toString()})();`, {
+      navigator, ServiceWorkerContainer: NativeContainer, DOMException,
+      console: { error: (message: string) => errors.push(message) },
+    });
+    expect(getterReads).toBe(0);
+    const descriptor = Object.getOwnPropertyDescriptor(NativeContainer.prototype, "register");
+    expect(descriptor?.writable).toBe(false);
+    expect(descriptor?.configurable).toBe(false);
+    await expect(new NativeContainer().register()).rejects.toMatchObject({
+      name: "SecurityError", message: "Service workers are disabled during offline browser acceptance",
+    });
+    expect(nativeCalls).toBe(0);
+    expect(getterReads).toBe(0);
+    expect(errors).toEqual(["Browser acceptance refused service worker registration"]);
+    expect(() => Object.defineProperty(NativeContainer.prototype, "register", { value: () => undefined })).toThrow();
+    expect(() => { Reflect.get(navigator, "serviceWorker"); }).toThrow(DOMException);
+  });
+
+  test("a realm without the API stays unavailable without touching its navigator getter", () => {
+    let reads = 0;
+    const navigator = Object.defineProperty({}, "serviceWorker", { get() { reads += 1; throw new Error("Forbidden getter"); } });
+    expect(() => { runInNewContext(`(${installBrowserServiceWorkerRefusal.toString()})();`, { navigator }); }).not.toThrow();
+    expect(reads).toBe(0);
+    expect(() => { runInNewContext(`(${installBrowserServiceWorkerRefusal.toString()})();`, {
+      navigator, ServiceWorkerContainer: { prototype: {} },
+    }); }).toThrow("registration boundary is unavailable");
+    expect(reads).toBe(0);
+  });
+});
 
 const docsRoutes = ["docs", "docs/start", "docs/web", "docs/sessions", "docs/reference", "docs/status"];
 const exampleCsp = "default-src 'none'; script-src 'self'; style-src 'self'; img-src data: blob:; font-src 'self'; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'; worker-src 'none'";

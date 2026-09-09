@@ -65,7 +65,7 @@ const negativeStylesheetSubsteps = [
 type NegativeStylesheetSubstep = typeof negativeStylesheetSubsteps[number];
 type NegativeStylesheetReporter = (step: NegativeStylesheetSubstep, phase: "entered" | "settled" | "failed", error?: unknown) => void;
 const browserDiagnosticSteps = new Set([
-  "launch", "isolation:install", "page:create", "browser-census:connect", "browser-census:read", "browser-census:detach",
+  "launch", "isolation:install", "isolation:service-worker-refusal", "page:create", "browser-census:connect", "browser-census:read", "browser-census:detach",
   "production-anonymous:navigation", "production-anonymous:assertions", "production-anonymous:negative-css",
   "asymmetric-safe-area", "isolation:assertions", "cleanup", "complete",
   ...fixtureViews.flatMap((view) => ["navigation", "assertions", "screenshot"].map((step) => `fixture:${view}:${step}`)),
@@ -1132,6 +1132,58 @@ async function safeArea(page: Page, origin: string): Promise<void> {
   }
 }
 
+/** Serialized as one document initializer. Playwright 1.62.0's built-in block
+ * reads navigator.serviceWorker, whose getter throws in opaque frames. Refuse
+ * the native registration method without reading or replacing that getter. */
+export function installBrowserServiceWorkerRefusal(): void {
+  if (typeof ServiceWorkerContainer === "undefined") return;
+  const descriptor = Object.getOwnPropertyDescriptor(ServiceWorkerContainer.prototype, "register");
+  if (descriptor === undefined || typeof descriptor.value !== "function") {
+    throw new Error("Browser service-worker registration boundary is unavailable");
+  }
+  Object.defineProperty(ServiceWorkerContainer.prototype, "register", {
+    configurable: false, enumerable: descriptor.enumerable === true, writable: false,
+    value: async function register() {
+      console.error("Browser acceptance refused service worker registration");
+      throw new DOMException("Service workers are disabled during offline browser acceptance", "SecurityError");
+    },
+  });
+}
+
+/** One deliberate rejection, on an inert controlled page before app acceptance.
+ * No worker script exists at this path; even a broken refusal cannot activate
+ * one. This page has its own exact error expectation, not an app-error waiver. */
+async function verifyBrowserServiceWorkerRefusal(page: Page, site: Surface): Promise<void> {
+  const errors: string[] = [];
+  const workerRequests: string[] = [];
+  const note = (values: string[], message: string) => { if (values.length < 8) values.push(message.slice(0, 500)); };
+  const sentinel = "/service-worker-negative-control.js";
+  assert.equal(site.bytes.has(sentinel.slice(1)), false, "Service-worker control must not name a served script");
+  page.on("pageerror", (error) => note(errors, error.message));
+  page.on("console", (message) => { if (message.type() === "error") note(errors, message.text()); });
+  page.on("request", (request) => { if (new URL(request.url()).pathname === sentinel) note(workerRequests, request.method()); });
+  await page.goto(`${site.origin}/preview/`);
+  const result = await page.evaluate(async (path) => {
+    const descriptor = Object.getOwnPropertyDescriptor(ServiceWorkerContainer.prototype, "register");
+    const registrationsBefore = (await navigator.serviceWorker.getRegistrations()).length;
+    let rejection: { name: string; message: string } | undefined;
+    try { await navigator.serviceWorker.register(path); }
+    catch (error) {
+      if (!(error instanceof DOMException)) throw error;
+      rejection = { name: error.name, message: error.message };
+    }
+    return { rejection, registrationsBefore, registrationsAfter: (await navigator.serviceWorker.getRegistrations()).length,
+      controlled: navigator.serviceWorker.controller !== null, configurable: descriptor?.configurable, writable: descriptor?.writable };
+  }, sentinel);
+  assert.deepEqual(result, {
+    rejection: { name: "SecurityError", message: "Service workers are disabled during offline browser acceptance" },
+    registrationsBefore: 0, registrationsAfter: 0, controlled: false, configurable: false, writable: false,
+  });
+  assert.deepEqual(workerRequests, [], "Service-worker refusal reached the network");
+  assert.deepEqual(errors, ["Browser acceptance refused service worker registration"]);
+  assert.equal(page.context().serviceWorkers().length, 0, "Service-worker control created an actual worker");
+}
+
 async function isolate(context: BrowserContext, origins: ReadonlySet<string>): Promise<Readonly<{ blocked: string[]; errors: string[] }>> {
   const blocked: string[] = [];
   const errors: string[] = [];
@@ -1139,6 +1191,9 @@ async function isolate(context: BrowserContext, origins: ReadonlySet<string>): P
     if (list.length < 128) list.push(value.slice(0, 500));
     else if (list.length === 128) list.push("Diagnostic limit exceeded");
   };
+  assert.equal(context.serviceWorkers().length, 0, "Fresh browser profile has a service worker");
+  context.on("serviceworker", () => note(errors, "A service worker started during offline browser acceptance"));
+  await context.addInitScript(installBrowserServiceWorkerRefusal);
   context.on("page", (page) => {
     page.on("pageerror", (error) => { note(errors, error.message); });
     page.on("console", (message) => {
@@ -1259,7 +1314,9 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
           executablePath: executable, headless: true, viewport: { width: profile.width, height: profile.height },
           hasTouch: profile.coarse, isMobile: profile.coarse, deviceScaleFactor: 1,
           reducedMotion: profile.reduced ? "reduce" : "no-preference", forcedColors: profile.forced ? "active" : "none",
-          colorScheme: profile.colorScheme ?? "dark", locale: "en-US", timezoneId: "UTC", serviceWorkers: "block", permissions: [],
+          // isolate() installs and proves the getter-free registration refusal
+          // before application navigation. The unsafe built-in cannot coexist.
+          colorScheme: profile.colorScheme ?? "dark", locale: "en-US", timezoneId: "UTC", permissions: [],
           args: ["--disable-background-networking", "--disable-component-update", "--disable-sync", "--no-first-run"],
           timeout: 30_000,
         });
@@ -1272,7 +1329,13 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
         context.setDefaultTimeout(15_000);
         context.setDefaultNavigationTimeout(20_000);
         mark("isolation:install");
+        const serviceWorkerControl = await context.newPage();
         const isolation = await isolate(context, new Set(servers.map((server) => server.origin)));
+        try {
+          mark("isolation:service-worker-refusal");
+          await verifyBrowserServiceWorkerRefusal(serviceWorkerControl, site);
+          evidence.push({ name: `${profile.name}:service-worker-refusal`, values: { registrations: 0, requests: 0, workers: 0 } });
+        } finally { await serviceWorkerControl.close(); }
         mark("page:create");
         const page = await context.newPage();
         page.on("crash", () => note("page-crashed"));
@@ -1534,7 +1597,8 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
         }
         mark("isolation:assertions");
         assert.deepEqual(isolation.errors, [], "Browser runtime or resource failure");
-        evidence.push({ name: `${profile.name}:isolation`, values: { blocked: [...new Set(isolation.blocked)].sort(), cspErrors: 0, runtimeErrors: 0 } });
+        assert.equal(context.serviceWorkers().length, 0, "An actual service worker survived browser acceptance");
+        evidence.push({ name: `${profile.name}:isolation`, values: { blocked: [...new Set(isolation.blocked)].sort(), cspErrors: 0, runtimeErrors: 0, serviceWorkers: 0 } });
         })();
         await boundedBrowserOperation(profileWork, 120_000, `Browser profile ${profile.name}`, cancellation.signal);
       } catch (error) {

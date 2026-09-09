@@ -550,6 +550,14 @@ const reviewedSyntheticPackageHistoryEvidence: Readonly<Record<string, ReviewedS
     fixtures: Object.freeze(["other_ui", "foreign_package"] as const),
     patchSha256: "a93c5c423beacf7ec5068310ae648b994de67506b07d46e523739b8903458beb",
   }),
+  "166451a0354d5ecb6ca375feb1128a95ff7ff966": Object.freeze({
+    fixtures: Object.freeze(["other_ui"] as const),
+    patchSha256: "5d7b62c01ac47c3c74389d21b288c4526728c74d68d23c18719b00df09537ef4",
+  }),
+  "21176e6ca34e58574376f54a9098856a90d6cd56": Object.freeze({
+    fixtures: Object.freeze(["other_ui"] as const),
+    patchSha256: "6fc0a85da146a9a0ffc2b3f3407481e6e966e907e99db03e41a7dabb6d3bb749",
+  }),
 });
 const reviewedSyntheticPackageTokens: Readonly<Record<ReviewedSyntheticPackageFixture, string>> = Object.freeze({
   other_ui: ["@other", "ui"].join("/"),

@@ -46,6 +46,10 @@ describe("reviewed historical synthetic package fixtures", () => {
       patchSha256: "fa6583ec433c00d10d967214631fb4e04847515bb273cca51548388cb7c6ba7b" },
     { commit: "52579a5debfe1ee6c31dca0f31733a798c74c6aa", fixtures: ["other_ui", "foreign_package"],
       patchSha256: "a93c5c423beacf7ec5068310ae648b994de67506b07d46e523739b8903458beb" },
+    { commit: "166451a0354d5ecb6ca375feb1128a95ff7ff966", fixtures: ["other_ui"],
+      patchSha256: "5d7b62c01ac47c3c74389d21b288c4526728c74d68d23c18719b00df09537ef4" },
+    { commit: "21176e6ca34e58574376f54a9098856a90d6cd56", fixtures: ["other_ui"],
+      patchSha256: "6fc0a85da146a9a0ffc2b3f3407481e6e966e907e99db03e41a7dabb6d3bb749" },
   ] as const;
 
   test("binds the exact public-patch inventory without requiring branch ancestors in a squash clone", async () => {

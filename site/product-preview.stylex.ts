@@ -33,6 +33,7 @@ const styles = stylex.create({
   status: { margin: "0.4rem 0 0", fontSize: "0.75rem" },
   dialog: {
     width: "min(96vw, 100rem)", maxWidth: "96vw", maxHeight: "96dvh", padding: 0,
+    marginTop: "auto", marginRight: "auto", marginBottom: "auto", marginLeft: "auto",
     borderTopWidth: "1px", borderRightWidth: "1px", borderBottomWidth: "1px", borderLeftWidth: "1px",
     borderTopStyle: "solid", borderRightStyle: "solid", borderBottomStyle: "solid", borderLeftStyle: "solid",
     borderTopColor: "var(--rule)", borderRightColor: "var(--rule)", borderBottomColor: "var(--rule)", borderLeftColor: "var(--rule)",
