@@ -1,4 +1,5 @@
 import {
+  admittedReleaseVersion,
   findSection,
   publicContent,
   publicPins,
@@ -49,7 +50,7 @@ const setupNotice: ContentBlock = {
   kind: "notice",
   label: "Before you start a daemon",
   content: [
-    text(`You can install and check v${publicContent.releaseVersion} now. Initialization, daemon startup, and hosted command writers remain blocked on capacity. Complete the `),
+    text(`The v${publicContent.releaseVersion} candidate is not yet admitted. Install it only after its own immutable GitHub and npm release admission. Initialization, daemon startup, and hosted command writers remain blocked on capacity. Complete the `),
     link("rollout and update prerequisites", "/docs/status/#install-and-update"),
     text(" before the steps below. Installing the CLI or opening the app does not clear that gate."),
   ],
@@ -112,16 +113,16 @@ export const docsPages: readonly DocsPage[] = [
   {
     path: "/docs/start/",
     title: "Set up HRA",
-    description: "Install the released CLI, check your machine, then connect one provider account and start a conversation when rollout prerequisites are satisfied.",
+    description: "Check release admission before installing the CLI, then connect a provider account and start a conversation only when rollout prerequisites are satisfied.",
     keywords: ["install", "setup", "login", "first session", "Bun"],
-    reviewDate: "2026-09-08",
+    reviewDate: "2026-09-09",
     admission: {
       owner: "Hraness",
-      checkedOn: "2026-09-08",
+      checkedOn: "2026-09-09",
       reassessOn: "2026-10-06",
       decision: "keep",
       readerJob: "Install HRA safely and understand the shortest path to a first local conversation.",
-      contribution: "An ordered installer-to-session path uses the exact admitted installer and puts the still-closed startup boundary before the first state-changing setup command.",
+      contribution: "An ordered installer-to-session path binds the exact release installer to its own artifact admission and puts the still-closed startup boundary before the first state-changing setup command.",
       overlapDecision: "The homepage offers a product overview, Sessions covers an existing setup, and Status owns upgrade and rollout detail. This page alone owns first-run order.",
       evidence: ["src/install-preflight.ts", "src/cli/parser.ts", "site/content.ts", "docs/beta-release-notes.md"],
       scores: [2, 2, 2, 2, 2, 1],
@@ -131,6 +132,15 @@ export const docsPages: readonly DocsPage[] = [
         id: "install",
         heading: "1. Install and check the CLI",
         blocks: [
+          {
+            kind: "notice",
+            label: "Candidate artifact not yet admitted",
+            content: [
+              text(`Only after immutable GitHub and npm release admission may you run the v${publicContent.releaseVersion} candidate install command below. For the admitted v${admittedReleaseVersion} artifact, use its `),
+              link("immutable README", `https://github.com/hraness/hra/tree/v${admittedReleaseVersion}#install-and-update`),
+              text(". Neither artifact admission nor installation authorizes daemon startup."),
+            ],
+          },
           commands(publicContent.installCommand),
           paragraph(text(`Use macOS or Linux with Bun ${publicPins.bun} and curl. The installer verifies the immutable v${publicContent.releaseVersion} release before replacing the HRA command. It does not start the daemon.`)),
           commands("hra --version", publicContent.doctorCommand),
@@ -175,11 +185,11 @@ export const docsPages: readonly DocsPage[] = [
     title: "Use the web app",
     description: "Pair a browser, see which sessions need you, and direct work on your own machines from the session grid.",
     keywords: ["web app", "browser", "pairing", "grid", "settings", "questions"],
-    reviewDate: "2026-09-08",
+    reviewDate: "2026-09-09",
     previewId: "overview",
     admission: {
       owner: "Hraness",
-      checkedOn: "2026-09-08",
+      checkedOn: "2026-09-09",
       reassessOn: "2026-10-06",
       decision: "keep",
       readerJob: "Enroll a browser and use HRA's real grid, conversation, and Settings screens without mistaking a browser for an execution machine.",
@@ -366,10 +376,10 @@ export const docsPages: readonly DocsPage[] = [
     title: "Availability and release status",
     description: "What is released, what each provider supports, and which runtime rollout prerequisites still apply to HRA.",
     keywords: ["release", "availability", "platforms", "Codex", "Claude", "upgrade"],
-    reviewDate: "2026-09-08",
+    reviewDate: "2026-09-09",
     admission: {
       owner: "Hraness",
-      checkedOn: "2026-09-08",
+      checkedOn: "2026-09-09",
       reassessOn: "2026-09-22",
       decision: "keep",
       readerJob: "Decide whether to install, initialize, upgrade, or use a provider without confusing released files with operational readiness.",
@@ -381,9 +391,10 @@ export const docsPages: readonly DocsPage[] = [
     sections: [
       {
         id: "current-release",
-        heading: `v${publicContent.releaseVersion} is released. Runtime rollout is separate.`,
+        heading: `v${publicContent.releaseVersion} is a candidate. v${admittedReleaseVersion} remains admitted.`,
         blocks: [
-          paragraph(text(`The v${publicContent.releaseVersion} CLI passed immutable GitHub and npm artifact admission. You can install it and run `), code("hra doctor --offline"), text(". The public website, browser app, and open-beta sync service are available; their availability does not authorize starting the current daemon or sending new hosted commands.")),
+          paragraph(text(`The v${admittedReleaseVersion} CLI passed immutable GitHub and npm artifact admission. The v${publicContent.releaseVersion} candidate is not yet admitted and requires its own immutable GitHub and npm proof. For the admitted predecessor, use its `), link("immutable README", `https://github.com/hraness/hra/tree/v${admittedReleaseVersion}#install-and-update`), text(" to install and run "), code("hra doctor --offline"), text(". The public website, browser app, and open-beta sync service are available; their availability does not authorize starting the current daemon or sending new hosted commands.")),
+          paragraph(text(`The v${publicContent.releaseVersion} candidate adds read-only exact Codex default-profile observation. The display remains unavailable until the intended daemon publishes a matching fresh companion after its rollout gates pass. This does not change Ultra defaults, admit models, choose a route, or authorize a command.`)),
           { kind: "notice", label: "Current runtime hold", content: [text(publicContent.daemonRolloutNotice)] },
           paragraph(text("The operator must complete protected capacity activation, then prove the current daemon and every intended target before enabling writers. Installing a release, signing in, or loading a fresh browser tab does not substitute for those proofs. "), link("Release record", source("docs/beta-release.md")), text(" · "), link("Hosted rollout procedure", source("docs/hosted-sync.md#converge-command-lifecycle-capacity-before-writer-rollout"))),
         ],

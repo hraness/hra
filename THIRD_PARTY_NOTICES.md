@@ -12,4 +12,6 @@ The isolated product examples on hra.sh incorporate MIT-licensed `@hraness/direc
 
 HRA validates trajectory exports during development against Apache-2.0-licensed `@letta-ai/trajectory` 0.3.0 and MIT-licensed Ajv 8.20.0. These development dependencies are not runtime dependencies of the published CLI.
 
+The `v0.7.1` candidate records its build graph in `bun.lock`, while its install tarball declares direct runtime dependency versions in `package.json`. This candidate is not yet admitted and cannot inherit an earlier version's publication or provenance evidence. Its own release workflow must verify the exact source, tarball and public provenance before admission.
+
 The admitted `v0.7.0` release records its build graph in `bun.lock`, while the install tarball declares its direct runtime dependency versions in `package.json`. Its release workflow bound the immutable source tag, published the exact tarball plus `SHA256SUMS` on GitHub and the same tarball on npm through trusted publishing, and verified the public bytes and cryptographic provenance before final admission. The tarball does not vendor transitive dependencies. Dependency packages retain their own license texts and source metadata.

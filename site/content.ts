@@ -287,18 +287,18 @@ export const siteDocumentPaths: readonly string[] = [
   "/privacy/",
 ];
 
-export const publicReleaseState: "live" | "release-ready" | "staged" = "live";
+export const publicReleaseState: "live" | "release-ready" | "staged" = "staged";
 
 const betaInstallCommand = buildHraGlobalInstallCommand(
-  "https://github.com/hraness/hra/releases/download/v0.7.0/hraness-hra-0.7.0.tgz",
+  "https://github.com/hraness/hra/releases/download/v0.7.1/hraness-hra-0.7.1.tgz",
 );
 
 const productName = "HRA";
 const tagline = "Workspace for Codex and Claude Code";
 const providerRoadmap = "Codex and Claude Code, side by side.";
-const releaseVersion = "0.7.0";
-const admittedReleaseVersion = releaseVersion;
-const daemonRolloutNotice = `Current daemon and hosted command-writer rollout remains blocked on capacity. Do not initialize, start, or autostart the admitted v${admittedReleaseVersion} daemon until the hosted operator records protected two-pass zero-debt capacity evidence and its exact .activated readback receipt. Artifact availability and the live sync service do not clear this gate. After activation, complete the update runbook's daemon and target marker-2 proofs before globally enabling hosted writers.`;
+const releaseVersion = "0.7.1";
+export const admittedReleaseVersion = "0.7.0";
+const daemonRolloutNotice = `Current daemon and hosted command-writer rollout remains blocked on capacity. Do not initialize, start, or autostart either the admitted v${admittedReleaseVersion} daemon or the v${releaseVersion} candidate until the hosted operator records protected two-pass zero-debt capacity evidence and its exact .activated readback receipt. Artifact availability and the live sync service do not clear this gate. After activation, complete the update runbook's daemon and target marker-2 proofs before globally enabling hosted writers.`;
 
 /** Public runtime pins come from their authoritative source modules. */
 export const publicPins = {
@@ -358,7 +358,7 @@ export const publicContent: PublicContent = {
   thesis: `${productName} brings your Codex and Claude Code sessions into one workspace. Follow the work in your browser, direct it from your terminal, and keep execution on your own machines.`,
   description: "A workspace for Codex and Claude Code. See your sessions, follow conversations, and direct the next turn from your browser or terminal.",
   daemonRolloutNotice,
-  statusLine: `Status: public beta. Local CLI v${releaseVersion} is the fully admitted public artifact. Codex runs on macOS and Linux, Claude Code on Linux; hosted sync is live as an ${hostedBetaLabel}. Current daemon and hosted command-writer rollout remains blocked on capacity.`,
+  statusLine: `Status: public beta. Local CLI v${releaseVersion} is a release candidate; v${admittedReleaseVersion} remains the fully admitted public artifact. Codex runs on macOS and Linux, Claude Code on Linux; hosted sync is live as an ${hostedBetaLabel}. Current daemon and hosted command-writer rollout remains blocked on capacity.`,
   badges,
   maintainer: {
     name: "Hraness",
@@ -375,7 +375,7 @@ export const publicContent: PublicContent = {
   initCommand: "hra init --yes",
   doctorCommand: "hra doctor --offline",
   endpoints: {
-    betaTag: "live",
+    betaTag: "beta-not-yet-live",
     githubRepository: "live",
     hostedSync: "live",
     website: "live",
@@ -481,7 +481,7 @@ export const publicContent: PublicContent = {
     },
     {
       question: "Can I start using it now?",
-      answer: [text(`The website, web app, and hosted sync are available in ${hostedBetaLabel}. You can install the v${admittedReleaseVersion} CLI now. Starting or upgrading a daemon and enabling hosted commands are paused until the capacity checks pass. `), link("Check the setup status", "/docs/status/"), text(" before starting a daemon.")],
+      answer: [text(`The website, web app, and hosted sync are available in ${hostedBetaLabel}. The admitted v${admittedReleaseVersion} CLI has its own `), link("immutable install instructions", `https://github.com/hraness/hra/tree/v${admittedReleaseVersion}#install-and-update`), text(`. The v${releaseVersion} candidate is not yet admitted. Starting or upgrading a daemon and enabling hosted commands are paused until the capacity checks pass. `), link("Check the setup status", "/docs/status/"), text(" before starting a daemon.")],
     },
     {
       question: "Does HRA use my API keys or provider subscription?",
@@ -514,15 +514,20 @@ export const publicContent: PublicContent = {
   introduction: [
     {
       kind: "notice",
-      label: `Local v${releaseVersion} artifacts admitted; hosted sync live as an ${hostedBetaLabel}`,
+      label: `Local v${releaseVersion} candidate; v${admittedReleaseVersion} artifacts admitted`,
       content: [
         text("The "),
         link(`v${admittedReleaseVersion} artifacts`, `https://github.com/hraness/hra/releases/tag/v${admittedReleaseVersion}`),
         text(" passed immutable GitHub and npm release admission in "),
         link("release run 34278486095", "https://github.com/hraness/hra/actions/runs/34278486095"),
-        text(", attempt 2. Use the exact install command below to install and verify the binary. The website and optional hosted sync are live; artifact admission does not authorize current-daemon startup or hosted command writers."),
+        text(`, attempt 2. That evidence does not admit v${releaseVersion}. This release candidate is not yet admitted. Only after immutable GitHub and npm release admission may the command below install its exact artifact. For the admitted predecessor, use its `),
+        link("immutable README", `https://github.com/hraness/hra/tree/v${admittedReleaseVersion}#install-and-update`),
+        text(". The website and optional hosted sync are live; artifact admission does not authorize current-daemon startup or hosted command writers."),
       ],
     },
+    paragraph(
+      text(`The v${releaseVersion} candidate adds a read-only exact Codex default-profile companion and a browser-safe projection decoder that does not require CSP-blocked dynamic code generation. The default-profile display remains unavailable until a matching fresh companion is published by the intended daemon after the relevant rollout. This observation does not change Ultra defaults, admit models, select a route, or authorize a command.`),
+    ),
     { kind: "notice", label: "Current daemon rollout blocked", content: [text(daemonRolloutNotice)] },
     paragraph(
       text("HRA is one Bun CLI plus a local daemon. It isolates Codex and Claude Code profiles, gives both providers one compact session interface, and optionally syncs encrypted provider-neutral projections and commands across your enrolled machines."),
@@ -548,7 +553,7 @@ export const publicContent: PublicContent = {
       heading: "Install and update",
       blocks: [
         paragraph(
-          text("HRA requires Bun 1.3.14 plus curl with HTTPS and TLS 1.2 support. The CLI and local daemon support macOS and Linux. Codex effects run on both platforms; Claude Code effects run on Linux only. HRA refuses new Claude Code effects on macOS pending authenticated isolated-Keychain and detached-read acceptance. Supported ChatGPT desktop account switching is macOS-only. Native protected-input control loads only when a terminal prompt needs it and supports the standard macOS, glibc, and x64 or arm64 musl library names. Install its reviewed immutable tag, then verify the binary before initialization:"),
+          text("HRA requires Bun 1.3.14 plus curl with HTTPS and TLS 1.2 support. The CLI and local daemon support macOS and Linux. Codex effects run on both platforms; Claude Code effects run on Linux only. HRA refuses new Claude Code effects on macOS pending authenticated isolated-Keychain and detached-read acceptance. Supported ChatGPT desktop account switching is macOS-only. Native protected-input control loads only when a terminal prompt needs it and supports the standard macOS, glibc, and x64 or arm64 musl library names. Only after immutable GitHub and npm release admission, install the candidate's reviewed immutable tag, then verify the binary before initialization:"),
         ),
         {
           kind: "commands",
@@ -560,7 +565,7 @@ export const publicContent: PublicContent = {
           ],
         },
         paragraph(
-          text("The single install command removes ambient Bun, Node, and native-library injection variables before either download or Bun startup, disables Bun dotenv loading, and selects /dev/null as the only Bun configuration. Curl and the loader independently cap the streamed preflight at 512 KiB, and the loader refuses an overrun before transpilation or installation. It then verifies and executes the exact v0.7.0 preflight from HRA's protected source tag and passes it the exact release archive URL. The preflight requires GitHub repository ID 1343008607, a published immutable v0.7.0 release, and one uploaded archive whose byte length and SHA-256 match GitHub's immutable release metadata. It creates a fresh random private staging root, downloads the archive into a private file there, and gives Bun only a verified in-memory snapshot of those exact bytes. The reviewed normalizer verifies the private archive again, derives its bounded package-file manifest, and compares every extracted HRA package path and SHA-256 while measuring the completion receipt. Local archives and official archives use separate full-digest version namespaces, so a local package cannot populate or replace the official cache entry. HRA then verifies the tagged preflight and normalizer, exact package identity, zero-lifecycle manifest, CLI SHA-256, and complete staged tree under protected descriptor and ACL custody. Bun 1.3.14 resolves the package's exact dependency versions from the configured package registry trust boundary with lifecycle scripts disabled; the release archive does not claim to contain that dependency closure. The detached staging worker and its Bun package-install child repeat the runtime neutralization while retaining the configured registry, proxy, and certificate trust inputs needed for dependency resolution. The prior verified command remains active throughout staging. Publication atomically replaces only the $BUN_INSTALL/bin/hra symlink after every check succeeds and fsyncs its directory. If installation is interrupted, the next invocation of that exact release's installer recovers or removes only the proven private stage; another release's installer refuses the durable intent. The invoking shell, PATH-selected pinned Bun binary, configured package registry and transport trust, operating system, and same-UID account remain trust boundaries. Existing trustedDependencies remain unchanged."),
+          text("The single install command removes ambient Bun, Node, and native-library injection variables before either download or Bun startup, disables Bun dotenv loading, and selects /dev/null as the only Bun configuration. Curl and the loader independently cap the streamed preflight at 512 KiB, and the loader refuses an overrun before transpilation or installation. It then verifies and executes the exact v0.7.1 preflight from HRA's protected source tag and passes it the exact release archive URL. The preflight requires GitHub repository ID 1343008607, a published immutable v0.7.1 release, and one uploaded archive whose byte length and SHA-256 match GitHub's immutable release metadata. It creates a fresh random private staging root, downloads the archive into a private file there, and gives Bun only a verified in-memory snapshot of those exact bytes. The reviewed normalizer verifies the private archive again, derives its bounded package-file manifest, and compares every extracted HRA package path and SHA-256 while measuring the completion receipt. Local archives and official archives use separate full-digest version namespaces, so a local package cannot populate or replace the official cache entry. HRA then verifies the tagged preflight and normalizer, exact package identity, zero-lifecycle manifest, CLI SHA-256, and complete staged tree under protected descriptor and ACL custody. Bun 1.3.14 resolves the package's exact dependency versions from the configured package registry trust boundary with lifecycle scripts disabled; the release archive does not claim to contain that dependency closure. The detached staging worker and its Bun package-install child repeat the runtime neutralization while retaining the configured registry, proxy, and certificate trust inputs needed for dependency resolution. The prior verified command remains active throughout staging. Publication atomically replaces only the $BUN_INSTALL/bin/hra symlink after every check succeeds and fsyncs its directory. If installation is interrupted, the next invocation of that exact release's installer recovers or removes only the proven private stage; another release's installer refuses the durable intent. The invoking shell, PATH-selected pinned Bun binary, configured package registry and transport trust, operating system, and same-UID account remain trust boundaries. Existing trustedDependencies remain unchanged."),
         ),
         { kind: "subheading", text: "Update runbook" },
         paragraph(
@@ -618,7 +623,7 @@ export const publicContent: PublicContent = {
           },
           {
             content: [
-              text("Install the admitted v0.7.0 release, then verify the installed version and offline health:"),
+              text("Only after immutable GitHub and npm release admission, install the v0.7.1 candidate's exact release, then verify the installed version and offline health:"),
             ],
             commands: [
               betaInstallCommand,
@@ -913,8 +918,8 @@ export const publicContent: PublicContent = {
           label: "Local release boundary",
           content: [
             text("These commands are part of the "),
-            code(`v${releaseVersion}`),
-            text(" admitted local CLI release. Its immutable artifacts passed GitHub and npm release admission. Hosted sync is not required for this local protocol; the current-daemon rollout prerequisite still applies before startup."),
+            code(`v${admittedReleaseVersion}`),
+            text(` admitted local CLI release and are retained in the v${releaseVersion} candidate. The predecessor's immutable artifacts passed GitHub and npm release admission; the candidate requires its own admission. Hosted sync is not required for this local protocol; the current-daemon rollout prerequisite still applies before startup.`),
           ],
         },
         paragraph(
@@ -1785,7 +1790,8 @@ export const renderReadmeMarkdown = (content: PublicContent = publicContent): st
     content.hero.summary,
     content.hero.pillars.map((pillar) => `- **${pillar.label}.** ${pillar.summary}`).join("\n"),
     `## Get started\n\nPublic beta. Codex execution supports macOS and Linux; Claude Code execution supports Linux. The local CLI does not need an HRA cloud identity. The web workspace uses optional encrypted sync and requires a paired machine and browser.`,
-    `Install and verify the admitted v${content.releaseVersion} CLI artifact. This does not start the daemon:`,
+    `The v${content.releaseVersion} candidate is not yet admitted. For the admitted v${admittedReleaseVersion} artifact, use its [immutable README](${content.links.github}/tree/v${admittedReleaseVersion}#install-and-update).`,
+    `Only after immutable GitHub and npm release admission, install and verify the v${content.releaseVersion} candidate CLI artifact. This does not start the daemon:`,
     `\`\`\`sh\n${content.installCommand}\n\`\`\``,
     `\`\`\`sh\n${content.doctorCommand}\n\`\`\``,
     `> **Before initialization:** ${content.daemonRolloutNotice}`,
@@ -1820,7 +1826,7 @@ export const renderLlmsText = (content: PublicContent = publicContent): string =
     content.thesis,
     content.statusLine,
     "",
-    `Install the admitted v${content.releaseVersion} local CLI artifact: ${content.installCommand}`,
+    `Only after immutable GitHub and npm release admission, install the v${content.releaseVersion} local CLI artifact: ${content.installCommand}`,
     `Verify local prerequisites without cloud access: ${content.doctorCommand}`,
     content.daemonRolloutNotice,
     `Initialize only after the rollout prerequisite is satisfied: ${content.initCommand}`,
