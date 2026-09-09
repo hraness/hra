@@ -1,13 +1,32 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 
 import { canonical24ResetDatabaseBytes, canonical24ResetFixture, canonical24ResetFixtureGeneratorSource } from "./fixtures/canonical24-reset";
 import { canonical30WorkDatabaseBytes, canonical30WorkFixture, canonical30WorkFixtureGeneratorSource } from "./fixtures/canonical30-work";
+import { canonical34StorageDatabaseBytes, canonical34StorageFixture } from "./fixtures/canonical34-storage";
+import { canonical35To38DatabaseBytes, canonical35To38Fixture, canonical35To38GeneratorSource, type Canonical35To38Scenario } from "./fixtures/canonical35-38";
+import { canonical20To40DatabaseBytes, canonical20To40Fixture, canonical20To40GeneratorSource, type Canonical20To40Scenario } from "./fixtures/canonical20-40";
+import { canonical38RuntimeDatabaseBytes, canonical38RuntimeFixture, canonical38RuntimeGeneratorSource } from "./fixtures/canonical38-runtime";
+import { observed2DatabaseBytes, observed2Fixture, observed2GeneratorSource } from "./fixtures/observed2-stage";
+import { canonicalAdoption35DatabaseBytes, canonicalAdoption35Fixture, canonicalAdoption35GeneratorSource } from "./fixtures/canonical-adoption35";
+import { canonicalIdentityAttentionDatabaseBytes, canonicalIdentityAttentionFixtures, canonicalIdentityAttentionGeneratorSource, type CanonicalIdentityAttentionScenario } from "./fixtures/canonical-identity-attention";
+import { canonicalSessionStartDatabaseBytes, canonicalSessionStartFixtures, type CanonicalSessionStartScenario } from "./fixtures/canonical-session-start";
+import { canonicalEarlyMigrationDatabaseBytes, canonicalEarlyMigrationFixture } from "./fixtures/canonical-early-migration";
+import { canonical39AttachmentDatabaseBytes, canonical39AttachmentFixtures } from "./fixtures/canonical39-attachments";
+import { canonicalLabelPresetDatabaseBytes, canonicalLabelPresetFixture, type CanonicalLabelPresetScenario } from "./fixtures/canonical-label-preset";
+import { canonicalResetPolicyDatabaseBytes, canonicalResetPolicyFixtures } from "./fixtures/canonical-reset-policy";
+import { canonical39SwitchDatabaseBytes, canonical39SwitchFixtures } from "./fixtures/canonical39-switch";
+import { canonical39RetiredRecoveryDatabaseBytes, canonical39RetiredRecoveryFixtures } from "./fixtures/canonical39-retired-recovery";
+import { canonical39RetiredTargetDatabaseBytes, canonical39RetiredTargetFixtures } from "./fixtures/canonical39-retired-targets";
+import { canonicalLoginLedgerDatabaseBytes, canonicalLoginLedgerFixtures } from "./fixtures/canonical-login-ledger";
 import { canonicalAdoption40DatabaseBytes, canonicalAdoption40Fixture, canonicalAdoption40FixtureGeneratorSource } from "./fixtures/canonical-adoption40";
 import { canonical40QueuesDatabaseBytes, canonical40QueuesFixture, canonical40QueuesFixtureGeneratorSource } from "./fixtures/canonical40-queues";
 import { canonical40UsageDatabaseBytes, canonical40UsageFixture, canonical40UsageFixtureGeneratorSource } from "./fixtures/canonical40-usage";
 import { canonical41TimestampsDatabaseBytes, canonical41TimestampsFixture, canonical41TimestampsGeneratorSource } from "./fixtures/canonical41-timestamps";
 import { canonical43MemoryDatabaseBytes, canonical43MemoryFixture, canonical43MemoryGeneratorSource } from "./fixtures/canonical43-memory";
+import { canonical48WorkDatabaseBytes, canonical48WorkFixture } from "./fixtures/canonical48-work";
+import { canonical50CollisionDatabaseBytes, canonical50CollisionFixture } from "./fixtures/canonical50-collision";
 import { privateTask48DatabaseBytes, privateTask48Fixture, privateTask48FixtureDatabaseIdentity, privateTask48FixtureGeneratorSource } from "./fixtures/private-task48";
 import { privateTask48PinnedDatabaseBytes, privateTask48PinnedDatabaseIdentity, privateTask48PinnedFixture, privateTask48PinnedGeneratorSource } from "./fixtures/private-task48-pinned";
 import { privateTask48UsageDatabaseBytes, privateTask48UsageFixture, privateTask48UsageGeneratorSource } from "./fixtures/private-task48-usage";
@@ -15,6 +34,8 @@ import { combined49ArchiveProvenance, combined49DatabaseBytes, combined49Fixture
 import { combined49SwitchArchiveProvenance, combined49SwitchDatabaseBytes, combined49SwitchFixture, combined49SwitchGeneratorSource } from "./fixtures/combined49-switch";
 import { combined49RetiredArchiveProvenance, combined49RetiredDatabaseBytes, combined49RetiredFixture, combined49RetiredGeneratorSource } from "./fixtures/combined49-retired";
 import { assertPublicSensitiveText } from "./public-text-policy";
+import { syntheticAdoption36SchemaFixture, syntheticAdoption36SchemaObjects } from "./fixtures/synthetic-adoption36-schema";
+import { syntheticAdoption36 } from "./fixtures/synthetic-adoption36";
 
 const fixtures: readonly Readonly<{
   name: string;
@@ -24,11 +45,98 @@ const fixtures: readonly Readonly<{
 }>[] = [
   { name: "canonical24-reset", bytes: canonical24ResetDatabaseBytes, generator: canonical24ResetFixtureGeneratorSource, metadata: canonical24ResetFixture },
   { name: "canonical30-work", bytes: canonical30WorkDatabaseBytes, generator: canonical30WorkFixtureGeneratorSource, metadata: canonical30WorkFixture },
+  { name: "canonical34-storage", bytes: canonical34StorageDatabaseBytes,
+    generator: readFileSync(new URL("./fixtures/canonical34-storage-generator.original.ts.txt", import.meta.url), "utf8"),
+    metadata: canonical34StorageFixture },
+  ...Object.values(canonicalEarlyMigrationFixture.images).map((image) => ({
+    name: `early-migration-${String(image.version)}-${image.provenance.kind}`,
+    bytes: () => canonicalEarlyMigrationDatabaseBytes(image.version),
+    generator: readFileSync(new URL("./fixtures/canonical-early-migration-generator.original.ts.txt", import.meta.url), "utf8"),
+    metadata: { ...canonicalEarlyMigrationFixture, selectedVersion: image.version },
+  })),
+  ...Object.keys(canonicalLabelPresetFixture.captures).map((scenario) => ({
+    name: `label-preset-${scenario}`,
+    bytes: () => canonicalLabelPresetDatabaseBytes(scenario as CanonicalLabelPresetScenario),
+    generator: readFileSync(new URL("./fixtures/canonical-label-preset-generator.original.ts.txt", import.meta.url), "utf8"),
+    metadata: { ...canonicalLabelPresetFixture, selectedScenario: scenario },
+  })),
+  ...Object.keys(canonical35To38Fixture.captures).map((scenario) => ({
+    name: `canonical35-38-${scenario}`,
+    bytes: () => canonical35To38DatabaseBytes(scenario as Canonical35To38Scenario),
+    generator: canonical35To38GeneratorSource,
+    metadata: { ...canonical35To38Fixture, selectedScenario: scenario },
+  })),
+  ...Object.keys(canonical20To40Fixture.captures).map((scenario) => ({
+    name: `legacy20-40-${scenario}`,
+    bytes: () => canonical20To40DatabaseBytes(scenario as Canonical20To40Scenario),
+    generator: canonical20To40GeneratorSource,
+    metadata: { ...canonical20To40Fixture, selectedScenario: scenario },
+  })),
+  { name: "canonical38-runtime", bytes: canonical38RuntimeDatabaseBytes,
+    generator: canonical38RuntimeGeneratorSource, metadata: canonical38RuntimeFixture },
+  { name: "observed2-stage", bytes: observed2DatabaseBytes,
+    generator: observed2GeneratorSource, metadata: observed2Fixture },
+  { name: "canonical-adoption35", bytes: canonicalAdoption35DatabaseBytes,
+    generator: canonicalAdoption35GeneratorSource, metadata: canonicalAdoption35Fixture },
+  ...Object.keys(canonicalIdentityAttentionFixtures).map((scenario) => ({
+    name: `identity-attention-${scenario}`,
+    bytes: () => canonicalIdentityAttentionDatabaseBytes(scenario as CanonicalIdentityAttentionScenario),
+    generator: canonicalIdentityAttentionGeneratorSource,
+    metadata: canonicalIdentityAttentionFixtures[scenario as CanonicalIdentityAttentionScenario],
+  })),
+  ...Object.values(canonicalResetPolicyFixtures).map((metadata) => ({
+    name: `canonical-reset-policy-${String(metadata.version)}`,
+    bytes: () => canonicalResetPolicyDatabaseBytes(metadata.version),
+    generator: readFileSync(new URL("./fixtures/canonical-reset-policy-generator.original.ts.txt", import.meta.url), "utf8"),
+    metadata,
+  })),
+  ...Object.values(canonical39AttachmentFixtures).map((metadata) => ({
+    name: `canonical39-attachments-${metadata.scenario}`,
+    bytes: () => canonical39AttachmentDatabaseBytes(metadata.scenario),
+    generator: readFileSync(new URL("./fixtures/canonical39-attachments-generator.original.ts.txt", import.meta.url), "utf8"),
+    metadata,
+  })),
+  ...Object.entries(canonicalSessionStartFixtures).map(([scenario, metadata]) => ({
+    name: `session-start-${scenario}`,
+    bytes: () => canonicalSessionStartDatabaseBytes(scenario as CanonicalSessionStartScenario),
+    generator: readFileSync(new URL("./fixtures/canonical-session-start-generator.original.ts.txt", import.meta.url), "utf8"),
+    metadata,
+  })),
+  ...Object.values(canonical39SwitchFixtures).map((metadata) => ({
+    name: `canonical39-switch-${metadata.scenario.name}`,
+    bytes: () => canonical39SwitchDatabaseBytes(metadata.scenario.name),
+    generator: readFileSync(new URL("./fixtures/canonical39-switch-generator.original.ts.txt", import.meta.url), "utf8"),
+    metadata,
+  })),
+  ...Object.values(canonical39RetiredRecoveryFixtures).map((metadata) => ({
+    name: `canonical39-retired-recovery-${metadata.scenario}`,
+    bytes: () => canonical39RetiredRecoveryDatabaseBytes(metadata.scenario),
+    generator: readFileSync(new URL("./fixtures/canonical39-retired-recovery-generator.original.ts.txt", import.meta.url), "utf8"),
+    metadata,
+  })),
+  ...Object.values(canonical39RetiredTargetFixtures).map((metadata) => ({
+    name: `canonical39-retired-targets-${metadata.scenario}`,
+    bytes: () => canonical39RetiredTargetDatabaseBytes(metadata.scenario),
+    generator: readFileSync(new URL("./fixtures/canonical39-retired-targets-generator.original.ts.txt", import.meta.url), "utf8"),
+    metadata,
+  })),
+  ...Object.values(canonicalLoginLedgerFixtures).map((metadata) => ({
+    name: `canonical${String(metadata.schemaVersion)}-login-ledger`,
+    bytes: () => canonicalLoginLedgerDatabaseBytes(metadata.schemaVersion),
+    generator: readFileSync(new URL("./fixtures/canonical-login-ledger-generator.original.ts.txt", import.meta.url), "utf8"),
+    metadata,
+  })),
   { name: "canonical-adoption40", bytes: canonicalAdoption40DatabaseBytes, generator: canonicalAdoption40FixtureGeneratorSource, metadata: canonicalAdoption40Fixture },
   { name: "canonical40-queues", bytes: canonical40QueuesDatabaseBytes, generator: canonical40QueuesFixtureGeneratorSource, metadata: canonical40QueuesFixture },
   { name: "canonical40-usage", bytes: canonical40UsageDatabaseBytes, generator: canonical40UsageFixtureGeneratorSource, metadata: canonical40UsageFixture },
   { name: "canonical41-timestamps", bytes: canonical41TimestampsDatabaseBytes, generator: canonical41TimestampsGeneratorSource, metadata: canonical41TimestampsFixture },
   { name: "canonical43-memory", bytes: canonical43MemoryDatabaseBytes, generator: canonical43MemoryGeneratorSource, metadata: canonical43MemoryFixture },
+  { name: "canonical48-work", bytes: canonical48WorkDatabaseBytes,
+    generator: readFileSync(new URL("./fixtures/canonical48-work-generator.original.ts.txt", import.meta.url), "utf8"),
+    metadata: canonical48WorkFixture },
+  { name: "canonical50-collision", bytes: canonical50CollisionDatabaseBytes,
+    generator: readFileSync(new URL("./fixtures/canonical50-collision-generator.original.ts.txt", import.meta.url), "utf8"),
+    metadata: canonical50CollisionFixture },
   { name: "private-task48", bytes: privateTask48DatabaseBytes, generator: privateTask48FixtureGeneratorSource, metadata: { fixture: privateTask48Fixture, identity: privateTask48FixtureDatabaseIdentity } },
   { name: "private-task48-pinned", bytes: privateTask48PinnedDatabaseBytes, generator: privateTask48PinnedGeneratorSource, metadata: { fixture: privateTask48PinnedFixture, identity: privateTask48PinnedDatabaseIdentity } },
   { name: "private-task48-usage", bytes: privateTask48UsageDatabaseBytes, generator: privateTask48UsageGeneratorSource, metadata: privateTask48UsageFixture },
@@ -42,17 +150,22 @@ const fixtures: readonly Readonly<{
 // are not themselves private paths. The sole image exception below is bound
 // to an exact immutable capture, not an inferred SQLite/text field boundary.
 const hostPrefixes = ["/Users/", "/home/", "/private/", "/tmp/", "/var/folders/", "\\Users\\"] as const;
-const encodings = ["utf8", "utf16le"] as const;
+const encodings = ["utf8", "utf16le", "utf16be"] as const;
 type FixtureEncoding = (typeof encodings)[number];
+const encode = (text: string, encoding: FixtureEncoding): Buffer =>
+  encoding === "utf16be" ? Buffer.from(text, "utf16le").swap16() : Buffer.from(text, encoding);
 type RootSpan = Readonly<{ start: number; end: number; encoding: FixtureEncoding }>;
 const publicProjectRoot = "/private/tmp/hra-public-canonical43-fixture/project";
 
 const assertNoHostPrefixes = (bytes: Buffer, admittedSpans: readonly RootSpan[] = []): void => {
   for (const prefix of hostPrefixes) {
     for (const encoding of encodings) {
-      const encodedPrefix = Buffer.from(prefix, encoding);
+      const encodedPrefix = encode(prefix, encoding);
       for (let at = bytes.indexOf(encodedPrefix); at !== -1; at = bytes.indexOf(encodedPrefix, at + 1)) {
-        if (!admittedSpans.some((span) => span.encoding === encoding
+        // Every byte inside a proved complete root is public, including an
+        // interior ASCII substring seen at the opposite UTF-16 alignment.
+        if (!admittedSpans.some((span) => (span.encoding === encoding
+          || (span.encoding !== "utf8" && encoding !== "utf8"))
           && at >= span.start && at + encodedPrefix.length <= span.end)) {
           throw new Error("HISTORICAL_FIXTURE_HOST_PATH");
         }
@@ -85,14 +198,30 @@ const isTextBoundary = (unit: number | undefined): boolean => unit === undefined
 const assertPublicProjectPathText = (bytes: Buffer): void => {
   const spans: RootSpan[] = [];
   for (const encoding of encodings) {
-    const rootBytes = Buffer.from(publicProjectRoot, encoding);
+    const rootBytes = encode(publicProjectRoot, encoding);
     const width = encoding === "utf8" ? 1 : 2;
-    const unitAt = (at: number): number => encoding === "utf8" ? bytes.readUInt8(at) : bytes.readUInt16LE(at);
+    const unitAt = (at: number): number => encoding === "utf8" ? bytes.readUInt8(at)
+      : encoding === "utf16be" ? bytes.readUInt16BE(at) : bytes.readUInt16LE(at);
     for (let at = bytes.indexOf(rootBytes); at !== -1; at = bytes.indexOf(rootBytes, at + 1)) {
       const end = at + rootBytes.length;
       const startsAtBoundary = at === 0 || (at >= width && isTextBoundary(unitAt(at - width)));
       const endsAtBoundary = end === bytes.length || (end + width <= bytes.length && isTextBoundary(unitAt(end)));
-      if (startsAtBoundary && endsAtBoundary) spans.push({ start: at, end, encoding });
+      if (startsAtBoundary && endsAtBoundary) {
+        spans.push({ start: at, end, encoding });
+        // ASCII UTF-16 bytes can also spell the complete same root in the
+        // opposite byte order at a one-byte offset. Admit that exact whole
+        // byte sequence only after the actual text field's two boundaries
+        // were proved; a prefix-shaped substring alone grants nothing.
+        if (encoding !== "utf8") {
+          const opposite = encoding === "utf16le" ? "utf16be" : "utf16le";
+          const shifted = at + (encoding === "utf16le" ? -1 : 1);
+          const encoded = encode(publicProjectRoot, opposite);
+          if (shifted >= 0 && shifted + encoded.length <= bytes.length
+            && bytes.subarray(shifted, shifted + encoded.length).equals(encoded)) {
+            spans.push({ start: shifted, end: shifted + encoded.length, encoding: opposite });
+          }
+        }
+      }
     }
   }
   assertNoHostPrefixes(bytes, spans);
@@ -155,6 +284,39 @@ describe("historical fixture decoded privacy", () => {
   }
 });
 
+describe("synthetic recognizer fixture privacy and qualification", () => {
+  test("adoption-v36 frozen SQL and constrained seed are explicitly synthetic, public and source-pinned", () => {
+    const objects = syntheticAdoption36SchemaObjects();
+    const recipe = readFileSync(new URL("./fixtures/synthetic-adoption36-builder.original.ts.txt", import.meta.url), "utf8");
+    const seed = readFileSync(new URL("./fixtures/synthetic-adoption36.ts", import.meta.url), "utf8");
+    expect(syntheticAdoption36SchemaFixture.historicalWriterProvenance).toBe(false);
+    expect(syntheticAdoption36.historicalWriterProvenance).toBe(false);
+    expect(syntheticAdoption36SchemaFixture.kind).toBe("synthetic_adoption_v36_recognizer_contract");
+    expect(createHash("sha256").update(recipe).digest("hex"))
+      .toBe("d10b93bc2cef84bee6b955d2934276234170ca8d3f25a33ef8c7615648fef54f");
+    expect(objects.length).toBe(syntheticAdoption36SchemaFixture.objectCount);
+    expect(objects.filter(({ type }) => type === "table").length).toBe(syntheticAdoption36SchemaFixture.tableCount);
+    const bytes = Buffer.from(JSON.stringify(objects));
+    expect(bytes.byteLength).toBe(syntheticAdoption36SchemaFixture.schemaBytes);
+    expect(createHash("sha256").update(bytes).digest("hex"))
+      .toBe(syntheticAdoption36SchemaFixture.schemaSha256);
+    expect(() => assertNoHostPrefixes(bytes)).not.toThrow();
+    for (const [name, value] of [["recipe", recipe], ["seed", seed], ["schema", bytes.toString("utf8")]] as const) {
+      expect(() => assertPublicSensitiveText(value, `synthetic adoption36 ${name}`)).not.toThrow();
+    }
+    for (const metadata of [syntheticAdoption36SchemaFixture, syntheticAdoption36]) {
+      expect(() => assertFixtureMetadataPaths(metadata)).not.toThrow();
+      expect(() => assertPublicSensitiveText(JSON.stringify(metadata), "synthetic adoption36 metadata")).not.toThrow();
+    }
+    // Decode afresh: a caller cannot rewrite the frozen expected schema for a
+    // later test. No historical database image or archived writer is executed.
+    const first = objects[0];
+    if (first === undefined) throw new Error("Synthetic schema is empty.");
+    first.sql = "SELECT 1";
+    expect(syntheticAdoption36SchemaObjects()[0]?.sql).not.toBe(first.sql);
+  });
+});
+
 describe("historical fixture public-root exception boundaries", () => {
   test("actual canonical43 metadata admits only whole-root fields and refuses mutated provenance paths", () => {
     expect(() => assertFixtureMetadataPaths(canonical43MemoryFixture, true)).not.toThrow();
@@ -182,11 +344,11 @@ describe("historical fixture public-root exception boundaries", () => {
   for (const encoding of encodings) {
     test(`${encoding} accepts only complete public-root text fields`, () => {
       for (const value of [publicProjectRoot, JSON.stringify({ root: publicProjectRoot }), `\0${publicProjectRoot}\0`, ` ${publicProjectRoot}\n`]) {
-        expect(() => assertPublicProjectPathText(Buffer.from(value, encoding))).not.toThrow();
+        expect(() => assertPublicProjectPathText(encode(value, encoding))).not.toThrow();
       }
-      expect(() => assertPublicProjectPathText(Buffer.from("archive/src/storage/state-store.ts", encoding))).not.toThrow();
+      expect(() => assertPublicProjectPathText(encode("archive/src/storage/state-store.ts", encoding))).not.toThrow();
       // Even an exact public root stays forbidden outside its explicit scope.
-      expect(() => assertNoHostPrefixes(Buffer.from(publicProjectRoot, encoding))).toThrow("HISTORICAL_FIXTURE_HOST_PATH");
+      expect(() => assertNoHostPrefixes(encode(publicProjectRoot, encoding))).toThrow("HISTORICAL_FIXTURE_HOST_PATH");
     });
 
     test(`${encoding} rejects descendants, siblings, private roots and relative provenance embeddings`, () => {
@@ -200,15 +362,15 @@ describe("historical fixture public-root exception boundaries", () => {
         `archive/src${publicProjectRoot}`, `é${publicProjectRoot}`,
       ];
       for (const value of values) {
-        expect(() => assertPublicProjectPathText(Buffer.from(value, encoding))).toThrow("HISTORICAL_FIXTURE_HOST_PATH");
+        expect(() => assertPublicProjectPathText(encode(value, encoding))).toThrow("HISTORICAL_FIXTURE_HOST_PATH");
       }
     });
 
     test(`${encoding} scans every byte offset and rejects truncated encoded boundaries`, () => {
-      const framed = Buffer.concat([Buffer.from([0xff]), Buffer.from(`"${publicProjectRoot}"`, encoding)]);
+      const framed = Buffer.concat([Buffer.from([0xff]), encode(`"${publicProjectRoot}"`, encoding)]);
       expect(() => assertPublicProjectPathText(framed)).not.toThrow();
       expect(() => assertNoHostPrefixes(framed)).toThrow("HISTORICAL_FIXTURE_HOST_PATH");
-      const unframed = Buffer.concat([Buffer.from([0xff]), Buffer.from(publicProjectRoot, encoding), Buffer.from([0xff])]);
+      const unframed = Buffer.concat([Buffer.from([0xff]), encode(publicProjectRoot, encoding), Buffer.from([0xff])]);
       expect(() => assertPublicProjectPathText(unframed)).toThrow("HISTORICAL_FIXTURE_HOST_PATH");
     });
   }

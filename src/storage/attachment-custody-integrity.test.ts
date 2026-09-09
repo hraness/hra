@@ -154,22 +154,29 @@ describe("attachment custody immutable integrity", () => {
     expect(f.db.query("SELECT terminal_digest IS NOT NULL AS settled FROM attachment_legacy_cleanup_blockers WHERE attempt_id=?").get(old.attemptId)).toEqual({ settled: 1 });
   });
 
-  test("a surviving partial custody trigger in current49 is refused without repair or row changes", async () => {
+  test("a surviving partial custody trigger in current60 is refused without repair or row changes", async () => {
     const f = await fixture();
     f.store.prepareSessionInputMutation(f.input([]));
     for (const type of ["trigger", "index", "table"] as const) for (const object of [...ATTACHMENT_CUSTODY_SCHEMA_OBJECTS].reverse()) {
       if (object.type === type && object.name !== "attachment_unknown_capture") f.db.exec(`DROP ${type.toUpperCase()} ${object.name}`);
     }
-    const snapshot = () => ({ schema: f.db.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all(),
-      migrations: f.db.query("SELECT * FROM migrations ORDER BY version").all(),
-      mutations: f.db.query("SELECT * FROM mutation_attempts ORDER BY id").all(),
-      sessions: f.db.query("SELECT * FROM sessions ORDER BY id").all() });
+    const snapshot = () => {
+      const tables = f.db.query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all() as { name: string }[];
+      return { schema: f.db.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all(),
+        version: f.db.query("PRAGMA user_version").get(),
+        rows: tables.map(({ name }) => {
+          if (!/^[a-z_][a-z0-9_]*$/u.test(name)) throw new Error("Unexpected fixture table name");
+          return [name, f.db.query(`SELECT * FROM "${name}"`).all()];
+        }) };
+    };
     const before = snapshot();
-    // Current joined schema admission detects the missing guard footprint
-    // before the later custody row audit; neither path repairs the damage.
-    expect(() => f.reopen(false)).toThrow("RETIRED_PROVIDER_ADMISSION_SCHEMA_INVALID");
-    expect(() => f.reopen(true)).toThrow("RETIRED_PROVIDER_ADMISSION_SCHEMA_INVALID");
-    expect(snapshot()).toEqual(before);
+    // Dropping custody tables also removes their peer-cancellation guards.
+    // Current admission detects that exact missing footprint first; neither
+    // writable nor read-only admission may reconstruct any object or row.
+    for (const readonly of [false, true]) {
+      expect(() => f.reopen(readonly)).toThrow("PEER_SESSION_CANCELLATION_UNPROVEN");
+      expect(snapshot()).toEqual(before);
+    }
     expect(f.db.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
   });
 

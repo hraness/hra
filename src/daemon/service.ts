@@ -1481,6 +1481,12 @@ type SessionListTraversalReplayState = {
 };
 
 type ServiceCommandContext = { signal: AbortSignal; afterResponse?: (callback: () => void) => void };
+type TerminalInputCustodyRoute = Readonly<{
+  kind: "terminal";
+  sessionId: SessionRecord["id"];
+  profileId: ProfileRecord["id"];
+  revision: number;
+} | { kind: "selection_failed"; error: unknown }>;
 
 export class HraService {
   readonly #store: StateStore;
@@ -2149,9 +2155,26 @@ export class HraService {
     const finish = this.#beginOperation();
     try {
       await this.#daemonAuthority.assertCurrent();
-      await this.#reconcileTerminalFactsMemory();
-      await this.#sweepExpiredFactsMemory();
-      const result = await this.#executeAdmitted(command, context);
+      let terminalCustody: TerminalInputCustodyRoute | undefined;
+      if (command.kind === "session.abandon") {
+        try {
+          const selected = this.#store.requireSession(command.session);
+          if (selected.state === "terminal") terminalCustody = {
+            kind: "terminal", sessionId: selected.id, profileId: selected.profileId, revision: selected.revision,
+          };
+        } catch (error: unknown) {
+          // Selection still uses the normal admitted error mapping. It must not
+          // silently choose a different recovery path after a failed read.
+          terminalCustody = { kind: "selection_failed", error };
+        }
+      }
+      // Explicit terminal input acknowledgment is local-only. In particular,
+      // it must not purge an unrelated pending facts-memory obligation first.
+      if (terminalCustody?.kind !== "terminal") {
+        await this.#reconcileTerminalFactsMemory();
+        await this.#sweepExpiredFactsMemory();
+      }
+      const result = await this.#executeAdmitted(command, context, terminalCustody);
       await this.#daemonAuthority.assertCurrent();
       return result;
     } catch (error: unknown) {
@@ -2184,8 +2207,13 @@ export class HraService {
     }
   }
 
-  async #executeAdmitted(command: LocalCommand, context: { signal: AbortSignal; afterResponse?: (callback: () => void) => void }): Promise<unknown> {
+  async #executeAdmitted(command: LocalCommand, context: ServiceCommandContext, terminalCustody?: TerminalInputCustodyRoute): Promise<unknown> {
     try {
+      if (terminalCustody?.kind === "selection_failed") throw terminalCustody.error;
+      if (terminalCustody?.kind === "terminal") {
+        if (command.kind !== "session.abandon") throw new Error("TERMINAL_INPUT_CUSTODY_ROUTE_INVALID");
+        return await this.#acknowledgeTerminalInputCustody(terminalCustody, context.signal);
+      }
       switch (command.kind) {
         case "doctor": return await this.#doctor(command.offline, context.signal);
         case "daemon.status": return { running: true, pid: process.pid };
@@ -3255,6 +3283,18 @@ export class HraService {
         )
       ) throw new CommandFailure("CONFLICT", error.message);
       if (error instanceof Error && error.message === "UNSETTLED_MUTATION_AUTHORITY") throw new CommandFailure("RECOVERY_REQUIRED", "This mutation authority has an unsettled earlier effect and rejects new idempotency keys.");
+      if (error instanceof Error && error.message === "PROVIDER_LOGIN_BINDING_PROOF_INVALID") {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "The pending login authority cannot be proved. Inspect the account before changing provider state.",
+        );
+      }
+      if (error instanceof Error && error.message === "ATTACHMENT_TERMINAL_ACKNOWLEDGMENT_INVALID") {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "The retained terminal input custody cannot be proved. Inspect the session before acknowledging local cleanup.",
+        );
+      }
       if (error instanceof Error && error.message === "AUTORESPOND_AFTER_HOURS_POLICY_CONFLICT") {
         throw new CommandFailure(
           "CONFLICT",
@@ -6415,8 +6455,36 @@ export class HraService {
   }
 
   #providerForInteractionAuthority(
-    authority: Pick<ProviderInteractionAuthority, "provider">,
+    authority: Pick<ProviderInteractionAuthority, "provider" | "method">,
   ): Provider {
+    let methodProvider: Provider;
+    switch (authority.method) {
+      case "claude/control_request/can_use_tool":
+        methodProvider = "claude";
+        break;
+      case "devin/session/request_permission":
+        // Classify retained authority for local no-RPC deadline cleanup only.
+        // The runtime boundary still refuses activation of the retired provider.
+        methodProvider = "devin";
+        break;
+      case "item/commandExecution/requestApproval":
+      case "item/fileChange/requestApproval":
+      case "item/permissions/requestApproval":
+      case "item/tool/requestUserInput":
+      case "mcpServer/elicitation/request":
+        methodProvider = "codex";
+        break;
+      default:
+        throw new ProviderRuntimeUnavailableError(
+          "The interaction method has no admitted provider runtime authority.",
+        );
+    }
+    if (methodProvider !== authority.provider) {
+      throw new ProviderRuntimeUnavailableError(
+        "The interaction method does not match its captured provider runtime authority.",
+      );
+    }
+    // The method validates the tuple; it never selects a replacement runtime.
     return authority.provider;
   }
 
@@ -20384,6 +20452,43 @@ export class HraService {
     return this.#store.readSessionSwitchForRecovery(sessionId);
   }
 
+  async #acknowledgeTerminalInputCustody(
+    selected: Extract<TerminalInputCustodyRoute, { kind: "terminal" }>,
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    // Raw serializers preserve the local account/session ordering without
+    // invoking cloud, native-account, provider-recovery, or memory authority.
+    return await this.#serializeProfileAuthorities([selected.profileId], async () =>
+      await this.#serialize(`session:${selected.sessionId}`, async () => {
+        await this.#daemonAuthority.assertCurrent();
+        signal.throwIfAborted();
+        const current = this.#store.requireSession(selected.sessionId);
+        if (current.profileId !== selected.profileId || current.state !== "terminal"
+          || current.revision !== selected.revision) {
+          throw new CommandFailure("CONFLICT", "The selected terminal session changed before local custody acknowledgment.");
+        }
+        const result = this.#store.acknowledgeTerminalSessionInputCustody({
+          sessionId: current.id, expectedRevision: current.revision,
+        });
+        if (result.releasedInputCount === 0 && result.alreadyAcknowledgedInputCount === 0) {
+          throw new CommandFailure("CONFLICT", "The terminal session has no retained input custody to acknowledge.");
+        }
+        return {
+          session: result.session,
+          recovery: {
+            resolved: true,
+            resolution: "abandoned",
+            localInputCustodyAcknowledged: true,
+            releasedInputCount: result.releasedInputCount,
+            alreadyAcknowledgedInputCount: result.alreadyAcknowledgedInputCount,
+            providerEffectRetried: false,
+            providerStateDeleted: false,
+            providerOutcomeKnown: false,
+          },
+        };
+      }));
+  }
+
   async #resolveSessionRecoveryCommand(
     selector: string,
     action: "recover" | "abandon",
@@ -20463,6 +20568,8 @@ export class HraService {
     }
     return await this.#serializeSessionAuthorityAcrossProfiles(selected, this.#sessionRecoveryProfileIds(selected), async () => {
       const current = this.#store.requireSession(selected.id);
+      // Reject retired recovery before any local memory cleanup can escape.
+      this.#assertSessionRecoveryProviderSupported(current);
       if (action === "abandon" && current.state === "recovery_required") {
         await this.#cleanupFactsMemory(current, "abandon");
       }
@@ -21844,7 +21951,14 @@ export class HraService {
       || !this.#sameProviderAccountBinding(effectProviderAuthority, currentProviderAuthority)
     ) throw new CommandFailure("RECOVERY_REQUIRED", "The immutable provider binding changed after the uncertain queued effect.");
     this.#assertProviderReady(profile, currentProviderAuthority, { session });
-    const projection = await this.#readExactSessionProjection({ ...session, providerThreadId: session.providerThreadId }, profile, false, signal);
+    // Recovery needs the bounded message-completeness proof, not just status.
+    // Abandonment retains its metadata-only read and never claims that proof.
+    const projection = await this.#readExactSessionProjection(
+      { ...session, providerThreadId: session.providerThreadId },
+      profile,
+      action === "recover",
+      signal,
+    );
     const provider = {
       providerThreadId: projection.providerThreadId,
       title: session.provider === "claude" ? session.title : projection.title,

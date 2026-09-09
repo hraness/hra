@@ -301,13 +301,16 @@ import type { HistoricalEffectEvidenceFormat } from "./effect-evidence-reader";
 import { SESSION_SWITCH_BLOCKING_PREDICATE, SESSION_SWITCH_FENCE_SOURCE } from "./session-switch-fence";
 import { AttachmentBlobStore, ATTACHMENT_BLOB_SWEEP_GRACE_MS, parseAttachmentCleanupCandidate,
   type AttachmentCleanupCandidate, type AttachmentCleanupPort } from "./attachment-store";
-import { AttachmentCustodyError, applyAttachmentCustodySchema, applyJoinedAttachmentTerminalGuard, auditAttachmentCustody, assertAttachmentCustodySchema, assertAttachmentDaemon, attachmentDaemonSchema,
+import { AttachmentCustodyError, applyAttachmentCustodySchema, applyJoinedAttachmentTerminalGuard, applyAcknowledgedAttachmentTerminalGuard,
+  auditAttachmentCustody, assertAttachmentCustodySchema, assertAttachmentDaemon, attachmentDaemonSchema,
   assertLiveAttachmentClosure, attachmentInputProof, attachmentMutationProtectedSql, attachmentReferencesDigest,
   bindAttachmentParent, hasUnknownAttachmentCustody, hasAttachmentCustodyArtifacts, initialEmptyAttachmentInput, insertEmptyAttachmentInput,
   parseAttachmentInput, readAttachmentParent, readAttachmentSet, reconcileAttachmentTerminals, reconcileLiveAttachmentTerminals, releaseAttachmentSet,
   requireAttachmentReservation, reserveAttachmentSet, retireAttachmentIngress, settleAttachmentParent, transferAttachmentQueue,
   type AttachmentDaemon, type AttachmentIngressInput, type AttachmentReservation } from "./attachment-custody";
 import type { InitialAttachmentInput } from "./attachment-custody-schema";
+import { applyTerminalAttachmentAcknowledgments, assertTerminalAttachmentAcknowledgmentSchema, auditTerminalAttachmentAcknowledgments,
+  insertTerminalAttachmentAcknowledgment, readTerminalAttachmentAcknowledgmentsForSession } from "./attachment-terminal-acknowledgments";
 import {
   QUEUE_ATTACHMENT_FORMAT, QUEUE_ATTACHMENT_PENDING_SOURCE_CAP, QueueAttachmentIdentityError,
   applyQueueAttachmentSchema, auditQueueAttachmentIdentities, insertQueueAttachmentIdentity,
@@ -6443,6 +6446,15 @@ CREATE INDEX IF NOT EXISTS queue_entries_message_scrub_candidates
   ON queue_entries(id)
   WHERE message!='[queue message removed after settlement]';
 `;
+
+// Current opens cannot replay the historical scrub installer. Require its
+// exact guards before trusting the absence of a pending scrub obligation.
+const joinedQueueMessageScrubObjects = schemaCohortObjects(schemaVersion22)
+  .filter((object) => [
+    "queue_message_terminal_insert_scrub", "queue_message_terminal_transition_scrub",
+    "queue_message_resolution_scrub", "queue_message_settlement_guard",
+  ].includes(object.name));
+if (joinedQueueMessageScrubObjects.length !== 4) throw new Error("STATE_QUEUE_SCRUB_DEFINITION_INVALID");
 
 const schemaVersion27 = `
 CREATE TABLE IF NOT EXISTS account_rate_limit_reset_attempts (
@@ -19003,6 +19015,66 @@ const readProvedMalformedSessionSwitchJournalSequences = (
   }
 };
 
+// Current admission only asserts immutable request, runtime and receipt proof.
+// The caller has already proved any contextless historical containment and
+// audited execution contexts in this same transaction. No phase, malformed
+// current context, or failed parse grants a historical fallback or repair.
+const auditCurrentSessionSwitchJournals = (
+  database: Database,
+  excludedHistoricalSequences: ReadonlySet<number>,
+): void => {
+  try {
+    if (!database.inTransaction) throw new Error();
+    const count = z.object({ count: z.number().int().nonnegative().safe() }).strict().parse(
+      database.query("SELECT COUNT(*) AS count FROM session_switch_attempts").get(),
+    ).count;
+    // Zod string limits count UTF-16 units. Three UTF-8 bytes per unit is a
+    // conservative materialization bound, not a narrower wire/string limit.
+    // The unchanged mapper still enforces each exact field's own contract.
+    const bounds = Object.keys(sessionSwitchRowSchema.shape).map((field) => {
+      const units = field === "raw_request_json" ? 2_048
+        : field.endsWith("_json") ? 262_144 : 512;
+      return `COALESCE(length(CAST("${field}" AS BLOB)),0)<=${String(units * 3)}`;
+    }).join(" AND ");
+    let after = 0;
+    let seen = 0;
+    let excluded = 0;
+    while (seen < count) {
+      const rows = z.object({ journal_sequence: z.number().int().positive().safe() })
+        .strict().array().max(100).parse(database.query(`SELECT journal_sequence
+          FROM session_switch_attempts WHERE journal_sequence>?
+          ORDER BY journal_sequence LIMIT 100`).all(after));
+      if (rows.length === 0 || seen + rows.length > count) throw new Error();
+      for (const row of rows) {
+        if (row.journal_sequence <= after) throw new Error();
+        after = row.journal_sequence;
+        seen++;
+        if (excludedHistoricalSequences.has(after)) {
+          excluded++;
+          continue;
+        }
+        // Start from raw parent sequences, so a missing mutation join cannot
+        // disappear. This precheck bounds joined-row strings; subsidiary mapper
+        // reads retain their existing contracts and are not covered by it.
+        const selected = `${sessionSwitchSelect} WHERE switch.journal_sequence=?`;
+        z.object({ bounded: z.literal(1) }).strict().array().length(1).parse(
+          database.query(`SELECT CASE WHEN ${bounds} THEN 1 ELSE 0 END AS bounded
+            FROM (${selected}) LIMIT 2`).all(after),
+        );
+        const values = database.query(`${selected} LIMIT 2`).all(after);
+        if (values.length !== 1) throw new Error();
+        const record = mapSessionSwitch(database, values[0], "joined");
+        readSessionSwitchAdoption(database, record.attemptId);
+      }
+    }
+    if (seen !== count || excluded !== excludedHistoricalSequences.size
+      || database.query("SELECT 1 FROM session_switch_attempts WHERE journal_sequence>? LIMIT 1")
+        .get(after) !== null) throw new Error();
+  } catch {
+    throw new Error("SESSION_SWITCH_RECOVERY_CORRUPT");
+  }
+};
+
 // The unpublished task checkpoint used 40..48. Those immutable definitions
 // remain frozen; adoption owns canonical 40 and the task ledger moves to 41..49.
 const privateTask40RootNames = new Set(schemaCohortObjects(schemaVersion40ProviderAccounts)
@@ -19126,9 +19198,11 @@ const relocateUsageMigrationLedger = (
   }
 };
 
-const peerSessionCancellationPredecessor = (): string => {
+const peerSessionCancellationPredecessor = (
+  name: "peer_session_direct_message_source_delete_guard" | "peer_session_action_transition_guard",
+): string => {
   const guard = schemaVersion40Objects.find((object) =>
-    object.name === "peer_session_direct_message_source_delete_guard");
+    object.name === name);
   if (guard === undefined) throw new Error("PEER_SESSION_CANCELLATION_SCHEMA_SOURCE_MISSING");
   return schemaVersion40ObjectSql(guard);
 };
@@ -19159,10 +19233,13 @@ const assertJoinedCanonicalObjects = (database: Database): void => {
   assertSessionUserMessageFinalizationCore(database, false, "joined");
   assertPeerAndLocalMemoryObjects(
     database,
-    schemaVersion40Objects.filter((object) => object.name !== "peer_session_direct_message_source_delete_guard"),
+    schemaVersion40Objects.filter((object) => object.name !== "peer_session_direct_message_source_delete_guard"
+      && object.name !== "peer_session_action_transition_guard"),
     "STATE_SCHEMA_V40_STRUCTURE_INVALID",
   );
-  assertPeerSessionCancellationSchema(database, peerSessionCancellationPredecessor());
+  assertPeerSessionCancellationSchema(database,
+    peerSessionCancellationPredecessor("peer_session_direct_message_source_delete_guard"),
+    peerSessionCancellationPredecessor("peer_session_action_transition_guard"));
 };
 
 const joinedProviderRootObjects = privateTask40RootObjects.filter((object) =>
@@ -19170,6 +19247,7 @@ const joinedProviderRootObjects = privateTask40RootObjects.filter((object) =>
     .some((guard) => guard.name === object.name));
 
 const assertJoinedStateSchema = (database: Database): void => {
+  assertSchemaCohortObjects(database, joinedQueueMessageScrubObjects, "joined60");
   assertSchemaMigrationLedgerTail(database,
     Array.from({ length: 26 }, (_, index) => index + 35), "STATE_SCHEMA_JOIN_LEDGER_INVALID");
   assertJoinedCanonicalObjects(database);
@@ -19179,6 +19257,8 @@ const assertJoinedStateSchema = (database: Database): void => {
   assertSchemaVersion42SessionSwitch(database, "joined");
   auditJoinedEvidenceGuards(database);
   assertProviderLoginBindingTransitionSchema(database);
+  assertTerminalAttachmentAcknowledgmentSchema(database);
+  assertAttachmentCustodySchema(database, "joined", "acknowledged_v1");
   auditRetiredProviderAdmissionGuards(database);
 };
 
@@ -19207,10 +19287,11 @@ const migrateWritableDatabase = (
       auditSessionSendOwners(database);
       auditAutomaticPointerMoves(database);
       auditQueueAttachmentIdentities(database);
-      auditAttachmentCustody(database);
-      auditSessionSwitchExecutionContexts(database, {
-        excludedMalformedJournalSequences: readProvedMalformedSessionSwitchJournalSequences(database, "current"),
-      });
+      auditTerminalAttachmentAcknowledgments(database);
+      auditAttachmentCustody(database, { kind: "source_selected" }, "acknowledged_v1");
+      const excludedHistoricalSequences = readProvedMalformedSessionSwitchJournalSequences(database, "current");
+      auditSessionSwitchExecutionContexts(database, { excludedMalformedJournalSequences: excludedHistoricalSequences });
+      auditCurrentSessionSwitchJournals(database, excludedHistoricalSequences);
       // Current schema is an assertion boundary, not permission to replay
       // historical installers, move a ledger or reconstruct missing proof.
       return hasPendingSecurityScrub(database);
@@ -19219,7 +19300,7 @@ const migrateWritableDatabase = (
     if (database.query(`SELECT 1 FROM sqlite_master WHERE
       name GLOB '*effect_evidence_provenance*' OR name GLOB 'session_switch_execution_*'
       OR name GLOB 'joined_evidence_*' OR name GLOB 'retired_provider_*'
-      OR name GLOB 'provider_login_binding_*' LIMIT 1`).get() !== null) {
+      OR name GLOB 'provider_login_binding_*' OR name GLOB 'attachment_terminal_acknowledg*' LIMIT 1`).get() !== null) {
       throw new Error("STATE_SCHEMA_JOIN_PREDECESSOR_COLLISION");
     }
     if (initialVersion < 50) assertLegacyCanonicalProfileStorageAbsent(database);
@@ -20181,8 +20262,12 @@ const migrateWritableDatabase = (
     applyJoinedEvidenceGuards(database);
     applyJoinedQueueTranscriptGuard(database, schemaVersion43FinalizationTriggerSql("queue_transcript_finalization_guard"));
     applyJoinedAttachmentTerminalGuard(database);
+    applyTerminalAttachmentAcknowledgments(database);
+    applyAcknowledgedAttachmentTerminalGuard(database);
     applyProviderLoginBindingTransitions(database);
-    applyPeerSessionCancellationSchema(database, peerSessionCancellationPredecessor());
+    applyPeerSessionCancellationSchema(database,
+      peerSessionCancellationPredecessor("peer_session_direct_message_source_delete_guard"),
+      peerSessionCancellationPredecessor("peer_session_action_transition_guard"));
     applyRetiredProviderAdmissionGuards(database);
     if (hasSettledQueueMessagesToScrub(database)) {
       requireQueueMessageScrub(database, now(), true);
@@ -20207,7 +20292,9 @@ const migrateWritableDatabase = (
     assertExactSchemaVersion40AdoptionSurface(database);
     auditEffectEvidenceProvenance(database);
     auditSessionSwitchExecutionContexts(database, executionContextExclusions);
+    auditCurrentSessionSwitchJournals(database, executionContextExclusions.excludedMalformedJournalSequences);
     auditProviderLoginBindingTransitions(database);
+    auditTerminalAttachmentAcknowledgments(database);
     database.query("INSERT INTO migrations(version,applied_at) VALUES (?,?)")
       .run(60, unixMillisecondsSchema.parse(now()));
     database.exec("PRAGMA user_version=60");
@@ -23132,15 +23219,16 @@ export class StateStore {
       if (this.#readonly) auditDevinJoinedCloses(this.#database);
       if (this.#readonly) auditAutomaticPointerMoves(this.#database);
       if (this.#readonly) auditQueueAttachmentIdentities(this.#database);
-      if (this.#readonly) auditAttachmentCustody(this.#database);
+      if (this.#readonly) auditAttachmentCustody(this.#database, { kind: "source_selected" }, "acknowledged_v1");
       if (this.#readonly) auditSessionSendOwners(this.#database);
       auditClaudeProcessCustody(this.#database);
       auditSessionSwitchAdoption(this.#database);
       if (this.#readonly) this.#database.transaction(() => {
+        auditTerminalAttachmentAcknowledgments(this.#database);
         auditProviderLoginBindingTransitions(this.#database);
-        auditSessionSwitchExecutionContexts(this.#database, {
-          excludedMalformedJournalSequences: readProvedMalformedSessionSwitchJournalSequences(this.#database, "current"),
-        });
+        const excludedHistoricalSequences = readProvedMalformedSessionSwitchJournalSequences(this.#database, "current");
+        auditSessionSwitchExecutionContexts(this.#database, { excludedMalformedJournalSequences: excludedHistoricalSequences });
+        auditCurrentSessionSwitchJournals(this.#database, excludedHistoricalSequences);
       }).deferred();
       assertCompositeNotificationPolicy(this.#database);
       assertStateDatabaseFile(paths.database, databaseFile);
@@ -33616,7 +33704,7 @@ export class StateStore {
     const candidate = parseAttachmentCleanupCandidate(input.candidate);
     return this.#database.transaction(() => {
       assertAttachmentDaemon(this.#database, input);
-      assertAttachmentCustodySchema(this.#database, "joined");
+      assertAttachmentCustodySchema(this.#database, "joined", "acknowledged_v1");
       reconcileLiveAttachmentTerminals(this.#database, this.#now());
       const live = assertLiveAttachmentClosure(this.#database);
       if (hasUnknownAttachmentCustody(this.#database)) return { kind: "retained" as const, reason: "unknown_input" as const };
@@ -34973,6 +35061,70 @@ export class StateStore {
       ...input,
       source: "claude_account_login",
     });
+  }
+
+  /** Explicit session.abandon only: acknowledge uncertain, already-terminal
+   * generic inputs and release their local blob pins, without provider work. */
+  acknowledgeTerminalSessionInputCustody(input: Readonly<{
+    sessionId: SessionId; expectedRevision: number;
+  }>): Readonly<{ session: SessionRecord; releasedInputCount: number; alreadyAcknowledgedInputCount: number }> {
+    try {
+    const parsed = z.object({ sessionId: sessionIdSchema, expectedRevision: z.number().int().positive().safe() }).strict().parse(input);
+    const result = this.#database.transaction(() => {
+      const session = this.requireSession(parsed.sessionId);
+      if (session.state !== "terminal" || session.revision !== parsed.expectedRevision) {
+        throw new Error("ATTACHMENT_TERMINAL_ACKNOWLEDGMENT_INVALID");
+      }
+      assertTerminalAttachmentAcknowledgmentSchema(this.#database);
+      assertAttachmentCustodySchema(this.#database, "joined", "acknowledged_v1");
+      const acknowledged = readTerminalAttachmentAcknowledgmentsForSession(this.#database, session.id);
+      if (this.#database.query(`SELECT 1 FROM mutation_attempts INDEXED BY attachment_terminal_acknowledgments_unknown_session
+        WHERE authority_id=? AND kind IN ('session.send','session.steer') AND attachment_input_format IS NULL
+          AND attachment_cleanup_terminal_digest IS NULL LIMIT 1`).get(session.id) !== null) {
+        throw new Error("ATTACHMENT_TERMINAL_ACKNOWLEDGMENT_INVALID");
+      }
+      const candidates = assertLiveAttachmentClosure(this.#database)
+        .filter((set) => set.origin.input.sessionId === session.id)
+        .flatMap((set) => {
+          if (set.parentAttemptId === null) throw new Error("ATTACHMENT_TERMINAL_ACKNOWLEDGMENT_INVALID");
+          z.object({ generic: z.literal(1) }).strict().parse(this.#database.query(
+            "SELECT request_format IS NULL AS generic FROM mutation_attempts WHERE id=?").get(set.parentAttemptId));
+          // Original-send outcome authority is a different, immutable contract.
+          // This acknowledgment must never reinterpret it or unknown old input.
+          const input = readAttachmentParent(this.#database, set.parentAttemptId);
+          if (input.format !== "retained_v1" || input.custody?.origin.id !== set.origin.id) {
+            throw new Error("ATTACHMENT_TERMINAL_ACKNOWLEDGMENT_INVALID");
+          }
+          return [set.parentAttemptId];
+        });
+      const now = unixMillisecondsSchema.parse(this.#now());
+      let removedManifestRows = 0;
+      for (const attemptId of candidates) {
+        insertTerminalAttachmentAcknowledgment(this.#database, { attemptId, sessionId: session.id,
+          expectedRevision: session.revision, createdAt: now });
+      }
+      // All candidate evidence is checked before the first pin/manifest moves;
+      // any later failure rolls the complete acknowledgement batch back.
+      for (const attemptId of candidates) {
+        settleAttachmentParent(this.#database, attemptId, now);
+        const parent = readAttachmentParent(this.#database, attemptId);
+        if (parent.custody === null || parent.custody.releasedBy === null) {
+          throw new Error("ATTACHMENT_TERMINAL_ACKNOWLEDGMENT_INVALID");
+        }
+        removedManifestRows += this.#database.query("DELETE FROM message_attachments WHERE session_id=? AND source_id=?")
+          .run(session.id, attemptId).changes;
+      }
+      if (removedManifestRows > 0) requireQueueMessageScrub(this.#database, now, false);
+      assertLiveAttachmentClosure(this.#database);
+      return { session: this.requireSession(session.id), releasedInputCount: candidates.length,
+        alreadyAcknowledgedInputCount: acknowledged.length };
+    }).immediate();
+    completePendingSecurityScrub(this.#database, true, this.#securityScrubCheckpoint);
+    return result;
+    } catch (error) {
+      if (error instanceof StateSecurityScrubRequiredError) throw error;
+      throw new Error("ATTACHMENT_TERMINAL_ACKNOWLEDGMENT_INVALID");
+    }
   }
 
   #terminalizeProviderSession(input: Readonly<{
@@ -48703,6 +48855,11 @@ export class StateStore {
       `SELECT * FROM provider_interactions interaction
        WHERE state='pending' AND deadline_at>? AND session_id IS NOT NULL
          AND NOT EXISTS(
+           SELECT 1 FROM legacy_provider_authority_quarantines quarantine
+           WHERE (quarantine.scope_kind='interaction' AND quarantine.scope_id=interaction.public_id)
+             OR (quarantine.scope_kind='session' AND quarantine.scope_id=interaction.session_id)
+         )
+         AND NOT EXISTS(
            SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
            WHERE switch.session_id=interaction.session_id
              AND ${SESSION_SWITCH_BLOCKING_PREDICATE}
@@ -48725,6 +48882,11 @@ export class StateStore {
     return this.#database.query(
       `SELECT interaction.* FROM provider_interactions interaction
        WHERE interaction.state='pending' AND interaction.deadline_at<=?
+         AND NOT EXISTS(
+           SELECT 1 FROM legacy_provider_authority_quarantines quarantine
+           WHERE (quarantine.scope_kind='interaction' AND quarantine.scope_id=interaction.public_id)
+             OR (quarantine.scope_kind='session' AND quarantine.scope_id=interaction.session_id)
+         )
          AND NOT EXISTS(
            SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
            LEFT JOIN session_switch_target_start_receipts target
@@ -48776,6 +48938,11 @@ export class StateStore {
       this.#database.query(
         `SELECT interaction.deadline_at FROM provider_interactions interaction
          WHERE interaction.state='pending'
+           AND NOT EXISTS(
+             SELECT 1 FROM legacy_provider_authority_quarantines quarantine
+             WHERE (quarantine.scope_kind='interaction' AND quarantine.scope_id=interaction.public_id)
+               OR (quarantine.scope_kind='session' AND quarantine.scope_id=interaction.session_id)
+           )
            AND NOT EXISTS(
              SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
              LEFT JOIN session_switch_target_start_receipts target
@@ -50853,7 +51020,7 @@ export class StateStore {
         return current.generation;
       }
       auditSessionSendOwners(this.#database);
-      auditAttachmentCustody(this.#database);
+      auditAttachmentCustody(this.#database, { kind: "source_selected" }, "acknowledged_v1");
       auditClaudeProcessCustody(this.#database);
       // Classify before retiring any interaction or mutation. A terminalized
       // row later in this transaction cannot fabricate a quiescent writer.

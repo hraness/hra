@@ -2903,3 +2903,65 @@ describe("pinned Claude runtime manager", () => {
     await value.manager.close();
   });
 });
+
+describe("Claude pre-acquisition reservation cleanup", () => {
+  test("admits one fresh reviewed reservation with an injected process", async () => {
+    const { manager, processes, bindingAuthority } = harness();
+    try {
+      const review = await manager.reviewSessionStart({
+        authority, fast: false, preset: "fable-max", requirement: presetRequirements["fable-max"],
+        projectRoot: PROJECT_ROOT, signal: signal(),
+      });
+      const started = await manager.startSession({
+        authority, review, providerThreadId: ADOPTED_PROVIDER_THREAD_ID, signal: signal(),
+      });
+      expect(started.providerThreadId).toBe(ADOPTED_PROVIDER_THREAD_ID);
+      expect(processes).toHaveLength(1);
+      expect(bindingAuthority.provisions).toHaveLength(1);
+    } finally { await manager.close(); }
+  });
+
+  test.each(["lookup_rejection", "abort_after_lookup"] as const)(
+    "releases the reserved ID after pre-acquisition failure (%s)",
+    async (failure) => {
+      let lookups = 0;
+      const controller = new AbortController();
+      const reason = new Error("Synthetic start-only configuration failure.");
+      const { manager, processes, bindingAuthority } = harness({
+        configDirFor: () => {
+          lookups++;
+          if (lookups === 2) {
+            if (failure === "lookup_rejection") return Promise.reject(reason);
+            controller.abort(reason);
+          }
+          return CONFIG_DIR;
+        },
+      });
+      const review = () => manager.reviewSessionStart({
+        authority, fast: false, preset: "fable-max", requirement: presetRequirements["fable-max"],
+        projectRoot: PROJECT_ROOT, signal: signal(),
+      });
+      try {
+        const original = await review();
+        expect(lookups).toBe(1);
+        await expect(manager.startSession({
+          authority, review: original, providerThreadId: ADOPTED_PROVIDER_THREAD_ID, signal: controller.signal,
+        })).rejects.toBe(reason);
+        expect(lookups).toBe(2);
+        expect(processes).toEqual([]);
+        expect(bindingAuthority.provisions).toEqual([]);
+        const renewed = await review();
+        expect(renewed).not.toBe(original);
+        expect(renewed.reviewId).not.toBe(original.reviewId);
+        expect(lookups).toBe(3);
+        const started = await manager.startSession({
+          authority, review: renewed, providerThreadId: ADOPTED_PROVIDER_THREAD_ID, signal: signal(),
+        });
+        expect(started.providerThreadId).toBe(ADOPTED_PROVIDER_THREAD_ID);
+        expect(lookups).toBe(4);
+        expect(processes).toHaveLength(1);
+        expect(bindingAuthority.provisions).toHaveLength(1);
+      } finally { await manager.close(); }
+    },
+  );
+});

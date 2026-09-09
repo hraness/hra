@@ -1,10 +1,9 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, renameSync, symlinkSync } from "node:fs";
 import { chmod, lstat, mkdtemp, mkdir, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { gunzipSync } from "node:zlib";
 
 import { Database, constants as sqliteConstants } from "bun:sqlite";
 import fc from "fast-check";
@@ -14,15 +13,29 @@ import { canonical40QueuesDatabaseBytes, canonical40QueuesFixture } from "../../
 import { canonical40UsageDatabaseBytes, canonical40UsageFixture } from "../../scripts/fixtures/canonical40-usage";
 import { canonical41TimestampsDatabaseBytes, canonical41TimestampsFixture } from "../../scripts/fixtures/canonical41-timestamps";
 import { canonical49WorkDatabaseBytes, canonical49WorkFixture } from "../../scripts/fixtures/canonical49-work";
+import { canonical50CollisionDatabaseBytes, canonical50CollisionFixture } from "../../scripts/fixtures/canonical50-collision";
+import { canonical48WorkDatabaseBytes, canonical48WorkFixture, type Canonical48WorkState } from "../../scripts/fixtures/canonical48-work";
 import { canonicalLoginLedgerDatabaseBytes, canonicalLoginLedgerFixtures } from "../../scripts/fixtures/canonical-login-ledger";
 import { canonicalBudgetDatabaseBytes, canonicalBudgetFixtures } from "../../scripts/fixtures/canonical-budget-history";
 import { canonicalBudgetRuntimeDatabaseBytes, canonicalBudgetRuntimeFixtures } from "../../scripts/fixtures/canonical-budget-runtime";
 import { canonicalAuthBudgetDatabaseBytes, canonicalAuthBudgetFixtures } from "../../scripts/fixtures/canonical-auth-budget";
 import { canonical30WorkDatabaseBytes, canonical30WorkFixture } from "../../scripts/fixtures/canonical30-work";
+import { canonical34StorageDatabaseBytes, canonical34StorageFixture } from "../../scripts/fixtures/canonical34-storage";
+import { canonicalIdentityAttentionDatabaseBytes, canonicalIdentityAttentionFixtures, type CanonicalIdentityAttentionScenario } from "../../scripts/fixtures/canonical-identity-attention";
+import { canonical35To38DatabaseBytes, canonical35To38Fixture, type Canonical35To38Scenario } from "../../scripts/fixtures/canonical35-38";
+import { canonical38RuntimeDatabaseBytes, canonical38RuntimeFixture } from "../../scripts/fixtures/canonical38-runtime";
+import { canonical20To40DatabaseBytes, canonical20To40Fixture, type Canonical20To40Scenario } from "../../scripts/fixtures/canonical20-40";
+import { observed2DatabaseBytes, observed2Fixture } from "../../scripts/fixtures/observed2-stage";
+import { canonicalAdoption35DatabaseBytes, canonicalAdoption35Fixture } from "../../scripts/fixtures/canonical-adoption35";
+import { installSyntheticAdoption36Fixture, syntheticAdoption36, syntheticAdoption36CandidateFingerprint } from "../../scripts/fixtures/synthetic-adoption36";
+import { canonicalEarlyMigrationDatabaseBytes, canonicalEarlyMigrationFixture } from "../../scripts/fixtures/canonical-early-migration";
+import { canonicalResetPolicyDatabaseBytes, canonicalResetPolicyFixtures } from "../../scripts/fixtures/canonical-reset-policy";
+import { canonicalLabelPresetDatabaseBytes, canonicalLabelPresetFixture, type CanonicalLabelPresetScenario } from "../../scripts/fixtures/canonical-label-preset";
 import { combined49RetiredDatabaseBytes, combined49RetiredFixture } from "../../scripts/fixtures/combined49-retired";
 import { combined49SwitchDatabaseBytes, combined49SwitchFixture } from "../../scripts/fixtures/combined49-switch";
 import { canonical39DevinDatabaseBytes, canonical39DevinFixture } from "../../scripts/fixtures/canonical39-devin";
 import { canonical39RetiredDatabaseBytes, canonical39RetiredFixtures, type Canonical39RetiredKind } from "../../scripts/fixtures/canonical39-retired-effects";
+import { canonical39RetiredRecoveryDatabaseBytes, canonical39RetiredRecoveryFixtures } from "../../scripts/fixtures/canonical39-retired-recovery";
 import { retiredSuccessorDatabaseBytes, retiredSuccessorFixtures } from "../../scripts/fixtures/retired-successors";
 import { deriveDesktopProfilePaths } from "../desktop/profile";
 import { AUTORESPOND_DAY_MS } from "../domain/autorespond-budget";
@@ -119,16 +132,10 @@ import {
   type SecurityScrubCheckpointPolicy,
   type SessionRecord,
 } from "./state-store";
-import { SESSION_SEND_OWNER_SCHEMA_OBJECTS } from "./session-send-owner";
-import { AUTOMATIC_POINTER_MOVE_SCHEMA_OBJECTS } from "./automatic-pointer-move";
-import { QUEUE_ATTACHMENT_SCHEMA_OBJECTS } from "./queue-attachment-identity";
-import { ATTACHMENT_CUSTODY_SCHEMA_OBJECTS } from "./attachment-custody";
-import { ATTACHMENT_CUSTODY_COLUMNS } from "./attachment-custody-schema";
-import { CLAUDE_PROCESS_CUSTODY_COLUMN, CLAUDE_PROCESS_CUSTODY_OBJECT_NAMES } from "./claude-process-custody";
-import { SESSION_SWITCH_ADOPTION_GUARDS, SESSION_SWITCH_ADOPTION_TABLES } from "./session-switch-adoption";
-import { schemaCohortObjects } from "./schema-cohort";
+import { auditJoinedEvidenceGuards } from "./joined-evidence-guards";
 import {
   canonicalWorkJson,
+  WORK_PROJECT_AUTHORITY_SCHEMA_SQL,
   type WorkDispatchOutcome,
 } from "./work-store";
 import {
@@ -137,6 +144,11 @@ import {
 } from "./canonical-profile-storage";
 
 const stores: StateStore[] = [];
+// Compare archived readonly values directly, without parsing or normalizing
+// them through a current runtime type.
+const expectHistoricalValue = (actual: unknown, expected: unknown): void => {
+  expect(actual).toEqual(expected);
+};
 const privateUserPathRoot = ["", "Users", "private"].join("/");
 const publicProviderIdentifierKey = new Uint8Array(32).fill(19);
 const publicProviderIdentifier = (value: string) =>
@@ -311,6 +323,196 @@ async function canonical40QueueArchive() {
   return paths;
 }
 
+async function canonical34StorageArchive() {
+  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-canonical34-storage-")));
+  const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+  await initializeStatePaths(paths);
+  await writeFile(paths.database, canonical34StorageDatabaseBytes(), { mode: 0o600, flag: "wx" });
+  return paths;
+}
+
+async function syntheticAdoption36ContractFixture(scenario: "launch" | "quarantine") {
+  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-synthetic-adoption36-")));
+  const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+  await initializeStatePaths(paths);
+  const database = new Database(paths.database, { create: true, strict: true });
+  try { installSyntheticAdoption36Fixture(database, scenario); }
+  finally { database.close(false); }
+  await chmod(paths.database, 0o600);
+  return paths;
+}
+
+const syntheticAdoption36MaintenanceTables = new Set([
+  "session_autorespond_counters", "session_event_streams", "usage_revision_authority", "sqlite_sequence",
+]);
+
+function expectSyntheticAdoption36Maintenance(
+  database: Database,
+  before: { readonly rows: Readonly<Record<string, unknown>> },
+  sessionIds: readonly string[],
+  profileIds: readonly string[],
+): void {
+  const source = syntheticAdoption36;
+  for (const table of ["session_autorespond_counters", "session_event_streams", "sqlite_sequence"]) {
+    expect(before.rows[table]).toEqual([]);
+  }
+  expect(before.rows.usage_revision_authority)
+    .toEqual(profileIds.map((profile_id) => ({ profile_id, next_revision: 0 })));
+  // v9/v10 fill missing local stream bookkeeping and advance the unused
+  // allocator floor. A fresh opaque stream epoch is not provider evidence.
+  const streams = z.array(z.object({
+    session_id: z.string(), stream_epoch: z.string().uuid(), next_sequence: z.number(),
+    floor_sequence: z.number(), observed_through_sequence: z.number(), retained_count: z.number(),
+    retained_bytes: z.number(), retention_gap_reason: z.string().nullable(),
+    created_at: z.number(), updated_at: z.number(),
+  }).strict()).parse(database.query("SELECT * FROM session_event_streams ORDER BY session_id").all());
+  expect(new Set(streams.map(({ stream_epoch }) => stream_epoch)).size).toBe(sessionIds.length);
+  expect(streams.map((stream) => Object.fromEntries(Object.entries(stream)
+    .filter(([key]) => key !== "stream_epoch")))).toEqual(sessionIds.map((session_id) => ({
+    session_id, next_sequence: 1, floor_sequence: 1, observed_through_sequence: 0,
+    retained_count: 0, retained_bytes: 0, retention_gap_reason: null,
+    created_at: source.migratedAt, updated_at: source.migratedAt,
+  })));
+  expect(database.query("SELECT * FROM usage_revision_authority ORDER BY profile_id").all())
+    .toEqual(profileIds.map((profile_id) => ({ profile_id, next_revision: 1 })));
+  // Canonical44 imposes the conservative consecutive floor on every older
+  // session; its empty evidence-table rebuild creates SQLite's zero sequence.
+  expect(database.query("SELECT * FROM session_autorespond_counters ORDER BY session_id").all())
+    .toEqual(sessionIds.map((session_id) => ({ session_id, consecutive_count: 3, updated_at: source.migratedAt })));
+  expect(database.query("SELECT * FROM sqlite_sequence").all()).toEqual([{ name: "autorespond_evidence", seq: 0 }]);
+}
+
+async function canonicalEarlyMigrationArchive(version: 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17) {
+  const home = await realpath(await mkdtemp(join(tmpdir(), `hra-store-canonical-early-${version}-`)));
+  const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+  await initializeStatePaths(paths);
+  await writeFile(paths.database, canonicalEarlyMigrationDatabaseBytes(version), { mode: 0o600, flag: "wx" });
+  return paths;
+}
+
+async function canonical35To38Archive(scenario: Canonical35To38Scenario) {
+  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-canonical35-38-")));
+  const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+  await initializeStatePaths(paths);
+  const bytes = canonical35To38DatabaseBytes(scenario);
+  const captured = canonical35To38Fixture.captures[scenario];
+  expect(createHash("sha256").update(bytes).digest("hex")).toBe(captured.databaseSha256);
+  await writeFile(paths.database, bytes, { mode: 0o600, flag: "wx" });
+  const database = new Database(paths.database, { create: false, strict: true });
+  try {
+    database.exec("PRAGMA query_only=ON");
+    database.transaction(() => {
+      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: captured.schemaVersion });
+      expect(database.query("SELECT * FROM migrations ORDER BY version").all()).toEqual([...captured.snapshot.ledger]);
+      const schema = database.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all();
+      expect(createHash("sha256").update(JSON.stringify(schema)).digest("hex")).toBe(captured.snapshot.schemaSha256);
+      expect(database.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    }).deferred();
+    expect(database.query("SELECT total_changes() AS count").get()).toEqual({ count: 0 });
+  } finally { database.close(false); }
+  return paths;
+}
+
+function expectCanonical35To38InertReopens(paths: StateStore["paths"], database: Database) {
+  const before = canonicalAuthBudgetSnapshot(database);
+  for (const readonly of [false, true]) {
+    const reopened = new StateStore(paths, { readonly,
+      resolveMachineTimeZone: () => { throw new Error("CAPTURED_POLICY_REOPEN_MUST_NOT_RESOLVE_ZONE"); },
+    });
+    reopened.close();
+    expect(canonicalAuthBudgetSnapshot(database)).toEqual(before);
+  }
+}
+
+async function canonicalAdoption35Archive() {
+  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-adoption35-")));
+  const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+  await initializeStatePaths(paths);
+  const bytes = canonicalAdoption35DatabaseBytes();
+  expect(createHash("sha256").update(bytes).digest("hex")).toBe(canonicalAdoption35Fixture.databaseSha256);
+  await writeFile(paths.database, bytes, { mode: 0o600, flag: "wx" });
+  return paths;
+}
+
+async function canonicalIdentityAttentionArchive(scenario: CanonicalIdentityAttentionScenario) {
+  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-identity-attention-")));
+  const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+  await initializeStatePaths(paths);
+  const source = canonicalIdentityAttentionFixtures[scenario];
+  const bytes = canonicalIdentityAttentionDatabaseBytes(scenario);
+  expect(createHash("sha256").update(bytes).digest("hex")).toBe(source.databaseSha256);
+  await writeFile(paths.database, bytes, { mode: 0o600, flag: "wx" });
+  const database = new Database(paths.database, { create: false, strict: true });
+  try {
+    database.exec("PRAGMA query_only=ON");
+    database.transaction(() => {
+      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: source.source.version });
+      expect(database.query("SELECT * FROM migrations ORDER BY version").all()).toEqual([...source.ledger]);
+      const schema = database.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all();
+      expect(createHash("sha256").update(JSON.stringify(schema)).digest("hex")).toBe(source.schemaSha256);
+      for (const [table, count] of Object.entries(source.rowCounts)) {
+        expect(table).toMatch(/^[a-z_0-9]+$/u);
+        expect(database.query(`SELECT COUNT(*) AS count FROM "${table}"`).get()).toEqual({ count });
+      }
+      expect(database.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    }).deferred();
+    expect(database.query("SELECT total_changes() AS count").get()).toEqual({ count: 0 });
+  } finally { database.close(false); }
+  return paths;
+}
+
+async function canonical38RuntimeArchive() {
+  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-canonical38-runtime-")));
+  const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+  await initializeStatePaths(paths);
+  const bytes = canonical38RuntimeDatabaseBytes();
+  const captured = canonical38RuntimeFixture;
+  expect(createHash("sha256").update(bytes).digest("hex")).toBe(captured.databaseSha256);
+  await writeFile(paths.database, bytes, { mode: 0o600, flag: "wx" });
+  const database = new Database(paths.database, { create: false, strict: true });
+  try {
+    database.exec("PRAGMA query_only=ON");
+    database.transaction(() => {
+      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 38 });
+      expect(database.query("SELECT * FROM migrations ORDER BY version").all()).toEqual([...captured.snapshot.ledger]);
+      const schema = database.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all();
+      expect(createHash("sha256").update(JSON.stringify(schema)).digest("hex")).toBe(captured.snapshot.schemaSha256);
+      expect(database.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    }).deferred();
+    expect(database.query("SELECT total_changes() AS count").get()).toEqual({ count: 0 });
+  } finally { database.close(false); }
+  return paths;
+}
+
+async function canonicalResetPolicyArchive(version: 27 | 28) {
+  const home = await realpath(await mkdtemp(join(tmpdir(), `hra-store-reset-policy-${version}-`)));
+  const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+  await initializeStatePaths(paths);
+  await writeFile(paths.database, canonicalResetPolicyDatabaseBytes(version), { mode: 0o600, flag: "wx" });
+  return paths;
+}
+
+async function canonicalLabelPresetArchive(scenario: CanonicalLabelPresetScenario) {
+  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-canonical-label-preset-")));
+  const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+  await initializeStatePaths(paths);
+  const bytes = canonicalLabelPresetDatabaseBytes(scenario);
+  const captured = canonicalLabelPresetFixture.captures[scenario];
+  expect(createHash("sha256").update(bytes).digest("hex")).toBe(captured.databaseSha256);
+  await writeFile(paths.database, bytes, { mode: 0o600, flag: "wx" });
+  const database = new Database(paths.database, { create: false, strict: true });
+  try {
+    database.exec("PRAGMA query_only=ON");
+    expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: captured.schemaVersion });
+    expect(database.query("SELECT * FROM migrations ORDER BY version").all()).toEqual([...captured.ledger]);
+    const schema = database.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all();
+    expect(createHash("sha256").update(JSON.stringify(schema)).digest("hex")).toBe(captured.schemaSha256);
+    expect(database.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    expect(database.query("SELECT total_changes() AS count").get()).toEqual({ count: 0 });
+  } finally { database.close(false); }
+  return paths;
+}
+
 async function canonical39DevinArchive() {
   const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-canonical39-devin-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
@@ -366,11 +568,22 @@ async function canonical50LedgerArchive() {
   return paths;
 }
 
+async function canonical20To40Archive(scenario: Canonical20To40Scenario) {
+  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-canonical20-40-")));
+  const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+  await initializeStatePaths(paths);
+  const bytes = canonical20To40DatabaseBytes(scenario);
+  expect(createHash("sha256").update(bytes).digest("hex"))
+    .toBe(canonical20To40Fixture.captures[scenario].databaseSha256);
+  await writeFile(paths.database, bytes, { mode: 0o600, flag: "wx" });
+  return paths;
+}
+
 // Capture the actual predecessor's complete column set once. Later additive
 // columns are separately asserted, never mistaken for rewritten old values.
 function canonicalAuthBudgetRows(database: Database, tables: readonly string[]) {
   const readers = tables.map((table) => {
-    expect(table).toMatch(/^[a-z_0-9]+$/u);
+    expect(table).toMatch(/^[A-Za-z_0-9]+$/u);
     const columns = z.array(z.object({ name: z.string().regex(/^[a-z_0-9]+$/u) })).parse(
       database.query(`PRAGMA table_info("${table}")`).all(),
     ).map(({ name }) => name);
@@ -391,7 +604,7 @@ function canonicalAuthBudgetRows(database: Database, tables: readonly string[]) 
 }
 
 function canonicalAuthBudgetSnapshot(database: Database) {
-  const tables = z.array(z.object({ name: z.string().regex(/^[a-z_0-9]+$/u) }).strict()).parse(
+  const tables = z.array(z.object({ name: z.string().regex(/^[A-Za-z_0-9]+$/u) }).strict()).parse(
     database.query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name LIMIT 257").all(),
   );
   expect(tables.length).toBeLessThanOrEqual(256);
@@ -512,61 +725,7 @@ function expectInertSchemaRefusal(paths: StateStore["paths"], code: string, read
   } finally { database.close(false); }
 }
 
-const dropProviderSwitchProgressSchema = (database: Database): void => {
-  database.exec(`
-    DROP TRIGGER IF EXISTS session_mutation_authority_rebinds_v39_immutable_delete;
-    DROP TRIGGER IF EXISTS session_mutation_authority_rebinds_v39_immutable_update;
-    DROP TABLE IF EXISTS session_mutation_authority_rebinds_v39;
-    DROP TABLE IF EXISTS session_provider_switch_source_releases;
-    DROP TABLE IF EXISTS session_provider_switch_seed_results;
-    DROP TABLE IF EXISTS session_provider_switch_seed_intents;
-    DROP TABLE IF EXISTS session_provider_switch_target_releases;
-    DROP TABLE IF EXISTS session_provider_switch_targets;
-    DROP TABLE IF EXISTS session_mutation_authority_rebinds;
-  `);
-};
 
-/** Remove only the current canonical overlay when deliberately shaping an older fixture. */
-const dropCanonicalProfileSchema = (database: Database): void => {
-  for (const name of [
-    "canonical_profile_session_insert_guard",
-    "canonical_profile_session_update_guard",
-    "canonical_profile_work_route_insert_guard",
-    "canonical_profile_work_task_insert_guard",
-    "canonical_profile_work_attempt_insert_guard",
-    "canonical_profile_work_attempt_immutable_guard",
-    "canonical_profile_session_live_attempt_guard",
-  ] as const) database.exec(`DROP TRIGGER IF EXISTS ${name}`);
-  for (const table of ["sessions", "work_routes", "work_tasks", "work_attempts"] as const) {
-    if (database.query(
-      `SELECT 1 FROM pragma_table_xinfo('${table}') WHERE name='canonical_profile_key'`,
-    ).get() !== null) database.exec(`ALTER TABLE ${table} DROP COLUMN canonical_profile_key`);
-    expect(database.query(
-      `SELECT name FROM pragma_table_xinfo('${table}') WHERE name='canonical_profile_key' COLLATE NOCASE`,
-    ).all()).toEqual([]);
-  }
-};
-
-/** Preserve every predecessor object, allowing only the four append-only column additions. */
-const expectCanonicalSchemaExtension = (before: unknown, after: unknown): void => {
-  const objectSchema = z.object({
-    type: z.string(), name: z.string(), tbl_name: z.string(), sql: z.string().nullable(),
-  }).strict();
-  const oldObjects = objectSchema.array().parse(before);
-  const newObjects = objectSchema.array().parse(after);
-  for (const old of oldObjects) {
-    if (old.type !== "table" || !["sessions", "work_routes", "work_tasks", "work_attempts"].includes(old.name)) {
-      expect(newObjects).toContainEqual(old);
-      continue;
-    }
-    const added = objectSchema.parse(newObjects.find((entry) => entry.type === old.type && entry.name === old.name));
-    const sql = z.string().parse(added.sql);
-    const column = ", canonical_profile_key TEXT";
-    expect(sql.split(column)).toHaveLength(2);
-    expect({ ...added, sql: sql.replace(column, "") })
-      .toEqual({ ...old, sql: z.string().parse(old.sql) });
-  }
-};
 
 const withCanonicalSessionKey = (value: unknown): Record<string, unknown> => {
   const row = z.record(z.string(), z.unknown()).parse(value);
@@ -597,604 +756,25 @@ const dropProviderV39SessionColumn = (database: Database): readonly Readonly<{
   return triggers;
 };
 
-const downgradeProviderV39SessionColumn = (database: Database): void => {
-  const triggers = dropProviderV39SessionColumn(database);
-  if (triggers.length === 0) return;
-  database.exec(`
-    DROP TRIGGER IF EXISTS session_mutation_authority_rebinds_v39_immutable_delete;
-    DROP TRIGGER IF EXISTS session_mutation_authority_rebinds_v39_immutable_update;
-    DROP TABLE IF EXISTS session_mutation_authority_rebinds_v39;
-  `);
-  for (const trigger of triggers) {
-    if (trigger.name.includes("devin")) continue;
-    database.exec(trigger.sql.replace(/\bprovider_v39\b/gu, "provider"));
-  }
-};
 
-const sessionAdoptionTableNames = [
-  "session_claude_process_authorities",
-  "session_claude_process_launch_intents",
-  "session_personal_runtime_bindings",
-  "session_adoption_candidates",
-  "session_adoption_policies",
-  "session_adoption_profile_generation_permits",
-  "profile_personal_authority_revocations",
-  "provider_runtime_account_revocations",
-  "session_provider_account_authorities",
-  "session_account_authorities",
-] as const;
 
-const dropSessionSwitchAdoptionSchema = (database: Database): void => {
-  const objects = schemaCohortObjects(SESSION_SWITCH_ADOPTION_TABLES, SESSION_SWITCH_ADOPTION_GUARDS);
-  for (const type of ["trigger", "index", "table"] as const) {
-    for (const object of [...objects].reverse()) if (object.type === type) {
-      if (!/^[a-z0-9_]+$/u.test(object.name)) throw new Error("Unexpected switch adoption schema object");
-      database.exec(`DROP ${type.toUpperCase()} IF EXISTS ${object.name}`);
-    }
-  }
-};
 
-// Exact released 6f056dc adoption guards. Combined49 overrides reference the
-// new process-proof markers, so restore these bytes before removing markers.
-const releasedAdoptionControllerGuards = `
-CREATE TRIGGER IF NOT EXISTS session_adoption_profile_generation_guard
-BEFORE UPDATE OF process_generation ON profiles
-WHEN NEW.process_generation!=OLD.process_generation AND (
-  EXISTS(
-    SELECT 1 FROM session_claude_process_authorities a
-    WHERE a.profile_id=OLD.id
-      AND a.profile_generation=OLD.process_generation
-      AND a.state!='released'
-  )
-  OR EXISTS(
-    SELECT 1 FROM session_claude_process_launch_intents i
-    WHERE i.profile_id=OLD.id
-      AND i.profile_generation=OLD.process_generation
-  )
-  OR (
-    EXISTS(
-      SELECT 1 FROM session_personal_runtime_bindings b
-      JOIN sessions s ON s.id=b.session_id
-      WHERE s.profile_id=OLD.id AND b.state IN ('active','detaching')
-    )
-    AND NOT (
-      EXISTS(
-        SELECT 1 FROM session_adoption_profile_generation_permits permit
-        WHERE permit.profile_id=OLD.id
-          AND permit.from_generation=OLD.process_generation
-          AND permit.to_generation=NEW.process_generation
-      )
-      AND (
-        NEW.state=OLD.state
-        OR (
-          NEW.state='login_pending'
-          AND NOT EXISTS(
-            SELECT 1 FROM session_personal_runtime_bindings b
-            JOIN sessions s ON s.id=b.session_id
-            WHERE s.profile_id=OLD.id AND s.provider_v39='codex'
-              AND b.provider='codex' AND b.state IN ('active','detaching')
-          )
-        )
-      )
-    )
-  )
-)
-BEGIN SELECT RAISE(ABORT, 'live session controllers must release before account generation changes'); END;
-CREATE TRIGGER IF NOT EXISTS profile_controller_authority_recovery_guard
-BEFORE UPDATE OF state ON profiles
-WHEN NEW.state='recovery_required' AND OLD.state!='recovery_required'
-  AND EXISTS(
-    SELECT 1 FROM session_claude_process_authorities a
-    WHERE a.profile_id=OLD.id
-      AND a.profile_generation=OLD.process_generation
-      AND a.state!='released'
-    UNION ALL
-    SELECT 1 FROM session_claude_process_launch_intents i
-    WHERE i.profile_id=OLD.id
-      AND i.profile_generation=OLD.process_generation
-  )
-  AND NOT EXISTS(
-    SELECT 1 FROM profile_personal_authority_revocations r
-    WHERE r.profile_id=OLD.id
-      AND r.profile_generation=OLD.process_generation
-      AND r.state='releasing'
-  )
-BEGIN SELECT RAISE(ABORT, 'controller revocation must be staged before account recovery'); END;
-`;
 
-const dropClaudeProcessCustodySchema = (database: Database): void => {
-  const guards = schemaCohortObjects(releasedAdoptionControllerGuards);
-  for (const guard of guards) {
-    if (database.query("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?").get(guard.name) !== null) {
-      database.exec(`DROP TRIGGER ${guard.name}`);
-      database.exec(guard.sql);
-    }
-  }
-  const objects = z.object({ name: z.string().regex(/^[a-z0-9_]+$/u), type: z.enum(["trigger", "index", "table"]) })
-    .strict().array().parse(database.query(`SELECT name,type FROM sqlite_master WHERE name IN (${CLAUDE_PROCESS_CUSTODY_OBJECT_NAMES.map(() => "?").join(",")})`).all(...CLAUDE_PROCESS_CUSTODY_OBJECT_NAMES));
-  for (const object of objects) if (object.type !== "table") database.exec(`DROP ${object.type.toUpperCase()} IF EXISTS ${object.name}`);
-  const column = CLAUDE_PROCESS_CUSTODY_COLUMN.split(" ")[0];
-  if (column === undefined || !/^[a-z0-9_]+$/u.test(column)) throw new Error("Invalid custody marker fixture");
-  for (const table of ["session_claude_process_launch_intents", "session_claude_process_authorities"]) {
-    if (database.query(`SELECT 1 FROM pragma_table_info('${table}') WHERE name=?`).get(column) !== null) {
-      database.exec(`ALTER TABLE ${table} DROP COLUMN ${column}`);
-    }
-  }
-  for (const object of objects.toReversed()) if (object.type === "table") database.exec(`DROP TABLE IF EXISTS ${object.name}`);
-};
 
-const dropSessionAdoptionSchema = (database: Database): void => {
-  dropSessionSwitchAdoptionSchema(database);
-  dropClaudeProcessCustodySchema(database);
-  database.exec("DROP TRIGGER IF EXISTS work_session_project_authority_guard");
-  const objects = z.object({
-    name: z.string().regex(/^[a-z0-9_]+$/u),
-    type: z.enum(["index", "trigger"]),
-  }).strict().array().parse(database.query(`
-    SELECT name,type FROM sqlite_master
-    WHERE name NOT LIKE 'sqlite_%' AND (
-      (type='index' AND (
-        tbl_name IN (${sessionAdoptionTableNames.map(() => "?").join(",")})
-        OR name='sessions_profile_created'
-      ))
-      OR (type='trigger' AND (
-        sql LIKE '%session_account_authorit%'
-        OR sql LIKE '%provider_runtime_account_revocation%'
-        OR sql LIKE '%session_adoption_%'
-        OR sql LIKE '%session_personal_runtime_%'
-          OR sql LIKE '%session_claude_process_%'
-          OR sql LIKE '%profile_personal_authority_%'
-          OR sql LIKE '%codex_account_key%'
-        ))
-    )
-    ORDER BY CASE type WHEN 'trigger' THEN 0 ELSE 1 END,name
-  `).all(...sessionAdoptionTableNames));
-  for (const object of objects) {
-    database.exec(`DROP ${object.type.toUpperCase()} IF EXISTS "${object.name}"`);
-  }
-  for (const table of sessionAdoptionTableNames) {
-    database.exec(`DROP TABLE IF EXISTS "${table}"`);
-  }
-};
 
-const dropSessionAdoptionAndPresetContractSchema = (database: Database): void => {
-  downgradeProviderAccountsToReleasedVersion(database);
-  dropSessionAdoptionSchema(database);
-  downgradeProviderV39SessionColumn(database);
-  const presetTriggers = z.object({
-    name: z.string().regex(/^[a-z0-9_]+$/u),
-  }).strict().array().parse(database.query(
-    `SELECT name FROM sqlite_master
-     WHERE type='trigger' AND sql LIKE '%preset_contract%'
-     ORDER BY name`,
-  ).all());
-  for (const trigger of presetTriggers) {
-    database.exec(`DROP TRIGGER IF EXISTS "${trigger.name}"`);
-  }
-  if (database.query("SELECT 1 FROM pragma_table_info('profiles') WHERE name='codex_account_key'").get() !== null) {
-    database.exec("ALTER TABLE profiles DROP COLUMN codex_account_key");
-  }
-  database.exec("ALTER TABLE sessions DROP COLUMN preset_contract");
-  database.exec("ALTER TABLE works DROP COLUMN preset_contract");
-};
 
-const dropHostedMemorySchema = (database: Database): void => {
-  dropCanonicalProfileSchema(database);
-  database.exec("DROP TRIGGER IF EXISTS work_session_project_authority_guard");
-  const hostedObjects = z.object({
-    name: z.string().regex(/^[a-z0-9_]+$/u),
-    type: z.enum(["index", "trigger"]),
-  }).strict().array().parse(database.query(`
-    SELECT name,type FROM sqlite_master
-    WHERE type IN ('index','trigger') AND (
-      name LIKE 'project_memory_hosted_%'
-      OR name LIKE 'project_memory_sync_%'
-      OR name LIKE 'project_memory_portable_adoption_%'
-      OR name='canonical_memory_sync_share_fence'
-    )
-    ORDER BY CASE type WHEN 'trigger' THEN 0 ELSE 1 END,name
-  `).all());
-  for (const object of hostedObjects) {
-    database.exec(`DROP ${object.type.toUpperCase()} IF EXISTS "${object.name}"`);
-  }
-  database.exec(`
-    DROP TABLE IF EXISTS project_memory_sync_spool;
-    DROP TABLE IF EXISTS project_memory_sync_intents;
-    DROP TABLE IF EXISTS project_memory_hosted_create_intents;
-    DROP TABLE IF EXISTS project_memory_portable_adoption_proofs;
-    DROP TABLE IF EXISTS project_memory_hosted_attachments;
-  `);
-};
 
-const dropPeerAndHostedMemorySchema = (database: Database): void => {
-  dropHostedMemorySchema(database);
-  const featureObjects = z.object({
-    name: z.string().regex(/^[a-z0-9_]+$/u),
-    type: z.enum(["index", "trigger"]),
-  }).strict().array().parse(database.query(`
-    SELECT name,type FROM sqlite_master
-    WHERE type IN ('index','trigger') AND (
-      name LIKE 'peer_session_%'
-      OR name LIKE 'session_peer_%'
-      OR name LIKE 'session_message_event_source%'
-      OR name LIKE 'session_host_capability%'
-      OR name LIKE 'project_memory_%'
-      OR name LIKE 'memory_%'
-      OR name LIKE 'queue_peer_%'
-      OR name IN (
-        'session_provider_switch_authority_immutable',
-        'session_provider_switch_transition_guard',
-        'session_provider_switch_seed_transition_guard',
-        'session_provider_switch_session_update_guard',
-        'session_provider_switch_session_delete_guard',
-        'session_provider_switch_delete_guard',
-        'session_provider_switch_v40_authority_guard',
-        'session_provider_switch_v40_authority_immutable'
-      )
-    )
-    ORDER BY CASE type WHEN 'trigger' THEN 0 ELSE 1 END,name
-  `).all());
-  for (const object of featureObjects) {
-    database.exec(`DROP ${object.type.toUpperCase()} IF EXISTS "${object.name}"`);
-  }
-  database.exec(`
-    DROP TABLE IF EXISTS memory_page_attestation_refs;
-    DROP TABLE IF EXISTS memory_working_attestation_forks;
-    DROP TABLE IF EXISTS memory_working_attestation_heads;
-    DROP TABLE IF EXISTS memory_page_attestations;
-    DROP TABLE IF EXISTS memory_submissions;
-    DROP TABLE IF EXISTS project_memory_authorities;
-    DROP TABLE IF EXISTS session_provider_switches;
-    DROP TABLE IF EXISTS peer_session_direct_message_sources;
-    DROP TABLE IF EXISTS peer_session_turn_origins;
-    DROP TABLE IF EXISTS peer_session_action_roots;
-    DROP TABLE IF EXISTS peer_session_action_visits;
-    DROP TABLE IF EXISTS peer_session_action_parents;
-    DROP TABLE IF EXISTS peer_session_actions;
-    DROP TABLE IF EXISTS session_peer_policies;
-    DROP TABLE IF EXISTS session_message_event_sources;
-    DROP TABLE IF EXISTS session_host_capability_bindings;
-  `);
-  if (database.query(
-    "SELECT 1 FROM pragma_table_info('queue_entries') WHERE name='peer_action_id'",
-  ).get() !== null) database.exec("ALTER TABLE queue_entries DROP COLUMN peer_action_id");
-  if (database.query(
-    "SELECT 1 FROM pragma_table_info('queue_entries') WHERE name='message_actor'",
-  ).get() !== null) database.exec("ALTER TABLE queue_entries DROP COLUMN message_actor");
-};
 
-const dropPostProviderSwitchSchema = (database: Database): void => {
-  dropPeerAndHostedMemorySchema(database);
-  dropSessionAdoptionAndPresetContractSchema(database);
-  database.exec(`
-    DROP TABLE IF EXISTS attention_email_policy;
-    DROP TABLE IF EXISTS notification_hours;
-  `);
-};
 
-const dropTranscriptFinalizationSchema = (database: Database): void => {
-  dropAfterHoursPolicySchema(database);
-  database.exec(`
-    DROP TRIGGER IF EXISTS queue_transcript_cancellation_settlement;
-    DROP TRIGGER IF EXISTS mutation_transcript_finalization_guard;
-    DROP TRIGGER IF EXISTS queue_transcript_finalization_guard;
-    DROP TRIGGER IF EXISTS session_events_account_authority_guard;
-    CREATE TRIGGER session_events_account_authority_guard
-    BEFORE INSERT ON session_events
-    WHEN NOT EXISTS(
-      SELECT 1 FROM sessions s JOIN profiles p ON p.id=s.profile_id
-      WHERE s.id=NEW.session_id
-        AND s.profile_id=NEW.account_id
-        AND p.process_generation=NEW.provider_generation
-    )
-    BEGIN SELECT RAISE(ABORT, 'session event account authority mismatch'); END;
-  `);
-  // Run each predecessor-shaping DDL separately so a dependency error cannot
-  // be hidden by a multi-statement batch. Assert the resulting shape on both
-  // Apple and upstream SQLite.
-  for (const table of ["mutation_attempts", "queue_entries"] as const) {
-    for (const column of [
-      "transcript_intent_json",
-      "transcript_status",
-      "transcript_finalized",
-    ] as const) {
-      database.exec(`ALTER TABLE ${table} DROP COLUMN ${column}`);
-    }
-  }
-  for (const table of ["mutation_attempts", "queue_entries"] as const) {
-    expect(database.query(
-      `SELECT name FROM pragma_table_info('${table}') WHERE name LIKE 'transcript_%'`,
-    ).all()).toEqual([]);
-  }
-};
 
-const dropSchemaAfterVersion34 = (database: Database): void => {
-  downgradeProviderAccountsToReleasedVersion(database);
-  // Peer provenance triggers reference transcript columns. Remove those
-  // newer dependants before shaping the exact pre-transcript predecessor.
-  dropPostProviderSwitchSchema(database);
-  dropTranscriptFinalizationSchema(database);
-  dropProviderSwitchProgressSchema(database);
-};
 
-const dropAfterHoursPolicySchema = (database: Database): void => {
-  database.exec(`
-    DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history;
-    DROP TABLE IF EXISTS autorespond_after_hours_history;
-    DROP TABLE IF EXISTS autorespond_after_hours_policy;
-  `);
-};
 
-const providerVersion39WorkSignalMemberGuardSql = `
-CREATE TRIGGER work_signal_member_guard
-BEFORE INSERT ON work_signals
-WHEN NOT EXISTS (SELECT 1 FROM work_members WHERE work_id=NEW.work_id AND session_id=NEW.from_session_id)
-  OR NOT EXISTS (SELECT 1 FROM work_members WHERE work_id=NEW.work_id AND session_id=NEW.to_session_id)
-  OR NOT EXISTS (
-    SELECT 1 FROM sessions AS s JOIN profiles AS p ON p.id=s.profile_id
-    WHERE s.id=NEW.to_session_id AND s.state IN ('active','idle')
-      AND p.state!='removed' AND (s.provider_v39 IN ('claude','devin') OR p.state='signed_in')
-      AND p.process_generation=NEW.target_account_generation
-  )
-BEGIN SELECT RAISE(ABORT,'WORK_SIGNAL_MEMBER_INVALID'); END;
-`;
 
-const downgradeToExactProviderVersion39 = (database: Database): void => {
-  dropPeerAndHostedMemorySchema(database);
-  dropAfterHoursPolicySchema(database);
-  downgradeProviderAccountsToReleasedVersion(database, 39);
-  database.exec(`
-    DROP TRIGGER IF EXISTS work_profile_attempt_identity_guard;
-    DROP TRIGGER IF EXISTS work_signal_member_guard;
-    ${providerVersion39WorkSignalMemberGuardSql}
-    ${providerVersion40WorkPresetContractGuardsSql}
-    DELETE FROM migrations WHERE version>39;
-    DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=39;
-  `);
-};
 
-const providerVersion40WorkPresetContractGuardsSql = `
-DROP TRIGGER IF EXISTS work_devin_preset_contract_guard;
-CREATE TRIGGER work_devin_preset_contract_guard
-BEFORE INSERT ON works
-WHEN NEW.preset_contract!=2 AND EXISTS (
-  SELECT 1 FROM sessions AS s
-  WHERE s.id=NEW.coordinator_session_id AND s.provider_v39='devin'
-)
-BEGIN SELECT RAISE(ABORT,'WORK_DEVIN_PRESET_CONTRACT_MISMATCH'); END;
-DROP TRIGGER IF EXISTS work_session_devin_contract_guard;
-CREATE TRIGGER work_session_devin_contract_guard
-BEFORE UPDATE OF provider_v39,preset_contract ON sessions
-WHEN NEW.provider_v39='devin' AND (
-  NEW.preset_contract!=2
-  OR EXISTS (
-    SELECT 1 FROM works AS w
-    WHERE w.coordinator_session_id=OLD.id
-      AND w.preset_contract!=2
-  )
-)
-BEGIN SELECT RAISE(ABORT,'WORK_DEVIN_PRESET_CONTRACT_MISMATCH'); END;
-`;
 
-/** Exact released adoption-v40 Work surface, prior to active Sol rebinding. */
-const downgradeToExactProviderVersion40 = (database: Database): void => {
-  dropPeerAndHostedMemorySchema(database);
-  dropAfterHoursPolicySchema(database);
-  database.exec(`
-    ${providerVersion40WorkPresetContractGuardsSql}
-    DELETE FROM migrations WHERE version>40;
-    DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert;
-    DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=40;
-  `);
-};
 
-/** Exact released timestamp-v41 surface, prior to active Sol rebinding. */
-const downgradeToExactProviderVersion41 = (database: Database): void => {
-  dropPeerAndHostedMemorySchema(database);
-  dropAfterHoursPolicySchema(database);
-  database.exec(`
-    ${providerVersion40WorkPresetContractGuardsSql}
-    DELETE FROM migrations WHERE version>41;
-    DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=41;
-  `);
-};
 
-/** Peer/local-memory v47 predecessor, without hosted-memory authority. */
-const downgradeToExactProviderVersion47 = (database: Database): void => {
-  dropHostedMemorySchema(database);
-  database.exec("DELETE FROM migrations WHERE version>47; PRAGMA user_version=47");
-};
 
-/** Canonical-memory v48 predecessor, without the nullable Work project guard. */
-const downgradeToExactProviderVersion48 = (database: Database): void => {
-  dropCanonicalProfileSchema(database);
-  database.exec(`DROP TRIGGER IF EXISTS work_session_project_authority_guard;
-    DELETE FROM migrations WHERE version>48; PRAGMA user_version=48`);
-};
-
-// Exact sqlite_master SQL emitted by StateStore at 42c4235e35daed1dec7eca4ff985bd9e8606b78a.
-// Keeping the generated predecessor surface compressed makes this bridge test
-// independent of the current schema builders that it is intended to challenge.
-const historicalAdoptionVersion35SchemaSha256 =
-  "b9ee8e59273df62581aad7ec065e518034bf3700f35e1cbea542bdf806209e0f";
-const historicalAdoptionVersion35SchemaGzipBase64 =
-  "H4sIAAAAAAAAE+0d23IaR/ZdX9F+QmywSkq8yToJrkLS2GYtQRbw2qnULjViWtKsYYbMDHL891t9v/f0DOAoNnmIEX07ffrcz+nmYhINZhGYDc6vIrAu8tt0CedrWJR5Fi/n8aa6z4u0+jQv4EO+iKs0z0pwfAR41zQBs+j9DPwyGV4PJr+CN9GvYBK9jCbR6CKasm7lcZp0wXgELqOraBaBi8H0YnAZ9aSJ7mAGC7wAGI5m0atoAkbjGRi9vboCF6+jizfHlp7n0exdFI3AKRiMLsHz09Mfzp4///bvz354dvr8+VkXzV9WcQUJjNp8pGU4AsedAi5hXKbZXafXWeSr9RJWMOl08QQFfEhLD1i8nQFz5gZmUcC4gsk8rlyzST1e9MEpHrVZJzWjpB4v+tIqZFG2IXkCuprSNCVTjifqEHNGMpggsC8jrG/OSAHtdo+6YDqbDC9mPx1daET3kCawmBebrEpXcB4vFvkmq2pJjuPgUdEb246V5HgjprpFnsA/EMUt400CGblRLJSLfG2nW7UHnmkVZ/EdTDq9DmNdOttiUxQwqzhOP8BPZE4y1REA9j6UFnD7eAI44H0KNN7/EmZ31f2xZXy3/8N3eCzAHcvNTVkVto69s97zbr/zcPYjnvfHTuCo0y7Gyqur8Tno/O23/54+fR4/vf3P3zpdG8gEv/UwPwuF+eyUAo1nDob6zAf1QVo9JmmFBko6jQuDNOkxwuopjOiUbyUskXrglMB0agqJWGPtNZqUdguQbKHyEY1xyAWLKECIpsxzMZjOlC6DKTi/Gp93u5oO/O5bosAKuMiLxKvB5C5Y8dWiM8nXSCbPF3GWpEj9cS2xlfzl6qi6L2CcmNgkM1FUmL11HHx7SnCwLvL/wUXF5kNfVWm1tIt4GdGkVx2KOSBue0frglEQL6r0AXZ6nTRZon8qWKxSoT5I87zaFII+GYUoLSaRqB1MrDz7hwq3ZMJMooEBs2wDibVszdxsWqYPMINlaccwa8RoQH91ep0sr+b04yb7kOUfM4qHMt8UCzhfo50qIkluEGDJX7+gxoL01c9903TQlpkn+SpOMxnjZqO0oqUR7SuJi49p1ul1lmm2+UPbTJEvECkUlW0V0ejgf7Oji0TPviVHvVjG6QoT38Z+JkoHDP8aZgm1ylEb+Yg5Hxs7tzBbcDudy4H5bZrdwWJdpFnl4y7rgG7/+2cYavt0RHX/JhQ3WpmAYS5LVrO0yqRCgTF7cUgsExhg7NxTuU2LsponabnIH2DhFd22roIJ47Ka5zclLB68kxj9XvRtMIg5F/dxdlc/pdSN7doGLzYNNRDEWnFVwdUa/auxv9Eq8YrW5NmPZmcQ48KiWYQxg+1NhV/6jBlcJCNbN9xGlmd4EjQFHW7AYhGEqtTThZbcaggbASG1rA1jXra41aXpJq0dZCDc/VRw5H5468GWyTpfpovUapfIRl4T00Qx8Dx2XVDUA2bxzRIL0iQtyccvJOShUCax+9lmMaQSJq18QcdwtNgGMU4IJwcjnoACbau02nFE7bbIVwHhDb2bN7ZBTqXKA+ZVOvW1Vb4hRGHpWUdLdWgmnIKZF5al4WXt0axv7HTtOwS12xCS7p/W+6TTiCyG9yqZzPrmJOvYZRbTKRRz2Jym3ubVjV2Pv9XAog2SsljHYsTe5JsM/StHm8nnvUjeNl43GUdAMs0dpUWYOvLXL/ryupb4i9hw35hPib5IiHzSp7jDro6gR3mMbkgpJN6zhG8k3m4oW5bxJlvcz9OsghkV3uSzKQXejob/ehupVMb7dvvffb/vmMNBODGpu0vWKiskKz2MJTq0Nmn4FHslbZ7qY5PepNjl3n1s8lFG5YIkOA+SJbCKF/dEcJPPexHcNMDhoRSpR2v6EnPg4Ww/ptRXWoTUl782pyOCr9adfTmeRMNXo1rXF1vmJsXZosCNXGiqlOgJ4yOxbNd0DDghNBzCfAl9hOSB1LMs29bnyCg8olymkavQ5iIn6stU1mYom2Umm2UkDfDMrGRtNrJpFrJh9nE3eZrh6DJ6H5TWn3NL+AggCgwZI4ULegFJOQDevY4mEVCsT8S4GrgegcLMvwKui/wGElB9AkgPJDoEGgHMHtmi8QZr7kMOSOFIdUjYnFBhTbgsLFhWGyprgFoKaT1O+fkageLLaHrhxbAaJmW44UBSE12F1R1NwAmieZrArEqrTyrg7lGSl9pbE3KliNNI9InkITnw6IGNdgmGSmiKHl5dAsbqZYVBpPpHLO7lBUodomXbtRBIj1vGtmNvdK4apCHo0yAVeGqJO6cBPidGiQqMs7dgECtEipljh4Qf1JxKWGVl5UykiC3mPhnts8nwFdIb3MLhIItCCJwZxjDN7zZxkRydR8gQBG9/uURTjF8SgHtaklmC5ujd62gEjkfRuxPNhBtPAPrWkp9mNhYWYNH74XQ2RTbDNLqKLmbgDLycjK8D/KIbjtWbE4HrPlo0TbiAvCFwPeGASS1c5KMx7A9Lu6Bqpaf4+qh7dB69Go7YHiaD4TQ6HpyPJ7Me4BYnYHthm0O5zSyvwA1c5CtIk/yd7k8gGl02OEfEAgUanGfqMQ5H02gyUxS61JeeHT46K6Ps4Hz+OR4KWgElppyTNOnLJ+Y+RqVPg+MsAw+z3P1RxosFXFfCYJfx3fxkf9/ADXSdKWmEWVWkkJ7l4bDaHBZGZAI+5sWH5kdUxeWHeZqVsKhcByV3lZmOGkKyz3s4wIYHWKUPKDxUom6b5XanSMx7nybcEAl2OM/HcZ7cTsqzqsiXSxSKkS5K4OqOT17LhupGnBVUORP7qHSGAv6+SQsWMhpfXXIlZHY5AhojuxSnJ08a42FEKcYnwt7ro6WpMiTLiFYp1Yt6sWnF18oow8XBrW9Hw/EIDKh7GQS2loJJJchTL+RpI8iRBY1GIdPEjdrAazOFBGThBbJohd7ixAhy4C14OENQMBCQgtWmRMYhzUCAG3ibF8hMxLEYwGivjju82JizeLidTUaBOBW8w+Z7gvHE/vrmjPkDIobyM+og/vShh8sLvriMJh7ST0uQZg/xMk08OKkLbIVgpDY4tm98MPOSgiDRRBusuCrjPz0OF1FlertYsoXgY+aAMAkP1vj8kAMii1XugMSmH6lJWeEBsnwuDhCyjZXpXQaTeZoJtyQ+0Wv4Ze9qLXQoXMXp0hrjU6boL/OPsDiuinR1rI9Gd7t8ZMO0LaMWwU1JDkuANPAqrhb3oLqHgOzlaZpJzgwNtjWnI2IgHw1ezqKJaRmXBOgjwJqGo9nYd7RyvEwKh8hRdrn4QVANOdSeeoYo4g5QuiVCdDCyHwo6sRlmavQpuppGwHsSCEFkYrSYCNSgXJukqxBN0vgzIksVsJ+OmmJ5j4GArbnQEgaQGY6Es2VO03h0O1bWFjqwbB0xNY09HOjj6xLpBUSRPirShTUgqUbDBlClG7GIJN5lSoBO5hEqWADNpLU0wUkEr4ziY4q9PUh5avlL/wULeJzsVdK9uINkBJqpDGqYNNUNu41THZj962L2fcXHDnT0ddGRQkJoX4Z37Zf6WBzqtoYzWFUCMoYLUSaBfVanKqHJbSP5BpTaruswEQUinq3h+qH+0tfygPGMLwL0fpabUu5ljD4GutzxPW9RGwlMyij12Nm8Lyl5Yf+S/7eiThTJWK02FboLBD6m1X2agTwT0Q96DrVkaZS18DKSOZ/fFHCecsae7Sqjv5AmiD/pMHEHlrOegosWG64Lcvkgr41toYIFEtrRi4RwjEv/UusuboqK3uK7lnhrEw0zsUarrTi1YOSx4IbTnnLjkHI84UrMPcbtTS791WbtFqe1l3GbkwbSuTCTixnMsjcLPLpGcsPk6+m61hmqtczTJTOrzLHjQyaayyMVBB6kj6zUzNh6baHdgUIeG4XgW8SfmqkKqUDLdtzsYnKjTRE4ttQEdDM8vdVMkHG49ZSpcrnXZ9wL71gU4Jr+sStUV28zd9uglCZxSxBnFL23KbY1FBu4kYlhxbNLlpBMijWCcsD9Nrin+TqR49sLvXtovf5hvcIT4ZaT1EfWzLWFbYqa8sbiRKnQ74tbHp4ktictvrYlxbvbZjFxCpy9DsYz4Ixv0xKwE9gZUXwG5jwQyl+HUBo7SiYJ7KUEwK3D2js6dMubrIRVtYQJKvZJV/68fyOGEEUABBe0BougwXwLRI2tyDVAksekvRCieBzmSyG8WZ3b6rP4IkyNSo2CJbunLsno11QUq6Pswt147seJ4VocB2HZhufW2rMxppvgui22ga6L6fxCF8u9XBrZ6Gg/PjnExriFoDUgWGp9yHGhEOXCvg1y+e1Evd7FL7zZCUser17B9FNDkzJEAXhah9luUyjtlN9+A/YoK4uxei01Ws1JUS4YdBd7st8E2fu+NHp31avKPeS8siWE70THTjbtvwQjCab6qzAygm6CxAa9EuN8IqGr9S+b4Mprl3FDgRd0P71HF5kwIRKLrIAVCgmit7W4pUIFeLhZYr7X5TBJTEFsL/A2+/FiBH08k6F/wYJuGuttDPlnrOnmjBiioOq5rAGPsYygsZ8GPCXucsu5O2EzcRM32Nhp8lYd+VcTGeRL5ykxKGg37VE4P6FpY9Xn5excZREnXoGCrnSLOyG8Jr5ksgTTtl4HLzErSRM5L9qFY3ee5Y5AwKjJGdU4tWiUDD7aLcofUhS3jOzyo5fzF+4YNQ2euuSkJcAq6yLaEi4l65g4mIW3Z+C28vEg2Wsl++65nKc72vI4zR7km4rFOahHa5Qw1t8ME3OZV8KkNmdFoxEdMesZ0bONuufdY8GdvggikQpCETPqXw/eSw9M4VJ38afy3IkcPGaVMGq0sqbI0IZihN+WN+4Is0r4Q68yrvIHFLQTSWQ9enQQPQejcr+iRxQgwSypFTwOZREeSXZrm4DKG8/eL/C8zEdSr9I1DRk7N8k6hCXYQrZKRRJ9dzSwaJRU/jmr/rjdXnrqX+qqAtXxW74R4jwcRqzUTAKrtMS1mTs6IWe2S1yw4mL7cGqf+9QUTzzEJ/F68g3ojwykr+k28kO8O+DWov8Cgn8XQS+d1Jjs9gAklqzyN1Lpdb0siBvIAl/gptv6nBZ5drtMF1WJi2Px7+6YtLntAYo6lq0OcPviII5EWwJG6asFJOru/9VVlzfKSNUWa9Sn8zxbUcZZf5jDnlqyU3p9erA9bfLaKvqDfGZNVTiJumIIkparIVBnFCL4LmMLC8NahrMzC4K/kcCKJJju4ZUCXDuFaiMnnkNqINUr2s7KefFc8VHQ+bTBQKtSSefmVYlIQkq1Lm8o4am+sP2da1YHYfGG274+4w35Szc88EIykbcXCOxxk0WcLeASJZGo22U8DkR23vq8Qv2ugKPZ7+MmOtm28Muct3fYEwy1gtFz/ccmG2tuXgXcu3LIRvfNpa3KQyzquGxY7yHfoeLQ2GwQ3z1gx6J6rtZXxNlGu4fUj+DbbiKhhWu2fI95azfQ7A96a50CHvU2RgQ+7G291OKH91kIvPWPfBtj/A99h1T38RKb2quaKCNIR20hJHxXfAOFxHa7aqChS1+oDcnQusyX/xc7zOcLduRzauqUvzEk6X3zB4oQxcjPs7XV6g6dXmdcYlfSGe1gqpz5sEyTs/Mmx1F7nB4N/mccZ+OXhxulH73oJiOA0zIQCK/Qo4PN8I1eVBQ/iGmIAIeBII8yLAEgY5G9cOS5yY1+0IuvaLwPNJhS64E/E8S6+p8L4r08zwYNpvLLQfYRlFEti2LNijCBfrzZ9PVs8+EhDAWKX+j89eduUJTCGfVgi1miHgJA39Xy8AcJbNO1f5ig8248eTMfzGbR9S+z+eDiYvx2NJsP3s5ejyfD2a/z6+H0ejC7eO0l7EWeF0maxVVeNCPu3RC1lZh38d6VSrhBT17JqLBGJrakwHhHVLRL6rkYjyeXw9FgNp40pZwVXN1YjSKfRCSDvjza+Vro5Tq6Po8akwryzOHHhqRCBu2RVKj2F4aOnWxo2x6Jh+zUriPZ8l8gLU2ifw+jd82pCW0P3SBqRE1k0JcneHBJ6hcjfWgk5Qs5myrfy8k4LdkqLu6g8FFsBu0jFAPT4avR4Kqt/cqFwYdWAgE9ew9T4aJF704+pFmCXl37oFfPWOlRFi6Y1vBHjQqd1IqgUciGDDco588iaQoOM3IIymRatoBLnap9WdFrG/UzOP7aDPAmhAn+D9/+9+D5kgAA";
-
-const downgradeToHistoricalAdoptionVersion35 = (database: Database): void => {
-  dropSchemaAfterVersion34(database);
-  const schema = gunzipSync(
-    Buffer.from(historicalAdoptionVersion35SchemaGzipBase64, "base64"),
-  ).toString("utf8");
-  if (createHash("sha256").update(schema).digest("hex")
-    !== historicalAdoptionVersion35SchemaSha256) {
-    throw new Error("Historical adoption-v35 fixture digest mismatch.");
-  }
-  database.exec(schema);
-  database.exec("DELETE FROM migrations WHERE version>35; DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=35;");
-};
-
-const dropPostLegacyAdoptionVersion36Schema = (database: Database): void => {
-  dropCanonicalProfileSchema(database);
-  database.exec("DROP TRIGGER IF EXISTS work_session_project_authority_guard");
-  downgradeProviderAccountsToReleasedVersion(database, 40);
-  database.exec("PRAGMA foreign_keys=OFF");
-  try {
-    // Replace combined Work guards before rebuilding their referenced tables.
-    // The released v36 guards below contain no task provider-account sidecars.
-    for (const guard of schemaCohortObjects(legacyAdoptionWorkAuthorityGuards)) {
-      database.exec(`DROP TRIGGER IF EXISTS ${guard.name}`);
-      database.exec(guard.sql);
-    }
-    downgradeProviderV39SessionColumn(database);
-    const presetTriggers = z.object({
-      name: z.string().regex(/^[a-z0-9_]+$/u),
-    }).strict().array().parse(database.query(
-      `SELECT name FROM sqlite_master
-       WHERE type='trigger' AND sql LIKE '%preset_contract%'
-       ORDER BY name`,
-    ).all());
-    for (const trigger of presetTriggers) {
-      database.exec(`DROP TRIGGER IF EXISTS "${trigger.name}"`);
-    }
-    database.exec("ALTER TABLE sessions DROP COLUMN preset_contract");
-    database.exec("ALTER TABLE works DROP COLUMN preset_contract");
-    database.exec("ALTER TABLE session_adoption_candidates DROP COLUMN last_live_observed_at");
-    database.exec("ALTER TABLE session_adoption_candidates DROP COLUMN provider_project_root");
-    database.exec("DROP TABLE IF EXISTS attention_email_policy");
-    database.exec("DROP TABLE IF EXISTS notification_hours");
-  } finally {
-    database.exec("PRAGMA foreign_keys=ON");
-  }
-};
-
-const legacyAdoptionWorkAuthorityGuards = `
-CREATE TRIGGER IF NOT EXISTS work_coordinator_account_authority_guard
-BEFORE INSERT ON works
-WHEN NOT EXISTS (
-  SELECT 1
-  FROM session_account_authorities AS a
-  JOIN sessions AS s ON s.id=a.session_id AND s.profile_id=a.profile_id
-  JOIN profiles AS p ON p.id=a.profile_id
-  WHERE a.session_id=NEW.coordinator_session_id
-    AND s.state IN ('active','idle')
-    AND p.state='signed_in'
-    AND a.account_key IS NOT NULL
-    AND p.provider_email IS NOT NULL
-    AND a.account_key=lower(trim(p.provider_email))
-)
-BEGIN SELECT RAISE(ABORT,'WORK_COORDINATOR_AUTHORITY_MISMATCH'); END;
-CREATE TRIGGER IF NOT EXISTS work_member_account_authority_guard
-BEFORE INSERT ON work_members
-WHEN NOT EXISTS (
-  SELECT 1
-  FROM session_account_authorities AS a
-  JOIN sessions AS s ON s.id=a.session_id AND s.profile_id=a.profile_id
-  JOIN profiles AS p ON p.id=a.profile_id
-  WHERE a.session_id=NEW.session_id
-    AND s.state IN ('active','idle')
-    AND p.state='signed_in'
-    AND a.account_key IS NOT NULL
-    AND p.provider_email IS NOT NULL
-    AND a.account_key=lower(trim(p.provider_email))
-)
-BEGIN SELECT RAISE(ABORT,'WORK_MEMBER_AUTHORITY_MISMATCH'); END;
-CREATE TRIGGER IF NOT EXISTS work_attempt_account_authority_guard
-BEFORE INSERT ON work_attempts
-WHEN NOT EXISTS (
-  SELECT 1
-  FROM session_account_authorities AS authority
-  JOIN sessions AS s
-    ON s.id=authority.session_id AND s.profile_id=authority.profile_id
-  JOIN profiles AS p ON p.id=authority.profile_id
-  WHERE authority.session_id=NEW.worker_session_id
-    AND authority.profile_id=NEW.account_id
-    AND s.state IN ('active','idle')
-    AND p.state='signed_in'
-    AND p.process_generation=NEW.account_generation
-    AND authority.account_key IS NOT NULL
-    AND p.provider_email IS NOT NULL
-    AND authority.account_key=lower(trim(p.provider_email))
-)
-BEGIN SELECT RAISE(ABORT,'WORK_ATTEMPT_ACCOUNT_AUTHORITY_MISMATCH'); END;
-CREATE TRIGGER IF NOT EXISTS work_review_account_authority_guard
-BEFORE INSERT ON work_reviews
-WHEN NOT EXISTS (
-  SELECT 1
-  FROM session_account_authorities AS a
-  JOIN sessions AS session ON session.id=a.session_id AND session.profile_id=a.profile_id
-  JOIN profiles AS p ON p.id=a.profile_id
-  WHERE a.session_id=NEW.reviewer_session_id
-    AND session.state IN ('active','idle')
-    AND p.state='signed_in'
-    AND a.account_key IS NOT NULL
-    AND p.provider_email IS NOT NULL
-    AND a.account_key=lower(trim(p.provider_email))
-)
-BEGIN SELECT RAISE(ABORT,'WORK_REVIEWER_AUTHORITY_MISMATCH'); END;
-CREATE TRIGGER IF NOT EXISTS work_signal_account_authority_guard
-BEFORE INSERT ON work_signals
-WHEN NOT EXISTS (
-  SELECT 1
-  FROM session_account_authorities AS a
-  JOIN sessions AS s ON s.id=a.session_id AND s.profile_id=a.profile_id
-  JOIN profiles AS p ON p.id=a.profile_id
-  WHERE a.session_id=NEW.from_session_id
-    AND s.state IN ('active','idle')
-    AND p.state='signed_in'
-    AND a.account_key IS NOT NULL
-    AND p.provider_email IS NOT NULL
-    AND a.account_key=lower(trim(p.provider_email))
-)
-OR NOT EXISTS (
-  SELECT 1
-  FROM session_account_authorities AS a
-  JOIN sessions AS s ON s.id=a.session_id AND s.profile_id=a.profile_id
-  JOIN profiles AS p ON p.id=a.profile_id
-  WHERE a.session_id=NEW.to_session_id
-    AND s.state IN ('active','idle')
-    AND p.state='signed_in'
-    AND p.process_generation=NEW.target_account_generation
-    AND a.account_key IS NOT NULL
-    AND p.provider_email IS NOT NULL
-    AND a.account_key=lower(trim(p.provider_email))
-)
-BEGIN SELECT RAISE(ABORT,'WORK_SIGNAL_ACCOUNT_AUTHORITY_MISMATCH'); END;
-CREATE TRIGGER IF NOT EXISTS work_signal_ack_account_authority_guard
-BEFORE INSERT ON work_signal_receipts
-WHEN NEW.kind='ack' AND NOT EXISTS (
-  SELECT 1
-  FROM work_signals AS signal
-  JOIN session_account_authorities AS a ON a.session_id=signal.to_session_id
-  JOIN sessions AS s ON s.id=a.session_id AND s.profile_id=a.profile_id
-  JOIN profiles AS p ON p.id=a.profile_id
-  WHERE signal.id=NEW.signal_id
-    AND signal.to_session_id=NEW.actor_session_id
-    AND s.state IN ('active','idle')
-    AND p.state='signed_in'
-    AND p.process_generation=signal.target_account_generation
-    AND a.account_key IS NOT NULL
-    AND p.provider_email IS NOT NULL
-    AND a.account_key=lower(trim(p.provider_email))
-)
-BEGIN SELECT RAISE(ABORT,'WORK_SIGNAL_ACK_ACCOUNT_AUTHORITY_MISMATCH'); END;
-`;
-
-const downgradeToExactLegacyAdoptionVersion36 = (database: Database): void => {
-  dropPostLegacyAdoptionVersion36Schema(database);
-  database.exec(`
-    DROP TRIGGER IF EXISTS work_attempt_account_authority_guard;
-    DROP TRIGGER IF EXISTS work_coordinator_account_authority_guard;
-    DROP TRIGGER IF EXISTS work_member_account_authority_guard;
-    DROP TRIGGER IF EXISTS work_review_account_authority_guard;
-    DROP TRIGGER IF EXISTS work_signal_account_authority_guard;
-    DROP TRIGGER IF EXISTS work_signal_ack_account_authority_guard;
-  `);
-  database.exec(legacyAdoptionWorkAuthorityGuards);
-  database.exec(`
-    DELETE FROM migrations WHERE version > 36;
-    DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=36;
-  `);
-};
 
 const codexAdoptionRuntimeProfile = (
   profile: Readonly<{ id: string; processGeneration: number }>,
@@ -1324,56 +904,8 @@ const enqueueAttachedTestQueue = (
   finally { store.releaseAttachmentIngress(reservation); }
 };
 
-const dropAutomaticUsagePolicySchema = (database: Database): void => {
-  dropSessionSendOwnerSchema(database);
-  database.exec(`
-    DROP TRIGGER IF EXISTS automatic_usage_policy_mutation_update_guard;
-    DROP TRIGGER IF EXISTS automatic_usage_policy_mutation_delete_guard;
-    DROP INDEX IF EXISTS automatic_usage_policy_mutations;
-    DROP TABLE IF EXISTS automatic_usage_policy_revisions;
-  `);
-};
 
-function dropAttachmentCustodySchema(database: Database): void {
-  // Combined v49 proof guards must disappear before SQLite rebuilds their
-  // parent tables; canonical adoption-v40 rows remain untouched here.
-  dropSessionSwitchAdoptionSchema(database);
-  dropClaudeProcessCustodySchema(database);
-  for (const type of ["trigger", "index"] as const) {
-    for (const object of [...ATTACHMENT_CUSTODY_SCHEMA_OBJECTS].reverse()) if (object.type === type) database.exec(`DROP ${type.toUpperCase()} IF EXISTS ${object.name}`);
-  }
-  for (const column of [...ATTACHMENT_CUSTODY_COLUMNS].reverse()) {
-    const name = column.split(" ")[0];
-    if (name !== undefined && database.query("SELECT 1 FROM pragma_table_info('mutation_attempts') WHERE name=?").get(name) !== null) database.exec(`ALTER TABLE mutation_attempts DROP COLUMN ${name}`);
-  }
-  for (const object of [...ATTACHMENT_CUSTODY_SCHEMA_OBJECTS].reverse()) if (object.type === "table") database.exec(`DROP TABLE IF EXISTS ${object.name}`);
-  database.exec("DELETE FROM migrations WHERE version=49");
-}
 
-function dropSessionSendOwnerSchema(database: Database): void {
-  dropAttachmentCustodySchema(database);
-  for (const object of QUEUE_ATTACHMENT_SCHEMA_OBJECTS.filter((entry) => entry.type === "trigger")) database.exec(`DROP TRIGGER IF EXISTS ${object.name}`);
-  if (database.query("SELECT 1 FROM pragma_table_info('queue_entries') WHERE name='enqueue_identity_attempt_id'").get() !== null) database.exec("ALTER TABLE queue_entries DROP COLUMN enqueue_identity_attempt_id");
-  if (database.query("SELECT 1 FROM pragma_table_info('queue_entries') WHERE name='enqueue_identity_format'").get() !== null) database.exec("ALTER TABLE queue_entries DROP COLUMN enqueue_identity_format");
-  for (const type of ["index", "table"] as const) {
-    for (const object of [...QUEUE_ATTACHMENT_SCHEMA_OBJECTS].reverse()) if (object.type === type) database.exec(`DROP ${type.toUpperCase()} IF EXISTS ${object.name}`);
-  }
-  database.exec("DELETE FROM migrations WHERE version=48");
-  for (const type of ["trigger", "index", "table"] as const) {
-    for (const object of [...AUTOMATIC_POINTER_MOVE_SCHEMA_OBJECTS].reverse()) {
-      if (object.type === type) database.exec(`DROP ${type.toUpperCase()} IF EXISTS ${object.name}`);
-    }
-  }
-  database.exec("DELETE FROM migrations WHERE version=47");
-  for (const type of ["trigger", "index", "table"] as const) {
-    for (const object of [...SESSION_SEND_OWNER_SCHEMA_OBJECTS].reverse()) {
-      if (object.type === type) database.exec(`DROP ${type.toUpperCase()} IF EXISTS ${object.name}`);
-    }
-  }
-  if (database.query("SELECT 1 FROM pragma_table_info('mutation_attempts') WHERE name='request_format'").get() !== null) {
-    database.exec("ALTER TABLE mutation_attempts DROP COLUMN request_format");
-  }
-}
 
 describe("automatic usage policy configuration", () => {
   const command = (expectedAutomaticPolicyRevision = 1): AutomaticUsagePolicyConfigurationUpdate => ({
@@ -1573,7 +1105,7 @@ describe("automatic usage policy configuration", () => {
     store.updateAutomaticUsagePolicyConfiguration(request);
     const database = inspect(home);
     try {
-      if (damage === "missing_table") dropAutomaticUsagePolicySchema(database);
+      if (damage === "missing_table") database.exec("DROP TABLE automatic_usage_policy_revisions");
       else if (damage === "weakened_guard") database.exec(`DROP TRIGGER automatic_usage_policy_immutable_update;
         CREATE TRIGGER automatic_usage_policy_immutable_update BEFORE UPDATE ON automatic_usage_policy_revisions BEGIN SELECT 1; END`);
       else if (damage === "missing_initial") {
@@ -1675,22 +1207,22 @@ describe("automatic usage policy configuration", () => {
     } finally { database.close(false); }
   });
 
-  test.each([false, true])("refuses unsupported intermediate v43 or partial v44 without rewriting prior state (partial=%s)", async (partial) => {
+  test.each([false, true])("refuses an adversarial joined-schema v43 restamp with missing or partial policy without writes (partial=%s)", async (partial) => {
     const { store, home } = await fixture();
     seedUnrelatedState(store);
     if (partial) store.updateAutomaticUsagePolicyConfiguration(command());
     const database = inspect(home);
     try {
-      const beforeDowngrade = unrelatedRows(database);
-      if (!partial) dropAutomaticUsagePolicySchema(database);
-      else {
-        dropSessionSendOwnerSchema(database);
-        database.exec("DROP TRIGGER automatic_usage_policy_immutable_update");
-      }
+      const beforeDamage = unrelatedRows(database);
+      // Deliberately inconsistent current input, not archived43/44 producer
+      // evidence. Retain all joined custody and change only the named policy
+      // surface and claimed ledger/version; a lower stamp grants no repair.
+      if (!partial) database.exec("DROP TABLE automatic_usage_policy_revisions");
+      else database.exec("DROP TRIGGER automatic_usage_policy_immutable_update");
       database.exec("DELETE FROM migrations WHERE version>=44; PRAGMA user_version=43");
       const baseline = unrelatedRows(database);
       expect(baseline.filter(([, rows]) => Array.isArray(rows) && rows.length > 0))
-        .toEqual(beforeDowngrade.filter(([, rows]) => Array.isArray(rows) && rows.length > 0));
+        .toEqual(beforeDamage.filter(([, rows]) => Array.isArray(rows) && rows.length > 0));
       const beforeAdmission = {
         schema: database.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all(),
         migrations: database.query("SELECT * FROM migrations ORDER BY version").all(),
@@ -1711,21 +1243,23 @@ describe("automatic usage policy configuration", () => {
     } finally { database.close(false); }
   });
 
-  test("refuses a malformed partial v44 schema and rolls back its migration stamp", async () => {
+  test("refuses an adversarial joined-schema v43 restamp with a malformed policy table without writes", async () => {
     const { home } = await fixture();
     const database = inspect(home);
     try {
-      dropAutomaticUsagePolicySchema(database);
+      database.exec("DROP TABLE automatic_usage_policy_revisions");
       database.exec(`CREATE TABLE automatic_usage_policy_revisions(automatic_policy_revision INTEGER PRIMARY KEY);
         DELETE FROM migrations WHERE version>=44; PRAGMA user_version=43`);
+      const beforeAdmission = policyAdmissionSnapshot(database);
       expect(() => new StateStore(pathsFor(home))).toThrow();
+      expect(policyAdmissionSnapshot(database)).toEqual(beforeAdmission);
       expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 43 });
       expect(database.query("SELECT COUNT(*) AS count FROM migrations WHERE version=44").get()).toEqual({ count: 0 });
       expect(database.query("SELECT COUNT(*) AS count FROM automatic_usage_policy_revisions").get()).toEqual({ count: 0 });
     } finally { database.close(false); }
   });
 
-  test.each([false, true])("refuses interrupted intermediate v43 configuration authority without repair (retained receipt=%s)", async (retainedReceipt) => {
+  test.each([false, true])("refuses an adversarial joined-schema v43 restamp with empty policy history without repair (retained receipt=%s)", async (retainedReceipt) => {
     const { store, home } = await fixture();
     if (retainedReceipt) store.updateAutomaticUsagePolicyConfiguration(command());
     const database = inspect(home);
@@ -1733,7 +1267,8 @@ describe("automatic usage policy configuration", () => {
       const original = (database.query("SELECT sql FROM sqlite_master WHERE name='automatic_usage_policy_immutable_delete'").get() as { sql: string }).sql;
       database.exec("DROP TRIGGER automatic_usage_policy_immutable_delete; DELETE FROM automatic_usage_policy_revisions");
       database.exec(original);
-      dropSessionSendOwnerSchema(database);
+      // This is damaged current state, not an authentic interrupted43 source.
+      // Keep all unrelated ownership, custody, and provenance objects intact.
       database.exec("DELETE FROM migrations WHERE version>=44; PRAGMA user_version=43");
       if (!retainedReceipt) database.exec(`CREATE TRIGGER test_policy_migration_fault AFTER INSERT ON automatic_usage_policy_revisions
         BEGIN SELECT RAISE(ABORT,'migration fixture fault'); END`);
@@ -1776,27 +1311,6 @@ describe("automatic usage policy configuration", () => {
   });
 });
 
-const dropProviderAuthorityObjectsForLegacyFeatureFixture = (database: Database): void => {
-  dropAttachmentCustodySchema(database);
-  database.exec(`
-    PRAGMA foreign_keys=OFF;
-    DROP TRIGGER IF EXISTS session_provider_switch_session_update_guard;
-    DROP TRIGGER IF EXISTS session_provider_switch_session_delete_guard;
-    DROP TABLE IF EXISTS session_provider_switches;
-    DROP TABLE IF EXISTS session_mutation_authority_rebinds_v39;
-    DROP TABLE IF EXISTS session_provider_switch_source_releases;
-    DROP TABLE IF EXISTS session_provider_switch_seed_results;
-    DROP TABLE IF EXISTS session_provider_switch_seed_intents;
-    DROP TABLE IF EXISTS session_provider_switch_target_releases;
-    DROP TABLE IF EXISTS session_provider_switch_targets;
-    DROP TABLE IF EXISTS session_mutation_authority_rebinds;
-    PRAGMA foreign_keys=ON;
-  `);
-};
-
-const dropProviderSwitchVersion35Objects = (database: Database): void => {
-  dropProviderAuthorityObjectsForLegacyFeatureFixture(database);
-};
 
 const providerSwitchSchemaObjectCount = (database: Database): number =>
   z.object({ count: z.number().int().nonnegative() }).strict().parse(database.query(
@@ -1805,37 +1319,90 @@ const providerSwitchSchemaObjectCount = (database: Database): number =>
         OR name LIKE 'session_mutation_authority_rebinds%'`,
   ).get()).count;
 
-const replaceAutorespondEvidenceWithVersion30Fixture = (
-  database: Database,
-  sessionId: string,
-): void => {
-  dropSchemaAfterVersion34(database);
-  database.query("DROP TABLE IF EXISTS autorespond_message_sources").run();
-  database.query("DROP TABLE IF EXISTS autorespond_evidence_next").run();
-  database.query("DROP TABLE autorespond_evidence").run();
-  database.query(`
-    CREATE TABLE autorespond_evidence (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-      interaction_id TEXT NOT NULL CHECK(length(interaction_id) = 36),
-      kind TEXT NOT NULL CHECK(kind IN ('command_approval','file_change_approval','permission_approval')),
-      class TEXT NOT NULL CHECK(length(class) BETWEEN 1 AND 256),
-      decision TEXT NOT NULL CHECK(length(decision) BETWEEN 1 AND 64),
-      mode TEXT NOT NULL CHECK(mode IN ('auto:all','auto:workspace','manual')),
-      outcome TEXT NOT NULL CHECK(outcome IN ('accepted','refused')),
-      latency_ms INTEGER NOT NULL CHECK(latency_ms >= 0),
-      subagent INTEGER NOT NULL CHECK(subagent IN (0,1)),
-      occurred_at INTEGER NOT NULL CHECK(occurred_at >= 0)
-    ) STRICT
-  `).run();
-  database.query(`
-    INSERT INTO autorespond_evidence(
-      id,session_id,interaction_id,kind,class,decision,mode,outcome,latency_ms,subagent,occurred_at
-    ) VALUES (7,?,'00000000-0000-4000-8000-000000000731','command_approval','shell','accept','manual','accepted',17,1,1500)
-  `).run(sessionId);
-  database.query("DELETE FROM migrations WHERE version > 30").run();
-  database.exec("DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version = 30");
-};
+async function canonical30AutorespondArchive() {
+  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-canonical30-autorespond-")));
+  const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+  await initializeStatePaths(paths);
+  await writeFile(paths.database, canonical30WorkDatabaseBytes(), { mode: 0o600, flag: "wx" });
+  return paths;
+}
+
+async function canonical48WorkArchive() {
+  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-canonical48-work-")));
+  const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+  await initializeStatePaths(paths);
+  await writeFile(paths.database, canonical48WorkDatabaseBytes(), { mode: 0o600, flag: "wx" });
+  return paths;
+}
+
+// Source-derived stage, NOT a captured or released47 artifact. The exact
+// archived5838 memory component is empty in the hash-verified48 capture. Only
+// that component and its original48 ledger row may be removed; the full
+// predecessor row/schema comparison prevents any broader downgrade helper.
+async function stagedCanonical47Archive() {
+  const paths = await canonical48WorkArchive();
+  const names = [
+    "project_memory_hosted_attachments", "project_memory_hosted_create_intents",
+    "project_memory_sync_intents", "project_memory_sync_spool", "project_memory_portable_adoption_proofs",
+    "project_memory_hosted_create_intents_project_recent", "project_memory_hosted_create_intents_remote_space",
+    "project_memory_hosted_create_intents_one_unresolved_project", "project_memory_sync_intents_project_recent",
+    "project_memory_sync_intents_project_settled", "project_memory_sync_intents_one_unresolved_project",
+    "project_memory_portable_adoption_proofs_record", "project_memory_portable_adoption_proof_insert_guard",
+    "project_memory_portable_adoption_proof_update_guard", "project_memory_portable_adoption_proof_delete_guard",
+    "project_memory_hosted_create_intent_insert_guard", "project_memory_hosted_create_intent_transition_guard",
+    "project_memory_hosted_create_intent_delete_guard", "project_memory_hosted_attachment_insert_guard",
+    "project_memory_hosted_attachment_transition_guard", "project_memory_hosted_attachment_delete_guard",
+    "project_memory_sync_spool_insert_guard", "project_memory_sync_spool_update_guard",
+    "project_memory_sync_spool_delete_guard", "project_memory_sync_intent_insert_guard",
+    "project_memory_sync_intent_transition_guard", "project_memory_sync_intent_delete_guard",
+    "project_memory_sync_intent_retained_quota", "project_memory_hosted_create_authority_fence",
+    "project_memory_sync_authority_fence", "canonical_memory_sync_share_fence",
+  ];
+  const database = new Database(paths.database, { create: false, strict: true });
+  try {
+    database.exec("PRAGMA foreign_keys=ON");
+    database.transaction(() => {
+      const before = canonicalAuthBudgetSnapshot(database);
+      expect(before.version).toEqual({ user_version: 48 });
+      expect(database.query("SELECT * FROM migrations WHERE version=48").get())
+        .toEqual({ version: 48, applied_at: canonical48WorkFixture.fixedTime });
+      const objects = z.array(z.object({
+        type: z.enum(["table", "index", "trigger", "view"]), name: z.string(), tbl_name: z.string(), sql: z.string().nullable(),
+      }).strict()).parse(before.schema);
+      const component = objects.filter((object) => names.includes(object.name));
+      expect(component).toHaveLength(31);
+      // Exact sqlite_schema metadata from5838's aliased physical48 component,
+      // not a digest of the current implementation's dynamically derived DDL.
+      expect(createHash("sha256").update(JSON.stringify(component)).digest("hex"))
+        .toBe("9583125a8741583e8f98290021f49f808d4b6c66508399285022c21b0dfb5490");
+      const tables = component.filter((object) => object.type === "table").map((object) => object.name);
+      expect(tables).toHaveLength(5);
+      for (const table of tables) expect(before.rows[table]).toEqual([]);
+      const isOwned = (object: (typeof objects)[number]) => names.includes(object.name)
+        || (object.type === "index" && object.sql === null && object.name.startsWith("sqlite_autoindex_") && tables.includes(object.tbl_name));
+      for (const object of objects.filter((entry) => !isOwned(entry))) {
+        expect(tables).not.toContain(object.tbl_name);
+        for (const table of tables) expect(object.sql ?? "").not.toMatch(new RegExp(`\\b${table}\\b`, "iu"));
+      }
+      for (const object of component.filter((entry) => entry.type === "trigger" || entry.type === "index")) {
+        database.exec(`DROP ${object.type.toUpperCase()} "${object.name}"`);
+      }
+      for (const table of [...tables].reverse()) database.exec(`DROP TABLE "${table}"`);
+      expect(database.query("DELETE FROM migrations WHERE version=48 AND applied_at=?")
+        .run(canonical48WorkFixture.fixedTime).changes).toBe(1);
+      database.exec("PRAGMA user_version=47");
+      const after = canonicalAuthBudgetSnapshot(database);
+      expect(after.schema).toEqual(objects.filter((object) => !isOwned(object)));
+      expect(after.rows).toEqual(Object.fromEntries(Object.entries(before.rows)
+        .filter(([table]) => !tables.includes(table))
+        .map(([table, rows]) => [table, table === "migrations"
+          ? rows.filter((row) => z.object({ version: z.number() }).parse(row).version !== 48) : rows])));
+      expect(after.version).toEqual({ user_version: 47 });
+      expect(database.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    }).immediate();
+  } finally { database.close(false); }
+  return paths;
+}
 
 // Pinned-reader tests prove the scrub fails once a reader outlives the whole
 // checkpoint budget. The production budget is three 5 s attempts; this policy
@@ -2043,6 +1610,22 @@ const combined49SwitchArchiveForTest = async () => {
   expect(createHash("sha256").update(bytes).digest("hex")).toBe(combined49SwitchFixture.databaseSha256);
   await writeFile(paths.database, bytes, { mode: 0o600, flag: "wx" });
   return paths;
+};
+
+const expectInertSwitchReopenForTest = (
+  paths: StateStore["paths"],
+  expected: ReturnType<StateStore["requireSessionSwitch"]>,
+): void => {
+  const inspector = new Database(paths.database, { create: false, strict: true });
+  try {
+    const before = snapshotSwitchContainmentForTest(inspector);
+    for (const readonly of [false, true]) {
+      const reopened = new StateStore(paths, { readonly });
+      try { expect(reopened.requireSessionSwitch(expected.attemptId)).toEqual(expected); }
+      finally { reopened.close(); }
+      expect(snapshotSwitchContainmentForTest(inspector)).toEqual(before);
+    }
+  } finally { inspector.close(false); }
 };
 
 const canonicalTimestampArchiveForTest = async (version: 40 | 41) => {
@@ -2358,174 +1941,10 @@ const desktopSwitchBinding = (plan: Readonly<{
   targetProviderAuthority: plan.targetProviderAuthority,
 });
 
-const schemaVersion41Tables = [
-  "work_signal_provider_authorities",
-  "account_rate_limit_reset_provider_authorities",
-  "session_event_provider_authorities",
-  "interaction_provider_authorities",
-  "queue_provider_authorities",
-  "mutation_provider_authorities",
-  "runtime_profile_provider_authorities",
-  "session_provider_authorities",
-  "account_scoped_provider_authorities",
-  "legacy_provider_authority_quarantines",
-  "provider_account_states",
-  "provider_accounts",
-] as const;
 
-const schemaVersion42ProviderUsageTables = [
-  "provider_usage_observation_components",
-  "provider_usage_prune_targets",
-  "provider_usage_observation_receipts",
-  "codex_usage_authority_prune_targets",
-] as const;
 
-const schemaVersion43SessionSwitchTables = [
-  "session_switch_seed_anchors",
-  "session_switch_rebind_anchors",
-  "session_switch_target_start_anchors",
-  "session_switch_abandon_anchors",
-  "session_switch_source_release_anchors",
-  "session_switch_no_effect_anchors",
-  "session_switch_reconciliation_anchors",
-  "session_switch_reconciliation_receipts",
-  "session_switch_malformed_dispositions",
-  "session_switch_plan_anchors",
-  "session_switch_target_start_receipts",
-  "session_switch_source_release_receipts",
-  "session_switch_rebind_receipts",
-  "session_switch_seed_authorities",
-  "session_switch_seed_receipts",
-  "session_switch_no_effect_receipts",
-  "session_switch_abandon_receipts",
-  "session_switch_attempts",
-  "session_provider_authority_successors",
-] as const;
 
-const dropDedicatedSessionSwitchSchema = (database: Database): void => {
-  dropSessionSwitchAdoptionSchema(database);
-  const switchTriggers = database.query(
-    `SELECT name FROM sqlite_schema
-     WHERE type='trigger' AND name GLOB 'session_switch_*'
-     ORDER BY name`,
-  ).all() as Array<{ name: string }>;
-  for (const { name } of switchTriggers) {
-    if (!/^session_switch_[a-z_]+$/u.test(name)) {
-      throw new Error("Unexpected session-switch trigger name.");
-    }
-    database.exec(`DROP TRIGGER "${name}"`);
-  }
-  for (const table of schemaVersion43SessionSwitchTables) {
-    database.exec(`DROP TABLE IF EXISTS ${table}`);
-  }
-};
 
-const downgradeProviderAccountsToReleasedVersion = (database: Database, targetVersion: 38 | 39 | 40 = 38): void => {
-  database.exec("PRAGMA foreign_keys=OFF");
-  try {
-    database.exec(`DROP TRIGGER IF EXISTS devin_joined_close_successor_guard;
-      DROP TABLE IF EXISTS devin_joined_close_consumptions;
-      DROP TABLE IF EXISTS devin_joined_close_anchors;
-      DROP TABLE IF EXISTS devin_joined_close_receipts;
-      DROP TABLE IF EXISTS devin_joined_close_snapshots;
-      DROP TABLE IF EXISTS devin_joined_close_intents;`);
-    dropAutomaticUsagePolicySchema(database);
-    if (targetVersion < 40) {
-      dropSessionAdoptionSchema(database);
-      if (database.query("SELECT 1 FROM pragma_table_info('profiles') WHERE name='codex_account_key'").get() !== null) {
-        database.exec("ALTER TABLE profiles DROP COLUMN codex_account_key");
-      }
-    }
-    dropDedicatedSessionSwitchSchema(database);
-    database.exec(`
-      DROP TRIGGER IF EXISTS mutation_transition_guard;
-      DROP TRIGGER IF EXISTS session_mutation_provider_successor_insert_guard;
-      DROP TRIGGER IF EXISTS session_mutation_provider_successor_v39_insert_guard;
-      DROP TRIGGER IF EXISTS session_provider_compatibility_insert_guard;
-      DROP TRIGGER IF EXISTS session_provider_compatibility_update_guard;
-      DROP TRIGGER IF EXISTS profiles_process_generation_provider_mirror;
-      DROP TRIGGER IF EXISTS session_events_account_authority_guard;
-      DROP TRIGGER IF EXISTS provider_interactions_authority_guard;
-      DROP TRIGGER IF EXISTS provider_interactions_current_generation_prepare;
-      DROP TRIGGER IF EXISTS usage_snapshots_immutable_update;
-      DROP TRIGGER IF EXISTS usage_poll_failures_immutable_update;
-      DROP TRIGGER IF EXISTS usage_cloud_upload_anchors_immutable_update;
-      DROP TRIGGER IF EXISTS usage_snapshots_prune_authority;
-      DROP TRIGGER IF EXISTS usage_poll_failures_prune_authority;
-      DROP TRIGGER IF EXISTS usage_cloud_upload_anchors_prune_authority;
-    `);
-    for (const table of schemaVersion42ProviderUsageTables) {
-      database.exec(`DROP TABLE IF EXISTS ${table}`);
-    }
-    for (const table of schemaVersion41Tables) {
-      database.exec(`DROP TABLE IF EXISTS ${table}`);
-    }
-    if (targetVersion === 38) {
-      const canonicalProviderTriggers = database.query(
-        "SELECT name FROM sqlite_schema WHERE type='trigger' AND sql LIKE '%provider_v39%'",
-      ).all() as Array<{ name: string }>;
-      for (const { name } of canonicalProviderTriggers) {
-        if (!/^[a-z_][a-z0-9_]*$/u.test(name)) throw new Error("Unexpected provider trigger");
-        database.exec(`DROP TRIGGER ${name}`);
-      }
-      database.exec("DROP TABLE IF EXISTS session_mutation_authority_rebinds_v39");
-      if ((database.query("SELECT name FROM pragma_table_info('sessions') WHERE name='provider_v39'").get()) !== null) {
-        database.exec("ALTER TABLE sessions DROP COLUMN provider_v39");
-      }
-    }
-    database.exec(`
-      CREATE TRIGGER mutation_transition_guard BEFORE UPDATE OF state ON mutation_attempts
-      WHEN NOT (
-        (OLD.state='prepared' AND NEW.state IN ('effect_started','cancelled'))
-        OR (OLD.state='effect_started' AND NEW.state IN ('applied','failed','ambiguous'))
-        OR OLD.state=NEW.state
-      )
-      BEGIN SELECT RAISE(ABORT, 'illegal mutation transition'); END;
-      CREATE TRIGGER session_events_account_authority_guard
-      BEFORE INSERT ON session_events
-      WHEN NOT EXISTS(
-        SELECT 1 FROM sessions s JOIN profiles p ON p.id=s.profile_id
-        WHERE s.id=NEW.session_id
-          AND s.profile_id=NEW.account_id
-          AND p.process_generation=NEW.provider_generation
-      )
-      BEGIN SELECT RAISE(ABORT, 'session event account authority mismatch'); END;
-      CREATE TRIGGER provider_interactions_authority_guard
-      BEFORE INSERT ON provider_interactions
-      WHEN NOT EXISTS(
-        SELECT 1 FROM profiles p
-        WHERE p.id=NEW.profile_id
-          AND p.process_generation=NEW.process_generation
-          AND p.state!='removed'
-          AND (
-            NEW.session_id IS NULL
-            OR EXISTS(
-              SELECT 1 FROM sessions s
-              WHERE s.id=NEW.session_id AND s.profile_id=NEW.profile_id
-            )
-          )
-      )
-      BEGIN SELECT RAISE(ABORT, 'provider interaction authority mismatch'); END;
-      CREATE TRIGGER provider_interactions_current_generation_prepare
-      BEFORE UPDATE OF state ON provider_interactions
-      WHEN NEW.state='response_prepared' AND NOT EXISTS(
-        SELECT 1 FROM profiles p
-        WHERE p.id=OLD.profile_id
-          AND p.process_generation=OLD.process_generation
-          AND p.state!='removed'
-      )
-      BEGIN SELECT RAISE(ABORT, 'provider interaction generation is stale'); END;
-      DELETE FROM migrations WHERE version>${targetVersion};
-      PRAGMA user_version=${targetVersion};
-    `);
-    const violations = database.query("PRAGMA foreign_key_check").all();
-    if (violations.length !== 0) {
-      throw new Error(`Version ${targetVersion} fixture retained a later foreign-key dependency.`);
-    }
-  } finally {
-    database.exec("PRAGMA foreign_keys=ON");
-  }
-};
 
 function admitRestartCommandInteraction(
   store: StateStore,
@@ -3387,217 +2806,6 @@ function usageSnapshot(input: Readonly<{
   });
 }
 
-function seedLegacyMcpUrlInteraction(input: Readonly<{
-  interactionId: string;
-  paths: ReturnType<typeof resolveStatePaths>;
-  processGeneration: number;
-  profileId: string;
-  sentinel: string;
-  sessionId: string;
-}>): void {
-  const legacy = new Database(input.paths.database, { create: false, strict: true });
-  dropSchemaAfterVersion34(legacy);
-  legacy.exec(`
-    DROP TRIGGER IF EXISTS provider_interactions_mcp_url_guard_insert;
-    DROP TRIGGER IF EXISTS provider_interactions_mcp_url_guard_update;
-    DROP TABLE IF EXISTS usage_cloud_upload_anchors;
-    DROP TABLE IF EXISTS security_scrub_authority;
-    DELETE FROM migrations WHERE version>10;
-    DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=10;
-  `);
-  const displayJson = JSON.stringify({
-    kind: "mcp_elicitation",
-    summary: "Authorize the legacy MCP server",
-    serverName: "legacy",
-    mode: "url",
-    url: `https://example.com/oauth?access_token=${input.sentinel}#${input.sentinel}`,
-    mayContainSecrets: false,
-  });
-  legacy.query(
-    `INSERT INTO provider_interactions(
-       public_id,session_id,profile_id,process_generation,connection_id,
-       request_id_type,request_id_number,request_id_text,method,request_digest,
-       thread_id,turn_id,item_id,approval_id,kind,state,revision,blocking,
-       display_json,response_digest,response_expected_revision,requested_at,updated_at,terminal_at
-     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-  ).run(
-    input.interactionId,
-    input.sessionId,
-    input.profileId,
-    input.processGeneration,
-    "028f1f55-3f10-7c1a-8f7b-c6dc608bcd3b",
-    "string",
-    null,
-    "legacy-url-request",
-    "mcpServer/elicitation/request",
-    "d".repeat(64),
-    "legacy-thread",
-    "legacy-turn",
-    null,
-    null,
-    "mcp_elicitation",
-    "pending",
-    1,
-    1,
-    displayJson,
-    null,
-    null,
-    5_000,
-    5_000,
-    null,
-  );
-  legacy.query(
-    `INSERT INTO provider_interaction_transitions(
-       public_id,revision,state,response_digest,recorded_at
-     ) VALUES (?,1,'pending',NULL,5000)`,
-  ).run(input.interactionId);
-  legacy.close(false);
-}
-
-function seedLegacyPermissionValueInteraction(input: Readonly<{
-  interactionId: string;
-  paths: ReturnType<typeof resolveStatePaths>;
-  processGeneration: number;
-  profileId: string;
-  sentinel: string;
-  sessionId: string;
-}>): void {
-  const legacy = new Database(input.paths.database, { create: false, strict: true });
-  dropSchemaAfterVersion34(legacy);
-  legacy.exec(`
-    PRAGMA secure_delete=OFF;
-    DROP TRIGGER IF EXISTS provider_interactions_permission_value_guard_insert;
-    DROP TRIGGER IF EXISTS provider_interactions_permission_value_guard_update;
-    DELETE FROM migrations WHERE version>14;
-    DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=14;
-  `);
-  const legacyPrivatePath = ["", "Users", "alice", "private"].join("/");
-  const displayJson = JSON.stringify({
-    kind: "permission_approval",
-    summary: "Allow legacy permissions",
-    reason: null,
-    requested: [{
-      name: "fileSystem",
-      value: { read: [`${legacyPrivatePath}/${input.sentinel}${"x".repeat(1_536)}`] },
-    }],
-    allowsSessionScope: true,
-  });
-  legacy.query(
-    `INSERT INTO provider_interactions(
-       public_id,session_id,profile_id,process_generation,connection_id,
-       request_id_type,request_id_number,request_id_text,method,request_digest,
-       thread_id,turn_id,item_id,approval_id,kind,state,revision,blocking,
-       display_json,response_digest,response_expected_revision,requested_at,updated_at,terminal_at
-     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-  ).run(
-    input.interactionId,
-    input.sessionId,
-    input.profileId,
-    input.processGeneration,
-    "038f1f55-3f10-7c1a-8f7b-c6dc608bcd3b",
-    "string",
-    null,
-    "legacy-permission-request",
-    "item/permissions/requestApproval",
-    "e".repeat(64),
-    "legacy-thread",
-    "legacy-turn",
-    "legacy-item",
-    null,
-    "permission_approval",
-    "pending",
-    1,
-    1,
-    displayJson,
-    null,
-    null,
-    5_000,
-    5_000,
-    null,
-  );
-  legacy.query(
-    `INSERT INTO provider_interaction_transitions(
-       public_id,revision,state,response_digest,recorded_at
-     ) VALUES (?,1,'pending',NULL,5000)`,
-  ).run(input.interactionId);
-  expect(legacy.query("PRAGMA wal_checkpoint(TRUNCATE)").get()).toEqual({
-    busy: 0,
-    log: 0,
-    checkpointed: 0,
-  });
-  legacy.close(false);
-}
-
-function simulateLogicallyRedactedMcpDatabase(input: Readonly<{
-  interactionId: string;
-  paths: ReturnType<typeof resolveStatePaths>;
-  targetVersion: 11 | 12 | 13;
-}>): void {
-  const legacy = new Database(input.paths.database, { create: false, strict: true });
-  legacy.exec(`
-    PRAGMA secure_delete=OFF;
-    DROP TRIGGER IF EXISTS provider_interactions_authority_immutable;
-  `);
-  expect(legacy.query("PRAGMA wal_checkpoint(TRUNCATE)").get()).toEqual({
-    busy: 0,
-    log: 0,
-    checkpointed: 0,
-  });
-  legacy.query(
-    `UPDATE provider_interactions
-     SET state='resolution_unknown',revision=revision+1,display_json=?,updated_at=9000,terminal_at=9000
-     WHERE public_id=? AND revision=1`,
-  ).run(JSON.stringify({
-    kind: "mcp_elicitation",
-    summary: "Unsupported MCP browser handoff canceled during security migration",
-    serverName: "redacted",
-    mode: "form",
-    url: null,
-    mayContainSecrets: true,
-  }), input.interactionId);
-  legacy.query(
-    `INSERT INTO provider_interaction_transitions(
-       public_id,revision,state,response_digest,recorded_at
-     ) SELECT public_id,revision,state,response_digest,9000
-       FROM provider_interactions WHERE public_id=?`,
-  ).run(input.interactionId);
-  legacy.query("INSERT INTO migrations(version,applied_at) VALUES (11,9000)").run();
-  if (input.targetVersion >= 12) {
-    legacy.exec(`
-      CREATE TABLE usage_cloud_upload_anchors (
-        profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
-        source_revision INTEGER NOT NULL CHECK(source_revision >= 0),
-        received_at INTEGER NOT NULL CHECK(received_at >= 0),
-        PRIMARY KEY(profile_id, source_revision)
-      ) STRICT;
-      CREATE INDEX usage_cloud_upload_anchors_recent
-        ON usage_cloud_upload_anchors(profile_id, source_revision DESC);
-      INSERT INTO migrations(version,applied_at) VALUES (12,9000);
-    `);
-  }
-  if (input.targetVersion === 13) {
-    legacy.exec(`
-      CREATE TABLE security_scrub_authority (
-        singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-        reason TEXT NOT NULL CHECK(reason='mcp_url_redaction'),
-        required_at INTEGER NOT NULL CHECK(required_at >= 0)
-      ) STRICT;
-      INSERT INTO migrations(version,applied_at) VALUES (13,9000);
-      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=13;
-    `);
-  } else if (input.targetVersion === 12) {
-    legacy.exec("DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=12");
-  } else {
-    legacy.exec("DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=11");
-  }
-  expect(legacy.query("PRAGMA wal_checkpoint(TRUNCATE)").get()).toEqual({
-    busy: 0,
-    log: 0,
-    checkpointed: 0,
-  });
-  legacy.close(false);
-}
-
 async function stateFileSuffixesContaining(databasePath: string, value: string): Promise<string[]> {
   const matches: string[] = [];
   for (const suffix of ["", "-wal", "-shm"] as const) {
@@ -4074,7 +3282,11 @@ describe("StateStore", () => {
 
   test("retains authentic combined49 unused Devin close, sealed input and runtime history without new execution", async () => {
     const paths = await archivedRetired49();
-    const database = new Database(paths.database, { readonly: true, strict: true });
+    // A fresh archived WAL database has no local WAL/SHM files yet. A raw
+    // writable handle may initialize them without running any HRA migration;
+    // query_only then keeps the baseline inspector nonmutating.
+    const database = new Database(paths.database, { create: false, strict: true });
+    database.exec("PRAGMA query_only=ON");
     try {
       const originalHistory = retiredCloseHistory(database);
       expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 49 });
@@ -4106,14 +3318,25 @@ describe("StateStore", () => {
     const database = new Database(paths.database, { readonly: true, strict: true });
     try {
       const originalHistory = retiredCloseHistory(database);
+      const originalSession = store.requireSession(archived.close.session.id);
       const originalAuthority = store.requireCapturedSessionProviderAuthority(archived.close.session.id);
+      const originalAccount = store.requireProviderAccountAuthority(archived.close.session.profileId, "devin");
       for (const boot of ["e", "f"]) {
         store.nextDaemonGeneration(`boot_${boot.repeat(32)}`);
-        expect(store.requireSession(archived.close.session.id).state).toBe("recovery_required");
+        // Retirement preserves the historical display state; idle is not
+        // current execution authority and cannot consume the old close proof.
+        expect(store.requireSession(archived.close.session.id)).toEqual(originalSession);
         expect(store.requireCapturedSessionProviderAuthority(archived.close.session.id)).toEqual(originalAuthority);
+        expect(store.requireProviderAccountAuthority(archived.close.session.profileId, "devin")).toEqual(originalAccount);
         expect(retiredCloseHistory(database)).toEqual(originalHistory);
         expect(database.query("SELECT COUNT(*) AS count FROM devin_joined_close_consumptions").get()).toEqual({ count: 0 });
-        expect(database.query("SELECT COUNT(*) AS count FROM session_provider_authority_successors WHERE provider='devin'").get()).toEqual({ count: 0 });
+        expect(database.query("SELECT COUNT(*) AS count FROM session_provider_authority_successors WHERE from_provider='devin' OR to_provider='devin'").get()).toEqual({ count: 0 });
+        const beforeDispatch = canonicalAuthBudgetSnapshot(database);
+        // The old close leaves a stale captured generation, so the exact
+        // session-authority fence refuses before generic provider admission.
+        expect(() => store.enqueue(archived.close.session.id, "No retired provider dispatch"))
+          .toThrow("SESSION_PROVIDER_AUTHORITY_STALE");
+        expect(canonicalAuthBudgetSnapshot(database)).toEqual(beforeDispatch);
       }
     } finally { database.close(false); }
   });
@@ -4200,10 +3423,19 @@ describe("StateStore", () => {
       expect(inspector.query("SELECT * FROM session_provider_authority_successors WHERE session_id=?").all(session.id)).toEqual([]);
     } finally { inspector.close(false); }
     migrated.nextDaemonGeneration(`boot_${"6".repeat(32)}`);
-    expect(migrated.requireSession(session.id).state).toBe("recovery_required");
+    expect(migrated.requireSession(session.id)).toEqual(session);
     expect(() => migrated.requireCapturedSessionProviderAuthority(session.id))
       .toThrow("SESSION_PROVIDER_AUTHORITY_QUARANTINED:missing_immutable_runtime_authority");
     expect(migrated.requireProviderAccountAuthority(session.profileId, "devin")).toEqual(authority);
+    const afterBoot = new Database(migrated.paths.database, { readonly: true, strict: true });
+    try {
+      const beforeDispatch = canonicalAuthBudgetSnapshot(afterBoot);
+      expect(() => migrated.enqueue(session.id, "No retired provider dispatch"))
+        .toThrow("SESSION_PROVIDER_AUTHORITY_QUARANTINED:missing_immutable_runtime_authority");
+      expect(canonicalAuthBudgetSnapshot(afterBoot)).toEqual(beforeDispatch);
+      expect(afterBoot.query("SELECT * FROM session_provider_authority_successors WHERE session_id=?").all(session.id)).toEqual([]);
+      expect(afterBoot.query("SELECT * FROM devin_joined_close_consumptions").all()).toEqual([]);
+    } finally { afterBoot.close(false); }
   });
 
   test.each([
@@ -4635,25 +3867,30 @@ describe("StateStore", () => {
         eventJson: `json_remove(${injectedText},'$.body.actor')`,
         sequence: "NEW.sequence",
         accountId: "NEW.account_id",
+        refusal: "session switch blocks callback event admission",
       },
       {
         eventJson: `json_set(${injectedText},'$.body.actor','human')`,
         sequence: "NEW.sequence",
         accountId: "NEW.account_id",
+        refusal: "session switch blocks callback event admission",
       },
       {
         eventJson: `json_set(${injectedText},'$.sequence',NEW.sequence+1)`,
         sequence: "NEW.sequence+1",
         accountId: "NEW.account_id",
+        refusal: "session switch blocks callback event admission",
       },
       {
         eventJson: `json_set(${injectedText},'$.accountId','${prepared.sourceProfile.id}')`,
         sequence: "NEW.sequence",
         accountId: `'${prepared.sourceProfile.id}'`,
+        refusal: "JOINED_EVIDENCE_BOUNDARY_REFUSED",
       },
     ];
     const database = new Database(store.paths.database, { create: false, strict: true });
     try {
+      const beforeSettlement = canonicalAuthBudgetSnapshot(database);
       for (const probe of probes) {
         database.exec(`
           CREATE TRIGGER session_switch_test_seed_callback BEFORE INSERT ON session_events
@@ -4671,7 +3908,7 @@ describe("StateStore", () => {
           END;
         `);
         try {
-          expect(settle).toThrow("session switch blocks callback event admission");
+          expect(settle).toThrow(probe.refusal);
         } finally {
           database.exec("DROP TRIGGER session_switch_test_seed_callback");
         }
@@ -4680,6 +3917,7 @@ describe("StateStore", () => {
           sessionId: prepared.session.id,
           afterSequence: 0,
         }).events).toEqual(eventsBefore);
+        expect(canonicalAuthBudgetSnapshot(database)).toEqual(beforeSettlement);
       }
     } finally {
       database.close(false);
@@ -5154,7 +4392,7 @@ describe("StateStore", () => {
   });
 
   for (const [index, phase] of ["failed", "seed_settled", "abandoned", "cancelled"].entries()) {
-    test(`quarantines corrupt ${phase} switch evidence on reopen without unblocking callbacks`, async () => {
+    test(`refuses corrupt current ${phase} switch evidence on reopen without repair`, async () => {
       const { store } = await fixture();
       const prepared = prepareDedicatedSessionSwitch(store, 755 + index);
       if (phase === "failed") {
@@ -5205,18 +4443,15 @@ describe("StateStore", () => {
       }
       const unrelated = prepareDedicatedSessionSwitch(store, 759 + index);
       store.cancelPreparedSessionSwitch(unrelated.cas);
-      const unrelatedBefore = store.requireSession(unrelated.session.id);
-      const before = store.requireSession(prepared.session.id);
-      const currentAuthority = phase === "seed_settled"
-        ? prepared.cas.targetAuthority
-        : prepared.cas.sourceAuthority;
-      const eventsBefore = store.listSessionEvents({
-        sessionId: prepared.session.id,
-        afterSequence: 0,
-      }).events;
+      const expectedTerminal = store.requireSessionSwitch(prepared.switch.attemptId);
+      // Startup admission proves retained evidence, not present-day liveness.
+      store.nextDaemonGeneration(`boot_${"d".repeat(32)}`);
+      expect(store.requireSessionSwitch(prepared.switch.attemptId)).toEqual(expectedTerminal);
       const paths = store.paths;
       store.close();
       stores.splice(stores.indexOf(store), 1);
+
+      expectInertSwitchReopenForTest(paths, expectedTerminal);
 
       const corrupt = new Database(paths.database, { create: false, strict: true });
       const restoreGuard = restoreSwitchGuardsForTest(corrupt, [
@@ -5254,74 +4489,10 @@ describe("StateStore", () => {
         corrupt.close(false);
       }
 
-      const reopened = new StateStore(paths, { now: () => 9_500 });
-      stores.push(reopened);
-      const quarantined = reopened.requireSession(prepared.session.id);
-      expect(quarantined.state).toBe(phase === "abandoned" ? "terminal" : "recovery_required");
-      if (phase === "abandoned") expect(quarantined).toEqual(before);
-      expect(() => reopened.readSessionSwitchByIdempotencyKey(prepared.switch.idempotencyKey))
-        .toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
-      expect(() => reopened.readSessionSwitchForRecovery(prepared.session.id))
-        .toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
-      expect(reopened.sessionSwitchAdmissionBlocked({
-        sessionId: prepared.session.id,
-        providerThreadId: before.providerThreadId ?? null,
-        providerAuthority: currentAuthority,
-      })).toEqual({ blocked: true, attemptId: null, role: "session" });
-      expect(() => reopened.appendSessionEvent({
-        sessionId: prepared.session.id,
-        accountId: currentAuthority.profileId,
-        providerGeneration: currentAuthority.processGeneration,
-        providerAuthority: currentAuthority,
-        providerConnectionId: null,
-        body: { type: "warning", code: "LATE_TERMINAL_CALLBACK", message: "Must remain fenced" },
-      })).toThrow("session switch blocks callback event admission");
-      expect(() => reopened.updateSessionMetadata({
-        sessionId: prepared.session.id,
-        expectedRevision: quarantined.revision,
-        note: "Must remain fenced",
-      })).toThrow("session switch blocks session mutation");
-      if (phase !== "abandoned") {
-        expect(() => reopened.enqueue(prepared.session.id, "Must not dispatch after corrupt terminal evidence"))
-          .toThrow("SESSION_SWITCH_STORAGE_FENCED");
-      }
-      expect(reopened.listSessionEvents({
-        sessionId: prepared.session.id,
-        afterSequence: 0,
-      }).events).toEqual(eventsBefore);
-      expect(reopened.requireSession(unrelated.session.id)).toEqual(unrelatedBefore);
-      expect(reopened.sessionSwitchAdmissionBlocked({
-        sessionId: unrelated.session.id,
-        providerThreadId: unrelated.session.providerThreadId ?? null,
-        providerAuthority: unrelated.cas.sourceAuthority,
-      })).toEqual({ blocked: false, attemptId: null, role: null });
-      const unrelatedEvent = reopened.appendSessionEvent({
-        sessionId: unrelated.session.id,
-        accountId: unrelated.cas.sourceAuthority.profileId,
-        providerGeneration: unrelated.cas.sourceAuthority.processGeneration,
-        providerAuthority: unrelated.cas.sourceAuthority,
-        providerConnectionId: null,
-        body: { type: "warning", code: "UNRELATED_CALLBACK", message: "Still admitted" },
-      });
-      expect(unrelatedEvent.body).toMatchObject({ code: "UNRELATED_CALLBACK" });
-      const inspector = new Database(paths.database, { create: false, strict: true });
-      try {
-        expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
-        expect(inspector.query(
-          `SELECT switch.phase,mutation.state,malformed.terminal_phase
-           FROM session_switch_attempts switch
-           JOIN mutation_attempts mutation ON mutation.idempotency_key=switch.request_key
-           JOIN session_switch_malformed_dispositions malformed
-             ON malformed.journal_sequence=switch.journal_sequence
-           WHERE switch.attempt_id=?`,
-        ).get(prepared.switch.attemptId)).toEqual({
-          phase,
-          state: phase === "seed_settled" ? "applied" : phase === "abandoned" ? "ambiguous" : phase,
-          terminal_phase: "reconciliation_required",
-        });
-      } finally {
-        inspector.close(false);
-      }
+      // Current sealed evidence is never rewritten into a historical disposition.
+      // Admission fails before this handle can admit callbacks or other work.
+      expectInertSchemaRefusal(paths, phase === "cancelled"
+        ? "SESSION_SWITCH_EXECUTION_CONTEXT_CORRUPT" : "SESSION_SWITCH_RECOVERY_CORRUPT");
     });
   }
 
@@ -5329,22 +4500,22 @@ describe("StateStore", () => {
     "source_process_generation",
     "target_process_generation",
   ].entries()) {
-    test(`keeps disposed switch callback authority when ${changedField} is corrupt`, async () => {
+    test(`refuses current switch admission when ${changedField} is corrupt`, async () => {
       const { store } = await fixture();
       const prepared = prepareDedicatedSessionSwitch(store, 767 + index);
       advanceDedicatedSessionSwitch(store, prepared, "target_started");
       const unrelated = prepareDedicatedSessionSwitch(store, 769 + index);
       store.cancelPreparedSessionSwitch(unrelated.cas);
-      const unrelatedBefore = store.requireSession(unrelated.session.id);
       const paths = store.paths;
       store.close();
       stores.splice(stores.indexOf(store), 1);
       const corrupt = new Database(paths.database, { create: false, strict: true });
       const restoreGuard = restoreSwitchGuardsForTest(corrupt, [
         "session_switch_attempts_immutable_update", "session_switch_adoption_parent_update",
+        "session_switch_execution_parent_advance",
       ]);
       try {
-        corrupt.exec("DROP TRIGGER session_switch_attempts_immutable_update; DROP TRIGGER session_switch_adoption_parent_update");
+        corrupt.exec("DROP TRIGGER session_switch_attempts_immutable_update; DROP TRIGGER session_switch_adoption_parent_update; DROP TRIGGER session_switch_execution_parent_advance");
         corrupt.query(
           `UPDATE session_switch_attempts SET ${changedField}=${changedField}+1 WHERE attempt_id=?`,
         ).run(prepared.switch.attemptId);
@@ -5354,49 +4525,17 @@ describe("StateStore", () => {
         corrupt.close(false);
       }
 
-      const reopened = new StateStore(paths, { now: () => 9_550 });
-      stores.push(reopened);
-      expect(reopened.requireSession(prepared.session.id).state).toBe("recovery_required");
-      for (const [providerThreadId, providerAuthority] of [
-        [prepared.switch.sourceProviderThreadId, prepared.cas.sourceAuthority],
-        [prepared.targetThreadId, prepared.cas.targetAuthority],
-      ] as const) {
-        expect(reopened.sessionSwitchAdmissionBlocked({
-          sessionId: null,
-          providerThreadId,
-          providerAuthority,
-        })).toMatchObject({ blocked: true, attemptId: null });
-      }
-      expect(reopened.sessionSwitchAdmissionBlocked({
-        sessionId: unrelated.session.id,
-        providerThreadId: unrelated.switch.sourceProviderThreadId,
-        providerAuthority: unrelated.cas.sourceAuthority,
-      })).toEqual({ blocked: false, attemptId: null, role: null });
-      expect(reopened.requireSession(unrelated.session.id)).toEqual(unrelatedBefore);
-      expect(reopened.appendSessionEvent({
-        sessionId: unrelated.session.id,
-        accountId: unrelated.cas.sourceAuthority.profileId,
-        providerGeneration: unrelated.cas.sourceAuthority.processGeneration,
-        providerAuthority: unrelated.cas.sourceAuthority,
-        providerConnectionId: null,
-        body: { type: "warning", code: "UNRELATED_CALLBACK", message: "Still admitted" },
-      }).body).toMatchObject({ code: "UNRELATED_CALLBACK" });
+      expectInertSchemaRefusal(paths, "SESSION_SWITCH_MALFORMED_DISPOSITION_UNPROVABLE",
+        "SESSION_SWITCH_ADOPTION_CUSTODY_CORRUPT");
     });
   }
 
-  test("keeps disposed switch session custody when its journal session identity is corrupt", async () => {
+  test("refuses current switch admission when its journal session identity is corrupt", async () => {
     const { store } = await fixture();
     const prepared = prepareDedicatedSessionSwitch(store, 771, { pendingQueueMessage: "Must retain original session custody" });
     advanceDedicatedSessionSwitch(store, prepared, "target_started");
     const unrelated = prepareDedicatedSessionSwitch(store, 772);
     store.cancelPreparedSessionSwitch(unrelated.cas);
-    const unrelatedBefore = store.requireSession(unrelated.session.id);
-    const sourceEvents = store.listSessionEvents({
-      sessionId: prepared.session.id,
-      afterSequence: 0,
-    }).events;
-    const queued = prepared.pendingQueue;
-    if (queued === null) throw new Error("fixture pending queue missing");
     const paths = store.paths;
     store.close();
     stores.splice(stores.indexOf(store), 1);
@@ -5415,48 +4554,8 @@ describe("StateStore", () => {
       corrupt.close(false);
     }
 
-    const reopened = new StateStore(paths, { now: () => 9_560 });
-    stores.push(reopened);
-    expect(reopened.requireSession(prepared.session.id).state).toBe("recovery_required");
-    expect(reopened.requireSession(unrelated.session.id)).toEqual(unrelatedBefore);
-    expect(reopened.sessionSwitchAdmissionBlocked({
-      sessionId: prepared.session.id,
-      providerThreadId: prepared.switch.sourceProviderThreadId,
-      providerAuthority: prepared.cas.sourceAuthority,
-    })).toMatchObject({ blocked: true, attemptId: null });
-    expect(reopened.sessionSwitchAdmissionBlocked({
-      sessionId: null,
-      providerThreadId: prepared.targetThreadId,
-      providerAuthority: prepared.cas.targetAuthority,
-    })).toMatchObject({ blocked: true, attemptId: null });
-    expect(reopened.sessionSwitchAdmissionBlocked({
-      sessionId: unrelated.session.id,
-      providerThreadId: unrelated.switch.sourceProviderThreadId,
-      providerAuthority: unrelated.cas.sourceAuthority,
-    })).toEqual({ blocked: false, attemptId: null, role: null });
-    expect(() => reopened.transitionQueue(queued.id, "pending", "dispatching"))
-      .toThrow("session switch blocks queue dispatch");
-    expect(reopened.requireQueue(queued.id).state).toBe("pending");
-    expect(() => reopened.appendSessionEvent({
-      sessionId: prepared.session.id,
-      accountId: prepared.cas.sourceAuthority.profileId,
-      providerGeneration: prepared.cas.sourceAuthority.processGeneration,
-      providerAuthority: prepared.cas.sourceAuthority,
-      providerConnectionId: null,
-      body: { type: "warning", code: "SOURCE_CALLBACK", message: "Must stay fenced" },
-    })).toThrow();
-    expect(reopened.listSessionEvents({
-      sessionId: prepared.session.id,
-      afterSequence: 0,
-    }).events).toEqual(sourceEvents);
-    expect(reopened.appendSessionEvent({
-      sessionId: unrelated.session.id,
-      accountId: unrelated.cas.sourceAuthority.profileId,
-      providerGeneration: unrelated.cas.sourceAuthority.processGeneration,
-      providerAuthority: unrelated.cas.sourceAuthority,
-      providerConnectionId: null,
-      body: { type: "warning", code: "UNRELATED_CALLBACK", message: "Still admitted" },
-    }).body).toMatchObject({ code: "UNRELATED_CALLBACK" });
+    expectInertSchemaRefusal(paths, "SESSION_SWITCH_MALFORMED_DISPOSITION_UNPROVABLE",
+        "SESSION_SWITCH_ADOPTION_CUSTODY_CORRUPT");
   });
 
   test("refuses current anchored plan tampering without startup repair", async () => {
@@ -5587,7 +4686,7 @@ describe("StateStore", () => {
     readonlyAfterCurrentRecovery.close();
   });
 
-  test("preserves multiple malformed terminal phases in one session without a unique-open conflict", async () => {
+  test("refuses multiple corrupt current terminal journals without blessing a valid latest journal", async () => {
     const { store } = await fixture();
     const prepared = prepareDedicatedSessionSwitch(store, 764);
     store.cancelPreparedSessionSwitch(prepared.cas);
@@ -5617,7 +4716,7 @@ describe("StateStore", () => {
       return repeated.switch;
     };
     const second = repeat("20000000-0000-4000-8000-000000000765");
-    const validLatest = repeat("20000000-0000-4000-8000-000000000766");
+    repeat("20000000-0000-4000-8000-000000000766");
     const paths = store.paths;
     store.close();
     stores.splice(stores.indexOf(store), 1);
@@ -5642,34 +4741,125 @@ describe("StateStore", () => {
       restoreGuard();
       corrupt.close(false);
     }
-    const reopened = new StateStore(paths, { now: () => 9_600 });
-    stores.push(reopened);
-    for (const key of [prepared.switch.idempotencyKey, second.idempotencyKey]) {
-      expect(() => reopened.readSessionSwitchByIdempotencyKey(key))
-        .toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
+    expectInertSchemaRefusal(paths, "SESSION_SWITCH_MALFORMED_DISPOSITION_UNPROVABLE",
+        "SESSION_SWITCH_ADOPTION_CUSTODY_CORRUPT");
+  });
+
+  test("admits older settled switch receipts after another switch, account removal, and restart", async () => {
+    const { store } = await fixture();
+    const first = prepareDedicatedSessionSwitch(store, 974);
+    advanceDedicatedSessionSwitch(store, first, "seed_dispatching");
+    const reject = (prepared: ReturnType<typeof prepareDedicatedSessionSwitch>) => store.completeSessionSwitchSeed({
+      ...prepared.cas,
+      seedAuthority: prepared.cas.targetAuthority,
+      seedAuthorityRevision: store.requireCapturedSessionProviderAuthority(prepared.session.id).authorityRevision,
+      settlement: { outcome: "rejected", failureCode: "SEED_REJECTED",
+        receiptDigest: createHash("sha256").update("hra:session-switch-seed-rejected:v1\0SEED_REJECTED").digest("hex") },
+    });
+    const firstTerminal = reject(first);
+    const session = store.requireSession(first.session.id);
+    const capturedSource = store.requireCapturedSessionProviderAuthority(session.id);
+    const source = { providerAccountId: capturedSource.providerAccountId,
+      profileId: capturedSource.profileId, provider: capturedSource.provider,
+      bindingGeneration: capturedSource.bindingGeneration, processGeneration: capturedSource.processGeneration };
+    const targetProfile = signInProfile(store, "Later terminal switch target", "later-terminal-switch@example.com");
+    const target = store.requireProviderAccountAuthority(targetProfile.id, "codex");
+    const runtime = store.latestSessionRuntimeProfile(session.id);
+    if (runtime === null) throw new Error("missing current switch runtime");
+    const position = store.readSessionSnapshotWithEventPosition(session.id);
+    const next = store.prepareSessionSwitch({
+      targetAccountKey: providerAccountKeyForProfile(store, targetProfile.id, "codex"),
+      targetHostCapabilities: testSwitchHostCapabilities,
+      idempotencyKey: "20000000-0000-4000-8000-000000000975",
+      rawRequest: { version: 2, session: session.id, provider: "codex",
+        account: targetProfile.id, preset: "low", presetContract: null },
+      sessionId: session.id, sourceAuthority: source, targetAuthority: target,
+      expectedSessionRevision: session.revision, expectedAuthorityRevision: capturedSource.authorityRevision,
+      sourcePreset: session.preset, sourcePresetContract: store.requireSessionPresetContract(session.id),
+      targetPreset: "low", targetPresetContract: activePresetBinding("low").contract,
+      sourceRuntimeProfileRevision: runtime.revision,
+      transcript: { ...first.switch.transcript,
+        streamEpoch: position.streamEpoch, floorSequence: position.floorSequence,
+        afterSequenceExclusive: position.observedThroughSequence,
+        throughSequenceInclusive: position.observedThroughSequence,
+        acceptedHeadSequence: position.observedThroughSequence,
+        seedClientMessageId: "later-terminal-switch-seed" },
+    });
+    const second = { ...first, ...next, session, targetProfile,
+      targetThreadId: "later-terminal-switch-thread",
+      targetRuntime: effectiveRuntimeProfileSchema.parse({ ...first.targetRuntime,
+        profileId: target.profileId, processGeneration: target.processGeneration }),
+      cas: { attemptId: next.switch.attemptId, requestDigest: next.switch.requestDigest,
+        sourceAuthority: source, targetAuthority: target,
+        originalSessionRevision: next.switch.originalSessionRevision,
+        originalAuthorityRevision: next.switch.originalAuthorityRevision },
+    };
+    advanceDedicatedSessionSwitch(store, second, "seed_dispatching");
+    const secondTerminal = reject(second);
+    store.removeProfile(first.sourceProfile.id);
+    store.removeProfile(first.targetProfile.id);
+    store.nextDaemonGeneration(`boot_${"e".repeat(32)}`);
+    expect(store.requireSessionSwitch(firstTerminal.attemptId)).toEqual(firstTerminal);
+    expect(store.requireSessionSwitch(secondTerminal.attemptId)).toEqual(secondTerminal);
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    expectInertSwitchReopenForTest(paths, firstTerminal);
+    expectInertSwitchReopenForTest(paths, secondTerminal);
+  });
+
+  test("audits terminal switch receipts beyond the first one hundred raw journal rows", async () => {
+    const { store } = await fixture();
+    const prepared = prepareDedicatedSessionSwitch(store, 976);
+    store.cancelPreparedSessionSwitch(prepared.cas);
+    const records = [store.requireSessionSwitch(prepared.switch.attemptId)];
+    for (let index = 0; index < 100; index++) {
+      const repeated = store.prepareSessionSwitch({
+        targetAccountKey: prepared.targetAccountKey,
+        targetHostCapabilities: testSwitchHostCapabilities,
+        idempotencyKey: `21000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+        rawRequest: prepared.switch.rawRequest,
+        sessionId: prepared.switch.sessionId,
+        sourceAuthority: prepared.cas.sourceAuthority,
+        targetAuthority: prepared.cas.targetAuthority,
+        expectedSessionRevision: prepared.cas.originalSessionRevision,
+        expectedAuthorityRevision: prepared.cas.originalAuthorityRevision,
+        sourcePreset: prepared.switch.sourcePreset,
+        sourcePresetContract: prepared.switch.sourcePresetContract,
+        targetPreset: prepared.switch.targetPreset,
+        targetPresetContract: prepared.switch.targetPresetContract,
+        sourceRuntimeProfileRevision: prepared.switch.sourceRuntimeProfileRevision,
+        transcript: prepared.switch.transcript,
+      });
+      const cas = { ...prepared.cas, attemptId: repeated.switch.attemptId,
+        requestDigest: repeated.switch.requestDigest };
+      store.beginSessionSwitchTargetStart(cas);
+      store.failSessionSwitchTargetStartNoEffect({ ...cas, expectedPhase: "target_starting",
+        diagnosticCode: "TARGET_START_REJECTED" });
+      records.push(store.requireSessionSwitch(cas.attemptId));
     }
-    expect(reopened.requireSessionSwitch(validLatest.attemptId).phase).toBe("cancelled");
-    expect(reopened.requireSession(prepared.session.id).state).toBe("recovery_required");
-    expect(reopened.sessionSwitchAdmissionBlocked({
-      sessionId: prepared.session.id,
-      providerThreadId: prepared.session.providerThreadId ?? null,
-      providerAuthority: prepared.cas.sourceAuthority,
-    })).toEqual({ blocked: true, attemptId: null, role: "session" });
+    const last = records.at(-1);
+    if (last === undefined) throw new Error("missing terminal journal fixture");
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    for (const readonly of [false, true]) {
+      const reopened = new StateStore(paths, { readonly });
+      try {
+        for (const record of records) expect(reopened.requireSessionSwitch(record.attemptId)).toEqual(record);
+      } finally { reopened.close(); }
+    }
     const inspector = new Database(paths.database, { create: false, strict: true });
     try {
-      expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
-      expect(inspector.query(
-        `SELECT phase FROM session_switch_attempts WHERE session_id=? ORDER BY journal_sequence`,
-      ).all(prepared.session.id)).toEqual([
-        { phase: "cancelled" }, { phase: "cancelled" }, { phase: "cancelled" },
-      ]);
-      expect(inspector.query(
-        `SELECT COUNT(*) AS count FROM session_switch_malformed_dispositions
-         WHERE session_id=? AND terminal_phase='reconciliation_required'`,
-      ).get(prepared.session.id)).toEqual({ count: 2 });
-    } finally {
-      inspector.close(false);
-    }
+      expect(inspector.query("SELECT COUNT(*) AS count FROM session_switch_attempts").get()).toEqual({ count: 101 });
+      // Leave the request/plan/context intact: only the full terminal mapper
+      // detects this mismatched receipt time on the second keyset page.
+      withRemovedTestGuards(inspector, ["session_switch_no_effect_receipts_immutable_update"], () => {
+        inspector.query("UPDATE session_switch_no_effect_receipts SET recorded_at=recorded_at+1 WHERE attempt_id=?")
+          .run(last.attemptId);
+      });
+    } finally { inspector.close(false); }
+    expectInertSchemaRefusal(paths, "SESSION_SWITCH_RECOVERY_CORRUPT");
   });
 
   test("requires the cumulative receipt chain and independent action anchors on every read", async () => {
@@ -6398,12 +5588,13 @@ describe("StateStore", () => {
   });
 
   test.each(["intact", "missing_context", "missing_context_anchor", "context_digest", "plan_digest"] as const)(
-    "contains a prepared switch with an orphan effect anchor without inventing no-effect proof: %s", async (damage) => {
+    "refuses a current prepared switch with an orphan effect anchor without startup writes: %s", async (damage) => {
     const { store } = await fixture();
     const prepared = prepareDedicatedSessionSwitch(store, 777);
     const paths = store.paths;
     store.close();
     stores.splice(stores.indexOf(store), 1);
+    expectInertSwitchReopenForTest(paths, prepared.switch);
     const inspector = new Database(paths.database, { create: false, strict: true });
     try {
       const readOriginalProof = () => ({
@@ -6429,28 +5620,6 @@ describe("StateStore", () => {
       } finally { restore(); }
       expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
       const orphanAnchor = inspector.query("SELECT * FROM session_switch_target_start_anchors WHERE attempt_id=?").get(prepared.switch.attemptId);
-      const reopened = new StateStore(paths, { now: () => 9_200 });
-      stores.push(reopened);
-      // Current-version open audits without synthesizing recovery state. The
-      // daemon's explicit recovery operation owns this containment transition.
-      expect(reopened.requireSession(prepared.session.id)).toEqual(prepared.session);
-      const recovered = reopened.recoverSessionSwitchesPage();
-      expect(recovered.switches).toEqual([]);
-      expect(recovered.malformedAttemptIds).toHaveLength(1);
-      const fenced = reopened.requireSession(prepared.session.id);
-      expect(fenced.state).toBe("recovery_required");
-      expect(fenced.activeTurnId).toBeUndefined();
-      expect(inspector.query("SELECT active_turn_id FROM sessions WHERE id=?").get(prepared.session.id))
-        .toEqual({ active_turn_id: null });
-      expect(inspector.query(`SELECT mutation_request_key,session_id,from_phase,terminal_phase,
-        diagnostic_code,evidence_depth FROM session_switch_malformed_dispositions`).all()).toEqual([{
-        mutation_request_key: prepared.switch.idempotencyKey,
-        session_id: prepared.session.id,
-        from_phase: "prepared",
-        terminal_phase: "reconciliation_required",
-        diagnostic_code: "MALFORMED_SWITCH_RECORD",
-        evidence_depth: 0,
-      }]);
       const retained = () => ({
         proof: readOriginalProof(),
         mutation: inspector.query("SELECT * FROM mutation_attempts WHERE id=?").get(prepared.switch.attemptId),
@@ -6463,12 +5632,6 @@ describe("StateStore", () => {
       });
       expect(retained()).toEqual({ proof: originalProof, mutation: originalMutation, journal: originalJournal,
         effectAnchor: orphanAnchor, targetReceipts: [], noEffectReceipts: [], seedAuthorities: [], seedReceipts: [] });
-      expect(() => reopened.beginSessionSwitchTargetStart(prepared.cas)).toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
-      expect(() => reopened.cancelPreparedSessionSwitch(prepared.cas)).toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
-      expect(() => reopened.readSessionSwitchByIdempotencyKey(prepared.switch.idempotencyKey)).toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
-      const beforeReopen = retained();
-      reopened.close();
-      stores.splice(stores.indexOf(reopened), 1);
       if (damage !== "intact") {
         const guard = damage === "missing_context" ? "session_switch_execution_contexts_delete"
           : damage === "missing_context_anchor" ? "session_switch_execution_context_anchors_delete"
@@ -6487,22 +5650,17 @@ describe("StateStore", () => {
           else inspector.query("UPDATE session_switch_plan_anchors SET plan_digest=? WHERE attempt_id=?")
             .run("f".repeat(64), prepared.switch.attemptId);
         } finally { restore(); inspector.exec("PRAGMA foreign_keys=ON"); }
-        const corrupted = snapshotSwitchContainmentForTest(inspector);
-        for (const readonly of [true, false]) {
-          expect(() => new StateStore(paths, { readonly, now: () => 9_300 }))
-            .toThrow("SESSION_SWITCH_EXECUTION_CONTEXT_CORRUPT");
-          expect(snapshotSwitchContainmentForTest(inspector)).toEqual(corrupted);
-        }
-        return;
       }
+      // Current sealed journals refuse before recovery can manufacture a
+      // disposition or no-effect receipt. Context damage is an earlier fence;
+      // only the intact-context case reaches the orphan-anchor mapper check.
+      expect(inspector.query("SELECT * FROM session_switch_malformed_dispositions").all()).toEqual([]);
+      const corrupted = snapshotSwitchContainmentForTest(inspector);
       for (const readonly of [true, false]) {
-        const stable = new StateStore(paths, { readonly, now: () => 9_300 });
-        try {
-          expect(stable.requireSession(prepared.session.id)).toEqual(fenced);
-          expect(() => stable.readSessionSwitchForRecovery(prepared.session.id)).toThrow("SESSION_SWITCH_RECOVERY_CORRUPT");
-          expect(retained()).toEqual(beforeReopen);
-          expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
-        } finally { stable.close(); }
+        expect(() => new StateStore(paths, { readonly, now: () => 9_300 }))
+          .toThrow(damage === "intact"
+            ? "SESSION_SWITCH_RECOVERY_CORRUPT" : "SESSION_SWITCH_EXECUTION_CONTEXT_CORRUPT");
+        expect(snapshotSwitchContainmentForTest(inspector)).toEqual(corrupted);
       }
     } finally { inspector.close(false); }
   });
@@ -6601,7 +5759,7 @@ describe("StateStore", () => {
     } finally { inspect.close(false); }
   });
 
-  test("refuses an unrecognized partial v42/v43 cohort without rewriting switch evidence", async () => {
+  test("refuses an adversarial joined-schema v42 restamp without rewriting switch evidence", async () => {
     const value = await fixture();
     const prepared = prepareDedicatedSessionSwitch(value.store, 739);
     advanceDedicatedSessionSwitch(value.store, prepared, "target_starting");
@@ -6610,11 +5768,13 @@ describe("StateStore", () => {
     stores.splice(stores.indexOf(value.store), 1);
     const corrupt = new Database(paths.database, { create: false, strict: true });
     try {
-      corrupt.exec("PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON");
-      withRemovedTestGuards(corrupt, ["session_switch_attempt_id_repair_guard", "session_switch_adoption_parent_update"], () => {
-        corrupt.query("UPDATE session_switch_attempts SET attempt_id=? WHERE attempt_id=?")
-          .run(`attempt_${"e".repeat(4096)}`, prepared.switch.attemptId);
-      });
+      // This is not an archived v42 producer: retain all joined proof objects.
+      // The context guard independently rejects a forged parent identifier.
+      const before = snapshotSwitchContainmentForTest(corrupt);
+      expect(() => corrupt.query("UPDATE session_switch_attempts SET attempt_id=? WHERE attempt_id=?")
+        .run(`attempt_${"e".repeat(4096)}`, prepared.switch.attemptId))
+        .toThrow("SESSION_SWITCH_EXECUTION_CONTEXT_CORRUPT");
+      expect(snapshotSwitchContainmentForTest(corrupt)).toEqual(before);
       corrupt.exec("DELETE FROM migrations WHERE version>42; PRAGMA user_version=42");
     } finally { corrupt.close(false); }
     expectInertSchemaRefusal(paths, "STATE_SCHEMA_COHORT_UNSUPPORTED:42", "STATE_SCHEMA_MIGRATION_REQUIRED:42:60");
@@ -6781,7 +5941,7 @@ describe("StateStore", () => {
     expect(store.requireProfile("work").providerEmail).toBe("work@example.com");
   });
 
-  test("keeps Devin routing and readiness independent while refusing its usage and legacy-shadow confusion", async () => {
+  test("retains inert Devin binding metadata while refusing new routing, readiness, usage, and session authority", async () => {
     const { store } = await fixture();
     const first = store.createProfile("Devin first route");
     const second = store.createProfile("Devin second route");
@@ -6794,38 +5954,67 @@ describe("StateStore", () => {
     const secondDevin = store.requireProviderAccountForProfile(second.id, "devin");
     expect(firstDevin.id).toMatch(/^dact_[0-9a-f]{32}$/u);
     expect(secondDevin.id).not.toBe(firstDevin.id);
+    for (const account of [firstDevin, secondDevin]) {
+      expect(account).toMatchObject({ readiness: "unverified", bindingGeneration: 1, processGeneration: 0 });
+    }
     const initialState = store.readProviderAccountState("devin");
-    store.replaceProviderAccountOrder({
-      provider: "devin", expectedOrderRevision: initialState.orderRevision,
-      providerAccountIds: [secondDevin.id, firstDevin.id],
-    });
-    store.activateProviderAccount({
-      provider: "devin", expectedPointerRevision: initialState.pointerRevision,
-      providerAccountId: secondDevin.id,
-    });
-    store.observeProviderAccountReadiness({
-      profileId: second.id, provider: "devin", expectedBindingGeneration: secondDevin.bindingGeneration,
-      readiness: "signed_in",
-    });
-    expect(siblingState()).toEqual(before);
-    const session = store.createSession({ provider: "devin", preset: "astra", fastEnabled: false, routing: "managed" });
-    expect(store.requireSessionProviderAuthority(session.id)).toMatchObject({
-      provider: "devin", profileId: second.id, providerAccountId: secondDevin.id, bindingGeneration: 2,
-      routingProvenance: "managed",
-    });
-    expect(() => store.latestProviderUsage(secondDevin.id)).toThrow();
-    expect(() => store.providerUsageObservations({ providerAccountId: secondDevin.id })).toThrow();
     const database = new Database(store.paths.database, { strict: true });
     try {
+      const allBefore = canonicalAuthBudgetSnapshot(database);
+      for (const operation of [
+        () => store.replaceProviderAccountOrder({
+          provider: "devin", expectedOrderRevision: initialState.orderRevision,
+          providerAccountIds: [secondDevin.id, firstDevin.id],
+        }),
+        () => store.activateProviderAccount({
+          provider: "devin", expectedPointerRevision: initialState.pointerRevision,
+          providerAccountId: secondDevin.id,
+        }),
+        () => store.observeProviderAccountReadiness({
+          profileId: second.id, provider: "devin", expectedBindingGeneration: secondDevin.bindingGeneration,
+          readiness: "signed_in",
+        }),
+        () => store.createSession({ provider: "devin", preset: "astra", fastEnabled: false, routing: "managed" }),
+      ]) {
+        expect(operation).toThrow("PROVIDER_RETIRED:devin");
+        expect(canonicalAuthBudgetSnapshot(database)).toEqual(allBefore);
+      }
+      expect(() => store.latestProviderUsage(secondDevin.id)).toThrow();
+      expect(() => store.providerUsageObservations({ providerAccountId: secondDevin.id })).toThrow();
+      expect(store.requireProviderAccountForProfile(first.id, "devin")).toEqual(firstDevin);
+      expect(store.requireProviderAccountForProfile(second.id, "devin")).toEqual(secondDevin);
+      expect(store.readProviderAccountState("devin")).toEqual(initialState);
+      expect(siblingState()).toEqual(before);
+      expect(canonicalAuthBudgetSnapshot(database)).toEqual(allBefore);
+    } finally { database.close(false); }
+  });
+
+  test("refuses compatibility-shadow confusion on authentic retired Devin session history", async () => {
+    const paths = await archivedRetired49();
+    const store = new StateStore(paths);
+    stores.push(store);
+    const session = store.requireSession(combined49RetiredFixture.close.session.id);
+    expect(session.provider).toBe("devin");
+    const database = new Database(paths.database, { create: false, strict: true });
+    try {
+      const beforeGuardedUpdate = canonicalAuthBudgetSnapshot(database);
       expect(() => database.query("UPDATE sessions SET provider='claude' WHERE id=?").run(session.id))
         .toThrow("session provider compatibility shadow mismatch");
+      expect(canonicalAuthBudgetSnapshot(database)).toEqual(beforeGuardedUpdate);
       const guard = (database.query("SELECT sql FROM sqlite_schema WHERE name='session_provider_compatibility_update_guard'").get() as { sql: string }).sql;
-      database.exec("DROP TRIGGER session_provider_compatibility_update_guard");
-      database.query("UPDATE sessions SET provider='claude' WHERE id=?").run(session.id);
-      database.exec(guard);
+      // Adversarial row damage follows real archived admission; it is never
+      // presented as a new historical capture or as provider execution.
+      withRemovedTestGuards(database, ["session_provider_compatibility_update_guard"], () => {
+        database.query("UPDATE sessions SET provider='claude' WHERE id=?").run(session.id);
+      });
+      expect(database.query("SELECT sql FROM sqlite_schema WHERE name='session_provider_compatibility_update_guard'").get())
+        .toEqual({ sql: guard });
+      const beforeRefusal = canonicalAuthBudgetSnapshot(database);
       expect(() => store.requireSession(session.id)).toThrow("SESSION_PROVIDER_COMPATIBILITY_SHADOW_MISMATCH");
-      expect(() => new StateStore(store.paths, { readonly: true })).toThrow("SESSION_PROVIDER_COMPATIBILITY_SHADOW_MISMATCH");
-      expect(() => new StateStore(store.paths)).toThrow("SESSION_PROVIDER_COMPATIBILITY_SHADOW_MISMATCH");
+      for (const readonly of [true, false]) {
+        expect(() => new StateStore(paths, { readonly })).toThrow("SESSION_PROVIDER_COMPATIBILITY_SHADOW_MISMATCH");
+        expect(canonicalAuthBudgetSnapshot(database)).toEqual(beforeRefusal);
+      }
     } finally { database.close(false); }
   });
 
@@ -7467,6 +6656,23 @@ describe("StateStore", () => {
     let keySequence = 0;
     const nextKey = () => `01890f31-a123-7000-8000-${(++keySequence).toString(16).padStart(12, "0")}`;
 
+    async function historicalWorkFixture(state: Canonical48WorkState) {
+      const paths = await canonical48WorkArchive();
+      const captured = canonical48WorkFixture.retained.cases.find((entry) => entry.state === state);
+      if (captured === undefined) throw new Error("Missing exact archived48 Work state.");
+      const snapshot = () => {
+        const database = new Database(paths.database, { create: false, strict: true });
+        database.exec("PRAGMA query_only=ON");
+        try { return canonicalAuthBudgetSnapshot(database); } finally { database.close(false); }
+      };
+      const original = snapshot();
+      expect(original.version).toEqual({ user_version: 48 });
+      expect(original.rows.session_runtime_profiles).toEqual([]);
+      expect(original.rows.work_attempts).toHaveLength(4);
+      expect(original.rows.work_attempts).toContainEqual(expect.objectContaining({ id: captured.attemptId, state }));
+      return { paths, session: captured.session, snapshot };
+    }
+
     async function workFixture(state: FixtureState, options: Parameters<typeof fixture>[0] = {}) {
       const { store, home } = await fixture(options);
       const profile = signInProfile(store, "Project authority", "project-authority@example.com");
@@ -7770,44 +6976,78 @@ describe("StateStore", () => {
       });
 
       test(`SQL Work project authority upgrades populated v48 ${state} attempts without rewriting evidence`, async () => {
-        const { store, session, snapshot } = await workFixture(state);
-        const paths = store.paths;
-        store.close();
-        stores.splice(stores.indexOf(store), 1);
+        const { paths, session, snapshot } = await historicalWorkFixture(state);
         const database = new Database(paths.database, { create: false, strict: true });
         try {
           database.exec("PRAGMA foreign_keys=ON");
-          downgradeToExactProviderVersion48(database);
           const before = snapshot();
-          const reopened = new StateStore(paths, { now: () => 10_000 });
+          const oldRows = canonicalAuthBudgetRows(database, Object.keys(before.rows).filter((table) => table !== "migrations"));
+          const ledgerBefore = database.query("SELECT * FROM migrations ORDER BY version").all();
+          expect(() => new StateStore(paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:48:60");
+          expect(snapshot()).toEqual(before);
+          const originalExec = z.custom<Database["exec"]>((value) => typeof value === "function")
+            .parse(Object.getOwnPropertyDescriptor(Database.prototype, "exec")?.value);
+          let preapplications = 0;
+          const exec = spyOn(Database.prototype, "exec").mockImplementation(function (
+            this: Database, ...args: Parameters<Database["exec"]>
+          ) {
+            const result = originalExec.apply(this, args);
+            if (this.filename === paths.database && args[0] === WORK_PROJECT_AUTHORITY_SCHEMA_SQL) {
+              expect(this.inTransaction).toBe(true);
+              const intermediate = canonicalAuthBudgetSnapshot(this);
+              expect(intermediate.version).toEqual(before.version);
+              expect(intermediate.rows).toEqual(before.rows);
+              expect(intermediate.schema).toHaveLength(before.schema.length + 1);
+              for (const object of before.schema) expect(intermediate.schema).toContainEqual(object);
+              expect(() => this.query("UPDATE sessions SET project_id=NULL WHERE id=?").run(session.id))
+                .toThrow("WORK_SESSION_ATTEMPT_AUTHORITY");
+              expect(canonicalAuthBudgetSnapshot(this)).toEqual(intermediate);
+              preapplications += 1;
+            }
+            return result;
+          });
+          const migratedAt = canonical48WorkFixture.fixedTime + 1_000;
+          let reopened: StateStore;
+          try { reopened = new StateStore(paths, { now: () => migratedAt }); } finally { exec.mockRestore(); }
+          expect(Object.getOwnPropertyDescriptor(Database.prototype, "exec")?.value).toBe(originalExec);
+          expect(preapplications).toBe(1);
           stores.push(reopened);
           const after = snapshot();
-          expect({ ...after, schema: before.schema, version: before.version, migrations: before.migrations })
-            .toEqual(before);
+          // The one-guard preapplication above is an uncommitted48 substep,
+          // not a claim that the full joined migration installs only a guard.
+          expect(oldRows.read()).toEqual(oldRows.before);
           expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
-          expect(database.query("SELECT * FROM migrations WHERE version=49").get())
-            .toEqual({ version: 49, applied_at: 10_000 });
+          expect(database.query("SELECT * FROM migrations WHERE version<=48 ORDER BY version").all()).toEqual(ledgerBefore);
+          expect(database.query("SELECT * FROM migrations WHERE version>48 ORDER BY version").all())
+            .toEqual(Array.from({ length: 12 }, (_, index) => ({ version: index + 49, applied_at: migratedAt })));
+          expect(database.query("SELECT * FROM legacy_provider_authority_quarantines ORDER BY scope_id").all())
+            .toEqual(canonical48WorkFixture.retained.cases.map((entry) => ({ scope_kind: "session", scope_id: entry.session.id,
+              reason: "missing_immutable_runtime_authority", recorded_at: migratedAt }))
+              .sort((left, right) => left.scope_id.localeCompare(right.scope_id)));
+          expect(database.query("SELECT * FROM session_provider_authorities").all()).toEqual([]);
+          for (const entry of canonical48WorkFixture.retained.cases) {
+            expect(() => reopened.requireSessionProviderAuthority(entry.session.id))
+              .toThrow("SESSION_PROVIDER_AUTHORITY_QUARANTINED:missing_immutable_runtime_authority");
+          }
           expect(() => database.query("UPDATE sessions SET project_id=NULL WHERE id=?").run(session.id))
             .toThrow("WORK_SESSION_ATTEMPT_AUTHORITY");
           expect(database.query("PRAGMA foreign_key_check").all()).toEqual([]);
           reopened.close();
           stores.splice(stores.indexOf(reopened), 1);
-          const second = new StateStore(paths, { now: () => 20_000 });
-          stores.push(second);
-          expect(snapshot()).toEqual(after);
+          for (const readonly of [false, true]) {
+            const second = new StateStore(paths, { readonly, now: () => migratedAt + 1 });
+            try { expect(snapshot()).toEqual(after); } finally { second.close(); }
+          }
         } finally { database.close(false); }
       });
 
       test(`SQL Work project authority refuses contradictory v48 ${state} project debt atomically`, async () => {
-        const { store, session, snapshot } = await workFixture(state);
-        const paths = store.paths;
-        store.close();
-        stores.splice(stores.indexOf(store), 1);
+        const { paths, session, snapshot } = await historicalWorkFixture(state);
         const database = new Database(paths.database, { create: false, strict: true });
         try {
           database.exec("PRAGMA foreign_keys=ON");
-          downgradeToExactProviderVersion48(database);
-          // This is the authentic released-v48 hole, with every old guard intact.
+          // This adversarial row edit demonstrates the authentic v48 hole,
+          // with every source-produced schema object and old guard intact.
           database.query("UPDATE sessions SET project_id=NULL WHERE id=?").run(session.id);
           const before = snapshot();
           expect(() => new StateStore(paths, { now: () => 10_000 }))
@@ -7887,13 +7127,9 @@ describe("StateStore", () => {
       "CREATE TABLE Work_Session_Project_Authority_Guard(value TEXT) STRICT",
     ]) {
       test(`SQL Work project authority refuses a predecessor object collision: ${collision.split(" ")[1]}`, async () => {
-        const { store, snapshot } = await workFixture("claimed");
-        const paths = store.paths;
-        store.close();
-        stores.splice(stores.indexOf(store), 1);
+        const { paths, snapshot } = await historicalWorkFixture("claimed");
         const database = new Database(paths.database, { create: false, strict: true });
         try {
-          downgradeToExactProviderVersion48(database);
           database.exec(collision);
           const before = snapshot();
           expect(() => new StateStore(paths))
@@ -7904,13 +7140,9 @@ describe("StateStore", () => {
     }
 
     test("SQL Work project authority rolls back its preapplied trigger when the ledger stamp fails", async () => {
-      const { store, snapshot } = await workFixture("claimed");
-      const paths = store.paths;
-      store.close();
-      stores.splice(stores.indexOf(store), 1);
+      const { paths, snapshot } = await historicalWorkFixture("claimed");
       const database = new Database(paths.database, { create: false, strict: true });
       try {
-        downgradeToExactProviderVersion48(database);
         database.exec(`CREATE TRIGGER refuse_work_project_migration BEFORE INSERT ON migrations
           WHEN NEW.version=49 BEGIN SELECT RAISE(ABORT,'refused Work project stamp'); END`);
         const before = snapshot();
@@ -7924,17 +7156,10 @@ describe("StateStore", () => {
     });
 
     test("SQL Work project authority never adopts an exact-looking predecessor companion", async () => {
-      const { store, snapshot } = await workFixture("claimed");
-      const paths = store.paths;
-      store.close();
-      stores.splice(stores.indexOf(store), 1);
+      const { paths, snapshot } = await historicalWorkFixture("claimed");
       const database = new Database(paths.database, { create: false, strict: true });
       try {
-        const original = z.object({ sql: z.string() }).parse(database.query(
-          "SELECT sql FROM sqlite_master WHERE name='work_session_project_authority_guard'",
-        ).get()).sql;
-        downgradeToExactProviderVersion48(database);
-        database.exec(original);
+        database.exec(WORK_PROJECT_AUTHORITY_SCHEMA_SQL);
         const before = snapshot();
         expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_V49_WORK_PROJECT_PREDECESSOR_COLLISION");
         expect(snapshot()).toEqual(before);
@@ -7943,13 +7168,9 @@ describe("StateStore", () => {
 
     for (const damage of ["missing", "weakened"] as const) {
       test(`SQL Work project authority refuses a ${damage} released v48 route guard before preapplication`, async () => {
-        const { store, snapshot } = await workFixture("claimed");
-        const paths = store.paths;
-        store.close();
-        stores.splice(stores.indexOf(store), 1);
+        const { paths, snapshot } = await historicalWorkFixture("claimed");
         const database = new Database(paths.database, { create: false, strict: true });
         try {
-          downgradeToExactProviderVersion48(database);
           database.exec("DROP TRIGGER work_session_attempt_authority_guard");
           if (damage === "weakened") database.exec(`CREATE TRIGGER work_session_attempt_authority_guard
             BEFORE UPDATE ON sessions BEGIN SELECT 1; END`);
@@ -7963,13 +7184,9 @@ describe("StateStore", () => {
     }
 
     test("SQL Work project authority serializes migration proof and rolls back an interrupted clock", async () => {
-      const { store, session, snapshot } = await workFixture("claimed");
-      const paths = store.paths;
-      store.close();
-      stores.splice(stores.indexOf(store), 1);
+      const { paths, session, snapshot } = await historicalWorkFixture("claimed");
       const contender = new Database(paths.database, { create: false, strict: true });
       try {
-        downgradeToExactProviderVersion48(contender);
         contender.exec("PRAGMA busy_timeout=0");
         const before = snapshot();
         let observedFence = false;
@@ -10792,149 +10009,91 @@ describe("StateStore", () => {
     expect(() => reopened.removeProfile(profile.id)).toThrow();
   });
 
-  test("preserves exact legacy adoption-v36 launch authority and rows", async () => {
-    const value = await fixture();
-    let store = value.store;
-    const profile = signInProfile(
-      store,
-      "Legacy Claude launch proof",
-      "legacy-claude-launch-proof@example.com",
-    );
-    const session = upsertProvenTestSession(store, {
-      profileId: profile.id,
-      provider: "claude",
-      providerThreadId: "legacy-v36-launch-proof",
-      preset: "fable-max",
-      fastEnabled: false,
-      state: "idle",
-    });
-    const intent = store.stageClaudeProcessLaunchIntent({
-      providerAuthority: store.requireProviderAccountAuthority(profile.id, "claude"),
-      providerThreadId: "legacy-v36-launch-proof",
-      profileId: profile.id,
-      profileGeneration: profile.processGeneration,
-      runtimeScope: "managed",
-      providerAccountKey: testProviderAccountKey("claude"),
-      sessionId: session.id,
-    });
-    const candidate = store.upsertSessionAdoptionCandidate({
-      provider: "claude",
-      providerThreadId: "legacy-v36-retained-candidate",
-      title: "Legacy v36 retained candidate",
-      state: "terminal",
-      providerUpdatedAt: 10,
-      liveness: "live",
-      sourceProcessIdentity: {
-        pid: 41_036,
-        pidDomain: "darwin",
-        procStart: "legacy-v36-retained-process",
-      },
-      trustedLiveObservation: true,
-    });
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
-    const legacy = new Database(paths.database, { create: false, strict: true });
+  test("synthetic adoption-v36 contract preserves supplied launch fields without execution authority", async () => {
+    const paths = await syntheticAdoption36ContractFixture("launch");
+    const source = syntheticAdoption36;
+    const database = new Database(paths.database, { create: false, strict: true });
     try {
-      downgradeToExactLegacyAdoptionVersion36(legacy);
-      expect(legacy.query("SELECT name FROM pragma_table_info('sessions') WHERE name='preset_contract'").all()).toEqual([]);
-      expect(legacy.query("SELECT name FROM pragma_table_info('works') WHERE name='preset_contract'").all()).toEqual([]);
-    } finally {
-      legacy.close(false);
-    }
+      const before = canonicalAuthBudgetSnapshot(database);
+      expect(before.version).toEqual({ user_version: 36 });
+      const original = canonicalAuthBudgetRows(database,
+        Object.keys(before.rows).filter((table) => table !== "migrations" && table !== "sessions"
+          && !syntheticAdoption36MaintenanceTables.has(table)));
+      const oldSession = z.record(z.string(), z.unknown()).parse(
+        database.query("SELECT * FROM sessions WHERE id=?").get(source.launchSessionId));
+      // The constrained synthetic source itself refuses mutation of retained
+      // launch identity. No native launch or historical writer is implied.
+      expect(() => database.query("UPDATE session_claude_process_launch_intents SET provider_account_key=? WHERE intent_id=?")
+        .run(`v1:claude:${"d".repeat(64)}`, source.launchId))
+        .toThrow("Claude process launch intent is immutable");
+      expect(canonicalAuthBudgetSnapshot(database)).toEqual(before);
+      expect(() => { new StateStore(paths, { readonly: true }).close(); })
+        .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:60");
+      expect(canonicalAuthBudgetSnapshot(database)).toEqual(before);
 
-    store = new StateStore(paths);
-    stores.push(store);
-    const retained = store.readClaudeProcessLaunchIntent({
-      providerThreadId: intent.providerThreadId,
-      profileId: intent.profileId,
-      runtimeScope: intent.runtimeScope,
-    });
-    expect(retained).toEqual({ ...intent, providerAuthority: null });
-    expect(store.requireSession(session.id)).toMatchObject({
-      id: session.id,
-      providerThreadId: session.providerThreadId,
-    });
-    expect(store.readSessionAdoptionCandidate(
-      candidate.provider,
-      candidate.providerThreadId,
-    )).toMatchObject({
-      lastLiveObservedAt: null,
-      providerProjectRoot: null,
-      providerThreadId: candidate.providerThreadId,
-      sourceProcessIdentity: candidate.sourceProcessIdentity,
-      status: candidate.status,
-    });
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
-    try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
-      expect(inspector.query(
-        "SELECT version FROM migrations WHERE version>=35 ORDER BY version",
-      ).all()).toEqual([
-        { version: 35 },
-        { version: 36 },
-        { version: 37 },
-        { version: 38 },
-        { version: 39 },
-        { version: 40 },
-        { version: 41 }, { version: 42 }, { version: 43 },
-        { version: 44 }, { version: 45 }, { version: 46 },
-        { version: 47 }, { version: 48 }, { version: 49 },
-        ...Array.from({ length: 11 }, (_, index) => ({ version: index + 50 })),
-      ]);
-      expect(inspector.query(
-        "SELECT name FROM pragma_table_info('session_adoption_candidates') WHERE name='provider_project_root'",
-      ).get()).toEqual({ name: "provider_project_root" });
-    } finally {
-      inspector.close(false);
-    }
+      const migrated = new StateStore(paths, { now: () => source.migratedAt, resolveMachineTimeZone: () => "UTC" });
+      stores.push(migrated);
+      expect(migrated.readClaudeProcessLaunchIntent({
+        providerThreadId: "synthetic-adoption36-launch", profileId: source.launchProfileId, runtimeScope: "managed",
+      })).toEqual({
+        intentId: source.launchId, providerThreadId: "synthetic-adoption36-launch",
+        profileId: source.launchProfileId, profileGeneration: 1, runtimeScope: "managed",
+        providerAccountKey: source.accountKey, sessionId: source.launchSessionId, revision: 1,
+        stagedAt: source.fixedTime, updatedAt: source.fixedTime, providerAuthority: null,
+      });
+      expect(migrated.requireSession(source.launchSessionId)).toMatchObject({
+        id: source.launchSessionId, provider: "claude", providerThreadId: "synthetic-adoption36-launch",
+      });
+      expect(migrated.readSessionAdoptionCandidate("claude", source.candidateThread)).toMatchObject({
+        provider: "claude", providerThreadId: source.candidateThread, sourceProcessIdentity: source.sourceProcessIdentity,
+        status: "pending", revision: 1, lastLiveObservedAt: null, providerProjectRoot: null,
+      });
+      expect(database.query("SELECT candidate_fingerprint FROM session_adoption_candidates").get())
+        .toEqual({ candidate_fingerprint: syntheticAdoption36CandidateFingerprint });
+      expect(original.read()).toEqual(original.before);
+      expectSyntheticAdoption36Maintenance(database, before, [source.launchSessionId], [source.launchProfileId]);
+      const currentSession = z.record(z.string(), z.unknown()).parse(
+        database.query("SELECT * FROM sessions WHERE id=?").get(source.launchSessionId));
+      expect(Object.fromEntries(Object.keys(oldSession).map((key) =>
+        [key, currentSession[key === "provider" ? "provider_v39" : key]]))).toEqual(oldSession);
+      expect(database.query("SELECT * FROM migrations WHERE version<=36 ORDER BY version").all())
+        .toEqual(Array.from({ length: 36 }, (_, index) => ({ version: index + 1, applied_at: source.fixedTime })));
+      expect(database.query("SELECT version FROM migrations ORDER BY version").all())
+        .toEqual(Array.from({ length: 60 }, (_, index) => ({ version: index + 1 })));
+      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
+      expect(database.query("SELECT * FROM session_provider_authorities").all()).toEqual([]);
+      const beforeRefusal = canonicalAuthBudgetSnapshot(database);
+      expect(() => migrated.requireSessionProviderAuthority(source.launchSessionId))
+        .toThrow("SESSION_PROVIDER_AUTHORITY_QUARANTINED:missing_immutable_runtime_authority");
+      expect(canonicalAuthBudgetSnapshot(database)).toEqual(beforeRefusal);
+      expectCanonical35To38InertReopens(paths, database);
+    } finally { database.close(false); }
   });
 
-  test("rejects a weakened same-name Work guard in legacy adoption-v36 without writes", async () => {
-    const { store } = await fixture();
-    const candidate = store.upsertSessionAdoptionCandidate({
-      provider: "codex",
-      providerThreadId: "legacy-v36-weakened-work-guard",
-      title: "Legacy v36 weakened Work guard",
-      state: "idle",
-      providerUpdatedAt: 10,
-      liveness: "unknown",
-    });
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
-    const legacy = new Database(paths.database, { create: false, strict: true });
+  test("synthetic adoption-v36 contract refuses one weakened Work guard without writes", async () => {
+    // The paired launch case proves this independently frozen schema admits;
+    // this input differs by exactly one deliberately weakened trigger.
+    const paths = await syntheticAdoption36ContractFixture("launch");
+    const database = new Database(paths.database, { create: false, strict: true });
     try {
-      downgradeToExactLegacyAdoptionVersion36(legacy);
-      legacy.exec(`
-        DROP TRIGGER work_member_account_authority_guard;
-        CREATE TRIGGER work_member_account_authority_guard
-        BEFORE INSERT ON work_members BEGIN SELECT 1; END;
-      `);
-    } finally {
-      legacy.close(false);
-    }
-
-    expect(() => new StateStore(paths))
-      .toThrow("STATE_SCHEMA_V39_LEGACY_ADOPTION_WORK_INVALID");
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
-    try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
-      expect(inspector.query(
-        `SELECT revision,claim_status FROM session_adoption_candidates
-         WHERE provider=? AND provider_thread_id=?`,
-      ).get(candidate.provider, candidate.providerThreadId)).toEqual({
-        claim_status: "pending",
-        revision: candidate.revision,
-      });
-      expect(inspector.query(
-        "SELECT 1 FROM sqlite_master WHERE name='notification_hours'",
-      ).get()).toBeNull();
-    } finally {
-      inspector.close(false);
-    }
+      const before = canonicalAuthBudgetSnapshot(database);
+      database.exec("DROP TRIGGER work_member_account_authority_guard");
+      database.exec("CREATE TRIGGER work_member_account_authority_guard BEFORE INSERT ON work_members BEGIN SELECT 1; END");
+      const damaged = canonicalAuthBudgetSnapshot(database);
+      expect(damaged.rows).toEqual(before.rows);
+      expect(damaged.version).toEqual(before.version);
+      const objects = z.array(z.object({ name: z.string() }).passthrough());
+      expect(objects.parse(damaged.schema).filter(({ name }) => name !== "work_member_account_authority_guard"))
+        .toEqual(objects.parse(before.schema).filter(({ name }) => name !== "work_member_account_authority_guard"));
+      for (const readonly of [true, false]) {
+        expect(() => { new StateStore(paths, { readonly, now: () => syntheticAdoption36.migratedAt }).close(); })
+          .toThrow(readonly ? "STATE_SCHEMA_MIGRATION_REQUIRED:36:60" : "STATE_SCHEMA_V39_LEGACY_ADOPTION_WORK_INVALID");
+        expect(canonicalAuthBudgetSnapshot(database)).toEqual(damaged);
+      }
+      expect(database.query("SELECT revision,claim_status FROM session_adoption_candidates").get())
+        .toEqual({ revision: 1, claim_status: "pending" });
+      expect(database.query("SELECT name FROM sqlite_master WHERE name='notification_hours'").get()).toBeNull();
+    } finally { database.close(false); }
   });
 
   test("rejects a weakened same-name Work authority guard in current adoption-v39", async () => {
@@ -12112,7 +11271,7 @@ describe("StateStore", () => {
   });
 
   test.each(["releasing", "completed_after_rollover"] as const)(
-    "refuses a legacy switch into a releasing Claude scope with a divergent own generation: %s",
+    "refuses a current generic switch into a releasing Claude scope with a divergent own generation: %s",
     async (disposition) => {
     const { store } = await fixture();
     const sourceProfile = signInProfile(store, "Scope switch source", "scope-source@example.com");
@@ -12135,7 +11294,8 @@ describe("StateStore", () => {
     const attempt = store.prepareMutation({
       authorityGeneration: targetAuthority.processGeneration, authorityId: source.id,
       idempotencyKey: key, kind: "session.switch",
-      request: { preset: "fable-max", provider: "claude" },
+      request: sessionProviderSwitchMutationRequest({ preset: "fable-max", provider: "claude",
+        targetProfileId: targetProfile.id, seedDigest: "8".repeat(64) }),
       providerAuthorities: [
         { role: "source", authority: sourceAuthority, provenance: "legacy_switch_source" },
         { role: "target", authority: targetAuthority, provenance: "legacy_switch_target" },
@@ -12174,6 +11334,7 @@ describe("StateStore", () => {
         sourceProviderThreadId,
         targetPreset: "fable-max", targetProcessGeneration: targetAuthority.processGeneration,
         targetProfileId: targetProfile.id, targetProvider: "claude",
+        targetHostCapabilities: testSwitchHostCapabilities,
         targetProviderAccountKey: testProviderAccountKey("claude"), transcriptDigest: "9".repeat(64),
       },
     })).toThrow("SESSION_PROVIDER_SWITCH_AUTHORITY_CHANGED");
@@ -12732,404 +11893,257 @@ describe("StateStore", () => {
     }
   });
 
-  test("quarantines mismatched and legacy session identity without inventing provenance", async () => {
-    const { store, home } = await fixture();
-    const profile = signInProfile(
-      store,
-      "Legacy provider provenance",
-      "legacy-provider-provenance@example.com",
-    );
-    const projectRoot = join(home, "legacy-provider-provenance");
-    await mkdir(projectRoot);
-    const project = await store.createProject(
-      "Legacy provider provenance",
-      projectRoot,
-      true,
-    );
-    const key = providerAccountKeyForProfile(store, profile.id, "codex");
-    const proven = store.upsertProviderSession({
-      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
-      profileId: profile.id,
-      provider: "codex",
-      providerThreadId: "proven-v35-session",
-      title: "Proven v35 session",
-      preset: "high",
-      fastEnabled: false,
-      state: "idle",
-      providerAccountKey: key,
-    });
-    const importedPartial = store.upsertProviderSession({
-      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
-      profileId: profile.id,
-      provider: "codex",
-      providerThreadId: "partial-v35-session",
-      projectId: project.id,
-      title: "Partial v35 session",
-      preset: "high",
-      fastEnabled: false,
-      state: "idle",
-      providerAccountKey: key,
-    });
-    const partial = store.updateSessionMetadata({
-      sessionId: importedPartial.id,
-      expectedRevision: importedPartial.revision,
-      preset: "high",
-    });
-    const queue = store.enqueue(partial.id, "legacy queued effect");
-    const mutationKey = "00000000-0000-4000-8000-000000000903";
-    store.prepareMutation({
-      kind: "session.rename",
-      authorityId: partial.id,
-      authorityGeneration: profile.processGeneration,
-      request: { name: "Legacy prepared rename" },
-      idempotencyKey: mutationKey,
-    });
-    const sessionTask = store.createSessionTaskStore().create({
-      sessionId: partial.id,
-      name: "Legacy active task",
-      prompt: "Do not dispatch after migration.",
-      minutes: 15,
-      status: "active",
-      idempotencyKey: "00000000-0000-4000-8000-000000000904",
-    });
-    const interaction = store.admitInteraction({
-      publicId: "00000000-0000-4000-8000-000000000905",
-      sessionId: partial.id,
-      authority: {
-        ...codexInteractionBinding(store, profile.id),
-        profileId: profile.id,
-        processGeneration: profile.processGeneration,
-        connectionId: "00000000-0000-4000-8000-000000000906",
-        requestId: { type: "string", value: "legacy-migration" },
-        method: "item/fileChange/requestApproval",
-        requestDigest: "9".repeat(64),
-        threadId: partial.providerThreadId ?? "",
-        turnId: "legacy-migration-turn",
-        itemId: "legacy-migration-item",
-        approvalId: null,
-      },
-      kind: "file_change_approval",
-      blocking: true,
-      display: {
-        kind: "file_change_approval",
-        summary: "Legacy migration approval",
-        reason: null,
-        grantRoot: null,
-        availableDecisions: ["once", "decline", "cancel"],
-      },
-    }).record;
-    const workStore = createRevocationWorkStore(store);
-    const createdWork = workStore.apply({
-      kind: "work.create",
-      idempotencyKey: "01890f31-a123-7000-8000-000000000907",
-      clientRef: "legacy-migration-work",
-      coordinatorSessionId: partial.id,
-      objective: "Prove migration-time work retirement.",
-      routes: [{
-        accountId: profile.id,
-        projectId: project.id,
-        preset: "high",
-        fast: false,
-      }],
-      tasks: [{
-        clientRef: "legacy-migration-work-task",
-        dependsOnRefs: [],
-        dependsOnTaskIds: [],
-        objective: "Hold one legacy claim.",
-        instructions: "Retire this claim during v35 repair.",
-        criteria: ["The claim is no longer active."],
-        route: { accountId: profile.id, projectId: project.id },
-        preset: "high",
-        fast: false,
-        priority: 0,
-        maxAttempts: 3,
-        requiredReviews: 0,
-        resultKind: "text",
-        minEvidence: 0,
-      }],
-    });
-    if (createdWork.kind !== "work.create") throw new Error("Expected legacy work.");
-    const workTask = createdWork.tasks[0];
-    if (workTask === undefined) throw new Error("Expected one legacy work task.");
-    const workClaim = workStore.apply({
-      kind: "task.claim",
-      idempotencyKey: "01890f31-a123-7000-8000-000000000908",
-      workId: createdWork.work.id,
-      taskId: workTask.id,
-      expectedTaskRevision: workTask.revision,
-      actorSessionId: partial.id,
-      actorCapability: `hrac1_${"A".repeat(43)}`,
-      leaseMs: 5_000,
-    });
-    if (workClaim.kind !== "task.claim") throw new Error("Expected legacy work claim.");
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-    const partialV35 = new Database(paths.database, { create: false, strict: true });
-    try {
-      const guard = z.object({ sql: z.string() }).strict().parse(partialV35.query(
-        `SELECT sql FROM sqlite_master
-         WHERE type='trigger' AND name='session_provider_account_authority_update_guard'`,
-      ).get());
-      partialV35.exec("DROP TRIGGER session_provider_account_authority_update_guard");
-      partialV35.query(
-        "UPDATE session_provider_account_authorities SET account_key=? WHERE session_id=?",
-      ).run(`v1:codex:${"f".repeat(64)}`, partial.id);
-      partialV35.exec(guard.sql);
-      downgradeToExactLegacyAdoptionVersion36(partialV35);
-      // A nullable project on this supported predecessor must fail before
-      // migration-time quarantine can release its real claimed Work attempt.
-      expect(partialV35.query("SELECT state FROM work_attempts WHERE id=?").get(workClaim.attempt.id))
-        .toEqual({ state: "claimed" });
-      partialV35.query("UPDATE sessions SET project_id=NULL WHERE id=?").run(partial.id);
-      const retainedTables = [
-        "profiles", "sessions", "works", "work_tasks", "work_task_states",
-        "work_attempts", "work_events", "work_prepared_effects", "work_idempotency_intents",
-        "work_task_history_index", "work_task_history_versions", "queue_entries",
-        "mutation_attempts", "mutation_resolutions", "provider_interactions", "session_tasks",
-      ] as const;
-      const snapshot = () => ({
-        schema: partialV35.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all(),
-        migrations: partialV35.query("SELECT * FROM migrations ORDER BY version").all(),
-        version: partialV35.query("PRAGMA user_version").get(),
-        rows: Object.fromEntries(retainedTables.map((table) => [
-          table, partialV35.query(`SELECT * FROM ${table}`).all(),
-        ])),
-      });
-      const debt = snapshot();
-      expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_V49_WORK_PROJECT_AUTHORITY_INVALID");
-      expect(snapshot()).toEqual(debt);
-      // Arrange the paired valid-project control on the same unchanged
-      // predecessor. Production migration never performs this assignment.
-      partialV35.query("UPDATE sessions SET project_id=? WHERE id=?").run(project.id, partial.id);
-    } finally {
-      partialV35.close(false);
-    }
-    const repaired = new StateStore(paths);
-    stores.push(repaired);
-    expect(repaired.sessionAccountAuthorityMatches(proven.id, profile.id)).toBe(true);
-    expect(repaired.sessionAccountAuthorityMatches(partial.id, profile.id)).toBe(false);
-    expect(repaired.readSessionProviderAccountAuthority(partial.id)).toBeNull();
-    expect(repaired.requireSession(partial.id).state).toBe("recovery_required");
-    expect(repaired.requireQueue(queue.id)).toMatchObject({ state: "pending", message: queue.message });
-    expect(repaired.hasUnsettledQueueAttachmentQuarantineForSession(partial.id)).toBe(true);
-    expect(repaired.nextPendingQueue(partial.id)).toBeNull();
-    expect(repaired.readMutation(mutationKey)?.state).toBe("cancelled");
-    expect(repaired.createSessionTaskStore().list(partial.id)
-      .find((task) => task.id === sessionTask.id)).toMatchObject({
-        status: "paused",
-        nextDueAt: null,
-      });
-    expect(() => repaired.requireInteraction(interaction.publicId))
-      .toThrow("INTERACTION_PROVIDER_AUTHORITY_MISSING");
-    expect(createRevocationWorkStore(repaired).task(workTask.id).activeAttempt).toBeNull();
-    const inspector = new Database(paths.database, { create: false, strict: true });
-    try {
-      expect(inspector.query("SELECT state,display_json FROM provider_interactions WHERE public_id=?")
-        .get(interaction.publicId)).toEqual({ state: "pending", display_json: JSON.stringify(interaction.display) });
-      expect(inspector.query("SELECT * FROM interaction_provider_authorities WHERE public_id=?")
-        .all(interaction.publicId)).toEqual([]);
-      expect(inspector.query("SELECT reason FROM legacy_provider_authority_quarantines WHERE scope_kind='interaction' AND scope_id=?")
-        .get(interaction.publicId)).toEqual({ reason: "unsettled_provider_authority_unproved" });
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
-      expect(inspector.query("SELECT state FROM work_attempts WHERE id=?").get(workClaim.attempt.id))
-        .toEqual({ state: "released" });
-      expect(inspector.query(
-        "SELECT account_key FROM session_account_authorities WHERE session_id=?",
-      ).get(partial.id)).toEqual({ account_key: null });
-      expect(() => inspector.query(
-        `INSERT INTO session_provider_account_authorities(
-           session_id,provider,runtime_scope,account_key,recorded_at
-         ) VALUES (?,'codex','managed',?,?)`,
-      ).run(partial.id, `v1:codex:${"f".repeat(64)}`, 1))
-        .toThrow("session provider account authority does not match its session");
-    } finally {
-      inspector.close(false);
-    }
+  test.each([false, true])("migrates authentic v40 mixed owners without rewriting history with mismatched identity=%s", async (mismatchedIdentity) => {
+    const source = canonicalIdentityAttentionFixtures["canonical40-mixed-owners"];
+    const { profile, proven, partial, project, queue, prepared, mutationKey, interaction, workClaim, workTask } = source.retained;
+    const migratedAt = 42_000;
+      const paths = await canonicalIdentityAttentionArchive("canonical40-mixed-owners");
+      const database = new Database(paths.database, { create: false, strict: true });
+      try {
+        const pristine = canonicalAuthBudgetSnapshot(database);
+        expect(database.query("SELECT account_key FROM session_provider_account_authorities WHERE session_id=?")
+          .get(partial.id)).toEqual({ account_key: source.retained.providerAccountKey });
+        expect(database.query("SELECT state FROM work_attempts WHERE id=?").get(workClaim.attempt.id))
+          .toEqual({ state: "claimed" });
+        if (mismatchedIdentity) {
+          // A labeled adversarial derivative, never claimed to be old writer
+          // output. The intact original guard refuses this one-cell edit.
+          const corruptKey = `v1:codex:${"f".repeat(64)}`;
+          expect(() => database.query("UPDATE session_provider_account_authorities SET account_key=? WHERE session_id=?")
+            .run(corruptKey, partial.id)).toThrow("session provider account authority is immutable");
+          expect(canonicalAuthBudgetSnapshot(database)).toEqual(pristine);
+          withRemovedTestGuards(database, ["session_provider_account_authority_update_guard"], () => {
+            database.query("UPDATE session_provider_account_authorities SET account_key=? WHERE session_id=?")
+              .run(corruptKey, partial.id);
+          });
+          const corrupted = canonicalAuthBudgetSnapshot(database);
+          expect(corrupted.schema).toEqual(pristine.schema);
+          expect(corrupted.version).toEqual(pristine.version);
+          expectHistoricalValue({ ...corrupted.rows, session_provider_account_authorities: pristine.rows.session_provider_account_authorities },
+            pristine.rows);
+          const originalProofs = z.array(z.record(z.string(), z.unknown())).parse(pristine.rows.session_provider_account_authorities);
+          expect(corrupted.rows.session_provider_account_authorities).toEqual(originalProofs
+            .map((row) => row.session_id === partial.id ? { ...row, account_key: corruptKey } : row));
 
-    const legacyValue = await fixture();
-    const legacyProfile = signInProfile(
-      legacyValue.store,
-      "Version 34 legacy session",
-      "version-34-legacy-session@example.com",
-    );
-    const legacySession = legacyValue.store.createSession({
-      profileId: legacyProfile.id,
-      provider: "codex",
-      preset: "high",
-      fastEnabled: false,
-    });
-    legacyValue.store.close();
-    stores.splice(stores.indexOf(legacyValue.store), 1);
-    const legacy = new Database(legacyValue.store.paths.database, {
-      create: false,
-      strict: true,
-    });
-    try {
-      dropSchemaAfterVersion34(legacy);
-      legacy.exec("DELETE FROM migrations WHERE version>34; DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=34;");
-    } finally {
-      legacy.close(false);
-    }
-    const migrated = new StateStore(legacyValue.store.paths);
-    stores.push(migrated);
-    expect(migrated.sessionAccountAuthorityMatches(
-      legacySession.id,
-      legacyProfile.id,
-    )).toBe(false);
-    expect(migrated.requireSession(legacySession.id).state).toBe("recovery_required");
-    expect(migrated.readSessionProviderAccountAuthority(legacySession.id)).toBeNull();
+          // The authentic v40 writer predates the v49 project update guard.
+          // Contradictory active-claim project authority must fail before any
+          // migration, including quarantine or Work release, can conceal it.
+          expect(database.query("SELECT name FROM sqlite_master WHERE name='work_session_project_authority_guard'").get()).toBeNull();
+          database.query("UPDATE sessions SET project_id=NULL WHERE id=?").run(partial.id);
+          const contradictory = canonicalAuthBudgetSnapshot(database);
+          expect(() => new StateStore(paths, { now: () => migratedAt }))
+            .toThrow("STATE_SCHEMA_V49_WORK_PROJECT_AUTHORITY_INVALID");
+          expect(canonicalAuthBudgetSnapshot(database)).toEqual(contradictory);
+          expect(() => new StateStore(paths, { readonly: true }))
+            .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:40:60");
+          expect(canonicalAuthBudgetSnapshot(database)).toEqual(contradictory);
+          database.query("UPDATE sessions SET project_id=? WHERE id=?").run(project.id, partial.id);
+          expect(canonicalAuthBudgetSnapshot(database)).toEqual(corrupted);
+        }
+        const before = canonicalAuthBudgetSnapshot(database);
+        expect(() => new StateStore(paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:40:60");
+        expect(canonicalAuthBudgetSnapshot(database)).toEqual(before);
+        const retained = canonicalAuthBudgetRows(database, Object.keys(before.rows)
+          .filter((table) => !["migrations", "sessions", "session_autorespond_counters"].includes(table)));
+        const sessions = canonicalAuthBudgetRows(database, ["sessions"]);
+        const expectedSessions = z.array(z.record(z.string(), z.unknown())).parse(sessions.before.sessions)
+          .map((row) => row.id === partial.id ? { ...row, state: "recovery_required",
+            revision: z.number().parse(row.revision) + 1, updated_at: migratedAt } : row);
+        const store = new StateStore(paths, { now: () => migratedAt });
+        stores.push(store);
+        expect(retained.read()).toEqual(retained.before);
+        expect(sessions.read().sessions).toEqual(expectedSessions);
+        expect(before.rows.session_autorespond_counters).toEqual([]);
+        expect(database.query("SELECT * FROM session_autorespond_counters ORDER BY session_id").all())
+          .toEqual([proven.id, partial.id].sort().map((session_id) =>
+            ({ session_id, consecutive_count: 3, updated_at: migratedAt })));
+        expect(store.sessionAccountAuthorityMatches(proven.id, profile.id)).toBe(true);
+        expect(store.sessionAccountAuthorityMatches(partial.id, profile.id)).toBe(!mismatchedIdentity);
+        expect(store.readSessionProviderAccountAuthority(partial.id)?.accountKey)
+          .toBe(mismatchedIdentity ? `v1:codex:${"f".repeat(64)}` : source.retained.providerAccountKey);
+        expect(store.requireCapturedSessionProviderAuthority(proven.id)).toMatchObject({
+          profileId: profile.id, provider: "codex", processGeneration: profile.processGeneration,
+        });
+        expect(() => store.requireCapturedSessionProviderAuthority(partial.id))
+          .toThrow("SESSION_PROVIDER_AUTHORITY_QUARANTINED:missing_immutable_runtime_authority");
+        expect(store.requireQueue(queue.id)).toMatchObject({ state: "pending", message: queue.message });
+        expect(store.hasUnsettledQueueAttachmentQuarantineForSession(partial.id)).toBe(true);
+        expect(store.nextPendingQueue(partial.id)).toBeNull();
+        expect(store.readMutation(mutationKey)?.state).toBe("prepared");
+        expect(database.query("SELECT status FROM session_tasks WHERE id=?").get(source.retained.sessionTask.id))
+          .toEqual({ status: "active" });
+        expect(() => store.requireInteraction(interaction.publicId)).toThrow("INTERACTION_PROVIDER_AUTHORITY_MISSING");
+        expect(database.query("SELECT * FROM interaction_provider_authorities").all()).toEqual([]);
+        expect(database.query("SELECT * FROM mutation_provider_authorities WHERE attempt_id=?").all(prepared.id)).toEqual([]);
+        expect(database.query("SELECT * FROM session_provider_authorities WHERE session_id=?").all(partial.id)).toEqual([]);
+        expect(database.query("SELECT * FROM migrations WHERE version<=40 ORDER BY version").all()).toEqual([...source.ledger]);
+        expect(database.query("SELECT version FROM migrations ORDER BY version").all())
+          .toEqual(Array.from({ length: 60 }, (_, index) => ({ version: index + 1 })));
+        expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
+        const joined = canonicalAuthBudgetSnapshot(database);
+        expect(() => store.requireSessionProviderAuthority(partial.id))
+          .toThrow("SESSION_PROVIDER_AUTHORITY_QUARANTINED:missing_immutable_runtime_authority");
+        expect(() => store.transitionQueue(queue.id, "pending", "dispatching")).toThrow();
+        expect(canonicalAuthBudgetSnapshot(database)).toEqual(joined);
+        expectCanonical35To38InertReopens(paths, database);
+
+        // A later live Work read owns its documented recovery sweep. It is
+        // separate from migration, and may release the old claim without
+        // dispatching it or inventing a receipt.
+        const workStore = store.createWorkStore(source.retained.daemonGeneration, () => "unused-history-cursor", {
+          issue: () => { throw new Error("HISTORICAL_WORK_READ_MUST_NOT_ISSUE_CAPABILITY"); },
+          verify: () => false,
+        });
+        const beforeWorkRead = canonicalAuthBudgetRows(database, ["queue_entries", "mutation_attempts",
+          "mutation_effect_evidence", "mutation_resolutions", "session_tasks", "provider_interactions",
+          "session_provider_account_authorities", "session_runtime_profiles", "work_prepared_effects",
+          "work_nested_effect_settlements", "work_effect_resolutions", "work_idempotency_intents"]);
+        expect(workStore.task(workTask.id).activeAttempt).toBeNull();
+        expect(database.query("SELECT state,revision FROM work_attempts WHERE id=?").get(workClaim.attempt.id))
+          .toEqual({ state: "released", revision: workClaim.attempt.revision + 1 });
+        expect(beforeWorkRead.read()).toEqual(beforeWorkRead.before);
+        expect(database.query("SELECT * FROM work_prepared_effects").all()).toEqual([]);
+        expect(database.query("SELECT * FROM mutation_effect_evidence").all()).toEqual([]);
+        expect(database.query("PRAGMA foreign_key_check").all()).toEqual([]);
+        expectCanonical35To38InertReopens(paths, database);
+      } finally { database.close(false); }
   });
 
-  test("quarantines malformed pre-release v36 Claude authority and every admitted effect", async () => {
-    const { store, home } = await fixture();
-    const profile = signInProfile(
-      store,
-      "Legacy Claude provider provenance",
-      "legacy-claude-provider-provenance@example.com",
-    );
-    const unaffectedProfile = store.createProfile("Unaffected signed-out Claude profile");
-    const projectRoot = join(home, "legacy-claude-provider-provenance");
-    await mkdir(projectRoot);
-    const project = await store.createProject(
-      "Legacy Claude provider provenance",
-      projectRoot,
-      true,
-    );
-    const malformed = upsertProvenTestSession(store, {
-      profileId: profile.id,
-      provider: "claude",
-      providerThreadId: "pre-release-v36-malformed-claude",
-      projectId: project.id,
-      title: "Malformed pre-release v36 Claude",
-      preset: "fable-max",
-      fastEnabled: false,
-      state: "idle",
-    });
-    const revoked = upsertProvenTestSession(store, {
-      profileId: profile.id,
-      provider: "claude",
-      providerThreadId: "pre-release-v36-revoked-claude",
-      title: "Revoked pre-release v36 Claude",
-      preset: "fable-max",
-      fastEnabled: false,
-      state: "idle",
-    });
-    const unaffected = upsertProvenTestSession(store, {
-      profileId: unaffectedProfile.id,
-      provider: "claude",
-      providerThreadId: "valid-signed-out-claude",
-      title: "Valid signed-out Claude",
-      preset: "fable-max",
-      fastEnabled: false,
-      state: "idle",
-    });
-    const queue = store.enqueue(malformed.id, "legacy Claude queued effect");
-    const mutationKey = "00000000-0000-4000-8000-000000000909";
-    store.prepareMutation({
-      kind: "session.rename",
-      authorityId: malformed.id,
-      authorityGeneration: profile.processGeneration,
-      request: { name: "Legacy Claude prepared rename" },
-      idempotencyKey: mutationKey,
-    });
-    const sessionTask = store.createSessionTaskStore().create({
-      sessionId: malformed.id,
-      name: "Legacy Claude active task",
-      prompt: "Do not dispatch after migration.",
-      minutes: 15,
-      status: "active",
-      idempotencyKey: "00000000-0000-4000-8000-000000000910",
-    });
-    const interaction = store.admitInteraction({
-      publicId: "00000000-0000-4000-8000-000000000911",
-      sessionId: malformed.id,
-      authority: {
-        provider: "claude",
-        providerAccountId: store.requireProviderAccountAuthority(profile.id, "claude").providerAccountId,
-        bindingGeneration: store.requireProviderAccountAuthority(profile.id, "claude").bindingGeneration,
-        profileId: profile.id,
-        processGeneration: store.requireProviderAccountAuthority(profile.id, "claude").processGeneration,
-        connectionId: "00000000-0000-4000-8000-000000000912",
-        requestId: { type: "string", value: "legacy-claude-migration" },
-        method: "claude/control_request/can_use_tool",
-        requestDigest: "8".repeat(64),
-        threadId: malformed.providerThreadId ?? "",
-        turnId: "legacy-claude-migration-turn",
-        itemId: "legacy-claude-migration-item",
-        approvalId: null,
-      },
-      kind: "command_approval",
-      blocking: true,
-      display: {
-        kind: "command_approval",
-        summary: "Legacy Claude migration approval",
-        reason: null,
-        commandClass: "test",
-        workingDirectory: null,
-        availableDecisions: ["once", "decline", "cancel"],
-      },
-    }).record;
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-    const preReleaseV36 = new Database(paths.database, { create: false, strict: true });
+  test("authentic v34 unbound session remains without native account proof", async () => {
+    // The separate real v34 image proves pre-adoption sessions do not acquire
+    // native account proof just because their profile was signed in.
+    const legacyPaths = await canonical34StorageArchive();
+    const legacySource = canonical34StorageFixture.retained;
+    const migrated = new StateStore(legacyPaths, { now: () => 42_000 });
+    stores.push(migrated);
+    expect(migrated.sessionAccountAuthorityMatches(legacySource.unboundSession.id, legacySource.profile.id)).toBe(false);
+    expect(migrated.requireSession(legacySource.unboundSession.id).state).toBe("recovery_required");
+    expect(migrated.readSessionProviderAccountAuthority(legacySource.unboundSession.id)).toBeNull();
+    expect(() => migrated.requireCapturedSessionProviderAuthority(legacySource.unboundSession.id))
+      .toThrow("SESSION_PROVIDER_AUTHORITY_QUARANTINED:missing_immutable_runtime_authority");
+    const legacyInspector = new Database(legacyPaths.database, { readonly: true, strict: true });
     try {
-      const guard = z.object({ sql: z.string() }).strict().parse(preReleaseV36.query(
-        `SELECT sql FROM sqlite_master
-         WHERE type='trigger' AND name='session_provider_account_authority_update_guard'`,
-      ).get());
-      preReleaseV36.exec("DROP TRIGGER session_provider_account_authority_update_guard");
-      preReleaseV36.query(
-        "UPDATE session_provider_account_authorities SET runtime_scope='personal' WHERE session_id=?",
-      ).run(malformed.id);
-      preReleaseV36.query(
-        `INSERT INTO provider_runtime_account_revocations(
-           profile_id,profile_generation,provider,runtime_scope,current_account_key,
-           state,revision,created_at,updated_at,completed_at
-         ) VALUES (?,?,'claude','managed',NULL,'completed',1,?,?,?)`,
-      ).run(
-        profile.id,
-        profile.processGeneration,
-        2_000,
-        2_000,
-        2_000,
-      );
-      preReleaseV36.exec(guard.sql);
-      downgradeToExactLegacyAdoptionVersion36(preReleaseV36);
-    } finally {
-      preReleaseV36.close(false);
-    }
+      expect(legacyInspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      expectCanonical35To38InertReopens(legacyPaths, legacyInspector);
+    } finally { legacyInspector.close(false); }
+  });
 
-    const repaired = new StateStore(paths);
-    stores.push(repaired);
-    expect(repaired.sessionAccountAuthorityMatches(unaffected.id, unaffectedProfile.id)).toBe(true);
-    expect(repaired.readSessionProviderAccountAuthority(unaffected.id)).not.toBeNull();
-    for (const invalid of [malformed, revoked]) {
-      expect(repaired.sessionAccountAuthorityMatches(invalid.id, profile.id)).toBe(false);
-      expect(repaired.readSessionProviderAccountAuthority(invalid.id)).toBeNull();
-      expect(repaired.requireSession(invalid.id).state).toBe("recovery_required");
-    }
-    expect(repaired.requireQueue(queue.id)).toMatchObject({ state: "pending", message: queue.message });
-    expect(repaired.hasUnsettledQueueAttachmentQuarantineForSession(malformed.id)).toBe(true);
-    expect(repaired.nextPendingQueue(malformed.id)).toBeNull();
-    expect(repaired.readMutation(mutationKey)?.state).toBe("cancelled");
-    expect(repaired.createSessionTaskStore().list(malformed.id)
-      .find((task) => task.id === sessionTask.id)).toMatchObject({
-        status: "paused",
-        nextDueAt: null,
-      });
-    expect(() => repaired.requireInteraction(interaction.publicId))
-      .toThrow("INTERACTION_PROVIDER_AUTHORITY_MISSING");
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
+  test("synthetic adoption-v36 contract quarantines malformed Claude scope and revoked authority without inventing effects", async () => {
+    const paths = await syntheticAdoption36ContractFixture("quarantine");
+    const source = syntheticAdoption36;
+    const database = new Database(paths.database, { create: false, strict: true });
     try {
-      expect(inspector.query("SELECT state,display_json FROM provider_interactions WHERE public_id=?")
-        .get(interaction.publicId)).toEqual({ state: "pending", display_json: JSON.stringify(interaction.display) });
-      expect(inspector.query("SELECT * FROM interaction_provider_authorities WHERE public_id=?")
-        .all(interaction.publicId)).toEqual([]);
-      expect(inspector.query("SELECT reason FROM legacy_provider_authority_quarantines WHERE scope_kind='interaction' AND scope_id=?")
-        .get(interaction.publicId)).toEqual({ reason: "unsettled_provider_authority_unproved" });
-    } finally { inspector.close(false); }
+      const pristine = canonicalAuthBudgetSnapshot(database);
+      const guard = z.object({ sql: z.string() }).strict().parse(database.query(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='session_provider_account_authority_update_guard'",
+      ).get());
+      expect(() => database.query(
+        "UPDATE session_provider_account_authorities SET runtime_scope='personal' WHERE session_id=?",
+      ).run(source.malformedSessionId)).toThrow("session provider account authority is immutable");
+      expect(canonicalAuthBudgetSnapshot(database)).toEqual(pristine);
+
+      // Explicit adversarial mutation of synthetic recognizer input, NOT a
+      // historical writer output. Restore the exact guard before admission.
+      database.exec("DROP TRIGGER session_provider_account_authority_update_guard");
+      database.query(
+        "UPDATE session_provider_account_authorities SET runtime_scope='personal' WHERE session_id=?",
+      ).run(source.malformedSessionId);
+      database.exec(guard.sql);
+      database.query(`INSERT INTO provider_runtime_account_revocations(
+        profile_id,profile_generation,provider,runtime_scope,current_account_key,
+        state,revision,created_at,updated_at,completed_at
+      ) VALUES (?,1,'claude','managed',NULL,'completed',1,?,?,?)`)
+        .run(source.invalidProfileId, source.fixedTime, source.fixedTime, source.fixedTime);
+      const damaged = canonicalAuthBudgetSnapshot(database);
+      expect(damaged.schema).toEqual(pristine.schema);
+      expect(damaged.version).toEqual(pristine.version);
+      expect(database.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      const changedTables = new Set(["session_provider_account_authorities", "provider_runtime_account_revocations"]);
+      for (const [table, rows] of Object.entries(pristine.rows)) {
+        if (!changedTables.has(table)) expect(damaged.rows[table]).toEqual(rows);
+      }
+      expect(database.query("SELECT session_id,runtime_scope FROM session_provider_account_authorities ORDER BY session_id").all())
+        .toEqual([
+          { session_id: source.malformedSessionId, runtime_scope: "personal" },
+          { session_id: source.revokedSessionId, runtime_scope: "managed" },
+          { session_id: source.unaffectedSessionId, runtime_scope: "managed" },
+        ]);
+      const mutableTables = new Set(["migrations", "sessions", "session_provider_account_authorities",
+        "session_account_authorities", "mutation_attempts", "session_tasks"]);
+      const unchanged = canonicalAuthBudgetRows(database, Object.keys(damaged.rows)
+        .filter((table) => !mutableTables.has(table) && !syntheticAdoption36MaintenanceTables.has(table)));
+      const oldRows = canonicalAuthBudgetRows(database,
+        ["session_provider_account_authorities", "session_account_authorities", "mutation_attempts", "session_tasks"]);
+      const oldSessions = z.array(z.record(z.string(), z.unknown())).parse(database.query("SELECT * FROM sessions ORDER BY id").all());
+      expect(() => { new StateStore(paths, { readonly: true }).close(); })
+        .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:60");
+      expect(canonicalAuthBudgetSnapshot(database)).toEqual(damaged);
+
+      const repaired = new StateStore(paths, { now: () => source.migratedAt, resolveMachineTimeZone: () => "UTC" });
+      stores.push(repaired);
+      expect(repaired.sessionAccountAuthorityMatches(source.unaffectedSessionId, source.unaffectedProfileId)).toBe(true);
+      expect(repaired.readSessionProviderAccountAuthority(source.unaffectedSessionId)).not.toBeNull();
+      expect(repaired.requireSession(source.unaffectedSessionId).state).toBe("idle");
+      for (const id of [source.malformedSessionId, source.revokedSessionId]) {
+        expect(repaired.sessionAccountAuthorityMatches(id, source.invalidProfileId)).toBe(false);
+        expect(repaired.readSessionProviderAccountAuthority(id)).toBeNull();
+        expect(repaired.requireSession(id).state).toBe("recovery_required");
+      }
+      expect(repaired.requireQueue(source.queueId)).toMatchObject({ state: "pending", message: source.queueMessage });
+      expect(repaired.hasUnsettledQueueAttachmentQuarantineForSession(source.malformedSessionId)).toBe(true);
+      expect(repaired.nextPendingQueue(source.malformedSessionId)).toBeNull();
+      expect(repaired.readMutation(source.mutationKey)?.state).toBe("cancelled");
+      expect(database.query("SELECT result_json FROM mutation_attempts WHERE id=?").get(source.mutationId))
+        .toEqual({ result_json: null });
+      expect(repaired.createSessionTaskStore().list(source.malformedSessionId)
+        .find((task) => task.id === source.taskId)).toMatchObject({ status: "paused", nextDueAt: null, revision: 2 });
+      expect(() => repaired.requireInteraction(source.interactionId))
+        .toThrow("INTERACTION_PROVIDER_AUTHORITY_MISSING");
+      expect(database.query("SELECT state,display_json FROM provider_interactions WHERE public_id=?")
+        .get(source.interactionId)).toEqual({ state: "pending", display_json: JSON.stringify(source.display) });
+      expect(database.query("SELECT * FROM interaction_provider_authorities").all()).toEqual([]);
+      expect(database.query("SELECT reason FROM legacy_provider_authority_quarantines WHERE scope_kind='interaction' AND scope_id=?")
+        .get(source.interactionId)).toEqual({ reason: "unsettled_provider_authority_unproved" });
+
+      // Exact old-column accounting: only the documented invalid-native-proof
+      // removal and quarantine transitions may change these synthetic rows.
+      expect(unchanged.read()).toEqual(unchanged.before);
+      expectSyntheticAdoption36Maintenance(database, damaged,
+        [source.malformedSessionId, source.revokedSessionId, source.unaffectedSessionId],
+        [source.invalidProfileId, source.unaffectedProfileId]);
+      const recordRows = (table: string) => z.array(z.record(z.string(), z.unknown())).parse(oldRows.before[table]);
+      expect(oldRows.read()).toEqual({
+        session_provider_account_authorities: recordRows("session_provider_account_authorities")
+          .filter((row) => row.session_id === source.unaffectedSessionId),
+        session_account_authorities: recordRows("session_account_authorities")
+          .map((row) => row.session_id === source.unaffectedSessionId ? row : { ...row, account_key: null }),
+        mutation_attempts: recordRows("mutation_attempts")
+          .map((row) => ({ ...row, state: "cancelled", updated_at: source.migratedAt })),
+        session_tasks: recordRows("session_tasks")
+          .map((row) => ({ ...row, status: "paused", revision: 2, next_due_at: null, updated_at: source.migratedAt })),
+      });
+      const currentSessions = z.array(z.record(z.string(), z.unknown())).parse(database.query("SELECT * FROM sessions ORDER BY id").all());
+      expect(currentSessions.map((row, index) => Object.fromEntries(Object.keys(oldSessions[index] ?? {}).map((key) =>
+        [key, row[key === "provider" ? "provider_v39" : key]]))))
+        .toEqual(oldSessions.map((row) => row.id === source.unaffectedSessionId ? row
+          : { ...row, state: "recovery_required", revision: 2, updated_at: source.migratedAt }));
+      expect(database.query("SELECT * FROM migrations WHERE version<=36 ORDER BY version").all())
+        .toEqual(Array.from({ length: 36 }, (_, index) => ({ version: index + 1, applied_at: source.fixedTime })));
+      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
+      // Even the unaffected legacy account row is not a new execution proof.
+      const beforeAuthorityRead = canonicalAuthBudgetSnapshot(database);
+      expect(database.query("SELECT * FROM session_provider_authorities").all()).toEqual([]);
+      for (const id of [source.malformedSessionId, source.revokedSessionId, source.unaffectedSessionId]) {
+        expect(() => repaired.requireSessionProviderAuthority(id))
+          .toThrow("SESSION_PROVIDER_AUTHORITY_QUARANTINED:missing_immutable_runtime_authority");
+      }
+      expect(canonicalAuthBudgetSnapshot(database)).toEqual(beforeAuthorityRead);
+      for (const table of ["session_runtime_profiles", "mutation_effect_evidence", "queue_effect_evidence",
+        "session_claude_process_authorities", "session_personal_runtime_bindings"]) {
+        expect(database.query(`SELECT * FROM ${table}`).all()).toEqual([]);
+      }
+      expectCanonical35To38InertReopens(paths, database);
+    } finally { database.close(false); }
   });
 
   test("rejects a malformed current adoption candidate table without releasing fences", async () => {
@@ -13772,11 +12786,17 @@ describe("StateStore", () => {
     stores.push(store);
     const authority = store.requireProviderAccountAuthority(source.profile.id, "devin");
     const captured = store.requireCapturedSessionProviderAuthority(source.session.id);
+    const session = store.requireSession(source.session.id);
+    const runtime = store.latestSessionRuntimeProfile(source.session.id);
     store.nextDaemonGeneration(`boot_${"3".repeat(32)}`);
-    expect(store.requireSession(source.session.id)).toMatchObject({ provider: "devin", state: "recovery_required" });
+    // Retiring supported provider processes cannot invent a discontinuity for
+    // this inert historical provider or grant it a new process generation.
+    expect(store.requireSession(source.session.id)).toEqual(session);
+    expect(session).toMatchObject({ provider: "devin", state: "idle" });
     expect(store.requireProviderAccountAuthority(source.profile.id, "devin")).toEqual(authority);
     expect(store.requireCapturedSessionProviderAuthority(source.session.id)).toEqual(captured);
     expect(captured.processGeneration).toBe(0);
+    expect(store.latestSessionRuntimeProfile(source.session.id)).toEqual(runtime);
     expect(store.latestSessionRuntimeProfile(source.session.id)?.profile).toEqual(source.runtimeProfile);
   });
 
@@ -14121,7 +13141,8 @@ describe("StateStore", () => {
       kind: "session.start",
       authorityId: profile.id,
       authorityGeneration: providerAuthority.processGeneration,
-      request: { projectId: project.id, preset: "high", fast: false },
+      request: sessionStartMutationRequest({ projectId: project.id, provider: "codex", preset: "high",
+        presetContract: legacyPresetContract, fast: false }),
       idempotencyKey: "00000000-0000-4000-8000-000000000625",
       providerAuthorities: [{ role: "primary", authority: providerAuthority, provenance: "session_start" }],
     });
@@ -14140,6 +13161,7 @@ describe("StateStore", () => {
         projectId: project.id,
         clientMessageId: null,
         messageDigest: null,
+        presetContract: legacyPresetContract,
         runtimeProfile: reviewedCodexProfile(profile),
       },
     });
@@ -14611,7 +13633,7 @@ describe("StateStore", () => {
       title: "Recovered Codex target",
       providerUpdatedAt: 20,
     });
-    expect(store.requireSessionPresetContract(recoveredTarget.id)).toBe(2);
+    expect(store.requireSessionPresetContract(recoveredTarget.id)).toBe(legacyPresetContract);
     expect(recoveredTarget).toMatchObject({
       profileId: codexProfile.id,
       provider: "codex",
@@ -14667,38 +13689,38 @@ describe("StateStore", () => {
         `DELETE FROM provider_runtime_account_revocations
          WHERE profile_id=? AND provider='codex' AND runtime_scope='managed'`,
       ).run(codexProfile.id);
-      inspector.exec("DROP TRIGGER mutation_effect_evidence_immutable_update");
-      inspector.exec("DROP TRIGGER session_provider_account_authority_update_guard");
       const storedEvidence = inspector.query(
         "SELECT evidence_json,evidence_digest FROM mutation_effect_evidence WHERE attempt_id=?",
       ).get(sourceSwitch.id) as { evidence_json: string; evidence_digest: string };
-      const legacyEvidence = JSON.parse(storedEvidence.evidence_json) as Record<string, unknown>;
-      delete legacyEvidence.targetProviderAccountKey;
-      const legacyEvidenceJson = JSON.stringify(legacyEvidence);
-      const legacyEvidenceDigest = createHash("sha256").update(legacyEvidenceJson).digest("hex");
-      inspector.query(
+      const alteredEvidence = JSON.parse(storedEvidence.evidence_json) as Record<string, unknown>;
+      delete alteredEvidence.targetProviderAccountKey;
+      const alteredEvidenceJson = JSON.stringify(alteredEvidence);
+      const alteredEvidenceDigest = createHash("sha256").update(alteredEvidenceJson).digest("hex");
+      withRemovedTestGuards(inspector, ["mutation_effect_evidence_immutable_update"], () => inspector.query(
         "UPDATE mutation_effect_evidence SET evidence_json=?,evidence_digest=? WHERE attempt_id=?",
-      ).run(legacyEvidenceJson, legacyEvidenceDigest, sourceSwitch.id);
+      ).run(alteredEvidenceJson, alteredEvidenceDigest, sourceSwitch.id));
+      const altered = snapshotSwitchContainmentForTest(inspector);
       expect(() => store.resolveSessionMutation({
         attemptId: sourceSwitch.id,
         expectedOriginalState: "effect_started",
-        expectedEvidenceDigest: legacyEvidenceDigest,
+        expectedEvidenceDigest: alteredEvidenceDigest,
         resolution: "proven_applied",
-        resolutionEvidence: { source: "legacy_target_read" },
-        receipt: { legacy: true },
+        resolutionEvidence: { source: "altered_target_read" },
+        receipt: { altered: true },
         provider: {
           providerThreadId: recoveredTargetThreadId,
           title: "Recovered Codex target",
           status: "idle",
           providerUpdatedAt: 20,
         },
-      })).toThrow("SESSION_PROVIDER_SWITCH_RECOVERY_BINDING_MISMATCH");
-      inspector.query(
+      })).toThrow("EFFECT_EVIDENCE_PROVENANCE_CORRUPT");
+      expect(snapshotSwitchContainmentForTest(inspector)).toEqual(altered);
+      withRemovedTestGuards(inspector, ["mutation_effect_evidence_immutable_update"], () => inspector.query(
         "UPDATE mutation_effect_evidence SET evidence_json=?,evidence_digest=? WHERE attempt_id=?",
-      ).run(storedEvidence.evidence_json, storedEvidence.evidence_digest, sourceSwitch.id);
-      inspector.query(
+      ).run(storedEvidence.evidence_json, storedEvidence.evidence_digest, sourceSwitch.id));
+      withRemovedTestGuards(inspector, ["session_provider_account_authority_update_guard"], () => inspector.query(
         "UPDATE session_provider_account_authorities SET account_key=? WHERE session_id=?",
-      ).run(`v1:codex:${"f".repeat(64)}`, personalSource.id);
+      ).run(`v1:codex:${"f".repeat(64)}`, personalSource.id));
       expect(() => store.resolveSessionMutation({
         attemptId: sourceSwitch.id,
         expectedOriginalState: "effect_started",
@@ -14713,9 +13735,9 @@ describe("StateStore", () => {
           providerUpdatedAt: 20,
         },
       })).toThrow("SESSION_PROVIDER_SWITCH_RECOVERY_BINDING_MISMATCH");
-      inspector.query(
+      withRemovedTestGuards(inspector, ["session_provider_account_authority_update_guard"], () => inspector.query(
         "UPDATE session_provider_account_authorities SET account_key=? WHERE session_id=?",
-      ).run(providerAccountKeyForProfile(store, codexProfile.id, "codex"), personalSource.id);
+      ).run(providerAccountKeyForProfile(store, codexProfile.id, "codex"), personalSource.id));
     } finally {
       inspector.close(false);
     }
@@ -14907,18 +13929,6 @@ describe("StateStore", () => {
       kind: "session.rename",
       request: { name: "possibly dispatched" },
     });
-    store.beginSessionMutationEffect({
-      attemptId: effect.id,
-      evidence: {
-        baseline: { activeTurnId: null, providerUpdatedAt: 10, status: "idle" },
-        kind: "session.rename",
-        providerThreadId: "thread-provider-deleted",
-        requestedName: "possibly dispatched",
-      },
-      profileGeneration: profile.processGeneration,
-      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
-      sessionId: session.id,
-    });
     const runtime = {
       approvalPolicy: "on-request" as const,
       computerUse: true as const,
@@ -14979,6 +13989,20 @@ describe("StateStore", () => {
       attachments: [storedAttachment],
       sessionId: session.id,
       sourceId: queued.id,
+    });
+    // Admit queued intent before a distinct provider effect becomes unsettled.
+    // New queue admission must not bypass the current mutation fence.
+    store.beginSessionMutationEffect({
+      attemptId: effect.id,
+      evidence: {
+        baseline: { activeTurnId: null, providerUpdatedAt: 10, status: "idle" },
+        kind: "session.rename",
+        providerThreadId: "thread-provider-deleted",
+        requestedName: "possibly dispatched",
+      },
+      profileGeneration: profile.processGeneration,
+      providerAuthority,
+      sessionId: session.id,
     });
     store.beginQueueEffect({
       queueId: queued.id,
@@ -15108,8 +14132,9 @@ describe("StateStore", () => {
       .toHaveLength(1);
   });
 
-  test("provider deletion abandons pending direct-message transcript and releases attachment custody", async () => {
+  test("provider deletion abandons direct-message transcript but retains custody until explicit acknowledgment", async () => {
     const { store } = await fixture();
+    const daemon = startInputFixtureDaemon(store);
     const profile = signInProfile(store, "Provider deletion send", "deleted-send@example.com");
     const session = createProvenTestSession(store, {
       fastEnabled: false,
@@ -15149,14 +14174,24 @@ describe("StateStore", () => {
     };
     const message = "possibly dispatched direct message";
     const key = "00000000-0000-4000-8000-000000000607";
-    const attempt = store.prepareMutation({
-      authorityGeneration: profile.processGeneration,
-      authorityId: session.id,
+    const input = {
+      ...daemon,
+      sessionId: session.id,
+      providerAuthority: capturedProviderAuthorityForTest(store, session.id),
       idempotencyKey: key,
-      kind: "session.send",
-      request: { message },
-    });
+      kind: "session.send" as const,
+      message,
+      attachments: [reference],
+    };
+    const reservation = store.reserveAttachmentIngress(input);
+    if (reservation.kind !== "reserved") throw new Error("Expected direct input reservation.");
+    const { attempt, custody } = store.prepareSessionInputMutation({ ...input,
+      reservation: { reservationId: reservation.reservationId, reservationDigest: reservation.reservationDigest } });
+    if (custody.kind !== "mutation_owned") throw new Error("Expected retained input custody.");
     store.beginSessionMutationEffect({
+      ...daemon,
+      attachments: [attachment],
+      custody,
       providerAuthority: capturedProviderAuthorityForTest(store, session.id),
       message,
       attemptId: attempt.id,
@@ -15200,6 +14235,27 @@ describe("StateStore", () => {
       intent: { version: 1, actor: "human", hadAttachments: true },
     });
     expect(store.hasPendingSessionUserMessageFinalization(session.id)).toBe(false);
+    expect(store.messageAttachmentManifest(session.id, attempt.id)).toEqual([reference]);
+    expect(store.attachmentCustody(attachment.digest)).toMatchObject({ referenceCount: 1 });
+    const retainedMutation = store.readMutation(key);
+    const terminalSession = store.requireSession(session.id);
+    const inspector = new Database(store.paths.database, { readonly: true, strict: true });
+    try {
+      const retained = canonicalAuthBudgetRows(inspector, [
+        "mutation_effect_evidence", "mutation_effect_evidence_provenance",
+        "mutation_effect_evidence_provenance_anchors", "mutation_resolutions", "sessions", "session_events",
+      ]);
+      expect(store.acknowledgeTerminalSessionInputCustody({
+        sessionId: session.id, expectedRevision: terminalSession.revision,
+      })).toEqual({ session: terminalSession, releasedInputCount: 1, alreadyAcknowledgedInputCount: 0 });
+      expect(retained.read()).toEqual(retained.before);
+      expect(store.readMutation(key)).toEqual(retainedMutation);
+      const acknowledged = canonicalAuthBudgetSnapshot(inspector);
+      expect(store.acknowledgeTerminalSessionInputCustody({
+        sessionId: session.id, expectedRevision: terminalSession.revision,
+      })).toEqual({ session: terminalSession, releasedInputCount: 0, alreadyAcknowledgedInputCount: 1 });
+      expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(acknowledged);
+    } finally { inspector.close(false); }
     expect(store.messageAttachmentManifest(session.id, attempt.id)).toEqual([]);
     expect(store.attachmentCustody(attachment.digest)).toMatchObject({ referenceCount: 0 });
     expect(store.listUnreferencedAttachments().some((candidate) =>
@@ -15434,6 +14490,7 @@ describe("StateStore", () => {
     const projectRoot = join(home, "bound-start-project");
     await mkdir(projectRoot);
     const project = await store.createProject("Bound start project", projectRoot, true);
+    const key = "00000000-0000-4000-8000-000000000610";
     const attempt = store.prepareMutation({
       kind: "session.start",
       authorityId: profile.id,
@@ -15445,7 +14502,7 @@ describe("StateStore", () => {
         presetContract: legacyPresetContract,
         fast: false,
       }),
-      idempotencyKey: "00000000-0000-4000-8000-000000000610",
+      idempotencyKey: key,
     });
     const session = store.beginSessionStartEffect({
       attemptId: attempt.id,
@@ -15471,7 +14528,7 @@ describe("StateStore", () => {
       manifestVersion: 1,
       manifestDigest: "b".repeat(64),
     });
-    expect(store.readMutation("00000000-0000-4000-8000-000000000610")).toMatchObject({
+    expect(store.readMutation(key)).toMatchObject({
       state: "effect_started",
       sessionStartId: session.id,
       evidence: {
@@ -15483,44 +14540,101 @@ describe("StateStore", () => {
       },
     });
 
-    // Older effect-started evidence has no additive contract field. It must
-    // remain readable and recoverable after restart; only fresh prepared
-    // replay is fenced by the request digest below.
-    const inspector = new Database(store.paths.database, { create: false, strict: true });
-    try {
-      const stored = inspector.query(
-        "SELECT evidence_json FROM mutation_effect_evidence WHERE attempt_id=?",
-      ).get(attempt.id) as { evidence_json: string };
-      const legacyEvidence = JSON.parse(stored.evidence_json) as Record<string, unknown>;
-      delete legacyEvidence.presetContract;
-      const evidenceJson = JSON.stringify(legacyEvidence);
-      inspector.exec("DROP TRIGGER mutation_effect_evidence_immutable_update");
-      inspector.query(
-        "UPDATE mutation_effect_evidence SET evidence_json=?,evidence_digest=? WHERE attempt_id=?",
-      ).run(evidenceJson, createHash("sha256").update(evidenceJson).digest("hex"), attempt.id);
-      inspector.exec(`
-        CREATE TRIGGER mutation_effect_evidence_immutable_update
-        BEFORE UPDATE ON mutation_effect_evidence
-        BEGIN SELECT RAISE(ABORT, 'mutation effect evidence is immutable'); END;
-      `);
-    } finally {
-      inspector.close(false);
-    }
+    const originalMutation = store.readMutation(key);
+    const originalCapabilities = store.requireSessionHostCapabilityBinding(session.id);
     const paths = store.paths;
     store.close();
     stores.splice(stores.indexOf(store), 1);
+    const inspector = new Database(paths.database, { create: false, strict: true });
+    try {
+      const before = snapshotSwitchContainmentForTest(inspector);
+      for (const readonly of [true, false]) {
+        const stable = new StateStore(paths, { readonly });
+        try {
+          expect(stable.readMutation(key)).toEqual(originalMutation);
+          expect(stable.requireSession(session.id)).toEqual(session);
+          expect(stable.requireSessionHostCapabilityBinding(session.id)).toEqual(originalCapabilities);
+        } finally { stable.close(); }
+        expect(snapshotSwitchContainmentForTest(inspector)).toEqual(before);
+      }
+    } finally { inspector.close(false); }
     const reopened = new StateStore(paths);
     stores.push(reopened);
-    expect(reopened.readMutation("00000000-0000-4000-8000-000000000610")).toMatchObject({
-      evidence: { evidence: { kind: "session.start", projectId: project.id } },
-      state: "effect_started",
-    });
-    expect(reopened.readMutation("00000000-0000-4000-8000-000000000610")?.evidence?.evidence)
-      .not.toHaveProperty("presetContract");
     expect(reopened.recoverEffectStartedMutations())
       .toEqual({ recovered: [attempt.id], unresolved: [] });
     expect(reopened.requireSession(session.id)).toMatchObject({ state: "recovery_required" });
     expect(reopened.requireSession(session.id).providerThreadId).toBeUndefined();
+    expect(reopened.readMutation(key)?.evidence).toEqual(originalMutation?.evidence);
+    expect(reopened.readMutation(key)?.evidence?.evidence)
+      .toMatchObject({ presetContract: legacyPresetContract });
+    expect(reopened.requireSessionHostCapabilityBinding(session.id)).toEqual(originalCapabilities);
+  });
+
+  test("refuses current session-start evidence contract deletion at readonly selection and writable startup", async () => {
+    const { store, home } = await fixture();
+    const profile = signInProfile(store, "Tampered start", "tampered-start@example.com");
+    const projectRoot = join(home, "tampered-start-project");
+    await mkdir(projectRoot);
+    const project = await store.createProject("Tampered start project", projectRoot, true);
+    const key = "00000000-0000-4000-8000-000000000611";
+    const attempt = store.prepareMutation({
+      kind: "session.start", authorityId: profile.id, authorityGeneration: profile.processGeneration,
+      request: sessionStartMutationRequest({ projectId: project.id, provider: "codex", preset: "high",
+        presetContract: legacyPresetContract, fast: false }),
+      idempotencyKey: key,
+    });
+    const session = store.beginSessionStartEffect({
+      attemptId: attempt.id, profileId: profile.id, profileGeneration: profile.processGeneration,
+      projectId: project.id, preset: "high", fastEnabled: false, provider: "codex",
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
+      evidence: { kind: "session.start", projectId: project.id, clientMessageId: null,
+        messageDigest: null, presetContract: legacyPresetContract },
+      hostCapabilities: { preambleVersion: 1, preambleDigest: "a".repeat(64),
+        manifestVersion: 1, manifestDigest: "b".repeat(64) },
+    });
+    expect(store.readMutation(key)).toMatchObject({
+      state: "effect_started", sessionStartId: session.id,
+      evidence: { evidence: { presetContract: legacyPresetContract } },
+    });
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const inspector = new Database(paths.database, { create: false, strict: true });
+    try {
+      const original = snapshotSwitchContainmentForTest(inspector);
+      const stored = z.object({ evidence_json: z.string() }).strict().parse(inspector.query(
+        "SELECT evidence_json FROM mutation_effect_evidence WHERE attempt_id=?",
+      ).get(attempt.id));
+      const alteredEvidence = z.record(z.string(), z.unknown()).parse(JSON.parse(stored.evidence_json));
+      delete alteredEvidence.presetContract;
+      const evidenceJson = JSON.stringify(alteredEvidence);
+      const evidenceDigest = createHash("sha256").update(evidenceJson).digest("hex");
+      // This is deliberately damaged current evidence, not an old-format
+      // producer row. Its independent provenance and anchor stay untouched.
+      inspector.transaction(() => withRemovedTestGuards(inspector,
+        ["mutation_effect_evidence_immutable_update"], () => {
+          inspector.query("UPDATE mutation_effect_evidence SET evidence_json=?,evidence_digest=? WHERE attempt_id=?")
+            .run(evidenceJson, evidenceDigest, attempt.id);
+        })).immediate();
+      const corrupted = snapshotSwitchContainmentForTest(inspector);
+      expect(corrupted.schema).toEqual(original.schema);
+      expect(corrupted.version).toEqual(original.version);
+      expect(corrupted.rows.filter(({ name }) => name !== "mutation_effect_evidence"))
+        .toEqual(original.rows.filter(({ name }) => name !== "mutation_effect_evidence"));
+      expect(inspector.query("SELECT evidence_json,evidence_digest FROM mutation_effect_evidence WHERE attempt_id=?")
+        .get(attempt.id)).toEqual({ evidence_json: evidenceJson, evidence_digest: evidenceDigest });
+      // Readonly startup does not sweep every generic effect. Selecting this
+      // row still refuses authority; writable startup audits it before writes.
+      const readonly = new StateStore(paths, { readonly: true });
+      try {
+        expect(snapshotSwitchContainmentForTest(inspector)).toEqual(corrupted);
+        expect(() => readonly.readMutation(key)).toThrow("EFFECT_EVIDENCE_PROVENANCE_CORRUPT");
+      } finally { readonly.close(); }
+      expect(snapshotSwitchContainmentForTest(inspector)).toEqual(corrupted);
+      expect(() => new StateStore(paths)).toThrow("EFFECT_EVIDENCE_PROVENANCE_CORRUPT");
+      expect(snapshotSwitchContainmentForTest(inspector)).toEqual(corrupted);
+    } finally { inspector.close(false); }
   });
 
   test("rejects a legacy rebound session-start digest before writing any effect state", async () => {
@@ -16234,26 +15348,11 @@ describe("StateStore", () => {
       profileId: profile.id,
       reasoningEffort: "max" as const,
     } as const;
-    const devinAuthority = store.advanceProviderAccountProcessGeneration({
-      profileId: profile.id, provider: "devin", expectedProcessGeneration: 0,
-    });
-    const devinProfile = {
-      devinVersion: "3000.6.14" as const,
-      isolatedHome: true as const,
-      model: "gpt-6-astra" as const,
-      observedAt: 2_200,
-      preset: "astra" as const,
-      processGeneration: devinAuthority.processGeneration,
-      profileId: profile.id,
-      protocolVersion: 1 as const,
-      reasoningEffort: "provider-default" as const,
-    };
-
     const start = (
       idempotencyKey: string,
-      provider: "codex" | "claude" | "devin",
-      preset: "high" | "fable-max" | "astra",
-      runtimeProfile: typeof codexProfile | typeof claudeProfile | typeof devinProfile,
+      provider: "codex" | "claude",
+      preset: "high" | "fable-max",
+      runtimeProfile: typeof codexProfile | typeof claudeProfile,
     ) => {
       const providerThreadId = `thread-${provider}`;
       const claudeProcessIdentity = provider === "claude"
@@ -16293,9 +15392,7 @@ describe("StateStore", () => {
         projectId: project.id,
         provider,
         providerAuthority: store.requireProviderAccountAuthority(profile.id, provider),
-        ...(provider === "devin" ? {} : {
-          providerAccountKey: providerAccountKeyForProfile(store, profile.id, provider),
-        }),
+        providerAccountKey: providerAccountKeyForProfile(store, profile.id, provider),
         ...(provider !== "codex"
           ? {
               providerAuthentication: {
@@ -16349,41 +15446,38 @@ describe("StateStore", () => {
 
     const codex = start("00000000-0000-4000-8000-0000000006a0", "codex", "high", codexProfile);
     const claude = start("00000000-0000-4000-8000-0000000006a1", "claude", "fable-max", claudeProfile);
-    const devin = start("00000000-0000-4000-8000-0000000006a2", "devin", "astra", devinProfile);
 
     expect(store.requireSession(codex.session.id)).toMatchObject({ preset: "high", provider: "codex" });
     expect(store.requireSession(claude.session.id))
       .toMatchObject({ preset: "fable-max", provider: "claude" });
-    expect(store.requireSession(devin.session.id))
-      .toMatchObject({ preset: "astra", provider: "devin" });
     expect(store.latestSessionRuntimeProfile(codex.session.id))
       .toMatchObject({ profile: codexProfile, sourceKind: "session_start" });
     expect(store.latestSessionRuntimeProfile(claude.session.id))
       .toMatchObject({ profile: claudeProfile, sourceKind: "session_start" });
-    expect(store.latestSessionRuntimeProfile(devin.session.id))
-      .toMatchObject({ profile: devinProfile, sourceKind: "session_start" });
     expect(store.readMutation("00000000-0000-4000-8000-0000000006a1")).toMatchObject({
       evidence: { evidence: { kind: "session.start", runtimeProfile: claudeProfile } },
       result: { effectiveRuntimeProfile: claudeProfile },
       state: "applied",
     });
 
-    // A Codex row is stored byte for byte as it was before the widening.
+    // Current supported rows retain each provider's canonical codec bytes.
+    // Genuine retired-provider history is covered by the archived39 fixtures;
+    // a current process generation must never fabricate another such row.
     const inspector = new Database(store.paths.database, { create: false, strict: true });
     try {
       const rows = inspector.query(
         "SELECT session_id,profile_json FROM session_runtime_profiles ORDER BY session_id",
       ).all() as { profile_json: string; session_id: string }[];
       const stored = new Map(rows.map((row) => [row.session_id, row.profile_json]));
-      // The widened union re-serialises a Codex document byte for byte as the
-      // Codex-only schema always did, so every row written before Claude
-      // existed still round-trips and still digests the same.
       expect(stored.get(codex.session.id))
         .toBe(JSON.stringify(effectiveRuntimeProfileSchema.parse(codexProfile)));
       expect(stored.get(claude.session.id))
         .toBe(JSON.stringify(effectiveClaudeRuntimeProfileSchema.parse(claudeProfile)));
-      expect(stored.get(devin.session.id))
-        .toBe(JSON.stringify(effectiveDevinRuntimeProfileSchema.parse(devinProfile)));
+      const beforeRetiredAdmission = snapshotSwitchContainmentForTest(inspector);
+      expect(() => store.advanceProviderAccountProcessGeneration({
+        profileId: profile.id, provider: "devin", expectedProcessGeneration: 0,
+      })).toThrow("PROVIDER_RETIRED:devin");
+      expect(snapshotSwitchContainmentForTest(inspector)).toEqual(beforeRetiredAdmission);
     } finally {
       inspector.close(false);
     }
@@ -16395,8 +15489,6 @@ describe("StateStore", () => {
       .toMatchObject({ profile: codexProfile });
     expect(reopened.latestSessionRuntimeProfile(claude.session.id))
       .toMatchObject({ profile: claudeProfile });
-    expect(reopened.latestSessionRuntimeProfile(devin.session.id))
-      .toMatchObject({ profile: devinProfile });
   });
 
   test("rejects only exact same-home provider-switch target aliases", async () => {
@@ -16520,7 +15612,7 @@ describe("StateStore", () => {
   });
 
   test.each(["current", "source_binding_changed", "target_binding_changed", "target_removed"] as const)(
-    "recovers retained generic switch evidence before generation retirement only with exact authorities: %s",
+    "quarantines a current generic switch without retiring its evidence when exact authorities remain: %s",
     async (authorityState) => {
       const { store } = await fixture();
       const source = signInProfile(store, "Legacy recovery source", "legacy-source@example.com");
@@ -16550,7 +15642,8 @@ describe("StateStore", () => {
         authorityId: session.id,
         authorityGeneration: targetAuthority.processGeneration,
         idempotencyKey: key,
-        request: { provider: "claude", preset: "fable-max" },
+        request: sessionProviderSwitchMutationRequest({ provider: "claude", preset: "fable-max",
+          targetProfileId: target.id, seedDigest: "a".repeat(64) }),
         providerAuthorities: [
           { role: "source", authority: sourceAuthority, provenance: "legacy_switch_source" },
           { role: "target", authority: targetAuthority, provenance: "legacy_switch_target" },
@@ -16585,6 +15678,7 @@ describe("StateStore", () => {
           targetProcessGeneration: targetAuthority.processGeneration,
           targetProfileId: target.id,
           targetProvider: "claude",
+          targetHostCapabilities: testSwitchHostCapabilities,
           targetProviderAccountKey: testProviderAccountKey("claude"),
           transcriptDigest: "b".repeat(64),
         },
@@ -16611,13 +15705,13 @@ describe("StateStore", () => {
       // Do not retire daemon generations first: that separately quarantines
       // Claude effects and would hide a broken generic evidence reader.
       expect(store.recoverEffectStartedMutations()).toEqual(authorityState === "current"
-        ? { recovered: [attempt.id], unresolved: [] }
+        ? { recovered: [], unresolved: [] }
         : {
             recovered: [],
             unresolved: [{ id: attempt.id, kind: "session.switch", authorityId: session.id }],
           });
       expect(store.readMutation(key)).toMatchObject({
-        state: authorityState === "current" ? "ambiguous" : "effect_started",
+        state: "effect_started",
         evidence: original?.evidence,
       });
       expect(store.requireSession(session.id).state)
@@ -16648,18 +15742,19 @@ describe("StateStore", () => {
       });
       const runtimeProfile = reviewedClaudeProfile({ id: target.id, processGeneration: targetAuthority.processGeneration });
       const key = "00000000-0000-4000-8000-0000000006e0";
+      const seedText = "Continue the retained switch.";
+      const seedDigest = createHash("sha256").update("hra:session-transcript-seed:v1\0")
+        .update(seedText).digest("hex");
       const attempt = store.prepareMutation({
         kind: "session.switch", authorityId: session.id,
         authorityGeneration: targetAuthority.processGeneration,
-        idempotencyKey: key, request: { provider: "claude", preset: "fable-max" },
+        idempotencyKey: key, request: sessionProviderSwitchMutationRequest({ provider: "claude",
+          preset: "fable-max", targetProfileId: target.id, seedDigest }),
         providerAuthorities: [
           { role: "source", authority: sourceAuthority, provenance: "legacy_switch_source" },
           { role: "target", authority: targetAuthority, provenance: "legacy_switch_target" },
         ],
       });
-      const seedText = "Continue the retained switch.";
-      const seedDigest = createHash("sha256").update("hra:session-transcript-seed:v1\0")
-        .update(seedText).digest("hex");
       store.beginSessionProviderSwitchEffect({
         attemptId: attempt.id, sessionId: session.id,
         providerAuthentication: {
@@ -16675,6 +15770,7 @@ describe("StateStore", () => {
           sourceProviderThreadId: "retained-source-thread", targetPreset: "fable-max",
           targetProcessGeneration: targetAuthority.processGeneration,
           targetProfileId: target.id, targetProvider: "claude",
+          targetHostCapabilities: testSwitchHostCapabilities,
           targetProviderAccountKey: testProviderAccountKey("claude"), transcriptDigest: "b".repeat(64),
         },
       });
@@ -16885,6 +15981,17 @@ describe("StateStore", () => {
       providerAuthentication: {
         profileId: claudeAccount.id,
         processGeneration: claudeAccount.processGeneration,
+        provider: "claude",
+        signedIn: true,
+      },
+      evidence: immutableSwitchEvidence,
+    })).toThrow("SESSION_PROVIDER_SWITCH_AUTHENTICATION_MISMATCH");
+    expect(() => store.beginSessionProviderSwitchEffect({
+      attemptId: switchAttempt.id,
+      sessionId: started.id,
+      providerAuthentication: {
+        profileId: claudeAccount.id,
+        processGeneration: claudeAuthority.processGeneration,
         provider: "claude",
         signedIn: true,
       },
@@ -17178,7 +16285,7 @@ describe("StateStore", () => {
     expect(store.requireSession(started.id).providerThreadId).toBe("claude-thread");
   });
 
-  test("rejects provider-switch completion after target generation changes without rebinding", async () => {
+  test("rejects provider-switch completion after the captured target profile generation changes without rebinding", async () => {
     const scenarios: readonly ("signed_out" | "new_generation")[] = ["new_generation"];
     for (const scenario of scenarios) {
       const { store } = await fixture();
@@ -17204,14 +16311,36 @@ describe("StateStore", () => {
       const idempotencyKey = scenario === "signed_out"
         ? "00000000-0000-4000-8000-0000000006b3"
         : "00000000-0000-4000-8000-0000000006b4";
+      const sourceAuthority = capturedProviderAuthorityForTest(store, session.id);
+      const runtimeProfile = reviewedClaudeProfile({ id: targetAccount.id,
+        processGeneration: targetAuthority.processGeneration });
+      const seedText = "Keep the captured target profile generation fenced.";
+      const seedDigest = createHash("sha256").update("hra:session-transcript-seed:v1\0")
+        .update(seedText).digest("hex");
       const attempt = store.prepareMutation({
-        authorityGeneration: targetAccount.processGeneration,
+        authorityGeneration: targetAuthority.processGeneration,
         authorityId: session.id,
         idempotencyKey,
         kind: "session.switch",
-        request: { preset: "fable-max", provider: "claude" },
+        request: sessionProviderSwitchMutationRequest({ preset: "fable-max", provider: "claude",
+          targetProfileId: targetAccount.id, seedDigest }),
+        providerAuthorities: [
+          { role: "source", authority: sourceAuthority, provenance: "session_switch_source" },
+          { role: "target", authority: targetAuthority, provenance: "session_switch_target" },
+        ],
       });
-      expect(store.transitionMutation(attempt.id, "prepared", "effect_started")).toBe(true);
+      store.beginSessionProviderSwitchEffect({ attemptId: attempt.id, sessionId: session.id,
+        providerAuthentication: { profileId: targetAccount.id, provider: "claude", signedIn: true,
+          processGeneration: targetAuthority.processGeneration },
+        evidence: { kind: "session.switch", daemonGeneration: 0, requestedAccountId: targetAccount.id,
+          requestedPreset: "fable-max", runtimeProfile, seedDigest, seedIncludedRecords: 1, seedOmittedRecords: 0,
+          sourcePreset: "high", sourceProcessGeneration: sourceAuthority.processGeneration,
+          sourceProfileId: sourceAccount.id, sourceProvider: "codex", sourceProviderThreadId: `source-thread-${scenario}`,
+          targetPreset: "fable-max", targetProcessGeneration: targetAuthority.processGeneration,
+          targetProfileId: targetAccount.id, targetProvider: "claude",
+          targetProviderAccountKey: testProviderAccountKey("claude"), targetHostCapabilities: testSwitchHostCapabilities,
+          transcriptDigest: "7".repeat(64) },
+      });
       const processIdentity = {
         pid: scenario === "signed_out" ? 42_104 : 42_105,
         pidDomain: "darwin" as const,
@@ -17220,6 +16349,15 @@ describe("StateStore", () => {
           : "Fri Sep  4 12:01:04 2026",
       };
       const providerThreadId = `target-thread-${scenario}`;
+      const targetInput = { attemptId: attempt.id, sessionId: session.id, providerThreadId };
+      store.recordSessionProviderSwitchTarget(targetInput);
+      store.recordSessionProviderSwitchSeedIntent({ ...targetInput, runtimeProfile, seedText });
+      store.recordSessionProviderSwitchSeedResult({ ...targetInput, runtimeProfile,
+        turnId: "unused-target-drift-turn", turnStatus: "completed" });
+      store.recordSessionProviderSwitchSourceReleased({ attemptId: attempt.id, sessionId: session.id });
+      store.recordClaimedClaudeProcessAuthority({ profileId: targetAccount.id,
+        profileGeneration: targetAccount.processGeneration, providerAuthority: targetAuthority,
+        sessionId: session.id, providerThreadId, runtimeScope: "managed", identity: processIdentity });
 
       if (scenario === "signed_out") {
         expect(store.setProfileState(
@@ -17232,21 +16370,11 @@ describe("StateStore", () => {
           processGeneration: targetAccount.processGeneration,
         });
       } else {
-        // Normal generation advancement now rejects unresolved switch authority
-        // unless the daemon records an explicit successor binding. Mutate the
-        // fixture directly to exercise completion's independent stale-target
-        // guard for a database that lacks that rebind evidence.
-        const direct = new Database(store.paths.database, { create: false, strict: true });
-        try {
-          expect(direct.query(
-            `UPDATE profiles SET process_generation=process_generation+1
-             WHERE id=? AND process_generation=? RETURNING id,process_generation`,
-          ).get(targetAccount.id, targetAccount.processGeneration)).toEqual({
-            id: targetAccount.id, process_generation: targetAccount.processGeneration + 1,
-          });
-        } finally {
-          direct.close(false);
-        }
+        // The independent Codex/profile counter can advance normally. It is
+        // not a fabricated Claude process successor; completion still owns
+        // the separate captured target-profile CAS supplied below.
+        store.nextProfileGeneration(targetAccount.id);
+        expect(store.requireProviderAccountAuthority(targetAccount.id, "claude")).toEqual(targetAuthority);
         expect(store.requireProfileById(targetAccount.id)).toMatchObject({
           state: "signed_in",
           processGeneration: targetAccount.processGeneration + 1,
@@ -17255,7 +16383,7 @@ describe("StateStore", () => {
       const beforeSession = store.requireSession(session.id);
       const beforeMutation = store.readMutation(idempotencyKey);
       expect(beforeMutation).toMatchObject({
-        authorityGeneration: targetAccount.processGeneration,
+        authorityGeneration: targetAuthority.processGeneration,
         authorityId: session.id,
         state: "effect_started",
       });
@@ -17272,7 +16400,7 @@ describe("StateStore", () => {
         receipt: { providerThreadId, sessionId: session.id, toProvider: "claude" },
         providerAccountKey: testProviderAccountKey("claude"),
         hostCapabilities: testSwitchHostCapabilities,
-        runtimeProfile: reviewedClaudeProfile({ id: targetAccount.id, processGeneration: targetAuthority.processGeneration }),
+        runtimeProfile,
         claudeProcessIdentity: processIdentity,
         seedTurnId: "unused-target-drift-turn",
         sessionId: session.id,
@@ -17709,7 +16837,7 @@ describe("StateStore", () => {
     expect(store.requireSession(session.id)).toEqual(session);
   });
 
-  test("fences provider-switch seed reviews to the exact historical preset contract", async () => {
+  test("fences current provider-switch seed reviews and refuses sealed runtime tampering", async () => {
     const { store } = await fixture();
     const sourceProfile = signInProfile(store, "Seed source", "seed-source@example.com");
     const targetProfile = signInProfile(store, "Seed target", "seed-target@example.com");
@@ -17821,53 +16949,45 @@ describe("StateStore", () => {
     expect(store.readSessionProviderSwitchProgress(current.attempt.id).seed?.runtimeProfile.model)
       .toBe("gpt-5.6-sol");
 
-    const legacy = stageSwitch("6b3", "Resume the established Astra target.");
+    const tampered = stageSwitch("6b3", "Keep the second admitted Sol target unchanged.");
     const inspector = new Database(store.paths.database, { create: false, strict: true });
     try {
-      // Simulate immutable contract-2 switch evidence left after the provider
-      // target was created but before its seed began.
+      // Deliberate current-row corruption is not historical contract-2 proof.
+      // Authentic canonical39 fixtures separately retain the old runtime bytes.
+      const before = snapshotSwitchContainmentForTest(inspector);
       const stored = inspector.query(
         "SELECT evidence_json FROM mutation_effect_evidence WHERE attempt_id=?",
-      ).get(legacy.attempt.id) as { evidence_json: string };
-      const legacyEvidence = JSON.parse(stored.evidence_json) as {
+      ).get(tampered.attempt.id) as { evidence_json: string };
+      const alteredEvidence = JSON.parse(stored.evidence_json) as {
         runtimeProfile: { model: string };
       };
-      legacyEvidence.runtimeProfile.model = "gpt-6-astra";
-      const legacyEvidenceJson = JSON.stringify(legacyEvidence);
-      inspector.exec("DROP TRIGGER mutation_effect_evidence_immutable_update");
-      inspector.query(
+      alteredEvidence.runtimeProfile.model = "gpt-6-astra";
+      const alteredEvidenceJson = JSON.stringify(alteredEvidence);
+      withRemovedTestGuards(inspector, ["mutation_effect_evidence_immutable_update"], () => inspector.query(
         `UPDATE mutation_effect_evidence SET evidence_json=?,evidence_digest=?
          WHERE attempt_id=?`,
       ).run(
-        legacyEvidenceJson,
-        createHash("sha256").update(legacyEvidenceJson).digest("hex"),
-        legacy.attempt.id,
-      );
-      inspector.exec(`
-        CREATE TRIGGER mutation_effect_evidence_immutable_update
-        BEFORE UPDATE ON mutation_effect_evidence
-        BEGIN SELECT RAISE(ABORT, 'mutation effect evidence is immutable'); END;
-      `);
+        alteredEvidenceJson,
+        createHash("sha256").update(alteredEvidenceJson).digest("hex"),
+        tampered.attempt.id,
+      ));
+      const corrupted = snapshotSwitchContainmentForTest(inspector);
+      expect(corrupted.schema).toEqual(before.schema);
+      expect(corrupted.rows.filter(({ name }) => name !== "mutation_effect_evidence"))
+        .toEqual(before.rows.filter(({ name }) => name !== "mutation_effect_evidence"));
+      expect(() => store.readMutation("00000000-0000-4000-8000-0000000006b3"))
+        .toThrow("EFFECT_EVIDENCE_PROVENANCE_CORRUPT");
+      expect(() => store.recordSessionProviderSwitchSeedIntent({
+        attemptId: tampered.attempt.id,
+        providerThreadId: "target-6b3",
+        runtimeProfile: astraProfile,
+        seedText: tampered.seedText,
+        sessionId: tampered.session.id,
+      })).toThrow("EFFECT_EVIDENCE_PROVENANCE_CORRUPT");
+      expect(snapshotSwitchContainmentForTest(inspector)).toEqual(corrupted);
     } finally {
       inspector.close(false);
     }
-    expect(store.readMutation("00000000-0000-4000-8000-0000000006b3"))
-      .toMatchObject({ evidence: { evidence: { runtimeProfile: { model: "gpt-6-astra" } } } });
-    expect(store.isSessionMutationProviderAuthorityCurrent({
-      attemptId: legacy.attempt.id,
-      originGeneration: targetProfile.processGeneration,
-      profileId: targetProfile.id,
-      provider: "codex",
-    })).toBe(true);
-    expect(() => store.recordSessionProviderSwitchSeedIntent({
-      attemptId: legacy.attempt.id,
-      providerThreadId: "target-6b3",
-      runtimeProfile: astraProfile,
-      seedText: legacy.seedText,
-      sessionId: legacy.session.id,
-    })).not.toThrow();
-    expect(store.readSessionProviderSwitchProgress(legacy.attempt.id).seed?.runtimeProfile.model)
-      .toBe("gpt-6-astra");
   });
 
   test("refuses to redispatch an authentic historical Devin switch without mutating its readable history", async () => {
@@ -17891,7 +17011,7 @@ describe("StateStore", () => {
     ["source", "digest"], ["target", "binding"],
     ["source", "runtime_profile"], ["target", "runtime_profile"],
   ] as const)(
-    "handles authentic retired Devin %s switch shutdown with %s evidence without reviving authority",
+    "preserves retired Devin %s switch quarantine and refuses current %s evidence tampering",
     async (side, variant) => {
       const kind = side === "source" ? "source_switch" : "target_switch";
       const paths = await canonical39RetiredArchive(kind);
@@ -17910,28 +17030,33 @@ describe("StateStore", () => {
       const database = new Database(paths.database, { create: false, strict: true });
       try {
         // Deliberate damage is applied only after the authentic source has been
-        // admitted; it never manufactures an old effect or its source format.
+        // admitted and sealed. It is current corruption, not another old format.
         const schemaBefore = database.query("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name").all();
-        if (variant !== "valid") withRemovedTestGuards(database, ["mutation_effect_evidence_immutable_update"], () => {
-          database.query("UPDATE mutation_effect_evidence SET evidence_json=?,evidence_digest=? WHERE attempt_id=?")
+        if (variant !== "valid") {
+          const intact = snapshotSwitchContainmentForTest(database);
+          const corrupt = () => database.query("UPDATE mutation_effect_evidence SET evidence_json=?,evidence_digest=? WHERE attempt_id=?")
             .run(evidenceJson, variant === "digest" ? "f".repeat(64) : testDigest(evidenceJson), attemptId);
-        });
+          expect(corrupt).toThrow("mutation effect evidence is immutable");
+          expect(snapshotSwitchContainmentForTest(database)).toEqual(intact);
+          withRemovedTestGuards(database, ["mutation_effect_evidence_immutable_update"], corrupt);
+        }
         expect(database.query("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name").all()).toEqual(schemaBefore);
         const before = database.query("SELECT * FROM mutation_effect_evidence WHERE attempt_id=?").get(attemptId);
         if (variant !== "valid") {
-          expect(store.recoverEffectStartedMutations()).toEqual({ recovered: [],
-            unresolved: [{ id: attemptId, kind: "session.switch", authorityId: session.id }] });
-          expect(store.requireSession(session.id)).toEqual(session);
-          expect(database.query("SELECT state FROM mutation_attempts WHERE id=?").get(attemptId))
-            .toEqual({ state: "effect_started" });
-          expect(database.query("SELECT * FROM mutation_effect_evidence WHERE attempt_id=?").get(attemptId)).toEqual(before);
+          const corrupted = snapshotSwitchContainmentForTest(database);
+          // The sealed original, not a rehashed mutable document, determines
+          // admissible history. Both selected reads and writable open refuse.
+          expect(() => store.readMutation(source.idempotencyKey)).toThrow("EFFECT_EVIDENCE_PROVENANCE_CORRUPT");
+          expect(() => new StateStore(paths)).toThrow("EFFECT_EVIDENCE_PROVENANCE_CORRUPT");
+          expect(snapshotSwitchContainmentForTest(database)).toEqual(corrupted);
           return;
         }
         const devinAuthority = store.requireProviderAccountAuthority(profile.id, "devin");
         for (const boot of ["a", "b"] as const) {
           expect(() => store.nextDaemonGeneration("boot_" + boot.repeat(32))).not.toThrow();
           expect(store.recoverEffectStartedMutations()).toEqual({
-            recovered: boot === "a" ? [attemptId] : [], unresolved: [],
+            // The unproved Codex source was already contained by migration.
+            recovered: boot === "a" && side === "source" ? [attemptId] : [], unresolved: [],
           });
           expect(store.requireSession(session.id).state).toBe("recovery_required");
           expect(store.readMutation(source.idempotencyKey)?.state).toBe("ambiguous");
@@ -17939,13 +17064,12 @@ describe("StateStore", () => {
           expect(store.isSessionMutationProviderAuthorityCurrent({ attemptId,
             profileId: profile.id, provider: "devin", originGeneration: source.profile.processGeneration })).toBe(false);
           expect(store.isSessionMutationProviderAuthorityCurrent({ attemptId,
-            profileId: profile.id, provider: "codex", originGeneration: source.profile.processGeneration })).toBe(true);
+            profileId: profile.id, provider: "codex", originGeneration: source.profile.processGeneration })).toBe(false);
+          expect(store.readMutation(source.idempotencyKey)?.result).toEqual(side === "source"
+            ? { code: "LEGACY_PROVIDER_AUTHORITY_QUARANTINED" } : undefined);
         }
         expect(database.query("SELECT provider,from_generation,to_generation FROM session_mutation_authority_rebinds_v39 WHERE attempt_id=? ORDER BY from_generation").all(attemptId))
-          .toEqual([
-            { provider: "codex", from_generation: profile.processGeneration, to_generation: profile.processGeneration + 1 },
-            { provider: "codex", from_generation: profile.processGeneration + 1, to_generation: profile.processGeneration + 2 },
-          ]);
+          .toEqual([]);
         expect(database.query("SELECT * FROM mutation_effect_evidence WHERE attempt_id=?").get(attemptId)).toEqual(before);
         expect(JSON.stringify(store.readMutation(source.idempotencyKey)?.evidence?.evidence)).toBe(evidenceJson);
       } finally { database.close(false); }
@@ -17953,7 +17077,7 @@ describe("StateStore", () => {
   );
 
   test.each(["valid", "digest", "binding", "runtime_profile"] as const)(
-    "quarantines authentic retired Devin dispatch after daemon generation advance only with %s evidence",
+    "quarantines authentic retired Devin dispatch and refuses current %s evidence tampering",
     async (variant) => {
       const paths = await canonical39RetiredArchive("queue_dispatch");
       const source = canonical39RetiredFixtures.queue_dispatch.retained;
@@ -17970,35 +17094,39 @@ describe("StateStore", () => {
       const database = new Database(paths.database, { create: false, strict: true });
       try {
         const schemaBefore = database.query("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name").all();
-        if (variant !== "valid") withRemovedTestGuards(database, ["queue_effect_evidence_immutable_update"], () => {
-          database.query("UPDATE queue_effect_evidence SET evidence_json=?,evidence_digest=? WHERE queue_id=?")
+        if (variant !== "valid") {
+          const intact = snapshotSwitchContainmentForTest(database);
+          const corrupt = () => database.query("UPDATE queue_effect_evidence SET evidence_json=?,evidence_digest=? WHERE queue_id=?")
             .run(evidenceJson, variant === "digest" ? "f".repeat(64) : testDigest(evidenceJson), queue.id);
-        });
+          expect(corrupt).toThrow("queue effect evidence is immutable");
+          expect(snapshotSwitchContainmentForTest(database)).toEqual(intact);
+          withRemovedTestGuards(database, ["queue_effect_evidence_immutable_update"], corrupt);
+        }
         expect(database.query("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name").all()).toEqual(schemaBefore);
         const before = database.query("SELECT * FROM queue_effect_evidence WHERE queue_id=?").get(queue.id);
+        if (variant !== "valid") {
+          const corrupted = snapshotSwitchContainmentForTest(database);
+          expect(() => store.readQueueEffect(queue.id)).toThrow("EFFECT_EVIDENCE_PROVENANCE_CORRUPT");
+          expect(() => store.recoverDispatchingQueueEffects()).toThrow("EFFECT_EVIDENCE_PROVENANCE_CORRUPT");
+          expect(() => new StateStore(paths)).toThrow("EFFECT_EVIDENCE_PROVENANCE_CORRUPT");
+          expect(snapshotSwitchContainmentForTest(database)).toEqual(corrupted);
+          return;
+        }
         const devinAuthority = store.requireProviderAccountAuthority(source.profile.id, "devin");
         store.nextDaemonGeneration("boot_" + "c".repeat(32));
         expect(store.requireProviderAccountAuthority(source.profile.id, "devin")).toEqual(devinAuthority);
-        const beforeSession = store.requireSession(session.id);
-        if (variant === "digest") {
-          expect(() => store.recoverDispatchingQueueEffects()).toThrow("QUEUE_EFFECT_EVIDENCE_MISMATCH");
-        } else {
-          expect(store.recoverDispatchingQueueEffects()).toEqual(variant === "valid"
-            ? { recovered: [queue.id], unresolved: [] } : { recovered: [], unresolved: [queue.id] });
-        }
-        expect(store.requireQueue(queue.id).state).toBe(variant === "valid" ? "ambiguous" : "dispatching");
+        expect(store.recoverDispatchingQueueEffects()).toEqual({ recovered: [queue.id], unresolved: [] });
+        expect(store.requireQueue(queue.id).state).toBe("ambiguous");
         expect(store.requireQueue(queue.id).message).toBe(queue.message);
-        if (variant === "valid") {
-          expect(store.requireSession(session.id).state).toBe("recovery_required");
-          expect(store.recoverDispatchingQueueEffects()).toEqual({ recovered: [], unresolved: [] });
-          expect(store.sessionAccountAuthorityMatches(session.id, source.profile.id)).toBe(false);
-        } else expect(store.requireSession(session.id)).toEqual(beforeSession);
+        expect(store.requireSession(session.id).state).toBe("recovery_required");
+        expect(store.recoverDispatchingQueueEffects()).toEqual({ recovered: [], unresolved: [] });
+        expect(store.sessionAccountAuthorityMatches(session.id, source.profile.id)).toBe(false);
         expect(database.query("SELECT * FROM queue_effect_evidence WHERE queue_id=?").get(queue.id)).toEqual(before);
       } finally { database.close(false); }
     },
   );
 
-  test("keeps authentic legacy Devin status recovery inert except explicit local abandonment", async () => {
+  test("refuses generic abandonment of authentic Devin history with unproved pending queue identity without writes", async () => {
     const paths = await canonical39RetiredArchive("mixed_history");
     const source = canonical39RetiredFixtures.mixed_history.retained;
     const store = new StateStore(paths);
@@ -18006,17 +17134,41 @@ describe("StateStore", () => {
     const bound = store.requireSession(source.session.id);
     const queue = store.requireQueue(source.queue.id);
     const recovery = store.quarantineSession(bound.id);
+    const database = new Database(paths.database, { readonly: true, strict: true });
+    try {
+    const before = snapshotSwitchContainmentForTest(database);
     expect(() => store.resolveSessionStatusRecovery({ sessionId: recovery.id,
       expectedRevision: recovery.revision, resolution: "provider_state_reconciled",
       provider: { providerThreadId: source.session.providerThreadId, title: "Must not restore", status: "idle" },
     })).toThrow("PROVIDER_RETIRED:devin");
     expect(store.requireSession(recovery.id)).toEqual(recovery);
     expect(store.requireQueue(queue.id).state).toBe("pending");
+    // The archived enqueue predates immutable attachment identity. Generic
+    // status recovery cannot bypass its separate abandonment receipt guard.
+    expect(() => store.resolveSessionStatusRecovery({ sessionId: recovery.id,
+      expectedRevision: recovery.revision, resolution: "abandoned" }))
+      .toThrow("QUEUE_ATTACHMENT_IDENTITY_UNPROVED");
+    expect(snapshotSwitchContainmentForTest(database)).toEqual(before);
+    expect(store.latestSessionRuntimeProfile(bound.id)).toEqual(source.runtime);
+    } finally { database.close(false); }
+  });
+
+  test("allows storage-only abandonment of authentic idle Devin history without pending queue debt", async () => {
+    const paths = await canonical39DevinArchive();
+    const source = canonical39DevinFixture.cases.find((entry) => entry.generation === 0);
+    if (source === undefined) throw new Error("Expected archived generation-zero Devin session.");
+    const store = new StateStore(paths);
+    stores.push(store);
+    const runtime = store.latestSessionRuntimeProfile(source.session.id);
+    const login = store.readMutation(source.idempotencyKey);
+    const authority = store.requireCapturedSessionProviderAuthority(source.session.id);
+    const recovery = store.quarantineSession(source.session.id);
     expect(store.resolveSessionStatusRecovery({ sessionId: recovery.id,
       expectedRevision: recovery.revision, resolution: "abandoned" }))
       .toMatchObject({ provider: "devin", state: "terminal" });
-    expect(store.requireQueue(queue.id).state).toBe("cancelled");
-    expect(store.latestSessionRuntimeProfile(bound.id)).toEqual(source.runtime);
+    expect(store.latestSessionRuntimeProfile(source.session.id)).toEqual(runtime);
+    expect(store.readMutation(source.idempotencyKey)).toEqual(login);
+    expect(store.requireCapturedSessionProviderAuthority(source.session.id)).toEqual(authority);
   });
 
   test("includes authentic retired local history only through an explicit read-only authority-filter opt-in", async () => {
@@ -18049,7 +17201,13 @@ describe("StateStore", () => {
     expect(store.listLocalSessionPage({ ...input, includeRetiredHistory: true }).sessions).toEqual([devin]);
     expect(store.sessionAccountAuthorityMatches(codex.id, account.id)).toBe(false);
     expect(store.sessionAccountAuthorityMatches(devin.id, account.id)).toBe(false);
-    expect(() => store.enqueue(devin.id, "history is not executable")).toThrow("PROVIDER_RETIRED:devin");
+    const database = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      const before = snapshotSwitchContainmentForTest(database);
+      // This history fails its existing authority precheck before provider admission.
+      expect(() => store.enqueue(devin.id, "history is not executable")).toThrow("MUTATION_EFFECT_AUTHORITY_CHANGED");
+      expect(snapshotSwitchContainmentForTest(database)).toEqual(before);
+    } finally { database.close(false); }
   });
 
   test("keeps authentic mixed v39 history readable while rejecting new retired-provider effects", async () => {
@@ -18067,6 +17225,12 @@ describe("StateStore", () => {
     const queue = store.requireQueue(source.queue.id);
     const mutation = store.readMutation(source.idempotencyKey);
     if (mutation === null) throw new Error("Expected archived prepared send.");
+    const snapshot = () => {
+      const database = new Database(paths.database, { readonly: true, strict: true });
+      try { return snapshotSwitchContainmentForTest(database); }
+      finally { database.close(false); }
+    };
+    const beforeAdmission = snapshot();
     expect(store.sessionAccountAuthorityMatches(devin.id, account.id)).toBe(false);
     expect(store.listLocalSessionPage({ profileId: account.id, after: null, limit: 10,
       requireCurrentAccountAuthority: true }).sessions).not.toContainEqual(devin);
@@ -18080,7 +17244,7 @@ describe("StateStore", () => {
       providerThreadId: "rejected-import", title: "Rejected import", preset: "astra",
       fastEnabled: false, state: "idle" })).toThrow("PROVIDER_RETIRED:devin");
     expect(() => store.setDefaultPreset("astra")).toThrow();
-    expect(() => store.enqueue(devin.id, "rejected")).toThrow("PROVIDER_RETIRED:devin");
+    expect(() => store.enqueue(devin.id, "rejected")).toThrow("MUTATION_EFFECT_AUTHORITY_CHANGED");
     expect(() => store.updateSessionMetadata({ sessionId: devin.id, expectedRevision: devin.revision, preset: "astra" }))
       .toThrow("PROVIDER_RETIRED:devin");
     expect(() => store.beginSessionMutationEffect({
@@ -18099,7 +17263,9 @@ describe("StateStore", () => {
         providerThreadId: source.session.providerThreadId, profileGeneration: source.profile.processGeneration,
         baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
         clientMessageId: queue.id, messageDigest: testDigest(queue.message), runtimeProfile },
-    })).toThrow("PROVIDER_RETIRED:devin");
+    // The immutable attachment-identity precheck precedes provider admission.
+    })).toThrow("QUEUE_ATTACHMENT_IDENTITY_UNPROVED");
+    expect(snapshot()).toEqual(beforeAdmission);
     expect(store.readMutation(source.idempotencyKey)).toEqual(mutation);
     expect(store.requireQueue(queue.id)).toMatchObject({ state: "pending", message: "legacy pending send" });
     const inspect = () => {
@@ -18335,7 +17501,7 @@ describe("StateStore", () => {
   // Each independent store gets the unchanged per-test budget and cleanup.
   for (const kind of ["session.stop", "session.rename"] as const) {
     for (const baselineTime of [null, 10, 10.5, Number.MAX_SAFE_INTEGER + 1]) {
-      test(`requires unit-marked safe baseline timestamps without rewriting legacy evidence: ${kind}, ${String(baselineTime)}`, async () => {
+      test(`requires unit-marked safe baseline timestamps without rewriting admitted unitless evidence: ${kind}, ${String(baselineTime)}`, async () => {
         const { store } = await fixture();
         const profile = signInProfile(store, "Legacy timestamp", "legacy-timestamp@example.com");
         const local = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
@@ -18361,11 +17527,13 @@ describe("StateStore", () => {
         const inspector = new Database(store.paths.database, { create: false, strict: true });
         try {
           const bytes = inspector.query("SELECT evidence_json,evidence_digest FROM mutation_effect_evidence WHERE attempt_id=?").get(attempt.id);
+          const beforeRefusal = snapshotSwitchContainmentForTest(inspector);
           expect(() => store.resolveSessionMutation({ attemptId: attempt.id, expectedOriginalState: "ambiguous", expectedEvidenceDigest: original.digest,
             resolution: "proven_applied", resolutionEvidence: proof, receipt,
             provider: { providerThreadId: evidence.providerThreadId, title: "Resolved", status: "idle", providerUpdatedAt: 10_000 } })).toThrow("MUTATION_RECOVERY_TIMESTAMP_PROOF_INVALID");
           expect(() => inspector.query("INSERT INTO mutation_resolutions(attempt_id,resolution_kind,evidence_json,receipt_json,created_at) VALUES (?,'proven_applied',?,?,1000)")
-            .run(attempt.id, JSON.stringify(proof), JSON.stringify(receipt))).toThrow("MUTATION_RECOVERY_TIMESTAMP_PROOF_INVALID");
+            .run(attempt.id, JSON.stringify(proof), JSON.stringify(receipt))).toThrow("JOINED_EVIDENCE_BOUNDARY_REFUSED");
+          expect(snapshotSwitchContainmentForTest(inspector)).toEqual(beforeRefusal);
           expect(store.readMutation(key)?.evidence).toEqual(original);
           expect(inspector.query("SELECT evidence_json,evidence_digest FROM mutation_effect_evidence WHERE attempt_id=?").get(attempt.id)).toEqual(bytes);
           store.resolveSessionMutation({ attemptId: attempt.id, expectedOriginalState: "ambiguous", expectedEvidenceDigest: original.digest,
@@ -18377,66 +17545,55 @@ describe("StateStore", () => {
     }
   }
 
-  test("migrates schema 40 through autorespond v44 while preserving legacy bytes and digests", async () => {
-    const { store } = await fixture();
-    const profile = signInProfile(store, "Historical proof", "historical-proof@example.com");
-    const local = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
-    const session = store.bindSession({ sessionId: local.id, expectedRevision: local.revision, providerThreadId: "thread-historical", state: "idle" });
-    const key = crypto.randomUUID();
-    const attempt = store.prepareMutation({ kind: "session.rename", authorityId: session.id, authorityGeneration: profile.processGeneration, request: {}, idempotencyKey: key });
-    const original = store.beginSessionMutationEffect({
-      providerAuthority: capturedProviderAuthorityForTest(store, session.id), attemptId: attempt.id, sessionId: session.id, profileGeneration: profile.processGeneration,
-      evidence: { kind: "session.rename", providerThreadId: "thread-historical", baseline: { providerUpdatedAt: 10, status: "idle", activeTurnId: null }, requestedName: "Historical" } });
-    store.transitionMutation(attempt.id, "effect_started", "ambiguous");
-    const inspector = new Database(store.paths.database, { create: false, strict: true });
+  test("migrates an authentic schema 40 unmarked resolution while preserving legacy bytes and digests", async () => {
+    const paths = await canonical20To40Archive("canonical40-unmarked-resolution");
+    const capture = canonical20To40Fixture.captures["canonical40-unmarked-resolution"];
+    const source = capture.retained;
+    const inspector = new Database(paths.database, { create: false, strict: true });
     const resolutionBytes = '{"source":"thread/read","providerUpdatedAt":10000}';
     try {
-      // Emulate a resolution committed before the timestamp and active-Work
-      // migrations existed, using the exact released v40 authority surface.
-      downgradeToExactProviderVersion40(inspector);
-      expect(() => new StateStore(store.paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:40:60");
-      inspector.query("INSERT INTO mutation_resolutions(attempt_id,resolution_kind,evidence_json,receipt_json,created_at) VALUES (?,'proven_applied',?,?,1000)").run(attempt.id, resolutionBytes, JSON.stringify({ renamed: true }));
-      const before = inspector.query("SELECT evidence_json,evidence_digest FROM mutation_effect_evidence WHERE attempt_id=?").get(attempt.id);
-      const stableSchemaBefore = inspector.query(
-        `SELECT type,name,tbl_name,sql FROM sqlite_master
-         WHERE name NOT LIKE '%autorespond_budget%'
-         AND name NOT LIKE '%autorespond_after_hours%' AND name NOT IN (
-           'mutation_resolutions_timestamp_proof_insert',
-           'work_devin_preset_contract_guard',
-           'work_session_devin_contract_guard',
-           'queue_entries'
-         )
-         AND tbl_name!='account_mutation_authority_rebinds'
-         ORDER BY type,name`,
-      ).all();
-      const ledgerBefore = inspector.query("SELECT * FROM migrations ORDER BY version").all();
-      const reopened = new StateStore(store.paths);
-      stores.push(reopened);
-      const stableSchemaAfter = inspector.query(
-        `SELECT type,name,tbl_name,sql FROM sqlite_master
-         WHERE name NOT LIKE '%autorespond_budget%'
-         AND name NOT LIKE '%autorespond_after_hours%' AND name NOT IN (
-           'mutation_resolutions_timestamp_proof_insert',
-           'work_devin_preset_contract_guard',
-           'work_session_devin_contract_guard',
-           'queue_entries'
-         )
-         AND tbl_name!='account_mutation_authority_rebinds'
-         ORDER BY type,name`,
-      ).all();
-      expectCanonicalSchemaExtension(stableSchemaBefore, stableSchemaAfter);
-      expect(inspector.query("SELECT * FROM migrations WHERE version<41 ORDER BY version").all()).toEqual(ledgerBefore);
-      expect(inspector.query("SELECT version FROM migrations WHERE version>=40 ORDER BY version").all()).toEqual([{ version: 40 }, { version: 41 }, { version: 42 }, { version: 43 }, { version: 44 }, { version: 45 }, { version: 46 }, { version: 47 }, { version: 48 }, { version: 49 }, ...Array.from({ length: 11 }, (_, index) => ({ version: index + 50 }))]);
+      const before = canonicalAuthBudgetSnapshot(inspector);
+      const retained = canonicalAuthBudgetRows(inspector, [
+        "profiles", "mutation_attempts", "mutation_effect_evidence", "mutation_resolutions",
+      ]);
+      expect(before.version).toEqual({ user_version: 40 });
+      expect(inspector.query("SELECT * FROM migrations ORDER BY version").all()).toEqual([...capture.snapshot.ledger]);
+      expect(createHash("sha256").update(JSON.stringify(before.schema)).digest("hex")).toBe(capture.snapshot.schemaSha256);
+      expect(inspector.query("SELECT name FROM sqlite_master WHERE name='mutation_resolutions_timestamp_proof_insert'").get()).toBeNull();
+      const original = z.object({ evidence_json: z.string(), evidence_digest: z.string() }).parse(
+        inspector.query("SELECT evidence_json,evidence_digest FROM mutation_effect_evidence WHERE attempt_id=?").get(source.effect.attemptId),
+      );
+      expect(createHash("sha256").update(original.evidence_json).digest("hex")).toBe(original.evidence_digest);
+      expect(original.evidence_digest).toBe(source.effect.digest);
+      expect(inspector.query("SELECT evidence_json FROM mutation_resolutions WHERE attempt_id=?").get(source.effect.attemptId))
+        .toEqual({ evidence_json: resolutionBytes });
+      expect(() => { new StateStore(paths, { readonly: true }).close(); }).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:40:60");
+      expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(before);
+
+      const migrated = new StateStore(paths, { now: () => 50_000, resolveMachineTimeZone: () => "UTC" });
+      stores.push(migrated);
+      expect(retained.read()).toEqual(retained.before);
+      expect(migrated.readMutation(source.key)?.evidence).toEqual(source.effect);
+      expect(migrated.readMutation(source.key)?.resolution?.evidence).toEqual(source.resolutionEvidence);
+      expect(inspector.query("SELECT evidence_json,evidence_digest FROM mutation_effect_evidence WHERE attempt_id=?").get(source.effect.attemptId)).toEqual(original);
+      expect(inspector.query("SELECT evidence_json FROM mutation_resolutions WHERE attempt_id=?").get(source.effect.attemptId))
+        .toEqual({ evidence_json: resolutionBytes });
+      expect(inspector.query("SELECT * FROM migrations WHERE version<=40 ORDER BY version").all()).toEqual([...capture.snapshot.ledger]);
+      expect(inspector.query("SELECT * FROM migrations WHERE version>40 ORDER BY version").all()).toEqual(
+        Array.from({ length: 20 }, (_, index) => ({ version: index + 41, applied_at: 50_000 })),
+      );
       expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
-      expect(reopened.readMutation(key)?.evidence).toEqual(original);
-      expect(reopened.readMutation(key)?.resolution?.evidence).toEqual(JSON.parse(resolutionBytes));
-      expect(inspector.query("SELECT evidence_json,evidence_digest FROM mutation_effect_evidence WHERE attempt_id=?").get(attempt.id)).toEqual(before);
-      expect(inspector.query("SELECT evidence_json FROM mutation_resolutions WHERE attempt_id=?").get(attempt.id)).toEqual({ evidence_json: resolutionBytes });
-      expect(inspector.query("SELECT count(*) AS count FROM sqlite_master WHERE type='trigger' AND name='mutation_resolutions_timestamp_proof_insert'").get()).toEqual({ count: 1 });
-      expect(inspector.query("SELECT name FROM sqlite_master WHERE name='session_peer_policies'").get())
-        .toEqual({ name: "session_peer_policies" });
-      expect(inspector.query("SELECT name FROM sqlite_master WHERE name='project_memory_sync_intents'").get())
-        .toEqual({ name: "project_memory_sync_intents" });
+      expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      for (const name of ["mutation_resolutions_timestamp_proof_insert", "session_peer_policies", "project_memory_sync_intents"]) {
+        expect(inspector.query("SELECT name FROM sqlite_master WHERE name=?").get(name)).toEqual({ name });
+      }
+      const joined = canonicalAuthBudgetSnapshot(inspector);
+      for (const readonly of [false, true]) {
+        const reopened = new StateStore(paths, { readonly, now: () => 50_001, resolveMachineTimeZone: () => "UTC" });
+        try { expect(reopened.readMutation(source.key)?.evidence).toEqual(source.effect); }
+        finally { reopened.close(); }
+        expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(joined);
+      }
     } finally { inspector.close(false); }
   });
 
@@ -18580,20 +17737,21 @@ describe("StateStore", () => {
   for (const version of [45, 46, 47, 48, 60] as const) test.each([
     "missing_table", "missing_guard", "weaker_guard", "wrong_table_guard", "extra_index",
   ] as const)(
-    `auth45 authority refuses DDL drift at schema ${String(version)} without writes: %s`,
+    `auth45 authority refuses DDL drift at ${version === 47 ? "source-derived staged schema 47" : `schema ${String(version)}`} without writes: %s`,
     async (damage) => {
       const paths = await (async () => {
         if (version === 45 || version === 46) return canonicalAuthBudgetArchive(version);
+        if (version === 47) return stagedCanonical47Archive();
+        if (version === 48) return canonical48WorkArchive();
         const { store } = await fixture();
         signInProfile(store, "Auth schema drift", "auth-schema@example.com");
         return store.paths;
       })();
       const inspector = new Database(paths.database, { create: false, strict: true });
       try {
-        if (version === 47) downgradeToExactProviderVersion47(inspector);
-        else if (version === 48) downgradeToExactProviderVersion48(inspector);
-        // Versions45/46 begin at authentic archived bytes. The following
-        // DDL damage is intentional adversarial input, not producer output.
+        // Versions45/46/48 begin at authentic archived bytes. The following
+        // DDL damage is intentional adversarial input, not producer output;
+        // stage47 separately removes only an exact empty source48 component.
         if (damage === "missing_table") inspector.exec("DROP TABLE account_mutation_authority_rebinds");
         else if (damage === "extra_index") inspector.exec("CREATE INDEX unreviewed_auth_index ON account_mutation_authority_rebinds(profile_id)");
         else {
@@ -18615,14 +17773,12 @@ describe("StateStore", () => {
     },
   );
 
-  for (const version of [45, 46, 47, 48] as const) test(`schema ${String(version)} refuses a missing auth45 ledger entry before migration`, async () => {
+  for (const version of [45, 46, 47, 48] as const) test(`${version === 47 ? "source-derived staged schema 47" : `schema ${String(version)}`} refuses a missing auth45 ledger entry before migration`, async () => {
     const paths = version === 45 || version === 46
       ? await canonicalAuthBudgetArchive(version)
-      : (await fixture()).store.paths;
+      : version === 48 ? await canonical48WorkArchive() : await stagedCanonical47Archive();
     const inspector = new Database(paths.database, { create: false, strict: true });
     try {
-      if (version === 47) downgradeToExactProviderVersion47(inspector);
-      else if (version === 48) downgradeToExactProviderVersion48(inspector);
       inspector.exec("DELETE FROM migrations WHERE version=45");
       const before = canonicalAuthBudgetSnapshot(inspector);
       for (const readonly of [false, true]) {
@@ -18634,6 +17790,36 @@ describe("StateStore", () => {
         expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: version });
       }
     } finally { inspector.close(false); }
+  });
+
+  test("migrates source-derived staged schema 47 without rewriting prior rows or minting runtime authority", async () => {
+    const paths = await stagedCanonical47Archive();
+    const database = new Database(paths.database, { create: false, strict: true });
+    try {
+      const before = canonicalAuthBudgetSnapshot(database);
+      const oldRows = canonicalAuthBudgetRows(database, Object.keys(before.rows).filter((table) => table !== "migrations"));
+      const ledgerBefore = database.query("SELECT * FROM migrations ORDER BY version").all();
+      expect(() => new StateStore(paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:47:60");
+      expect(canonicalAuthBudgetSnapshot(database)).toEqual(before);
+      const now = canonical48WorkFixture.fixedTime + 1_000;
+      const store = new StateStore(paths, { now: () => now });
+      try {
+        expect(oldRows.read()).toEqual(oldRows.before);
+        expect(database.query("SELECT * FROM migrations WHERE version<=47 ORDER BY version").all()).toEqual(ledgerBefore);
+        expect(database.query("SELECT * FROM migrations WHERE version>47 ORDER BY version").all())
+          .toEqual(Array.from({ length: 13 }, (_, index) => ({ version: index + 48, applied_at: now })));
+        expect(database.query("SELECT * FROM session_provider_authorities").all()).toEqual([]);
+        expect(database.query("SELECT * FROM legacy_provider_authority_quarantines ORDER BY scope_id").all())
+          .toEqual(canonical48WorkFixture.retained.cases.map((entry) => ({ scope_kind: "session", scope_id: entry.session.id,
+            reason: "missing_immutable_runtime_authority", recorded_at: now }))
+            .sort((left, right) => left.scope_id.localeCompare(right.scope_id)));
+      } finally { store.close(); }
+      const after = canonicalAuthBudgetSnapshot(database);
+      for (const readonly of [false, true]) {
+        const reopened = new StateStore(paths, { readonly });
+        try { expect(canonicalAuthBudgetSnapshot(database)).toEqual(after); } finally { reopened.close(); }
+      }
+    } finally { database.close(false); }
   });
 
   test("auth45 schema rejects colliding predecessor objects and rolls back the whole migration", async () => {
@@ -19455,7 +18641,7 @@ describe("StateStore", () => {
       expect(() => inspector.query(
         "UPDATE queue_entries SET message='rewritten pending body' WHERE id=?",
       ).run(pending.id)).toThrow(
-        "queue message is immutable except for settlement removal",
+        "QUEUE_ATTACHMENT_IDENTITY_CORRUPT",
       );
 
       inspector.query(
@@ -19509,155 +18695,70 @@ describe("StateStore", () => {
     }
   });
 
-  test("migrates and physically scrubs v20 terminal and resolved-ambiguous queue bodies", async () => {
-    const { store } = await fixture();
-    const profile = signInProfile(store, "Legacy queue bodies", "legacy-queue@example.com");
-    const importedSession = upsertProvenTestSession(store, {
-      profileId: profile.id,
-      preset: "high",
-      fastEnabled: false,
-      providerThreadId: "thread-legacy-queue-bodies",
-      state: "idle",
-      providerUpdatedAt: 10,
+  test("physically scrubs authentic settled queue bodies from an observed archived v20 stage", async () => {
+    const paths = await canonical20To40Archive("observed20-settled-queues");
+    const capture = canonical20To40Fixture.captures["observed20-settled-queues"];
+    const source = capture.retained;
+    expect(capture.provenance).toMatchObject({
+      kind: "uncommitted_archived_migration_stage",
+      releasedWriterImage: false,
+      observerRowOrSchemaWrites: false,
+      observedBeforeOuterCommit: true,
     });
-    const session = store.updateSessionMetadata({
-      sessionId: importedSession.id,
-      expectedRevision: importedSession.revision,
-      preset: "high",
-    });
-    const terminal = store.enqueue(session.id, "already terminal body");
-    expect(store.transitionQueue(terminal.id, "pending", "cancelled")).toBe(true);
-
-    const ambiguousMessage = "V20_RESOLVED_AMBIGUOUS_QUEUE_SENTINEL";
-    const ambiguous = store.enqueue(session.id, ambiguousMessage);
-    const runtime = {
-      profileId: profile.id,
-      processGeneration: profile.processGeneration,
-      observedAt: 2_000,
-      preset: "high" as const,
-      model: "gpt-5.6-sol",
-      reasoningEffort: "max" as const,
-      serviceTier: null,
-      fast: false,
-      approvalPolicy: "on-request" as const,
-      reviewMode: "auto_review" as const,
-      permissionProfile: ":workspace" as const,
-      computerUse: true as const,
-      pluginCapability: true as const,
-      enabledApps: [],
-    };
-    const evidence = store.beginQueueEffect({
-      queueId: ambiguous.id,
-      sessionId: session.id,
-      profileGeneration: profile.processGeneration,
-      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
-      providerConnectionId: "10000000-0000-4000-8000-000000000007",
-      evidence: {
-        kind: "queue.dispatch",
-        queueId: ambiguous.id,
-        sessionId: session.id,
-        providerThreadId: "thread-legacy-queue-bodies",
-        profileGeneration: profile.processGeneration,
-        baseline: { providerUpdatedAt: 10, status: "idle", activeTurnId: null },
-        clientMessageId: ambiguous.id,
-        messageDigest: new Bun.CryptoHasher("sha256").update(ambiguousMessage).digest("hex"),
-        runtimeProfile: runtime,
-      },
-    });
-    store.markQueueEffectAmbiguous(ambiguous.id, evidence.digest);
-
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
     const legacy = new Database(paths.database, { create: false, strict: true });
-    dropSchemaAfterVersion34(legacy);
-    legacy.exec(`
-      PRAGMA secure_delete=OFF;
-      DROP TRIGGER IF EXISTS queue_message_settlement_guard;
-      DROP TRIGGER IF EXISTS queue_message_terminal_insert_scrub;
-      DROP TRIGGER IF EXISTS queue_message_terminal_transition_scrub;
-      DROP TRIGGER IF EXISTS queue_message_resolution_scrub;
-      DROP TRIGGER IF EXISTS queue_message_scrub_authority_record;
-      DROP TRIGGER IF EXISTS queue_effect_resolution_authority_guard;
-      DROP TABLE IF EXISTS queue_message_scrub_authority;
-      DELETE FROM migrations WHERE version>20;
-      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=20;
-    `);
-    dropAttachmentCustodySchema(legacy);
-    expect(legacy.query(
-      "UPDATE queue_entries SET message=? WHERE id=? RETURNING id",
-    ).all("V20_TERMINAL_QUEUE_SENTINEL", terminal.id)).toEqual([{ id: terminal.id }]);
-    legacy.query(
-      `INSERT INTO queue_effect_resolutions(
-         queue_id,resolution_kind,evidence_json,receipt_json,created_at
-       ) VALUES (?,?,?,?,?)`,
-    ).run(
-      ambiguous.id,
-      "abandoned",
-      JSON.stringify({ source: "legacy_provider_observation" }),
-      null,
-      2_000,
-    );
-    legacy.query(
-      `UPDATE sessions
-       SET state='idle',active_turn_id=NULL,revision=revision+1,updated_at=MAX(updated_at,2000)
-       WHERE id=? AND state='recovery_required'`,
-    ).run(session.id);
-    expect(legacy.query("SELECT message,state FROM queue_entries WHERE id=?").get(terminal.id))
-      .toEqual({ message: "V20_TERMINAL_QUEUE_SENTINEL", state: "cancelled" });
-    expect(legacy.query("SELECT message,state FROM queue_entries WHERE id=?").get(ambiguous.id))
-      .toEqual({ message: ambiguousMessage, state: "ambiguous" });
-    // A deferred SQLite close can checkpoint between the separate main and WAL
-    // reads. Keep both plaintext controls in the main file before inspecting it.
-    expect(legacy.query("PRAGMA wal_checkpoint(TRUNCATE)").get()).toEqual({
-      busy: 0,
-      log: 0,
-      checkpointed: 0,
+    // Retain the original column projections across closing the predecessor
+    // connection, so additive joined columns cannot hide old-cell rewrites.
+    const projections = ["queue_effect_evidence", "queue_effect_resolutions"].map((table) => {
+      const columns = z.array(z.object({ name: z.string().regex(/^[a-z_0-9]+$/u) })).parse(
+        legacy.query("PRAGMA table_info(" + table + ")").all(),
+      ).map(({ name }) => name);
+      expect(columns.length).toBeGreaterThan(0);
+      const sql = "SELECT " + columns.join(",") + " FROM " + table + " ORDER BY queue_id";
+      return { sql, rows: legacy.query(sql).all() };
     });
-    legacy.close(false);
+    try {
+      const before = canonicalAuthBudgetSnapshot(legacy);
+      expect(before.version).toEqual({ user_version: 20 });
+      expect(createHash("sha256").update(JSON.stringify(before.schema)).digest("hex")).toBe(capture.snapshot.schemaSha256);
+      expect(legacy.query("SELECT * FROM migrations ORDER BY version").all()).toEqual([...capture.snapshot.ledger]);
+      expect(legacy.query("SELECT message,state FROM queue_entries WHERE id=?").get(source.terminal.id))
+        .toEqual({ message: source.terminalMessage, state: "cancelled" });
+      expect(legacy.query("SELECT message,state FROM queue_entries WHERE id=?").get(source.ambiguous.id))
+        .toEqual({ message: source.ambiguousMessage, state: "ambiguous" });
+      expect(legacy.query("SELECT name FROM sqlite_master WHERE name='queue_message_scrub_authority'").get()).toBeNull();
+      expect(() => { new StateStore(paths, { readonly: true }).close(); }).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:20:60");
+      expect(canonicalAuthBudgetSnapshot(legacy)).toEqual(before);
+    } finally { legacy.close(false); }
+    for (const message of [source.terminalMessage, source.ambiguousMessage]) {
+      expect(await stateFileSuffixesContaining(paths.database, message)).toEqual([""]);
+    }
 
-    expect(await stateFileSuffixesContaining(paths.database, "V20_TERMINAL_QUEUE_SENTINEL"))
-      .toEqual([""]);
-    expect(await stateFileSuffixesContaining(paths.database, ambiguousMessage)).toEqual([""]);
-
-    const migrated = new StateStore(paths, { now: () => 3_000 });
+    const migrated = new StateStore(paths, { now: () => 30_000, resolveMachineTimeZone: () => "UTC" });
     stores.push(migrated);
     const removed = "[queue message removed after settlement]";
-    expect(migrated.requireQueue(terminal.id)).toMatchObject({
-      message: removed,
-      state: "cancelled",
-    });
-    expect(migrated.requireQueue(ambiguous.id)).toMatchObject({
-      message: removed,
-      state: "ambiguous",
-    });
-    expect(migrated.readQueueEffect(ambiguous.id)).toMatchObject({
-      digest: evidence.digest,
-      resolution: {
-        evidence: { source: "legacy_provider_observation" },
-        kind: "abandoned",
-      },
-    });
-    expect(migrated.listUnsettledQueueEffects(session.id)).toEqual([]);
-
+    expect(migrated.requireQueue(source.terminal.id)).toMatchObject({ ...source.terminal, message: removed });
+    expect(migrated.requireQueue(source.ambiguous.id)).toMatchObject({ ...source.ambiguous, message: removed });
+    expectHistoricalValue(migrated.readQueueEffect(source.ambiguous.id), source.effect);
+    expect(migrated.listUnsettledQueueEffects(source.session.id)).toEqual([]);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
+      for (const projection of projections) expect(inspector.query(projection.sql).all()).toEqual(projection.rows);
+      expect(inspector.query("SELECT * FROM migrations WHERE version<=20 ORDER BY version").all()).toEqual([...capture.snapshot.ledger]);
+      expect(inspector.query("SELECT applied_at FROM migrations WHERE version=23").get()).toEqual({ applied_at: 30_000 });
       expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
-      expect(inspector.query(
-        "SELECT applied_at FROM migrations WHERE version=23",
-      ).get()).toEqual({ applied_at: 3_000 });
-      expect(JSON.stringify(inspector.query(
-        "SELECT id,message FROM queue_entries WHERE id IN (?,?) ORDER BY id",
-      ).all(terminal.id, ambiguous.id))).not.toContain("QUEUE_SENTINEL");
-      expect(inspector.query(
-        "SELECT required_at,requires_vacuum FROM queue_message_scrub_authority WHERE singleton=1",
-      ).get()).toBeNull();
-    } finally {
-      inspector.close(false);
+      expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      expect(inspector.query("SELECT required_at,requires_vacuum FROM queue_message_scrub_authority WHERE singleton=1").get()).toBeNull();
+      const joined = canonicalAuthBudgetSnapshot(inspector);
+      for (const readonly of [false, true]) {
+        const reopened = new StateStore(paths, { readonly, now: () => 30_001, resolveMachineTimeZone: () => "UTC" });
+        try { expectHistoricalValue(reopened.readQueueEffect(source.ambiguous.id), source.effect); }
+        finally { reopened.close(); }
+        expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(joined);
+      }
+    } finally { inspector.close(false); }
+    for (const message of [source.terminalMessage, source.ambiguousMessage]) {
+      expect(await stateFileSuffixesContaining(paths.database, message)).toEqual([]);
     }
-    expect(await stateFileSuffixesContaining(paths.database, "V20_TERMINAL_QUEUE_SENTINEL"))
-      .toEqual([]);
-    expect(await stateFileSuffixesContaining(paths.database, ambiguousMessage)).toEqual([]);
   });
 
   test("keeps a pinned-reader queue scrub unavailable until restart can truncate its WAL", async () => {
@@ -19842,7 +18943,11 @@ describe("StateStore", () => {
     }).toThrow("WORK_SCHEMA_FOREIGN_KEY_VIOLATION");
   });
 
-  test("repairs stale current-version queue triggers before accepting more state", async () => {
+  test.each([
+    "queue_message_terminal_insert_scrub", "queue_message_terminal_transition_scrub",
+    "queue_message_resolution_scrub", "queue_message_settlement_guard",
+  ])("refuses a damaged current queue scrub guard without repairing history: %s", async (guard) => {
+    for (const damage of ["missing", "weakened", "wrong_table"] as const) {
     const { store } = await fixture();
     const profile = signInProfile(store, "Stale queue trigger", "stale-trigger@example.com");
     const session = createProvenTestSession(store, {
@@ -19857,41 +18962,33 @@ describe("StateStore", () => {
     stores.splice(stores.indexOf(store), 1);
 
     const stale = new Database(paths.database, { create: false, strict: true });
-    stale.exec(`
-      DROP TRIGGER queue_message_terminal_transition_scrub;
-      CREATE TRIGGER queue_message_terminal_transition_scrub
-      AFTER UPDATE OF state ON queue_entries
-      BEGIN SELECT 1; END;
-    `);
-    stale.query(
-      "UPDATE queue_entries SET state='cancelled',updated_at=updated_at+1 WHERE id=?",
-    ).run(queued.id);
-    expect(stale.query(
-      "SELECT message,state FROM queue_entries WHERE id=?",
-    ).get(queued.id)).toEqual({ message: sentinel, state: "cancelled" });
-    expect(stale.query(
-      "SELECT generation FROM queue_message_scrub_authority WHERE singleton=1",
-    ).get()).toBeNull();
-    stale.close(false);
-
-    const repaired = new StateStore(paths, { now: () => 5_000 });
-    stores.push(repaired);
-    expect(repaired.requireQueue(queued.id)).toMatchObject({
-      message: "[queue message removed after settlement]",
-      state: "cancelled",
-    });
-    expect(await stateFileSuffixesContaining(paths.database, sentinel)).toEqual([]);
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query(
+      const original = z.object({ tbl_name: z.string(), sql: z.string() }).strict().parse(
+        stale.query("SELECT tbl_name,sql FROM sqlite_schema WHERE type='trigger' AND name=?").get(guard),
+      );
+      stale.exec(`DROP TRIGGER "${guard}"`);
+      if (damage === "weakened") {
+        stale.exec(`CREATE TRIGGER "${guard}" AFTER UPDATE ON "${original.tbl_name}" BEGIN SELECT 1; END;`);
+      } else if (damage === "wrong_table") {
+        stale.exec(original.sql.replace(new RegExp(`\\bON ${original.tbl_name}\\b`, "u"), "ON profiles"));
+      }
+      if (guard === "queue_message_terminal_transition_scrub") {
+        // Reproduces the privacy failure: without this trigger a settlement
+        // retains the raw body and never records a physical-scrub obligation.
+        stale.query("UPDATE queue_entries SET state='cancelled',updated_at=updated_at+1 WHERE id=?").run(queued.id);
+        expect(stale.query("SELECT message,state FROM queue_entries WHERE id=?").get(queued.id))
+          .toEqual({ message: sentinel, state: "cancelled" });
+      }
+      expect(stale.query(
         "SELECT generation FROM queue_message_scrub_authority WHERE singleton=1",
       ).get()).toBeNull();
-      const trigger = z.object({ sql: z.string() }).parse(inspector.query(
-        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='queue_message_terminal_transition_scrub'",
-      ).get());
-      expect(trigger.sql).toContain("queue_message_scrub_authority");
-    } finally {
-      inspector.close(false);
+      const corrupted = snapshotSwitchContainmentForTest(stale);
+      for (const readonly of [false, true]) {
+        expect(() => { const opened = new StateStore(paths, { readonly, now: () => 5_000 }); opened.close(); })
+          .toThrow("STATE_SCHEMA_COHORT_INVALID:joined60:" + guard);
+        expect(snapshotSwitchContainmentForTest(stale)).toEqual(corrupted);
+      }
+    } finally { stale.close(false); }
     }
   });
 
@@ -20364,111 +19461,49 @@ describe("StateStore", () => {
   });
 
   test("hydrates an immutable v34 desktop recovery receipt from migrated exact authority", async () => {
-    const { store } = await fixture();
-    const target = signInProfile(store, "Legacy recovery target", "legacy-recovery@example.com");
-    const key = "89898989-8989-4989-8989-898989898989";
-    const plan = await store.beginDesktopSwitch({
-      idempotencyKey: key,
-      target: codexAuthorityFor(store, target),
-    });
-    if (plan.status !== "ready") throw new Error("Expected a ready desktop switch plan.");
-    await store.prepareDesktopSwitchJournal({
-      idempotencyKey: key,
-      ...desktopSwitchBinding(plan),
-      bundleCdHash: "9".repeat(40),
-      sourcePid: null,
-      targetPaths: deriveDesktopProfilePaths(store.paths.root, target.id),
-      expectedAccountKey: "legacy-recovery@example.com",
-    });
-    await store.advanceDesktopSwitchJournal({
-      idempotencyKey: key,
-      ...desktopSwitchBinding(plan),
-      stage: "launch-requested",
-    });
-    await store.advanceDesktopSwitchJournal({
-      idempotencyKey: key,
-      ...desktopSwitchBinding(plan),
-      stage: "recovery-required",
-      diagnostic: "LEGACY_RECOVERY_REQUIRED",
-    });
-    const recovery = store.readCurrentDesktopSwitchRecovery() as { attemptId: string };
-    const legacyReceipt = {
-      status: "resolved_applied" as const,
-      attemptId: recovery.attemptId,
-      idempotencyKey: key,
-      switchGeneration: plan.switchGeneration,
-      sourceProfileId: null,
-      sourceProcessGeneration: null,
-      targetProfileId: target.id,
-      targetProcessGeneration: target.processGeneration,
-      diagnostic: "STABLE_TARGET_ACCOUNT_VERIFIED",
-      observationDigest: "8".repeat(64),
-      resolvedAt: 2_000,
-      activeAccount: {
-        signedIn: true,
-        email: "legacy-recovery@example.com",
-        plan: "Plus",
-      },
-    };
-    const legacyReceiptBytes = JSON.stringify(legacyReceipt);
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
-    const legacy = new Database(paths.database, { create: false, strict: true });
-    legacy.query(
-      `INSERT INTO desktop_switch_resolutions(
-         attempt_id,switch_generation,resolution_kind,diagnostic_code,
-         observation_digest,receipt_json,resolved_at
-       ) VALUES (?,?,'resolved_applied',?,?,?,?)`,
-    ).run(
-      recovery.attemptId,
-      plan.switchGeneration,
-      legacyReceipt.diagnostic,
-      legacyReceipt.observationDigest,
-      legacyReceiptBytes,
-      legacyReceipt.resolvedAt,
-    );
-    legacy.query(
-      "UPDATE desktop_switch_authority SET released_generation=? WHERE singleton=1",
-    ).run(plan.switchGeneration);
-    downgradeProviderAccountsToReleasedVersion(legacy);
-    legacy.close(false);
-
-    const migrated = new StateStore(paths, { now: () => 3_000 });
-    stores.push(migrated);
-    const targetAuthority = codexAuthorityFor(migrated, target);
-    const hydratedReceipt = {
-      ...legacyReceipt,
-      sourceProviderAuthority: null,
-      targetProviderAuthority: targetAuthority,
-    };
-    expect(migrated.readCurrentDesktopSwitchRecovery()).toEqual(hydratedReceipt);
-    expect(migrated.resolveDesktopSwitchRecovery({
-      attemptId: recovery.attemptId,
-      idempotencyKey: key,
-      ...desktopSwitchBinding(plan),
-      targetProviderAuthority: targetAuthority,
-      resolution: legacyReceipt.status,
-      diagnostic: legacyReceipt.diagnostic,
-      observationDigest: legacyReceipt.observationDigest,
-      activeAccount: legacyReceipt.activeAccount,
-    })).toEqual(hydratedReceipt);
-    expect(migrated.readDesktopSwitchReplay({
-      idempotencyKey: key,
-      target: targetAuthority,
-    })).toMatchObject({
-      status: "applied",
-      targetProviderAuthority: targetAuthority,
-    });
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    const paths = await canonical34StorageArchive();
+    const source = canonical34StorageFixture.retained;
+    const inspector = new Database(paths.database, { create: false, strict: true });
+    inspector.exec("PRAGMA query_only=ON");
     try {
-      expect(inspector.query(
-        "SELECT receipt_json FROM desktop_switch_resolutions WHERE attempt_id=?",
-      ).get(recovery.attemptId)).toEqual({ receipt_json: legacyReceiptBytes });
-    } finally {
-      inspector.close(false);
-    }
+      const original = canonicalAuthBudgetSnapshot(inspector);
+      const history = canonicalAuthBudgetRows(inspector, [
+        "desktop_switches", "desktop_switch_resolutions", "desktop_switch_authority",
+      ]);
+      expect(original.version).toEqual({ user_version: 34 });
+      expect(inspector.query("SELECT * FROM desktop_switch_resolutions WHERE attempt_id=?")
+        .get(source.receipt.attemptId)).toEqual(source.immutableDesktop);
+      expect(() => new StateStore(paths, { readonly: true }))
+        .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:60");
+      expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(original);
+
+      const migrated = new StateStore(paths, { now: () => 40_000 });
+      stores.push(migrated);
+      const targetAuthority = codexAuthorityFor(migrated, source.profile);
+      const hydratedReceipt = {
+        ...source.receipt, sourceProviderAuthority: null, targetProviderAuthority: targetAuthority,
+      };
+      expect(migrated.readCurrentDesktopSwitchRecovery()).toEqual(hydratedReceipt);
+      const joined = canonicalAuthBudgetSnapshot(inspector);
+      expect(migrated.resolveDesktopSwitchRecovery({
+        ...source.resolutionInput, sourceProviderAuthority: null, targetProviderAuthority: targetAuthority,
+      })).toEqual(hydratedReceipt);
+      expect(migrated.readDesktopSwitchReplay({
+        idempotencyKey: source.plan.idempotencyKey, target: targetAuthority,
+      })).toMatchObject({ status: "applied", targetProviderAuthority: targetAuthority });
+      expect(history.read()).toEqual(history.before);
+      expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(joined);
+      migrated.close();
+      stores.splice(stores.indexOf(migrated), 1);
+      for (const readonly of [false, true]) {
+        const reopened = new StateStore(paths, { readonly, now: () => 40_001 });
+        try {
+          expect(reopened.readCurrentDesktopSwitchRecovery()).toEqual(hydratedReceipt);
+          expect(history.read()).toEqual(history.before);
+          expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(joined);
+        } finally { reopened.close(); }
+      }
+    } finally { inspector.close(false); }
   });
 
   test("enforces the original deadline before resolving a switch as not applied", async () => {
@@ -20814,6 +19849,7 @@ describe("StateStore", () => {
   test("commits sanitized send, steer, and queue message events with their effect receipts", async () => {
     let currentTime = 1_000;
     const { store } = await fixture({ now: () => currentTime });
+    const daemon = startInputFixtureDaemon(store);
     const profile = signInProfile(store, "Atomic message events", "atomic-events@example.com");
     const runtime = codexRuntimeProfile(profile);
     const bind = (
@@ -20841,14 +19877,14 @@ describe("StateStore", () => {
       "x".repeat(SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS),
     ].join("/");
     const sendKey = peerIdempotencyKey(70_001);
-    const sendAttempt = store.prepareMutation({
-      kind: "session.send",
-      authorityId: sendSession.id,
-      authorityGeneration: profile.processGeneration,
-      request: { message: sendMessage },
+    const { attempt: sendAttempt } = store.prepareSessionInputMutation({
+      ...daemon, kind: "session.send", sessionId: sendSession.id,
+      providerAuthority: capturedProviderAuthorityForTest(store, sendSession.id),
+      message: sendMessage, attachments: [],
       idempotencyKey: sendKey,
     });
     store.beginSessionMutationEffect({
+      ...daemon, attachments: [],
       providerAuthority: capturedProviderAuthorityForTest(store, sendSession.id),
       transcript: {
         accountId: store.requireSession(sendSession.id).profileId,
@@ -20949,14 +19985,14 @@ describe("StateStore", () => {
     const steerSession = bind("thread-atomic-steer", "active", "turn-atomic-steer");
     const steerMessage = "sk_testabcdefgh";
     const steerKey = peerIdempotencyKey(70_002);
-    const steerAttempt = store.prepareMutation({
-      kind: "session.steer",
-      authorityId: steerSession.id,
-      authorityGeneration: profile.processGeneration,
-      request: { message: steerMessage },
+    const { attempt: steerAttempt } = store.prepareSessionInputMutation({
+      ...daemon, kind: "session.steer", sessionId: steerSession.id,
+      providerAuthority: capturedProviderAuthorityForTest(store, steerSession.id),
+      message: steerMessage, attachments: [],
       idempotencyKey: steerKey,
     });
     store.beginSessionMutationEffect({
+      ...daemon, attachments: [],
       providerAuthority: capturedProviderAuthorityForTest(store, steerSession.id),
       transcript: {
         accountId: store.requireSession(steerSession.id).profileId,
@@ -21056,14 +20092,14 @@ describe("StateStore", () => {
         .toEndWith(secret.slice(0, -1));
       const cutoffSession = bind(`thread-atomic-cutoff-${name}`, "idle");
       const cutoffKey = peerIdempotencyKey(70_010 + index);
-      const cutoffAttempt = store.prepareMutation({
-        kind: "session.send",
-        authorityId: cutoffSession.id,
-        authorityGeneration: profile.processGeneration,
-        request: { message: cutoffMessage },
+      const { attempt: cutoffAttempt } = store.prepareSessionInputMutation({
+        ...daemon, kind: "session.send", sessionId: cutoffSession.id,
+        providerAuthority: capturedProviderAuthorityForTest(store, cutoffSession.id),
+        message: cutoffMessage, attachments: [],
         idempotencyKey: cutoffKey,
       });
       store.beginSessionMutationEffect({
+      ...daemon, attachments: [],
         providerAuthority: capturedProviderAuthorityForTest(store, cutoffSession.id),
         transcript: {
           accountId: store.requireSession(cutoffSession.id).profileId,
@@ -22456,20 +21492,19 @@ describe("StateStore", () => {
       expect(before.evidence).toEqual([]);
       expect(store.readMutation(idempotencyKey)).toMatchObject({ state: "prepared" });
       // The failure fires only after all three captured retirement events
-      // have reached SQLite, so rollback is not merely an input rejection.
+      // have reached SQLite. If they are absent this trigger does not reject,
+      // so the expected error cannot be satisfied by its wrong-order branch.
       database.exec(`CREATE TRIGGER test_logout_retirement_evidence_failure
         BEFORE INSERT ON mutation_effect_evidence
         WHEN NEW.attempt_id='${attempt.id}' AND NEW.kind='account.logout'
+          AND (SELECT COUNT(*) FROM session_events WHERE session_id='${session.id}')=${before.events.length + 3}
         BEGIN
-          SELECT CASE WHEN (
-            SELECT COUNT(*) FROM session_events WHERE session_id='${session.id}'
-          )=${before.events.length + 3}
-          THEN RAISE(ABORT,'INJECTED_LOGOUT_EVIDENCE_FAILURE')
-          ELSE RAISE(ABORT,'LOGOUT_RETIREMENT_NOT_WRITTEN_BEFORE_EVIDENCE') END;
+          SELECT RAISE(ABORT,'INJECTED_LOGOUT_EVIDENCE_FAILURE');
         END;`);
       try {
+        // The provenance writer sanitizes SQL failures at its public boundary.
         expect(() => store.beginAccountMutationEffect(input))
-          .toThrow("INJECTED_LOGOUT_EVIDENCE_FAILURE");
+          .toThrow("EFFECT_EVIDENCE_PROVENANCE_CORRUPT");
         expect(snapshot()).toEqual(before);
       } finally {
         database.exec("DROP TRIGGER test_logout_retirement_evidence_failure");
@@ -23014,11 +22049,11 @@ describe("StateStore", () => {
     );
   });
 
-  test.each(["codex", "claude", "devin"] as const)("rejects a bound interaction from another provider thread for %s", async (provider) => {
+  test.each(["codex", "claude"] as const)("rejects a bound interaction from another provider thread for %s", async (provider) => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Exact interaction thread", "exact-thread@example.com");
     const session = upsertProvenTestSession(store, {
-      profileId: profile.id, provider, preset: provider === "codex" ? "high" : provider === "claude" ? "fable-max" : "astra",
+      profileId: profile.id, provider, preset: provider === "codex" ? "high" : "fable-max",
       fastEnabled: false,
       providerThreadId: "exact-interaction-thread", state: "idle",
     });
@@ -23027,7 +22062,7 @@ describe("StateStore", () => {
       ...captured, connectionId: "20000000-0000-4000-8000-000000000801",
       requestId: { type: "number" as const, value: 1 },
       method: provider === "codex" ? "item/commandExecution/requestApproval"
-        : provider === "claude" ? "claude/control_request/can_use_tool" : "devin/session/request_permission",
+        : "claude/control_request/can_use_tool",
       requestDigest: "a".repeat(64), threadId: "exact-interaction-thread",
       turnId: null, itemId: null, approvalId: null,
     };
@@ -23061,6 +22096,40 @@ describe("StateStore", () => {
       }
     }
     expect(store.admitInteraction(input)).toMatchObject({ replayed: false, record: { state: "pending" } });
+  });
+
+  test("refuses new callbacks for authentic retired Devin history even with the exact retained thread", async () => {
+    const paths = await canonical39DevinArchive();
+    const source = canonical39DevinFixture.cases.find((entry) => entry.generation === 0);
+    if (source === undefined) throw new Error("Expected archived generation-zero Devin session.");
+    const store = new StateStore(paths);
+    stores.push(store);
+    const database = new Database(paths.database, { create: false, strict: true });
+    try {
+      const before = snapshotSwitchContainmentForTest(database);
+      const authority = store.requireProviderAccountAuthority(source.profile.id, "devin");
+      for (const threadId of [source.session.providerThreadId, "unrelated-interaction-thread", null]) {
+        const input = {
+          publicId: "20000000-0000-4000-8000-000000000802", sessionId: source.session.id,
+          authority: { ...authority, connectionId: "20000000-0000-4000-8000-000000000801",
+            requestId: { type: "number" as const, value: 1 }, method: "devin/session/request_permission",
+            requestDigest: "a".repeat(64), threadId, turnId: null, itemId: null, approvalId: null },
+          kind: "command_approval" as const, blocking: true,
+          display: { kind: "command_approval" as const, summary: "Rejected retired callback", reason: null,
+            commandClass: "test", workingDirectory: null, availableDecisions: ["once" as const] },
+        };
+        expect(() => store.admitInteraction(input)).toThrow(threadId === source.session.providerThreadId
+          ? "RETIRED_PROVIDER_ADMISSION_REFUSED" : "INTERACTION_SESSION_AUTHORITY_MISMATCH");
+        expect(() => database.query(`INSERT INTO provider_interactions(
+          public_id,session_id,profile_id,process_generation,connection_id,request_id_type,request_id_number,
+          method,request_digest,thread_id,kind,state,revision,blocking,display_json,requested_at,updated_at
+        ) VALUES (?,?,?,?,?,'number',1,?,?,?,'command_approval','pending',1,1,?,2000,2000)`)
+          .run(input.publicId, source.session.id, source.profile.id, authority.processGeneration,
+            input.authority.connectionId, input.authority.method, input.authority.requestDigest, threadId,
+            JSON.stringify(input.display))).toThrow("RETIRED_PROVIDER_ADMISSION_REFUSED");
+        expect(snapshotSwitchContainmentForTest(database)).toEqual(before);
+      }
+    } finally { database.close(false); }
   });
 
   test("brokers tagged provider requests with exact replay and write-ahead CAS states", async () => {
@@ -23915,6 +22984,7 @@ describe("StateStore", () => {
     const database = new Database(paths.database, { readonly: true, strict: true });
     try {
       const originalHistory = retiredCloseHistory(database);
+      const originalSession = store.requireSession(session.id);
       // Local display state only; this does not create a provider interaction,
       // runtime observation, writer witness, close receipt or process authority.
       store.upsertSessionState({ sessionId: session.id, state: "needs_approval", attention: true,
@@ -23923,7 +22993,9 @@ describe("StateStore", () => {
       const bootId = `boot_${"8".repeat(32)}`;
       expect(store.nextDaemonGeneration(bootId)).toBe(2);
       expect(store.requireCapturedSessionProviderAuthority(session.id)).toEqual(authority);
-      expect(store.requireSession(session.id).state).toBe("recovery_required");
+      // Local attention repair is not a new provider discontinuity or process grant.
+      expect(store.requireSession(session.id)).toEqual(originalSession);
+      expect(originalSession.state).toBe("idle");
       expect(store.readSessionState(session.id)).toMatchObject({ state: "aborted", attention: false, revision: 2 });
       const stateEvents = store.listSessionEvents({ sessionId: session.id, afterSequence: 0 }).events
         .filter((event) => event.body.type === "session_state");
@@ -23934,47 +23006,71 @@ describe("StateStore", () => {
     } finally { database.close(false); }
   });
 
-  test.each([false, true])("restart preserves stranded attention on a migrated unproved session authority with pending callback=%s", async (pendingCallback) => {
-    const value = await fixture();
-    const profile = signInProfile(value.store, "Unproved restart attention", "unproved-restart@example.com");
-    const created = value.store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
-    const session = value.store.bindSession({ sessionId: created.id, expectedRevision: created.revision,
-      providerThreadId: "unproved-restart-attention-thread", state: "idle" });
-    // The current callback must first be admitted under real account custody.
-    // The exact v39 downgrade removes this later scope proof; no runtime
-    // observation is created that could prove the historical session tuple.
-    value.store.bindSessionProviderAccountAuthority({ sessionId: session.id, provider: "codex",
-      runtimeScope: "managed",
-      accountKey: `v1:codex:${createHash("sha256").update("unproved-restart@example.com").digest("hex")}` });
-    const interaction = pendingCallback ? admitRestartCommandInteraction(value.store, { index: 44,
-      profileId: profile.id, processGeneration: profile.processGeneration, sessionId: session.id,
-      threadId: "unproved-restart-attention-thread", turnId: null }) : null;
-    const state = value.store.upsertSessionState({ sessionId: session.id, state: "needs_approval", attention: true,
-      reason: "pending command_approval", verbatimRequired: false, verbatimLiteral: undefined,
-      lastActivityAt: 1_000, revision: 1 });
-    value.store.close();
-    stores.splice(stores.indexOf(value.store), 1);
-    const downgrade = new Database(value.store.paths.database, { strict: true });
-    try { downgradeToExactProviderVersion39(downgrade); }
-    finally { downgrade.close(false); }
-    const store = new StateStore(value.store.paths, { now: () => 9_000 });
-    stores.push(store);
-    expect(store.hasUnsettledLegacyProviderAuthorityQuarantineForSession(session.id)).toBe(true);
-    expect(() => store.requireCapturedSessionProviderAuthority(session.id)).toThrow();
-    const bootId = `boot_${"9".repeat(32)}`;
-    expect(store.nextDaemonGeneration(bootId)).toBe(1);
-    expect(store.readSessionState(session.id)).toEqual(state);
-    expect(store.hasUnsettledLegacyProviderAuthorityQuarantineForSession(session.id)).toBe(true);
-    expect(store.eventStreamPosition(session.id).observedThroughSequence).toBe(0);
-    if (interaction !== null) {
-      expect(store.readInteractionProviderAuthority(interaction.publicId)).toBeNull();
-      const database = new Database(store.paths.database, { readonly: true, strict: true });
-      try {
-        expect(database.query("SELECT state,revision FROM provider_interactions WHERE public_id=?").get(interaction.publicId))
-          .toEqual({ state: interaction.state, revision: interaction.revision });
-      } finally { database.close(false); }
-    }
-    expect(store.nextDaemonGeneration(bootId)).toBe(1);
+  test.each([false, true])("daemon boot preserves authentic v39 unproved attention with pending callback=%s", async (pendingCallback) => {
+    const scenario = pendingCallback
+      ? "canonical39-unproved-attention-with-callback"
+      : "canonical39-unproved-attention-without-callback";
+    const paths = await canonicalIdentityAttentionArchive(scenario);
+    const source = canonicalIdentityAttentionFixtures[scenario];
+    const { session, state, interaction } = source.retained;
+    const database = new Database(paths.database, { create: false, strict: true });
+    try {
+      const original = canonicalAuthBudgetSnapshot(database);
+      expect(database.query("SELECT * FROM session_runtime_profiles").all()).toEqual([]);
+      expect(database.query("SELECT name FROM sqlite_master WHERE name='session_provider_account_authorities'").get()).toBeNull();
+      expect(database.query("SELECT * FROM session_events").all()).toEqual([]);
+      expect(database.query("SELECT * FROM session_autorespond_counters").all()).toEqual([]);
+      expect(() => new StateStore(paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:39:60");
+      expect(canonicalAuthBudgetSnapshot(database)).toEqual(original);
+      const retained = canonicalAuthBudgetRows(database, Object.keys(original.rows)
+        .filter((table) => !["migrations", "sessions", "session_autorespond_counters"].includes(table)));
+      const sessions = canonicalAuthBudgetRows(database, ["sessions"]);
+      const expectedSessions = z.array(z.record(z.string(), z.unknown())).parse(sessions.before.sessions)
+        .map((row) => ({ ...row, state: "recovery_required", active_turn_id: null,
+          revision: z.number().parse(row.revision) + 1, updated_at: 90_000 }));
+      const store = new StateStore(paths, { now: () => 90_000 });
+      stores.push(store);
+      expect(retained.read()).toEqual(retained.before);
+      expect(sessions.read().sessions).toEqual(expectedSessions);
+      expect(database.query("SELECT * FROM session_autorespond_counters").all())
+        .toEqual([{ session_id: session.id, consecutive_count: 3, updated_at: 90_000 }]);
+      expect(database.query("SELECT * FROM migrations WHERE version<=39 ORDER BY version").all()).toEqual([...source.ledger]);
+      expect(database.query("SELECT version FROM migrations ORDER BY version").all())
+        .toEqual(Array.from({ length: 60 }, (_, index) => ({ version: index + 1 })));
+      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
+      expect(store.hasUnsettledLegacyProviderAuthorityQuarantineForSession(session.id)).toBe(true);
+      expect(store.sessionAccountAuthorityMatches(session.id, source.retained.profile.id)).toBe(false);
+      expect(store.readSessionProviderAccountAuthority(session.id)).toBeNull();
+      expect(() => store.requireCapturedSessionProviderAuthority(session.id))
+        .toThrow("SESSION_PROVIDER_AUTHORITY_QUARANTINED:missing_immutable_runtime_authority");
+      const authorityTables = ["session_runtime_profiles", "session_provider_authorities",
+        "session_provider_account_authorities", "interaction_provider_authorities",
+        "session_events", "session_event_provider_authorities", "mutation_effect_evidence"];
+      for (const table of authorityTables) expect(database.query(`SELECT * FROM "${table}"`).all()).toEqual([]);
+
+      // This drives the real storage boot transition, not a daemon process or
+      // provider restart. Missing historical authority cannot repair attention.
+      const bootId = `boot_${"9".repeat(32)}`;
+      const migratedSession = store.requireSession(session.id);
+      expect(store.nextDaemonGeneration(bootId)).toBe(1);
+      expect(store.readSessionState(session.id)).toEqual(state);
+      expect(store.requireSession(session.id)).toEqual(migratedSession);
+      expect(store.hasUnsettledLegacyProviderAuthorityQuarantineForSession(session.id)).toBe(true);
+      expect(store.eventStreamPosition(session.id).observedThroughSequence).toBe(0);
+      if (interaction !== null) {
+        expect(store.readInteractionProviderAuthority(interaction.publicId)).toBeNull();
+        expect(database.query("SELECT state,revision,display_json FROM provider_interactions WHERE public_id=?")
+          .get(interaction.publicId)).toEqual({ state: interaction.state, revision: interaction.revision,
+          display_json: JSON.stringify(interaction.display) });
+        expect(() => store.requireInteraction(interaction.publicId)).toThrow("INTERACTION_PROVIDER_AUTHORITY_MISSING");
+      }
+      for (const table of authorityTables) expect(database.query(`SELECT * FROM "${table}"`).all()).toEqual([]);
+      expect(database.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      const booted = canonicalAuthBudgetSnapshot(database);
+      expect(store.nextDaemonGeneration(bootId)).toBe(1);
+      expect(canonicalAuthBudgetSnapshot(database)).toEqual(booted);
+      expectCanonical35To38InertReopens(paths, database);
+    } finally { database.close(false); }
   });
 
   test.each(["codex", "claude"] as const)("restart preserves historical attention when the %s account binding has changed", async (provider) => {
@@ -24746,168 +23842,134 @@ describe("StateStore", () => {
     });
   });
 
-  test("migrates every nonremoved v27 profile into fail-closed reconciliation", async () => {
-    const { store } = await fixture();
-    const email = "legacy-policy@example.com";
-    const signedIn = signInProfile(store, "Legacy signed in", email);
-    const signedOut = store.createProfile("Legacy signed out");
-    const removed = store.createProfile("Legacy removed");
-    store.removeProfile(removed.id);
-    const accountFingerprint = resetAccountFingerprint(email);
-    const prepared = prepareAuthorizedReset(store, {
-      profileId: signedIn.id,
-      processGeneration: signedIn.processGeneration,
-      accountFingerprint,
-      weeklyWindowResetsAt: 500_000_000,
-      observedUsedPercent: 99,
-    });
-    expect(beginAuthorizedReset(store, prepared).state)
-      .toBe("effect_started");
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
-    const legacy = new Database(paths.database, { create: false, strict: true });
+  test("migrates every nonremoved profile from an exact v27 writer into fail-closed reconciliation", async () => {
+    const source = canonicalResetPolicyFixtures[27];
+    const ledger = [...source.ledger].sort((a, b) => a.version - b.version);
+    const paths = await canonicalResetPolicyArchive(27);
+    const inspector = new Database(paths.database, { create: false, strict: true });
     try {
-      dropSchemaAfterVersion34(legacy);
-      legacy.exec(`
-        DROP TRIGGER account_rate_limit_reset_attempt_policy_insert_guard;
-        DROP TRIGGER account_rate_limit_reset_attempt_policy_begin_guard;
-        DROP TRIGGER account_rate_limit_reset_attempt_policy_close_guard;
-        DROP TRIGGER account_rate_limit_reset_rebind_policy_guard;
-        DROP TRIGGER account_rate_limit_reset_policy_insert_guard;
-        DROP TRIGGER account_rate_limit_reset_policy_transition_guard;
-        DROP TRIGGER account_rate_limit_reset_policy_delete_guard;
-        DROP TABLE account_rate_limit_reset_policies;
-        DELETE FROM migrations WHERE version>27;
-        DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=27;
-      `);
-    } finally {
-      legacy.close(false);
-    }
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 27 });
+      expect(inspector.query("SELECT * FROM migrations ORDER BY version").all()).toEqual(ledger);
+      expect(inspector.query("SELECT 1 FROM sqlite_master WHERE name='account_rate_limit_reset_policies'").get()).toBeNull();
+      const original = canonicalAuthBudgetRows(inspector, ["profiles", "account_rate_limit_reset_attempts", "usage_revision_authority"]);
+      const before = canonicalAuthBudgetSnapshot(inspector);
+      expect(() => { const opened = new StateStore(paths, { readonly: true }); opened.close(); })
+        .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:27:60");
+      expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(before);
 
-    const migrated = new StateStore(paths, { now: () => 2_000 });
-    stores.push(migrated);
-    for (const profileId of [signedIn.id, signedOut.id]) {
-      expect(migrated.requireAccountRateLimitResetPolicy(profileId)).toMatchObject({
-        state: "reconciliation_required",
-        accountFingerprint: null,
-        weeklyWindowResetsAt: null,
-        revision: 1,
+      const migrated = new StateStore(paths, { now: () => 40_000, resolveMachineTimeZone: () => "UTC" });
+      stores.push(migrated);
+      expect(original.read()).toEqual(original.before);
+      for (const profileId of [source.signedIn.id, source.signedOut.id]) {
+        expect(migrated.requireAccountRateLimitResetPolicy(profileId)).toMatchObject({
+          state: "reconciliation_required", accountFingerprint: null,
+          weeklyWindowResetsAt: null, revision: 1,
+        });
+      }
+      expect(() => migrated.requireAccountRateLimitResetPolicy(source.removed.id))
+        .toThrow("ACCOUNT_RATE_LIMIT_RESET_POLICY_MISSING");
+      expect(migrated.readRecoverableAccountRateLimitReset(source.signedIn.id, source.fingerprint))
+        .toMatchObject(source.started);
+      const refusal = canonicalAuthBudgetSnapshot(inspector);
+      expect(() => migrated.prepareAccountRateLimitReset({
+        profileId: source.signedIn.id, processGeneration: source.signedIn.processGeneration,
+        accountFingerprint: source.fingerprint, weeklyWindowResetsAt: source.weeklyWindowResetsAt,
+        observedUsedPercent: 99,
+      })).toThrow("ACCOUNT_RATE_LIMIT_RESET_POLICY_NOT_ACTIVE");
+      expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(refusal);
+      expect(inspector.query("SELECT * FROM migrations WHERE version<=27 ORDER BY version").all()).toEqual(ledger);
+      expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      for (const readonly of [false, true]) {
+        const snapshot = canonicalAuthBudgetSnapshot(inspector);
+        const reopened = new StateStore(paths, { readonly, now: () => 40_001 });
+        try {
+          expect(reopened.readRecoverableAccountRateLimitReset(source.signedIn.id, source.fingerprint))
+            .toMatchObject(source.started);
+        } finally { reopened.close(); }
+        expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(snapshot);
+      }
+
+      // A later explicit identity change cannot reuse the old reset window.
+      const replacementEmail = "legacy-policy-replacement@example.com";
+      expect(migrated.setProfileState(source.signedIn.id, source.signedIn.processGeneration,
+        "signed_in", { email: replacementEmail, plan: "Plus" })).toBe(true);
+      expect(migrated.readRecoverableAccountRateLimitReset(source.signedIn.id, source.fingerprint))
+        .toMatchObject(source.started);
+      const replacementFingerprint = resetAccountFingerprint(replacementEmail);
+      expect(migrated.authorizeAccountRateLimitResetPolicy({
+        profileId: source.signedIn.id, processGeneration: source.signedIn.processGeneration,
+        accountFingerprint: replacementFingerprint, weeklyWindowDurationMinutes: 10_080,
+        weeklyWindowResetsAt: 500_100_000,
+      })).toMatchObject({
+        decision: "suppress", policy: { accountFingerprint: replacementFingerprint, state: "window_suppressed" },
       });
-    }
-    expect(() => migrated.requireAccountRateLimitResetPolicy(removed.id))
-      .toThrow("ACCOUNT_RATE_LIMIT_RESET_POLICY_MISSING");
-    expect(migrated.readRecoverableAccountRateLimitReset(
-      signedIn.id,
-      accountFingerprint,
-    )).toMatchObject({
-      idempotencyKey: prepared.idempotencyKey,
-      outcome: null,
-      state: "effect_started",
-    });
-    expect(() => migrated.prepareAccountRateLimitReset({
-      profileId: signedIn.id,
-      processGeneration: signedIn.processGeneration,
-      accountFingerprint,
-      weeklyWindowResetsAt: 500_000_000,
-      observedUsedPercent: 99,
-    })).toThrow("ACCOUNT_RATE_LIMIT_RESET_POLICY_NOT_ACTIVE");
-    const replacementEmail = "legacy-policy-replacement@example.com";
-    expect(migrated.setProfileState(
-      signedIn.id,
-      signedIn.processGeneration,
-      "signed_in",
-      { email: replacementEmail, plan: "Plus" },
-    )).toBe(true);
-    expect(migrated.readRecoverableAccountRateLimitReset(
-      signedIn.id,
-      accountFingerprint,
-    )).toMatchObject({
-      idempotencyKey: prepared.idempotencyKey,
-      outcome: null,
-      state: "effect_started",
-    });
-    const replacementFingerprint = resetAccountFingerprint(replacementEmail);
-    expect(migrated.authorizeAccountRateLimitResetPolicy({
-      profileId: signedIn.id,
-      processGeneration: signedIn.processGeneration,
-      accountFingerprint: replacementFingerprint,
-      weeklyWindowDurationMinutes: 10_080,
-      weeklyWindowResetsAt: 500_100_000,
-    })).toMatchObject({
-      decision: "suppress",
-      policy: {
-        accountFingerprint: replacementFingerprint,
-        state: "window_suppressed",
-      },
-    });
-    expect(migrated.readRecoverableAccountRateLimitReset(
-      signedIn.id,
-      accountFingerprint,
-    )).toBeNull();
-    expect(migrated.latestAccountRateLimitResetAttempt(
-      signedIn.id,
-      accountFingerprint,
-    )).toMatchObject({
-      idempotencyKey: prepared.idempotencyKey,
-      localResolution: "account_identity_changed",
-      outcome: null,
-      state: "closed",
-    });
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
-    try {
+      expect(migrated.readRecoverableAccountRateLimitReset(source.signedIn.id, source.fingerprint)).toBeNull();
+      expect(migrated.latestAccountRateLimitResetAttempt(source.signedIn.id, source.fingerprint)).toMatchObject({
+        idempotencyKey: source.started.idempotencyKey, localResolution: "account_identity_changed",
+        outcome: null, state: "closed",
+      });
       expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
-      expect(inspector.query(
-        "SELECT COUNT(*) AS count FROM account_rate_limit_reset_attempts",
-      ).get()).toEqual({ count: 1 });
-    } finally {
-      inspector.close(false);
-    }
+      expect(inspector.query("SELECT COUNT(*) AS count FROM account_rate_limit_reset_attempts").get()).toEqual({ count: 1 });
+    } finally { inspector.close(false); }
   });
 
-  test("reconciles retained partial-v28 policies when user_version is still 27", async () => {
-    const { store } = await fixture();
-    const email = "partial-policy@example.com";
-    const profile = signInProfile(store, "Partial reset policy", email);
-    const accountFingerprint = resetAccountFingerprint(email);
-    const prepared = prepareAuthorizedReset(store, {
-      profileId: profile.id,
-      processGeneration: profile.processGeneration,
-      accountFingerprint,
-      weeklyWindowResetsAt: 500_000_000,
-      observedUsedPercent: 99,
-    });
-    beginAuthorizedReset(store, prepared);
-    const previousPolicy = store.requireAccountRateLimitResetPolicy(profile.id);
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
-    const partial = new Database(paths.database, { create: false, strict: true });
+  test("reconciles an explicitly source-derived partial-v28 policy boundary stamped 27", async () => {
+    const source = canonicalResetPolicyFixtures[28];
+    const ledger = [...source.ledger].sort((a, b) => a.version - b.version);
+    const paths = await canonicalResetPolicyArchive(28);
+    const inspector = new Database(paths.database, { create: false, strict: true });
     try {
-      dropSchemaAfterVersion34(partial);
-      partial.exec("DELETE FROM migrations WHERE version>27; DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=27");
-    } finally {
-      partial.close(false);
-    }
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 28 });
+      expect(inspector.query("SELECT * FROM migrations ORDER BY version").all()).toEqual(ledger);
+      const original = canonicalAuthBudgetRows(inspector, ["profiles", "account_rate_limit_reset_attempts", "usage_revision_authority"]);
+      const intact = canonicalAuthBudgetSnapshot(inspector);
+      // An adversarial partial-stamp derivative, not a released v27 database
+      // or an observed interrupted migration. Retain every authentic v28 data
+      // cell and schema object, changing only its exact final ledger/stamp.
+      inspector.transaction(() => {
+        expect(inspector.query("DELETE FROM migrations WHERE version=28").run().changes).toBe(1);
+        inspector.exec("PRAGMA user_version=27");
+      }).immediate();
+      const partial = canonicalAuthBudgetSnapshot(inspector);
+      expect(partial.schema).toEqual(intact.schema);
+      for (const [table, rows] of Object.entries(intact.rows)) {
+        if (table !== "migrations") expect(partial.rows[table]).toEqual(rows);
+      }
+      expect(inspector.query("SELECT * FROM migrations ORDER BY version").all())
+        .toEqual(ledger.filter((entry) => entry.version !== 28));
+      expect(() => { const opened = new StateStore(paths, { readonly: true }); opened.close(); })
+        .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:27:60");
+      expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(partial);
 
-    const migrated = new StateStore(paths, { now: () => 2_000 });
-    stores.push(migrated);
-    expect(migrated.requireAccountRateLimitResetPolicy(profile.id)).toMatchObject({
-      state: "reconciliation_required",
-      accountFingerprint: null,
-      weeklyWindowResetsAt: null,
-      revision: previousPolicy.revision + 1,
-    });
-    expect(migrated.readRecoverableAccountRateLimitReset(
-      profile.id,
-      accountFingerprint,
-    )).toMatchObject({
-      idempotencyKey: prepared.idempotencyKey,
-      outcome: null,
-      state: "effect_started",
-    });
+      const migrated = new StateStore(paths, { now: () => 40_000, resolveMachineTimeZone: () => "UTC" });
+      stores.push(migrated);
+      expect(original.read()).toEqual(original.before);
+      expect(migrated.requireAccountRateLimitResetPolicy(source.signedIn.id)).toMatchObject({
+        state: "reconciliation_required", accountFingerprint: null,
+        weeklyWindowResetsAt: null, revision: source.policy.revision + 1,
+      });
+      expect(migrated.requireAccountRateLimitResetPolicy(source.signedOut.id)).toMatchObject({
+        state: "reconciliation_required", accountFingerprint: null, weeklyWindowResetsAt: null, revision: 2,
+      });
+      expect(() => migrated.requireAccountRateLimitResetPolicy(source.removed.id))
+        .toThrow("ACCOUNT_RATE_LIMIT_RESET_POLICY_MISSING");
+      expect(migrated.readRecoverableAccountRateLimitReset(source.signedIn.id, source.fingerprint))
+        .toMatchObject(source.started);
+      expect(inspector.query("SELECT * FROM migrations WHERE version<=27 ORDER BY version").all())
+        .toEqual(ledger.filter((entry) => entry.version !== 28));
+      expect(inspector.query("SELECT * FROM migrations WHERE version=28").get()).toEqual({ version: 28, applied_at: 40_000 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
+      expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      for (const readonly of [false, true]) {
+        const snapshot = canonicalAuthBudgetSnapshot(inspector);
+        const reopened = new StateStore(paths, { readonly, now: () => 40_001 });
+        try {
+          expect(reopened.requireAccountRateLimitResetPolicy(source.signedIn.id))
+            .toEqual(migrated.requireAccountRateLimitResetPolicy(source.signedIn.id));
+        } finally { reopened.close(); }
+        expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(snapshot);
+      }
+    } finally { inspector.close(false); }
   });
 
   test("persists reset-policy reconciliation until the suppressed boundary has elapsed", async () => {
@@ -26667,7 +25729,7 @@ describe("StateStore", () => {
     expect(() => new StateStore(paths)).toThrow("CODEX_USAGE_SNAPSHOT_DIGEST_INVALID");
   });
 
-  test("refuses weakened same-name usage guards in current49 without rewriting authority", async () => {
+  test("refuses weakened same-name usage guards in current60 without rewriting authority", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Repair v36 guards", "repair-v36@example.com");
     const codexAuthority = store.requireProviderAccountAuthority(profile.id, "codex");
@@ -26704,8 +25766,7 @@ describe("StateStore", () => {
       weakened.close(false);
     }
 
-    expectInertSchemaRefusal(paths, "STATE_SCHEMA_COHORT_INVALID:private-task48:account_scoped_provider_authorities_immutable_update",
-      "STATE_SCHEMA_COHORT_INVALID:combined49:account_scoped_provider_authorities_immutable_update");
+    expectInertSchemaRefusal(paths, "STATE_SCHEMA_COHORT_INVALID:joined60:account_scoped_provider_authorities_immutable_update");
   });
   test("refuses weakened same-name switch guards in current49 without rewriting authority", async () => {
     const { store } = await fixture();
@@ -27342,485 +26403,188 @@ describe("StateStore", () => {
     expect(readonly.requireInteraction(interaction.publicId)).toEqual(interaction);
   });
 
-  test("migrates pre-provider-authority evidence from v38 and reruns idempotently", async () => {
-    const { store } = await fixture();
-    const first = store.createProfile("Earlier signed out");
-    const signedIn = signInProfile(store, "Later signed in", "later@example.com");
-    const signedInCodexAccountKey = providerAccountKeyForProfile(store, signedIn.id, "codex");
-    store.advanceProviderAccountProcessGeneration({
-      profileId: signedIn.id,
-      provider: "claude",
-      expectedProcessGeneration: 0,
-    });
-    const codexAuthority = store.requireProviderAccountAuthority(signedIn.id, "codex");
-    const claudeAuthority = store.requireProviderAccountAuthority(signedIn.id, "claude");
-    const codexSession = store.createSession({
-      fastEnabled: false,
-      preset: "high",
-      profileId: signedIn.id,
-      provider: "codex",
-    });
-    store.recordSessionRuntimeProfile({
-      profile: reviewedCodexProfile(signedIn, 2_100),
-      sessionId: codexSession.id,
-      sourceId: "legacy-codex-session",
-      sourceKind: "session_start",
-      providerAuthority: codexAuthority,
-    });
-    const claudeSession = store.createSession({
-      fastEnabled: false,
-      preset: "fable-max",
-      profileId: signedIn.id,
-      provider: "claude",
-    });
-    store.recordSessionRuntimeProfile({
-      profile: reviewedClaudeProfile(signedIn, 2_200),
-      sessionId: claudeSession.id,
-      sourceId: "legacy-claude-session",
-      sourceKind: "session_start",
-      providerAuthority: claudeAuthority,
-    });
-    const conflictingSession = store.createSession({
-      fastEnabled: false,
-      preset: "fable-max",
-      profileId: signedIn.id,
-      provider: "claude",
-    });
-    store.recordSessionRuntimeProfile({
-      profile: reviewedClaudeProfile(signedIn, 2_300),
-      sessionId: conflictingSession.id,
-      sourceId: "legacy-conflicting-session",
-      sourceKind: "session_start",
-      providerAuthority: claudeAuthority,
-    });
-    const revisionPrecedenceSession = store.createSession({
-      fastEnabled: false,
-      preset: "fable-max",
-      profileId: signedIn.id,
-      provider: "claude",
-    });
-    const invalidLatestSession = store.createSession({
-      fastEnabled: false,
-      preset: "high",
-      profileId: signedIn.id,
-      provider: "codex",
-    });
-    const unprovedSession = upsertProvenTestSession(store, {
-      fastEnabled: false,
-      preset: "high",
-      profileId: signedIn.id,
-      provider: "codex",
-      providerThreadId: "legacy-unproved-thread", state: "idle",
-    });
-    const unprovedQueue = store.enqueue(unprovedSession.id, "unproved queue authority");
-    const unprovedInteraction = store.admitInteraction({
-      authority: {
-        ...codexInteractionBinding(store, signedIn.id),
-        approvalId: null,
-        connectionId: "35000000-0000-4000-8000-000000000001",
-        itemId: "legacy-unproved-item",
-        method: "item/commandExecution/requestApproval",
-        processGeneration: signedIn.processGeneration,
-        profileId: signedIn.id,
-        requestDigest: "9".repeat(64),
-        requestId: { type: "string", value: "legacy-unproved-request" },
-        threadId: "legacy-unproved-thread",
-        turnId: "legacy-unproved-turn",
-      },
-      blocking: true,
-      display: {
-        availableDecisions: ["once", "session", "decline", "cancel"],
-        commandClass: "test",
-        kind: "command_approval",
-        reason: null,
-        summary: "Run a bounded legacy check",
-        workingDirectory: null,
-      },
-      kind: "command_approval",
-      publicId: "35000000-0000-4000-8000-000000000002",
-      sessionId: unprovedSession.id,
-    }).record;
-    const unprovedMutation = store.prepareMutation({
-      authorityGeneration: signedIn.processGeneration,
-      authorityId: unprovedSession.id,
-      idempotencyKey: "35000000-0000-4000-8000-000000000003",
-      kind: "session.rename",
-      request: { name: "Unproved rename" },
-    });
-    expect(store.transitionMutation(unprovedMutation.id, "prepared", "effect_started"))
-      .toBe(true);
+  test("migrates captured v38 runtime evidence and adversarial derivatives without inventing authority", async () => {
+    const captured = canonical38RuntimeFixture;
+    const c = captured.retained;
+    const { first, signedIn, target } = c;
+    const codexSession = c.codex.session;
+    const claudeSession = c.claude.session;
+    const conflictingSession = c.conflictingBaseline.session;
+    const revisionPrecedenceSession = c.revisionPrecedence.session;
+    const invalidLatestSession = c.invalidLatestBaseline.session;
+    const unprovedSession = c.unproved.session;
+    const unprovedQueue = c.unproved.queue;
+    const unprovedInteraction = c.unproved.interaction;
+    const unprovedMutation = c.unproved.mutation;
+    const unprovedEvent = c.unproved.event;
+    const switchedSession = c.switched.session;
+    const historicalQueue = c.switched.queue;
+    const historicalEvent = c.switched.event;
+    const migratedAt = 60_000;
+    expect(first.createdAt).toBeLessThan(signedIn.createdAt);
+    expect(signedIn.createdAt).toBeLessThan(target.createdAt);
+    expect(target.createdAt).toBeLessThan(c.restartTarget.createdAt);
+    expect(first.state).toBe("signed_out");
+    expect(c.revisionPrecedence.second.revision).toBeGreaterThan(c.revisionPrecedence.record.revision);
+    expect(c.revisionPrecedence.second.recordedAt).toBeLessThan(c.revisionPrecedence.record.recordedAt);
 
-    // A v34 session can contain immutable source-provider observations even
-    // though its mutable session row already points at the switch target.
-    // Migration must keep those historical authorities and bind only the
-    // current session authority to the target provider.
-    const switchedSourceProfile = reviewedCodexProfile(signedIn, 2_800);
-    const switchedSession = store.createSession({
-      fastEnabled: false,
-      preset: "high",
-      profileId: signedIn.id,
-      provider: "codex",
-    });
-    store.recordSessionRuntimeProfile({
-      profile: switchedSourceProfile,
-      sessionId: switchedSession.id,
-      sourceId: "legacy-switched-source",
-      sourceKind: "session_start",
-      providerAuthority: codexAuthority,
-    });
-    const switchedBound = store.bindSession({
-      expectedRevision: switchedSession.revision,
-      providerThreadId: "legacy-switched-codex-thread",
-      providerUpdatedAt: 2_800,
-      sessionId: switchedSession.id,
-      state: "idle",
-    });
-    store.bindSessionProviderAccountAuthority({ sessionId: switchedSession.id,
-      provider: "codex", runtimeScope: "managed",
-      accountKey: providerAccountKeyForProfile(store, signedIn.id, "codex") });
-    const historicalEvent = store.appendSessionEvent({
-      accountId: signedIn.id,
-      body: { type: "warning", code: "SOURCE_PROVIDER", message: "immutable source event" },
-      providerConnectionId: null,
-      providerGeneration: signedIn.processGeneration,
-      providerAuthority: codexAuthority,
-      sessionId: switchedSession.id,
-    });
-    const historicalQueueMessage = "immutable source queue";
-    const historicalQueue = store.enqueue(switchedSession.id, historicalQueueMessage);
-    store.beginQueueEffect({
-      evidence: {
-        baseline: { activeTurnId: null, providerUpdatedAt: 2_800, status: "idle" },
-        clientMessageId: historicalQueue.id,
-        kind: "queue.dispatch",
-        messageDigest: createHash("sha256").update(historicalQueueMessage).digest("hex"),
-        profileGeneration: signedIn.processGeneration,
-        providerThreadId: "legacy-switched-codex-thread",
-        queueId: historicalQueue.id,
-        runtimeProfile: switchedSourceProfile,
-        sessionId: switchedSession.id,
-      },
-      profileGeneration: signedIn.processGeneration,
-      providerAuthority: codexAuthority,
-      queueId: historicalQueue.id,
-      sessionId: switchedSession.id,
-      providerConnectionId: "10000000-0000-4000-8000-000000000234",
-    });
-    expect(store.failQueueEffect(historicalQueue.id)).toBe(true);
-    const targetAuthority = store.advanceProviderAccountProcessGeneration({
-      expectedProcessGeneration: 0,
-      profileId: first.id,
-      provider: "claude",
-    });
-    const switchAttempt = store.prepareMutation({
-      authorityGeneration: signedIn.processGeneration,
-      authorityId: switchedSession.id,
-      idempotencyKey: "35000000-0000-4000-8000-000000000004",
-      kind: "session.switch",
-      request: { preset: "fable-max", provider: "claude" },
-    });
-    expect(store.transitionMutation(switchAttempt.id, "prepared", "effect_started"))
-      .toBe(true);
-    const historicalTargetRuntime = reviewedClaudeProfile({
-      id: first.id,
-      processGeneration: targetAuthority.processGeneration,
-    }, 2_900);
-
-    const unprovedEvent = store.appendSessionEvent({
-      accountId: signedIn.id,
-      body: { type: "warning", code: "UNPROVED", message: "no immutable runtime" },
-      providerConnectionId: null,
-      providerGeneration: signedIn.processGeneration,
-      providerAuthority: codexAuthority,
-      sessionId: unprovedSession.id,
-    });
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-    const legacy = new Database(paths.database, { create: false, strict: true });
-    downgradeProviderAccountsToReleasedVersion(legacy);
-    legacy.query("UPDATE sessions SET provider='codex' WHERE id=?")
-      .run(conflictingSession.id);
-    // Build the historical mutable rebind and immutable target observation
-    // after removing the new authority layer. The fixture must not dispatch
-    // today's switch state machine merely to manufacture pre-migration rows.
-    legacy.query(
-      `UPDATE sessions SET profile_id=?,provider='claude',preset='ultra',
-         preset_contract=?,provider_thread_id=?,revision=?,updated_at=2900
-       WHERE id=?`,
-    ).run(first.id, currentPresetContract, "legacy-switched-claude-thread",
-      switchedBound.revision + 1, switchedSession.id);
-    legacy.query(
-      `INSERT INTO session_runtime_profiles(
-         session_id,revision,source_kind,source_id,profile_id,
-         process_generation,observed_at,profile_json,recorded_at
-       ) VALUES (?,2,'session_start',?,?,?,?,?,2900)`,
-    ).run(switchedSession.id, switchAttempt.id, first.id,
-      targetAuthority.processGeneration, 2_900, JSON.stringify(historicalTargetRuntime));
-    legacy.query(
-      "UPDATE mutation_attempts SET state='applied',result_json=? WHERE id=?",
-    ).run(JSON.stringify({ providerThreadId: "legacy-switched-claude-thread" }), switchAttempt.id);
-    // Legacy timestamps are not monotonic authority. Insert revision 1 with a
-    // later wall clock and a different valid provider document; revision 2
-    // must still win because the table itself is append-only.
-    legacy.query(
-      `INSERT INTO session_runtime_profiles(
-         session_id,revision,source_kind,source_id,profile_id,
-         process_generation,observed_at,profile_json,recorded_at
-       ) VALUES (?,1,'session_start',?,?,?,?,?,99000)`,
-    ).run(
-      revisionPrecedenceSession.id,
-      "legacy-revision-precedence-1",
-      signedIn.id,
-      signedIn.processGeneration,
-      2_400,
-      JSON.stringify(reviewedCodexProfile(signedIn, 2_400)),
-    );
-    legacy.query(
-      `INSERT INTO session_runtime_profiles(
-         session_id,revision,source_kind,source_id,profile_id,
-         process_generation,observed_at,profile_json,recorded_at
-       ) VALUES (?,2,'turn_start',?,?,?,?,?,1000)`,
-    ).run(
-      revisionPrecedenceSession.id,
-      "legacy-revision-precedence-2",
-      signedIn.id,
-      signedIn.processGeneration,
-      2_500,
-      JSON.stringify(reviewedClaudeProfile(signedIn, 2_500)),
-    );
-    // A malformed newest immutable row must quarantine the session instead of
-    // silently promoting an older valid revision.
-    legacy.query(
-      `INSERT INTO session_runtime_profiles(
-         session_id,revision,source_kind,source_id,profile_id,
-         process_generation,observed_at,profile_json,recorded_at
-       ) VALUES (?,1,'session_start',?,?,?,?,?,1000)`,
-    ).run(
-      invalidLatestSession.id,
-      "legacy-invalid-latest-1",
-      signedIn.id,
-      signedIn.processGeneration,
-      2_600,
-      JSON.stringify(reviewedCodexProfile(signedIn, 2_600)),
-    );
-    legacy.query(
-      `INSERT INTO session_runtime_profiles(
-         session_id,revision,source_kind,source_id,profile_id,
-         process_generation,observed_at,profile_json,recorded_at
-       ) VALUES (?,2,'turn_start',?,?,?,?,?,2000)`,
-    ).run(
-      invalidLatestSession.id,
-      "legacy-invalid-latest-2",
-      signedIn.id,
-      signedIn.processGeneration,
-      2_700,
-      JSON.stringify({ invalid: true }),
-    );
-    const legacyRows = {
-      interactions: legacy.query(
-        "SELECT * FROM provider_interactions ORDER BY public_id",
-      ).all(),
-      mutations: legacy.query(`SELECT *,NULL AS request_format,
-        NULL AS attachment_input_format,NULL AS attachment_custody_id,
-        NULL AS attachment_input_digest,NULL AS attachment_cleanup_terminal_digest
-        FROM mutation_attempts ORDER BY id`).all(),
-      profiles: legacy.query("SELECT * FROM profiles ORDER BY id").all(),
-      runtimeProfiles: legacy.query(
-        "SELECT * FROM session_runtime_profiles ORDER BY session_id,revision",
-      ).all(),
-      sessions: legacy.query("SELECT *,provider AS provider_v39 FROM sessions ORDER BY id").all(),
-    };
-    legacy.close(false);
-
-    const migrated = new StateStore(paths, { now: () => 9_000 });
-    stores.push(migrated);
-    expect(migrated.listProviderAccounts("codex").map((account) => ({
-      id: account.id,
-      orderPosition: account.orderPosition,
-      profileId: account.profileId,
-    }))).toEqual([
-      { id: first.id, orderPosition: 1, profileId: first.id },
-      { id: signedIn.id, orderPosition: 2, profileId: signedIn.id },
-    ]);
-    expect(migrated.readProviderAccountState("codex").activeProviderAccountId)
-      .toBe(signedIn.id);
-    expect(migrated.readProviderAccountState("claude").activeProviderAccountId)
-      .toBe(migrated.requireProviderAccountForProfile(first.id, "claude").id);
-    expect(migrated.requireSessionProviderAuthority(codexSession.id)).toMatchObject({
-      appliedPointerRevision: null,
-      profileId: signedIn.id,
-      provider: "codex",
-      routingProvenance: "explicit",
-    });
-    expect(migrated.requireSessionProviderAuthority(claudeSession.id)).toMatchObject({
-      appliedPointerRevision: null,
-      profileId: signedIn.id,
-      provider: "claude",
-      routingProvenance: "explicit",
-    });
-    expect(migrated.requireSessionProviderAuthority(revisionPrecedenceSession.id))
-      .toMatchObject({
-        profileId: signedIn.id,
-        provider: "claude",
-        routingProvenance: "explicit",
-      });
-    expect(() => migrated.requireSessionProviderAuthority(conflictingSession.id))
-      .toThrow("SESSION_PROVIDER_AUTHORITY_QUARANTINED:conflicting_immutable_runtime_authority");
-    expect(() => migrated.requireSessionProviderAuthority(unprovedSession.id))
-      .toThrow("SESSION_PROVIDER_AUTHORITY_QUARANTINED:missing_immutable_runtime_authority");
-    expect(() => migrated.requireSessionProviderAuthority(invalidLatestSession.id))
-      .toThrow("SESSION_PROVIDER_AUTHORITY_QUARANTINED:missing_immutable_runtime_authority");
-    const migratedSourceAuthority = migrated.requireProviderAccountAuthority(
-      signedIn.id,
-      "codex",
-    );
-    const migratedTargetAuthority = migrated.requireProviderAccountAuthority(first.id, "claude");
-    expect(migrated.requireSessionProviderAuthority(switchedSession.id)).toMatchObject({
-      profileId: first.id,
-      provider: "claude",
-      providerAccountId: migratedTargetAuthority.providerAccountId,
-      processGeneration: migratedTargetAuthority.processGeneration,
-    });
-    expect(migrated.readQueueProviderAuthority(historicalQueue.id))
-      .toEqual(migratedSourceAuthority);
-    expect(migrated.listSessionEvents({
-      afterSequence: 0,
-      sessionId: switchedSession.id,
-    }).events.some((event) => event.accountId === signedIn.id
-      && event.providerGeneration === signedIn.processGeneration
-      && event.sequence === historicalEvent.sequence)).toBe(true);
-
-    // The historical trigger branches fail closed: naming a legacy
-    // provenance is insufficient without its matching immutable source row.
-    // Queue sidecars additionally bind to the exact queue-effect document,
-    // including its account, generation, and provider-discriminated preset.
-    const guardQueueMessage = "guard queue authority";
-    const guardQueueId = `queue_${"e".repeat(32)}`;
-    const guardRuntime = reviewedClaudeProfile({
-      id: first.id,
-      processGeneration: migratedTargetAuthority.processGeneration,
-    }, 9_100);
-    const guardEvidence = {
-      baseline: { activeTurnId: null, providerUpdatedAt: null, status: "idle" as const },
-      clientMessageId: guardQueueId,
-      kind: "queue.dispatch" as const,
-      messageDigest: createHash("sha256").update(guardQueueMessage).digest("hex"),
-      profileGeneration: migratedTargetAuthority.processGeneration,
-      providerThreadId: "legacy-switched-claude-thread",
-      queueId: guardQueueId,
-      runtimeProfile: guardRuntime,
-      sessionId: switchedSession.id,
-    };
-    const guardEvidenceJson = JSON.stringify(guardEvidence);
-    const guardDatabase = new Database(paths.database, { create: false, strict: true });
+    // First prove that the intact archived image admits each valid baseline.
+    const controlPaths = await canonical38RuntimeArchive();
+    const control = new StateStore(controlPaths, { now: () => migratedAt, resolveMachineTimeZone: () => "UTC" });
     try {
-      expect(guardDatabase.query(
-        `SELECT provider_account_id,profile_id,provider,binding_generation,process_generation
-         FROM session_event_provider_authorities
-         WHERE session_id=? AND sequence=?`,
-      ).get(switchedSession.id, historicalEvent.sequence)).toEqual({
-        binding_generation: migratedSourceAuthority.bindingGeneration,
-        process_generation: migratedSourceAuthority.processGeneration,
-        profile_id: migratedSourceAuthority.profileId,
-        provider: migratedSourceAuthority.provider,
-        provider_account_id: migratedSourceAuthority.providerAccountId,
-      });
-      // Isolate the historical provider-proof trigger from modern account
-      // admission. This rollback-only corruption probe leaves no new queue,
-      // no fabricated historical attachment identity, and no weakened guard.
-      const queueProbeRollback = "ROLLBACK_LEGACY_QUEUE_AUTHORITY_PROBE";
-      const queueProbe = guardDatabase.transaction(() => {
-      const guardQueueSequence = guardDatabase.query(
-        `UPDATE queue_sequence_authority
-         SET next_sequence=next_sequence+1
-         WHERE singleton=1
-         RETURNING next_sequence-1 AS enqueue_sequence`,
-      ).get() as { enqueue_sequence: number };
-      withRemovedTestGuards(guardDatabase, ["session_account_authority_queue_guard"], () => guardDatabase.query(
-        `INSERT INTO queue_entries(
-           id,session_id,message,state,created_at,updated_at,enqueue_sequence
-         ) VALUES (?,?,?,'pending',?,?,?)`,
-      ).run(
-        guardQueueId,
-        switchedSession.id,
-        guardQueueMessage,
-        9_100,
-        9_100,
-        guardQueueSequence.enqueue_sequence,
-      ));
-      guardDatabase.query(
-        `INSERT INTO queue_effect_evidence(
-           queue_id,evidence_json,evidence_digest,recorded_at
-         ) VALUES (?,?,?,?)`,
-      ).run(
-        guardQueueId,
-        guardEvidenceJson,
-        createHash("sha256").update(guardEvidenceJson).digest("hex"),
-        9_100,
-      );
-      const insertQueueAuthority = guardDatabase.query(
-        `INSERT INTO queue_provider_authorities(
-           queue_id,provider_account_id,profile_id,provider,binding_generation,
-           process_generation,provenance,recorded_at
-         ) VALUES (?,?,?,?,?,?,?,?)`,
-      );
-      expect(() => insertQueueAuthority.run(
-        guardQueueId,
-        migratedTargetAuthority.providerAccountId,
-        migratedTargetAuthority.profileId,
-        migratedTargetAuthority.provider,
-        migratedTargetAuthority.bindingGeneration,
-        migratedTargetAuthority.processGeneration,
-        "forged_unknown_provenance",
-        9_100,
-      )).toThrow("queue provider authority mismatch");
-      expect(() => insertQueueAuthority.run(
-        guardQueueId,
-        migratedSourceAuthority.providerAccountId,
-        migratedSourceAuthority.profileId,
-        migratedSourceAuthority.provider,
-        migratedSourceAuthority.bindingGeneration,
-        migratedSourceAuthority.processGeneration,
-        "legacy_queue_runtime",
-        9_100,
-      )).toThrow("queue provider authority mismatch");
-      expect(() => insertQueueAuthority.run(
-        guardQueueId,
-        migratedTargetAuthority.providerAccountId,
-        migratedTargetAuthority.profileId,
-        migratedTargetAuthority.provider,
-        migratedTargetAuthority.bindingGeneration,
-        migratedTargetAuthority.processGeneration + 1,
-        "legacy_queue_runtime",
-        9_100,
-      )).toThrow("queue provider authority mismatch");
-      const targetCodexAuthority = migrated.requireProviderAccountAuthority(first.id, "codex");
-      expect(() => insertQueueAuthority.run(
-        guardQueueId,
-        targetCodexAuthority.providerAccountId,
-        targetCodexAuthority.profileId,
-        targetCodexAuthority.provider,
-        targetCodexAuthority.bindingGeneration,
-        migratedTargetAuthority.processGeneration,
-        "legacy_queue_runtime",
-        9_100,
-      )).toThrow("queue provider authority mismatch");
-      insertQueueAuthority.run(
-        guardQueueId,
-        migratedTargetAuthority.providerAccountId,
-        migratedTargetAuthority.profileId,
-        migratedTargetAuthority.provider,
-        migratedTargetAuthority.bindingGeneration,
-        migratedTargetAuthority.processGeneration,
-        "queue_runtime",
-        9_100,
-      );
-      throw new Error(queueProbeRollback);
-      });
-      expect(() => queueProbe()).toThrow(queueProbeRollback);
-      expect(guardDatabase.query("SELECT * FROM queue_entries WHERE id=?").all(guardQueueId)).toEqual([]);
+      expect(control.requireSessionProviderAuthority(conflictingSession.id)).toMatchObject({ provider: "claude", profileId: signedIn.id });
+      expect(control.requireSessionProviderAuthority(invalidLatestSession.id)).toMatchObject({ provider: "codex", profileId: signedIn.id });
+      expect(control.requireSessionProviderAuthority(revisionPrecedenceSession.id)).toMatchObject({ provider: "claude", profileId: signedIn.id });
+    } finally { control.close(); }
 
+    const paths = await canonical38RuntimeArchive();
+    const inspector = new Database(paths.database, { create: false, strict: true });
+    try {
+      inspector.exec("PRAGMA foreign_keys=ON");
+      const original = canonicalAuthBudgetSnapshot(inspector);
+      // Explicitly test-derived old-state disagreements, not writer output:
+      // a mutable provider cell; a malformed newest runtime; and conflicting
+      // older runtime bytes whose later timestamp must not outrank revision2.
+      expect(inspector.query("UPDATE sessions SET provider='codex' WHERE id=?").run(conflictingSession.id).changes).toBe(1);
+      const insertLatest = inspector.query("INSERT INTO session_runtime_profiles(session_id,revision,source_kind,source_id,profile_id,process_generation,observed_at,profile_json,recorded_at) VALUES (?,2,'session_start',?,?,?,38101,?,38101)");
+      expect(insertLatest.run(invalidLatestSession.id, "adversarial-invalid-latest", signedIn.id, signedIn.processGeneration, '{"invalid":true}').changes).toBe(1);
+      const replaceOlder = () => inspector.query("UPDATE session_runtime_profiles SET profile_json=? WHERE session_id=? AND revision=1")
+        .run(JSON.stringify(c.codex.runtime), revisionPrecedenceSession.id);
+      expect(replaceOlder).toThrow("session runtime profile is immutable");
+      withRemovedTestGuards(inspector, ["session_runtime_profiles_immutable_update"], () => {
+        expect(replaceOlder().changes).toBe(1);
+      });
+      const derived = canonicalAuthBudgetSnapshot(inspector);
+      expect(derived.schema).toEqual(original.schema);
+      expect(derived.version).toEqual(original.version);
+      for (const [table, rows] of Object.entries(original.rows)) {
+        if (table !== "sessions" && table !== "session_runtime_profiles") expect(derived.rows[table]).toEqual(rows);
+      }
+      const sessionRows = z.array(z.object({ id: z.string() }).passthrough()).parse(original.rows.sessions);
+      expect(derived.rows.sessions).toEqual(sessionRows.map((row) => row.id === conflictingSession.id ? { ...row, provider: "codex" } : row));
+      expect(inspector.query("SELECT profile_json,recorded_at FROM session_runtime_profiles WHERE session_id=? ORDER BY revision")
+        .all(revisionPrecedenceSession.id)).toEqual([
+          { profile_json: JSON.stringify(c.codex.runtime), recorded_at: c.revisionPrecedence.record.recordedAt },
+          { profile_json: JSON.stringify(c.revisionPrecedence.second.profile), recorded_at: c.revisionPrecedence.second.recordedAt },
+        ]);
+      const retained = canonicalAuthBudgetRows(inspector, [
+        "profiles", "provider_interactions", "provider_interaction_transitions",
+        "session_runtime_profiles", "session_turn_runtime_profiles", "session_events",
+        "queue_entries", "queue_effect_evidence", "mutation_effect_evidence",
+        "session_mutation_authority_rebinds", "session_provider_switch_targets",
+        "session_provider_switch_seed_intents", "session_provider_switch_seed_results",
+        "session_provider_switch_source_releases",
+      ]);
+      const sessions = canonicalAuthBudgetRows(inspector, ["sessions"]);
+      const mutations = canonicalAuthBudgetRows(inspector, ["mutation_attempts"]);
+      expect(() => { new StateStore(paths, { readonly: true }).close(); }).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:38:60");
+      expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(derived);
+      const migrated = new StateStore(paths, { now: () => migratedAt, resolveMachineTimeZone: () => "UTC" });
+      stores.push(migrated);
+      expect(migrated.listProviderAccounts("codex").map((account) => ({
+        id: account.id, orderPosition: account.orderPosition, profileId: account.profileId,
+      }))).toEqual([first, signedIn, target, c.restartTarget].map((profile, index) => ({
+        id: profile.id, orderPosition: index + 1, profileId: profile.id,
+      })));
+      expect(migrated.readProviderAccountState("codex").activeProviderAccountId).toBe(signedIn.id);
+      expect(migrated.readProviderAccountState("claude").activeProviderAccountId)
+        .toBe(migrated.requireProviderAccountForProfile(first.id, "claude").id);
+      for (const [session, provider] of [[codexSession, "codex"], [claudeSession, "claude"], [revisionPrecedenceSession, "claude"]] as const) {
+        expect(migrated.requireSessionProviderAuthority(session.id)).toMatchObject({
+          appliedPointerRevision: null, profileId: signedIn.id, provider, routingProvenance: "explicit",
+        });
+      }
+      expect(() => migrated.requireSessionProviderAuthority(conflictingSession.id))
+        .toThrow("SESSION_PROVIDER_AUTHORITY_QUARANTINED:conflicting_immutable_runtime_authority");
+      for (const session of [unprovedSession, invalidLatestSession]) {
+        expect(() => migrated.requireSessionProviderAuthority(session.id))
+          .toThrow("SESSION_PROVIDER_AUTHORITY_QUARANTINED:missing_immutable_runtime_authority");
+      }
+      const migratedSourceAuthority = migrated.requireProviderAccountAuthority(signedIn.id, "codex");
+      const migratedTargetAuthority = migrated.requireProviderAccountAuthority(target.id, "claude");
+      expect(migrated.requireSessionProviderAuthority(switchedSession.id)).toMatchObject({
+        profileId: target.id, provider: "claude", providerAccountId: migratedTargetAuthority.providerAccountId,
+        processGeneration: migratedTargetAuthority.processGeneration,
+      });
+      expect(migrated.readQueueProviderAuthority(historicalQueue.id)).toEqual(migratedSourceAuthority);
+      expectHistoricalValue(migrated.readQueueEffect(historicalQueue.id), c.switched.queueEffect);
+      expect(migrated.listSessionEvents({ afterSequence: 0, sessionId: switchedSession.id }).events.some(
+        (event) => event.accountId === signedIn.id && event.providerGeneration === signedIn.processGeneration
+          && event.sequence === historicalEvent.sequence,
+      )).toBe(true);
+      // Exercise the actual captured queue's immutable document and anchor,
+      // rather than constructing a new effect outside its provenance writer.
+      const sourceClaudeAuthority = migrated.requireProviderAccountAuthority(signedIn.id, "claude");
+      const guardDatabase = new Database(paths.database, { create: false, strict: true });
+      try {
+        expect(guardDatabase.query(
+          "SELECT provider_account_id,profile_id,provider,binding_generation,process_generation FROM session_event_provider_authorities WHERE session_id=? AND sequence=?",
+        ).get(switchedSession.id, historicalEvent.sequence)).toEqual({
+          binding_generation: migratedSourceAuthority.bindingGeneration,
+          process_generation: migratedSourceAuthority.processGeneration,
+          profile_id: migratedSourceAuthority.profileId,
+          provider: migratedSourceAuthority.provider,
+          provider_account_id: migratedSourceAuthority.providerAccountId,
+        });
+        const capturedQueueAuthority = z.object({
+          queue_id: z.string(), provider_account_id: z.string(), profile_id: z.string(), provider: z.string(),
+          binding_generation: z.number(), process_generation: z.number(), provenance: z.literal("legacy_queue_runtime"),
+          recorded_at: z.number(),
+        }).strict().parse(guardDatabase.query("SELECT * FROM queue_provider_authorities WHERE queue_id=?").get(historicalQueue.id));
+        const beforeQueueProbe = canonicalAuthBudgetSnapshot(guardDatabase);
+        const queueProbeRollback = "ROLLBACK_LEGACY_QUEUE_AUTHORITY_PROBE";
+        const queueProbe = guardDatabase.transaction(() => {
+          // This temporary sidecar removal changes no captured effect bytes,
+          // provenance or schema. Every installed guard remains intact.
+          expect(guardDatabase.query("DELETE FROM queue_provider_authorities WHERE queue_id=?").run(historicalQueue.id).changes).toBe(1);
+          const missingSidecar = canonicalAuthBudgetSnapshot(guardDatabase);
+          const insert = (authority: typeof capturedQueueAuthority) => guardDatabase.query(
+            "INSERT INTO queue_provider_authorities(queue_id,provider_account_id,profile_id,provider,binding_generation,process_generation,provenance,recorded_at) VALUES (?,?,?,?,?,?,?,?)",
+          ).run(authority.queue_id, authority.provider_account_id, authority.profile_id, authority.provider,
+            authority.binding_generation, authority.process_generation, authority.provenance, authority.recorded_at);
+          for (const wrong of [
+            { ...capturedQueueAuthority, profile_id: migratedTargetAuthority.profileId,
+              provider_account_id: migratedTargetAuthority.providerAccountId, provider: migratedTargetAuthority.provider,
+              binding_generation: migratedTargetAuthority.bindingGeneration, process_generation: migratedTargetAuthority.processGeneration },
+            { ...capturedQueueAuthority, process_generation: capturedQueueAuthority.process_generation + 1 },
+            { ...capturedQueueAuthority, provider_account_id: sourceClaudeAuthority.providerAccountId, provider: sourceClaudeAuthority.provider,
+              binding_generation: sourceClaudeAuthority.bindingGeneration },
+          ]) {
+            expect(() => insert(wrong)).toThrow(/queue provider authority mismatch|JOINED_EVIDENCE_BOUNDARY_REFUSED/u);
+            expect(canonicalAuthBudgetSnapshot(guardDatabase)).toEqual(missingSidecar);
+          }
+          expect(() => guardDatabase.query(
+            "INSERT INTO queue_provider_authorities SELECT ?,?,?,?,?,?,'forged_unknown_provenance',?",
+          ).run(historicalQueue.id, capturedQueueAuthority.provider_account_id, capturedQueueAuthority.profile_id,
+            capturedQueueAuthority.provider, capturedQueueAuthority.binding_generation,
+            capturedQueueAuthority.process_generation, capturedQueueAuthority.recorded_at))
+            .toThrow("queue provider authority mismatch");
+          expect(canonicalAuthBudgetSnapshot(guardDatabase)).toEqual(missingSidecar);
+          expect(insert(capturedQueueAuthority).changes).toBe(1);
+          expect(canonicalAuthBudgetSnapshot(guardDatabase)).toEqual(beforeQueueProbe);
+          throw new Error(queueProbeRollback);
+        });
+        expect(() => queueProbe()).toThrow(queueProbeRollback);
+        expect(canonicalAuthBudgetSnapshot(guardDatabase)).toEqual(beforeQueueProbe);
+        expect(migrated.readQueueProviderAuthority(historicalQueue.id)).toEqual(migratedSourceAuthority);
+        expectHistoricalValue(migrated.readQueueEffect(historicalQueue.id), c.switched.queueEffect);
+
+        // A different old queue has no effect or anchor. Even copied valid
+        // runtime fields cannot create new evidence outside the joined writer.
+        const unanchored = { ...c.switched.queueEffect.evidence, queueId: unprovedQueue.id,
+          clientMessageId: unprovedQueue.id, sessionId: unprovedSession.id,
+          providerThreadId: unprovedSession.providerThreadId,
+          messageDigest: createHash("sha256").update(unprovedQueue.message).digest("hex") };
+        const unanchoredJson = JSON.stringify(unanchored);
+        expect(guardDatabase.query("SELECT * FROM queue_effect_evidence WHERE queue_id=?").all(unprovedQueue.id)).toEqual([]);
+        expect(() => guardDatabase.query(
+          "INSERT INTO queue_effect_evidence(queue_id,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?)",
+        ).run(unprovedQueue.id, unanchoredJson, createHash("sha256").update(unanchoredJson).digest("hex"), 61_100))
+          .toThrow("EFFECT_EVIDENCE_PROVENANCE_CORRUPT");
+        expect(canonicalAuthBudgetSnapshot(guardDatabase)).toEqual(beforeQueueProbe);
+
+      // Schema60 replaces this event guard with the joined boundary's exact
+      // refusal; every rejected insertion must leave all retained state intact.
       const insertEventAuthority = guardDatabase.query(
         `INSERT INTO session_event_provider_authorities(
            session_id,sequence,provider_account_id,profile_id,provider,
@@ -27836,8 +26600,9 @@ describe("StateStore", () => {
         migratedSourceAuthority.bindingGeneration,
         migratedSourceAuthority.processGeneration,
         "legacy_session_runtime",
-        9_100,
-      )).toThrow("session event provider authority mismatch");
+        61_100,
+      )).toThrow("JOINED_EVIDENCE_BOUNDARY_REFUSED");
+      expect(canonicalAuthBudgetSnapshot(guardDatabase)).toEqual(beforeQueueProbe);
       expect(() => insertEventAuthority.run(
         unprovedSession.id,
         unprovedEvent.sequence,
@@ -27847,8 +26612,9 @@ describe("StateStore", () => {
         migratedSourceAuthority.bindingGeneration,
         migratedSourceAuthority.processGeneration,
         "legacy_interaction_authority",
-        9_100,
-      )).toThrow("session event provider authority mismatch");
+        61_100,
+      )).toThrow("JOINED_EVIDENCE_BOUNDARY_REFUSED");
+      expect(canonicalAuthBudgetSnapshot(guardDatabase)).toEqual(beforeQueueProbe);
       expect(() => insertEventAuthority.run(
         unprovedSession.id,
         unprovedEvent.sequence,
@@ -27858,8 +26624,9 @@ describe("StateStore", () => {
         migratedSourceAuthority.bindingGeneration,
         migratedSourceAuthority.processGeneration,
         "forged_unknown_provenance",
-        9_100,
-      )).toThrow("session event provider authority mismatch");
+        61_100,
+      )).toThrow("JOINED_EVIDENCE_BOUNDARY_REFUSED");
+      expect(canonicalAuthBudgetSnapshot(guardDatabase)).toEqual(beforeQueueProbe);
       expect(() => insertEventAuthority.run(
         unprovedSession.id,
         unprovedEvent.sequence,
@@ -27869,8 +26636,9 @@ describe("StateStore", () => {
         migratedTargetAuthority.bindingGeneration,
         migratedTargetAuthority.processGeneration,
         "legacy_session_runtime",
-        9_100,
-      )).toThrow("session event provider authority mismatch");
+        61_100,
+      )).toThrow("JOINED_EVIDENCE_BOUNDARY_REFUSED");
+      expect(canonicalAuthBudgetSnapshot(guardDatabase)).toEqual(beforeQueueProbe);
       expect(() => insertEventAuthority.run(
         unprovedSession.id,
         unprovedEvent.sequence,
@@ -27880,8 +26648,9 @@ describe("StateStore", () => {
         migratedSourceAuthority.bindingGeneration,
         migratedSourceAuthority.processGeneration + 1,
         "legacy_session_runtime",
-        9_100,
-      )).toThrow("session event provider authority mismatch");
+        61_100,
+      )).toThrow("JOINED_EVIDENCE_BOUNDARY_REFUSED");
+      expect(canonicalAuthBudgetSnapshot(guardDatabase)).toEqual(beforeQueueProbe);
       expect(() => insertEventAuthority.run(
         unprovedSession.id,
         unprovedEvent.sequence,
@@ -27891,8 +26660,9 @@ describe("StateStore", () => {
         migratedSourceAuthority.bindingGeneration,
         migratedSourceAuthority.processGeneration,
         "legacy_session_runtime",
-        9_100,
-      )).toThrow("session event provider authority mismatch");
+        61_100,
+      )).toThrow("JOINED_EVIDENCE_BOUNDARY_REFUSED");
+      expect(canonicalAuthBudgetSnapshot(guardDatabase)).toEqual(beforeQueueProbe);
       expect(guardDatabase.query(
         `SELECT provider_account_id,profile_id,provider,binding_generation,process_generation
          FROM session_event_provider_authorities
@@ -27902,7 +26672,6 @@ describe("StateStore", () => {
       guardDatabase.close(false);
     }
 
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
     const quarantines = inspector.query(
       `SELECT scope_kind,scope_id,reason
        FROM legacy_provider_authority_quarantines
@@ -27952,125 +26721,24 @@ describe("StateStore", () => {
     expect(inspector.query(
       "SELECT 1 FROM session_provider_authorities WHERE session_id=?",
     ).get(invalidLatestSession.id)).toBeNull();
-    expect({
-      interactions: inspector.query(
-        "SELECT * FROM provider_interactions ORDER BY public_id",
-      ).all(),
-      mutations: inspector.query("SELECT * FROM mutation_attempts ORDER BY id").all(),
-      profiles: inspector.query("SELECT * FROM profiles ORDER BY id").all(),
-      runtimeProfiles: inspector.query(
-        "SELECT * FROM session_runtime_profiles ORDER BY session_id,revision",
-      ).all(),
-      sessions: inspector.query("SELECT * FROM sessions ORDER BY id").all(),
-    }).toEqual({
-      ...legacyRows,
-      mutations: legacyRows.mutations.map((value) => {
-        const row = z.object({ id: z.string() }).passthrough().parse(value);
-        return row.id === unprovedMutation.id
-          ? { ...row, state: "ambiguous", updated_at: 9_000 }
-          : row;
-      }),
-      profiles: legacyRows.profiles.map((value) => {
-        const row = z.object({ id: z.string() }).passthrough().parse(value);
-        return { ...row, codex_account_key: row.id === signedIn.id ? signedInCodexAccountKey : null };
-      }),
-      sessions: legacyRows.sessions.map((value) => {
-        const row = z.object({ id: z.string(), revision: z.number().int().positive() }).passthrough().parse(value);
-        // Runtime observations prove their historical provider tuples, not
-        // the missing canonical40 account/scope binding for live control.
-        return [codexSession.id, claudeSession.id, conflictingSession.id,
-          revisionPrecedenceSession.id, invalidLatestSession.id,
-          switchedSession.id, unprovedSession.id].some((id) => id === row.id)
-          ? { ...row, state: "recovery_required", revision: row.revision + 1, updated_at: 9_000 }
-          : row;
-      }),
-    });
-    const firstMigrationRows = {
-      accountScopedAuthorities: inspector.query(
-        "SELECT * FROM account_scoped_provider_authorities ORDER BY scope_kind,scope_id",
-      ).all(),
-      eventAuthorities: inspector.query(
-        `SELECT * FROM session_event_provider_authorities
-         ORDER BY session_id,sequence`,
-      ).all(),
-      interactionAuthorities: inspector.query(
-        "SELECT * FROM interaction_provider_authorities ORDER BY public_id",
-      ).all(),
-      mutationAuthorities: inspector.query(
-        `SELECT * FROM mutation_provider_authorities
-         ORDER BY attempt_id,role`,
-      ).all(),
-      providerAccounts: inspector.query(
-        "SELECT * FROM provider_accounts ORDER BY provider,profile_id",
-      ).all(),
-      providerStates: inspector.query(
-        "SELECT * FROM provider_account_states ORDER BY provider",
-      ).all(),
-      quarantines: inspector.query(
-        `SELECT * FROM legacy_provider_authority_quarantines
-         ORDER BY scope_kind,scope_id`,
-      ).all(),
-      queueAuthorities: inspector.query(
-        "SELECT * FROM queue_provider_authorities ORDER BY queue_id",
-      ).all(),
-      runtimeAuthorities: inspector.query(
-        `SELECT * FROM runtime_profile_provider_authorities
-         ORDER BY session_id,revision`,
-      ).all(),
-      sessionAuthorities: inspector.query(
-        "SELECT * FROM session_provider_authorities ORDER BY session_id",
-      ).all(),
-    };
-    inspector.close(false);
-    migrated.close();
-    stores.splice(stores.indexOf(migrated), 1);
-
-    // A completed migration reopens idempotently at its actual schema. A
-    // restamped modern database is a mixed cohort, not an interrupted v38.
-    const rerun = new StateStore(paths, { now: () => 12_000 });
-    stores.push(rerun);
-    const rerunInspector = new Database(paths.database, { readonly: true, strict: true });
-    try {
-      expect({
-        accountScopedAuthorities: rerunInspector.query(
-          "SELECT * FROM account_scoped_provider_authorities ORDER BY scope_kind,scope_id",
-        ).all(),
-        eventAuthorities: rerunInspector.query(
-          `SELECT * FROM session_event_provider_authorities
-           ORDER BY session_id,sequence`,
-        ).all(),
-        interactionAuthorities: rerunInspector.query(
-          "SELECT * FROM interaction_provider_authorities ORDER BY public_id",
-        ).all(),
-        mutationAuthorities: rerunInspector.query(
-          `SELECT * FROM mutation_provider_authorities
-           ORDER BY attempt_id,role`,
-        ).all(),
-        providerAccounts: rerunInspector.query(
-          "SELECT * FROM provider_accounts ORDER BY provider,profile_id",
-        ).all(),
-        providerStates: rerunInspector.query(
-          "SELECT * FROM provider_account_states ORDER BY provider",
-        ).all(),
-        quarantines: rerunInspector.query(
-          `SELECT *
-           FROM legacy_provider_authority_quarantines
-           ORDER BY scope_kind,scope_id`,
-        ).all(),
-        queueAuthorities: rerunInspector.query(
-          "SELECT * FROM queue_provider_authorities ORDER BY queue_id",
-        ).all(),
-        runtimeAuthorities: rerunInspector.query(
-          `SELECT * FROM runtime_profile_provider_authorities
-           ORDER BY session_id,revision`,
-        ).all(),
-        sessionAuthorities: rerunInspector.query(
-          "SELECT * FROM session_provider_authorities ORDER BY session_id",
-        ).all(),
-      }).toEqual(firstMigrationRows);
-    } finally {
-      rerunInspector.close(false);
-    }
+      expect(retained.read()).toEqual(retained.before);
+      const sessionSchema = z.object({ state: z.string(), revision: z.number(), updated_at: z.number() }).passthrough();
+      expect(sessions.read().sessions).toEqual(z.array(sessionSchema).parse(sessions.before.sessions).map((row) =>
+        row.state === "terminal" || row.state === "recovery_required" ? row
+          : { ...row, state: "recovery_required", revision: row.revision + 1, updated_at: migratedAt }));
+      const mutationSchema = z.object({ id: z.string(), state: z.string() }).passthrough();
+      expect(mutations.read().mutation_attempts).toEqual(z.array(mutationSchema).parse(mutations.before.mutation_attempts).map((row) =>
+        row.state === "effect_started" ? { ...row, state: "ambiguous", updated_at: migratedAt } : row));
+      expect(inspector.query("SELECT * FROM session_provider_account_authorities").all()).toEqual([]);
+      expect(inspector.query("SELECT id,codex_account_key FROM profiles ORDER BY created_at,id").all()).toEqual(
+        [{ id: first.id, codex_account_key: null }, ...[signedIn, target, c.restartTarget].map((profile) => ({
+          id: profile.id, codex_account_key: namedProviderAccountKey("codex", profile.providerEmail),
+        }))],
+      );
+      expect(inspector.query("SELECT * FROM migrations WHERE version<=38 ORDER BY version").all()).toEqual([...captured.snapshot.ledger]);
+      expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      expectCanonical35To38InertReopens(paths, inspector);
+    } finally { inspector.close(false); }
   });
 
   test("creates fresh databases at the latest append-only schema version", async () => {
@@ -28176,142 +26844,83 @@ describe("StateStore", () => {
     }
   });
 
-  test("upgrades an exact released v38 schema without changing presets or notifications while quarantining unproved adoption", async () => {
-    const { store } = await fixture();
-    const profile = signInProfile(store, "Released v38", "released-v38@example.com");
-    const created = store.createSession({
-      profileId: profile.id, provider: "codex", preset: "high", fastEnabled: false,
-    });
-    const session = store.bindSession({
-      sessionId: created.id, expectedRevision: created.revision,
-      providerThreadId: "released-v38-thread", state: "idle",
-    });
-    const runtime = reviewedCodexProfile(profile);
-    store.recordSessionRuntimeProfile({
-      sessionId: session.id, sourceKind: "session_start", sourceId: "released-v38-runtime",
-      profile: runtime, providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
-    });
-    store.updateNotificationHours({
-      expectedRevision: 1, version: 1, startMinute: 480, endMinute: 1_200, timeZone: "UTC",
-    });
-    const email = store.updateNotificationEmailPolicy({
-      enabled: true, expectedRevision: store.readNotificationEmailPolicy().revision,
-    });
-    const hours = store.readNotificationHours();
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-    const legacy = new Database(paths.database, { create: false, strict: true });
-    downgradeProviderAccountsToReleasedVersion(legacy);
-    expect(legacy.query("PRAGMA user_version").get()).toEqual({ user_version: 38 });
-    expect(legacy.query("SELECT MAX(version) AS version FROM migrations").get())
-      .toEqual({ version: 38 });
-    expect(legacy.query("SELECT name FROM sqlite_schema WHERE type='table' AND name='provider_accounts'").get())
-      .toBeNull();
-    const rows = z.record(z.string(), z.unknown()).parse(legacy.query(
-      "SELECT *,provider AS provider_v39 FROM sessions WHERE id=?",
-    ).get(session.id));
-    const runtimeBytes = legacy.query("SELECT profile_json FROM session_runtime_profiles WHERE session_id=?")
-      .get(session.id);
-    legacy.close(false);
-    expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:38:60");
+  test("upgrades an exact captured v38 writer without changing presets or notifications while quarantining unproved adoption", async () => {
+    const paths = await canonical35To38Archive("canonical38");
+    const captured = canonical35To38Fixture.captures.canonical38;
+    const retained = canonical35To38Fixture.input.retained;
+    const database = new Database(paths.database, { create: false, strict: true });
+    try {
+      database.exec("PRAGMA query_only=ON");
+      const before = canonicalAuthBudgetSnapshot(database);
+      const history = canonicalAuthBudgetRows(database, ["profiles", "session_runtime_profiles", "queue_entries"]);
+      const sessionRows = canonicalAuthBudgetRows(database, ["sessions"]);
+      expect(database.query("SELECT name FROM sqlite_master WHERE name='provider_accounts'").get()).toBeNull();
+      expect(() => new StateStore(paths, { readonly: true }))
+        .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:38:60");
+      expect(canonicalAuthBudgetSnapshot(database)).toEqual(before);
 
-    const upgraded = new StateStore(paths, { now: () => 40_000,
-      resolveMachineTimeZone: () => { throw new Error("RELEASED_V38_ZONE_MUST_NOT_BE_REPLACED"); },
-    });
-    stores.push(upgraded);
-    expect(upgraded.readNotificationHours()).toEqual(hours);
-    expect(upgraded.readNotificationEmailPolicy()).toEqual(email);
-    expect(upgraded.requireSessionPresetContract(session.id)).toBe(currentPresetContract);
-    expect(upgraded.latestSessionRuntimeProfile(session.id)?.profile).toEqual(runtime);
-    const proof = new Database(paths.database, { readonly: true, strict: true });
-    expect(proof.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
-    // The released v38 row has immutable runtime evidence, but no adopted
-    // runtime/account-scope attestation. Migration preserves its bytes while
-    // adding only the explicit fail-closed session-state transition.
-    expect(proof.query("SELECT * FROM sessions WHERE id=?").get(session.id)).toEqual({
-      ...rows, state: "recovery_required", revision: session.revision + 1, updated_at: 40_000,
-    });
-    expect(proof.query("SELECT 1 FROM session_provider_account_authorities WHERE session_id=?").get(session.id)).toBeNull();
-    expect(proof.query("SELECT profile_json FROM session_runtime_profiles WHERE session_id=?")
-      .get(session.id)).toEqual(runtimeBytes);
-    expect(proof.query("PRAGMA foreign_key_check").all()).toEqual([]);
-    proof.close(false);
+      const migratedAt = 90_000_000;
+      const upgraded = new StateStore(paths, { now: () => migratedAt,
+        resolveMachineTimeZone: () => { throw new Error("CAPTURED_V38_ZONE_MUST_NOT_BE_REPLACED"); },
+      });
+      stores.push(upgraded);
+      expect(upgraded.readNotificationHours()).toEqual(captured.metadata.caseState.hours);
+      expect(upgraded.readNotificationEmailPolicy()).toEqual(captured.metadata.caseState.email);
+      expect(upgraded.requireSessionPresetContract(retained.session.id)).toBe(legacyPresetContract);
+      expectHistoricalValue(upgraded.latestSessionRuntimeProfile(retained.session.id)?.profile, retained.runtime);
+      expect(history.read()).toEqual(history.before);
+      const originals = z.array(z.record(z.string(), z.unknown())).parse(sessionRows.before.sessions);
+      // Both retained34 sessions lack native account-scope attestation: the
+      // bound Sol row and the unbound queued row retain every other old cell.
+      expect(sessionRows.read().sessions).toEqual(originals.map((row) => ({
+        ...row, state: "recovery_required", revision: z.number().parse(row.revision) + 1, updated_at: migratedAt,
+      })).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))));
+      expect(database.query("SELECT * FROM session_provider_account_authorities").all()).toEqual([]);
+      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
+      expect(database.query("SELECT * FROM migrations WHERE version<=38 ORDER BY version").all())
+        .toEqual([...captured.snapshot.ledger]);
+      expect(database.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      expectCanonical35To38InertReopens(paths, database);
+    } finally { database.close(false); }
   });
 
-  test("migrates historical Sol runtime profiles without rewriting their durable JSON", async () => {
-    const { store } = await fixture();
-    const profile = signInProfile(store, "Historical Sol", "historical-sol@example.com");
-    const session = store.upsertProviderSession({
-      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
-      profileId: profile.id,
-      provider: "codex",
-      preset: "high",
-      fastEnabled: false,
-      providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
-      providerThreadId: "thread-historical-sol",
-      title: "Historical Sol",
-      state: "idle",
-    });
-    const runtimeProfile = effectiveRuntimeProfileSchema.parse({
-      profileId: profile.id,
-      processGeneration: profile.processGeneration,
-      observedAt: 2_000,
-      preset: "high",
-      model: "gpt-5.6-sol",
-      reasoningEffort: "max",
-      serviceTier: null,
-      fast: false,
-      approvalPolicy: "on-request",
-      reviewMode: "auto_review",
-      permissionProfile: ":workspace",
-      computerUse: true,
-      pluginCapability: true,
-      enabledApps: [],
-    });
-    store.recordSessionRuntimeProfile({
-      sessionId: session.id,
-      sourceKind: "turn_start",
-      sourceId: "historical-sol-source",
-      profile: runtimeProfile,
-      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
-    });
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
-    const legacy = new Database(paths.database, { create: false, strict: true });
-    const before = z.object({ profile_json: z.string() }).strict().parse(legacy.query(
-      "SELECT profile_json FROM session_runtime_profiles WHERE source_id='historical-sol-source'",
-    ).get()).profile_json;
-    downgradeProviderAccountsToReleasedVersion(legacy);
-    legacy.exec("DELETE FROM migrations WHERE version=38; PRAGMA user_version=37;");
-    legacy.close(false);
-
-    expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:37:60");
-    const migrated = new StateStore(paths, { now: () => 4_000 });
-    stores.push(migrated);
-    expect(migrated.latestSessionRuntimeProfile(session.id)?.profile).toEqual(runtimeProfile);
-    expect(migrated.requireSessionPresetRequirement(session.id)).toEqual({
-      preset: "high",
-      requirement: { model: "gpt-5.6-sol", effort: "max" },
-    });
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
+  test("migrates captured canonical37 Sol runtime profiles without rewriting their durable JSON", async () => {
+    const paths = await canonical35To38Archive("canonical37");
+    const retained = canonical35To38Fixture.input.retained;
+    const database = new Database(paths.database, { create: false, strict: true });
     try {
-      expect(inspector.query(
-        "SELECT profile_json FROM session_runtime_profiles WHERE source_id='historical-sol-source'",
-      ).get()).toEqual({ profile_json: before });
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
-    } finally {
-      inspector.close(false);
-    }
+      database.exec("PRAGMA query_only=ON");
+      const before = canonicalAuthBudgetSnapshot(database);
+      const runtimeRows = canonicalAuthBudgetRows(database, ["session_runtime_profiles"]);
+      expect(retained.runtime.model).toBe("gpt-5.6-sol");
+      expect(database.query("SELECT profile_json FROM session_runtime_profiles WHERE session_id=?")
+        .get(retained.session.id)).toEqual({ profile_json: JSON.stringify(retained.runtime) });
+      expect(() => new StateStore(paths, { readonly: true }))
+        .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:37:60");
+      expect(canonicalAuthBudgetSnapshot(database)).toEqual(before);
+      const migrated = new StateStore(paths, { now: () => 90_000_000,
+        resolveMachineTimeZone: () => { throw new Error("CAPTURED_SOL_ZONE_MUST_NOT_BE_REPLACED"); },
+      });
+      stores.push(migrated);
+      expectHistoricalValue(migrated.latestSessionRuntimeProfile(retained.session.id)?.profile, retained.runtime);
+      expect(migrated.requireSessionPresetRequirement(retained.session.id)).toEqual({
+        preset: "high", requirement: { model: "gpt-5.6-sol", effort: "max" },
+      });
+      expect(runtimeRows.read()).toEqual(runtimeRows.before);
+      expect(database.query("SELECT * FROM session_provider_account_authorities WHERE session_id=?")
+        .get(retained.session.id)).toBeNull();
+      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
+      expect(database.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      expectCanonical35To38InertReopens(paths, database);
+    } finally { database.close(false); }
   });
 
   test("preserves authentic canonical39 Devin runtime and login bytes without borrowing a later Codex generation", async () => {
     const paths = await canonical39DevinArchive();
-    const database = new Database(paths.database, { readonly: true, strict: true });
+    // A copied WAL-mode main image needs SQLite to establish its local shared
+    // memory files. This raw query-only observer never runs HRA migrations.
+    const database = new Database(paths.database, { create: false, strict: true });
+    database.exec("PRAGMA query_only=ON");
     try {
       expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 39 });
       const ledger = database.query("SELECT * FROM migrations ORDER BY version").all();
@@ -28353,132 +26962,86 @@ describe("StateStore", () => {
     } finally { database.close(false); }
   });
 
-  test("widens v38 provider authority without replacing existing session or rebind rows", async () => {
-    const { store } = await fixture();
-    const profile = signInProfile(store, "V38 provider authority", "v38-provider@example.com");
-    const codex = createProvenTestSession(store, {
-      profileId: profile.id,
-      preset: "high",
-      fastEnabled: false,
-    });
-    const claude = store.createSession({
-      profileId: profile.id,
-      provider: "claude",
-      preset: "fable-max",
-      fastEnabled: false,
-    });
-    const queued = store.enqueue(codex.id, "retained across provider widening");
-    const attempt = store.prepareMutation({
-      authorityGeneration: profile.processGeneration,
-      authorityId: profile.id,
-      idempotencyKey: "00000000-0000-4000-8000-000000003901",
-      kind: "migration.provider-authority",
-      request: { provider: "claude" },
-    });
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
-    const legacy = new Database(paths.database, { create: false, strict: true });
-    try {
-      downgradeProviderAccountsToReleasedVersion(legacy);
-      legacy.query(
-        `INSERT INTO session_mutation_authority_rebinds(
-           attempt_id,profile_id,provider,from_generation,to_generation,recorded_at
-         ) VALUES (?,?,?,?,?,?)`,
-      ).run(
-        attempt.id,
-        profile.id,
-        "claude",
-        profile.processGeneration,
-        profile.processGeneration + 1,
-        1_500,
-      );
-      expect(legacy.query("PRAGMA table_info(sessions)").all())
-        .not.toContainEqual(expect.objectContaining({ name: "provider_v39" }));
-    } finally {
-      legacy.close(false);
-    }
-
-    const migrated = new StateStore(paths, { now: () => 2_000 });
-    stores.push(migrated);
-    expect(migrated.requireSession(codex.id)).toMatchObject({ provider: "codex", preset: "high" });
-    expect(migrated.requireSession(claude.id))
-      .toMatchObject({ provider: "claude", preset: "fable-max" });
-    expect(migrated.requireQueue(queued.id).message).toBe("retained across provider widening");
-    const devin = migrated.createSession({
-      profileId: profile.id,
-      provider: "devin",
-      preset: "astra",
-      fastEnabled: false,
-    });
-    expect(migrated.requireSession(devin.id))
-      .toMatchObject({ provider: "devin", preset: "astra" });
-
+  test("widens captured v38 provider columns while retaining the authentic generation-rebind history", async () => {
+    const paths = await canonical38RuntimeArchive();
+    const c = canonical38RuntimeFixture.retained;
     const inspector = new Database(paths.database, { create: false, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
-      expect(inspector.query(
-        "SELECT id,provider,provider_v39 FROM sessions ORDER BY id",
-      ).all()).toEqual([
-        { id: claude.id, provider: "claude", provider_v39: "claude" },
-        { id: codex.id, provider: "codex", provider_v39: "codex" },
-        { id: devin.id, provider: "codex", provider_v39: "devin" },
-      ].sort((left, right) => left.id.localeCompare(right.id)));
-      expect(inspector.query(
-        `SELECT attempt_id,profile_id,provider,from_generation,to_generation,recorded_at
-         FROM session_mutation_authority_rebinds_v39 WHERE attempt_id=?`,
-      ).get(attempt.id)).toEqual({
-        attempt_id: attempt.id,
-        profile_id: profile.id,
-        provider: "claude",
-        from_generation: profile.processGeneration,
-        to_generation: profile.processGeneration + 1,
-        recorded_at: 1_500,
-      });
-      expect(() => inspector.query(
-        `INSERT INTO session_mutation_authority_rebinds_v39(
-           attempt_id,profile_id,provider,from_generation,to_generation,recorded_at
-         ) VALUES (?,?,?,?,?,?)`,
-      ).run(
-        attempt.id,
-        profile.id,
-        "devin",
-        profile.processGeneration,
-        profile.processGeneration + 1,
-        2_001,
-      )).toThrow("session mutation provider successor authority mismatch");
-      expect(() => inspector.query(
-        `UPDATE session_mutation_authority_rebinds_v39
-         SET recorded_at=recorded_at+1 WHERE attempt_id=? AND provider='claude'`,
-      ).run(attempt.id)).toThrow("immutable");
-    } finally {
-      inspector.close(false);
-    }
+      const before = canonicalAuthBudgetSnapshot(inspector);
+      expect(inspector.query("SELECT name FROM pragma_table_info('sessions') WHERE name='provider_v39'").get()).toBeNull();
+      const originalRebind = {
+        attempt_id: c.pendingSwitch.attempt.id, profile_id: c.restartTarget.id, provider: "claude",
+        from_generation: c.restartTarget.processGeneration, to_generation: c.advanced.profile.processGeneration,
+        recorded_at: 38_200,
+      };
+      expect(inspector.query("SELECT * FROM session_mutation_authority_rebinds").all()).toEqual([originalRebind]);
+      expect(originalRebind.from_generation + 1).toBe(originalRebind.to_generation);
+      const retained = canonicalAuthBudgetRows(inspector, [
+        "profiles", "queue_entries", "session_mutation_authority_rebinds", "session_runtime_profiles",
+        "session_turn_runtime_profiles", "mutation_effect_evidence",
+      ]);
+      const sessions = canonicalAuthBudgetRows(inspector, ["sessions"]);
+      const oldProviders = z.array(z.object({ id: z.string(), provider: z.string() }).strict())
+        .parse(inspector.query("SELECT id,provider FROM sessions ORDER BY id").all());
+      expect(() => { new StateStore(paths, { readonly: true }).close(); }).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:38:60");
+      expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(before);
+      const migrated = new StateStore(paths, { now: () => 60_000, resolveMachineTimeZone: () => "UTC" });
+      stores.push(migrated);
+      expect(migrated.requireSession(c.codex.session.id)).toMatchObject({ provider: "codex", preset: "high" });
+      expect(migrated.requireSession(c.claude.session.id)).toMatchObject({ provider: "claude", preset: "fable-max" });
+      expect(migrated.requireQueue(c.unproved.queue.id).message).toBe(c.unproved.queue.message);
+      expect(retained.read()).toEqual(retained.before);
+      expect(inspector.query("SELECT id,provider,provider_v39 FROM sessions ORDER BY id").all())
+        .toEqual(oldProviders.map((row) => ({ ...row, provider_v39: row.provider })));
+      expect(inspector.query("SELECT * FROM session_mutation_authority_rebinds_v39").all()).toEqual([originalRebind]);
+      expect(migrated.readMutation(c.pendingSwitch.key)?.evidence).toEqual(c.pendingSwitch.effect);
+      expect(inspector.query("SELECT * FROM session_provider_account_authorities").all()).toEqual([]);
+      const sessionSchema = z.object({ state: z.string(), revision: z.number() }).passthrough();
+      expect(sessions.read().sessions).toEqual(z.array(sessionSchema).parse(sessions.before.sessions).map((row) =>
+        row.state === "terminal" || row.state === "recovery_required" ? row
+          : { ...row, state: "recovery_required", revision: row.revision + 1, updated_at: 60_000 }));
+      const joined = canonicalAuthBudgetSnapshot(inspector);
+      // Historical widening stays readable. Retirement still prohibits new
+      // Devin execution; this compatibility test must not revive that provider.
+      expect(() => migrated.createSession({ profileId: c.signedIn.id, provider: "devin",
+        preset: "astra", fastEnabled: false })).toThrow("PROVIDER_RETIRED:devin");
+      expect(() => inspector.query("INSERT INTO session_mutation_authority_rebinds_v39(attempt_id,profile_id,provider,from_generation,to_generation,recorded_at) VALUES (?,?,?,?,?,?)")
+        .run(c.pendingSwitch.attempt.id, c.restartTarget.id, "devin",
+          originalRebind.from_generation, originalRebind.to_generation, 60_001))
+        .toThrow("session mutation provider successor authority mismatch");
+      expect(() => inspector.query("UPDATE session_mutation_authority_rebinds_v39 SET recorded_at=recorded_at+1 WHERE attempt_id=? AND provider='claude'")
+        .run(c.pendingSwitch.attempt.id)).toThrow("immutable");
+      expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(joined);
+      expect(inspector.query("SELECT * FROM migrations WHERE version<=38 ORDER BY version").all()).toEqual([...canonical38RuntimeFixture.snapshot.ledger]);
+      expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      expectCanonical35To38InertReopens(paths, inspector);
+    } finally { inspector.close(false); }
   });
 
   test("rejects a v39 Devin session persisted under the legacy preset contract", async () => {
-    const { store } = await fixture();
-    const profile = signInProfile(store, "Invalid Devin contract", "invalid-devin@example.com");
-    const session = store.createSession({
-      profileId: profile.id,
-      preset: "high",
-      fastEnabled: false,
-    });
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
+    const paths = await canonical39DevinArchive();
+    const source = canonical39DevinFixture.cases[0];
+    const session = source.session;
     const partial = new Database(paths.database, { create: false, strict: true });
     try {
-      downgradeToExactProviderVersion39(partial);
+      const before = canonicalAuthBudgetSnapshot(partial);
+      expect(before.version).toEqual({ user_version: 39 });
+      expect(partial.query("SELECT provider_v39,preset_contract FROM sessions WHERE id=?").get(session.id))
+        .toEqual({ provider_v39: "devin", preset_contract: 2 });
+      // One explicitly adversarial old cell, not a new historical capture or
+      // a relabeled current Codex session. Restore the exact captured trigger.
       partial.exec("PRAGMA ignore_check_constraints=ON");
-      withRemovedTestGuards(partial, ["work_session_devin_contract_guard"], () => {
-        partial.query(
-          "UPDATE sessions SET provider_v39='devin',preset_contract=? WHERE id=?",
-        ).run(legacyPresetContract, session.id);
-      });
-      partial.exec("PRAGMA ignore_check_constraints=OFF");
+      try {
+        withRemovedTestGuards(partial, ["work_session_devin_contract_guard"], () => {
+          expect(partial.query("UPDATE sessions SET preset_contract=? WHERE id=?")
+            .run(legacyPresetContract, session.id).changes).toBe(1);
+        });
+      } finally { partial.exec("PRAGMA ignore_check_constraints=OFF"); }
+      const after = canonicalAuthBudgetSnapshot(partial);
+      expect(after.schema).toEqual(before.schema);
+      for (const [table, rows] of Object.entries(before.rows)) {
+        if (table !== "sessions") expect(after.rows[table]).toEqual(rows);
+      }
     } finally {
       partial.close(false);
     }
@@ -28600,163 +27163,94 @@ describe("StateStore", () => {
   });
 
   test("migrates v34 through provider switch, notifications, contracts, and adoption v39", async () => {
-    const { store } = await fixture();
-    const profile = signInProfile(store, "Historical Sol", "historical-sol@example.com");
-    const session = store.upsertProviderSession({
-      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
-      profileId: profile.id,
-      provider: "codex",
-      providerThreadId: "thread-historical-sol",
-      title: "Historical Sol",
-      preset: "high",
-      fastEnabled: false,
-      state: "idle",
-      providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
-    });
-    const runtimeProfile = effectiveRuntimeProfileSchema.parse({
-      profileId: profile.id,
-      processGeneration: profile.processGeneration,
-      observedAt: 2_000,
-      preset: "high",
-      model: "gpt-5.6-sol",
-      reasoningEffort: "max",
-      serviceTier: null,
-      fast: false,
-      approvalPolicy: "on-request",
-      reviewMode: "auto_review",
-      permissionProfile: ":workspace",
-      computerUse: true,
-      pluginCapability: true,
-      enabledApps: [],
-    });
-    const legacyBinding = new Database(store.paths.database, { create: false, strict: true });
+    const paths = await canonical34StorageArchive();
+    const source = canonical34StorageFixture.retained;
+    const inspector = new Database(paths.database, { create: false, strict: true });
+    inspector.exec("PRAGMA query_only=ON");
     try {
-      legacyBinding.query(
-        "UPDATE sessions SET preset_contract=? WHERE id=?",
-      ).run(legacyPresetContract, session.id);
-    } finally {
-      legacyBinding.close(false);
-    }
-    store.recordSessionRuntimeProfile({
-      sessionId: session.id,
-      sourceKind: "turn_start",
-      sourceId: "historical-sol-source",
-      profile: runtimeProfile,
-      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
-    });
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
-    const legacy = new Database(paths.database, { create: false, strict: true });
-    try {
-      dropPostProviderSwitchSchema(legacy);
-      dropProviderSwitchProgressSchema(legacy);
-      legacy.exec("DELETE FROM migrations WHERE version>=35; DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=34;");
-      expect(legacy.query(
-        `SELECT COUNT(*) AS count FROM sqlite_master
-         WHERE name LIKE 'session_provider_switch_%'
-            OR name LIKE 'session_mutation_authority_rebinds%'
-            OR name='session_adoption_policies'`,
-      ).get()).toEqual({ count: 0 });
-    } finally {
-      legacy.close(false);
-    }
-
-    expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:60");
-    const migrated = new StateStore(paths, { now: () => 4_000 });
-    stores.push(migrated);
-    expect(migrated.latestSessionRuntimeProfile(session.id)?.profile).toEqual(runtimeProfile);
-    expect(migrated.requireSessionPresetRequirement(session.id)).toEqual({
-      preset: "high",
-      requirement: { model: "gpt-5.6-sol", effort: "max" },
-    });
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
-    try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
-      expect(inspector.query("SELECT version FROM migrations WHERE version>=35 ORDER BY version").all())
-        .toEqual([
-          { version: 35 },
-          { version: 36 },
-          { version: 37 },
-          { version: 38 },
-          { version: 39 },
-          { version: 40 },
-          { version: 41 }, { version: 42 }, { version: 43 },
-          { version: 44 }, { version: 45 }, { version: 46 },
-          { version: 47 }, { version: 48 }, { version: 49 },
-          ...Array.from({ length: 11 }, (_, index) => ({ version: index + 50 })),
-        ]);
-      expect(inspector.query(
-        `SELECT type,COUNT(*) AS count FROM sqlite_master
-         WHERE name LIKE 'session_provider_switch_%'
-            OR name LIKE 'session_mutation_authority_rebinds%'
-         GROUP BY type ORDER BY type`,
-      ).all()).toEqual([
-        { count: 7, type: "table" },
-        { count: 14, type: "trigger" },
+      const original = canonicalAuthBudgetSnapshot(inspector);
+      const ledger = inspector.query("SELECT * FROM migrations ORDER BY version").all();
+      const retained = canonicalAuthBudgetRows(inspector, [
+        "profiles", "session_runtime_profiles", "queue_entries",
+        "desktop_switches", "desktop_switch_resolutions", "desktop_switch_authority",
       ]);
-      expect(inspector.query(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='session_adoption_policies'",
-      ).get()).toEqual({ name: "session_adoption_policies" });
-      expect(inspector.query(
-        "SELECT profile_json FROM session_runtime_profiles WHERE source_id='historical-sol-source'",
-      ).get()).toEqual({ profile_json: JSON.stringify(runtimeProfile) });
-    } finally {
-      inspector.close(false);
-    }
+      expect(original.version).toEqual({ user_version: 34 });
+      expect(providerSwitchSchemaObjectCount(inspector)).toBe(0);
+      expect(() => new StateStore(paths, { readonly: true }))
+        .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:60");
+      expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(original);
+
+      const migrated = new StateStore(paths, { now: () => 40_000 });
+      stores.push(migrated);
+      expectHistoricalValue(migrated.latestSessionRuntimeProfile(source.session.id), source.runtimeRecord);
+      expect(migrated.requireSessionPresetRequirement(source.session.id)).toEqual({
+        preset: "high", requirement: { model: "gpt-5.6-sol", effort: "max" },
+      });
+      // The separate unbound source never had a native account/runtime proof
+      // or queue identity. Retain its input; no missing authority is invented.
+      expect(migrated.requireQueue(source.unboundQueue.id)).toMatchObject(source.unboundQueue);
+      expect(migrated.hasUnsettledQueueAttachmentQuarantineForSession(source.unboundSession.id)).toBe(true);
+      expect(inspector.query("SELECT * FROM session_provider_account_authorities WHERE session_id=?")
+        .all(source.unboundSession.id)).toEqual([]);
+      expect(inspector.query("SELECT * FROM queue_attachment_identities WHERE queue_id=?")
+        .all(source.unboundQueue.id)).toEqual([]);
+      expect(retained.read()).toEqual(retained.before);
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
+      expect(inspector.query("SELECT * FROM migrations WHERE version<=34 ORDER BY version").all()).toEqual(ledger);
+      expect(inspector.query("SELECT version,applied_at FROM migrations WHERE version>=35 ORDER BY version").all())
+        .toEqual(Array.from({ length: 26 }, (_, index) => ({ version: index + 35, applied_at: 40_000 })));
+      expect(providerSwitchSchemaObjectCount(inspector)).toBe(21);
+      expect(inspector.query("SELECT name FROM sqlite_master WHERE type='table' AND name='session_adoption_policies'")
+        .get()).toEqual({ name: "session_adoption_policies" });
+      expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      const joined = canonicalAuthBudgetSnapshot(inspector);
+      migrated.close();
+      stores.splice(stores.indexOf(migrated), 1);
+      for (const readonly of [false, true]) {
+        const reopened = new StateStore(paths, { readonly, now: () => 40_001 });
+        try {
+          expectHistoricalValue(reopened.latestSessionRuntimeProfile(source.session.id), source.runtimeRecord);
+          expect(retained.read()).toEqual(retained.before);
+          expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(joined);
+        } finally { reopened.close(); }
+      }
+    } finally { inspector.close(false); }
   });
 
-  test("migrates an upstream provider-switch v35 database to adoption v39", async () => {
-    const { store } = await fixture();
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
-    const upstreamV35 = new Database(paths.database, { create: false, strict: true });
+  test("migrates an exact main35 writer through adoption and the joined60 ledger", async () => {
+    const paths = await canonical35To38Archive("main35");
+    const captured = canonical35To38Fixture.captures.main35;
+    const database = new Database(paths.database, { create: false, strict: true });
     try {
-      dropPostProviderSwitchSchema(upstreamV35);
-      upstreamV35.exec("DELETE FROM migrations WHERE version>=36; DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=35;");
-      expect(upstreamV35.query(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='session_provider_switch_targets'",
-      ).get()).toEqual({ name: "session_provider_switch_targets" });
-      expect(upstreamV35.query(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='session_adoption_policies'",
-      ).get()).toBeNull();
-    } finally {
-      upstreamV35.close(false);
-    }
-
-    const migrated = new StateStore(paths, { now: () => 2_000 });
-    stores.push(migrated);
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
-    try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
-      expect(inspector.query("SELECT version FROM migrations WHERE version>=35 ORDER BY version").all())
-        .toEqual([
-          { version: 35 },
-          { version: 36 },
-          { version: 37 },
-          { version: 38 },
-          { version: 39 },
-          { version: 40 },
-          { version: 41 }, { version: 42 }, { version: 43 },
-          { version: 44 }, { version: 45 }, { version: 46 },
-          { version: 47 }, { version: 48 }, { version: 49 },
-          ...Array.from({ length: 11 }, (_, index) => ({ version: index + 50 })),
-        ]);
-      expect(inspector.query(
-        `SELECT name FROM sqlite_master WHERE type='table'
-         AND name IN ('session_provider_switch_targets','session_adoption_policies')
-         ORDER BY name`,
-      ).all()).toEqual([
-        { name: "session_adoption_policies" },
-        { name: "session_provider_switch_targets" },
+      database.exec("PRAGMA query_only=ON");
+      expect(database.query("SELECT name FROM sqlite_master WHERE name='session_provider_switch_targets'").get())
+        .toEqual({ name: "session_provider_switch_targets" });
+      expect(database.query("SELECT name FROM sqlite_master WHERE name='session_adoption_policies'").get()).toBeNull();
+      const before = canonicalAuthBudgetSnapshot(database);
+      const history = canonicalAuthBudgetRows(database, [
+        "session_provider_switch_targets", "mutation_effect_evidence", "session_runtime_profiles", "queue_entries",
       ]);
-    } finally {
-      inspector.close(false);
-    }
+      expect(() => new StateStore(paths, { readonly: true }))
+        .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:60");
+      expect(canonicalAuthBudgetSnapshot(database)).toEqual(before);
+      let zoneReads = 0;
+      const migrated = new StateStore(paths, { now: () => 90_000_000,
+        resolveMachineTimeZone: () => { zoneReads++; return "UTC"; },
+      });
+      stores.push(migrated);
+      expect(zoneReads).toBe(1);
+      expect(history.read()).toEqual(history.before);
+      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
+      expect(database.query("SELECT * FROM migrations ORDER BY version").all()).toEqual([
+        ...captured.snapshot.ledger,
+        ...Array.from({ length: 25 }, (_, index) => ({ version: index + 36, applied_at: 90_000_000 })),
+      ]);
+      expect(database.query(`SELECT name FROM sqlite_master WHERE type='table'
+        AND name IN ('session_provider_switch_targets','session_adoption_policies') ORDER BY name`).all())
+        .toEqual([{ name: "session_adoption_policies" }, { name: "session_provider_switch_targets" }]);
+      expect(database.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      expectCanonical35To38InertReopens(paths, database);
+    } finally { database.close(false); }
   });
 
   test("migrates the exact provider-v39 predecessor through transcript finalization v43", async () => {
@@ -28814,7 +27308,8 @@ describe("StateStore", () => {
 
     const predecessor = new Database(paths.database, { create: false, strict: true });
     let timestampGuardBefore: unknown;
-    let sessionBefore: unknown;
+    let sessionBefore: Record<string, unknown>;
+    let pendingBefore: { id: string; message: string }[];
     try {
       expect(predecessor.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
       expect(predecessor.query(
@@ -28823,7 +27318,15 @@ describe("StateStore", () => {
       timestampGuardBefore = predecessor.query(
         "SELECT type,tbl_name,sql FROM sqlite_master WHERE name='mutation_resolutions_timestamp_proof_insert'",
       ).get();
-      sessionBefore = predecessor.query("SELECT * FROM sessions WHERE id=?").get(session.id);
+      sessionBefore = z.record(z.string(), z.unknown()).parse(
+        predecessor.query("SELECT * FROM sessions WHERE id=?").get(session.id),
+      );
+      pendingBefore = z.array(z.object({ id: z.string(), message: z.string() }).strict()).parse(
+        predecessor.query("SELECT id,message FROM queue_entries WHERE session_id=? AND state='pending' ORDER BY id")
+          .all(session.id),
+      );
+      expect(pendingBefore.length).toBeGreaterThan(0);
+      expect(sessionBefore.state).toBe("idle");
       expect(predecessor.query(
         "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='work_devin_preset_contract_guard'",
       ).get()).toEqual(expect.objectContaining({
@@ -28857,7 +27360,26 @@ describe("StateStore", () => {
         "SELECT type,tbl_name,sql FROM sqlite_master WHERE name='mutation_resolutions_timestamp_proof_insert'",
       ).get()).toEqual(timestampGuardBefore);
       expect(inspector.query("SELECT * FROM sessions WHERE id=?").get(session.id))
-        .toEqual(withCanonicalSessionKey(sessionBefore));
+        .toEqual(withCanonicalSessionKey({
+          ...sessionBefore,
+          // The original pending queues lack immutable enqueue identity. The
+          // joined migration contains them without changing their input or
+          // granting dispatch authority; only these session projection cells
+          // change, independently of the preserved timestamp/Work history.
+          state: "recovery_required",
+          revision: z.number().parse(sessionBefore.revision) + 1,
+          updated_at: Math.max(z.number().parse(sessionBefore.updated_at), 2_000),
+        }));
+      for (const queue of pendingBefore) {
+        expect(inspector.query("SELECT id,message FROM queue_entries WHERE id=?").get(queue.id)).toEqual(queue);
+        expect(inspector.query("SELECT enqueue_identity_format FROM queue_entries WHERE id=?").get(queue.id))
+          .toEqual({ enqueue_identity_format: null });
+        expect(inspector.query("SELECT * FROM queue_attachment_quarantines WHERE queue_id=?").all(queue.id))
+          .toEqual([{ queue_id: queue.id, ordinal: 1, session_id: session.id, kind: "quarantined",
+            predecessor: null, expected_session_revision: null, reason: "legacy_identity_unproved", recorded_at: 2_000 }]);
+        expect(inspector.query("SELECT 1 FROM queue_attachment_identities WHERE queue_id=?").get(queue.id)).toBeNull();
+        expect(inspector.query("SELECT 1 FROM queue_attachment_identity_anchors WHERE queue_id=?").get(queue.id)).toBeNull();
+      }
       const workGuard = z.object({ sql: z.string() }).parse(inspector.query(
         "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='work_devin_preset_contract_guard'",
       ).get()).sql;
@@ -28934,12 +27456,10 @@ describe("StateStore", () => {
       expect(inspector.query(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='session_user_message_finalizations'",
       ).get()).toBeNull();
-      expect(inspector.query(
-        `SELECT sql FROM sqlite_master WHERE type='trigger'
-         AND name='session_events_account_authority_guard'`,
-      ).get()).toEqual(expect.objectContaining({
-        sql: expect.stringContaining("p.process_generation>NEW.provider_generation"),
-      }));
+      // Historical43 installed the old scalar event guard. The final joined
+      // schema must instead have the exact source-selected authority guards;
+      // demanding the historical body here would discard that later fence.
+      expect(() => auditJoinedEvidenceGuards(inspector)).not.toThrow();
     } finally {
       inspector.close(false);
     }
@@ -29417,7 +27937,7 @@ describe("StateStore", () => {
       .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:42:60");
   });
 
-  test("refuses a missing or weakened v43 transcript authority guard without repair", async () => {
+  test("refuses a missing or weakened current60 transcript authority guard without repair", async () => {
     for (const damage of ["missing", "weakened"] as const) {
       const { store } = await fixture();
       const paths = store.paths;
@@ -29440,7 +27960,7 @@ describe("StateStore", () => {
         ).all();
         for (const readonly of [true, false]) {
           expect(() => new StateStore(paths, readonly ? { readonly: true } : {}))
-            .toThrow("STATE_SCHEMA_V43_USER_MESSAGE_FINALIZATION_INVALID");
+            .toThrow("JOINED_EVIDENCE_BOUNDARY_SCHEMA_INVALID");
           expect(malformed.query(
             "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
           ).all()).toEqual(schemaBefore);
@@ -29455,6 +27975,7 @@ describe("StateStore", () => {
 
   test("refuses to begin a direct user-message effect without exact connection provenance", async () => {
     const { store } = await fixture();
+    const daemon = startInputFixtureDaemon(store);
     const profile = signInProfile(
       store,
       "Transcript connection authority",
@@ -29468,15 +27989,15 @@ describe("StateStore", () => {
       activeTurnId: "turn-transcript-connection",
     });
     const key = "43000000-0000-4000-8000-000000000014";
-    const attempt = store.prepareMutation({
-      kind: "session.steer",
-      authorityId: session.id,
-      authorityGeneration: profile.processGeneration,
-      request: { message: "must retain exact connection provenance" },
+    const { attempt } = store.prepareSessionInputMutation({
+      ...daemon, kind: "session.steer", sessionId: session.id,
+      providerAuthority: capturedProviderAuthorityForTest(store, session.id),
+      message: "must retain exact connection provenance", attachments: [],
       idempotencyKey: key,
     });
 
     expect(() => store.beginSessionMutationEffect({
+      ...daemon, attachments: [],
       providerAuthority: capturedProviderAuthorityForTest(store, session.id),
       message: "must retain exact connection provenance",
       attemptId: attempt.id,
@@ -29511,80 +28032,106 @@ describe("StateStore", () => {
       .toEqual({ status: "none" });
   });
 
-  test("finalizes historical colliding mutation and queue source strings independently", async () => {
+  test("refuses a new colliding non-UUID mutation key without disturbing an admitted queue", async () => {
     const { store } = await fixture();
-    const profile = signInProfile(store, "Transcript collision", "transcript-collision@example.com");
+    const paths = store.paths;
+    const daemon = startInputFixtureDaemon(store);
+    const profile = signInProfile(store, "Current source collision", "current-collision@example.com");
     const session = createProvenTestSession(store, {
-      profileId: profile.id,
-      preset: "high",
-      fastEnabled: false,
-      state: "idle",
+      profileId: profile.id, preset: "high", fastEnabled: false, state: "idle",
     });
-    const queued = store.enqueueIdempotent({
-      providerAuthority: capturedProviderAuthorityForTest(store, session.id),
-      sessionId: session.id,
-      profileGeneration: profile.processGeneration,
-      message: "queued collision source",
-    });
-    const attempt = store.prepareMutation({
-      kind: "session.steer",
-      authorityId: session.id,
-      authorityGeneration: profile.processGeneration,
-      request: { message: "mutation collision source" },
-      idempotencyKey: queued.id,
-    });
-    store.beginSessionMutationEffect({
-      providerAuthority: capturedProviderAuthorityForTest(store, session.id),
-      message: "mutation collision source",
-      attemptId: attempt.id,
-      sessionId: session.id,
-      profileGeneration: profile.processGeneration,
-      transcript: {
-        accountId: profile.id,
-        providerGeneration: profile.processGeneration,
-        providerConnectionId: "10000000-0000-4000-8000-00000000000f",
-        actor: "human",
-        message: "mutation collision source",
-      },
-      evidence: {
-        kind: "session.steer",
-        providerThreadId: session.providerThreadId ?? "",
-        baseline: { providerUpdatedAt: null, status: "active", activeTurnId: "turn-collision" },
-        activeTurnId: "turn-collision",
-        clientMessageId: attempt.id,
-        messageDigest: createHash("sha256").update("mutation collision source").digest("hex"),
-      },
-    });
-    expect(store.transitionMutation(attempt.id, "effect_started", "applied", {
-      steered: true,
-      activeTurnId: "turn-collision",
-    })).toBe(true);
-    store.nextProfileGeneration(profile.id);
+    const providerAuthority = capturedProviderAuthorityForTest(store, session.id);
+    const queued = store.enqueueIdempotent({ providerAuthority, sessionId: session.id,
+      profileGeneration: providerAuthority.processGeneration, message: "independent current queue",
+      idempotencyKey: "43000000-0000-4000-8000-000000000017" });
+    const description = { ...daemon, kind: "session.steer" as const, sessionId: session.id,
+      providerAuthority, message: "independent current mutation", attachments: [] };
+    const snapshot = () => {
+      const database = new Database(paths.database, { readonly: true, strict: true });
+      try { return snapshotSwitchContainmentForTest(database); }
+      finally { database.close(false); }
+    };
+    const before = snapshot();
+    expect(() => store.prepareSessionInputMutation({ ...description, idempotencyKey: queued.id }))
+      .toThrow("ATTACHMENT_CUSTODY_INVALID_INPUT");
+    expect(snapshot()).toEqual(before);
+    expect(store.requireQueue(queued.id)).toEqual(queued);
 
-    store.finalizeSessionUserMessageSource({
-      sessionId: session.id,
-      sourceKind: "mutation",
-      sourceId: queued.id,
-      turnId: "turn-collision",
-    });
-    expect(store.hasSessionUserMessageSource(session.id, "mutation", queued.id)).toBe(true);
-    expect(store.hasSessionUserMessageSource(session.id, "queue", queued.id)).toBe(false);
-    expect(store.transitionQueue(queued.id, "pending", "dispatching")).toBe(true);
-    expect(store.transitionQueue(queued.id, "dispatching", "applied")).toBe(true);
-    store.finalizeSessionUserMessageSource({
-      sessionId: session.id,
-      sourceKind: "queue",
-      sourceId: queued.id,
-      turnId: "turn-collision",
-    });
-    expect(store.hasSessionUserMessageSource(session.id, "mutation", queued.id)).toBe(true);
-    expect(store.hasSessionUserMessageSource(session.id, "queue", queued.id)).toBe(true);
+    // Change only the rejected key. The same current input now acquires its
+    // own prepared authority without changing the separately admitted queue.
+    const key = "43000000-0000-4000-8000-000000000018";
+    const prepared = store.prepareSessionInputMutation({ ...description, idempotencyKey: key });
+    expect(prepared.attempt.state).toBe("prepared");
+    expect(store.readMutation(key)).toMatchObject({ id: prepared.attempt.id, kind: "session.steer" });
+    expect(store.requireQueue(queued.id)).toEqual(queued);
+    expect(store.readQueueEffect(queued.id)).toBeNull();
     expect(store.listSessionEvents({ sessionId: session.id, afterSequence: 0 }).events
-      .filter((event) => event.body.type === "user_message")).toHaveLength(2);
+      .filter((event) => event.body.type === "user_message")).toEqual([]);
+  });
+
+  test("preserves authentic canonical50 colliding mutation and queue finalizations independently", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-canonical50-source-collision-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    const bytes = canonical50CollisionDatabaseBytes();
+    expect(createHash("sha256").update(bytes).digest("hex")).toBe(canonical50CollisionFixture.databaseSha256);
+    await writeFile(paths.database, bytes, { mode: 0o600, flag: "wx" });
+    const retained = canonical50CollisionFixture.retained;
+    const sessionId = retained.session.id;
+    const sourceId = retained.queued.id;
+    const inspector = new Database(paths.database, { create: false, strict: true });
+    inspector.exec("PRAGMA query_only=ON");
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
+      expect(retained.mutation.idempotencyKey).toBe(sourceId);
+      expect(retained.mutation.authorityGeneration).toBe(1);
+      expect(retained.profile.processGeneration).toBe(2);
+      // Bind original columns before migration; new authority sidecars cannot
+      // substitute for either actual archived effect or its finalized source.
+      const originals = ["mutation_attempts", "mutation_effect_evidence", "queue_entries", "queue_effect_evidence",
+        "session_runtime_profiles", "session_turn_runtime_profiles", "session_events", "session_message_event_sources"]
+        .map((table) => {
+          const columns = z.object({ name: z.string().regex(/^[a-z0-9_]+$/u) }).passthrough().array()
+            .parse(inspector.query(`PRAGMA table_info(${table})`).all()).map((column) => column.name);
+          const query = `SELECT ${columns.join(",")} FROM ${table} ORDER BY rowid LIMIT 201`;
+          const rows = inspector.query(query).all();
+          expect(rows.length).toBeLessThanOrEqual(200);
+          return { query, rows };
+        });
+      expect(inspector.query("SELECT count(*) AS n FROM mutation_effect_evidence").get()).toEqual({ n: 1 });
+      expect(inspector.query("SELECT count(*) AS n FROM queue_effect_evidence").get()).toEqual({ n: 1 });
+      expect(inspector.query("SELECT count(*) AS n FROM session_turn_runtime_profiles").get()).toEqual({ n: 1 });
+      expect(inspector.query("SELECT source_id,source_kind FROM session_message_event_sources ORDER BY source_kind").all())
+        .toEqual([{ source_id: retained.mutation.id, source_kind: "mutation" }, { source_id: sourceId, source_kind: "queue" }]);
+      const migrated = new StateStore(paths, { now: () => 60_000 });
+      stores.push(migrated);
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
+      for (const original of originals) expect(inspector.query(original.query).all()).toEqual(original.rows);
+      const before = snapshotSwitchContainmentForTest(inspector);
+      for (const sourceKind of ["mutation", "queue"] as const) {
+        expect(migrated.hasSessionUserMessageSource(sessionId, sourceKind, sourceId)).toBe(true);
+        expect(migrated.readSessionUserMessageSource(sessionId, sourceKind, sourceId)).toMatchObject({ status: "finalized" });
+        expect(migrated.finalizeSessionUserMessageSource({ sessionId, sourceKind, sourceId, turnId: retained.turnId })).toBeNull();
+      }
+      expect(migrated.listSessionEvents({ sessionId, afterSequence: 0 }).events
+        .filter((event) => event.body.type === "user_message")).toEqual([...retained.messages]);
+      expect(snapshotSwitchContainmentForTest(inspector)).toEqual(before);
+      migrated.close();
+      stores.splice(stores.indexOf(migrated), 1);
+      for (const readonly of [false, true]) {
+        const reopened = new StateStore(paths, { readonly, now: () => 60_000 });
+        try {
+          expect(reopened.hasSessionUserMessageSource(sessionId, "mutation", sourceId)).toBe(true);
+          expect(reopened.hasSessionUserMessageSource(sessionId, "queue", sourceId)).toBe(true);
+          expect(snapshotSwitchContainmentForTest(inspector)).toEqual(before);
+        } finally { reopened.close(); }
+      }
+    } finally { inspector.close(false); }
   });
 
   test("rolls a settled-source transcript append and source finalization back together", async () => {
     const { store } = await fixture();
+    const daemon = startInputFixtureDaemon(store);
     const profile = signInProfile(store, "Transcript retry", "transcript-retry@example.com");
     const session = createProvenTestSession(store, {
       profileId: profile.id,
@@ -29594,14 +28141,14 @@ describe("StateStore", () => {
       activeTurnId: "turn-transcript-retry",
     });
     const key = "43000000-0000-4000-8000-000000000009";
-    const attempt = store.prepareMutation({
-      kind: "session.steer",
-      authorityId: session.id,
-      authorityGeneration: profile.processGeneration,
-      request: { message: "retry this transcript append" },
+    const { attempt } = store.prepareSessionInputMutation({
+      ...daemon, kind: "session.steer", sessionId: session.id,
+      providerAuthority: capturedProviderAuthorityForTest(store, session.id),
+      message: "retry this transcript append", attachments: [],
       idempotencyKey: key,
     });
     store.beginSessionMutationEffect({
+      ...daemon, attachments: [],
       providerAuthority: capturedProviderAuthorityForTest(store, session.id),
       message: "retry this transcript append",
       attemptId: attempt.id,
@@ -29677,6 +28224,7 @@ describe("StateStore", () => {
   for (const rawMessage of [false, true]) test(`retains charged prose through delayed ambiguous recovery without double-counting finalization (${rawMessage ? "raw message" : "durable intent"})`, async () => {
     let now = 10_000;
     const { store } = await fixture({ now: () => now });
+    const daemon = startInputFixtureDaemon(store);
     const profile = signInProfile(store, "Budget recovery", "budget-recovery@example.com");
     const session = createProvenTestSession(store, {
       profileId: profile.id, preset: "high", fastEnabled: false, providerUpdatedAt: 10, state: "idle",
@@ -29690,12 +28238,14 @@ describe("StateStore", () => {
     };
     const key = "44000000-0000-4000-8000-000000000001";
     const message = "continue approved work";
-    const attempt = store.prepareMutation({
-      kind: "session.send", authorityId: session.id, authorityGeneration: profile.processGeneration,
-      request: { message }, idempotencyKey: key,
+    const { attempt } = store.prepareSessionInputMutation({
+      ...daemon, kind: "session.send", sessionId: session.id,
+      providerAuthority: capturedProviderAuthorityForTest(store, session.id),
+      message, attachments: [], idempotencyKey: key,
     });
     store.recordAutorespondMessageSource(session.id, attempt.id);
     const effect = store.beginSessionMutationEffect({
+      ...daemon, attachments: [],
       providerAuthority: capturedProviderAuthorityForTest(store, session.id),
       message,
       attemptId: attempt.id, sessionId: session.id, profileGeneration: profile.processGeneration,
@@ -29753,6 +28303,7 @@ describe("StateStore", () => {
   test("rolls proven-applied mutation recovery back when transcript finalization fails", async () => {
     let currentTime = 1_000;
     const { store } = await fixture({ now: () => currentTime });
+    const daemon = startInputFixtureDaemon(store);
     const profile = signInProfile(
       store,
       "Transcript mutation recovery",
@@ -29783,14 +28334,14 @@ describe("StateStore", () => {
     };
     const key = "43000000-0000-4000-8000-00000000000a";
     const message = "recover this accepted send";
-    const attempt = store.prepareMutation({
-      kind: "session.send",
-      authorityId: session.id,
-      authorityGeneration: profile.processGeneration,
-      request: { message },
+    const { attempt } = store.prepareSessionInputMutation({
+      ...daemon, kind: "session.send", sessionId: session.id,
+      providerAuthority: capturedProviderAuthorityForTest(store, session.id),
+      message, attachments: [],
       idempotencyKey: key,
     });
     const effect = store.beginSessionMutationEffect({
+      ...daemon, attachments: [],
       providerAuthority: capturedProviderAuthorityForTest(store, session.id),
       message,
       attemptId: attempt.id,
@@ -30072,21 +28623,16 @@ describe("StateStore", () => {
 
   test("rolls attachment custody back with direct message intent and effect evidence", async () => {
     const { store } = await fixture();
+    const daemon = startInputFixtureDaemon(store);
     const profile = signInProfile(store, "Transcript attachment", "transcript-attachment@example.com");
     const session = createProvenTestSession(store, {
       profileId: profile.id,
       preset: "high",
       fastEnabled: false,
-      state: "idle",
+      state: "active",
+      activeTurnId: "turn-atomic",
     });
     const key = "43000000-0000-4000-8000-000000000010";
-    const attempt = store.prepareMutation({
-      kind: "session.steer",
-      authorityId: session.id,
-      authorityGeneration: profile.processGeneration,
-      request: { message: "attached" },
-      idempotencyKey: key,
-    });
     const stored = {
       byteLength: 4,
       canonicalMediaType: "text/plain" as const,
@@ -30094,11 +28640,23 @@ describe("StateStore", () => {
       mediaType: "text/plain" as const,
       name: "proof.txt",
     };
+    const input = { ...daemon, kind: "session.steer" as const, sessionId: session.id,
+      idempotencyKey: key, message: "attached",
+      providerAuthority: capturedProviderAuthorityForTest(store, session.id),
+      attachments: [{ byteLength: stored.byteLength, digest: stored.digest,
+        mediaType: stored.mediaType, name: stored.name }] };
+    const reservation = store.reserveAttachmentIngress(input);
+    if (reservation.kind !== "reserved") throw new Error("Expected an attached input reservation.");
+    const { attempt, custody } = store.prepareSessionInputMutation({ ...input, reservation });
+    if (custody.kind !== "mutation_owned") throw new Error("Expected retained mutation attachment custody.");
     const inspector = new Database(store.paths.database, { create: false, strict: true });
     inspector.exec(`CREATE TRIGGER reject_atomic_message_attachment
       BEFORE INSERT ON message_attachments
       BEGIN SELECT RAISE(ABORT,'reject atomic attachment'); END;`);
-    expect(() => store.beginSessionMutationEffect({
+    const before = snapshotSwitchContainmentForTest(inspector);
+    const begin = () => store.beginSessionMutationEffect({
+      ...daemon, attachments: [stored],
+      custody: { custodyId: custody.custodyId, custodyDigest: custody.custodyDigest },
       providerAuthority: capturedProviderAuthorityForTest(store, session.id),
       message: "attached",
       attemptId: attempt.id,
@@ -30126,7 +28684,9 @@ describe("StateStore", () => {
         clientMessageId: attempt.id,
         messageDigest: createHash("sha256").update("attached").digest("hex"),
       },
-    })).toThrow("reject atomic attachment");
+    });
+    expect(begin).toThrow("reject atomic attachment");
+    expect(snapshotSwitchContainmentForTest(inspector)).toEqual(before);
     expect(store.readMutation(key)).toMatchObject({ state: "prepared" });
     expect(store.readMutation(key)?.evidence).toBeUndefined();
     expect(store.readSessionUserMessageSource(session.id, "mutation", key))
@@ -30134,11 +28694,15 @@ describe("StateStore", () => {
     expect(store.messageAttachmentManifest(session.id, attempt.id)).toEqual([]);
     expect(store.attachmentCustody(stored.digest)).toBeNull();
     inspector.exec("DROP TRIGGER reject_atomic_message_attachment");
+    expect(begin()).toMatchObject({ attemptId: attempt.id, evidence: { kind: "session.steer" } });
+    expect(store.messageAttachmentManifest(session.id, attempt.id)).toEqual(input.attachments);
+    expect(store.attachmentCustody(stored.digest)?.referenceCount).toBe(1);
     inspector.close(false);
   });
 
   test("refuses a deceptive attachment name before durable message effect authority", async () => {
     const { store } = await fixture();
+    const daemon = startInputFixtureDaemon(store);
     const profile = signInProfile(
       store,
       "Transcript attachment control",
@@ -30151,63 +28715,35 @@ describe("StateStore", () => {
       state: "idle",
     });
     const key = "43000000-0000-4000-8000-00000000001f";
-    const attempt = store.prepareMutation({
-      kind: "session.steer",
-      authorityId: session.id,
-      authorityGeneration: profile.processGeneration,
-      request: { message: "attached" },
-      idempotencyKey: key,
-    });
     const name = `report${String.fromCodePoint(0x202e)}fdp.exe`;
     const attachment = {
       byteLength: 4,
-      canonicalMediaType: "text/plain" as const,
       digest: "9".repeat(64),
       mediaType: "text/plain" as const,
       name,
     };
-
-    expect(() => store.beginSessionMutationEffect({
+    const input = { ...daemon, kind: "session.steer" as const, sessionId: session.id,
+      idempotencyKey: key, message: "attached",
       providerAuthority: capturedProviderAuthorityForTest(store, session.id),
-      message: "attached",
-      attemptId: attempt.id,
-      sessionId: session.id,
-      profileGeneration: profile.processGeneration,
-      transcript: {
-        accountId: profile.id,
-        providerGeneration: profile.processGeneration,
-        providerConnectionId: "10000000-0000-4000-8000-000000000013",
-        actor: "human",
-        message: "attached",
-        attachments: [{
-          byteLength: attachment.byteLength,
-          digest: attachment.digest,
-          mediaType: attachment.mediaType,
-          name,
-        }],
-        storedAttachments: [attachment],
-      },
-      evidence: {
-        kind: "session.steer",
-        providerThreadId: session.providerThreadId ?? "",
-        baseline: {
-          providerUpdatedAt: null,
-          status: "active",
-          activeTurnId: "turn-control-name",
-        },
-        activeTurnId: "turn-control-name",
-        clientMessageId: attempt.id,
-        messageDigest: createHash("sha256").update("attached").digest("hex"),
-      },
-    })).toThrow();
-    expect(store.readMutation(key)).toMatchObject({ state: "prepared" });
-    expect(store.readMutation(key)?.evidence).toBeUndefined();
-    expect(store.readSessionUserMessageSource(session.id, "mutation", key))
-      .toEqual({ status: "none" });
-    expect(store.messageAttachmentManifest(session.id, attempt.id)).toEqual([]);
-    expect(store.attachmentCustody(attachment.digest)).toBeNull();
-    expect(store.listSessionEvents({ sessionId: session.id, afterSequence: 0 }).events)
-      .toHaveLength(0);
+      attachments: [attachment] };
+    // Changing only the name makes the same ingress reservable. No missing
+    // reservation or later digest conflict may satisfy the refusal oracle.
+    const valid = store.reserveAttachmentIngress({ ...input,
+      attachments: [{ ...attachment, name: "report.pdf" }] });
+    if (valid.kind !== "reserved") throw new Error("Expected the safe-name reservation control.");
+    store.releaseAttachmentIngress({ ...daemon, ...valid });
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      const before = snapshotSwitchContainmentForTest(inspector);
+      expect(() => store.reserveAttachmentIngress(input)).toThrow("ATTACHMENT_CUSTODY_INVALID_INPUT");
+      expect(() => store.prepareSessionInputMutation(input)).toThrow("ATTACHMENT_CUSTODY_INVALID_INPUT");
+      expect(snapshotSwitchContainmentForTest(inspector)).toEqual(before);
+      expect(store.readMutation(key)).toBeNull();
+      expect(() => store.readSessionUserMessageSource(session.id, "mutation", key))
+        .toThrow("SESSION_USER_MESSAGE_SOURCE_AUTHORITY_INVALID");
+      expect(store.attachmentCustody(attachment.digest)).toBeNull();
+      expect(store.listSessionEvents({ sessionId: session.id, afterSequence: 0 }).events).toHaveLength(0);
+    } finally { inspector.close(false); }
   });
 
   test("rolls queue source, mutation receipt, intent, and attachments back together", async () => {
@@ -30254,7 +28790,7 @@ describe("StateStore", () => {
     inspector.close(false);
   });
 
-  test("replays a finalized attachment queue only from its retained exact manifest", async () => {
+  test("replays a finalized attachment queue from sealed identity after display manifest pruning", async () => {
     const { store } = await fixture();
     const daemon = startInputFixtureDaemon(store);
     const profile = signInProfile(
@@ -30406,7 +28942,7 @@ describe("StateStore", () => {
       actor: "automation",
       attachments: [{ ...attachments[0]!, digest: "a".repeat(64) }],
       idempotencyKey: key,
-    })).toThrow("IDEMPOTENCY_CONFLICT");
+    })).toThrow("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
 
     store.recordMessageAttachments({
       sessionId: session.id,
@@ -30414,7 +28950,26 @@ describe("StateStore", () => {
       attachments: [stored],
     });
     expect(store.messageAttachmentManifest(session.id, queued.id)).toEqual([]);
-    expect(() => store.enqueueIdempotent({
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    try {
+    // This fixture intentionally admits over 200 display sources to prove
+    // pruning. Keep its all-table oracle bounded independently of tiny fixtures.
+    const snapshotReplay = () => ({
+      schema: inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all(),
+      version: inspector.query("PRAGMA user_version").get(),
+      rows: z.object({ name: z.string().regex(/^[a-z0-9_]+$/u) }).strict().array().parse(
+        inspector.query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all(),
+      ).map(({ name }) => {
+        const rows = inspector.query(`SELECT * FROM ${name} ORDER BY rowid LIMIT 1025`).all();
+        if (rows.length > 1024) throw new Error("Attachment replay fixture exceeded its row bound.");
+        return { name, rows };
+      }),
+    });
+    const beforeReplay = snapshotReplay();
+    expect(store.readQueueEnqueueReplay({ sessionId: session.id, message: "queued attached replay",
+      actor: "automation", attachments, idempotencyKey: key }))
+      .toEqual({ queued: store.requireQueue(queued.id), verification: "sealed" });
+    expect(store.enqueueIdempotent({
       providerAuthority: capturedProviderAuthorityForTest(store, session.id),
       sessionId: session.id,
       profileGeneration: profile.processGeneration,
@@ -30422,7 +28977,12 @@ describe("StateStore", () => {
       actor: "automation",
       attachments,
       idempotencyKey: key,
-    })).toThrow("QUEUE_ATTACHMENT_REPLAY_EVIDENCE_PRUNED");
+    })).toEqual(store.requireQueue(queued.id));
+    expect(() => store.readQueueEnqueueReplay({ sessionId: session.id, message: "queued attached replay",
+      actor: "automation", attachments: [{ ...attachments[0]!, digest: "a".repeat(64) }], idempotencyKey: key }))
+      .toThrow("QUEUE_ATTACHMENT_REQUEST_CONFLICT");
+    expect(snapshotReplay()).toEqual(beforeReplay);
+    } finally { inspector.close(false); }
   });
 
   for (const drift of [
@@ -30477,14 +29037,13 @@ describe("StateStore", () => {
   }
 
   test("rejects a drifted provider-v39 predecessor before adding adoption authority", async () => {
-    const { store } = await fixture();
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
+    const paths = await canonical39DevinArchive();
     const predecessor = new Database(paths.database, { create: false, strict: true });
     try {
-      downgradeToExactProviderVersion39(predecessor);
+      expect(predecessor.query("PRAGMA user_version").get()).toEqual({ user_version: 39 });
+      const before = canonicalAuthBudgetSnapshot(predecessor);
+      // One adversarial trigger replacement on the authentic old image.
+      // No session, effect, provider tuple, or migration stamp is restaged.
       predecessor.exec(`
         DROP TRIGGER session_mutation_authority_rebinds_v39_immutable_delete;
         CREATE TRIGGER session_mutation_authority_rebinds_v39_immutable_delete
@@ -30492,14 +29051,14 @@ describe("StateStore", () => {
         WHEN OLD.recorded_at>=0
         BEGIN SELECT RAISE(ABORT, 'session mutation authority rebind v39 is immutable'); END;
       `);
+      expect(canonicalAuthBudgetSnapshot(predecessor).rows).toEqual(before.rows);
     } finally {
       predecessor.close(false);
     }
 
-    expect(() => new StateStore(paths, { now: () => 2_000 }))
-      .toThrow(
-        "STATE_SCHEMA_V39_OBJECT_INVALID:session_mutation_authority_rebinds_v39_immutable_delete",
-      );
+    expectInertSchemaRefusal(paths,
+      "STATE_SCHEMA_V39_OBJECT_INVALID:session_mutation_authority_rebinds_v39_immutable_delete",
+      "STATE_SCHEMA_MIGRATION_REQUIRED:39:60");
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
       expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 39 });
@@ -30518,139 +29077,75 @@ describe("StateStore", () => {
     }
   });
 
-  test("migrates the exact 42c4235 adoption-v35 surface and preserves candidates", async () => {
-    const { store } = await fixture();
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
-    const historicalV35 = new Database(paths.database, { create: false, strict: true });
+  test("migrates the captured 42c4235 adoption-v35 writer and preserves original candidate cells", async () => {
+    const paths = await canonicalAdoption35Archive();
+    const captured = canonicalAdoption35Fixture;
+    const inspector = new Database(paths.database, { create: false, strict: true });
     try {
-      downgradeToHistoricalAdoptionVersion35(historicalV35);
-      historicalV35.query(
-        `INSERT INTO session_adoption_candidates(
-           provider,provider_thread_id,project_id,title,provider_state,
-           active_turn_id,provider_updated_at,liveness,
-           source_pid,source_pid_domain,source_proc_start,claim_status,
-           candidate_fingerprint,fenced_fingerprint,revision,
-           first_discovered_at,last_observed_at,last_changed_at,last_attempt_at
-         ) VALUES ('claude',?,NULL,?,'terminal',NULL,10,'not_live',
-           46001,'darwin','historical-v35-process','pending',?,NULL,1,1000,1000,1000,NULL)`,
-      ).run(
-        "historical-v35-candidate",
-        "Historical v35 candidate",
-        "a".repeat(64),
-      );
-      expect(historicalV35.query(
-        "SELECT sql FROM sqlite_master WHERE name='session_adoption_candidates'",
-      ).get()).not.toBeNull();
-      expect(historicalV35.query(
-        "SELECT 1 FROM pragma_table_info('profiles') WHERE name='codex_account_key'",
-      ).get()).toBeNull();
-    } finally {
-      historicalV35.close(false);
-    }
-
-    const migrated = new StateStore(paths, { now: () => 2_000 });
-    stores.push(migrated);
-    expect(migrated.readSessionAdoptionCandidate(
-      "claude",
-      "historical-v35-candidate",
-    )).toMatchObject({
-      lastLiveObservedAt: null,
-      providerProjectRoot: null,
-      provider: "claude",
-      providerThreadId: "historical-v35-candidate",
-      sourceProcessIdentity: {
-        pid: 46_001,
-        pidDomain: "darwin",
-        procStart: "historical-v35-process",
-      },
-      status: "pending",
-    });
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
-    try {
+      const before = canonicalAuthBudgetSnapshot(inspector);
+      expect(before.version).toEqual({ user_version: 35 });
+      expect(inspector.query("SELECT * FROM migrations ORDER BY version").all()).toEqual([...captured.ledger]);
+      const schema = inspector.query("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").all();
+      expect(createHash("sha256").update(JSON.stringify(schema)).digest("hex")).toBe(captured.schemaSha256);
+      expect(inspector.query("SELECT * FROM session_adoption_candidates").all()).toEqual([captured.rawCandidate]);
+      expect(inspector.query("SELECT name FROM pragma_table_info('profiles') WHERE name='codex_account_key'").get()).toBeNull();
+      const oldRows = canonicalAuthBudgetRows(inspector, Object.keys(before.rows).filter((table) => table !== "migrations"));
+      expect(() => { new StateStore(paths, { readonly: true }).close(); }).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:60");
+      expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(before);
+      const migrated = new StateStore(paths, { now: () => 2_000, resolveMachineTimeZone: () => "UTC" });
+      stores.push(migrated);
+      expect(oldRows.read()).toEqual(oldRows.before);
+      expect(migrated.readSessionAdoptionCandidate(captured.request.provider, captured.request.providerThreadId))
+        .toMatchObject({ ...captured.candidate, lastLiveObservedAt: null, providerProjectRoot: null });
+      expect(inspector.query("SELECT last_live_observed_at,provider_project_root FROM session_adoption_candidates").get())
+        .toEqual({ last_live_observed_at: null, provider_project_root: null });
+      expect(inspector.query("SELECT * FROM migrations WHERE version<=35 ORDER BY version").all()).toEqual([...captured.ledger]);
       expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
-      expect(inspector.query(
-        "SELECT 1 FROM pragma_table_info('session_adoption_candidates') WHERE name='last_live_observed_at'",
-      ).get()).toEqual({ 1: 1 });
-      expect(inspector.query(
-        "SELECT 1 FROM pragma_table_info('session_adoption_candidates') WHERE name='provider_project_root'",
-      ).get()).toEqual({ 1: 1 });
-    } finally {
-      inspector.close(false);
-    }
+      expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      expectCanonical35To38InertReopens(paths, inspector);
+    } finally { inspector.close(false); }
   });
 
-  test("rejects an extra adoption object beside the exact 42c4235 v35 surface without writes", async () => {
-    const { store } = await fixture();
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
-    const historicalLookalike = new Database(paths.database, { create: false, strict: true });
-    try {
-      downgradeToHistoricalAdoptionVersion35(historicalLookalike);
-      historicalLookalike.exec(
-        "CREATE TABLE session_adoption_unrecognized_authority (id TEXT PRIMARY KEY) STRICT",
-      );
-    } finally {
-      historicalLookalike.close(false);
-    }
-
-    expect(() => new StateStore(paths, { now: () => 2_000 }))
-      .toThrow("STATE_SCHEMA_V39_LEGACY_ADOPTION_OBJECT_INVALID");
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
-    try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 35 });
-      expect(inspector.query(
-        "SELECT name FROM sqlite_master WHERE name='session_adoption_unrecognized_authority'",
-      ).get()).toEqual({ name: "session_adoption_unrecognized_authority" });
-      expect(inspector.query(
-        "SELECT 1 FROM sqlite_master WHERE name='notification_hours'",
-      ).get()).toBeNull();
-    } finally {
-      inspector.close(false);
-    }
-  });
-
-  test("rejects a malformed adoption-v35 lookalike before mutating it", async () => {
-    const { store } = await fixture();
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
-    const featureV35 = new Database(paths.database, { create: false, strict: true });
-    try {
-      dropPostLegacyAdoptionVersion36Schema(featureV35);
-      dropProviderSwitchProgressSchema(featureV35);
-      featureV35.exec("DELETE FROM migrations WHERE version>=36; DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=35;");
-      expect(featureV35.query(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='session_adoption_policies'",
-      ).get()).toEqual({ name: "session_adoption_policies" });
-      expect(featureV35.query(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='session_provider_switch_targets'",
-      ).get()).toBeNull();
-    } finally {
-      featureV35.close(false);
-    }
-
-    expect(() => new StateStore(paths, { now: () => 2_000 }))
-      .toThrow(/STATE_SCHEMA_V39_LEGACY_ADOPTION_/u);
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
-    try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 35 });
-      expect(inspector.query("SELECT version FROM migrations WHERE version>=35 ORDER BY version").all())
-        .toEqual([{ version: 35 }]);
-      expect(inspector.query(
-        `SELECT name FROM sqlite_master WHERE type='table'
-         AND name IN ('session_provider_switch_targets','session_adoption_policies')
-         ORDER BY name`,
-      ).all()).toEqual([{ name: "session_adoption_policies" }]);
-    } finally {
-      inspector.close(false);
-    }
-  });
+  for (const damage of ["extra_object", "weakened_guard"] as const) {
+    test("refuses an adversarial captured adoption-v35 derivative without writes: " + damage, async () => {
+      const paths = await canonicalAdoption35Archive();
+      const inspector = new Database(paths.database, { create: false, strict: true });
+      try {
+        const before = canonicalAuthBudgetSnapshot(inspector);
+        expect(before.version).toEqual({ user_version: 35 });
+        expect(inspector.query("SELECT * FROM session_adoption_candidates").all()).toEqual([canonicalAdoption35Fixture.rawCandidate]);
+        // One explicitly adversarial alteration of an authentic independent
+        // copy. The captured writer, original cells and ledger stay unchanged.
+        if (damage === "extra_object") {
+          inspector.exec("CREATE TABLE session_adoption_unrecognized_authority (id TEXT PRIMARY KEY) STRICT");
+        } else {
+          expect(inspector.query("SELECT name FROM sqlite_master WHERE name='session_adoption_candidate_revision_guard'").get())
+            .toEqual({ name: "session_adoption_candidate_revision_guard" });
+          inspector.exec("DROP TRIGGER session_adoption_candidate_revision_guard");
+          inspector.exec("CREATE TRIGGER session_adoption_candidate_revision_guard BEFORE UPDATE ON session_adoption_candidates BEGIN SELECT 1; END");
+        }
+        const damaged = canonicalAuthBudgetSnapshot(inspector);
+        expect(damaged.version).toEqual(before.version);
+        for (const [table, rows] of Object.entries(before.rows)) expect(damaged.rows[table]).toEqual(rows);
+        const changedName = damage === "extra_object" ? "session_adoption_unrecognized_authority" : "session_adoption_candidate_revision_guard";
+        const objects = z.array(z.object({ name: z.string() }).passthrough());
+        const addedIndex = "sqlite_autoindex_session_adoption_unrecognized_authority_1";
+        if (damage === "extra_object") expect(damaged.schema).toContainEqual({
+          type: "index", name: addedIndex, tbl_name: changedName, sql: null,
+        });
+        expect(objects.parse(damaged.schema).filter(({ name }) => name !== changedName && name !== addedIndex))
+          .toEqual(objects.parse(before.schema).filter(({ name }) => name !== changedName));
+        expect(() => { new StateStore(paths, { now: () => 2_000 }).close(); }).toThrow(
+          damage === "extra_object"
+            ? "STATE_SCHEMA_V39_LEGACY_ADOPTION_OBJECT_INVALID:session_adoption_unrecognized_authority"
+            : "STATE_SCHEMA_V39_LEGACY_ADOPTION_V35_INVALID",
+        );
+        expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(damaged);
+        expect(() => { new StateStore(paths, { readonly: true }).close(); }).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:60");
+        expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(damaged);
+      } finally { inspector.close(false); }
+    });
+  }
 
   test("rejects stale same-name v39 provider-revocation policy guards", async () => {
     const value = await fixture();
@@ -30759,9 +29254,9 @@ describe("StateStore", () => {
       malformed.close(false);
     }
 
-    expectInertSchemaRefusal(paths,
-      "STATE_SCHEMA_V39_OBJECT_INVALID:session_mutation_authority_rebinds_v39",
-      "STATE_SCHEMA_COHORT_INVALID:combined49:session_mutation_provider_successor_v39_insert_guard");
+    // The joined login successor guard refers to this missing historical
+    // table, so its structural proof fails before any row or repair path.
+    expectInertSchemaRefusal(paths, "PROVIDER_LOGIN_BINDING_PROOF_INVALID");
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
       expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
@@ -30829,8 +29324,9 @@ describe("StateStore", () => {
       malformed.close(false);
     }
 
-    expectInertSchemaRefusal(paths, "STATE_SCHEMA_V39_OBJECT_INVALID:sessions.provider_v39",
-      "STATE_SCHEMA_COHORT_INVALID:combined49:provider_interactions_authority_guard");
+    // Removing the column also removes the canonical guard that references
+    // it. Current admission checks that exact guard before provider rows.
+    expectInertSchemaRefusal(paths, "CANONICAL_PROFILE_SCHEMA_TRIGGER:canonical_profile_session_insert_guard");
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
       expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
@@ -30910,52 +29406,38 @@ describe("StateStore", () => {
     }
   });
 
-  test("pre-applies v38 preset contracts before replaying the current work schema from v25", async () => {
-    const { store } = await fixture();
-    const profile = store.createProfile("Pre-v26 preset contract");
-    const session = store.createSession({
-      profileId: profile.id,
-      preset: "high",
-      fastEnabled: false,
-    });
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
+  test("pre-applies v38 preset contracts before replaying the current work schema from authentic v25", async () => {
+    const captured = canonicalLabelPresetFixture.captures["canonical25-preset"];
+    const { session, originalPresetRequirement } = captured.retained;
+    const paths = await canonicalLabelPresetArchive("canonical25-preset");
     const legacy = new Database(paths.database, { create: false, strict: true });
-    dropPostProviderSwitchSchema(legacy);
-    dropProviderSwitchProgressSchema(legacy);
-    downgradeProviderAccountsToReleasedVersion(legacy);
-    for (const trigger of [
-      "work_attempt_route_guard",
-      "work_devin_preset_contract_guard",
-      "work_profile_attempt_authority_guard",
-      "work_session_attempt_authority_guard",
-      "work_session_devin_contract_guard",
-      "work_signal_member_guard",
-      "works_identity_immutable",
-    ] as const) legacy.exec(`DROP TRIGGER IF EXISTS ${trigger}`);
-    // Keep each ALTER separate: Bun's multi-statement exec can continue past
-    // an intermediate schema error, which would leave this fixture current.
-    legacy.exec("ALTER TABLE works DROP COLUMN preset_contract");
-    legacy.exec("ALTER TABLE sessions DROP COLUMN preset_contract");
-    expect(legacy.query("PRAGMA table_info(sessions)").all())
-      .not.toContainEqual(expect.objectContaining({ name: "preset_contract" }));
-    expect(legacy.query("PRAGMA table_info(sessions)").all())
-      .not.toContainEqual(expect.objectContaining({ name: "provider_v39" }));
-    legacy.exec("DELETE FROM migrations WHERE version > 25; PRAGMA user_version=25;");
-    legacy.exec(`
-      DELETE FROM migrations WHERE version > 25;
-      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=25;
-    `);
-    legacy.close(false);
+    try {
+      legacy.exec("PRAGMA query_only=ON");
+      expect(legacy.query("PRAGMA table_info(sessions)").all())
+        .not.toContainEqual(expect.objectContaining({ name: "preset_contract" }));
+      expect(legacy.query("SELECT name FROM sqlite_master WHERE type='table' AND name='works'").get()).toBeNull();
+      expect(legacy.query("SELECT id,preset,state FROM sessions").all()).toEqual([
+        { id: session.id, preset: "high", state: "starting" },
+      ]);
+    } finally { legacy.close(false); }
 
-    const migrated = new StateStore(paths, { now: () => 5_000 });
+    const migratedAt = 25_060;
+    // The authentic starting placeholder has no provider-account adoption
+    // proof. The joined migration preserves its preset and payload, but must
+    // quarantine it instead of inventing live execution authority.
+    const expectedSession = {
+      ...session,
+      state: "recovery_required" as const,
+      revision: session.revision + 1,
+      updatedAt: migratedAt,
+    };
+    const migrated = new StateStore(paths, { now: () => migratedAt });
     stores.push(migrated);
     expect(migrated.requireSessionPresetRequirement(session.id)).toEqual({
       preset: "high",
-      requirement: { model: "gpt-5.6-sol", effort: "max" },
+      requirement: originalPresetRequirement,
     });
+    expect(migrated.requireSession(session.id)).toMatchObject(expectedSession);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
       expect(inspector.query("PRAGMA table_info(sessions)").all())
@@ -30964,12 +29446,32 @@ describe("StateStore", () => {
         .toContainEqual(expect.objectContaining({ name: "preset_contract", notnull: 1 }));
       expect(inspector.query("SELECT preset_contract FROM sessions WHERE id=?").get(session.id))
         .toEqual({ preset_contract: legacyPresetContract });
+      expect(inspector.query("SELECT * FROM session_provider_account_authorities WHERE session_id=?").get(session.id)).toBeNull();
       expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
       expect(inspector.query("SELECT version FROM migrations WHERE version=38").get())
         .toEqual({ version: 38 });
+      expect(inspector.query("SELECT * FROM migrations WHERE version<=25 ORDER BY version").all())
+        .toEqual([...captured.ledger]);
     } finally {
       inspector.close(false);
     }
+    migrated.close();
+    stores.splice(stores.indexOf(migrated), 1);
+    const stable = new Database(paths.database, { create: false, strict: true });
+    try {
+      stable.exec("PRAGMA query_only=ON");
+      const before = canonicalAuthBudgetSnapshot(stable);
+      for (const readonly of [false, true]) {
+        const reopened = new StateStore(paths, { readonly, now: () => 25_061 });
+        try {
+          expect(reopened.requireSessionPresetRequirement(session.id)).toEqual({
+            preset: "high", requirement: originalPresetRequirement,
+          });
+          expect(reopened.requireSession(session.id)).toMatchObject(expectedSession);
+        } finally { reopened.close(); }
+        expect(canonicalAuthBudgetSnapshot(stable)).toEqual(before);
+      }
+    } finally { stable.close(false); }
   });
 
   test("captures the fresh notification-hours default from the machine zone exactly once", async () => {
@@ -31030,270 +29532,160 @@ describe("StateStore", () => {
     }
   });
 
-  test("migrates populated main-v35 provider-switch evidence to v42 without rewriting it", async () => {
-    const { store } = await fixture();
-    const profile = signInProfile(store, "Main v35", "main-v35@example.com");
-    const session = store.createSession({
-      profileId: profile.id,
-      preset: "high",
-      fastEnabled: false,
-    });
-    const attempt = store.prepareMutation({
-      authorityGeneration: profile.processGeneration,
-      authorityId: session.id,
-      idempotencyKey: "00000000-0000-4000-8000-000000000735",
-      kind: "session.switch",
-      request: { preset: "fable-max", provider: "claude" },
-    });
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
-    const mainV35 = new Database(paths.database, { create: false, strict: true });
-    downgradeProviderAccountsToReleasedVersion(mainV35);
-    mainV35.query(
-      `INSERT INTO session_provider_switch_targets(attempt_id,provider_thread_id,recorded_at)
-       VALUES (?,?,?)`,
-    ).run(attempt.id, "retained-provider-thread", 7_350);
-    dropPostProviderSwitchSchema(mainV35);
-    mainV35.exec(`
-      DELETE FROM migrations WHERE version>=36;
-      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=35;
-    `);
-    mainV35.close(false);
-
-    expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:60");
-    const migrated = new StateStore(paths, {
-      now: () => 8_000,
-      resolveMachineTimeZone: () => "UTC",
-    });
-    stores.push(migrated);
-    expect(migrated.readNotificationHours()).toMatchObject({ revision: 1, timeZone: "UTC" });
-    expect(migrated.readNotificationEmailPolicy()).toEqual({
-      enabled: false,
-      revision: 1,
-      version: 1,
-    });
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
+  test("migrates captured main35 provider-switch evidence without rewriting its original bytes or digests", async () => {
+    const paths = await canonical35To38Archive("main35");
+    const captured = canonical35To38Fixture.captures.main35;
+    const original = captured.metadata.caseState;
+    const database = new Database(paths.database, { create: false, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
-      expect(inspector.query(
-        "SELECT provider_thread_id,recorded_at FROM session_provider_switch_targets WHERE attempt_id=?",
-      ).get(attempt.id)).toEqual({
-        provider_thread_id: "retained-provider-thread",
-        recorded_at: 7_350,
-      });
-      expect(inspector.query(
-        "SELECT version FROM migrations WHERE version BETWEEN 35 AND 50 ORDER BY version",
-      ).all()).toEqual([
-        { version: 35 },
-        { version: 36 },
-        { version: 37 },
-        { version: 38 },
-        { version: 39 },
-        { version: 40 },
-        { version: 41 },
-        { version: 42 },
-        { version: 43 },
-        { version: 44 },
-        { version: 45 },
-        { version: 46 }, { version: 47 }, { version: 48 }, { version: 49 },
-        ...Array.from({ length: 11 }, (_, index) => ({ version: index + 50 })),
+      database.exec("PRAGMA query_only=ON");
+      const history = canonicalAuthBudgetRows(database, [
+        "mutation_effect_evidence", "session_provider_switch_targets",
+        "session_provider_switch_seed_intents", "session_provider_switch_seed_results",
+        "session_provider_switch_source_releases", "session_provider_switch_target_releases",
       ]);
-    } finally {
-      inspector.close(false);
-    }
+      const readRequest = () => database.query(
+        "SELECT id,idempotency_key,kind,authority_id,authority_generation,request_digest,created_at FROM mutation_attempts WHERE id=?",
+      ).get(original.attempt.id);
+      const request = readRequest();
+      expect(database.query("SELECT evidence_json,evidence_digest,recorded_at FROM mutation_effect_evidence WHERE attempt_id=?")
+        .get(original.attempt.id)).toEqual({ evidence_json: JSON.stringify(original.effect.evidence),
+          evidence_digest: original.effect.digest, recorded_at: original.effect.recordedAt });
+      expect(database.query("SELECT provider_thread_id,recorded_at FROM session_provider_switch_targets WHERE attempt_id=?")
+        .get(original.attempt.id)).toEqual({ provider_thread_id: original.progress.targetProviderThreadId,
+          recorded_at: captured.metadata.fixedTime });
+      const before = canonicalAuthBudgetSnapshot(database);
+      expect(() => new StateStore(paths, { readonly: true }))
+        .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:60");
+      expect(canonicalAuthBudgetSnapshot(database)).toEqual(before);
+      const migrated = new StateStore(paths, { now: () => 90_000_000, resolveMachineTimeZone: () => "UTC" });
+      stores.push(migrated);
+      expect(migrated.readNotificationHours()).toMatchObject({ revision: 1, timeZone: "UTC" });
+      expect(migrated.readNotificationEmailPolicy()).toEqual({ enabled: false, revision: 1, version: 1 });
+      expect(history.read()).toEqual(history.before);
+      expect(readRequest()).toEqual(request);
+      // A captured old target observation is retained evidence, not proof of
+      // a current native account binding or permission to resume provider IO.
+      expect(database.query("SELECT * FROM session_provider_account_authorities").all()).toEqual([]);
+      expect(database.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      expectCanonical35To38InertReopens(paths, database);
+    } finally { database.close(false); }
   });
 
-  test("converges an exact legacy feature-v35 hours authority without resolving the zone", async () => {
-    const { store } = await fixture();
-    expect(store.updateNotificationHours({
-      expectedRevision: 1,
-      version: 1,
-      startMinute: 480,
-      endMinute: 1_200,
-      timeZone: "UTC",
-    }).revision).toBe(2);
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
-    const legacy = new Database(paths.database, { create: false, strict: true });
-    dropSessionAdoptionAndPresetContractSchema(legacy);
-    dropProviderSwitchVersion35Objects(legacy);
-    legacy.exec(`
-      DROP TABLE attention_email_policy;
-      DELETE FROM migrations WHERE version>=36;
-      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=35;
-    `);
-    expect(providerSwitchSchemaObjectCount(legacy)).toBe(0);
-    legacy.close(false);
-
-    expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:60");
-    const migrated = new StateStore(paths, {
-      now: () => 9_000,
-      resolveMachineTimeZone: () => {
-        throw new Error("LEGACY_V35_MUST_RETAIN_ITS_ZONE");
-      },
-    });
-    stores.push(migrated);
-    expect(migrated.readNotificationEmailPolicy()).toEqual({
-      enabled: false,
-      revision: 2,
-      version: 1,
-    });
-    expect(migrated.readNotificationHours()).toMatchObject({
-      revision: 2,
-      startMinute: 480,
-      endMinute: 1_200,
-      timeZone: "UTC",
-    });
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
+  test("converges captured feature35 hours authority without resolving the zone", async () => {
+    const paths = await canonical35To38Archive("feature35");
+    const captured = canonical35To38Fixture.captures.feature35;
+    const database = new Database(paths.database, { create: false, strict: true });
     try {
-      expect(providerSwitchSchemaObjectCount(inspector)).toBe(21);
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
-    } finally {
-      inspector.close(false);
-    }
+      database.exec("PRAGMA query_only=ON");
+      const history = canonicalAuthBudgetRows(database, ["notification_hours", "profiles", "session_runtime_profiles", "queue_entries"]);
+      expect(providerSwitchSchemaObjectCount(database)).toBe(0);
+      const before = canonicalAuthBudgetSnapshot(database);
+      expect(() => new StateStore(paths, { readonly: true }))
+        .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:35:60");
+      expect(canonicalAuthBudgetSnapshot(database)).toEqual(before);
+      const migrated = new StateStore(paths, { now: () => 90_000_000,
+        resolveMachineTimeZone: () => { throw new Error("CAPTURED_FEATURE35_MUST_RETAIN_ITS_ZONE"); },
+      });
+      stores.push(migrated);
+      expect(migrated.readNotificationHours()).toEqual(captured.metadata.caseState.hours);
+      expect(migrated.readNotificationEmailPolicy()).toEqual({ enabled: false, revision: 2, version: 1 });
+      expect(history.read()).toEqual(history.before);
+      expect(providerSwitchSchemaObjectCount(database)).toBe(21);
+      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
+      expect(database.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      expectCanonical35To38InertReopens(paths, database);
+    } finally { database.close(false); }
   });
 
-  test("refuses an enabled email lookalike under canonical v36 and rolls back", async () => {
-    const { store } = await fixture();
-    expect(store.updateNotificationEmailPolicy({
-      enabled: true,
-      expectedRevision: 1,
-    }).enabled).toBe(true);
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
+  test("refuses adversarial enabled email on an observed canonical36 stage without changing original rows", async () => {
+    const captured = canonical35To38Fixture.captures["observed-canonical36-stage"];
+    expect(captured.metadata).toMatchObject({
+      kind: "uncommitted_archived_migration_stage", releasedWriterImage: false,
+      observedBeforeOuterCommit: true, observerRowOrSchemaWrites: false,
+    });
+    // Positive control: the serialized stage is source-derived, not a
+    // released36 writer, and its unchanged bytes can migrate on their own.
+    const controlPaths = await canonical35To38Archive("observed-canonical36-stage");
+    const control = new StateStore(controlPaths, { now: () => 90_000_000,
+      resolveMachineTimeZone: () => { throw new Error("OBSERVED36_ZONE_MUST_NOT_BE_REPLACED"); },
+    });
+    stores.push(control);
+    expect(control.readNotificationEmailPolicy()).toEqual({ enabled: false, revision: 1, version: 1 });
 
-    const legacy = new Database(paths.database, { create: false, strict: true });
-    dropSessionAdoptionAndPresetContractSchema(legacy);
-    legacy.exec(`
-      DELETE FROM migrations WHERE version>=37;
-      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=36;
-    `);
-    legacy.close(false);
-
-    expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:60");
-
-    expect(() => new StateStore(paths))
-      .toThrow("ATTENTION_EMAIL_POLICY_MIGRATION_OPT_IN_REFUSED");
-    const unchanged = new Database(paths.database, { readonly: true, strict: true });
+    const paths = await canonical35To38Archive("observed-canonical36-stage");
+    const declarationPaths = await canonical35To38Archive("canonical37");
+    const declarations = new Database(declarationPaths.database, { create: false, strict: true });
+    declarations.exec("PRAGMA query_only=ON");
+    const database = new Database(paths.database, { create: false, strict: true });
     try {
-      expect(unchanged.query("PRAGMA user_version").get())
-        .toEqual({ user_version: 36 });
-      expect(unchanged.query("SELECT version FROM migrations WHERE version=37").get())
-        .toBeNull();
-      expect(unchanged.query(
-        "SELECT enabled,revision FROM attention_email_policy WHERE singleton=1",
-      ).get()).toEqual({ enabled: 1, revision: 2 });
-    } finally {
-      unchanged.close(false);
-    }
+      const before = canonicalAuthBudgetSnapshot(database);
+      expect(database.query("SELECT name FROM sqlite_master WHERE name='attention_email_policy'").get()).toBeNull();
+      const objects = z.array(z.object({ type: z.enum(["table", "trigger"]), name: z.string(), sql: z.string() }).strict()).parse(
+        declarations.query(`SELECT type,name,sql FROM sqlite_master WHERE tbl_name='attention_email_policy'
+          ORDER BY CASE type WHEN 'table' THEN 0 ELSE 1 END,name`).all(),
+      );
+      expect(objects.map(({ name }) => name)).toEqual([
+        "attention_email_policy", "attention_email_policy_delete_guard",
+        "attention_email_policy_insert_guard", "attention_email_policy_update_guard",
+      ]);
+      // Explicit adversarial extension only: exact source37 declarations
+      // plus one invented opt-in. No captured old cell/version is edited.
+      database.transaction(() => {
+        for (const object of objects) database.exec(object.sql);
+        database.query(`INSERT INTO attention_email_policy(
+          singleton,version,enabled,revision,created_at,updated_at) VALUES(1,1,1,1,37001,37001)`).run();
+      }).immediate();
+      const after = canonicalAuthBudgetSnapshot(database);
+      for (const [table, rows] of Object.entries(before.rows)) expect(after.rows[table]).toEqual(rows);
+      expect(after.version).toEqual(before.version);
+      expect(database.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally { database.close(false); declarations.close(false); }
+    expectInertSchemaRefusal(paths, "ATTENTION_EMAIL_POLICY_MIGRATION_OPT_IN_REFUSED",
+      "STATE_SCHEMA_MIGRATION_REQUIRED:36:60");
   });
 
-  test("preserves an exact legacy feature-v36 explicit email opt-in", async () => {
-    const { store } = await fixture();
-    expect(store.updateNotificationHours({
-      expectedRevision: 1,
-      version: 1,
-      startMinute: 420,
-      endMinute: 1_260,
-      timeZone: "Asia/Tokyo",
-    }).revision).toBe(2);
-    expect(store.updateNotificationEmailPolicy({
-      enabled: true,
-      expectedRevision: 2,
-    })).toEqual({ enabled: true, revision: 3, version: 1 });
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
-    const legacy = new Database(paths.database, { create: false, strict: true });
-    dropSessionAdoptionAndPresetContractSchema(legacy);
-    dropProviderSwitchVersion35Objects(legacy);
-    legacy.exec("DELETE FROM migrations WHERE version>=37; DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=36;");
-    const before = legacy.query(
-      `SELECT h.start_minute,h.end_minute,h.time_zone,h.revision AS hours_revision,
-              e.enabled,e.revision AS email_revision,e.created_at,e.updated_at
-       FROM notification_hours h JOIN attention_email_policy e ON h.singleton=e.singleton`,
-    ).get();
-    expect(providerSwitchSchemaObjectCount(legacy)).toBe(0);
-    legacy.close(false);
-
-    expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:60");
-    const migrated = new StateStore(paths, {
-      now: () => 12_000,
-      resolveMachineTimeZone: () => {
-        throw new Error("LEGACY_V36_MUST_RETAIN_ITS_ZONE");
-      },
-    });
-    stores.push(migrated);
-    expect(migrated.readNotificationHours()).toEqual({
-      version: 1,
-      revision: 3,
-      startMinute: 420,
-      endMinute: 1_260,
-      timeZone: "Asia/Tokyo",
-    });
-    expect(migrated.readNotificationEmailPolicy()).toEqual({
-      enabled: true,
-      revision: 3,
-      version: 1,
-    });
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
+  test("preserves captured feature36 explicit email opt-in and its original policy rows", async () => {
+    const paths = await canonical35To38Archive("feature36");
+    const captured = canonical35To38Fixture.captures.feature36;
+    const database = new Database(paths.database, { create: false, strict: true });
     try {
-      expect(inspector.query(
-        `SELECT h.start_minute,h.end_minute,h.time_zone,h.revision AS hours_revision,
-                e.enabled,e.revision AS email_revision,e.created_at,e.updated_at
-         FROM notification_hours h JOIN attention_email_policy e ON h.singleton=e.singleton`,
-      ).get()).toEqual(before);
-      expect(providerSwitchSchemaObjectCount(inspector)).toBe(21);
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
-    } finally {
-      inspector.close(false);
-    }
+      database.exec("PRAGMA query_only=ON");
+      const history = canonicalAuthBudgetRows(database, [
+        "notification_hours", "attention_email_policy", "profiles", "session_runtime_profiles", "queue_entries",
+      ]);
+      expect(providerSwitchSchemaObjectCount(database)).toBe(0);
+      const before = canonicalAuthBudgetSnapshot(database);
+      expect(() => new StateStore(paths, { readonly: true }))
+        .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:36:60");
+      expect(canonicalAuthBudgetSnapshot(database)).toEqual(before);
+      const migrated = new StateStore(paths, { now: () => 90_000_000,
+        resolveMachineTimeZone: () => { throw new Error("CAPTURED_FEATURE36_MUST_RETAIN_ITS_ZONE"); },
+      });
+      stores.push(migrated);
+      expect(migrated.readNotificationHours()).toEqual(captured.metadata.caseState.hours);
+      expect(migrated.readNotificationEmailPolicy()).toEqual(captured.metadata.caseState.email);
+      expect(history.read()).toEqual(history.before);
+      expect(providerSwitchSchemaObjectCount(database)).toBe(21);
+      expect(database.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
+      expect(database.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      expectCanonical35To38InertReopens(paths, database);
+    } finally { database.close(false); }
   });
 
-  test("rejects a legacy-v36 lookalike with an extra policy object and rolls back", async () => {
-    const { store } = await fixture();
-    expect(store.updateNotificationEmailPolicy({
-      enabled: true,
-      expectedRevision: 1,
-    }).enabled).toBe(true);
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
-    const lookalike = new Database(paths.database, { create: false, strict: true });
-    dropSessionAdoptionAndPresetContractSchema(lookalike);
-    dropProviderSwitchVersion35Objects(lookalike);
-    lookalike.exec(`
-      CREATE INDEX attention_email_policy_untrusted ON attention_email_policy(enabled);
-      DELETE FROM migrations WHERE version>=37;
-      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=36;
-    `);
-    lookalike.close(false);
-
-    expect(() => new StateStore(paths))
-      .toThrow("ATTENTION_EMAIL_POLICY_MIGRATION_OPT_IN_REFUSED");
-    const unchanged = new Database(paths.database, { readonly: true, strict: true });
+  test("rejects an adversarial captured feature36 extra policy object without migration writes", async () => {
+    const paths = await canonical35To38Archive("feature36");
+    const database = new Database(paths.database, { create: false, strict: true });
     try {
-      expect(unchanged.query("PRAGMA user_version").get()).toEqual({ user_version: 36 });
-      expect(unchanged.query("SELECT version FROM migrations WHERE version=37").get())
-        .toBeNull();
-      expect(providerSwitchSchemaObjectCount(unchanged)).toBe(0);
-      expect(unchanged.query(
-        "SELECT name FROM sqlite_master WHERE name='attention_email_policy_untrusted'",
-      ).get()).toEqual({ name: "attention_email_policy_untrusted" });
-    } finally {
-      unchanged.close(false);
-    }
+      const before = canonicalAuthBudgetSnapshot(database);
+      // One explicitly adversarial additive object on an exact old image;
+      // no current database is restamped and no old source row is rewritten.
+      database.exec("CREATE INDEX attention_email_policy_untrusted ON attention_email_policy(enabled)");
+      expect(canonicalAuthBudgetSnapshot(database).rows).toEqual(before.rows);
+      expect(database.query("PRAGMA user_version").get()).toEqual(before.version);
+    } finally { database.close(false); }
+    expectInertSchemaRefusal(paths, "ATTENTION_EMAIL_POLICY_MIGRATION_OPT_IN_REFUSED",
+      "STATE_SCHEMA_MIGRATION_REQUIRED:36:60");
   });
 
   test("shares one immediate CAS revision across email opt-in and hours", async () => {
@@ -31377,127 +29769,85 @@ describe("StateStore", () => {
   });
 
   test("migrates a populated v34 database once and preserves its authority", async () => {
-    const { store } = await fixture();
-    const profile = store.createProfile("V34 retained");
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
-    const legacy = new Database(paths.database, { create: false, strict: true });
-    dropPostProviderSwitchSchema(legacy);
-    dropProviderSwitchVersion35Objects(legacy);
-    legacy.exec(`
-      DELETE FROM migrations WHERE version>=35;
-      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=34;
-    `);
-    legacy.close(false);
-
-    expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:60");
-    const unchanged = new Database(paths.database, { readonly: true, strict: true });
+    const paths = await canonical34StorageArchive();
+    const source = canonical34StorageFixture.retained;
+    const inspector = new Database(paths.database, { create: false, strict: true });
+    inspector.exec("PRAGMA query_only=ON");
     try {
-      expect(unchanged.query("PRAGMA user_version").get()).toEqual({ user_version: 34 });
-      expect(unchanged.query(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='notification_hours'",
-      ).get()).toBeNull();
-    } finally {
-      unchanged.close(false);
-    }
+      const before = canonicalAuthBudgetSnapshot(inspector);
+      const retained = canonicalAuthBudgetRows(inspector, [
+        "profiles", "projects", "session_runtime_profiles", "queue_entries",
+        "desktop_switches", "desktop_switch_resolutions", "desktop_switch_authority",
+        "usage_revision_authority", "usage_snapshots", "usage_poll_failures",
+      ]);
+      expect(before.version).toEqual({ user_version: 34 });
+      expect(() => new StateStore(paths, { readonly: true }))
+        .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:34:60");
+      expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(before);
+      expect(inspector.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='notification_hours'")
+        .get()).toBeNull();
 
-    let resolutions = 0;
-    const migrated = new StateStore(paths, {
-      now: () => 5_000,
-      resolveMachineTimeZone: () => {
-        resolutions += 1;
-        return "Asia/Tokyo";
-      },
-    });
-    stores.push(migrated);
-    expect(migrated.requireProfile(profile.id)).toMatchObject({
-      id: profile.id,
-      label: "V34 retained",
-    });
-    expect(migrated.readNotificationHours()).toEqual({
-      version: 1,
-      revision: 1,
-      startMinute: 600,
-      endMinute: 1_320,
-      timeZone: "Asia/Tokyo",
-    });
-    expect(resolutions).toBe(1);
-    migrated.close();
-    stores.splice(stores.indexOf(migrated), 1);
-
-    const reopened = new StateStore(paths, {
-      now: () => 6_000,
-      resolveMachineTimeZone: () => {
-        throw new Error("CURRENT_SCHEMA_MUST_NOT_RESOLVE_MACHINE_ZONE");
-      },
-    });
-    stores.push(reopened);
-    expect(reopened.readNotificationHours().timeZone).toBe("Asia/Tokyo");
-    expect(reopened.requireProfile(profile.id).label).toBe("V34 retained");
-    reopened.close();
-    stores.splice(stores.indexOf(reopened), 1);
-
-    const readonly = new StateStore(paths, {
-      readonly: true,
-      resolveMachineTimeZone: () => {
-        throw new Error("READONLY_CURRENT_SCHEMA_MUST_NOT_RESOLVE_MACHINE_ZONE");
-      },
-    });
-    stores.push(readonly);
-    expect(readonly.readNotificationHours().timeZone).toBe("Asia/Tokyo");
-    const schemaInspector = new Database(paths.database, { readonly: true, strict: true });
-    try {
-      expect(providerSwitchSchemaObjectCount(schemaInspector)).toBe(21);
-      expect(schemaInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
-    } finally {
-      schemaInspector.close(false);
-    }
+      let resolutions = 0;
+      const migrated = new StateStore(paths, {
+        now: () => 50_000,
+        resolveMachineTimeZone: () => { resolutions += 1; return "Asia/Tokyo"; },
+      });
+      stores.push(migrated);
+      expect(migrated.requireProfile(source.profile.id)).toMatchObject(source.profile);
+      expect(migrated.readNotificationHours()).toEqual({
+        version: 1, revision: 1, startMinute: 600, endMinute: 1_320, timeZone: "Asia/Tokyo",
+      });
+      expect(resolutions).toBe(1);
+      expect(retained.read()).toEqual(retained.before);
+      expect(migrated.requireQueue(source.unboundQueue.id)).toMatchObject(source.unboundQueue);
+      expect(migrated.hasUnsettledQueueAttachmentQuarantineForSession(source.unboundSession.id)).toBe(true);
+      expect(inspector.query("SELECT * FROM session_provider_account_authorities WHERE session_id=?")
+        .all(source.unboundSession.id)).toEqual([]);
+      expect(providerSwitchSchemaObjectCount(inspector)).toBe(21);
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
+      expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      const joined = canonicalAuthBudgetSnapshot(inspector);
+      migrated.close();
+      stores.splice(stores.indexOf(migrated), 1);
+      for (const readonly of [false, true]) {
+        const reopened = new StateStore(paths, {
+          readonly, now: () => 60_000,
+          resolveMachineTimeZone: () => { throw new Error("CURRENT_SCHEMA_MUST_NOT_RESOLVE_MACHINE_ZONE"); },
+        });
+        try {
+          expect(reopened.readNotificationHours().timeZone).toBe("Asia/Tokyo");
+          expect(reopened.requireProfile(source.profile.id)).toMatchObject(source.profile);
+          expect(retained.read()).toEqual(retained.before);
+          expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(joined);
+        } finally { reopened.close(); }
+      }
+    } finally { inspector.close(false); }
   });
 
   test("rolls a failed v34 notification-hours migration back without a UTC fallback", async () => {
-    const { store } = await fixture();
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-    const legacy = new Database(paths.database, { create: false, strict: true });
-    dropPostProviderSwitchSchema(legacy);
-    dropProviderSwitchVersion35Objects(legacy);
-    legacy.exec(`
-      DELETE FROM migrations WHERE version>=35;
-      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=34;
-    `);
-    legacy.close(false);
-
-    expect(() => new StateStore(paths, {
-      now: () => 7_000,
-      resolveMachineTimeZone: () => "+00:00",
-    })).toThrow();
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    const paths = await canonical34StorageArchive();
+    const inspector = new Database(paths.database, { create: false, strict: true });
+    inspector.exec("PRAGMA query_only=ON");
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 34 });
-      expect(inspector.query(
-        "SELECT 1 FROM migrations WHERE version=35",
-      ).get()).toBeNull();
-      expect(inspector.query(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='notification_hours'",
-      ).get()).toBeNull();
+      const before = canonicalAuthBudgetSnapshot(inspector);
+      expect(before.version).toEqual({ user_version: 34 });
+      expect(() => new StateStore(paths, {
+        now: () => 70_000, resolveMachineTimeZone: () => "+00:00",
+      })).toThrow();
+      expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(before);
+      expect(inspector.query("SELECT 1 FROM migrations WHERE version=35").get()).toBeNull();
+      expect(inspector.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='notification_hours'")
+        .get()).toBeNull();
       expect(providerSwitchSchemaObjectCount(inspector)).toBe(0);
-    } finally {
-      inspector.close(false);
-    }
-
-    const recovered = new StateStore(paths, {
-      now: () => 8_000,
-      resolveMachineTimeZone: () => "UTC",
-    });
-    stores.push(recovered);
-    expect(recovered.readNotificationHours()).toMatchObject({
-      revision: 1,
-      timeZone: "UTC",
-    });
+      const recovered = new StateStore(paths, {
+        now: () => 80_000, resolveMachineTimeZone: () => "UTC",
+      });
+      stores.push(recovered);
+      expect(recovered.readNotificationHours()).toMatchObject({ revision: 1, timeZone: "UTC" });
+      expectHistoricalValue(recovered.latestSessionRuntimeProfile(canonical34StorageFixture.retained.session.id),
+        canonical34StorageFixture.retained.runtimeRecord);
+      expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally { inspector.close(false); }
   });
 
   test("updates notification hours by independent revision CAS across clock rollback", async () => {
@@ -31904,380 +30254,251 @@ describe("StateStore", () => {
 
     expectInertSchemaRefusal(paths, "STATE_SCHEMA_V24_STRUCTURE_INVALID");
   });
-  test("fails closed when a v23 account state contains a Unicode label collision", async () => {
-    const { store } = await fixture();
-    const paths = store.paths;
-    store.createProfile("Équipe");
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
-    const legacy = new Database(paths.database, { create: false, strict: true });
-    dropSchemaAfterVersion34(legacy);
-    legacy.exec(`
-      DROP INDEX profiles_label_key_active;
-      DROP TRIGGER profiles_label_key_insert_guard;
-      DROP TRIGGER profiles_label_key_immutable;
-      DELETE FROM migrations WHERE version>23;
-      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=23;
-    `);
-    legacy.query(
-      `INSERT INTO profiles(
-         id,label,label_key,state,process_generation,created_at,updated_at
-       ) VALUES (?,?,NULL,'signed_out',0,1000,1000)`,
-    ).run("acct_00000000000000000000000000000024", "équipe");
-    legacy.close(false);
-
-    expect(() => new StateStore(paths, { now: () => 2_000 }))
-      .toThrow("STATE_ACCOUNT_LABEL_COLLISION");
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
+  test("fails closed without writes when authentic v17 account labels collide during Unicode migration", async () => {
+    const captured = canonicalLabelPresetFixture.captures["canonical17-account-collision"];
+    const paths = await canonicalLabelPresetArchive("canonical17-account-collision");
+    const inspector = new Database(paths.database, { create: false, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 23 });
-      expect(inspector.query("SELECT version FROM migrations WHERE version=24").get()).toBeNull();
-      expect(inspector.query(
-        "SELECT label_key FROM profiles WHERE id='acct_00000000000000000000000000000024'",
-      ).get()).toEqual({ label_key: null });
+      inspector.exec("PRAGMA query_only=ON");
+      expect(inspector.query("PRAGMA table_info(profiles)").all())
+        .not.toContainEqual(expect.objectContaining({ name: "label_key" }));
+      expect(inspector.query("SELECT id,label FROM profiles ORDER BY id").all())
+        .toEqual(captured.retained.profiles.map(({ id, label }) => ({ id, label })).sort((a, b) => a.id.localeCompare(b.id)));
+      expect(captured.retained.profiles.map(({ label }) => label)).toEqual(["Équipe", "équipe"]);
+      expect(new Set(captured.retained.profiles.map(({ label }) => label.normalize("NFKC").toLowerCase())).size).toBe(1);
     } finally {
       inspector.close(false);
     }
+    // These two rows were accepted by the actual17 public writer. Neither
+    // current SQL corruption nor a fabricated23 cohort supplies this input.
+    expectInertSchemaRefusal(paths, "STATE_ACCOUNT_LABEL_COLLISION", "STATE_SCHEMA_MIGRATION_REQUIRED:17:60");
   });
 
-  test("fails closed when a v23 project state contains canonically equivalent labels", async () => {
-    const { store, home } = await fixture();
-    const paths = store.paths;
-    const firstRoot = join(home, "project-composed");
-    const secondRoot = join(home, "project-decomposed");
-    await mkdir(firstRoot);
-    await mkdir(secondRoot);
-    await store.createProject("Café", firstRoot);
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
-    const legacy = new Database(paths.database, { create: false, strict: true });
-    dropSchemaAfterVersion34(legacy);
-    legacy.exec(`
-      DROP INDEX projects_label_key_unique;
-      DROP TRIGGER projects_label_key_insert_guard;
-      DROP TRIGGER projects_label_key_immutable;
-      DELETE FROM migrations WHERE version>23;
-      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=23;
-    `);
-    legacy.query(
-      `INSERT INTO projects(
-         id,label,label_key,root_path,is_default,created_at,updated_at
-       ) VALUES (?,?,NULL,?,0,1000,1000)`,
-    ).run("proj_00000000000000000000000000000024", "Cafe\u0301", secondRoot);
-    legacy.close(false);
-
-    expect(() => new StateStore(paths, { now: () => 2_000 }))
-      .toThrow("STATE_PROJECT_LABEL_COLLISION");
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
+  test("fails closed without writes when authentic v17 project labels collide during Unicode migration", async () => {
+    const captured = canonicalLabelPresetFixture.captures["canonical17-project-collision"];
+    const paths = await canonicalLabelPresetArchive("canonical17-project-collision");
+    const inspector = new Database(paths.database, { create: false, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 23 });
-      expect(inspector.query("SELECT version FROM migrations WHERE version=24").get()).toBeNull();
-      expect(inspector.query(
-        "SELECT label_key FROM projects WHERE id='proj_00000000000000000000000000000024'",
-      ).get()).toEqual({ label_key: null });
+      inspector.exec("PRAGMA query_only=ON");
+      expect(inspector.query("PRAGMA table_info(projects)").all())
+        .not.toContainEqual(expect.objectContaining({ name: "label_key" }));
+      expect(inspector.query("SELECT id,label,root_path FROM projects ORDER BY id").all())
+        .toEqual(captured.retained.projects.map(({ id, label, rootPath }) => ({ id, label, root_path: rootPath }))
+          .sort((a, b) => a.id.localeCompare(b.id)));
+      expect(captured.retained.projects.map(({ label }) => label)).toEqual(["Café", "Cafe\u0301"]);
+      expect(new Set(captured.retained.projects.map(({ label }) => label.normalize("NFKC").toLowerCase())).size).toBe(1);
+      expect(captured.retained.projectDirectoriesInspectedOnly).toBe(true);
     } finally {
       inspector.close(false);
     }
+    // The archive contains directory metadata only; this test never opens or
+    // grants execution authority to either captured public project root.
+    expectInertSchemaRefusal(paths, "STATE_PROJECT_LABEL_COLLISION", "STATE_SCHEMA_MIGRATION_REQUIRED:17:60");
   });
 
-  test("migrates v18 databases to the exact prepared-response supersession guards", async () => {
-    const { store } = await fixture();
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-    const legacy = new Database(paths.database, { create: false, strict: true });
-    dropSchemaAfterVersion34(legacy);
-    legacy.exec(`
-      DROP TRIGGER IF EXISTS provider_interactions_response_fields_guard;
-      DROP TRIGGER IF EXISTS provider_interactions_revision_guard;
-      DELETE FROM migrations WHERE version>18;
-      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=18;
-    `);
-    legacy.close(false);
-
-    const migrated = new StateStore(paths, { now: () => 9_000 });
-    stores.push(migrated);
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
+  test("migrates an exact v17 writer to the current prepared-response supersession guards", async () => {
+    const paths = await canonicalLabelPresetArchive("canonical17-approval-controls");
+    const { store: reference } = await fixture();
+    const selectGuards = (database: Database) => database.query(
+      `SELECT name,tbl_name,sql FROM sqlite_master WHERE type='trigger' AND name IN (
+         'provider_interactions_intent_immutable','provider_interactions_response_fields_guard',
+         'provider_interactions_revision_guard') ORDER BY name`,
+    ).all();
+    const referenceReader = new Database(reference.paths.database, { readonly: true, strict: true });
+    const expectedGuards = selectGuards(referenceReader);
+    referenceReader.close(false);
+    expect(expectedGuards).toHaveLength(3);
+    const inspector = new Database(paths.database, { create: false, strict: true });
+    inspector.exec("PRAGMA query_only=ON");
     try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 17 });
+      const original = canonicalAuthBudgetSnapshot(inspector);
+      expect(() => new StateStore(paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:17:60");
+      expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(original);
+      const migrated = new StateStore(paths, { now: () => 26_000 });
+      stores.push(migrated);
       expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
-      expect(inspector.query(
-        `SELECT name FROM sqlite_master
-         WHERE type='trigger' AND name IN (
-           'provider_interactions_intent_immutable',
-           'provider_interactions_response_fields_guard',
-           'provider_interactions_revision_guard'
-         ) ORDER BY name`,
-      ).all()).toEqual([
-        { name: "provider_interactions_intent_immutable" },
-        { name: "provider_interactions_response_fields_guard" },
-        { name: "provider_interactions_revision_guard" },
-      ]);
-    } finally {
-      inspector.close(false);
-    }
+      expect(selectGuards(inspector)).toEqual(expectedGuards);
+      expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      const after = canonicalAuthBudgetSnapshot(inspector);
+      for (const readonly of [false, true]) {
+        const reopened = new StateStore(paths, { readonly, now: () => 26_001 });
+        try {
+          expect(selectGuards(inspector)).toEqual(expectedGuards);
+          expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(after);
+        } finally { reopened.close(); }
+      }
+    } finally { inspector.close(false); }
   });
 
-  test("migrates legacy approval scope booleans into exact ordered decisions", async () => {
-    const { store } = await fixture();
-    const profile = signInProfile(store, "Legacy approvals", "legacy-approvals@example.com");
-    const session = upsertProvenTestSession(store, {
-      profileId: profile.id, preset: "high", fastEnabled: false,
-      providerThreadId: "thread-legacy-approvals", state: "idle",
-    });
-    const connectionId = "50000000-0000-4000-8000-000000000001";
-    const admit = (input: {
-      publicId: string;
-      method: "item/commandExecution/requestApproval" | "item/fileChange/requestApproval";
-      kind: "command_approval" | "file_change_approval";
-      display: Parameters<StateStore["admitInteraction"]>[0]["display"];
-    }) => store.admitInteraction({
-      publicId: input.publicId,
-      sessionId: session.id,
-      authority: {
-        ...codexInteractionBinding(store, profile.id),
-        profileId: profile.id,
-        processGeneration: profile.processGeneration,
-        connectionId,
-        requestId: { type: "string", value: input.publicId },
-        method: input.method,
-        requestDigest: input.publicId.endsWith("1") ? "1".repeat(64) : "2".repeat(64),
-        threadId: "thread-legacy-approvals",
-        turnId: "turn-legacy-approvals",
-        itemId: input.publicId,
-        approvalId: null,
-      },
-      kind: input.kind,
-      blocking: true,
-      display: input.display,
-    }).record;
-    const command = admit({
-      publicId: "50000000-0000-4000-8000-000000000011",
-      method: "item/commandExecution/requestApproval",
-      kind: "command_approval",
-      display: {
-        kind: "command_approval",
-        summary: "Allow legacy command",
-        reason: null,
-        commandClass: "test",
-        workingDirectory: null,
-        availableDecisions: ["once", "session", "decline", "cancel"],
-      },
-    });
-    const files = admit({
-      publicId: "50000000-0000-4000-8000-000000000012",
-      method: "item/fileChange/requestApproval",
-      kind: "file_change_approval",
-      display: {
-        kind: "file_change_approval",
-        summary: "Allow legacy files",
-        reason: null,
-        grantRoot: null,
-        availableDecisions: ["once", "decline", "cancel"],
-      },
-    });
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
-    const legacy = new Database(paths.database, { create: false, strict: true });
-    dropSchemaAfterVersion34(legacy);
-    legacy.exec("DROP TRIGGER IF EXISTS provider_interactions_authority_immutable");
-    legacy.query("UPDATE provider_interactions SET display_json=? WHERE public_id=?").run(JSON.stringify({
-      kind: "command_approval",
-      summary: "Allow legacy command",
-      reason: null,
-      commandClass: "test",
-      workingDirectory: null,
-      allowsSessionApproval: true,
-    }), command.publicId);
-    legacy.query("UPDATE provider_interactions SET display_json=? WHERE public_id=?").run(JSON.stringify({
-      kind: "file_change_approval",
-      summary: "Allow legacy files",
-      reason: null,
-      grantRoot: null,
-      allowsSessionApproval: false,
-    }), files.publicId);
-    legacy.exec("DELETE FROM migrations WHERE version>17; DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=17");
-    legacy.close(false);
-
-    const migrated = new StateStore(paths, { now: () => 9_000 });
-    stores.push(migrated);
-    for (const interaction of [command, files]) {
-      expect(() => migrated.requireInteraction(interaction.publicId))
-        .toThrow("INTERACTION_PROVIDER_AUTHORITY_MISSING");
-    }
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
+  test("migrates exact v17 approval scope booleans into ordered decisions without provider authority", async () => {
+    const paths = await canonicalLabelPresetArchive("canonical17-approval-controls");
+    const retained = canonicalLabelPresetFixture.captures["canonical17-approval-controls"].retained;
+    const command = retained.command.record;
+    const files = retained.fileChange.record;
+    const cases = [
+      { interaction: command, decisions: ["once", "session", "decline", "cancel"] },
+      { interaction: files, decisions: ["once", "decline", "cancel"] },
+    ];
+    const inspector = new Database(paths.database, { create: false, strict: true });
+    inspector.exec("PRAGMA query_only=ON");
     try {
-      for (const interaction of [command, files]) {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 17 });
+      const originalRows = canonicalAuthBudgetRows(inspector, ["provider_interactions", "provider_interaction_transitions"]);
+      const expected = new Map(cases.map(({ interaction, decisions }) => {
+        expect(inspector.query("SELECT display_json FROM provider_interactions WHERE public_id=?").get(interaction.publicId))
+          .toEqual({ display_json: JSON.stringify(interaction.display) });
+        const { allowsSessionApproval, ...display } = interaction.display;
+        expect(allowsSessionApproval).toBe(interaction.kind === "command_approval");
+        const publicId: string = interaction.publicId;
+        return [publicId, { ...display, availableDecisions: decisions }];
+      }));
+      const migrated = new StateStore(paths, { now: () => 26_000 });
+      stores.push(migrated);
+      for (const { interaction } of cases) {
+        expect(() => migrated.requireInteraction(interaction.publicId)).toThrow("INTERACTION_PROVIDER_AUTHORITY_MISSING");
         const row = z.object({ display_json: z.string() }).strict().parse(inspector.query(
           "SELECT display_json FROM provider_interactions WHERE public_id=?",
         ).get(interaction.publicId));
-        expect(JSON.parse(row.display_json)).toEqual(interaction.display);
-        expect(inspector.query("SELECT * FROM interaction_provider_authorities WHERE public_id=?")
-          .all(interaction.publicId)).toEqual([]);
+        expect(JSON.parse(row.display_json)).toEqual(expected.get(interaction.publicId));
+        expect(inspector.query("SELECT * FROM interaction_provider_authorities WHERE public_id=?").all(interaction.publicId))
+          .toEqual([]);
       }
+      const originalInteractions = z.array(z.record(z.string(), z.unknown())).parse(originalRows.before.provider_interactions);
+      expect(originalRows.read()).toEqual({
+        ...originalRows.before,
+        provider_interactions: originalInteractions.map((row) => ({
+          ...row,
+          display_json: JSON.stringify(expected.get(z.string().parse(row.public_id))),
+        })),
+      });
       expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
-      expect(JSON.stringify(inspector.query(
-        "SELECT display_json FROM provider_interactions ORDER BY public_id",
-      ).all())).not.toContain("allowsSessionApproval");
-    } finally {
-      inspector.close(false);
-    }
+      expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      const after = canonicalAuthBudgetSnapshot(inspector);
+      for (const readonly of [false, true]) {
+        const reopened = new StateStore(paths, { readonly, now: () => 26_001 });
+        try {
+          expect(() => reopened.requireInteraction(command.publicId)).toThrow("INTERACTION_PROVIDER_AUTHORITY_MISSING");
+          expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(after);
+        } finally { reopened.close(); }
+      }
+    } finally { inspector.close(false); }
   });
 
-  test("migrates a v16 pending login without a provider login ID to an explicit fresh-login state", async () => {
-    const { store } = await fixture();
-    const profile = store.createProfile("Legacy pending login");
-    const idempotencyKey = "00000000-0000-4000-8000-000000000981";
-    const attempt = store.prepareMutation({
-      kind: "account.login",
-      authorityId: profile.id,
-      authorityGeneration: 1,
-      request: { deviceCode: false },
-      idempotencyKey,
-    });
-    completeCodexAccountMutationAuthorityRetirement(
-      store,
-      profile.id,
-      profile.processGeneration,
-    );
-    store.beginAccountMutationEffect({
-      attemptId: attempt.id,
-      profileId: profile.id,
-      profileGeneration: 1,
-      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
-      evidence: { kind: "account.login", method: "browser" },
-    });
-    expect(store.transitionMutation(attempt.id, "effect_started", "applied", { status: "pending" })).toBe(true);
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
+  test("migrates an observed v16 stage pending login without a provider login ID to fresh-login state", async () => {
+    const paths = await canonicalEarlyMigrationArchive(16);
+    const { pendingProfile: profile, pendingLogin: attempt, loginKey } = canonicalEarlyMigrationFixture.retained;
+    expect(canonicalEarlyMigrationFixture.images[16].provenance.kind)
+      .toBe("uncommitted_archived_migration_stage");
+    const inspector = new Database(paths.database, { create: false, strict: true });
+    inspector.exec("PRAGMA query_only=ON");
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 16 });
+      const original = canonicalAuthBudgetRows(inspector, ["mutation_attempts", "mutation_effect_evidence"]);
+      expect(inspector.query("SELECT result_json FROM mutation_attempts WHERE id=?").get(attempt.id))
+        .toEqual({ result_json: JSON.stringify(attempt.result) });
+      const before = canonicalAuthBudgetSnapshot(inspector);
+      expect(() => new StateStore(paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:16:60");
+      expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(before);
 
-    const legacy = new Database(paths.database, { create: false, strict: true });
-    dropSchemaAfterVersion34(legacy);
-    legacy.exec(`
-      DROP TRIGGER IF EXISTS provider_login_authority_identity_immutable;
-      DROP TRIGGER IF EXISTS provider_login_authority_generation_guard;
-      DROP TRIGGER IF EXISTS provider_login_authority_state_guard;
-      DROP TRIGGER IF EXISTS provider_login_authority_immutable_delete;
-      DROP TABLE provider_login_authorities;
-      DELETE FROM migrations WHERE version>=17;
-      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=16;
-    `);
-    legacy.close(false);
-
-    const migrated = new StateStore(paths, { now: () => 9_000 });
-    stores.push(migrated);
-    expect(migrated.requireProfile(profile.id)).toMatchObject({
-      processGeneration: 1,
-      state: "signed_out",
-    });
-    expect(migrated.readMutation(idempotencyKey)).toMatchObject({
-      originalState: "applied",
-      resolution: {
-        kind: "abandoned",
-        evidence: { source: "schema17", reason: "missing_provider_login_id" },
-      },
-      state: "reconciled",
-    });
-    expect(migrated.readPendingLoginAuthority(profile.id, 1)).toBeNull();
-    expect(migrated.prepareMutation({
-      kind: "account.login",
-      authorityId: profile.id,
-      authorityGeneration: 2,
-      request: { deviceCode: false },
-      idempotencyKey: "00000000-0000-4000-8000-000000000982",
-    })).toMatchObject({ replay: false, state: "prepared" });
+      const migrated = new StateStore(paths, { now: () => 20_000 });
+      stores.push(migrated);
+      expect(migrated.requireProfile(profile.id)).toMatchObject({ processGeneration: 1, state: "signed_out" });
+      expect(migrated.readMutation(loginKey)).toMatchObject({
+        originalState: "applied",
+        resolution: { kind: "abandoned", evidence: { source: "schema17", reason: "missing_provider_login_id" } },
+        state: "reconciled",
+      });
+      expect(migrated.readPendingLoginAuthority(profile.id, 1)).toBeNull();
+      expect(original.read()).toEqual(original.before);
+      expect(inspector.query("SELECT * FROM provider_login_authorities WHERE profile_id=?").all(profile.id))
+        .toEqual([]);
+      expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      const migratedSnapshot = canonicalAuthBudgetSnapshot(inspector);
+      for (const readonly of [false, true]) {
+        const reopened = new StateStore(paths, { readonly, now: () => 21_000 });
+        try {
+          expect(reopened.readMutation(loginKey)?.state).toBe("reconciled");
+          expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(migratedSnapshot);
+        } finally { reopened.close(); }
+      }
+      expect(migrated.prepareMutation({
+        kind: "account.login",
+        authorityId: profile.id,
+        authorityGeneration: 2,
+        request: { deviceCode: false },
+        idempotencyKey: "00000000-0000-4000-8000-000000000982",
+      })).toMatchObject({ replay: false, state: "prepared" });
+    } finally { inspector.close(false); }
   });
 
-  test("redacts and terminalizes secret-bearing MCP URL interactions when upgrading v10", async () => {
-    const { store } = await fixture();
-    const profile = signInProfile(store, "Legacy URL profile", "legacy-url@example.com");
-    const session = createProvenTestSession(store, {
-      profileId: profile.id,
-      title: "Legacy URL session",
-      preset: "high",
-      fastEnabled: false,
-      providerThreadId: "legacy-thread",
-    });
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
+  test("redacts and terminalizes secret-bearing MCP URL interactions from an exact v10 writer", async () => {
+    const paths = await canonicalEarlyMigrationArchive(10);
+    const { mcp, mcpSentinel: sentinel, session } = canonicalEarlyMigrationFixture.retained;
+    const interactionId = mcp.record.publicId;
+    const inspector = new Database(paths.database, { create: false, strict: true });
+    inspector.exec("PRAGMA query_only=ON");
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 10 });
+      expect(inspector.query("SELECT display_json FROM provider_interactions WHERE public_id=?").get(interactionId))
+        .toEqual({ display_json: JSON.stringify(mcp.record.display) });
+      expect(await stateFileSuffixesContaining(paths.database, sentinel)).toContain("");
+      const before = canonicalAuthBudgetSnapshot(inspector);
+      expect(() => new StateStore(paths, { readonly: true })).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:10:60");
+      expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(before);
+    } finally { inspector.close(false); }
 
-    const sentinel = "MCP_V10_URL_SECRET_SENTINEL";
-    const interactionId = "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b";
-    seedLegacyMcpUrlInteraction({
-      interactionId,
-      paths,
-      processGeneration: profile.processGeneration,
-      profileId: profile.id,
-      sentinel,
-      sessionId: session.id,
-    });
-
-    const migrated = new StateStore(paths, { now: () => 9_000 });
+    const migrated = new StateStore(paths, { now: () => 20_000 });
     stores.push(migrated);
-    expect(() => migrated.requireInteraction(interactionId))
+    expect(() => migrated.requireInteraction(interactionId)).toThrow("INTERACTION_PROVIDER_AUTHORITY_MISSING");
+    expect(() => migrated.listInteractions({ sessionId: session.id })).toThrow("INTERACTION_PROVIDER_AUTHORITY_MISSING");
+    // This genuine image also retains two other pending approvals. They lack
+    // immutable session authority, so a pending-page read must refuse them.
+    expect(() => migrated.listInteractions({ sessionId: session.id, pendingOnly: true }))
       .toThrow("INTERACTION_PROVIDER_AUTHORITY_MISSING");
-    expect(() => migrated.listInteractions({ sessionId: session.id }))
-      .toThrow("INTERACTION_PROVIDER_AUTHORITY_MISSING");
-    expect(migrated.listInteractions({ sessionId: session.id, pendingOnly: true })).toEqual([]);
     migrated.close();
     stores.splice(stores.indexOf(migrated), 1);
 
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    const after = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
-      expect(inspector.query(
+      expect(after.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
+      expect(after.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
-      ).all(interactionId)).toEqual([
-        { revision: 1, state: "pending" },
-        { revision: 2, state: "resolution_unknown" },
-      ]);
-      expect(inspector.query(
+      ).all(interactionId)).toEqual([{ revision: 1, state: "pending" }, { revision: 2, state: "resolution_unknown" }]);
+      expect(after.query(
         "SELECT reason FROM legacy_provider_authority_quarantines WHERE scope_kind='interaction' AND scope_id=?",
       ).get(interactionId)).toEqual({ reason: "unknown_provider_method" });
-      expect(JSON.stringify(inspector.query(
+      expect(JSON.stringify(after.query(
         "SELECT display_json FROM provider_interactions WHERE public_id=?",
       ).get(interactionId))).not.toContain(sentinel);
-    } finally {
-      inspector.close(false);
-    }
+      expect(after.query("SELECT * FROM interaction_provider_authorities WHERE public_id=?").all(interactionId)).toEqual([]);
+      expect(after.query("SELECT public_id FROM provider_interactions WHERE session_id=? AND state='pending' ORDER BY public_id")
+        .all(session.id)).toEqual([
+          { public_id: canonicalEarlyMigrationFixture.retained.permission.record.publicId },
+          { public_id: canonicalEarlyMigrationFixture.retained.approval.record.publicId },
+        ]);
+      expect(after.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally { after.close(false); }
     expect(await stateFileSuffixesContaining(paths.database, sentinel)).toEqual([]);
   });
 
-  test("redacts and physically scrubs permission values when upgrading v14", async () => {
-    const { store } = await fixture();
-    const profile = signInProfile(store, "Legacy permission profile", "legacy-permission@example.com");
-    const session = createProvenTestSession(store, {
-      profileId: profile.id,
-      title: "Legacy permission session",
-      preset: "high",
-      fastEnabled: false,
-      providerThreadId: "legacy-permission-thread",
-    });
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
-    const sentinel = "PERMISSION_V14_VALUE_SENTINEL";
-    const interactionId = "118f1f55-3f10-7c1a-8f7b-c6dc608bcd3b";
-    seedLegacyPermissionValueInteraction({
-      interactionId,
-      paths,
-      processGeneration: profile.processGeneration,
-      profileId: profile.id,
-      sentinel,
-      sessionId: session.id,
-    });
+  test("redacts and physically scrubs permission values from an observed v14 migration stage", async () => {
+    const paths = await canonicalEarlyMigrationArchive(14);
+    const { permission, permissionSentinel: sentinel } = canonicalEarlyMigrationFixture.retained;
+    const interactionId = permission.record.publicId;
+    expect(canonicalEarlyMigrationFixture.images[14].provenance.kind).toBe("uncommitted_archived_migration_stage");
+    const before = new Database(paths.database, { create: false, strict: true });
+    before.exec("PRAGMA query_only=ON");
+    try {
+      expect(before.query("PRAGMA user_version").get()).toEqual({ user_version: 14 });
+      expect(before.query("SELECT display_json FROM provider_interactions WHERE public_id=?").get(interactionId))
+        .toEqual({ display_json: JSON.stringify(permission.record.display) });
+    } finally { before.close(false); }
     expect(await stateFileSuffixesContaining(paths.database, sentinel)).toContain("");
 
-    const migrated = new StateStore(paths, { now: () => 9_000 });
+    const migrated = new StateStore(paths, { now: () => 20_000 });
     stores.push(migrated);
-    expect(() => migrated.requireInteraction(interactionId))
-      .toThrow("INTERACTION_PROVIDER_AUTHORITY_MISSING");
+    expect(() => migrated.requireInteraction(interactionId)).toThrow("INTERACTION_PROVIDER_AUTHORITY_MISSING");
     migrated.close();
     stores.splice(stores.indexOf(migrated), 1);
 
@@ -32293,317 +30514,183 @@ describe("StateStore", () => {
       expect(JSON.stringify(inspector.query(
         "SELECT display_json FROM provider_interactions WHERE public_id=?",
       ).get(interactionId))).not.toContain(sentinel);
-    } finally {
-      inspector.close(false);
-    }
+      expect(inspector.query("SELECT * FROM interaction_provider_authorities WHERE public_id=?").all(interactionId)).toEqual([]);
+      expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally { inspector.close(false); }
     expect(await stateFileSuffixesContaining(paths.database, sentinel)).toEqual([]);
   });
 
   for (const targetVersion of [11, 12, 13] as const) {
-    test(`physically scrubs logically safe v${targetVersion} state without changing queue FIFO`, async () => {
-      const home = await realpath(await mkdtemp(join(tmpdir(), `hra-store-v${targetVersion}-physical-scrub-`)));
-      const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
-      await initializeStatePaths(paths);
-      const store = new StateStore(paths, { now: () => 5_000 });
-      const profile = signInProfile(store, `Physical v${targetVersion}`, `physical-v${targetVersion}@example.com`);
-      const session = createProvenTestSession(store, {
-        profileId: profile.id,
-        title: `Physical v${targetVersion} session`,
-        preset: "high",
-        fastEnabled: false,
-        providerThreadId: `legacy-physical-thread-${targetVersion}`,
+    test(`physically scrubs retained note bytes from observed v${targetVersion} stage without changing queue FIFO`, async () => {
+      const paths = await canonicalEarlyMigrationArchive(targetVersion);
+      const { mcp, session, queue, staleNoteSentinel: sentinel } = canonicalEarlyMigrationFixture.retained;
+      expect(canonicalEarlyMigrationFixture.images[targetVersion].provenance).toMatchObject({
+        kind: "uncommitted_archived_migration_stage",
+        oldNoteSentinelPresent: true,
+        oldNoteSentinelIsNotMcpErasureProvenance: true,
       });
-      const queue = ["first", "deleted", "third", "fourth"].map((message) => store.enqueue(session.id, message));
-      store.close();
-
-      const legacyQueue = new Database(paths.database, { create: false, strict: true });
-      dropSessionSendOwnerSchema(legacyQueue);
-      legacyQueue.exec(`
-        DROP TRIGGER IF EXISTS queue_enqueue_sequence_required;
-        DROP TRIGGER IF EXISTS queue_enqueue_identity_insert_once;
-        DROP TRIGGER IF EXISTS queue_enqueue_sequence_immutable;
-        DROP TRIGGER IF EXISTS queue_sequence_authority_no_delete;
-        DROP TRIGGER IF EXISTS queue_sequence_authority_singleton_immutable;
-        DROP INDEX IF EXISTS queue_pending_sequence;
-        DROP INDEX IF EXISTS queue_enqueue_sequence_unique;
-        DROP TABLE IF EXISTS queue_sequence_authority;
-        ALTER TABLE queue_entries DROP COLUMN enqueue_sequence;
-      `);
-      legacyQueue.query("DELETE FROM queue_entries WHERE id=?").run(queue[1]!.id);
-      legacyQueue.close(false);
-
-      const sentinelNeedle = `MCP_V${targetVersion}_PHYSICAL_SECRET_SENTINEL`;
-      const interactionId = `${targetVersion === 11 ? "218" : targetVersion === 12 ? "318" : "418"}f1f55-3f10-7c1a-8f7b-c6dc608bcd3b`;
-      seedLegacyMcpUrlInteraction({
-        interactionId,
-        paths,
-        processGeneration: profile.processGeneration,
-        profileId: profile.id,
-        sentinel: `${sentinelNeedle}${"x".repeat(1_536)}`,
-        sessionId: session.id,
-      });
-      simulateLogicallyRedactedMcpDatabase({ interactionId, paths, targetVersion });
-
-      const logicalInspector = new Database(paths.database, { readonly: true, strict: true });
+      // The unchanged archived writer cleared this note through its public API.
+      // These bytes prove a physical scrub, not the provenance of erased MCP bytes.
+      // All three queue rows were genuinely inserted; no deleted-row hole is claimed.
+      const inspector = new Database(paths.database, { create: false, strict: true });
+      inspector.exec("PRAGMA query_only=ON");
       try {
-        expect(JSON.stringify(logicalInspector.query(
-          "SELECT display_json FROM provider_interactions WHERE public_id=?",
-        ).get(interactionId))).not.toContain(sentinelNeedle);
-        expect(logicalInspector.query(
-          "SELECT id FROM queue_entries ORDER BY rowid",
-        ).all()).toEqual([
-          { id: queue[0]!.id },
-          { id: queue[2]!.id },
-          { id: queue[3]!.id },
-        ]);
-      } finally {
-        logicalInspector.close(false);
-      }
-      expect(await stateFileSuffixesContaining(paths.database, sentinelNeedle)).toEqual([""]);
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: targetVersion });
+        expect(JSON.stringify(inspector.query("SELECT note FROM sessions").all())).not.toContain(sentinel);
+        expect(inspector.query("SELECT id FROM queue_entries ORDER BY rowid").all())
+          .toEqual(queue.map(({ id }) => ({ id })));
+        const originalQueue = canonicalAuthBudgetRows(inspector, ["queue_entries"]);
+        expect(await stateFileSuffixesContaining(paths.database, sentinel)).toEqual([""]);
 
-      const migrated = new StateStore(paths, { now: () => 10_000 });
-      expect(migrated.listQueue(session.id).map((entry) => entry.id)).toEqual([
-        queue[0]!.id,
-        queue[2]!.id,
-        queue[3]!.id,
-      ]);
-      expect(migrated.listQueue(session.id).map((entry) => entry.state))
-        .toEqual(["pending", "pending", "pending"]);
-      expect(migrated.listQueue(session.id).map((entry) => entry.message))
-        .toEqual(["first", "third", "fourth"]);
-      expect(migrated.hasUnsettledQueueAttachmentQuarantineForSession(session.id)).toBe(true);
-      expect(migrated.nextPendingQueue(session.id)).toBeNull();
-      expect(migrated.listRecoverableQueue()).toEqual(migrated.listQueue(session.id));
-      migrated.close();
+        const migrated = new StateStore(paths, { now: () => 20_000 });
+        stores.push(migrated);
+        expect(migrated.listQueue(session.id).map(({ id }) => id)).toEqual(queue.map(({ id }) => id));
+        expect(migrated.listQueue(session.id).map(({ state }) => state)).toEqual(["pending", "pending", "pending"]);
+        expect(migrated.listQueue(session.id).map(({ message }) => message)).toEqual(["first", "third", "fourth"]);
+        expect(migrated.hasUnsettledQueueAttachmentQuarantineForSession(session.id)).toBe(true);
+        expect(migrated.nextPendingQueue(session.id)).toBeNull();
+        expect(migrated.listRecoverableQueue()).toEqual(migrated.listQueue(session.id));
+        migrated.close();
+        stores.splice(stores.indexOf(migrated), 1);
 
-      const inspector = new Database(paths.database, { readonly: true, strict: true });
-      try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
-        expect(inspector.query(
-          "SELECT enqueue_sequence FROM queue_entries ORDER BY enqueue_sequence",
-        ).all()).toEqual([
-          { enqueue_sequence: 1 },
-          { enqueue_sequence: 2 },
-          { enqueue_sequence: 3 },
-        ]);
-        expect(inspector.query(
-          "SELECT reason,required_at FROM security_scrub_authority WHERE singleton=1",
-        ).get()).toBeNull();
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
+        expect(originalQueue.read()).toEqual(originalQueue.before);
+        expect(inspector.query("SELECT enqueue_sequence FROM queue_entries ORDER BY enqueue_sequence").all())
+          .toEqual([{ enqueue_sequence: 1 }, { enqueue_sequence: 2 }, { enqueue_sequence: 3 }]);
+        expect(inspector.query("SELECT reason,required_at FROM security_scrub_authority WHERE singleton=1").get()).toBeNull();
+        expect(inspector.query("SELECT * FROM queue_attachment_identities").all()).toEqual([]);
+        expect(inspector.query("SELECT id FROM queue_entries WHERE enqueue_identity_format IS NOT NULL OR enqueue_identity_attempt_id IS NOT NULL").all()).toEqual([]);
         expect(inspector.query(
           "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
-        ).all(interactionId)).toEqual([
-          { revision: 1, state: "pending" },
-          { revision: 2, state: "resolution_unknown" },
-        ]);
-      } finally {
-        inspector.close(false);
-      }
-      expect(await stateFileSuffixesContaining(paths.database, sentinelNeedle)).toEqual([]);
+        ).all(mcp.record.publicId)).toEqual([{ revision: 1, state: "pending" }, { revision: 2, state: "resolution_unknown" }]);
+        expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+        const snapshot = canonicalAuthBudgetSnapshot(inspector);
+        for (const readonly of [false, true]) {
+          const reopened = new StateStore(paths, { readonly, now: () => 21_000 });
+          try {
+            expect(reopened.nextPendingQueue(session.id)).toBeNull();
+            expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(snapshot);
+          } finally { reopened.close(); }
+        }
+      } finally { inspector.close(false); }
+      expect(await stateFileSuffixesContaining(paths.database, sentinel)).toEqual([]);
     });
   }
 
-  test("keeps a busy-reader MCP scrub unavailable until WAL truncation can finish", async () => {
-    const { store } = await fixture();
-    const profile = signInProfile(store, "Pinned legacy URL", "pinned-legacy-url@example.com");
-    const session = createProvenTestSession(store, {
-      profileId: profile.id,
-      title: "Pinned legacy URL session",
-      preset: "high",
-      fastEnabled: false,
-      providerThreadId: "legacy-thread",
-    });
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
-    const sentinel = "MCP_PINNED_READER_SECRET_SENTINEL";
-    const interactionId = "118f1f55-3f10-7c1a-8f7b-c6dc608bcd3b";
-    seedLegacyMcpUrlInteraction({
-      interactionId,
-      paths,
-      processGeneration: profile.processGeneration,
-      profileId: profile.id,
-      sentinel,
-      sessionId: session.id,
-    });
-
-    const pinnedReader = new Database(paths.database, { readonly: true, strict: true });
-    pinnedReader.exec("BEGIN");
-    expect(JSON.stringify(pinnedReader.query(
-      "SELECT display_json FROM provider_interactions WHERE public_id=?",
-    ).get(interactionId))).toContain(sentinel);
+  test("keeps an exact v10 busy-reader MCP scrub unavailable until WAL truncation can finish", async () => {
+    const paths = await canonicalEarlyMigrationArchive(10);
+    const { mcp, mcpSentinel: sentinel } = canonicalEarlyMigrationFixture.retained;
+    const interactionId = mcp.record.publicId;
+    // Query-only permits WAL sidecar setup but forbids database writes. Keep
+    // this genuine read snapshot open across the migration and checkpoint.
+    const pinnedReader = new Database(paths.database, { create: false, strict: true });
+    pinnedReader.exec("PRAGMA query_only=ON; BEGIN");
+    expect(pinnedReader.query("SELECT display_json FROM provider_interactions WHERE public_id=?").get(interactionId))
+      .toEqual({ display_json: JSON.stringify(mcp.record.display) });
     try {
-      // Reproduce the buggy v12 boundary: the durable interaction transition
-      // commits, its checkpoint reports busy, and no scrub-completion marker
-      // survives to distinguish the schema stamp from a byte purge.
-      const buggyMigration = new Database(paths.database, { create: false, strict: true });
-      buggyMigration.exec(`
-        PRAGMA secure_delete=OFF;
-        DROP TRIGGER IF EXISTS provider_interactions_authority_immutable;
-      `);
-      buggyMigration.query(
-        `UPDATE provider_interactions
-         SET state='resolution_unknown',revision=revision+1,display_json=?,updated_at=9000,terminal_at=9000
-         WHERE public_id=? AND revision=1`,
-      ).run(JSON.stringify({
-        kind: "mcp_elicitation",
-        summary: "Unsupported MCP browser handoff canceled during security migration",
-        serverName: "redacted",
-        mode: "form",
-        url: null,
-        mayContainSecrets: true,
-      }), interactionId);
-      buggyMigration.query(
-        `INSERT INTO provider_interaction_transitions(
-           public_id,revision,state,response_digest,recorded_at
-         ) SELECT public_id,revision,state,response_digest,9000
-           FROM provider_interactions WHERE public_id=?`,
-      ).run(interactionId);
-      buggyMigration.exec(`
-        CREATE TABLE usage_cloud_upload_anchors (
-          profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
-          source_revision INTEGER NOT NULL CHECK(source_revision >= 0),
-          received_at INTEGER NOT NULL CHECK(received_at >= 0),
-          PRIMARY KEY(profile_id, source_revision)
-        ) STRICT;
-        CREATE INDEX usage_cloud_upload_anchors_recent
-          ON usage_cloud_upload_anchors(profile_id, source_revision DESC);
-        INSERT INTO migrations(version,applied_at) VALUES (11,9000),(12,9000);
-        DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=12;
-      `);
-      expect(buggyMigration.query("PRAGMA wal_checkpoint(TRUNCATE)").get())
-        .toEqual(expect.objectContaining({ busy: 1 }));
-      buggyMigration.close(false);
-
+      // The real current migration runs against the untouched v10 writer image.
+      // A reader pins its original secret-bearing page across the committed migration.
       expect(() => {
         const unexpectedlyOpened = new StateStore(paths, {
-          now: () => 9_000,
+          now: () => 20_000,
           securityScrubCheckpoint: shortScrubCheckpoint,
         });
         unexpectedlyOpened.close();
       }).toThrow("STATE_SECURITY_SCRUB_REQUIRED");
-
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
         expect(inspector.query(
           "SELECT reason,required_at FROM security_scrub_authority WHERE singleton=1",
-        ).get()).toEqual({ reason: "mcp_url_redaction", required_at: 9_000 });
+        ).get()).toEqual({ reason: "mcp_url_redaction", required_at: 20_000 });
         expect(inspector.query(
           "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
-        ).all(interactionId)).toEqual([
-          { revision: 1, state: "pending" },
-          { revision: 2, state: "resolution_unknown" },
-        ]);
-      } finally {
-        inspector.close(false);
-      }
-      expect(() => {
-        const unexpectedlyReadable = new StateStore(paths, { readonly: true });
-        unexpectedlyReadable.close();
-      }).toThrow("STATE_SECURITY_SCRUB_REQUIRED");
+        ).all(interactionId)).toEqual([{ revision: 1, state: "pending" }, { revision: 2, state: "resolution_unknown" }]);
+      } finally { inspector.close(false); }
+      expect(pinnedReader.query("SELECT display_json FROM provider_interactions WHERE public_id=?").get(interactionId))
+        .toEqual({ display_json: JSON.stringify(mcp.record.display) });
+      expect(() => new StateStore(paths, { readonly: true })).toThrow("STATE_SECURITY_SCRUB_REQUIRED");
       expect(await stateFileSuffixesContaining(paths.database, sentinel)).not.toEqual([]);
     } finally {
+      expect(pinnedReader.query("SELECT total_changes() AS changes").get()).toEqual({ changes: 0 });
       pinnedReader.exec("COMMIT");
       pinnedReader.close(false);
     }
 
-    const recovered = new StateStore(paths, { now: () => 10_000 });
+    const recovered = new StateStore(paths, { now: () => 21_000 });
     stores.push(recovered);
-    expect(() => recovered.requireInteraction(interactionId))
-      .toThrow("INTERACTION_PROVIDER_AUTHORITY_MISSING");
+    expect(() => recovered.requireInteraction(interactionId)).toThrow("INTERACTION_PROVIDER_AUTHORITY_MISSING");
     recovered.close();
     stores.splice(stores.indexOf(recovered), 1);
-
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query(
-        "SELECT reason,required_at FROM security_scrub_authority WHERE singleton=1",
-      ).get()).toBeNull();
+      expect(inspector.query("SELECT reason,required_at FROM security_scrub_authority WHERE singleton=1").get()).toBeNull();
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
-      ).all(interactionId)).toEqual([
-        { revision: 1, state: "pending" },
-        { revision: 2, state: "resolution_unknown" },
-      ]);
+      ).all(interactionId)).toEqual([{ revision: 1, state: "pending" }, { revision: 2, state: "resolution_unknown" }]);
       expect(inspector.query(
         "SELECT reason FROM legacy_provider_authority_quarantines WHERE scope_kind='interaction' AND scope_id=?",
       ).get(interactionId)).toEqual({ reason: "unknown_provider_method" });
-    } finally {
-      inspector.close(false);
-    }
+    } finally { inspector.close(false); }
     expect(await stateFileSuffixesContaining(paths.database, sentinel)).toEqual([]);
   }, 20_000);
 
   test("transactionally rebuilds v30 autorespond evidence and preserves rows across reopen", async () => {
-    const { store } = await fixture();
-    const profile = store.createProfile("Autorespond migration");
-    const session = store.createSession({
-      profileId: profile.id,
-      preset: "high",
-      fastEnabled: false,
-    });
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
+    const paths = await canonical30AutorespondArchive();
+    const sessionId = canonical30WorkFixture.sessionId;
     const legacy = new Database(paths.database, { create: false, strict: true });
-    replaceAutorespondEvidenceWithVersion30Fixture(legacy, session.id);
+    expect(legacy.query("PRAGMA user_version").get()).toEqual({ user_version: 30 });
+    expect(legacy.query("SELECT * FROM autorespond_evidence ORDER BY id").all())
+      .toEqual([...canonical30WorkFixture.evidence]);
     legacy.close(false);
-
-    const expectedEvidence = {
-      approvalClass: "shell",
-      decision: "accept",
-      interactionId: "00000000-0000-4000-8000-000000000731",
-      kind: "command_approval",
-      latencyMs: 17,
-      mode: "manual",
+    const expectedEvidence = canonical30WorkFixture.evidence.map((row) => ({
+      approvalClass: row.class,
+      decision: row.decision,
+      interactionId: row.interaction_id,
+      kind: row.kind,
+      latencyMs: row.latency_ms,
+      mode: row.mode,
       model: null,
-      occurredAt: 1_500,
-      outcome: "accepted",
-      path: "protocol",
+      occurredAt: row.occurred_at,
+      outcome: row.outcome,
+      path: "protocol" as const,
       rule: null,
-      sessionId: session.id,
-      subagent: true,
-    } as const;
+      sessionId: row.session_id,
+      subagent: Boolean(row.subagent),
+    }));
     const migrated = new StateStore(paths, { now: () => 2_000 });
     stores.push(migrated);
-    expect(migrated.listAutorespondEvidence({ sessionId: session.id })).toEqual([expectedEvidence]);
+    expect(migrated.listAutorespondEvidence({ sessionId })).toEqual(expectedEvidence);
     migrated.close();
     stores.splice(stores.indexOf(migrated), 1);
-
-    const reopened = new StateStore(paths, { now: () => 3_000 });
-    stores.push(reopened);
-    expect(reopened.listAutorespondEvidence({ sessionId: session.id })).toEqual([expectedEvidence]);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
       expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
-      expect(inspector.query("SELECT id,path,rule,model FROM autorespond_evidence").get()).toEqual({
-        id: 7,
-        path: "protocol",
-        rule: null,
-        model: null,
-      });
+      expect(inspector.query("SELECT * FROM autorespond_evidence ORDER BY id").all())
+        .toEqual(canonical30WorkFixture.evidence.map((row) => ({ ...row, path: "protocol", rule: null, model: null })));
+      const beforeReopen = canonicalAuthBudgetSnapshot(inspector);
+      for (const readonly of [false, true]) {
+        const reopened = new StateStore(paths, { readonly, now: () => 3_000 });
+        try {
+          expect(reopened.listAutorespondEvidence({ sessionId })).toEqual(expectedEvidence);
+          expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(beforeReopen);
+        } finally { reopened.close(); }
+      }
     } finally {
       inspector.close(false);
     }
   });
 
   test("rolls back the v31 rebuild when an intermediate schema statement fails", async () => {
-    const { store } = await fixture();
-    const profile = store.createProfile("Autorespond rollback");
-    const session = store.createSession({
-      profileId: profile.id,
-      preset: "high",
-      fastEnabled: false,
-    });
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
+    const paths = await canonical30AutorespondArchive();
     const legacy = new Database(paths.database, { create: false, strict: true });
-    replaceAutorespondEvidenceWithVersion30Fixture(legacy, session.id);
+    expect(legacy.query("PRAGMA user_version").get()).toEqual({ user_version: 30 });
+    expect(legacy.query("SELECT * FROM autorespond_evidence ORDER BY id").all())
+      .toEqual([...canonical30WorkFixture.evidence]);
+    // This one collision is adversarial input on a real archived30 image,
+    // not a current database with removed authority and a historical stamp.
     legacy.query("CREATE TABLE autorespond_evidence_next (blocked TEXT) STRICT").run();
+    const before = canonicalAuthBudgetSnapshot(legacy);
     legacy.close(false);
 
     expect(() => new StateStore(paths, { now: () => 2_000 })).toThrow();
@@ -32611,10 +30698,9 @@ describe("StateStore", () => {
     try {
       expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 30 });
       expect(inspector.query("SELECT version FROM migrations WHERE version=31").get()).toBeNull();
-      expect(inspector.query("SELECT id,session_id FROM autorespond_evidence").get()).toEqual({
-        id: 7,
-        session_id: session.id,
-      });
+      expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(before);
+      expect(inspector.query("SELECT * FROM autorespond_evidence ORDER BY id").all())
+        .toEqual([...canonical30WorkFixture.evidence]);
       expect(inspector.query("PRAGMA table_info(autorespond_evidence)").all())
         .not.toContainEqual(expect.objectContaining({ name: "path" }));
     } finally {
@@ -32750,55 +30836,73 @@ describe("StateStore", () => {
     }
   });
 
-  test("upgrades an early-stamped v2 database to v3 without losing authority data", async () => {
-    const { store } = await fixture();
-    const profile = signInProfile(store, "V2 profile", "v2@example.com");
-    const session = store.createSession({
-      profileId: profile.id,
-      title: "V2 retained",
-      preset: "high",
-      fastEnabled: false,
+  test("upgrades a synthetically populated archived v2 migration stage without losing authority data", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-observed2-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    const bytes = observed2DatabaseBytes();
+    expect(createHash("sha256").update(bytes).digest("hex")).toBe(observed2Fixture.databaseSha256);
+    await writeFile(paths.database, bytes, { mode: 0o600, flag: "wx" });
+    expect(observed2Fixture.provenance).toMatchObject({
+      kind: "uncommitted_archived_migration_stage",
+      releasedWriterImage: false,
+      observerRowOrSchemaWrites: false,
+      originalProfilesAndSessionsEmpty: true,
     });
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
-    const legacy = new Database(paths.database, { create: false, strict: true });
-    dropSchemaAfterVersion34(legacy);
-    legacy.exec(`
-      DROP TRIGGER IF EXISTS queue_transition_guard;
-      DROP TRIGGER IF EXISTS desktop_switch_transition_guard;
-      DROP TABLE IF EXISTS desktop_switch_authority;
-      DELETE FROM migrations WHERE version>2;
-      DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TRIGGER IF EXISTS sessions_autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_history; DROP TABLE IF EXISTS autorespond_after_hours_policy; DROP TABLE IF EXISTS account_mutation_authority_rebinds; DROP TRIGGER IF EXISTS sessions_autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_history; DROP TABLE IF EXISTS autorespond_budget_reservations; PRAGMA user_version=2;
-    `);
-    legacy.close(false);
-
-    const migrated = new StateStore(paths, { now: () => 9_000 });
-    stores.push(migrated);
-    expect(migrated.requireProfile(profile.id)).toMatchObject({
-      id: profile.id,
-      providerEmail: "v2@example.com",
-    });
-    expect(migrated.requireSession(session.id)).toMatchObject({
-      id: session.id,
-      title: "V2 retained",
-    });
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    const profileId = "acct_22222222222222222222222222222222";
+    const sessionId = "sess_22222222222222222222222222222222";
+    const inspector = new Database(paths.database, { create: false, strict: true });
     try {
+      inspector.exec("PRAGMA foreign_keys=ON");
+      const empty = canonicalAuthBudgetSnapshot(inspector);
+      expect(empty.version).toEqual({ user_version: 2 });
+      expect(empty.rows.profiles).toEqual([]);
+      expect(empty.rows.sessions).toEqual([]);
+      expect(createHash("sha256").update(JSON.stringify(empty.schema)).digest("hex")).toBe(observed2Fixture.snapshot.schemaSha256);
+      expect(inspector.query("SELECT * FROM migrations ORDER BY version").all()).toEqual([...observed2Fixture.snapshot.ledger]);
+      // These two rows are explicitly synthetic test inputs under the captured
+      // original constraints, not claimed to be emitted by an archived writer.
+      inspector.transaction(() => {
+        inspector.query("INSERT INTO profiles(id,label,state,process_generation,provider_email,provider_plan,created_at,updated_at) VALUES (?,?,'signed_in',1,?,'Plus',10001,10001)")
+          .run(profileId, "V2 profile", "v2@example.com");
+        inspector.query("INSERT INTO sessions(id,profile_id,title,preset,fast_enabled,state,revision,created_at,updated_at) VALUES (?,?,'V2 retained','high',0,'starting',1,10001,10001)")
+          .run(sessionId, profileId);
+      }).immediate();
+      const populated = canonicalAuthBudgetSnapshot(inspector);
+      expect(populated.schema).toEqual(empty.schema);
+      expect(populated.version).toEqual(empty.version);
+      for (const [table, rows] of Object.entries(empty.rows)) {
+        if (table !== "profiles" && table !== "sessions") expect(populated.rows[table]).toEqual(rows);
+      }
+      expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      const originalProfile = canonicalAuthBudgetRows(inspector, ["profiles"]);
+      expect(() => { new StateStore(paths, { readonly: true }).close(); }).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:2:60");
+      expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(populated);
+
+      const migrated = new StateStore(paths, { now: () => 90_000, resolveMachineTimeZone: () => "UTC" });
+      stores.push(migrated);
+      expect(originalProfile.read()).toEqual(originalProfile.before);
+      expect(migrated.requireProfile(profileId)).toMatchObject({
+        id: profileId, label: "V2 profile", providerEmail: "v2@example.com", processGeneration: 1,
+      });
+      expect(migrated.requireSession(sessionId)).toMatchObject({
+        id: sessionId, profileId, title: "V2 retained", preset: "high", state: "recovery_required", revision: 2,
+      });
       expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
-      expect(inspector.query("SELECT applied_at FROM migrations WHERE version=3").get()).toEqual({
-        applied_at: 9_000,
-      });
+      expect(inspector.query("SELECT * FROM migrations WHERE version<=2 ORDER BY version").all()).toEqual([...observed2Fixture.snapshot.ledger]);
+      expect(inspector.query("SELECT applied_at FROM migrations WHERE version=3").get()).toEqual({ applied_at: 90_000 });
       expect(inspector.query("SELECT * FROM desktop_switch_authority").get()).toEqual({
-        singleton: 1,
-        current_generation: 0,
-        current_attempt_id: null,
-        released_generation: 0,
+        singleton: 1, current_generation: 0, current_attempt_id: null, released_generation: 0,
       });
-    } finally {
-      inspector.close(false);
-    }
+      expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      const joined = canonicalAuthBudgetSnapshot(inspector);
+      for (const readonly of [false, true]) {
+        const reopened = new StateStore(paths, { readonly, now: () => 90_001, resolveMachineTimeZone: () => "UTC" });
+        try { expect(reopened.requireSession(sessionId).title).toBe("V2 retained"); }
+        finally { reopened.close(); }
+        expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(joined);
+      }
+    } finally { inspector.close(false); }
   });
 
   test("binds immutable host capabilities and keeps project memory authority content-free", async () => {
@@ -33682,43 +31786,49 @@ describe("StateStore", () => {
   });
 
   test("structurally identifies upstream adoption v40 before adding peer and hosted memory", async () => {
-    const { store } = await fixture();
-    const profile = signInProfile(store, "Upstream adoption v40", "upstream-v40@example.com");
-    const session = upsertProvenTestSession(store, {
-      profileId: profile.id,
-      providerThreadId: "upstream-adoption-v40-thread",
-      preset: "high",
-      fastEnabled: false,
-      state: "idle",
-    });
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-
+    const paths = await canonical40QueueArchive();
+    const captured = canonical40QueuesFixture.queues.find((entry) => entry.state === "cancelled");
+    if (captured === undefined) throw new Error("Missing archived cancelled queue");
     const upstream = new Database(paths.database, { create: false, strict: true });
+    let originalSession: Record<string, unknown>;
+    let originalQueue: Record<string, unknown>;
     try {
-      downgradeToExactProviderVersion40(upstream);
+      upstream.exec("PRAGMA query_only=ON");
+      expect(upstream.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+      originalSession = z.record(z.string(), z.unknown()).parse(upstream.query("SELECT * FROM sessions WHERE id=?").get(captured.sessionId));
+      originalQueue = z.record(z.string(), z.unknown()).parse(upstream.query("SELECT * FROM queue_entries WHERE id=?").get(captured.queueId));
+      expect(originalSession).toMatchObject({ state: "idle" });
+      expect(originalQueue).toMatchObject({ state: "cancelled", message: captured.queued.message });
       expect(upstream.query(
         "SELECT name FROM sqlite_master WHERE name='session_adoption_policies'",
       ).get()).toEqual({ name: "session_adoption_policies" });
       expect(upstream.query(
         "SELECT name FROM sqlite_master WHERE name='session_peer_policies'",
       ).get()).toBeNull();
+      const before = canonicalAuthBudgetSnapshot(upstream);
+      expect(() => new StateStore(paths, { readonly: true }))
+        .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:40:60");
+      expect(canonicalAuthBudgetSnapshot(upstream)).toEqual(before);
     } finally {
       upstream.close(false);
     }
 
-    expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:40:60");
     const migrated = new StateStore(paths, { now: () => 5_050 });
     stores.push(migrated);
-    expect(migrated.requireSession(session.id)).toMatchObject({
-      providerThreadId: session.providerThreadId,
-      state: "idle",
-    });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
+      // This genuine source had a settled queue and a native account-key
+      // observation, but no immutable runtime. Preserve its old cells without
+      // promoting that observation to a captured execution tuple.
+      expect(inspector.query("SELECT * FROM sessions WHERE id=?").get(captured.sessionId)).toMatchObject(originalSession);
+      expect(inspector.query("SELECT * FROM queue_entries WHERE id=?").get(captured.queueId)).toMatchObject(originalQueue);
+      expect(inspector.query("SELECT * FROM session_provider_authorities WHERE session_id=?").all(captured.sessionId)).toEqual([]);
+      expect(() => migrated.requireSessionProviderAuthority(captured.sessionId))
+        .toThrow("SESSION_PROVIDER_AUTHORITY_QUARANTINED:missing_immutable_runtime_authority");
+      expect(migrated.requirePeerSessionPolicy(captured.sessionId)).toMatchObject({ mode: "coordinate", revision: 1 });
       expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
+      expect(inspector.query("SELECT * FROM migrations WHERE version<=40 ORDER BY version").all())
+        .toEqual([...canonical40QueuesFixture.migrations]);
       expect(inspector.query(
         "SELECT version,applied_at FROM migrations WHERE version>=41 ORDER BY version",
       ).all()).toEqual([
@@ -33730,6 +31840,14 @@ describe("StateStore", () => {
         { applied_at: 5_050, version: 46 }, { applied_at: 5_050, version: 47 }, { applied_at: 5_050, version: 48 }, { applied_at: 5_050, version: 49 },
         ...Array.from({ length: 11 }, (_, index) => ({ version: index + 50, applied_at: 5_050 })),
       ]);
+      const after = canonicalAuthBudgetSnapshot(inspector);
+      migrated.close();
+      stores.splice(stores.indexOf(migrated), 1);
+      for (const readonly of [false, true]) {
+        const reopened = new StateStore(paths, { readonly, now: () => 5_051 });
+        try { expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(after); }
+        finally { reopened.close(); }
+      }
     } finally {
       inspector.close(false);
     }
@@ -33737,42 +31855,21 @@ describe("StateStore", () => {
 
 
   test("refuses a missing guard on an authoritative v41 predecessor without writes", async () => {
-    const { store } = await fixture();
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
+    const paths = await canonicalTimestampArchiveForTest(41);
     const damaged = new Database(paths.database, { create: false, strict: true });
     try {
-      downgradeToExactProviderVersion41(damaged);
-      damaged.exec(`
-        DROP TRIGGER mutation_resolutions_timestamp_proof_insert;
-        DELETE FROM migrations WHERE version>41;
-        PRAGMA user_version=41;
-      `);
+      expect(damaged.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
+      // Deliberately damage only the exact archived guard; this is not a
+      // newly asserted historical producer or a current-schema downgrade.
+      damaged.exec("DROP TRIGGER mutation_resolutions_timestamp_proof_insert");
+      const before = canonicalAuthBudgetSnapshot(damaged);
+      for (const readonly of [true, false]) {
+        expect(() => new StateStore(paths, readonly ? { readonly: true } : {}))
+          .toThrow(readonly ? "STATE_SCHEMA_MIGRATION_REQUIRED:41:60" : "STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_INVALID");
+        expect(canonicalAuthBudgetSnapshot(damaged)).toEqual(before);
+      }
     } finally {
       damaged.close(false);
-    }
-    const before = new Database(paths.database, { create: false, readonly: true, strict: true });
-    const schemaBefore = before.query(
-      "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
-    ).all();
-    const ledgerBefore = before.query("SELECT * FROM migrations ORDER BY version").all();
-    before.close(false);
-
-    for (const readonly of [true, false]) {
-      expect(() => new StateStore(paths, readonly ? { readonly: true } : {}))
-        .toThrow(readonly ? "STATE_SCHEMA_MIGRATION_REQUIRED:41:60" : "STATE_SCHEMA_V41_TIMESTAMP_PROOF_GUARD_INVALID");
-    }
-    const unchanged = new Database(paths.database, { create: false, readonly: true, strict: true });
-    try {
-      expect(unchanged.query(
-        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name",
-      ).all()).toEqual(schemaBefore);
-      expect(unchanged.query("SELECT * FROM migrations ORDER BY version").all())
-        .toEqual(ledgerBefore);
-      expect(unchanged.query("PRAGMA user_version").get()).toEqual({ user_version: 41 });
-    } finally {
-      unchanged.close(false);
     }
   });
 
@@ -34592,12 +32689,24 @@ describe("StateStore", () => {
   });
 
   test("pages only actor-authorized visible same-project peers in stable creation order", async () => {
-    const { store, home } = await fixture({ now: () => 4_000 });
-    const firstRoot = join(home, "peer-directory-a");
+    const captured = canonical39RetiredRecoveryFixtures.inflight_start;
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-peer-directory-history-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    const bytes = canonical39RetiredRecoveryDatabaseBytes("inflight_start");
+    expect(createHash("sha256").update(bytes).digest("hex")).toBe(captured.databaseSha256);
+    await writeFile(paths.database, bytes, { mode: 0o600, flag: "wx" });
+    const store = new StateStore(paths, { now: () => 40_000 });
+    stores.push(store);
+    // The retained /opt/homebrew project is public metadata only. This test
+    // creates control-plane records, never directories or provider work there.
+    const firstProject = store.requireProject(captured.retained.project.id);
+    const retired = store.requireSession(captured.retained.session.id);
+    expect(retired).toMatchObject({
+      provider: "devin", profileId: captured.retained.profile.id, projectId: firstProject.id,
+    });
     const secondRoot = join(home, "peer-directory-b");
-    await mkdir(firstRoot);
     await mkdir(secondRoot);
-    const firstProject = await store.createProject("Peer directory A", firstRoot);
     const secondProject = await store.createProject("Peer directory B", secondRoot);
     const profile = signInProfile(store, "Peer directory account", "directory@example.com");
     const create = (projectId: typeof firstProject.id, title: string) =>
@@ -34627,14 +32736,6 @@ describe("StateStore", () => {
     });
     const archived = create(firstProject.id, "Hidden by archive");
     store.setSessionArchived(archived.id, true);
-    const retired = create(firstProject.id, "Hidden retired provider history");
-    const retire = new Database(store.paths.database, { create: false, strict: true });
-    try {
-      retire.query("UPDATE sessions SET provider_v39='devin',preset='ultra',preset_contract=?,canonical_profile_key='devin:gpt-6-astra:provider-default' WHERE id=?")
-        .run(devinPresetContract, retired.id);
-    } finally {
-      retire.close(false);
-    }
     create(secondProject.id, "Hidden by project");
 
     expect(() => store.listPeerProjectSessionPage({
@@ -34680,6 +32781,18 @@ describe("StateStore", () => {
       targetSessionId: retired.id,
       expectedTargetRevision: retired.revision,
     })).toThrow("PEER_SESSION_TARGET_STATE_REFUSED");
+    expect(() => store.admitPeerSessionAction({
+      actorSessionId: actor.id,
+      actorTurnId: actor.activeTurnId!,
+      targetSessionId: retired.id,
+      expectedTargetRevision: retired.revision,
+      delivery: "send",
+      requestDigest: testDigest("archived retired peer admission"),
+      messageDigest: testDigest("archived retired peer message"),
+      reasonDigest: testDigest("archived retired peer reason"),
+      idempotencyKey: peerIdempotencyKey(8_969),
+    })).toThrow("PEER_SESSION_TARGET_STATE_REFUSED");
+    expect(store.requireSession(retired.id)).toEqual(retired);
 
     const policy = store.requirePeerSessionPolicy(actor.id);
     store.setPeerSessionPolicy({
@@ -34699,28 +32812,23 @@ describe("StateStore", () => {
       after: null,
       limit: 51,
     })).toThrow();
-    const retireActor = new Database(store.paths.database, { create: false, strict: true });
-    try {
-      retireActor.query("UPDATE sessions SET provider_v39='devin',preset='ultra',preset_contract=?,canonical_profile_key='devin:gpt-6-astra:provider-default' WHERE id=?")
-        .run(devinPresetContract, actor.id);
-    } finally {
-      retireActor.close(false);
-    }
+    // The authentic retired source has no current actor authority. Do not
+    // fabricate an active retired turn merely to select a later gate.
     expect(() => store.listPeerProjectSessionPage({
-      actorSessionId: actor.id,
-      actorTurnId: actor.activeTurnId!,
+      actorSessionId: retired.id,
+      actorTurnId: "unproved-retired-turn",
       after: null,
       limit: 50,
     })).toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
     expect(() => store.assertPeerSessionInspection({
-      actorSessionId: actor.id,
-      actorTurnId: actor.activeTurnId!,
+      actorSessionId: retired.id,
+      actorTurnId: "unproved-retired-turn",
       targetSessionId: visible[0]!.id,
       expectedTargetRevision: visible[0]!.revision,
     })).toThrow("PEER_SESSION_ACTOR_TURN_REFUSED");
   });
 
-  test("keeps retired provider history outside peer admission, replay, and begin", async () => {
+  test("refuses current peer replay and begin after adversarial provider-column corruption", async () => {
     const { store, home } = await fixture();
     const root = join(home, "peer-retired-target");
     await mkdir(root);
@@ -34773,11 +32881,30 @@ describe("StateStore", () => {
       message: queuedMessage,
     };
     const queued = store.admitPeerSessionAction(queueRequest);
+    const targetAuthority = capturedProviderAuthorityForTest(store, target.id);
 
     const retire = new Database(store.paths.database, { create: false, strict: true });
+    let corrupted: ReturnType<typeof canonicalAuthBudgetSnapshot>;
     try {
-      retire.query("UPDATE sessions SET provider_v39='devin',preset='ultra',preset_contract=?,canonical_profile_key='devin:gpt-6-astra:provider-default' WHERE id=?")
+      const intact = canonicalAuthBudgetSnapshot(retire);
+      const retag = () => retire.query("UPDATE sessions SET provider_v39='devin',preset='ultra',preset_contract=?,canonical_profile_key='devin:gpt-6-astra:provider-default' WHERE id=?")
         .run(devinPresetContract, target.id);
+      expect(retag).toThrow("RETIRED_PROVIDER_ADMISSION_REFUSED");
+      expect(canonicalAuthBudgetSnapshot(retire)).toEqual(intact);
+      const guard = z.object({ sql: z.string() }).strict().parse(retire.query(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='retired_provider_session_rebind'",
+      ).get());
+      // Deliberately corrupt a current supported row, not historical provider
+      // evidence. Restore the exact guard before exercising readers or effects.
+      retire.transaction(() => {
+        retire.exec("DROP TRIGGER retired_provider_session_rebind");
+        retag();
+        retire.exec(guard.sql);
+      }).immediate();
+      expect(retire.query(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='retired_provider_session_rebind'",
+      ).get()).toEqual(guard);
+      corrupted = canonicalAuthBudgetSnapshot(retire);
     } finally {
       retire.close(false);
     }
@@ -34808,7 +32935,7 @@ describe("StateStore", () => {
     expect(() => store.beginPeerSessionActionEffect(direct.action.id))
       .toThrow("PEER_SESSION_TARGET_STATE_REFUSED");
     expect(() => store.beginQueueEffect({
-      providerAuthority: capturedProviderAuthorityForTest(store, target.id),
+      providerAuthority: targetAuthority,
       queueId: queued.queue!.id,
       sessionId: target.id,
       profileGeneration: profile.processGeneration,
@@ -34829,6 +32956,9 @@ describe("StateStore", () => {
     expect(store.requirePeerSessionAction(queued.action.id).state).toBe("queued");
     expect(store.requireQueue(queued.queue!.id).state).toBe("pending");
     expect(store.readQueueEffect(queued.queue!.id)).toBeNull();
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    try { expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(corrupted); }
+    finally { inspector.close(false); }
   });
 
   test("admits peer queues idempotently and preserves attributed provenance across restart", async () => {
@@ -36101,6 +34231,7 @@ describe("StateStore", () => {
   test("pins unsettled actions and recursively required causal roots beyond the retention window", async () => {
     let now = 20_000;
     const { store, home } = await fixture({ now: () => now });
+    const daemon = startInputFixtureDaemon(store);
     const root = join(home, "peer-retention-pins");
     await mkdir(root);
     const project = await store.createProject("Peer retention pins", root);
@@ -36190,11 +34321,13 @@ describe("StateStore", () => {
       reasonDigest: testDigest("unresolved evidence retention reason"),
       idempotencyKey: unresolvedKey,
     }).action;
-    store.prepareMutation({
+    store.prepareSessionInputMutation({
+      ...daemon,
       kind: "session.send",
-      authorityId: pendingTarget.id,
-      authorityGeneration: profile.processGeneration,
-      request: { message: unresolvedMessage },
+      sessionId: pendingTarget.id,
+      providerAuthority: capturedProviderAuthorityForTest(store, pendingTarget.id),
+      message: unresolvedMessage,
+      attachments: [],
       idempotencyKey: unresolvedKey,
     });
     store.beginPeerSessionActionEffect(unresolvedPinned.id);
@@ -36686,6 +34819,7 @@ describe("StateStore", () => {
 
   test("revalidates direct peer authority at replay and begin and joins its nested mutation exactly", async () => {
     const { store, home } = await fixture();
+    const daemon = startInputFixtureDaemon(store);
     const root = join(home, "peer-begin-authority");
     await mkdir(root);
     const project = await store.createProject("Peer begin authority", root);
@@ -36708,9 +34842,10 @@ describe("StateStore", () => {
       preset: "high",
       fastEnabled: false,
     });
-    const target = store.setSessionTurnState({
+    const target = store.bindSession({
       sessionId: targetBase.id,
       expectedRevision: targetBase.revision,
+      providerThreadId: "thread-peer-begin-authority",
       state: "idle",
     });
     const key = peerIdempotencyKey(52_000);
@@ -36726,23 +34861,29 @@ describe("StateStore", () => {
       idempotencyKey: key,
     };
     const action = store.admitPeerSessionAction(request).action;
-    expect(() => store.prepareMutation({
+    expect(() => store.prepareSessionInputMutation({
+      ...daemon,
       kind: "session.send",
-      authorityId: target.id,
-      authorityGeneration: profile.processGeneration,
-      request: { message: "different peer begin message" },
+      sessionId: target.id,
+      providerAuthority: capturedProviderAuthorityForTest(store, target.id),
+      message: "different peer begin message",
+      attachments: [],
       idempotencyKey: key,
     })).toThrow("PEER_SESSION_MESSAGE_DIGEST_MISMATCH");
     expect(store.readMutation(key)).toBeNull();
     expect(store.requirePeerSessionAction(action.id).state).toBe("prepared");
-    const attempt = store.prepareMutation({
+    const { attempt } = store.prepareSessionInputMutation({
+      ...daemon,
       kind: "session.send",
-      authorityId: target.id,
-      authorityGeneration: profile.processGeneration,
-      request: { message: "peer begin message" },
+      sessionId: target.id,
+      providerAuthority: capturedProviderAuthorityForTest(store, target.id),
+      message: "peer begin message",
+      attachments: [],
       idempotencyKey: key,
     });
     expect(() => store.beginSessionMutationEffect({
+      ...daemon,
+      attachments: [],
       providerAuthority: capturedProviderAuthorityForTest(store, target.id),
       transcript: {
         accountId: store.requireSession(target.id).profileId,
@@ -36801,21 +34942,27 @@ describe("StateStore", () => {
       reasonDigest: testDigest("peer steer reason"),
       idempotencyKey: steerKey,
     }).action;
-    expect(() => store.prepareMutation({
+    expect(() => store.prepareSessionInputMutation({
+      ...daemon,
       kind: "session.steer",
-      authorityId: steerTarget.id,
-      authorityGeneration: profile.processGeneration,
-      request: { message: steerMismatch },
+      sessionId: steerTarget.id,
+      providerAuthority: capturedProviderAuthorityForTest(store, steerTarget.id),
+      message: steerMismatch,
+      attachments: [],
       idempotencyKey: steerKey,
     })).toThrow("PEER_SESSION_MESSAGE_DIGEST_MISMATCH");
-    const steerAttempt = store.prepareMutation({
+    const { attempt: steerAttempt } = store.prepareSessionInputMutation({
+      ...daemon,
       kind: "session.steer",
-      authorityId: steerTarget.id,
-      authorityGeneration: profile.processGeneration,
-      request: { message: steerMessage },
+      sessionId: steerTarget.id,
+      providerAuthority: capturedProviderAuthorityForTest(store, steerTarget.id),
+      message: steerMessage,
+      attachments: [],
       idempotencyKey: steerKey,
     });
     expect(() => store.beginSessionMutationEffect({
+      ...daemon,
+      attachments: [],
       providerAuthority: capturedProviderAuthorityForTest(store, steerTarget.id),
       transcript: {
         accountId: store.requireSession(steerTarget.id).profileId,
@@ -36946,7 +35093,10 @@ describe("StateStore", () => {
     };
     const mismatchedCanonical = JSON.stringify(mismatchedSteerEvidence);
     const joinInjector = new Database(store.paths.database, { create: false, strict: true });
-    joinInjector.query(
+    // Current joined SQL rejects an invented evidence row before it can become
+    // a readable historical join. This is a current admission negative, not
+    // an archived writer receipt with fabricated provenance.
+    expect(() => joinInjector.query(
       `INSERT INTO mutation_effect_evidence(
          attempt_id,kind,evidence_json,evidence_digest,recorded_at
        ) VALUES (?,?,?,?,?)`,
@@ -36956,13 +35106,12 @@ describe("StateStore", () => {
       mismatchedCanonical,
       testDigest(mismatchedCanonical),
       2_000,
-    );
-    joinInjector.query(
-      "UPDATE mutation_attempts SET state='effect_started' WHERE id=? AND state='prepared'",
-    ).run(steerAttempt.id);
+    )).toThrow("EFFECT_EVIDENCE_PROVENANCE_CORRUPT");
     joinInjector.close(false);
-    expect(() => store.readPeerSessionMutationJoin(steerKey))
-      .toThrow("PEER_SESSION_MUTATION_JOIN_INVALID");
+    expect(store.readPeerSessionMutationJoin(steerKey)).toMatchObject({
+      action: { id: steerAction.id }, attempt: { id: steerAttempt.id, state: "prepared" },
+    });
+    expect(store.readMutation(steerKey)?.evidence).toBeUndefined();
     expect(store.requirePeerSessionAction(steerAction.id).state).toBe("prepared");
 
     expect(store.beginPeerSessionActionEffect(action.id).state).toBe("effect_started");
@@ -36975,11 +35124,26 @@ describe("StateStore", () => {
       state: "ambiguous",
     });
     expect(store.beginPeerSessionActionEffect(action.id).state).toBe("ambiguous");
-    const crashInjector = new Database(store.paths.database, { create: false, strict: true });
-    crashInjector.query(
-      "UPDATE mutation_attempts SET state='effect_started' WHERE id=? AND state='prepared'",
-    ).run(attempt.id);
-    crashInjector.close(false);
+    store.beginSessionMutationEffect({
+      ...daemon,
+      attachments: [],
+      providerAuthority: capturedProviderAuthorityForTest(store, target.id),
+      attemptId: attempt.id,
+      sessionId: target.id,
+      profileGeneration: profile.processGeneration,
+      message: "peer begin message",
+      transcript: {
+        accountId: profile.id, providerGeneration: profile.processGeneration,
+        providerConnectionId: "10000000-0000-4000-8000-000000000099",
+        actor: "peer_session", message: "peer begin message",
+      },
+      evidence: {
+        kind: "session.send", providerThreadId: "thread-peer-begin-authority",
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        clientMessageId: attempt.id, messageDigest: testDigest("peer begin message"),
+        runtimeProfile: codexRuntimeProfile(profile), messageActor: "peer_session",
+      },
+    });
     expect(() => store.beginPeerSessionActionEffect(action.id))
       .toThrow("PEER_SESSION_NESTED_MUTATION_NOT_RESUMABLE");
     store.setPeerSessionPolicy({
@@ -36997,6 +35161,7 @@ describe("StateStore", () => {
   test("retains direct peer attribution through compaction and cancels provably unstarted joins", async () => {
     let now = 40_000;
     const { store, home } = await fixture({ now: () => now++ });
+    const daemon = startInputFixtureDaemon(store);
     const root = join(home, "peer-direct-retention");
     await mkdir(root);
     const project = await store.createProject("Peer direct retention", root);
@@ -37042,15 +35207,19 @@ describe("StateStore", () => {
       idempotencyKey: key,
     };
     const action = store.admitPeerSessionAction(request).action;
-    const attempt = store.prepareMutation({
+    const { attempt } = store.prepareSessionInputMutation({
+      ...daemon,
       kind: "session.send",
-      authorityId: target.id,
-      authorityGeneration: profile.processGeneration,
-      request: { message },
+      sessionId: target.id,
+      providerAuthority: capturedProviderAuthorityForTest(store, target.id),
+      message,
+      attachments: [],
       idempotencyKey: key,
     });
     const runtime = codexRuntimeProfile(profile);
     const evidence = store.beginSessionMutationEffect({
+      ...daemon,
+      attachments: [],
       providerAuthority: capturedProviderAuthorityForTest(store, target.id),
       transcript: {
         accountId: store.requireSession(target.id).profileId,
@@ -37081,7 +35250,7 @@ describe("StateStore", () => {
       sessionId: target.id,
       accountId: profile.id,
       providerGeneration: profile.processGeneration,
-      providerConnectionId: null,
+      providerConnectionId: "10000000-0000-4000-8000-000000000099",
       expectedSessionRevision: target.revision,
       applyResponseState: false,
       turnId: "turn-peer-direct-target",
@@ -37172,8 +35341,12 @@ describe("StateStore", () => {
     });
     expect(cancelled.state).toBe("cancelled");
     expect(restarted.readMutation(crashKey)).toMatchObject({
+      kind: "peer.session.cancel",
+      authorityGeneration: 0,
       state: "cancelled",
-      result: { providerEffectStarted: false },
+    });
+    expect(restarted.readMutation(crashKey)?.result).toMatchObject({
+      version: 1, peerActionId: crashAction.id, providerEffectStarted: false,
     });
     expect(restarted.readPeerSessionDirectMessageSource(crashKey)).toBeNull();
     expect(restarted.cancelUnstartedPeerSessionDirectAction({
@@ -37181,7 +35354,7 @@ describe("StateStore", () => {
       diagnosticCode: "PEER_SESSION_PROVIDER_EFFECT_NOT_STARTED",
     })).toEqual(cancelled);
 
-    const preparedBase = restarted.createSession({
+    const preparedBase = createAuthorizedStartingTestSession(restarted, {
       profileId: profile.id,
       projectId: project.id,
       preset: "high",
@@ -37205,11 +35378,13 @@ describe("StateStore", () => {
       reasonDigest: testDigest("prepared peer reason"),
       idempotencyKey: preparedKey,
     }).action;
-    restarted.prepareMutation({
+    restarted.prepareSessionInputMutation({
+      ...daemon,
       kind: "session.send",
-      authorityId: preparedTarget.id,
-      authorityGeneration: profile.processGeneration,
-      request: { message: "prepared peer message" },
+      sessionId: preparedTarget.id,
+      providerAuthority: capturedProviderAuthorityForTest(restarted, preparedTarget.id),
+      message: "prepared peer message",
+      attachments: [],
       idempotencyKey: preparedKey,
     });
     restarted.beginPeerSessionActionEffect(preparedAction.id);
@@ -37220,7 +35395,7 @@ describe("StateStore", () => {
     expect(restarted.readMutation(preparedKey)?.state).toBe("cancelled");
   });
 
-  test("requires peer queue effect evidence and quarantines missing-evidence restart state", async () => {
+  test("requires peer queue evidence and preserves unresolved current corruption without inventing recovery proof", async () => {
     const { store, home } = await fixture();
     const root = join(home, "peer-queue-evidence");
     await mkdir(root);
@@ -37265,15 +35440,57 @@ describe("StateStore", () => {
     });
     expect(() => store.transitionQueue(admitted.queue!.id, "pending", "dispatching"))
       .toThrow("PEER_QUEUE_EFFECT_EVIDENCE_REQUIRED");
+    const provedBase = createAuthorizedStartingTestSession(store, {
+      profileId: profile.id, projectId: project.id, preset: "high", fastEnabled: false,
+    });
+    const provedTarget = store.bindSession({
+      sessionId: provedBase.id, expectedRevision: provedBase.revision,
+      providerThreadId: "thread-peer-proved-queue-evidence", state: "idle",
+    });
+    const proved = store.admitPeerSessionAction({
+      actorSessionId: actor.id, actorTurnId: actor.activeTurnId!,
+      targetSessionId: provedTarget.id, expectedTargetRevision: provedTarget.revision,
+      delivery: "queue", requestDigest: testDigest("proved peer queue request"),
+      messageDigest: testDigest(message), reasonDigest: testDigest("proved peer queue reason"),
+      idempotencyKey: peerIdempotencyKey(52_004), message,
+    });
+    store.beginQueueEffect({
+      providerAuthority: capturedProviderAuthorityForTest(store, provedTarget.id),
+      queueId: proved.queue!.id, sessionId: provedTarget.id,
+      profileGeneration: profile.processGeneration,
+      providerConnectionId: "10000000-0000-4000-8000-000000000099",
+      evidence: {
+        kind: "queue.dispatch", queueId: proved.queue!.id, sessionId: provedTarget.id,
+        providerThreadId: "thread-peer-proved-queue-evidence", profileGeneration: profile.processGeneration,
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        clientMessageId: proved.queue!.id, messageDigest: testDigest(message),
+        runtimeProfile: codexRuntimeProfile(profile),
+      },
+    });
+    expect(store.recoverDispatchingQueueEffects()).toEqual({ recovered: [proved.queue!.id], unresolved: [] });
+    expect(store.requireQueue(proved.queue!.id).state).toBe("ambiguous");
+    expect(store.requireSession(provedTarget.id).state).toBe("recovery_required");
+    expect(store.readQueueEffect(proved.queue!.id)).not.toBeNull();
     const injector = new Database(store.paths.database, { create: false, strict: true });
-    const evidenceGuardSql = injector.query(
+    const beforeRefusal = canonicalAuthBudgetSnapshot(injector);
+    expect(() => injector.query("UPDATE queue_entries SET state='dispatching' WHERE id=?")
+      .run(admitted.queue!.id)).toThrow("peer queue effect evidence required");
+    expect(canonicalAuthBudgetSnapshot(injector)).toEqual(beforeRefusal);
+    const evidenceGuardSql = z.object({ sql: z.string() }).strict().parse(injector.query(
       "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='queue_peer_effect_evidence_guard'",
-    ).get() as { sql: string } | null;
-    expect(evidenceGuardSql?.sql).toBeString();
-    injector.exec("PRAGMA foreign_keys=ON; DROP TRIGGER queue_peer_effect_evidence_guard;");
-    injector.query("UPDATE queue_entries SET state='dispatching' WHERE id=?")
-      .run(admitted.queue!.id);
-    injector.exec(evidenceGuardSql!.sql);
+    ).get());
+    // Explicit current-row corruption, not a historical producer or a claim
+    // that opening an already-current store runs daemon recovery.
+    injector.transaction(() => {
+      injector.exec("DROP TRIGGER queue_peer_effect_evidence_guard");
+      injector.query("UPDATE queue_entries SET state='dispatching' WHERE id=?")
+        .run(admitted.queue!.id);
+      injector.exec(evidenceGuardSql.sql);
+    }).immediate();
+    expect(injector.query(
+      "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='queue_peer_effect_evidence_guard'",
+    ).get()).toEqual(evidenceGuardSql);
+    const corrupted = canonicalAuthBudgetSnapshot(injector);
     injector.close(false);
     const paths = store.paths;
     store.close();
@@ -37284,9 +35501,15 @@ describe("StateStore", () => {
       recovered: [],
       unresolved: [admitted.queue!.id],
     });
-    expect(restarted.requireQueue(admitted.queue!.id).state).toBe("ambiguous");
-    expect(restarted.requirePeerSessionAction(admitted.action.id).state).toBe("ambiguous");
-    expect(restarted.requireSession(target.id).state).toBe("recovery_required");
+    expect(restarted.requireQueue(admitted.queue!.id).state).toBe("dispatching");
+    // The intact queue transition projection marked the outer action started
+    // during the deliberate corruption; recovery must not invent inner proof.
+    expect(restarted.requirePeerSessionAction(admitted.action.id).state).toBe("effect_started");
+    expect(restarted.requireSession(target.id)).toEqual(target);
+    expect(restarted.readQueueEffect(admitted.queue!.id)).toBeNull();
+    const inspector = new Database(paths.database, { create: false, strict: true });
+    try { expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(corrupted); }
+    finally { inspector.close(false); }
   });
 
   test("atomically advances only share memory heads and recovers started control effects with cursors", async () => {
@@ -37625,10 +35848,7 @@ describe("StateStore", () => {
       "UPDATE project_memory_authorities SET head_digest=? WHERE project_id=?",
     ).run("c".repeat(64), project.id);
     corrupted.close(false);
-    expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_V40_STRUCTURE_INVALID");
-    expect(() => new StateStore(paths, { now: () => 8_000 }))
-      .toThrow("STATE_SCHEMA_V40_STRUCTURE_INVALID");
+    expectInertSchemaRefusal(paths, "STATE_SCHEMA_V41_STRUCTURE_INVALID");
     const unchanged = new Database(paths.database, { create: false, readonly: true, strict: true });
     expect(unchanged.query<{ name: string }, []>(
       "SELECT name FROM pragma_table_info('project_memory_authorities') WHERE name='identity_contract'",
@@ -37640,55 +35860,62 @@ describe("StateStore", () => {
   });
 
   test("upgrades an exact released v39 schema through adoption, timestamp proof, peer, and hosted state", async () => {
-    const { store } = await fixture();
-    const profile = signInProfile(
-      store,
-      "Upstream v39 peer migration",
-      "upstream-v39@example.com",
-    );
-    const session = createAuthorizedStartingTestSession(store, {
-      profileId: profile.id,
-      preset: "high",
-      fastEnabled: false,
-    });
-    const queue = store.enqueue(session.id, "legacy human queue");
-    const paths = store.paths;
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
-    const legacy = new Database(paths.database, { create: false, strict: true });
-    downgradeToExactProviderVersion39(legacy);
-    dropPeerAndHostedMemorySchema(legacy);
-    legacy.close(false);
-    expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:39:60");
-    const migrated = new StateStore(paths, { now: () => 9_000 });
-    stores.push(migrated);
-    expect(migrated.requireQueue(queue.id)).toMatchObject({
-      message: "[queue message removed after settlement]",
-      messageActor: "human",
-      state: "cancelled",
-    });
-    expect(migrated.requireQueue(queue.id)).not.toHaveProperty("peerActionId");
-    expect(migrated.requirePeerSessionPolicy(session.id)).toMatchObject({
-      mode: "coordinate",
-      revision: 1,
-    });
-    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    const paths = await canonical39RetiredArchive("mixed_history");
+    const source = canonical39RetiredFixtures.mixed_history.retained;
+    const migratedAt = 40_000;
+    const inspector = new Database(paths.database, { create: false, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
-      expect(inspector.query("SELECT applied_at FROM migrations WHERE version=40").get())
-        .toEqual({ applied_at: 9_000 });
-      expect(inspector.query(
-        "SELECT version,applied_at FROM migrations WHERE version>=41 ORDER BY version",
-      ).all()).toEqual([
-        { applied_at: 9_000, version: 41 },
-        { applied_at: 9_000, version: 42 },
-        { applied_at: 9_000, version: 43 },
-        { applied_at: 9_000, version: 44 },
-        { applied_at: 9_000, version: 45 },
-        { applied_at: 9_000, version: 46 }, { applied_at: 9_000, version: 47 }, { applied_at: 9_000, version: 48 }, { applied_at: 9_000, version: 49 },
-        ...Array.from({ length: 11 }, (_, index) => ({ version: index + 50, applied_at: 9_000 })),
+      const before = canonicalAuthBudgetSnapshot(inspector);
+      expect(before.version).toEqual({ user_version: 39 });
+      const ledger = inspector.query("SELECT * FROM migrations ORDER BY version").all();
+      const retained = canonicalAuthBudgetRows(inspector, [
+        "queue_entries", "session_runtime_profiles", "mutation_attempts",
+        "mutation_effect_evidence", "queue_effect_evidence", "session_events",
       ]);
+      expect(() => new StateStore(paths, { readonly: true }))
+        .toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:39:60");
+      expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(before);
+      const migrated = new StateStore(paths, { now: () => migratedAt });
+      stores.push(migrated);
+      // The real old writer retained pending input without sealed attachment
+      // identity. Migration quarantines it; it cannot invent cancellation.
+      expect(migrated.requireQueue(source.queue.id)).toMatchObject({
+        ...source.queue, messageActor: "human",
+      });
+      expect(migrated.requireQueue(source.queue.id)).not.toHaveProperty("peerActionId");
+      expect(migrated.hasUnsettledQueueAttachmentQuarantineForSession(source.session.id)).toBe(true);
+      expect(inspector.query("SELECT * FROM queue_attachment_identities").all()).toEqual([]);
+      expect(inspector.query("SELECT * FROM queue_attachment_identity_anchors").all()).toEqual([]);
+      expect(retained.read()).toEqual(retained.before);
+      for (const session of [source.session, source.codex, source.claude]) {
+        expect(migrated.requireSession(session.id)).toMatchObject({
+          provider: session.provider, preset: session.preset, fastEnabled: session.fastEnabled,
+        });
+        expect(migrated.requirePeerSessionPolicy(session.id)).toMatchObject({
+          mode: "coordinate", revision: 1,
+        });
+        expect(migrated.sessionAccountAuthorityMatches(session.id, source.profile.id)).toBe(false);
+      }
+      expect(migrated.latestSessionRuntimeProfile(source.session.id)).toEqual(source.runtime);
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
+      expect(inspector.query("SELECT * FROM migrations WHERE version<=39 ORDER BY version").all()).toEqual(ledger);
+      expect(inspector.query(
+        "SELECT version,applied_at FROM migrations WHERE version>=40 ORDER BY version",
+      ).all()).toEqual(Array.from({ length: 21 }, (_, index) => ({ version: index + 40, applied_at: migratedAt })));
+      expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      const joined = canonicalAuthBudgetSnapshot(inspector);
+      expect(() => migrated.transitionQueue(source.queue.id, "pending", "dispatching")).toThrow();
+      expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(joined);
+      migrated.close();
+      stores.splice(stores.indexOf(migrated), 1);
+      for (const readonly of [false, true]) {
+        const reopened = new StateStore(paths, { readonly, now: () => migratedAt + 1 });
+        try {
+          expect(reopened.requireQueue(source.queue.id)).toMatchObject(source.queue);
+          expect(reopened.latestSessionRuntimeProfile(source.session.id)).toEqual(source.runtime);
+          expect(canonicalAuthBudgetSnapshot(inspector)).toEqual(joined);
+        } finally { reopened.close(); }
+      }
     } finally {
       inspector.close(false);
     }

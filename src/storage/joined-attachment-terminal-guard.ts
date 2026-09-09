@@ -3,6 +3,7 @@ import type { Database } from "bun:sqlite";
 import { z } from "zod";
 
 import { normalizeSchemaSql } from "./schema-cohort";
+import { terminalAttachmentAcknowledgmentSql } from "./attachment-terminal-acknowledgments";
 
 const name = "attachment_terminal_projection_guard";
 const invalid = (): never => { throw new Error("ATTACHMENT_CUSTODY_TERMINAL_GUARD_INVALID"); };
@@ -90,4 +91,29 @@ export function installJoinedAttachmentTerminalGuard(database: Database, predece
   database.exec(`DROP TRIGGER ${name}`);
   database.exec(joined);
   assertJoinedAttachmentTerminalGuard(database, predecessor);
+}
+
+/** Explicit successor of joined_v1; the frozen historical guard is untouched. */
+export function acknowledgedAttachmentTerminalGuardSql(predecessor: string): string {
+  const prefix = "WHEN NEW.attachment_cleanup_terminal_digest IS NOT OLD.attachment_cleanup_terminal_digest AND NOT ";
+  let sql = replaceOnce(joinedAttachmentTerminalGuardSql(predecessor), prefix, `${prefix}(`);
+  sql = replaceOnce(sql, "\n    BEGIN SELECT RAISE(ABORT,'ATTACHMENT_CUSTODY_UNPROVED'); END;",
+    ` OR ${terminalAttachmentAcknowledgmentSql("NEW")})\n    BEGIN SELECT RAISE(ABORT,'ATTACHMENT_CUSTODY_UNPROVED'); END;`);
+  return sql;
+}
+export function assertAcknowledgedAttachmentTerminalGuard(database: Database, predecessor: string): void {
+  const row = observed(database)[0];
+  if (row === undefined || row.type !== "trigger"
+    || normalizeSchemaSql(row.sql) !== normalizeSchemaSql(acknowledgedAttachmentTerminalGuardSql(predecessor))) invalid();
+}
+export function installAcknowledgedAttachmentTerminalGuard(database: Database, predecessor: string): void {
+  if (!database.inTransaction) invalid();
+  const row = observed(database)[0];
+  if (row === undefined || row.type !== "trigger") return invalid();
+  const next = acknowledgedAttachmentTerminalGuardSql(predecessor);
+  if (normalizeSchemaSql(row.sql) === normalizeSchemaSql(next)) return assertAcknowledgedAttachmentTerminalGuard(database, predecessor);
+  if (normalizeSchemaSql(row.sql) !== normalizeSchemaSql(joinedAttachmentTerminalGuardSql(predecessor))) invalid();
+  database.exec(`DROP TRIGGER ${name}`);
+  database.exec(next);
+  assertAcknowledgedAttachmentTerminalGuard(database, predecessor);
 }

@@ -121,6 +121,88 @@ describe("terminal-only peer cancellation", () => {
     }
   });
 
+  test.each([
+    ["send", "effect_started"], ["send", "ambiguous"],
+    ["steer", "effect_started"], ["steer", "ambiguous"],
+  ] as const)("an outer %s %s with no nested effect cancels exactly after target revision advances", async (delivery, state) => {
+    const f = await fixture(delivery);
+    f.store.beginPeerSessionActionEffect(f.action.id);
+    if (state === "ambiguous") f.store.settlePeerSessionAction({
+      actionId: f.action.id, expectedState: "effect_started", state,
+    });
+    const target = f.store.updateSessionMetadata({ sessionId: f.target.session.id,
+      expectedRevision: f.target.session.revision, note: "Target revision advanced before inner dispatch" });
+    expect(target.revision).toBe(f.action.targetExpectedRevision + 1);
+    const cancelled = f.cancel();
+    expect(cancelled).toMatchObject({ state: "cancelled", resultDigest: hash(JSON.stringify(f.receipt())) });
+    expect(readPeerSessionCancellation(f.db, f.action.idempotencyKey)).toEqual(f.receipt());
+    expect(f.store.requireSession(target.id)).toEqual(target);
+    for (const table of ["mutation_effect_evidence", "mutation_resolutions", "mutation_provider_authorities",
+      "attachment_custody_sets", "attachment_custody_anchors", "session_send_owners", "session_events"]) {
+      expect(f.db.query(`SELECT * FROM ${quote(table)}`).all()).toEqual([]);
+    }
+    const before = f.snapshot();
+    expect(f.cancel()).toEqual(cancelled);
+    expect(f.snapshot()).toEqual(before);
+    for (const readonly of [false, true]) {
+      const reopened = new StateStore(f.paths, { readonly }); stores.push(reopened);
+      expect(reopened.readPeerSessionMutationJoin(f.action.idempotencyKey)?.attempt.kind).toBe(PEER_SESSION_CANCELLATION_KIND);
+      expect(f.snapshot()).toEqual(before);
+    }
+  });
+
+  test.each(["result_digest", "updated_at", "target_expected_revision"] as const)(
+    "the joined outer cancellation refuses mismatched %s and rolls back the inserted receipt", async (field) => {
+      const f = await fixture();
+      f.store.beginPeerSessionActionEffect(f.action.id);
+      f.store.settlePeerSessionAction({ actionId: f.action.id, expectedState: "effect_started", state: "ambiguous" });
+      const before = f.snapshot();
+      expect(() => f.db.transaction(() => {
+        insertPeerSessionCancellation(f.db, { attemptId: `attempt_${"d".repeat(32)}`,
+          receipt: f.receipt(), recordedAt: 20_000 });
+        f.db.query(`UPDATE peer_session_actions SET state='cancelled',result_digest=?,updated_at=?,target_expected_revision=? WHERE id=?`)
+          .run(field === "result_digest" ? hash("wrong result") : hash(JSON.stringify(f.receipt())),
+            field === "updated_at" ? 19_999 : 20_000,
+            f.action.targetExpectedRevision + (field === "target_expected_revision" ? 1 : 0), f.action.id);
+      }).immediate()).toThrow("illegal peer session action transition");
+      expect(f.snapshot()).toEqual(before);
+      expect(f.store.readMutation(f.action.idempotencyKey)).toBeNull();
+    },
+  );
+
+  test("a different nested mutation kind cannot borrow the peer key or authorize cancellation", async () => {
+    const f = await fixture();
+    f.store.beginPeerSessionActionEffect(f.action.id);
+    const before = f.snapshot();
+    expect(() => f.store.prepareMutation({ kind: "session.stop", authorityId: f.target.session.id,
+      authorityGeneration: f.target.authority.processGeneration,
+      request: { activeTurnId: "other-turn" }, idempotencyKey: f.action.idempotencyKey }))
+      .toThrow("PEER_SESSION_MUTATION_JOIN_INVALID");
+    expect(f.snapshot()).toEqual(before);
+    expect(f.store.readMutation(f.action.idempotencyKey)).toBeNull();
+  });
+
+  test("an actual nested steer effect stays recoverable and cannot become a no-effect cancellation", async () => {
+    const f = await fixture("steer");
+    const prepared = f.store.prepareSessionInputMutation({ kind: "session.steer", sessionId: f.target.session.id,
+      idempotencyKey: f.action.idempotencyKey, message: f.message, attachments: [],
+      providerAuthority: f.target.authority, daemonGeneration: f.daemonGeneration, bootId: f.bootId });
+    f.store.beginSessionMutationEffect({ attemptId: prepared.attempt.id, sessionId: f.target.session.id,
+      profileGeneration: f.target.authority.processGeneration, providerAuthority: f.target.authority,
+      daemonGeneration: f.daemonGeneration, bootId: f.bootId, attachments: [], message: f.message,
+      transcript: { accountId: f.target.profile.id, providerGeneration: f.target.authority.processGeneration,
+        providerConnectionId: "10000000-0000-4000-8000-000000000099", actor: "peer_session", message: f.message },
+      evidence: { kind: "session.steer", providerThreadId: "thread-target", activeTurnId: "turn-target",
+        baseline: { providerUpdatedAt: null, status: "active", activeTurnId: "turn-target" },
+        clientMessageId: prepared.attempt.id, messageDigest: hash(f.message), messageActor: "peer_session" },
+    });
+    f.store.settlePeerSessionAction({ actionId: f.action.id, expectedState: "effect_started", state: "ambiguous" });
+    const before = f.snapshot();
+    expect(f.cancel).toThrow("PEER_SESSION_CANCELLATION_UNPROVEN");
+    expect(f.snapshot()).toEqual(before);
+    expect(f.store.readMutation(f.action.idempotencyKey)).toMatchObject({ state: "effect_started", kind: "session.steer" });
+  });
+
   test("the terminal row cannot acquire an effect, be rewritten, or be used by generic preparation", async () => {
     const f = await fixture(); f.cancel();
     const attempt = f.store.readMutation(f.action.idempotencyKey);
@@ -169,6 +251,8 @@ describe("terminal-only peer cancellation", () => {
   test.each(["peerActionId", "actorSessionId", "actorTurnDigest", "projectId", "targetSessionId", "targetExpectedRevision", "delivery", "requestDigest", "messageDigest", "reasonDigest"] as const)(
     "SQL cancellation admission refuses an altered %s without writes", async (field) => {
       const f = await fixture();
+      f.store.beginPeerSessionActionEffect(f.action.id);
+      f.store.settlePeerSessionAction({ actionId: f.action.id, expectedState: "effect_started", state: "ambiguous" });
       const original = f.receipt();
       const value = original[field];
       const changed = field === "delivery" ? "steer" : typeof value === "number" ? value + 1
@@ -185,6 +269,8 @@ describe("terminal-only peer cancellation", () => {
 
   test("a retained ingress reservation prevents a false absent-input cancellation", async () => {
     const f = await fixture();
+    f.store.beginPeerSessionActionEffect(f.action.id);
+    f.store.settlePeerSessionAction({ actionId: f.action.id, expectedState: "effect_started", state: "ambiguous" });
     const reservation = f.store.reserveAttachmentIngress({ kind: "session.send", sessionId: f.target.session.id,
       idempotencyKey: f.action.idempotencyKey, message: f.message, providerAuthority: f.target.authority,
       daemonGeneration: f.daemonGeneration, bootId: f.bootId,

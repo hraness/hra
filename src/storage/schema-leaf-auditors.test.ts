@@ -14,6 +14,10 @@ import { StateStore } from "./state-store";
 
 let database: Database;
 let home: string;
+// This suite creates a current database; historical component tests select
+// their frozen predecessor guard explicitly in their own fixtures.
+const assertCurrentAttachmentCustodySchema = (db: Database): void =>
+  assertAttachmentCustodySchema(db, "joined", "acknowledged_v1");
 beforeAll(async () => {
   home = await realpath(await mkdtemp(join(tmpdir(), "hra-leaf-ddl-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
@@ -68,7 +72,7 @@ function assertLiteralTamperingRefused(input: {
 
 test("all four leaf auditors accept authentic current SQLite ALTER formatting", () => {
   for (const audit of [assertQueueAttachmentSchema, assertSessionSendOwnerSchema,
-    assertAutomaticPointerMoveSchema, assertAttachmentCustodySchema]) {
+    assertAutomaticPointerMoveSchema, assertCurrentAttachmentCustodySchema]) {
     expect(() => audit(database)).not.toThrow();
   }
 });
@@ -79,9 +83,9 @@ test.each([
   { name: "mutation_attempts", original: "'original_send_v1'", replacement: "'original_ send_v1'",
     audit: assertSessionSendOwnerSchema, error: "SESSION_SEND_OWNER_CORRUPT" },
   { name: "mutation_attempts", original: "'empty_v1'", replacement: "'empty_ v1'",
-    audit: assertAttachmentCustodySchema, error: "ATTACHMENT_CUSTODY_CORRUPT" },
+    audit: assertCurrentAttachmentCustodySchema, error: "ATTACHMENT_CUSTODY_CORRUPT" },
   { name: "attachment_custody_members", original: "'text/plain'", replacement: "'text/ plain'",
-    audit: assertAttachmentCustodySchema, error: "ATTACHMENT_CUSTODY_CORRUPT" },
+    audit: assertCurrentAttachmentCustodySchema, error: "ATTACHMENT_CUSTODY_CORRUPT" },
 ])("leaf auditor preserves semantic literal whitespace: $name / $original", (input) => {
   expect(database.query(`SELECT ?1=${input.original} AS original, ?1=${input.replacement} AS changed`)
     .get(input.replacement.slice(1, -1))).toEqual({ original: 0, changed: 1 });
@@ -102,7 +106,7 @@ test.each([
     error: "QUEUE_ATTACHMENT_IDENTITY_CORRUPT" },
   { name: "session_send_owner_insert_guard", audit: assertSessionSendOwnerSchema,
     error: "SESSION_SEND_OWNER_CORRUPT" },
-  { name: "attachment_empty_anchor_guard", audit: assertAttachmentCustodySchema,
+  { name: "attachment_empty_anchor_guard", audit: assertCurrentAttachmentCustodySchema,
     error: "ATTACHMENT_CUSTODY_CORRUPT" },
 ])("leaf auditor preserves IF NOT EXISTS within a JSON path: $name", (input) => {
   const row = database.query("SELECT sql FROM sqlite_master WHERE name=?").get(input.name) as { sql: string };

@@ -1,0 +1,323 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { existsSync, lstatSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdir } from "node:fs/promises";
+import { join, relative } from "node:path";
+import { gzipSync } from "node:zlib";
+import { Database } from "bun:sqlite";
+
+// PREPARATION ONLY: the integration owner must review the complete recipe and
+// exact archived API contracts, stage the pinned tree/dependencies, then run it
+// through the host scheduler. Never overwrite or resume an earlier capture.
+// All database row/schema writes use archived public StateStore APIs. Synthetic
+// provider results are explicitly component fixtures, not observed native work.
+// There are no provider processes, native calls, network requests, credentials,
+// current StateStore imports, raw SQL mutation, or facts-memory operations.
+const root = import.meta.dir;
+const output = join(root, "capture");
+const sourceRoot = join(root, "canonical39");
+const hash = (value: string | Uint8Array) => createHash("sha256").update(value).digest("hex");
+assert.equal(Bun.version, "1.3.14");
+assert.equal(lstatSync(root).mode & 0o777, 0o700);
+assert.equal(existsSync(output), false, "Never overwrite or resume an existing capture.");
+
+const definition = {
+  sourceCommit: "5f2735191640037c86d9949bc1d7f04b2ef09ffe",
+  sourceTree: "12b4cec2c26b328e41d763ecca41c9a844d3dec3",
+  sourceManifestSha256: "b4a34de0517950f4dc6bb2288c3f5ca79274551095a1aa63436c1099181e71fc",
+  sourceFileCount: 282,
+  sourceHashes: {
+    "src/storage/state-store.ts": "bde901608092489d89aa9acdfde320a0cf2959a6bd3659879cf7ac9dfab43e89",
+    "src/domain/runtime-profile.ts": "49305314d5619f828b685a8e45d5bd055719c7661e77db8ea9e44924de4f85b2",
+    "src/domain/transcript.ts": "10ec6d15209eae962c9c7d2abba595fe8f6691a0a54555d49c3a800a126c2da8",
+    "src/domain/presets.ts": "cde66c4106ee7f2961b8c959327cc277e056b761cf282d53738792d9d99e66de",
+    "package.json": "ef8779bd5fa796f395ad3d064710e247a89eb0cbd4023dc069b4daaad8e12d3c",
+    "bun.lock": "5a2b90063d8eb1aa55e18be71abbca59c1f051a9358a2a36ff89698d066b182a",
+  },
+  dependencies: { "@agentclientprotocol/sdk": "1.4.0", "@hraness/oh": "0.2.7",
+    "@openai/codex": "0.153.2", convex: "1.45.0", zod: "4.4.3" },
+} as const;
+
+const readBounded = (path: string, maximumBytes = 8 * 1024 * 1024) => {
+  const stat = lstatSync(path);
+  assert.equal(stat.isFile(), true);
+  assert.ok(stat.size <= maximumBytes);
+  return readFileSync(path);
+};
+const verifySource = () => {
+  assert.equal(lstatSync(sourceRoot).isDirectory(), true);
+  for (const [path, expected] of Object.entries(definition.sourceHashes)) {
+    assert.equal(hash(readBounded(join(sourceRoot, path))), expected, path);
+  }
+  const sourceFiles: { path: string; sha256: string }[] = [];
+  const visit = (directory: string) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      assert.match(entry.name, /^[A-Za-z0-9_.-]+$/);
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) visit(path);
+      else if (entry.isFile()) sourceFiles.push({ path: relative(sourceRoot, path), sha256: hash(readBounded(path)) });
+      else throw new Error("Unexpected archived source entry.");
+    }
+  };
+  assert.equal(lstatSync(join(sourceRoot, "src")).isDirectory(), true);
+  visit(join(sourceRoot, "src"));
+  sourceFiles.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+  assert.equal(sourceFiles.length, definition.sourceFileCount);
+  assert.equal(hash(JSON.stringify(sourceFiles)), definition.sourceManifestSha256);
+  const manifest = JSON.parse(readBounded(join(sourceRoot, "package.json")).toString("utf8"));
+  assert.deepEqual(manifest.dependencies, definition.dependencies);
+  for (const [name, expected] of Object.entries(definition.dependencies)) {
+    const installed = JSON.parse(readBounded(join(sourceRoot, "node_modules", name, "package.json")).toString("utf8"));
+    assert.equal(installed.version, expected);
+  }
+  return sourceFiles;
+};
+
+const snapshot = (path: string) => {
+  const database = new Database(path, { create: false, strict: true });
+  database.exec("PRAGMA query_only=ON");
+  try {
+    return database.transaction(() => {
+      const schema = database.query("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name LIMIT 2049").all();
+      assert.ok(schema.length <= 2048);
+      const tables = database.query("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name LIMIT 257").all() as { name: string }[];
+      assert.ok(tables.length <= 256);
+      const rows: Record<string, unknown[]> = {};
+      for (const { name } of tables) {
+        assert.match(name, /^[A-Za-z0-9_]+$/);
+        rows[name] = database.query(`SELECT * FROM "${name}" LIMIT 4097`).all().sort((a, b) => {
+          const left = JSON.stringify(a), right = JSON.stringify(b);
+          return left < right ? -1 : left > right ? 1 : 0;
+        });
+        assert.ok(rows[name].length <= 4096);
+      }
+      const result = { userVersion: database.query("PRAGMA user_version").get(), schema, rows,
+        foreignKeyCheck: database.query("PRAGMA foreign_key_check").all(),
+        inspectionChanges: database.query("SELECT total_changes() AS count").get() };
+      assert.deepEqual(result.foreignKeyCheck, []);
+      assert.deepEqual(result.inspectionChanges, { count: 0 });
+      assert.ok(Buffer.byteLength(JSON.stringify(result)) < 8 * 1024 * 1024);
+      return result;
+    }).deferred();
+  } finally { database.close(false); }
+};
+
+const scenarios = [
+  { name: "codex-distinct-target", sourceProvider: "codex", targetPreset: "low", alias: false, seeded: false, bound: false },
+  { name: "codex-aliased-target", sourceProvider: "codex", targetPreset: "low", alias: true, seeded: false, bound: false },
+  { name: "claude-seeded-target", sourceProvider: "claude", targetPreset: "ultra", alias: false, seeded: true, bound: false },
+  { name: "claude-bound-target", sourceProvider: "claude", targetPreset: "ultra", alias: false, seeded: true, bound: true },
+] as const;
+const sourceFiles = verifySource();
+const { StateStore } = await import("./canonical39/src/storage/state-store");
+const { initializeStatePaths, resolveStatePaths } = await import("./canonical39/src/storage/paths");
+const { effectiveRuntimeProfileSchema } = await import("./canonical39/src/domain/runtime-profile");
+const { buildSessionTranscript, renderTranscriptSeed, digestTranscriptSeed, TRANSCRIPT_SEED_HEADER } =
+  await import("./canonical39/src/domain/transcript");
+const { currentPresetContract, presetRequirementForContract } = await import("./canonical39/src/domain/presets");
+assert.equal(currentPresetContract, 2);
+assert.equal(TRANSCRIPT_SEED_HEADER, "[HRA provider handoff]");
+await mkdir(output, { mode: 0o700 });
+const generatorSource = readBounded(import.meta.path).toString("utf8");
+const summaries = [];
+
+for (const [index, scenario] of scenarios.entries()) {
+  verifySource();
+  const directory = join(output, scenario.name);
+  await mkdir(directory, { mode: 0o700 });
+  assert.equal(lstatSync(directory).mode & 0o777, 0o700);
+  const paths = resolveStatePaths({ rootDirectory: join(directory, "state") });
+  await initializeStatePaths(paths);
+  assert.equal(existsSync(paths.database), false);
+  const clock = { now: 39000 + index * 100 };
+  const store = new StateStore(paths, { now: () => clock.now });
+  assert.deepEqual(snapshot(paths.database).userVersion, { user_version: 39 });
+  const bootId = `boot_${"3".repeat(32)}`;
+  const daemonGeneration = store.nextDaemonGeneration(bootId);
+  assert.equal(daemonGeneration, 1);
+  let sourceProfile = store.createProfile(`Canonical39 synthetic ${scenario.name} source`);
+  assert.equal(store.allocateNextUsageRevision(sourceProfile.id), 1);
+  assert.equal(store.nextProfileGeneration(sourceProfile.id).processGeneration, 1);
+  // Claude has no Codex authentication claim. Its source binding below is an
+  // archived control-plane fixture, not proof that a native process existed.
+  if (scenario.sourceProvider === "codex") {
+    assert.equal(store.setProfileState(sourceProfile.id, 1, "signed_in", {
+      email: "canonical39-source@example.com", plan: "Plus" }), true);
+  }
+  sourceProfile = store.requireProfile(sourceProfile.id);
+  let targetProfile = store.requireProfile(sourceProfile.id);
+  if (scenario.sourceProvider === "claude") {
+    targetProfile = store.createProfile(`Canonical39 synthetic ${scenario.name} target`);
+    assert.equal(store.allocateNextUsageRevision(targetProfile.id), 1);
+    assert.equal(store.nextProfileGeneration(targetProfile.id).processGeneration, 1);
+    assert.equal(store.setProfileState(targetProfile.id, 1, "signed_in", {
+      email: "canonical39-target@example.com", plan: "Plus" }), true);
+    targetProfile = store.requireProfile(targetProfile.id);
+  }
+  const sourcePreset = scenario.sourceProvider === "codex" ? "ultra" : "fable-max";
+  const sourceThreadId = scenario.sourceProvider === "codex" ? "codex-thread-1" : "claude-thread-1";
+  const targetThreadId = scenario.alias ? sourceThreadId : scenario.sourceProvider === "codex" ? "codex-thread-2" : "codex-thread-1";
+  const starting = store.createSession({ profileId: sourceProfile.id, provider: scenario.sourceProvider,
+    preset: sourcePreset, fastEnabled: false, title: `Canonical39 ${scenario.name}` });
+  const sourceSession = store.bindSession({ sessionId: starting.id, expectedRevision: starting.revision,
+    providerThreadId: sourceThreadId, state: "idle" });
+  assert.deepEqual(store.requireSessionPresetRequirement(sourceSession.id), {
+    preset: sourcePreset, requirement: presetRequirementForContract(sourcePreset, currentPresetContract) });
+  const transcript = buildSessionTranscript({ sessionId: sourceSession.id, events: [] });
+  assert.deepEqual(transcript.records, []);
+  const seed = renderTranscriptSeed({ transcript, fromProvider: scenario.sourceProvider, toProvider: "codex" });
+  assert.ok(seed.text.startsWith(TRANSCRIPT_SEED_HEADER));
+  assert.ok(seed.text.length > 0);
+  assert.equal(seed.includedRecords, 0);
+  assert.equal(seed.omittedRecords, 0);
+  assert.equal(seed.digest, digestTranscriptSeed(seed.text));
+  const requirement = presetRequirementForContract(scenario.targetPreset, currentPresetContract);
+  assert.deepEqual(requirement, scenario.targetPreset === "low"
+    ? { model: "gpt-5.6-luna", effort: "max" }
+    : { model: "gpt-6-astra", effort: "ultra" });
+  const runtimeProfile = effectiveRuntimeProfileSchema.parse({
+    profileId: targetProfile.id, processGeneration: 1, observedAt: clock.now,
+    preset: scenario.targetPreset, model: requirement.model, reasoningEffort: requirement.effort,
+    serviceTier: null, fast: false, approvalPolicy: "on-request", reviewMode: "auto_review",
+    permissionProfile: ":workspace", computerUse: true, pluginCapability: true, enabledApps: [],
+  });
+  const idempotencyKey = `39000000-0000-4000-8000-00000000000${index + 1}`;
+  const request = { provider: "codex", preset: scenario.targetPreset, targetProfileId: targetProfile.id, seedDigest: seed.digest };
+  const prepared = store.prepareMutation({ kind: "session.switch", authorityId: sourceSession.id,
+    authorityGeneration: 1, request, idempotencyKey });
+  assert.equal(prepared.replay, false);
+  const effect = store.beginSessionProviderSwitchEffect({ attemptId: prepared.id, sessionId: sourceSession.id,
+    evidence: { kind: "session.switch", daemonGeneration,
+      requestedAccountId: scenario.sourceProvider === "claude" ? targetProfile.id : null,
+      requestedPreset: scenario.sourceProvider === "codex" ? scenario.targetPreset : null,
+      sourceProfileId: sourceProfile.id, sourceProcessGeneration: 1, sourceProvider: scenario.sourceProvider,
+      sourceProviderThreadId: sourceThreadId, sourcePreset,
+      targetProfileId: targetProfile.id, targetProcessGeneration: 1, targetProvider: "codex",
+      targetPreset: scenario.targetPreset, transcriptDigest: transcript.digest, seedDigest: seed.digest,
+      seedIncludedRecords: seed.includedRecords, seedOmittedRecords: seed.omittedRecords, runtimeProfile } });
+  assert.equal(Object.hasOwn(effect.evidence, "targetProviderAccountKey"), false);
+  assert.equal(effect.digest, hash(JSON.stringify(effect.evidence)));
+  clock.now += 1;
+  // This exact old API has no source-alias predicate. The alias image records
+  // what the old API admitted; the joined reader is allowed to refuse it.
+  store.recordSessionProviderSwitchTarget({ attemptId: prepared.id, sessionId: sourceSession.id, providerThreadId: targetThreadId });
+  if (scenario.seeded) {
+    clock.now += 1;
+    store.recordSessionProviderSwitchSeedIntent({ attemptId: prepared.id, sessionId: sourceSession.id,
+      providerThreadId: targetThreadId, seedText: seed.text, runtimeProfile });
+    clock.now += 1;
+    store.recordSessionProviderSwitchSeedResult({ attemptId: prepared.id, sessionId: sourceSession.id,
+      providerThreadId: targetThreadId, runtimeProfile, turnId: "codex-turn-1", turnStatus: "completed" });
+  }
+  if (scenario.bound) {
+    clock.now += 1;
+    store.recordSessionProviderSwitchSourceReleased({ attemptId: prepared.id, sessionId: sourceSession.id });
+    clock.now += 1;
+    const current = store.requireSession(sourceSession.id);
+    store.bindSessionProviderSwitchRecoveryTarget({ attemptId: prepared.id, sessionId: sourceSession.id,
+      expectedSessionRevision: current.revision, title: "Canonical39 retained target" });
+  }
+  clock.now += 1;
+  // Match the archived service's closed unknown-effect diagnostic only; there
+  // is no terminal switch receipt or source/target cleanup beyond the explicit
+  // synthetic source-release API in the bound scenario.
+  assert.equal(store.transitionMutation(prepared.id, "effect_started", "ambiguous", {
+    code: "IndeterminateLocalCommitError" }), true);
+  if (!scenario.bound) store.quarantineSession(sourceSession.id);
+  const session = store.requireSession(sourceSession.id);
+  const mutation = store.readMutation(idempotencyKey);
+  const progress = store.readSessionProviderSwitchProgress(prepared.id);
+  assert.equal(session.state, "recovery_required");
+  assert.equal(session.profileId, scenario.bound ? targetProfile.id : sourceProfile.id);
+  assert.equal(session.provider, scenario.bound ? "codex" : scenario.sourceProvider);
+  assert.equal(session.providerThreadId, scenario.bound ? targetThreadId : sourceThreadId);
+  assert.equal(mutation.state, "ambiguous");
+  assert.equal(mutation.resolution, undefined);
+  assert.deepEqual(mutation.evidence, effect);
+  assert.equal(progress.targetProviderThreadId, targetThreadId);
+  assert.equal(progress.sourceReleased, scenario.bound);
+  assert.equal(progress.targetReleased, false);
+  assert.equal(progress.seedTurnId, scenario.seeded ? "codex-turn-1" : undefined);
+  if (scenario.seeded) {
+    assert.equal(progress.seed.text, seed.text);
+    assert.equal(progress.seed.clientMessageId, prepared.id);
+    assert.deepEqual(progress.seed.runtimeProfile, runtimeProfile);
+  } else assert.equal(progress.seed, undefined);
+
+  const finalSnapshot = snapshot(paths.database);
+  assert.deepEqual(finalSnapshot.userVersion, { user_version: 39 });
+  assert.deepEqual(finalSnapshot.rows.migrations.map((row) => (row as { version: number }).version).sort((a, b) => a - b),
+    Array.from({ length: 39 }, (_, index) => index + 1));
+  assert.equal(finalSnapshot.rows.profiles.length, scenario.sourceProvider === "claude" ? 2 : 1);
+  assert.equal(finalSnapshot.rows.projects.length, 0);
+  assert.equal(finalSnapshot.rows.sessions.length, 1);
+  assert.equal((finalSnapshot.rows.sessions[0] as { preset_contract: number }).preset_contract, 2);
+  assert.equal(finalSnapshot.rows.mutation_attempts.length, 1);
+  assert.equal(finalSnapshot.rows.mutation_effect_evidence.length, 1);
+  assert.equal(finalSnapshot.rows.session_provider_switch_targets.length, 1);
+  assert.equal(finalSnapshot.rows.session_provider_switch_seed_intents.length, scenario.seeded ? 1 : 0);
+  assert.equal(finalSnapshot.rows.session_provider_switch_seed_results.length, scenario.seeded ? 1 : 0);
+  assert.equal(finalSnapshot.rows.session_provider_switch_source_releases.length, scenario.bound ? 1 : 0);
+  assert.equal(finalSnapshot.rows.session_runtime_profiles.length, scenario.bound ? 1 : 0);
+  for (const table of ["mutation_resolutions", "provider_login_authorities", "session_mutation_authority_rebinds",
+    "session_mutation_authority_rebinds_v39", "session_turn_runtime_profiles", "session_events", "turn_summaries",
+    "queue_entries", "queue_effect_evidence",
+    "session_provider_switch_target_releases"]) assert.deepEqual(finalSnapshot.rows[table], []);
+  assert.equal(Object.hasOwn(finalSnapshot.rows, "account_mutation_authority_rebinds"), false);
+  assert.equal(Object.hasOwn(finalSnapshot.rows, "session_claude_process_authorities"), false);
+  assert.equal(Object.hasOwn(finalSnapshot.rows, "session_claude_process_launch_intents"), false);
+  const rawEffect = finalSnapshot.rows.mutation_effect_evidence[0] as { evidence_json: string; evidence_digest: string };
+  assert.equal(rawEffect.evidence_json, JSON.stringify(effect.evidence));
+  assert.equal(rawEffect.evidence_digest, hash(rawEffect.evidence_json));
+  assert.equal(rawEffect.evidence_json.includes("targetProviderAccountKey"), false);
+  if (scenario.bound) {
+    const runtime = finalSnapshot.rows.session_runtime_profiles[0] as { source_kind: string; source_id: string; profile_json: string };
+    assert.equal(runtime.source_kind, "session_start");
+    assert.equal(runtime.source_id, prepared.id);
+    assert.equal(runtime.profile_json, JSON.stringify(runtimeProfile));
+  }
+  store.close();
+  const reopened = new StateStore(paths, { now: () => clock.now });
+  assert.deepEqual(reopened.readMutation(idempotencyKey), mutation);
+  assert.deepEqual(reopened.readSessionProviderSwitchProgress(prepared.id), progress);
+  assert.deepEqual(reopened.requireSession(sourceSession.id), session);
+  assert.deepEqual(snapshot(paths.database), finalSnapshot);
+  reopened.close();
+  const checkpoint = new Database(paths.database, { create: false, strict: true });
+  const checkpointResult = checkpoint.query("PRAGMA wal_checkpoint(TRUNCATE)").get() as { busy: number };
+  checkpoint.close(false);
+  assert.equal(checkpointResult.busy, 0);
+  const beforeReadonly = hash(readBounded(paths.database));
+  const readonly = new StateStore(paths, { readonly: true });
+  assert.deepEqual(readonly.readMutation(idempotencyKey), mutation);
+  assert.deepEqual(readonly.readSessionProviderSwitchProgress(prepared.id), progress);
+  assert.deepEqual(snapshot(paths.database), finalSnapshot);
+  readonly.close();
+  const bytes = readBounded(paths.database, 4 * 1024 * 1024);
+  assert.equal(hash(bytes), beforeReadonly);
+  const metadata = { ...definition, schemaVersion: 39, scenario, generatorSha256: hash(generatorSource),
+    bunVersion: Bun.version, sourceManifestOrdering: "ASCII relative paths", fixedTime: clock.now,
+    provenance: { syntheticControlPlaneOnly: true, archivedPublicApisOnly: true, nativeProviderEffects: 0,
+      networkEffects: 0, rawSqlRowOrSchemaWrites: false, randomizedIdentifiers: true,
+      reservedUsageRevisionForEveryNewProfile: true, writableReopenUnchanged: true, readonlyReopenUnchanged: true,
+      readonlyDatabaseHashUnchanged: true, providerRuntimeObservationClaim: false, currentMergedAdmissionClaim: false,
+      sourceTranscriptEmpty: true, syntheticSeedResult: scenario.seeded, syntheticSourceRelease: scenario.bound,
+      nativeProcessCustody: false, factsMemoryAuthority: false, aliasAcceptedByArchivedTargetApi: scenario.alias },
+    databaseSha256: hash(bytes), databaseBytes: bytes.length, checkpointResult,
+    retained: { sourceProfile, targetProfile, sourceSession,
+      session, mutation, progress, effect, request, runtimeProfile, transcript, seed, bootId, daemonGeneration, idempotencyKey },
+    snapshot: finalSnapshot };
+  const text = JSON.stringify(metadata);
+  assert.ok(Buffer.byteLength(text) < 8 * 1024 * 1024);
+  for (const forbidden of [root, "/Users/", "/private/", "/tmp/", "/home/", "/Volumes/"]) {
+    assert.equal(text.includes(forbidden), false);
+    assert.equal(bytes.includes(Buffer.from(forbidden)), false);
+  }
+  writeFileSync(join(directory, "state.sqlite.gz"), gzipSync(bytes), { mode: 0o600, flag: "wx" });
+  writeFileSync(join(directory, "fixture.json"), JSON.stringify(metadata, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+  writeFileSync(join(directory, "source-manifest.json"), JSON.stringify(sourceFiles, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+  verifySource();
+  summaries.push({ scenario: scenario.name, sourceCommit: definition.sourceCommit, databaseSha256: hash(bytes),
+    databaseBytes: bytes.length, archivedReopensUnchanged: true });
+}
+console.log(JSON.stringify({ generatorSha256: hash(generatorSource), summaries, earlierCapturesOpened: false }));

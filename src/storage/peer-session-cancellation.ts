@@ -134,9 +134,35 @@ export function joinedPeerSessionSourceDeleteGuardSql(predecessor: string): stri
   return predecessor.replace(marker, ` AND NOT ${peerSessionCancellationSourceDeleteSql("OLD")}${marker}`);
 }
 
+// Replace only the old no-effect terminal-mutation check. The surrounding
+// frozen transition still owns identity, state, target-turn and result CAS.
+const terminalMutationClause = `      AND EXISTS (
+        SELECT 1 FROM mutation_attempts mutation
+        WHERE mutation.idempotency_key=OLD.idempotency_key
+          AND mutation.authority_id=OLD.target_session_id
+          AND mutation.kind=('session.' || OLD.delivery)
+          AND mutation.state='cancelled'
+      )`;
+
+export function joinedPeerSessionActionTransitionGuardSql(predecessor: string): string {
+  if (predecessor.split(terminalMutationClause).length !== 2) return fail();
+  const terminalCancellation = `EXISTS(
+        SELECT 1 FROM mutation_attempts cancellation WHERE ${validRow("cancellation")}
+          AND ${matches("cancellation.result_json", "OLD", "action")}
+          AND ${absent("cancellation")}
+          AND NEW.result_digest=cancellation.request_digest
+          AND NEW.updated_at>=cancellation.created_at
+          AND EXISTS(SELECT 1 FROM peer_session_direct_message_sources source
+            WHERE ${matches("cancellation.result_json", "source", "source")}))`;
+  return predecessor.replace(terminalMutationClause,
+    `      AND (${terminalMutationClause.slice("      AND ".length)} OR ${terminalCancellation})`);
+}
+
 const sourceGuardName = "peer_session_direct_message_source_delete_guard";
-const schemaObjects = (predecessor: string) => [...guards, { name: sourceGuardName,
-  table: "peer_session_direct_message_sources", sql: joinedPeerSessionSourceDeleteGuardSql(predecessor) }];
+const transitionGuardName = "peer_session_action_transition_guard";
+const schemaObjects = (predecessor: string, transitionPredecessor: string) => [...guards,
+  { name: sourceGuardName, table: "peer_session_direct_message_sources", sql: joinedPeerSessionSourceDeleteGuardSql(predecessor) },
+  { name: transitionGuardName, table: "peer_session_actions", sql: joinedPeerSessionActionTransitionGuardSql(transitionPredecessor) }];
 const observed = (db: Database, name: string) => {
   const count = z.object({ n: z.number().int().min(0).max(1) }).strict().safeParse(db.query(`
     SELECT count(*) AS n FROM (SELECT 1 FROM sqlite_master WHERE name=? COLLATE NOCASE
@@ -152,28 +178,29 @@ const observed = (db: Database, name: string) => {
     FROM sqlite_temp_master WHERE name=? COLLATE NOCASE LIMIT 2`).all(name, name));
 };
 
-export function assertPeerSessionCancellationSchema(db: Database, predecessor: string): void {
-  for (const object of schemaObjects(predecessor)) {
+export function assertPeerSessionCancellationSchema(db: Database, predecessor: string, transitionPredecessor: string): void {
+  for (const object of schemaObjects(predecessor, transitionPredecessor)) {
     const rows = observed(db, object.name);
     if (rows.length !== 1 || rows[0]?.tbl_name !== object.table
       || normalizeSchemaSql(rows[0].sql) !== normalizeSchemaSql(object.sql)) fail();
   }
 }
 
-export function applyPeerSessionCancellationSchema(db: Database, predecessor: string): void {
+export function applyPeerSessionCancellationSchema(db: Database, predecessor: string, transitionPredecessor: string): void {
   if (!db.inTransaction) fail();
-  for (const object of schemaObjects(predecessor)) {
+  for (const object of schemaObjects(predecessor, transitionPredecessor)) {
     const rows = observed(db, object.name);
     if (rows.length === 1 && rows[0]?.tbl_name === object.table
       && normalizeSchemaSql(rows[0].sql) === normalizeSchemaSql(object.sql)) continue;
-    if (object.name === sourceGuardName) {
+    if (object.name === sourceGuardName || object.name === transitionGuardName) {
+      const original = object.name === sourceGuardName ? predecessor : transitionPredecessor;
       if (rows.length !== 1 || rows[0]?.tbl_name !== object.table
-        || normalizeSchemaSql(rows[0].sql) !== normalizeSchemaSql(predecessor)) fail();
-      db.exec(`DROP TRIGGER ${sourceGuardName}`);
+        || normalizeSchemaSql(rows[0].sql) !== normalizeSchemaSql(original)) fail();
+      db.exec(`DROP TRIGGER ${object.name}`);
     } else if (rows.length !== 0) fail();
     db.exec(object.sql);
   }
-  assertPeerSessionCancellationSchema(db, predecessor);
+  assertPeerSessionCancellationSchema(db, predecessor, transitionPredecessor);
 }
 
 export function insertPeerSessionCancellation(db: Database, input: Readonly<{

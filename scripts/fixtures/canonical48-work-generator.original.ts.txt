@@ -1,0 +1,252 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { existsSync, lstatSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdir } from "node:fs/promises";
+import { join, relative } from "node:path";
+import { gzipSync } from "node:zlib";
+import { Database } from "bun:sqlite";
+
+// PREPARATION ONLY: the integration owner must review the complete recipe and
+// exact archived API contracts, stage the pinned tree/dependencies, then run it
+// through the host scheduler. Never overwrite or resume an earlier capture.
+// All database row/schema writes use archived public StateStore APIs. Synthetic
+// provider results are explicitly component fixtures, not observed native work.
+// There are no provider processes, native calls, network requests, credentials,
+// current StateStore imports, raw SQL mutation, or facts-memory operations.
+const root = import.meta.dir;
+const output = join(root, "capture");
+const sourceRoot = join(root, "canonical48");
+const hash = (value: string | Uint8Array) => createHash("sha256").update(value).digest("hex");
+assert.equal(Bun.version, "1.3.14");
+assert.equal(lstatSync(root).mode & 0o777, 0o700);
+assert.equal(existsSync(output), false, "Never overwrite or resume an existing capture.");
+
+const definition = {
+  sourceCommit: "5838ec446d5cfbf6d0edeaae9a67bcc9e95c82e4",
+  sourceTree: "2f757ef8d954d5837286c2344fcef7e1e9a1d464",
+  sourceManifestSha256: "f89d979edea07450cd529a9946a3a5529d20ea9fd7a7e2dc6e5cb442c8c73dbc",
+  sourceFileCount: 315,
+  sourceHashes: {
+    "src/storage/state-store.ts": "ac6fc2f478e816a9b7f88cdc2a9cf8d6eb4f22b6b2bbaac7dde6927cc8cbec30",
+    "src/storage/work-store.ts": "24df6490a4c7cfcaa896ef326ce5745a97241dd419de1131f68b74be6e2f3ee8",
+    "src/domain/work.ts": "bd3c1f4dd766dbdc38292bd2dca9bf8292a8ba6ef34c2cd56969aa120efca709",
+    "package.json": "1ab5a6e4f2ca9839a5971bf5e3bf462343667a05891780bee48428ab7fbd3708",
+    "bun.lock": "0a108a3ba2a4b705a96564548592108c9169697ed1f10186c9dfb7f6e3a229ad",
+  },
+  dependencies: { "@hraness/oh": "0.4.1", "@openai/codex": "0.153.2",
+    convex: "1.45.0", effect: "3.22.1", zod: "4.4.3" },
+} as const;
+
+const readBounded = (path: string, maximumBytes = 8 * 1024 * 1024) => {
+  const stat = lstatSync(path);
+  assert.equal(stat.isFile(), true);
+  assert.ok(stat.size <= maximumBytes);
+  return readFileSync(path);
+};
+const verifySource = () => {
+  assert.equal(lstatSync(sourceRoot).isDirectory(), true);
+  for (const [path, expected] of Object.entries(definition.sourceHashes)) {
+    assert.equal(hash(readBounded(join(sourceRoot, path))), expected, path);
+  }
+  const sourceFiles: { path: string; sha256: string }[] = [];
+  const visit = (directory: string) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      assert.match(entry.name, /^[A-Za-z0-9_.-]+$/);
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) visit(path);
+      else if (entry.isFile()) sourceFiles.push({ path: relative(sourceRoot, path), sha256: hash(readBounded(path)) });
+      else throw new Error("Unexpected archived source entry.");
+    }
+  };
+  assert.equal(lstatSync(join(sourceRoot, "src")).isDirectory(), true);
+  visit(join(sourceRoot, "src"));
+  sourceFiles.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+  assert.equal(sourceFiles.length, definition.sourceFileCount);
+  assert.equal(hash(JSON.stringify(sourceFiles)), definition.sourceManifestSha256);
+  const manifest = JSON.parse(readBounded(join(sourceRoot, "package.json")).toString("utf8"));
+  assert.deepEqual(manifest.dependencies, definition.dependencies);
+  for (const [name, expected] of Object.entries(definition.dependencies)) {
+    const installed = JSON.parse(readBounded(join(sourceRoot, "node_modules", name, "package.json")).toString("utf8"));
+    assert.equal(installed.version, expected);
+  }
+  return sourceFiles;
+};
+
+const snapshot = (path: string) => {
+  const database = new Database(path, { create: false, strict: true });
+  database.exec("PRAGMA query_only=ON");
+  try {
+    return database.transaction(() => {
+      const schema = database.query("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name LIMIT 2049").all();
+      assert.ok(schema.length <= 2048);
+      const tables = database.query("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name LIMIT 257").all() as { name: string }[];
+      assert.ok(tables.length <= 256);
+      const rows: Record<string, unknown[]> = {};
+      for (const { name } of tables) {
+        assert.match(name, /^[A-Za-z0-9_]+$/);
+        rows[name] = database.query(`SELECT * FROM "${name}" LIMIT 4097`).all().sort((a, b) => {
+          const left = JSON.stringify(a), right = JSON.stringify(b);
+          return left < right ? -1 : left > right ? 1 : 0;
+        });
+        assert.ok(rows[name].length <= 4096);
+      }
+      const result = { userVersion: database.query("PRAGMA user_version").get(), schema, rows,
+        foreignKeyCheck: database.query("PRAGMA foreign_key_check").all(),
+        inspectionChanges: database.query("SELECT total_changes() AS count").get() };
+      assert.deepEqual(result.foreignKeyCheck, []);
+      assert.deepEqual(result.inspectionChanges, { count: 0 });
+      assert.ok(Buffer.byteLength(JSON.stringify(result)) < 8 * 1024 * 1024);
+      return result;
+    }).deferred();
+  } finally { database.close(false); }
+};
+
+
+// The public project path is metadata only. The archived resolver checks its
+// directory identity/access, but no provider or filesystem writer uses it.
+const sourceFiles = verifySource();
+const { StateStore } = await import("./canonical48/src/storage/state-store");
+const { initializeStatePaths, resolveStatePaths } = await import("./canonical48/src/storage/paths");
+await mkdir(output, { mode: 0o700 });
+const paths = resolveStatePaths({ rootDirectory: join(output, "state") });
+await initializeStatePaths(paths);
+const fixedTime = 48_001;
+const options = { now: () => fixedTime };
+const store = new StateStore(paths, options);
+const bootId = "boot_" + crypto.randomUUID().replaceAll("-", "");
+const daemonGeneration = store.nextDaemonGeneration(bootId);
+assert.equal(daemonGeneration, 1);
+const initial = snapshot(paths.database);
+const createdProfile = store.createProfile("Canonical48 synthetic Work");
+store.nextProfileGeneration(createdProfile.id);
+assert.equal(store.setProfileState(createdProfile.id, 1, "signed_in", {
+  email: "canonical48-work@example.com", plan: "Plus",
+}), true);
+assert.equal(store.allocateNextUsageRevision(createdProfile.id), 1);
+const profile = store.requireProfile(createdProfile.id);
+const project = await store.createProject("Canonical48 public metadata only", "/opt/homebrew", true);
+const capability = "hrac1_" + "A".repeat(43);
+const work = store.createWorkStore(daemonGeneration, () => "unused-canonical48-cursor", {
+  issue: () => capability, verify: (value) => value === capability,
+});
+let sequence = 0;
+const nextKey = () => "01890f31-a123-7000-8000-" + (++sequence).toString(16).padStart(12, "0");
+const cases: unknown[] = [];
+for (const state of ["claimed", "dispatching", "running", "recovery_required"] as const) {
+  const session = store.upsertProviderSession({
+    profileId: profile.id, projectId: project.id, provider: "codex",
+    providerThreadId: "canonical48-work-" + state, title: "Synthetic " + state,
+    providerAccountKey: "v1:codex:" + hash("canonical48-work@example.com"),
+    preset: "ultra", fastEnabled: false, state: "idle",
+  });
+  const created = work.apply({
+    kind: "work.create", idempotencyKey: nextKey(), clientRef: "canonical48-" + state,
+    coordinatorSessionId: session.id, objective: "Preserve original Work project authority.",
+    routes: [{ accountId: profile.id, projectId: project.id, preset: "ultra", fast: false }],
+    tasks: [{ clientRef: "task-" + state, dependsOnRefs: [], dependsOnTaskIds: [],
+      objective: "Keep exact historical authority.", instructions: "No native provider effect is executed.",
+      criteria: ["Preserve immutable source evidence."],
+      route: { accountId: profile.id, projectId: project.id },
+      preset: "ultra", fast: false, priority: 0, maxAttempts: 3,
+      requiredReviews: 1, resultKind: "text", minEvidence: 0 }],
+  });
+  assert.equal(created.kind, "work.create");
+  if (created.kind !== "work.create") throw new Error("Unexpected creation.");
+  const task = created.tasks[0];
+  assert.ok(task);
+  const claim = {
+    kind: "task.claim", idempotencyKey: nextKey(), workId: created.work.id,
+    taskId: task.id, expectedTaskRevision: task.revision, actorSessionId: session.id,
+    actorCapability: capability, leaseMs: 50_000,
+  } as const;
+  const claimed = work.apply(claim);
+  assert.equal(claimed.kind, "task.claim");
+  if (claimed.kind !== "task.claim") throw new Error("Unexpected claim.");
+  let dispatch: unknown = null;
+  let outcome: unknown = null;
+  if (state !== "claimed") {
+    const instruction = {
+      kind: "attempt.dispatch", idempotencyKey: nextKey(), workId: created.work.id,
+      attemptId: claimed.attempt.id, expectedAttemptRevision: claimed.attempt.revision,
+      fence: claimed.attempt.fence, actorSessionId: session.id,
+      attemptCapability: capability, targetSessionId: session.id, mode: "send",
+    } as const;
+    const prepared = work.apply(instruction);
+    dispatch = { instruction, prepared };
+    if (state !== "dispatching") {
+      assert.equal(work.authorizePreparedEffect(instruction.idempotencyKey).executable, true);
+      const syntheticOutcome = state === "recovery_required"
+        ? { kind: "unknown", code: "custodian_restart" } as const
+        : { kind: "accepted", receipt: {
+          kind: "turn_started", turnId: "opaque_v2_" + hash("canonical48-synthetic-turn"),
+          runtimeProfileDigest: hash("canonical48-synthetic-runtime"),
+          mutationAttemptId: "attempt_" + crypto.randomUUID().replaceAll("-", ""),
+          accountGeneration: profile.processGeneration,
+        } } as const;
+      const settled = work.finalizeDispatch(instruction.idempotencyKey, syntheticOutcome);
+      outcome = { syntheticOutcome, settled };
+    }
+  }
+  const current = snapshot(paths.database);
+  const attempts = current.rows.work_attempts;
+  assert.ok(attempts);
+  const attempt = attempts.find((row) => row !== null && typeof row === "object"
+    && "id" in row && row.id === claimed.attempt.id);
+  assert.ok(attempt !== null && typeof attempt === "object" && "state" in attempt);
+  assert.equal(attempt.state, state);
+  // Capture actual archived bytes/projection without calling replay or a
+  // current Work reader that might retire an unproved historical claim.
+  cases.push({ state, session, workId: created.work.id, taskId: task.id,
+    attemptId: claimed.attempt.id, claim, claimed, dispatch, outcome });
+}
+const finalSnapshot = snapshot(paths.database);
+assert.deepEqual(finalSnapshot.rows.migrations, initial.rows.migrations);
+assert.deepEqual(finalSnapshot.userVersion, { user_version: 48 });
+assert.equal(finalSnapshot.rows.work_attempts.length, 4);
+assert.equal(finalSnapshot.rows.session_runtime_profiles.length, 0);
+store.close();
+const reopened = new StateStore(paths, options);
+assert.deepEqual(snapshot(paths.database), finalSnapshot);
+reopened.close();
+const checkpoint = new Database(paths.database, { create: false, strict: true });
+const checkpointResult = checkpoint.query("PRAGMA wal_checkpoint(TRUNCATE)").get() as { busy: number };
+checkpoint.close(false);
+assert.equal(checkpointResult.busy, 0);
+const beforeReadonly = hash(readBounded(paths.database));
+const readonly = new StateStore(paths, { readonly: true });
+assert.deepEqual(snapshot(paths.database), finalSnapshot);
+readonly.close();
+const bytes = readBounded(paths.database, 4 * 1024 * 1024);
+assert.equal(hash(bytes), beforeReadonly);
+const generatorSource = readBounded(import.meta.path).toString("utf8");
+const metadata = {
+  ...definition, schemaVersion: 48, generatorSha256: hash(generatorSource),
+  bunVersion: Bun.version, fixedTime, sourceManifestOrdering: "ASCII relative paths",
+  provenance: {
+    syntheticControlPlaneOnly: true, archivedPublicApisOnly: true,
+    rawSqlRowOrSchemaWrites: false, nativeProviderEffects: 0, networkEffects: 0,
+    nativeProcessCustody: false, factsMemoryAuthority: false, projectDirectoryWrites: 0,
+    syntheticProviderAccountKey: true, syntheticDispatchOutcomes: true,
+    sessionRuntimeProofRows: 0, randomizedIdentifiers: true,
+    writableReopenUnchanged: true, readonlyReopenUnchanged: true,
+    readonlyDatabaseHashUnchanged: true, currentMergedAdmissionClaim: false,
+  },
+  databaseSha256: hash(bytes), databaseBytes: bytes.length, checkpointResult,
+  retained: { profile, project, bootId, daemonGeneration, cases }, snapshot: finalSnapshot,
+};
+const text = JSON.stringify(metadata);
+assert.ok(Buffer.byteLength(text) < 8 * 1024 * 1024);
+for (const forbidden of [root, "/Users/", "/private/", "/tmp/", "/home/", "/Volumes/"]) {
+  assert.equal(text.includes(forbidden), false);
+  assert.equal(bytes.includes(Buffer.from(forbidden)), false);
+}
+writeFileSync(join(output, "state.sqlite.gz"), gzipSync(bytes), { mode: 0o600, flag: "wx" });
+writeFileSync(join(output, "fixture.json"), JSON.stringify(metadata, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+writeFileSync(join(output, "source-manifest.json"), JSON.stringify(sourceFiles, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+verifySource();
+console.log(JSON.stringify({
+  sourceCommit: definition.sourceCommit, generatorSha256: hash(generatorSource),
+  databaseSha256: hash(bytes), databaseBytes: bytes.length,
+  states: ["claimed", "dispatching", "running", "recovery_required"],
+  archivedReopensUnchanged: true, earlierCapturesOpened: false,
+}));

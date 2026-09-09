@@ -10,7 +10,7 @@ import { z } from "zod";
 import { combined49DatabaseBytes } from "../../scripts/fixtures/combined49";
 import { privateTask48DatabaseBytes } from "../../scripts/fixtures/private-task48";
 import { privateTask48PinnedDatabaseBytes } from "../../scripts/fixtures/private-task48-pinned";
-import { attachmentTerminalProof, auditAttachmentCustody, readAttachmentParent, readAttachmentSet } from "./attachment-custody";
+import { applyJoinedAttachmentTerminalGuard, attachmentTerminalProof, auditAttachmentCustody, readAttachmentParent, readAttachmentSet } from "./attachment-custody";
 import { applyEffectEvidenceProvenance } from "./effect-evidence-provenance";
 import { auditSessionSendOwners, historicalSessionSendOwnerAuditFormatSchema, requireHistoricalSessionSendOwnerForAudit,
   requireSessionSendOwner, sessionSendExecutionClaimSchema,
@@ -171,10 +171,13 @@ describe("historical custody terminal owner evidence", () => {
       expect(() => readAttachmentParent(database, attemptId)).toThrow();
       if (custodyId !== null) expect(() => readAttachmentSet(database, custodyId)).toThrow();
       expect(snapshot(database)).toEqual(before);
-      database.transaction(() => applyEffectEvidenceProvenance(database, capture.format)).immediate();
+      database.transaction(() => {
+        applyEffectEvidenceProvenance(database, capture.format);
+        applyJoinedAttachmentTerminalGuard(database);
+      }).immediate();
       const selected = snapshot(database);
       expect(attachmentTerminalProof(database, attemptId)).toBe(terminalDigest);
-      expect(() => auditAttachmentCustody(database)).not.toThrow();
+      expect(() => auditAttachmentCustody(database, { kind: "source_selected", terminalGuard: "joined_v1" })).not.toThrow();
       expect(snapshot(database)).toEqual(selected);
     });
   }

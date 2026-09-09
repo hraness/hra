@@ -21,37 +21,93 @@ manual-switch and policy-control foundation. Managed automatic movement,
 Claude native fallback activation and the unfinished hosted/browser publisher
 remain dormant. Phases 6 through 9 are not complete.
 
-The September 8 integration with canonical main `7ab3478` is saved as local
-checkpoint `52c762b3c65b738957e15c0275c4f8084a64eb7f`, tree
-`448d660798c948ece627861c36c5520d3d2fdb36`. The subsequent exact-current-main
-join is uncommitted, with source conflict markers resolved. Integration and
-delivery gates remain incomplete. PR 140 remains a draft at `8f05930`; no
+The September 8 integration checkpoints now include canonical main through
+schema 50 at `ab56d3bc5034abedd12a20b5b405caf42bfa174f`, then the clean
+release-policy join at `9d6e2e12a42215e9201ae2ed3f64ed1b41e5c47d`, tree
+`78189f73fd35407b433b9a8009a23e8f1c5f5cb3`. Runtime and historical-fixture
+repairs continue on that local branch. Integration and delivery gates remain
+incomplete. PR 140 remains a draft at `8f05930`; no
 protected-branch merge, usage release or production deployment is claimed.
 Earlier exact-tree checks do not cover this integration. Canonical schema 50
 is now governed by PR 151's merge at
 `d5376e34dcf2ace99009fd6eeaed3dcae917bcca`, tree
 `14ccd71d668411851ec5f65e03f16f6e63ec78f7`. The exact fully qualified main
-ref was refreshed after the merge. This usage candidate still needs to join
-that ancestry and validate its own changes. Usage slots 51 through 59 and the
+ref was refreshed after the merge. This usage candidate includes that ancestry
+but still needs to validate its own changes. Usage slots 51 through 59 and the
 joined evidence/recovery bridge at 60 remain private candidate allocations;
 recheck competing ownership before push, review readiness or merge. The
 canonical owner's successful gates are not this branch's acceptance evidence.
 
-The governed main ref now also contains release-policy merge `b856c661`, which
-has been fetched and reviewed but not yet joined here. Its artifact-admission
+The governed main ref also contains release-policy merge `b856c661`, now
+joined here without source or workflow conflicts. Its artifact-admission
 policy separates optional live qualification from publication; operational
 capacity, identity and intended-target gates remain binding. The release owner
-is publishing the baseline `v0.7.0`; this task has not entered that main window
-or claimed that release as usage delivery.
+reports complete immutable admission for the baseline `v0.7.0` and has released
+that main window. The owner also reports PR 157's documentation/site successor
+at `7ad1607df15a112125351ee01fb46fcdd9ccad98`, with actual-main CI and public site
+verification complete. That successor is not yet joined here and does not
+republish the immutable baseline artifact. This is not usage delivery. A later usage release must own
+its own version, exact-source checks, protected merge and artifact admission.
+
+The latest scoped main fetch confirms
+`5027d21d8e4a128f87f2a78810b3f23929404061`, the separate custody-scoped
+attention-key installer after StyleX successor `3da9744`, is still unjoined
+here. The installer requires its own operational handoff and does not activate
+attention or clear hosted capacity gates. Independent impact review of the
+StyleX successor found no new storage or
+service implementation delta, but the service-fixture teardown join must
+preserve the explicitly expected custody-refusal outcome without a generic
+catch. After the join, frozen dependency installation, the scoped app/site
+test commands and the new separate browser acceptance gate are required in
+addition to the unchanged aggregate check.
+
+Independent review of the complete seven-file production repair diff against
+`9d6e2e12a42215e9201ae2ed3f64ed1b41e5c47d` found no actionable issues. It
+traced original attachment request and effect authority, atomic terminal
+acknowledgment, explicit abandonment routing, peer no-effect receipts,
+historical switch audits, quarantined maintenance and Claude reservation
+cleanup. All seven inspected file hashes remained unchanged across review.
+This is source-review evidence only. The historical cases, full StateStore
+diagnostic, fresh typecheck and scoped lint now pass after test-only typing
+repairs. Neither final integration nor operational activation is admitted.
 
 The joined source passed a fresh typecheck and Effect architecture check. A
 private-48 CLI regression exposed an actual stage mismatch: the canonical
 waypoint audit required joined queue and peer guards before their installers
 ran. Intermediate retained-usage waypoints now require the exact historical
 guards, while final schema 60 still requires the exact successor guards. The
-previously failing CLI case passes; independent stage and no-write refusal
-regressions are being added. These focused results do not replace the final
-exact-tree aggregate.
+previously failing CLI case passes. Six independent stage and no-write refusal
+cases pass with 529 assertions, covering the exact pre-installer guards and
+current missing or reverted guards. These focused results do not replace the
+final exact-tree aggregate.
+
+The broader service and storage diagnostics exposed stale legacy fixtures and
+current service or admission gaps. Interaction methods now validate the
+captured provider tuple before runtime access; three supported routing controls
+and two no-write refusal controls pass. Queue recovery now explicitly requests
+the bounded detailed projection required to prove one exact message, while
+abandonment retains its metadata-only read. The original transcript finalizer
+already uses the captured source tuple and connection; no authority substitution
+was needed. The two queue controls pass with 52 assertions. The current store's
+assertion-only audit now covers every retained switch journal, including
+terminal receipts, without historical repair or authority invention. Independent
+review approved its transactional admission and full keyset coverage. Thirteen
+focused controls pass, including the 101st retained journal, inert terminal
+reopen, and older settled switches after account removal and restart. The new
+precheck bounds joined-row materialization; subsidiary readers retain their
+existing contracts. This is not a measured large-history performance guarantee.
+
+Actual archived interactions reproduced a maintenance failure: quarantined
+history could throw during deadline selection and prevent supported callbacks
+from being processed. Deadline, next-timer and attention selectors now exclude
+only explicit interaction or session quarantine before applying their limits.
+The regression passes with exact original-row preservation and a supported
+callback positive. A separate retired-session abandonment regression exposed
+facts-memory cleanup before the provider refusal. The existing provider guard
+now runs before cleanup inside the serialized reread. Authentic bound-send and
+started-target controls pass, preserving the original receipts and refusing
+provider execution and memory cleanup. Neither repair invents historical
+authority or deletes evidence.
 
 A fresh exact-writer capture supplies a genuinely unbound canonical-43 login
 and an independent canonical-50 ledger predecessor. The retained recipe digest
@@ -72,9 +128,197 @@ an unproved claim. Original intent JSON and effect evidence remain immutable,
 and public replay reports current released state without reviving the claim.
 The adapted archived generator has byte-identical transpiled runtime to its
 retained exact original recipe; the original database fixture is unchanged.
-Authentic schema-50 ledger controls and the remaining schema-39 switch captures
-are still under validation. The latest broader daemon diagnostic passed 147
-cases and exposed ten failures; focused repairs are not yet a full rerun.
+Authentic schema-50 ledger controls pass 15 cases with 23,419 assertions.
+Four additional exact-writer schema-39 switch images preserve actual old effect
+and progress bytes, including an aliased target. Their five service controls
+pass with 4,562 assertions after explicit optional-row type narrowing, preserving missing account-identity refusals rather
+than manufacturing execution authority. Five more exact-writer schema-39
+images retain bound-send, in-flight-start, interaction-deadline and both
+started-target retired switch histories. Their archived writable and readonly
+reopens are unchanged. A new exact-writer schema-48 Work image preserves four
+claimed, dispatching, running and recovery-required attempts. Its source is
+`5838ec446d5cfbf6d0edeaae9a67bcc9e95c82e4` and its database digest is
+`aa7dbe6453ce2e69520ba2baa1eafaa6db028632ee73a22063533fa1c3869a35`.
+Twenty-four migration and refusal cases pass without inventing runtime rows.
+Six schema-47 negatives and a positive use an explicitly source-derived stage:
+only the exact empty schema-48 memory component and its original ledger row
+are removed transactionally, with all remaining rows and objects preserved.
+This is not a captured or released schema-47 artifact. A further exact-writer
+schema-50 image proves a retained queue source and generic steer source can
+share one public source identifier without conflating their immutable effects.
+Its database digest is
+`77bd12ae229983ee83e0f4541795b1b671749d266f4f5738b162562d65fe1d24`.
+The joined readback, idempotent completion and inert reopen control passes
+with 40 assertions. A schema-34 capture from exact source
+`127c1e7dcf8ef1461b7d71ab4d077a93f85cc682` retains a synthetic desktop recovery
+receipt, original Sol runtime and a separately unbound pending queue. Its
+database digest is
+`95d9e375061ac090f1409e50937d68f66ae702176fae06287ff137c23f049e6b`;
+the original recipe digest is
+`511a6f6bcc791a46a947e323b4f19954c8f6bff644fe5100a5c2a8dbba3350c3`.
+Both archived reopen modes preserve every row and schema object, and readonly
+reopen preserves the whole image digest. The first, unpublished attempt failed
+its unchanged-reopen check. The revised recipe explicitly reserves an unused
+usage revision through the archived public API, avoiding a known old startup
+backfill; the failed image remains unmodified and is not an accepted fixture.
+Four additional exact schema-33/39 session-start images retain both applied
+and effect-started requests with their actual original request shapes. All
+four historical service controls pass; a separate current prepared-request
+control also passes with the required original provider-authority sidecar.
+The four schema-34 migration and refusal controls pass with 9,892 assertions.
+
+Eight further early-migration images retain exact schema-10 and schema-17
+public-writer state plus byte copies observed inside the archived 10-to-17
+transaction at stages 11 through 16. These stages are not released-writer
+fixtures. They preserve full snapshot and standalone readback evidence without
+changing source SQL or disabling secure deletion. The stale note sentinel in
+stages 11 through 13 is independently attributable old note data, not evidence
+of erased MCP contents; the final schema-17 image proves its physical removal.
+Two schema-39 attachment images passed storage and privacy checks but failed
+service replay because the first recipe did not use the archived parser's
+reference-key ordering. Those original outputs remain unchanged; a separate
+capture through that exact archived parser now replaces the repository
+fixtures. Both historical service replays pass with 48 assertions while
+preserving original request, effect and result bytes; they read no blobs and
+make no provider calls. Nine early migration controls now pass using the
+authentic schema-10/17 images and explicitly observed intermediate stages.
+Two exact schema-17 Unicode label collision controls also pass, proving
+different read-only and writable refusal paths without changing the database.
+The expanded privacy suite passes 52 cases with 421 assertions, including both
+UTF-16 byte orders. Independent review confirms that the sole historical
+public-root exception remains exact-image and exact-whole-field bounded.
+These synthetic control-plane fixtures do not prove native provider effects.
+
+The full provider-switch diagnostic passed 108 tests with 5,539 assertions
+before the type-only narrowing above. Fresh no-bail diagnostics completed for
+the full service file (539 passing, 13 failing, 4,592 assertions) and full
+StateStore file (556 passing, 150 failing, 99,697 assertions). These are failed
+diagnostics, not admission receipts. Parallel repairs address exact historical
+producers, current input custody and retired-provider behavior. All 85 original
+historical/stage failures now have focused passing evidence. Three newly repaired queue20,
+resolution40 and synthetically populated observed2 controls pass with 7,862
+assertions and independent review. All three authentic adoption35 controls
+pass, including exact old-cell preservation and two inert corruption refusals.
+The captured v38 widening control passes with 4,402 assertions and preserves
+a genuine archived generation rebind while refusing new retired-provider
+execution. Its larger runtime/lineage matrix now passes with 14,541 assertions.
+Both authentic v39 attention cases pass with 9,889 assertions. They drive the
+actual storage boot transition, preserve the original attention and optional
+callback, and create no runtime, event or execution proof. A third new exact
+image retains a v40 claimed Work attempt and mixed pending owners. Both v40
+identity cases and the independent authentic v34 no-proof control pass with
+19,878 assertions under unchanged individual deadlines. The three images preserve old rows and schema
+across archived writable and readonly reopens; their decoded privacy controls
+pass with 24 assertions. All three synthetic v36 contracts now pass, including
+the two positive migrations with 10,829 assertions. Their local stream and
+allocator maintenance expectations come from the exact migration definitions,
+not post-hoc fixture changes. Independent review approved these boundaries.
+The obsolete current-to-legacy downgrade helper chains are removed after their
+last consumers moved to authentic images or explicitly synthetic contracts.
+The fresh complete fixture-privacy suite passes all 75 cases with 614
+assertions. The revised anchored v38 queue probe passes before the matrix
+reaches a stale predecessor-event diagnostic assertion. The test now requires
+the exact joined successor refusal and complete unchanged snapshots after all
+six event probes; independent review approved that correction and its rerun
+passes. The full StateStore diagnostic passes all 715 cases with 336,015
+assertions in 776.09 seconds. That run loaded before the subsequent type-only
+comparison repairs; the unchanged final gate must still run on the joined
+delivery tree. Fresh typecheck exposed
+test-only readonly comparison, map-key and mutation-ID typing errors. Reviewed
+repairs preserve fixture values and production contracts. The fresh typecheck,
+scoped lint and whitespace check now pass.
+The authentic-39
+joined migration positive preserves old input and effects, adds default peer
+policy without execution authority, and passes with 3,667 assertions. All 40 current-input
+and effect-contract failures have focused passing evidence, including the
+authentic source-identifier collision above. All 19 root-owned recovery cases
+now have focused passing evidence; the direct-send acknowledgment control
+passes with 1,528 assertions, preserving the original resolution and effects.
+All 28 new storage acknowledgment cases now have focused passing evidence,
+including rollback, immutable-source corruption, shared-blob retention,
+postcommit scrub failure and a real 101-record keyset audit. All 13 original
+service failures now have focused passing evidence. The fresh full service
+diagnostic passes all 568 tests with 4,928 assertions, including the new
+terminal acknowledgment path. The final aggregate gate remains open.
+Six login and memory
+controls pass with 60 assertions,
+including exact memory-owner transfer and unchanged refusal while a submission
+is unsettled. Four pending/settled transcript controls pass with 53 assertions,
+using actual turn completion to prove restart replay and refusing missing turn
+runtime evidence without writes. The public boundary now maps the exact closed
+login-binding failure to sanitized `RECOVERY_REQUIRED`; its unbound-generation
+negative and supported cancellation control pass with 12 assertions, preserving
+all rows and issuing no provider call on refusal. The full StateStore
+diagnostic above closes those behavioral repairs, not the final delivery gate.
+
+Adoption-v36 historical writer provenance remains unavailable: exact source
+`42c4235` is v35, retained PR113 ancestry is v40 or later, and the observed
+released 35-to-40 path does not match the v36 recognizer's schema. Supplemental
+v36 contract tests instead construct an empty database from independently
+frozen canonical34, adoption and Work SQL, then seed explicitly synthetic rows
+under intact constraints. They exercise current migration and refusal, not
+proof that a historical v36 producer emitted those rows or that schema.
+
+Two additional product regressions have focused passing evidence. Current
+schema admission now asserts the exact four queue scrub guards before trusting
+the absence of cleanup debt. The reproduced missing-trigger case previously
+opened with an unscrubbed settled body. Four guard matrices cover missing,
+weakened and wrong-table definitions in both open modes without repair or row
+changes; the intact scrub-generation control also passes (five cases, 83
+assertions). A joined-only peer transition now accepts the exact terminal-only
+cancellation receipt when the outer action is effect-started or ambiguous but
+no nested provider effect exists. Frozen predecessor SQL is unchanged; wrong
+receipts, revisions, effects and custody remain refused. The coupled peer and
+waypoint group passes 43 cases with 7,429 assertions. Focused repairs are not
+a passing full-file rerun or final integration gate.
+
+A real direct-message custody test exposed an additional cleanup gap:
+provider deletion records an immutable abandonment reason and ends transcript
+finalization, but that reason is not explicit user acknowledgment of an unknown
+provider outcome. Retaining the attachment custody is correct; its current
+terminal/resolved state previously had no proved later acknowledgment path
+and could retain the slot indefinitely. Do not release custody from provider deletion or
+transport loss alone, rewrite its original resolution, or call this case
+complete until a bounded explicit cleanup path is verified. The reviewed design
+adds a separate immutable, anchored acknowledgment for an explicit terminal
+`session.abandon`, tied to the original generic input, custody, source-selected
+effect and unchanged automatic-abandonment resolution. It grants no provider
+action and does not reinterpret original-send or unknown historical custody.
+The storage implementation and 28 adversarial cases have been independently
+reviewed. The local-only service path now skips unrelated memory maintenance
+only for an exact terminal abandonment selection and rechecks the selected
+session revision and daemon authority under local serializers. It preserves
+ordinary recovery maintenance and the existing postcommit scrub-stop lifecycle.
+All 11 service acknowledgment cases now pass, covering deletion and transport
+loss, inert replay, final authority fences, selection and abort failures, and
+postcommit scrub shutdown. They also pass in the full service diagnostic.
+The repository integration gate is still required.
+An adjacent review also confirmed a current Claude-manager reservation leak
+when configuration lookup rejects before entering its cleanup boundary. The
+bounded cleanup repair passes seven adapter regression and existing control
+cases with 56 assertions. It also passes the full service diagnostic. A
+separate type-only correction preserves the foreign host-capability runtime
+guard while satisfying lint; four focused cases pass with 35 assertions.
+Neither change
+is an Effect architecture migration or proof of native Claude execution.
+
+The exact schema-27 reset writer and explicitly source-derived partial-28
+boundary now pass both migration controls with 8,678 assertions. Their initial
+failures compared lexically sorted captured ledger rows against numeric SQL
+ordering; sorting a copy corrected the oracle without changing fixtures or
+product code. The exact schema-25 preset control passes with 2,247 assertions,
+including the deliberate three-field quarantine for missing native authority.
+Eight schema-35/36/37/38 consumers pass with 18,569 assertions from five exact
+archived writers and one explicitly uncommitted observed stage. The six new
+images pass privacy checks with 48 assertions. These results preserve original
+history and distinguish explicit email consent from a damaged lookalike.
+
+Historical adoption source retrieval remains bounded to its identified PR and
+immutable commits. PR 113's final head contains schema 40, not the earlier
+adoption cohort. A separate exact-commit fetch recovered the original
+`42c4235e35daed1dec7eca4ff985bd9e8606b78a` schema-35 writer. The schema-36
+producer has not yet been identified; a different cohort cannot substitute for
+that missing evidence.
 
 The candidate runs canonical upgrades before usage installation. For admitted
 private-48 and combined-49 inputs, it relocates the nine original usage ledger
@@ -188,9 +432,10 @@ handling, CLI recovery boundaries, hosted configuration recovery and the
 eight-job complete CI partition. New test conflicts retain authentic archived
 inputs and current version 60; they do not restamp a newer database as an old
 source. The legacy-43 unbound-login case and canonical-50 predecessor ledger
-controls still need exact-source fixture captures. Installer inner pins and
-the reviewed security-primitive inventory are regenerated; package inventory,
-the joined regression groups and final gates remain outstanding. Focused
+controls now have the exact-source fixtures and focused results recorded above.
+Installer inner pins and the security-primitive inventory were regenerated
+before the subsequent repairs and must be rechecked after convergence. Package
+inventory, the joined regression groups and final gates remain outstanding. Focused
 checks do not authorize a release or production activation.
 
 The join preserves source-selected historical evidence bytes and adds immutable
@@ -849,16 +1094,16 @@ Independent field, punctuation and whole-skeleton calculations bound the compose
 
 ## Phase 10: Contract convergence, validation, and delivery
 
-- **Status:** Not started
-- **Depends on:** Phase 9
+- **Status:** In progress for the scoped foundation delivery; whole-feature completion remains pending Phases 6 through 9.
+- **Depends on:** Phase 9 for whole-feature completion. The current delivery checkpoint above explicitly limits the foundation artifact's scope and claims.
 - **Objective:** Converge documentation and code, obtain independent whole-feature review, pass the authoritative gate, and deliver through repository policy.
 - **Scope:** `docs/usage-management.md`, `docs/providers/claude.md`, `docs/hosted-sync.md`, `README.md`, active plan evidence, generated convergence artifacts only when proven, delivery records.
 - **Out of scope:** Expanding the explicitly deferred Claude automation boundary.
-- **Approach:** Audit public claims against tests and exact runtime behavior. Run independent final review against this plan. Repair every in-scope finding, rerun only invalidated focused checks, then run the final gate once on the converged tree. Resolve `hra-host-run` to its installed absolute path and use `--mode=heavy --lane=compute` for the unchanged child command `bun run check`. Commit coherent task-owned changes, push, open the PR, wait for required checks/reviews, merge, perform any repository-required release, and deploy hosted changes only through the attested candidate chain in `docs/hosted-sync.md`. Do not weaken a gate or bypass an enforced approval.
+- **Approach:** Audit public claims against tests and exact runtime behavior. Run independent final review against this plan. Repair every in-scope finding, rerun only invalidated focused checks, then run the final gate once on the converged tree. Resolve `hra-host-run` to its installed absolute path and use `--mode=exclusive --lane=compute` for the unchanged child command `bun run check`, which shares the host process-recovery journal. Commit coherent task-owned changes, push, open the PR, wait for required checks/reviews, merge, perform any repository-required release, and deploy hosted changes only through the attested candidate chain in `docs/hosted-sync.md`. Do not weaken a gate or bypass an enforced approval.
 - **Acceptance criteria:**
   - Documentation states the 99 percent threshold, reset-before-switch order, active/default semantics, provider observation sources and freshness, switches, supported actions, and deliberate deferrals.
   - Independent final review finds no unresolved correctness, recovery, privacy, compatibility, or contract issue within scope.
-  - `bun run check` passes on the exact delivered Git tree through the heavy compute lane.
+  - `bun run check` passes on the exact delivered Git tree through the exclusive compute lane.
   - The final branch, commits, PR, required checks, merge SHA, release evidence if applicable, hosted candidate/deployment evidence if applicable, and production readback are recorded.
 - **Validation:** Focused checks from invalidated phases, then host-scheduled `bun run check`; repository PR, merge, release, deployment, and production-verification checks as documented.
 

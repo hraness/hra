@@ -595,7 +595,10 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     signal: AbortSignal;
   }): Promise<CodexSessionProjection & { effectiveRuntimeProfile: EffectiveClaudeRuntimeProfile }> {
     this.#assertLaunchAuthority(input.authority, input.signal);
-    if (input.hostCapabilities !== undefined && input.hostCapabilities !== "current" && input.hostCapabilities !== "historical_v1") {
+    const hostCapabilityInput: { readonly hostCapabilities?: unknown } = input;
+    if (hostCapabilityInput.hostCapabilities !== undefined
+      && hostCapabilityInput.hostCapabilities !== "current"
+      && hostCapabilityInput.hostCapabilities !== "historical_v1") {
       throw new ClaudeError("INVALID_INPUT", "The session host-capability mode is invalid");
     }
     this.#assertNoUnboundSessionChild();
@@ -1493,10 +1496,6 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     }
     this.#startingSessionIds.add(input.providerThreadId);
 
-    const connectionId = randomUUID();
-    const configDir = await this.#configDirFor(input.authority);
-    this.#assertLaunchAuthority(input.authority, input.signal);
-    this.#assertNoUnboundSessionChild();
     let ready = false;
     const initializationFacts: ClaudeFact[] = [];
     let binding: ClaudeHostToolBindingLease | undefined;
@@ -1504,6 +1503,10 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     let client: ClaudeStreamClient | undefined;
     let admitted = false;
     try {
+      const connectionId = randomUUID();
+      const configDir = await this.#configDirFor(input.authority);
+      this.#assertLaunchAuthority(input.authority, input.signal);
+      this.#assertNoUnboundSessionChild();
       if (input.hostTools !== "disabled") {
         binding = await this.#hostTools.bindingAuthority.provision({
           callbackSocketPath: this.#hostTools.callbackSocketPath,

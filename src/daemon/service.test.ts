@@ -7,8 +7,30 @@ import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
 import { canonical40QueuesDatabaseBytes, canonical40QueuesFixture } from "../../scripts/fixtures/canonical40-queues";
+import { canonical39DevinDatabaseBytes, canonical39DevinFixture } from "../../scripts/fixtures/canonical39-devin";
+import { canonical39RetiredDatabaseBytes, canonical39RetiredFixtures } from "../../scripts/fixtures/canonical39-retired-effects";
+import {
+  canonical39RetiredRecoveryDatabaseBytes,
+  canonical39RetiredRecoveryFixtures,
+  type Canonical39RetiredRecoveryScenario,
+} from "../../scripts/fixtures/canonical39-retired-recovery";
+import {
+  canonical39RetiredTargetDatabaseBytes,
+  canonical39RetiredTargetFixtures,
+  type Canonical39RetiredTargetScenario,
+} from "../../scripts/fixtures/canonical39-retired-targets";
 import { canonical24ResetDatabaseBytes, canonical24ResetFixture } from "../../scripts/fixtures/canonical24-reset";
 import { canonicalLoginLedgerDatabaseBytes, canonicalLoginLedgerFixtures } from "../../scripts/fixtures/canonical-login-ledger";
+import {
+  canonical39AttachmentDatabaseBytes,
+  canonical39AttachmentFixtures,
+  type Canonical39AttachmentScenario,
+} from "../../scripts/fixtures/canonical39-attachments";
+import {
+  canonicalSessionStartDatabaseBytes,
+  canonicalSessionStartFixtures,
+  type CanonicalSessionStartScenario,
+} from "../../scripts/fixtures/canonical-session-start";
 import {
   CodexError,
   CodexRemoteError,
@@ -57,11 +79,9 @@ import { AttachmentBlobStore } from "../storage/attachment-store";
 import { ingestAttachments } from "./attachment-ingest";
 import {
   currentPresetContract,
-  devinPresetContract,
   legacyPresetContract,
   presetRequirements,
 } from "../domain/presets";
-import { createQueueId } from "../domain/values";
 import type {
   EffectiveClaudeRuntimeProfile,
   EffectiveRuntimeProfile,
@@ -82,6 +102,7 @@ import {
 import {
   mutationRequestDigest,
   sessionStartMutationRequest,
+  StateSecurityScrubRequiredError,
   StateStore,
   type SecurityScrubCheckpointPolicy,
   type SessionRecord,
@@ -1452,6 +1473,12 @@ afterEach(async () => {
 
 type FixtureAdoptionOptions = Readonly<{
   canonical40Queues?: true;
+  canonical39Devin?: true;
+  canonical39Retired?: "queue_dispatch";
+  canonical39RetiredRecovery?: Canonical39RetiredRecoveryScenario;
+  canonical39RetiredTarget?: Canonical39RetiredTargetScenario;
+  canonicalSessionStart?: CanonicalSessionStartScenario;
+  canonical39Attachments?: Canonical39AttachmentScenario;
   managedClaude?: ClaudeRuntimePort;
   memory?: HraMemoryPort;
   personalCodex?: CodexRuntimePort;
@@ -1478,6 +1505,27 @@ const isHraMemoryPort = (
 ): value is HraMemoryPort => typeof value === "object"
   && typeof (value as Partial<HraMemoryPort>).status === "function"
   && typeof (value as Partial<HraMemoryPort>).remember === "function";
+
+const expectHistoricalValue = (actual: unknown, expected: unknown): void => {
+  expect(actual).toEqual(expected);
+};
+
+const serviceFixtureDatabaseSnapshot = (path: string) => {
+  const database = new Database(path, { strict: true });
+  try {
+    database.exec("PRAGMA query_only=ON");
+    return database.transaction(() => ({
+      schema: database.query("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name").all(),
+      tables: database.query<{ name: string }, []>("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name").all()
+        .map(({ name }) => {
+          if (!/^[A-Za-z0-9_]+$/u.test(name)) throw new Error("Unexpected service fixture table name.");
+          const rows = database.query(`SELECT * FROM "${name}" LIMIT 4097`).all();
+          if (rows.length > 4096) throw new Error("Service fixture exceeded its row bound.");
+          return { name, rows: rows.map((row) => JSON.stringify(row)).sort() };
+        }),
+    })).deferred();
+  } finally { database.close(false); }
+};
 
 async function fixture(
   desktop?: DesktopSwitchPort,
@@ -1508,6 +1556,44 @@ async function fixture(
     : {};
   if (adoption.canonical40Queues === true) {
     await writeFile(paths.database, canonical40QueuesDatabaseBytes(), { mode: 0o600 });
+  }
+  if (adoption.canonical39Devin === true) {
+    if (adoption.canonical40Queues === true) throw new Error("Choose exactly one archived source.");
+    // Preserve the actual released producer's sessions and login evidence. This
+    // is synthetic control-plane history, not a native provider custody proof.
+    await writeFile(paths.database, canonical39DevinDatabaseBytes(), { mode: 0o600 });
+  }
+  if (adoption.canonical39Retired !== undefined) {
+    if (adoption.canonical40Queues === true || adoption.canonical39Devin === true) {
+      throw new Error("Choose exactly one archived source.");
+    }
+    await writeFile(paths.database, canonical39RetiredDatabaseBytes(adoption.canonical39Retired), { mode: 0o600 });
+  }
+  if (adoption.canonical39RetiredRecovery !== undefined) {
+    if (adoption.canonical40Queues === true || adoption.canonical39Devin === true
+      || adoption.canonical39Retired !== undefined) throw new Error("Choose exactly one archived source.");
+    await writeFile(paths.database, canonical39RetiredRecoveryDatabaseBytes(adoption.canonical39RetiredRecovery), { mode: 0o600 });
+  }
+  if (adoption.canonical39RetiredTarget !== undefined) {
+    if (adoption.canonical40Queues === true || adoption.canonical39Devin === true
+      || adoption.canonical39Retired !== undefined || adoption.canonical39RetiredRecovery !== undefined) {
+      throw new Error("Choose exactly one archived source.");
+    }
+    await writeFile(paths.database, canonical39RetiredTargetDatabaseBytes(adoption.canonical39RetiredTarget), { mode: 0o600 });
+  }
+  if (adoption.canonicalSessionStart !== undefined) {
+    if (adoption.canonical40Queues === true || adoption.canonical39Devin === true
+      || adoption.canonical39Retired !== undefined || adoption.canonical39RetiredRecovery !== undefined
+      || adoption.canonical39RetiredTarget !== undefined) throw new Error("Choose exactly one archived source.");
+    await writeFile(paths.database, canonicalSessionStartDatabaseBytes(adoption.canonicalSessionStart), { mode: 0o600 });
+  }
+  if (adoption.canonical39Attachments !== undefined) {
+    if (adoption.canonical40Queues === true || adoption.canonical39Devin === true
+      || adoption.canonical39Retired !== undefined || adoption.canonical39RetiredRecovery !== undefined
+      || adoption.canonical39RetiredTarget !== undefined || adoption.canonicalSessionStart !== undefined) {
+      throw new Error("Choose exactly one archived source.");
+    }
+    await writeFile(paths.database, canonical39AttachmentDatabaseBytes(adoption.canonical39Attachments), { mode: 0o600 });
   }
   const store = new StateStore(paths, {
     now,
@@ -1582,6 +1668,30 @@ async function fixture(
     eventCursors,
     paths,
   };
+}
+
+async function archivedDevinFixture(cloud = new FakeCloud(), options: Readonly<{
+  factsMemory?: HraFactsMemoryLifecyclePort;
+  memory?: HraMemoryPort;
+}> = {}) {
+  const value = await fixture(undefined, cloud, () => undefined, Date.now,
+    options.factsMemory, {}, {
+      canonical39Devin: true,
+      ...(options.memory === undefined ? {} : { memory: options.memory }),
+    });
+  const captured = canonical39DevinFixture.cases[0];
+  expect(value.store.requireSession(captured.session.id)).toEqual(captured.session);
+  expect(value.store.readMutation(captured.idempotencyKey)).toMatchObject(captured.mutation);
+  return { ...value, captured };
+}
+
+async function abandonArchivedDevinLogin(value: Awaited<ReturnType<typeof archivedDevinFixture>>) {
+  const { captured } = value;
+  await value.service.execute({
+    kind: "account.devin-login.abandon", account: captured.profile.id,
+    attemptId: captured.mutation.id, idempotencyKey: captured.idempotencyKey,
+    providerGeneration: captured.generation, acknowledgeChildExited: true,
+  }, { signal });
 }
 
 function guidanceFixture(): Promise<Awaited<ReturnType<typeof fixture>> & {
@@ -1994,70 +2104,6 @@ async function nativeClaudeFixture(
   };
 }
 
-/**
- * Reconstructs the immutable request and evidence shape emitted by a historical
- * binary. The current writer correctly cannot create or rewrite this shape, so
- * the test fixture temporarily removes and then restores the evidence-update
- * guard around one exact compatibility-row rewrite.
- */
-function rewriteSessionStartAttemptAsHistoricalFixture(input: Readonly<{
-  idempotencyKey: string;
-  request: unknown;
-  store: StateStore;
-}>): Readonly<{ evidence: Readonly<Record<string, unknown>>; requestDigest: string }> {
-  const attempt = input.store.readMutation(input.idempotencyKey);
-  if (attempt === null) throw new Error("The session-start compatibility fixture is missing its mutation attempt.");
-  const inspector = new Database(input.store.paths.database, { create: false, strict: true });
-  let evidenceUpdateGuardDropped = false;
-  try {
-    const evidenceRow = inspector.query(
-      `SELECT e.evidence_json FROM mutation_effect_evidence e
-       JOIN mutation_attempts m ON m.id=e.attempt_id
-       WHERE m.idempotency_key=?`,
-    ).get(input.idempotencyKey) as { evidence_json: string } | null;
-    if (evidenceRow === null) {
-      throw new Error("The session-start compatibility fixture is missing its effect evidence.");
-    }
-    const parsedEvidence = JSON.parse(evidenceRow.evidence_json) as unknown;
-    if (typeof parsedEvidence !== "object" || parsedEvidence === null || Array.isArray(parsedEvidence)) {
-      throw new Error("The session-start compatibility fixture has invalid effect evidence.");
-    }
-    const contractlessEvidence = { ...(parsedEvidence as Record<string, unknown>) };
-    delete contractlessEvidence.presetContract;
-    const evidence = contractlessEvidence;
-    const evidenceJson = JSON.stringify(evidence);
-    const requestDigest = mutationRequestDigest({
-      authorityGeneration: attempt.authorityGeneration,
-      authorityId: attempt.authorityId,
-      kind: attempt.kind,
-      request: input.request,
-    });
-    inspector.exec("DROP TRIGGER mutation_effect_evidence_immutable_update");
-    evidenceUpdateGuardDropped = true;
-    inspector.query(
-      "UPDATE mutation_attempts SET request_digest=? WHERE idempotency_key=?",
-    ).run(requestDigest, input.idempotencyKey);
-    inspector.query(
-      "UPDATE mutation_effect_evidence SET evidence_json=?,evidence_digest=? WHERE attempt_id=?",
-    ).run(
-      evidenceJson,
-      createHash("sha256").update(evidenceJson).digest("hex"),
-      attempt.id,
-    );
-    return { evidence, requestDigest };
-  } finally {
-    try {
-      if (evidenceUpdateGuardDropped) {
-        inspector.exec(`CREATE TRIGGER IF NOT EXISTS mutation_effect_evidence_immutable_update
-BEFORE UPDATE ON mutation_effect_evidence
-BEGIN SELECT RAISE(ABORT, 'mutation effect evidence is immutable'); END;`);
-      }
-    } finally {
-      inspector.close(false);
-    }
-  }
-}
-
 async function claudeAccountFixture(
   initiallySignedIn = false,
   platform: NodeJS.Platform = "linux",
@@ -2160,33 +2206,6 @@ async function claudeAccountFixture(
     setClaudeSignedIn: (value: boolean) => { signedIn = value; },
   };
 }
-
-// Seed frozen v39 provenance plus its coherent current canonical mirror,
-// not an active retired-provider API or an authentic old database capture.
-function legacyDevinSession(
-  value: Awaited<ReturnType<typeof fixture>>,
-  profileId: NonNullable<Parameters<StateStore["createSession"]>[0]["profileId"]>,
-) {
-  const created = value.store.createSession({
-    profileId, provider: "codex", preset: "ultra", fastEnabled: false,
-    title: "Historical Devin",
-  });
-  value.store.bindSession({
-    sessionId: created.id, expectedRevision: created.revision,
-    providerThreadId: "historical-devin-thread", state: "idle",
-  });
-  const legacy = new Database(value.paths.database, { strict: true });
-  try {
-    legacy.query("DELETE FROM session_provider_account_authorities WHERE session_id=?").run(created.id);
-    legacy.query(
-      "UPDATE sessions SET provider_v39='devin',preset_contract=?,canonical_profile_key='devin:gpt-6-astra:provider-default' WHERE id=?",
-    ).run(devinPresetContract, created.id);
-  } finally {
-    legacy.close();
-  }
-  return value.store.requireSession(created.id);
-}
-
 
 async function isolatedLoginCompletionFixture(provider: "claude") {
   const value = await claudeAccountFixture();
@@ -2899,7 +2918,47 @@ describe("HraService personal-session adoption", () => {
     expect(value.store.requireSession(value.session.id)).toEqual(establishedSession);
     expect(value.store.latestSessionRuntimeProfile(value.session.id)).toEqual(establishedProfile);
 
+    const originalCaptured = value.store.requireCapturedSessionProviderAuthority(value.session.id);
     await value.service.close();
+    // Shutdown alone retires the runtime. Its exact historical observation
+    // permission is local-only and must not silently revive the old tuple.
+    expect(value.store.requireCapturedSessionProviderAuthority(value.session.id)).toEqual(originalCaptured);
+    expect(value.store.readHistoricalSessionObservationAuthority(value.session.id)).toEqual({
+      authority: originalCaptured, lineage: "provider_disconnect",
+    });
+    expect(() => value.store.requireSessionProviderAuthority(value.session.id))
+      .toThrow("SESSION_PROVIDER_AUTHORITY_STALE");
+    expect(value.store.latestSessionRuntimeProfile(value.session.id)).toEqual(establishedProfile);
+    const restartBootId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
+    const restartGeneration = value.store.nextDaemonGeneration(restartBootId);
+    expect(restartGeneration).toBe(value.daemonGeneration + 1);
+    const rebound = value.store.requireSessionProviderAuthority(value.session.id);
+    expect(rebound).toEqual({
+      ...originalCaptured,
+      authorityRevision: originalCaptured.authorityRevision + 1,
+      processGeneration: originalCaptured.processGeneration + 2,
+    });
+    expect(value.store.readHistoricalSessionObservationAuthority(value.session.id)).toBeNull();
+    const successorReader = new Database(value.paths.database, { strict: true });
+    try {
+      successorReader.exec("PRAGMA query_only=ON");
+      expect(successorReader.query(`SELECT from_provider_account_id,to_provider_account_id,
+        from_profile_id,to_profile_id,from_provider,to_provider,
+        from_binding_generation,to_binding_generation,from_process_generation,to_process_generation,
+        transition_kind,transition_id FROM session_provider_authority_successors
+        WHERE session_id=? AND from_authority_revision=?`).all(value.session.id, originalCaptured.authorityRevision))
+        .toEqual([{
+          from_provider_account_id: originalCaptured.providerAccountId,
+          to_provider_account_id: originalCaptured.providerAccountId,
+          from_profile_id: originalCaptured.profileId, to_profile_id: originalCaptured.profileId,
+          from_provider: "codex", to_provider: "codex",
+          from_binding_generation: originalCaptured.bindingGeneration,
+          to_binding_generation: originalCaptured.bindingGeneration,
+          from_process_generation: originalCaptured.processGeneration,
+          to_process_generation: rebound.processGeneration,
+          transition_kind: "provider_restart", transition_id: restartBootId,
+        }]);
+    } finally { successorReader.close(false); }
     const restartedPersonalCodex = new FakeCodex();
     restartedPersonalCodex.readProjection = {
       ...value.personalCodex.readProjection,
@@ -2915,6 +2974,8 @@ describe("HraService personal-session adoption", () => {
       personalDiscovery: value.discovery,
       cloud: new FakeCloud(),
       daemonAuthority: new FakeDaemonAuthority(),
+      daemonGeneration: restartGeneration,
+      daemonBootId: restartBootId,
       eventCursors: value.eventCursors,
       now: () => personalAdoptionNow,
       requestStop: () => undefined,
@@ -6516,11 +6577,9 @@ describe("HraService personal-session adoption", () => {
 
   test("pages every authorized local session and retired history while provider listing is recovery-blocked", async () => {
     const cloud = new FakeCloud();
-    const value = await fixture(undefined, cloud);
-    const added = await value.service.execute(
-      { kind: "account.add", label: "Recovery local pagination" },
-      { signal },
-    ) as { account: { id: `acct_${string}` } };
+    const value = await archivedDevinFixture(cloud);
+    await abandonArchivedDevinLogin(value);
+    const added = { account: value.captured.profile };
     await value.service.execute({
       kind: "account.login",
       account: added.account.id,
@@ -6540,7 +6599,7 @@ describe("HraService personal-session adoption", () => {
       });
       return session.id;
     }));
-    expectedIds.add(legacyDevinSession(value, added.account.id).id);
+    expectedIds.add(value.captured.session.id);
     const callsBeforeListing = [...value.codex.calls];
     cloud.unsettledProjectionProfiles.add(added.account.id);
     value.codex.listedProjections = [{
@@ -10679,7 +10738,6 @@ describe("HraService", () => {
         runtimeScope: "managed",
         accountKey: codexProviderAccountKey(),
       });
-      const profile = value.store.requireProfileById(target.profileId);
       const idempotencyKey = crypto.randomUUID();
       const message = "prepared peer restart message";
       const request = {
@@ -10694,12 +10752,15 @@ describe("HraService", () => {
         idempotencyKey,
       };
       const admitted = value.store.admitPeerSessionAction(request);
-      value.store.prepareMutation({
+      const prepared = value.store.prepareSessionInputMutation({
         kind: "session.send",
-        authorityId: target.id,
-        authorityGeneration: profile.processGeneration,
-        request: { message },
+        sessionId: target.id,
+        providerAuthority: value.store.requireProviderAccountAuthority(target.profileId, "codex"),
+        message,
+        attachments: [],
         idempotencyKey,
+        daemonGeneration: value.daemonGeneration,
+        bootId: value.daemonBootId,
       });
       if (peerEffectStarted) value.store.beginPeerSessionActionEffect(admitted.action.id);
       expect(value.store.requirePeerSessionAction(admitted.action.id).state)
@@ -10721,12 +10782,16 @@ describe("HraService", () => {
 
       expect(value.store.requirePeerSessionAction(admitted.action.id).state).toBe("cancelled");
       expect(value.store.readMutation(idempotencyKey)).toMatchObject({
+        id: prepared.attempt.id,
+        kind: "session.send",
         state: "cancelled",
-        result: {
-          code: "PEER_SESSION_PROVIDER_EFFECT_NOT_STARTED",
-          peerActionId: admitted.action.id,
-          providerEffectStarted: false,
-        },
+      });
+      // Genuine retained input keeps its own no-effect custody receipt; the
+      // terminal peer action, not an invented mutation result, proves cancel.
+      expect(value.store.readMutation(idempotencyKey)?.result).toBeUndefined();
+      expect(value.store.readPeerSessionMutationJoin(idempotencyKey)).toMatchObject({
+        action: { id: admitted.action.id, state: "cancelled" },
+        attempt: { id: prepared.attempt.id, state: "cancelled" },
       });
       expect(providerMutationCalls(restartedCodex)).toEqual([]);
       await restarted.close();
@@ -11358,7 +11423,7 @@ describe("HraService", () => {
     },
   );
 
-  test("fences established and peer Claude targets with universally unavailable profiles", async () => {
+  test("fences recovery-blocked Claude targets and terminal history under removed profiles", async () => {
     for (const provider of ["claude"] as const) {
       for (const profileState of ["recovery_required", "removed"] as const) {
         const value = await claudeAccountFixture(true);
@@ -11384,13 +11449,26 @@ describe("HraService", () => {
           providerThreadId: `provider-${provider}-${fence}-target`,
           state: "idle",
         });
-        expect(value.store.setProfileState(
-          targetProfile.id,
-          targetProfile.processGeneration,
-          profileState,
-        )).toBe(true);
+        if (profileState === "removed") {
+          // Removal requires all owned sessions to be terminal. Do not invent
+          // the impossible current state of a live session on a removed owner.
+          value.store.setSessionTurnState({
+            sessionId: target.id,
+            expectedRevision: target.revision,
+            state: "terminal",
+          });
+          value.store.removeProfile(targetProfile.id);
+          expect(value.store.requireProfileById(targetProfile.id, { includeRemoved: true }).state).toBe("removed");
+        } else {
+          expect(value.store.setProfileState(
+            targetProfile.id,
+            targetProfile.processGeneration,
+            profileState,
+          )).toBe(true);
+        }
 
-        const establishedCode = profileState === "removed" ? "NOT_FOUND" : "RECOVERY_REQUIRED";
+        // The terminal-session fence precedes profile selection on direct input.
+        const establishedCode = profileState === "removed" ? "CONFLICT" : "RECOVERY_REQUIRED";
         await expect(value.service.execute({
           kind: "session.send",
           session: target.id,
@@ -13319,29 +13397,11 @@ describe("HraService", () => {
   });
 
   test("preserves historical Devin login custody until exact acknowledged cleanup", async () => {
-    const value = await fixture();
-    const profile = value.store.createProfile("Retired grant");
-    const key = "00000000-0000-4000-8000-000000000711";
-    const attemptId = "attempt_00000000000000000000000000000711" as const;
-    const request = JSON.stringify({
-      kind: "account.devin-login", authorityId: profile.id,
-      authorityGeneration: profile.processGeneration, request: { provider: "devin" },
-    });
-    const evidence = JSON.stringify({
-      kind: "account.devin-login", provider: "devin", baselineSignedIn: false,
-    });
-    const digest = (text: string) => createHash("sha256").update(text).digest("hex");
-    const legacy = new Database(value.paths.database, { strict: true });
-    try {
-      legacy.query(
-        "INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at) VALUES (?,?,'account.devin-login',?,?,?,'effect_started',0,0)",
-      ).run(attemptId, key, profile.id, profile.processGeneration, digest(request));
-      legacy.query(
-        "INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,'account.devin-login',?,?,0)",
-      ).run(attemptId, evidence, digest(evidence));
-    } finally {
-      legacy.close();
-    }
+    const value = await archivedDevinFixture();
+    const profile = value.captured.profile;
+    const key = value.captured.idempotencyKey;
+    const attemptId = value.captured.mutation.id;
+    const original = value.store.readMutation(key);
     const status = await value.service.execute({
       kind: "account.show", account: profile.id, provider: "devin",
     }, { signal }) as { recovery: Record<string, unknown> };
@@ -13363,6 +13423,8 @@ describe("HraService", () => {
     expect(value.store.readMutation(key)).toMatchObject({
       state: "reconciled", resolution: { kind: "abandoned" },
     });
+    expect(value.store.readMutation(key)?.evidence).toEqual(original?.evidence);
+    expect(value.store.readMutation(key)?.requestDigest).toBe(original?.requestDigest);
     expect(value.codex.calls).toEqual([]);
   });
 
@@ -14276,21 +14338,113 @@ describe("HraService", () => {
   });
 
   test("fails closed for an unrecognized provider-level interaction method", async () => {
-    const { service, store, codex } = await fixture();
+    const { store, codex, paths } = await fixture();
     const profile = store.createProfile("Unknown provider interaction");
-    const interaction = store.admitInteraction({
+    const snapshot = () => {
+      const database = new Database(paths.database, { strict: true });
+      try {
+        database.exec("PRAGMA query_only=ON");
+        return database.transaction(() => {
+          const tables = database.query<{ name: string }, []>(
+            "SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name",
+          ).all();
+          return {
+            schema: database.query("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name").all(),
+            rows: tables.map(({ name }) => {
+              if (!/^[A-Za-z0-9_]+$/u.test(name)) throw new Error("Unexpected fixture table name.");
+              return [name, database.query(`SELECT * FROM "${name}"`).all()
+                .map((row) => JSON.stringify(row)).sort()];
+            }),
+          };
+        }).deferred();
+      } finally { database.close(false); }
+    };
+    const before = snapshot();
+    const calls = [...codex.calls];
+    // Unbound unknown methods have no admitted provider source. Known foreign
+    // methods cannot borrow the explicitly captured Codex tuple either.
+    for (const [method, diagnostic] of [
+      ["future-provider/requestApproval", "provider interaction authority mismatch"],
+      ["claude/control_request/can_use_tool", "INTERACTION_PROVIDER_AUTHORITY_MISMATCH"],
+      ["devin/session/request_permission", "RETIRED_PROVIDER_ADMISSION_REFUSED"],
+    ] as const) {
+      expect(() => store.admitInteraction({
+        authority: {
+          ...codexInteractionBinding(store, profile.id),
+          approvalId: null,
+          connectionId: "30000000-0000-4000-8000-000000000004",
+          itemId: "unknown-item",
+          method,
+          processGeneration: profile.processGeneration,
+          profileId: profile.id,
+          requestDigest: "a".repeat(64),
+          requestId: { type: "string", value: "unknown-request" },
+          threadId: null,
+          turnId: null,
+        },
+        blocking: true,
+        display: {
+          availableDecisions: ["once", "decline", "cancel"],
+          commandClass: "unknown",
+          kind: "command_approval",
+          reason: null,
+          summary: "Unknown provider request",
+          workingDirectory: null,
+        },
+        kind: "command_approval",
+        publicId: "30000000-0000-4000-8000-000000000005",
+        sessionId: null,
+      })).toThrow(diagnostic);
+      expect(snapshot()).toEqual(before);
+    }
+    expect(codex.calls).toEqual(calls);
+    expect(codex.inspectedInteractions).toEqual([]);
+    expect(codex.validatedInteractions).toEqual([]);
+    expect(codex.resolvedInteractions).toEqual([]);
+    expect(codex.validatedInteractionTimeouts).toEqual([]);
+    expect(codex.timedOutInteractions).toEqual([]);
+  });
+
+  test("fails closed for unknown or cross-provider methods on a bound session", async () => {
+    let now = 50_000;
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const { sessionId } = await createIdleSession(value, "Provider-bound interaction");
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
+
+    const snapshot = () => {
+      const database = new Database(value.paths.database, { strict: true });
+      try {
+        database.exec("PRAGMA query_only=ON");
+        return database.transaction(() => {
+          const tables = database.query<{ name: string }, []>(
+            "SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name",
+          ).all();
+          return {
+            schema: database.query("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name").all(),
+            rows: tables.map(({ name }) => {
+              if (!/^[A-Za-z0-9_]+$/u.test(name)) throw new Error("Unexpected fixture table name.");
+              return [name, database.query(`SELECT * FROM "${name}"`).all()
+                .map((row) => JSON.stringify(row)).sort()];
+            }),
+          };
+        }).deferred();
+      } finally { database.close(false); }
+    };
+    const input: Parameters<StateStore["admitInteraction"]>[0] = {
       authority: {
-        ...codexInteractionBinding(store, profile.id),
+        ...codexInteractionBinding(value.store, profile.id),
         approvalId: null,
-        connectionId: "30000000-0000-4000-8000-000000000004",
-        itemId: "unknown-item",
+        connectionId: "30000000-0000-4000-8000-000000000014",
+        itemId: "provider-bound-item",
         method: "future-provider/requestApproval",
         processGeneration: profile.processGeneration,
         profileId: profile.id,
-        requestDigest: "a".repeat(64),
-        requestId: { type: "string", value: "unknown-request" },
-        threadId: null,
-        turnId: null,
+        requestDigest: "1".repeat(64),
+        requestId: { type: "string", value: "provider-bound-request" },
+        threadId: session.providerThreadId,
+        turnId: "provider-bound-turn",
       },
       blocking: true,
       display: {
@@ -14298,15 +14452,34 @@ describe("HraService", () => {
         commandClass: "unknown",
         kind: "command_approval",
         reason: null,
-        summary: "Unknown provider request",
+        summary: "Provider-bound request",
         workingDirectory: null,
       },
       kind: "command_approval",
-      publicId: "30000000-0000-4000-8000-000000000005",
-      sessionId: null,
-    }).record;
-
-    await expect(service.execute({
+      publicId: "30000000-0000-4000-8000-000000000015",
+      sessionId: session.id,
+    };
+    const beforeAdmission = snapshot();
+    for (const [method, diagnostic] of [
+      ["claude/control_request/can_use_tool", "INTERACTION_PROVIDER_AUTHORITY_MISMATCH"],
+      ["devin/session/request_permission", "RETIRED_PROVIDER_ADMISSION_REFUSED"],
+    ] as const) {
+      expect(() => value.store.admitInteraction({ ...input, authority: { ...input.authority, method } }))
+        .toThrow(diagnostic);
+      expect(snapshot()).toEqual(beforeAdmission);
+    }
+    // A bound unknown method can be retained, but it cannot dispatch through
+    // the session's otherwise valid captured provider-account authority.
+    const interaction = value.store.admitInteraction(input).record;
+    const before = snapshot();
+    const calls = [...value.codex.calls];
+    await expect(value.service.execute({
+      kind: "interaction.inspect", interaction: interaction.publicId, expectedRevision: interaction.revision,
+    }, { signal })).rejects.toMatchObject({
+      code: "RECOVERY_REQUIRED", details: { reason: "interaction_provider_unknown" },
+    });
+    expect(snapshot()).toEqual(before);
+    await expect(value.service.execute({
       expectedRevision: interaction.revision,
       interaction: interaction.publicId,
       kind: "interaction.resolve",
@@ -14315,82 +14488,17 @@ describe("HraService", () => {
       code: "RECOVERY_REQUIRED",
       details: { reason: "interaction_provider_unknown" },
     });
-
-    expect(codex.validatedInteractions).toEqual([]);
-    expect(codex.resolvedInteractions).toEqual([]);
-    expect(store.requireInteraction(interaction.publicId)).toMatchObject({
-      revision: interaction.revision,
-      state: "pending",
-    });
-  });
-
-  test("fails closed for unknown or cross-provider methods on a bound session", async () => {
-    const value = await fixture();
-    const { sessionId } = await createIdleSession(value, "Provider-bound interaction");
-    const session = value.store.requireSession(sessionId);
-    const profile = value.store.requireProfileById(session.profileId);
-    if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-
-    const cases = [
-      {
-        connectionId: "30000000-0000-4000-8000-000000000014",
-        method: "future-provider/requestApproval",
-        publicId: "30000000-0000-4000-8000-000000000015",
-        reason: "interaction_provider_unknown",
-      },
-      {
-        connectionId: "30000000-0000-4000-8000-000000000024",
-        method: "devin/session/request_permission",
-        publicId: "30000000-0000-4000-8000-000000000025",
-        reason: "interaction_provider_session_mismatch",
-      },
-    ] as const;
-    for (const [index, candidate] of cases.entries()) {
-      const interaction = value.store.admitInteraction({
-        authority: {
-          ...codexInteractionBinding(value.store, profile.id),
-          approvalId: null,
-          connectionId: candidate.connectionId,
-          itemId: `provider-bound-item-${String(index)}`,
-          method: candidate.method,
-          processGeneration: profile.processGeneration,
-          profileId: profile.id,
-          requestDigest: String(index + 1).repeat(64),
-          requestId: { type: "string", value: `provider-bound-request-${String(index)}` },
-          threadId: session.providerThreadId,
-          turnId: `provider-bound-turn-${String(index)}`,
-        },
-        blocking: true,
-        display: {
-          availableDecisions: ["once", "decline", "cancel"],
-          commandClass: "unknown",
-          kind: "command_approval",
-          reason: null,
-          summary: "Provider-bound request",
-          workingDirectory: null,
-        },
-        kind: "command_approval",
-        publicId: candidate.publicId,
-        sessionId: session.id,
-      }).record;
-
-      await expect(value.service.execute({
-        expectedRevision: interaction.revision,
-        interaction: interaction.publicId,
-        kind: "interaction.resolve",
-        resolution: { decision: "once", kind: "approval_decision" },
-      }, { signal })).rejects.toMatchObject({
-        code: "RECOVERY_REQUIRED",
-        details: { reason: candidate.reason },
-      });
-      expect(value.store.requireInteraction(interaction.publicId)).toMatchObject({
-        revision: interaction.revision,
-        state: "pending",
-      });
-    }
-
+    expect(snapshot()).toEqual(before);
+    now = interaction.deadlineAt;
+    expect(await value.service.maintainInteractionDeadlines()).toEqual({ examined: 1, failed: 1 });
+    expect(value.store.requireInteraction(interaction.publicId)).toEqual(interaction);
+    expect(snapshot()).toEqual(before);
+    expect(value.codex.calls).toEqual(calls);
+    expect(value.codex.inspectedInteractions).toEqual([]);
     expect(value.codex.validatedInteractions).toEqual([]);
     expect(value.codex.resolvedInteractions).toEqual([]);
+    expect(value.codex.validatedInteractionTimeouts).toEqual([]);
+    expect(value.codex.timedOutInteractions).toEqual([]);
   });
 
   test("archives and unarchives a session and filters the default listing", async () => {
@@ -15055,11 +15163,9 @@ describe("HraService", () => {
   });
 
   test("pages every durable provider session before Codex discovery without duplicates", async () => {
-    const value = await fixture();
-    const added = await value.service.execute(
-      { kind: "account.add", label: "Mixed provider history" },
-      { signal },
-    ) as { account: { id: `acct_${string}` } };
+    const value = await archivedDevinFixture();
+    await abandonArchivedDevinLogin(value);
+    const added = { account: value.captured.profile };
     await value.service.execute({
       kind: "account.login",
       account: added.account.id,
@@ -15077,7 +15183,7 @@ describe("HraService", () => {
         state: "idle",
         title: "Durable Claude one",
       });
-    const durableDevin = legacyDevinSession(value, added.account.id);
+    const durableDevin = value.store.requireSession(value.captured.session.id);
     const secondClaude = value.store.upsertProviderSession({
       providerAuthority: value.store.requireProviderAccountAuthority(added.account.id, "claude"),
         profileId: added.account.id,
@@ -15463,125 +15569,68 @@ describe("HraService", () => {
     expect(JSON.stringify(transcript)).not.toContain(Buffer.from(png).toString("base64"));
   });
 
-  test("projects predecessor attachment names only for an exact durable send or steer replay", async () => {
-    const value = await fixture();
-    const { service, codex, documents, paths, store } = value;
-    const added = await service.execute(
-      { kind: "account.add", label: "Legacy attachment replay" },
-      { signal },
-    ) as { account: { id: string } };
-    await service.execute(
-      { kind: "account.login", account: added.account.id, deviceCode: false },
-      { signal },
-    );
-    await service.execute(
-      { kind: "project.add", label: "Legacy attachment docs", path: documents },
-      { signal },
-    );
-    const started = await service.execute({
-      account: added.account.id,
-      fast: false,
-      kind: "session.start",
-      preset: "high",
-      presetContract: 1,
-    }, { signal }) as { session: { id: `sess_${string}` } };
-    const session = store.requireSession(started.session.id);
-    const profile = store.requireProfileById(session.profileId);
-    const unsafeNames = [
-      `legacy${String.fromCodePoint(0x2028)}notes.txt`,
-      `legacy${String.fromCodePoint(0x2029)}notes.txt`,
-      "legacy�notes.txt",
-    ];
-    const projectedNames = [
-      "legacy�notes~1.txt",
-      "legacy�notes~2.txt",
-      "legacy�notes.txt",
-    ];
-    for (const name of unsafeNames) await writeFile(join(documents, name), "legacy body");
-    const blobs = AttachmentBlobStore.forStatePaths(paths);
-    const legacyAttachments = await ingestAttachments(
-      blobs,
-      unsafeNames,
-      documents,
-      { allowLegacyReplayName: true },
-    );
-    const sendKey = "00000000-0000-4000-8000-00000000020a";
-    const sendMessage = "finish the prepared send";
-    const preparedSend = store.prepareMutation({
-      authorityGeneration: profile.processGeneration,
-      authorityId: session.id,
-      idempotencyKey: sendKey,
-      kind: "session.send",
-      request: { message: sendMessage, attachments: legacyAttachments },
-    });
-
-    const sent = await service.execute({
-      attachments: [...legacyAttachments],
-      idempotencyKey: sendKey,
-      kind: "session.send",
-      message: sendMessage,
-      session: session.id,
-    }, { signal }) as { attachments: readonly { name: string }[] };
-    expect(sent.attachments.map(({ name }) => name)).toEqual(projectedNames);
-    expect(codex.startTurnAttachments.at(-1)?.attachments?.map(({ name }) => name))
-      .toEqual(projectedNames);
-    expect(store.messageAttachmentManifest(session.id, preparedSend.id)
-      .map(({ name }) => name)).toEqual(projectedNames);
-
-    const providerCallsAfterSend = [...codex.calls];
-    const replayedSend = await service.execute({
-      attachments: [...legacyAttachments],
-      idempotencyKey: sendKey,
-      kind: "session.send",
-      message: sendMessage,
-      session: session.id,
-    }, { signal }) as { attachments: readonly { name: string }[] };
-    expect(replayedSend.attachments.map(({ name }) => name)).toEqual(projectedNames);
-    expect(codex.calls).toEqual(providerCallsAfterSend);
-
-    const absentKey = "00000000-0000-4000-8000-00000000020b";
-    await expect(service.execute({
-      attachments: [...legacyAttachments],
-      idempotencyKey: absentKey,
-      kind: "session.send",
-      message: sendMessage,
-      session: session.id,
-    }, { signal })).rejects.toMatchObject({ code: "INVALID_INPUT" });
-    expect(store.readMutation(absentKey)).toBeNull();
-    expect(codex.calls).toEqual(providerCallsAfterSend);
-
-    const steerKey = "00000000-0000-4000-8000-00000000020c";
-    const steerMessage = "finish the prepared steer";
-    const preparedSteer = store.prepareMutation({
-      authorityGeneration: profile.processGeneration,
-      authorityId: session.id,
-      idempotencyKey: steerKey,
-      kind: "session.steer",
-      request: { message: steerMessage, attachments: legacyAttachments },
-    });
-    const steered = await service.execute({
-      attachments: [...legacyAttachments],
-      idempotencyKey: steerKey,
-      kind: "session.steer",
-      message: steerMessage,
-      session: session.id,
-    }, { signal }) as { attachments: readonly { name: string }[]; steered: boolean };
-    expect(steered.steered).toBe(true);
-    expect(steered.attachments.map(({ name }) => name)).toEqual(projectedNames);
-    expect(codex.steerAttachments.at(-1)?.attachments?.map(({ name }) => name))
-      .toEqual(projectedNames);
-    expect(store.messageAttachmentManifest(session.id, preparedSteer.id)
-      .map(({ name }) => name)).toEqual(projectedNames);
-    const providerCallsAfterSteer = [...codex.calls];
-    await expect(service.execute({
-      attachments: [...legacyAttachments],
-      idempotencyKey: steerKey,
-      kind: "session.steer",
-      message: `${steerMessage} changed`,
-      session: session.id,
-    }, { signal })).rejects.toMatchObject({ code: "INVALID_INPUT" });
-    expect(codex.calls).toEqual(providerCallsAfterSteer);
-  });
+  test.each(["send", "steer"] as const)(
+    "projects authentic predecessor attachment names only for its exact settled replay (%s)",
+    async (scenario) => {
+      const captured = canonical39AttachmentFixtures[scenario];
+      const { service, codex, store, paths } = await fixture(
+        undefined, new FakeCloud(), () => undefined, () => 40_000, undefined, {},
+        { canonical39Attachments: scenario },
+      );
+      const unsafeNames = [
+        "legacy\u2028notes.txt", "legacy\u2029notes.txt", "legacy�notes.txt",
+      ];
+      const projectedNames = ["legacy�notes~1.txt", "legacy�notes~2.txt", "legacy�notes.txt"];
+      expectHistoricalValue(captured.request.attachments.map(({ name }) => name), unsafeNames);
+      expectHistoricalValue(captured.manifest.map(({ name }) => name), unsafeNames);
+      expect(store.readMutation(captured.idempotencyKey)?.requestDigest).toBe(captured.mutation.requestDigest);
+      expectHistoricalValue(store.readMutation(captured.idempotencyKey)?.evidence, captured.mutation.evidence);
+      expectHistoricalValue(store.readMutation(captured.idempotencyKey)?.result, captured.mutation.result);
+      const expectedAttachments = captured.request.attachments.map((attachment, index) => ({
+        ...attachment, name: projectedNames[index],
+      }));
+      expectHistoricalValue(store.messageAttachmentManifest(captured.session.id, captured.mutation.id), expectedAttachments);
+      const blobs = AttachmentBlobStore.forStatePaths(paths);
+      // Only archived terminal receipts/manifests were imported. No blob file or
+      // renewed native authority is manufactured to make a settled replay work.
+      await expect(readFile(blobs.pathFor(captured.attachments[0].digest, "text/plain")))
+        .rejects.toMatchObject({ code: "ENOENT" });
+      const base = {
+        kind: scenario === "send" ? "session.send" as const : "session.steer" as const,
+        session: captured.session.id, message: captured.request.message,
+        attachments: captured.request.attachments.map((attachment) => ({ ...attachment })),
+      };
+      const command = { ...base, idempotencyKey: captured.idempotencyKey };
+      const before = serviceFixtureDatabaseSnapshot(paths.database);
+      for (let replay = 0; replay < 2; replay++) {
+        const replayed = await service.execute(command, { signal });
+        expect(replayed).toMatchObject({
+          idempotencyKey: captured.idempotencyKey, attachments: expectedAttachments,
+        });
+        expect(serviceFixtureDatabaseSnapshot(paths.database)).toEqual(before);
+      }
+      const absentKey = crypto.randomUUID();
+      for (const key of [undefined, absentKey]) {
+        await expect(service.execute({
+          ...base, ...(key === undefined ? {} : { idempotencyKey: key }),
+        }, { signal })).rejects.toMatchObject({ code: "INVALID_INPUT" });
+        expect(store.readMutation(absentKey)).toBeNull();
+        expect(serviceFixtureDatabaseSnapshot(paths.database)).toEqual(before);
+      }
+      for (const changed of [
+        { ...command, message: command.message + " changed" },
+        { ...command, attachments: command.attachments.map((attachment, index) => ({
+          ...attachment, name: index === 0 ? "different\u2028notes.txt" : attachment.name,
+        })) },
+      ]) {
+        await expect(service.execute(changed, { signal })).rejects.toMatchObject({ code: "INVALID_INPUT" });
+        expect(serviceFixtureDatabaseSnapshot(paths.database)).toEqual(before);
+      }
+      expect(codex.calls).toEqual([]);
+      expectHistoricalValue(store.readMutation(captured.idempotencyKey)?.result, captured.mutation.result);
+      expectHistoricalValue(store.readMutation(captured.idempotencyKey)?.evidence, captured.mutation.evidence);
+    },
+  );
 
   test.each(["accounted", "unaccounted"] as const)("attachment cleanup rechecks a competing writer's reference after the %s snapshot", async (mode) => {
     const value = await fixture();
@@ -16207,7 +16256,7 @@ describe("HraService", () => {
     }).success).toBe(false);
   });
 
-  test("refuses a cross-account provider switch before effects once working memory is bound", async () => {
+  test.each([false, true])("honors bound working-memory ownership during a cross-account switch (unsettled=%s)", async (unsettled) => {
     const factsMemory = new FakeFactsMemoryLifecycle();
     const value = await fixture(
       undefined,
@@ -16234,7 +16283,7 @@ describe("HraService", () => {
       preset: "high",
       presetContract: legacyPresetContract,
       fast: false,
-    }, { signal }) as { session: { id: string } };
+    }, { signal }) as { session: { id: `sess_${string}` } };
     const target = await value.service.execute(
       { kind: "account.add", label: "Memory switch target" },
       { signal },
@@ -16244,20 +16293,52 @@ describe("HraService", () => {
       { signal },
     );
     const callsBeforeSwitch = [...value.codex.calls];
-
-    const refused = await value.service.execute({
-      account: target.account.id,
+    const memoryBefore = factsMemory.readSession(started.session.id);
+    if (memoryBefore === null) throw new Error("Expected an existing facts-memory owner.");
+    expect(memoryBefore.ownerId).toBe(source.account.id);
+    const session = value.store.requireSession(started.session.id);
+    if (session.projectId === undefined) throw new Error("Expected a project-bound session.");
+    const prepared = unsettled ? value.store.prepareMemorySubmission({
+      actorSessionId: session.id, projectId: session.projectId, kind: "remember",
+      requestDigest: "1".repeat(64), contentDigest: "2".repeat(64), keyDigest: "3".repeat(64),
+      workingBindingDigest: memoryBefore.bindingDigest, workingEpoch: memoryBefore.epoch,
+      expectedHead: { sequence: 0, operationSha256: null, headDigest: PROJECT_MEMORY_EMPTY_HEAD.headDigest },
       idempotencyKey: crypto.randomUUID(),
-      kind: "session.switch",
+    }).record : null;
+    const before = serviceFixtureDatabaseSnapshot(value.paths.database);
+    const key = crypto.randomUUID();
+    const command = {
+      account: target.account.id,
+      idempotencyKey: key,
+      kind: "session.switch" as const,
       presetContract: legacyPresetContract,
-      provider: "codex",
+      provider: "codex" as const,
       session: started.session.id,
-    }, { signal }).catch((error: unknown) => error);
-
-    expect(refused).toMatchObject({ code: "CONFLICT", name: "CommandFailure" });
-    expect(String(refused)).toContain("working memory bound to its current account");
-    expect(value.codex.calls).toEqual(callsBeforeSwitch);
-    expect(value.store.requireSession(started.session.id).profileId).toBe(source.account.id);
+    };
+    if (prepared !== null) {
+      await expect(value.service.execute(command, { signal })).rejects.toMatchObject({
+        code: "RECOVERY_REQUIRED", details: { sessionId: session.id, submissionId: prepared.id, submissionState: "prepared" },
+      });
+      expect(value.codex.calls).toEqual(callsBeforeSwitch);
+      expect(serviceFixtureDatabaseSnapshot(value.paths.database)).toEqual(before);
+      expect(factsMemory.readSession(session.id)).toEqual(memoryBefore);
+      expect(factsMemory.transfers).toEqual([]);
+    } else {
+      await value.service.execute(command, { signal });
+      const record = value.store.readSessionSwitchByIdempotencyKey(key);
+      if (record === null) throw new Error("Expected the committed switch journal.");
+      const digest = createHash("sha256").update(JSON.stringify({
+        domain: "hra:session-switch-facts-memory-owner:v1", attemptId: record.attemptId,
+        sourceAuthority: record.sourceAuthority, targetAuthority: record.targetAuthority,
+      })).digest("hex");
+      expect(factsMemory.transfers).toHaveLength(1);
+      expect(factsMemory.transfers[0]).toMatchObject({ sessionId: session.id,
+        fromOwnerId: source.account.id, toOwnerId: target.account.id, operationKey: `session-switch-owner:${digest}` });
+      expect(factsMemory.readSession(session.id)).toEqual({ ...memoryBefore,
+        ownerId: target.account.id, epoch: memoryBefore.epoch + 1 });
+      expect(value.store.requireSession(session.id).profileId).toBe(target.account.id);
+    }
+    expect(factsMemory.cleanups).toEqual([]);
   });
 
   test("cancels pre-effect memory submissions before terminal facts-memory purge", async () => {
@@ -19743,6 +19824,7 @@ describe("HraService", () => {
     if (recoveryRuntime === undefined) throw new Error("Expected a recovery runtime profile.");
     const pendingReplayKey = "00000000-0000-4000-8000-000000000807";
     const pendingReplayMessage = "settled before compact recovery";
+    let pendingReplayAttempt: ReturnType<StateStore["prepareSessionInputMutation"]>["attempt"] | undefined;
     const peerCreated = value.store.createSession({
       profileId: recoveryProfile.id,
       title: "Same-account recovery peer",
@@ -19780,18 +19862,17 @@ describe("HraService", () => {
         threadId: recoverySession.providerThreadId as string,
         type: "threadNameUpdated",
       });
-      const pendingReplay = value.store.prepareMutation({
-        authorityGeneration: recoveryProfile.processGeneration,
-        authorityId: sessionId,
-        providerAuthorities: [{
-          role: "primary",
-          provenance: "session_send",
-          authority: value.store.requireProviderAccountAuthority(recoveryProfile.id, "codex"),
-        }],
+      const { attempt: pendingReplay } = value.store.prepareSessionInputMutation({
+        sessionId,
+        providerAuthority: value.store.requireProviderAccountAuthority(recoveryProfile.id, "codex"),
+        message: pendingReplayMessage,
+        attachments: [],
+        daemonGeneration: value.daemonGeneration,
+        bootId: value.daemonBootId,
         idempotencyKey: pendingReplayKey,
         kind: "session.send",
-        request: { message: pendingReplayMessage },
       });
+      pendingReplayAttempt = pendingReplay;
       value.store.beginSessionMutationEffect({
         attemptId: pendingReplay.id,
         evidence: {
@@ -19821,12 +19902,8 @@ describe("HraService", () => {
           providerGeneration: recoveryProfile.processGeneration,
         },
       });
-      expect(value.store.transitionMutation(pendingReplay.id, "effect_started", "applied", {
-        effectiveRuntimeProfile: recoveryRuntime,
-        sourceId: pendingReplay.id,
-        status: "inProgress",
-        turnId: "turn-pending-compact-recovery",
-      })).toBe(true);
+      // The admitted turn remains in flight while projection recovery holds
+      // the fence; no applied receipt or source runtime is fabricated.
       await value.service.observeCodexAccount(recoveryAuthority, { signedIn: false });
       entered();
       await recoveryGate;
@@ -19887,6 +19964,18 @@ describe("HraService", () => {
 
     release();
     await expect(recovery).resolves.toBe(cloud.projectionRecoveryResult);
+    if (pendingReplayAttempt === undefined) throw new Error("Expected the admitted in-flight turn.");
+    value.store.completeSessionTurnEffect({
+      attemptId: pendingReplayAttempt.id, sessionId,
+      accountId: recoveryProfile.id, providerGeneration: recoveryProfile.processGeneration,
+      providerAuthority: value.store.requireProviderAccountAuthority(recoveryProfile.id, "codex"),
+      providerConnectionId: "30000000-0000-4000-8000-00000000000d",
+      expectedSessionRevision: value.store.requireSession(sessionId).revision, applyResponseState: false,
+      turnId: "turn-pending-compact-recovery", turnStatus: "inProgress",
+      runtimeProfile: recoveryRuntime, message: pendingReplayMessage,
+      receipt: { effectiveRuntimeProfile: recoveryRuntime, sourceId: pendingReplayAttempt.id,
+        status: "inProgress", turnId: "turn-pending-compact-recovery" },
+    });
     await expect(value.service.execute({
       idempotencyKey: pendingReplayKey,
       kind: "session.send",
@@ -20024,15 +20113,16 @@ describe("HraService", () => {
       throw new Error("Expected a bound session with a runtime profile.");
     }
     const message = "accepted before transcript commit";
-    const attempt = value.store.prepareMutation({
+    const { attempt } = value.store.prepareSessionInputMutation({
       kind: "session.send",
-      authorityId: session.id,
-      authorityGeneration: profile.processGeneration,
-      request: { message },
+      sessionId: session.id,
+      providerAuthority: value.store.requireProviderAccountAuthority(profile.id, "codex"),
+      message, attachments: [], daemonGeneration: value.daemonGeneration, bootId: value.daemonBootId,
       idempotencyKey: "00000000-0000-4000-8000-000000000806",
     });
     value.store.beginSessionMutationEffect({
       providerAuthority: value.store.requireProviderAccountAuthority(profile.id, "codex"),
+      attachments: [], daemonGeneration: value.daemonGeneration, bootId: value.daemonBootId,
       attemptId: attempt.id,
       message,
       sessionId: session.id,
@@ -21917,11 +22007,13 @@ describe("HraService", () => {
 
     const shown = await restarted.execute({ kind: "account.show", account: added.account.id }, { signal });
     expect(shown).toMatchObject({
-      account: { processGeneration: 2, state: "signed_out" },
+      account: { processGeneration: 2, state: "login_pending" },
+      login: { status: "pending", loginId: "provider-login-crashed-cancel" },
       recovery: { cleared: true, required: false, resolution: "provider_state_reconciled" },
     });
     expect(store.readMutation(idempotencyKey)).toMatchObject({ state: "reconciled", originalState: "ambiguous" });
-    expect(store.readPendingLoginAuthority(added.account.id, 1)).toBeNull();
+    expect(() => store.readPendingLoginAuthority(added.account.id, 1)).toThrow("PROVIDER_LOGIN_BINDING_PROOF_INVALID");
+    expect(store.readPendingLoginAuthority(added.account.id, 2)).toMatchObject({ loginId: "provider-login-crashed-cancel" });
     expect(store.listUnsettledMutations({ authorityId: added.account.id })).toEqual([]);
     expect(store.readMutationProviderAuthorities(attempt.id)).toEqual(capturedAuthority);
     expect(restartedCodex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(0);
@@ -22123,11 +22215,13 @@ describe("HraService", () => {
     await expect(service.execute({ kind: "account.login-cancel", account: added.account.id, idempotencyKey }, { signal }))
       .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
     store.recoverEffectStartedMutations();
-    // Recovery may already have quarantined a cancellation at startup.
-    store.setProfileState(added.account.id, 1, "recovery_required");
+    // Keep the original pending binding: a generic readiness transition is not
+    // the dedicated cancellation-quarantine witness produced at real restart.
     codex.accountProjection = { signedIn: true, email: "race@example.com" };
-    await expect(service.execute({ kind: "account.show", account: added.account.id }, { signal }))
-      .resolves.toMatchObject({ account: { state: "signed_in", processGeneration: 1, providerEmail: "race@example.com" }, recovery: { required: false, cleared: true } });
+    const shown = await service.execute({ kind: "account.show", account: added.account.id }, { signal });
+    expect(shown).toMatchObject({ account: {
+      state: "signed_in", processGeneration: 1, providerEmail: "race@example.com" } });
+    expect(shown).not.toHaveProperty("recovery");
     await service.settled();
     expect(store.requireProfile(added.account.id)).toMatchObject({ state: "signed_in", processGeneration: 1 });
     expect(store.readMutation(idempotencyKey)?.state).toBe("reconciled");
@@ -22569,17 +22663,8 @@ describe("HraService", () => {
   test("reads retired Devin history locally and refuses further provider effects", async () => {
     const factsMemory = new FakeFactsMemoryLifecycle();
     const memory = new FakeMemory();
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
-      () => undefined,
-      Date.now,
-      factsMemory,
-      {},
-      memory,
-    );
-    const profile = value.store.createProfile("Retired session");
-    const session = legacyDevinSession(value, profile.id);
+    const value = await archivedDevinFixture(new FakeCloud(), { factsMemory, memory });
+    const session = value.store.requireSession(value.captured.session.id);
     const before = value.store.requireSession(session.id);
     await expect(value.service.execute({
       kind: "session.show", session: session.id, detail: true,
@@ -22644,9 +22729,8 @@ describe("HraService", () => {
 
   test("keeps retired note changes from minting facts-memory authority", async () => {
     const memory = new FakeFactsMemoryLifecycle();
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, Date.now, memory);
-    const profile = value.store.createProfile("Retired note authority");
-    const session = legacyDevinSession(value, profile.id);
+    const value = await archivedDevinFixture(new FakeCloud(), { factsMemory: memory });
+    const session = value.store.requireSession(value.captured.session.id);
     const beforeMutations = value.store.listUnsettledMutations({ sessionId: session.id });
     try {
       for (const command of [
@@ -22676,9 +22760,8 @@ describe("HraService", () => {
     { kind: "autorespond.set", mode: "auto:all" },
     { kind: "autorespond.set", mode: null },
   ] as const)("rejects retired session policy writes %j without changing history", async (change) => {
-    const value = await fixture();
-    const profile = value.store.createProfile("Retired session policy");
-    const session = legacyDevinSession(value, profile.id);
+    const value = await archivedDevinFixture();
+    const session = value.store.requireSession(value.captured.session.id);
     const approval = value.store.readSessionApprovalMode(session.id);
     try {
       await expect(value.service.execute({ ...change, session: session.id }, { signal }))
@@ -22717,9 +22800,8 @@ describe("HraService", () => {
   });
 
   test("reports retired provider admission for new scheduled tasks without changing history", async () => {
-    const value = await fixture();
-    const profile = value.store.createProfile("Retired task admission");
-    const session = legacyDevinSession(value, profile.id);
+    const value = await archivedDevinFixture();
+    const session = value.store.requireSession(value.captured.session.id);
     const before = value.store.requireSession(session.id);
     try {
       await expect(value.service.execute({
@@ -22739,96 +22821,138 @@ describe("HraService", () => {
     }
   });
 
-  test.each(["bound", "source", "target"] as const)(
-    "quarantines retired %s recovery without changing evidence or causing provider or facts-memory effects",
-    async (side) => {
-      const memory = new FakeFactsMemoryLifecycle();
-      const value = await fixture(undefined, new FakeCloud(), () => undefined, Date.now, memory);
-      const profile = value.store.createProfile(`Retired recovery ${side}`);
-      const session = side === "target"
-        ? (() => {
-            const created = value.store.createSession({
-              profileId: profile.id, provider: "codex", preset: "high", fastEnabled: false,
-            });
-            return value.store.bindSession({
-              sessionId: created.id, expectedRevision: created.revision,
-              providerThreadId: "historical-source-thread", state: "idle",
-            });
-          })()
-        : legacyDevinSession(value, profile.id);
-      const attemptId = `attempt_${crypto.randomUUID().replaceAll("-", "")}`;
-      const key = crypto.randomUUID();
-      const kind = side === "bound" ? "session.send" : "session.switch";
-      const targetRuntimeProfile = side === "target"
-        ? {
-            profileId: profile.id, processGeneration: profile.processGeneration,
-            observedAt: 2_000, preset: "astra", model: "gpt-6-astra",
-            reasoningEffort: "provider-default", devinVersion: "3000.6.14",
-            protocolVersion: 1, isolatedHome: true,
-          }
-        : runtimeProfile(liveAuthorityFor(value.store, profile.id, "codex"));
-      const evidence = side === "bound"
-        ? {
-            kind, providerThreadId: session.providerThreadId,
-            baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
-            clientMessageId: attemptId, messageDigest: "a".repeat(64),
-          }
-        : {
-            kind, requestedAccountId: null, requestedPreset: null,
-            sourceProfileId: profile.id, sourceProcessGeneration: profile.processGeneration,
-            sourceProvider: side === "source" ? "devin" : "codex",
-            sourceProviderThreadId: session.providerThreadId,
-            sourcePreset: side === "source" ? "astra" : "high",
-            targetProfileId: profile.id, targetProcessGeneration: profile.processGeneration,
-            targetProvider: side === "target" ? "devin" : "codex",
-            targetPreset: side === "target" ? "astra" : "high",
-            transcriptDigest: "b".repeat(64), seedDigest: "c".repeat(64),
-            seedIncludedRecords: 0, seedOmittedRecords: 0, runtimeProfile: targetRuntimeProfile,
-          };
-      const encodedEvidence = JSON.stringify(evidence);
-      const legacy = new Database(value.paths.database, { strict: true });
-      try {
-        legacy.query(
-          "INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at) VALUES (?,?,?,?,?,?,'effect_started',0,0)",
-        ).run(attemptId, key, kind, session.id, profile.processGeneration, "d".repeat(64));
-        legacy.query(
-          "INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,0)",
-        ).run(attemptId, kind, encodedEvidence, createHash("sha256").update(encodedEvidence).digest("hex"));
-        if (side !== "bound") {
-          // A started, unseeded opposite-provider target is exactly the old
-          // cleanup branch that must not end another runtime after retirement.
-          legacy.query(
-            "INSERT INTO session_provider_switch_targets(attempt_id,provider_thread_id,recorded_at) VALUES (?,?,0)",
-          ).run(attemptId, "historical-target-thread");
-        }
-      } finally {
-        legacy.close();
-      }
-      const immutableEvidence = value.store.readMutation(key)?.evidence;
-      try {
-        await expect(value.service.recover()).resolves.toBeUndefined();
-        expect(value.store.requireSession(session.id).state).toBe("recovery_required");
-        expect(value.store.readMutation(key)).toMatchObject({
-          state: "ambiguous",
-          evidence: immutableEvidence,
-          result: { code: "DAEMON_RESTART" },
-        });
+  test("quarantines retired bound recovery without changing evidence or causing provider or facts-memory effects", async () => {
+    const memory = new FakeFactsMemoryLifecycle();
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, Date.now,
+      memory, {}, { canonical39RetiredRecovery: "bound_send" });
+    const captured = canonical39RetiredRecoveryFixtures.bound_send.retained;
+    const sessionId = captured.session.id;
+    const key = captured.idempotencyKey;
+    // The released39 producer admitted this actual uncertain send. Current
+    // migration/boot may contain it, but cannot rewrite its original proof.
+    expect(value.store.readMutation(key)?.evidence).toEqual(captured.effect);
+    try {
+      await expect(value.service.recover()).resolves.toBeUndefined();
+      expect(value.store.requireSession(sessionId)).toMatchObject({ provider: "devin", state: "recovery_required" });
+      expect(value.store.readMutation(key)).toMatchObject({
+        ...captured.mutation, state: "ambiguous",
+        result: { code: "DAEMON_RESTART" },
+      });
+      expect(value.store.readMutation(key)?.evidence).toEqual(captured.effect);
+      expect(value.codex.calls).toEqual([]);
+      expect(memory.ensures).toEqual([]);
+      expect(memory.cleanups).toEqual([]);
+      const beforeSession = value.store.requireSession(sessionId);
+      const beforeMutation = value.store.readMutation(key);
+      await expect(value.service.recover()).resolves.toBeUndefined();
+      expect(value.store.requireSession(sessionId)).toEqual(beforeSession);
+      expect(value.store.readMutation(key)).toEqual(beforeMutation);
+      for (const kind of ["session.recover", "session.abandon"] as const) {
+        await expect(value.service.execute({ kind, session: sessionId }, { signal }))
+          .rejects.toMatchObject({ code: "UNAVAILABLE", details: { reason: "provider_retired" } });
+        expect(value.store.requireSession(sessionId)).toEqual(beforeSession);
+        expect(value.store.readMutation(key)).toEqual(beforeMutation);
         expect(value.codex.calls).toEqual([]);
         expect(memory.ensures).toEqual([]);
         expect(memory.cleanups).toEqual([]);
+      }
+      const supported = await createIdleSession(value, "Supported after retired bound");
+      expect(value.store.requireSession(supported.sessionId).provider).toBe("codex");
+    } finally {
+      await value.service.close();
+    }
+  });
+
+  test.each(["source", "target"] as const)(
+    "quarantines retired %s recovery without changing evidence or causing provider or facts-memory effects",
+    async (side) => {
+      const memory = new FakeFactsMemoryLifecycle();
+      const scenario = side === "source" ? "source_switch" : "target_switch";
+      const archive = canonical39RetiredTargetFixtures[scenario];
+      const captured = archive.retained;
+      const value = await fixture(undefined, new FakeCloud(), () => undefined, () => archive.fixedTime,
+        memory, {}, { canonical39RetiredTarget: scenario });
+      const session = value.store.requireSession(captured.session.id);
+      const key = captured.idempotencyKey;
+      const attemptId = captured.mutation.id;
+      const immutableEvidence = captured.effect;
+      // A real archived target-start receipt, with no seed/release receipt,
+      // exercises the obsolete cleanup branch without fabricating live proof.
+      expectHistoricalValue(value.store.readMutation(key)?.evidence, immutableEvidence);
+      expect(value.store.readSessionProviderSwitchProgress(attemptId)).toEqual(captured.progress);
+      try {
+        await expect(value.service.recover()).resolves.toBeUndefined();
+        expect(value.store.requireSession(session.id).state).toBe("recovery_required");
+        // A Codex source without native account-key proof is contained during
+        // migration, before effect recovery can append a result. A retired
+        // source is contained by the mutation-quarantine recovery branch.
+        expect(value.store.readMutation(key)).toMatchObject({
+          ...captured.mutation,
+          state: "ambiguous",
+          evidence: immutableEvidence,
+          providerAuthorityQuarantine: {
+            scopeKind: "mutation", scopeId: attemptId,
+            reason: "unsettled_provider_authority_unproved", recordedAt: archive.fixedTime,
+          },
+        });
+        expect(value.store.readMutation(key)?.result).toEqual(side === "source"
+          ? { code: "LEGACY_PROVIDER_AUTHORITY_QUARANTINED" }
+          : undefined);
+        expect(value.codex.calls).toEqual([]);
+        expect(memory.ensures).toEqual([]);
+        expect(memory.cleanups).toEqual([]);
+        expect(value.store.readSessionProviderSwitchProgress(attemptId)).toEqual(captured.progress);
         const beforeSession = value.store.requireSession(session.id);
         const beforeMutation = value.store.readMutation(key);
         await expect(value.service.recover()).resolves.toBeUndefined();
         expect(value.store.requireSession(session.id)).toEqual(beforeSession);
         expect(value.store.readMutation(key)).toEqual(beforeMutation);
+        expect(value.store.readSessionProviderSwitchProgress(attemptId)).toEqual(captured.progress);
         for (const kind of ["session.recover", "session.abandon"] as const) {
           await expect(value.service.execute({ kind, session: session.id }, { signal }))
-            .rejects.toMatchObject({ code: "UNAVAILABLE", details: { reason: "provider_retired" } });
+            .rejects.toMatchObject(side === "source"
+              ? { code: "UNAVAILABLE", details: { reason: "provider_retired" } }
+              : { code: "RECOVERY_REQUIRED", details: { sessionId: session.id, accountId: captured.profile.id } });
           expect(value.store.requireSession(session.id)).toEqual(beforeSession);
           expect(value.store.readMutation(key)).toEqual(beforeMutation);
+          expect(value.store.readSessionProviderSwitchProgress(attemptId)).toEqual(captured.progress);
           expect(memory.cleanups).toEqual([]);
           expect(memory.ensures).toEqual([]);
           expect(value.codex.calls).toEqual([]);
+        }
+        if (side === "target") {
+          // The original signed-in Codex source correctly fails the earlier
+          // native-account check. A public signed-out observation removes only
+          // that precheck; it cannot invent the missing original account key.
+          const profile = value.store.requireProfileById(captured.profile.id);
+          expect(profile.state).toBe("signed_in");
+          expect(value.store.setProfileState(profile.id, profile.processGeneration, "signed_out")).toBe(true);
+          const signedOut = value.store.requireProfileById(profile.id);
+          expect(signedOut).toMatchObject({
+            id: profile.id, state: "signed_out", processGeneration: profile.processGeneration,
+          });
+          expect(signedOut.providerEmail).toBeUndefined();
+          expect(value.store.sessionAccountAuthorityMatches(session.id, profile.id)).toBe(false);
+          const historyAfterReadiness = {
+            session: value.store.requireSession(session.id),
+            mutation: value.store.readMutation(key),
+            progress: value.store.readSessionProviderSwitchProgress(attemptId),
+          };
+          expect(historyAfterReadiness).toEqual({
+            session: beforeSession, mutation: beforeMutation, progress: captured.progress,
+          });
+          for (const kind of ["session.recover", "session.abandon"] as const) {
+            await expect(value.service.execute({ kind, session: session.id }, { signal }))
+              .rejects.toMatchObject({ code: "UNAVAILABLE", details: { reason: "provider_retired" } });
+            expect(value.store.requireProfileById(profile.id)).toEqual(signedOut);
+            expect(value.store.requireSession(session.id)).toEqual(historyAfterReadiness.session);
+            expect(value.store.readMutation(key)).toEqual(historyAfterReadiness.mutation);
+            expect(value.store.readSessionProviderSwitchProgress(attemptId)).toEqual(captured.progress);
+            expectHistoricalValue(value.store.readMutation(key)?.evidence, immutableEvidence);
+            expect(memory.cleanups).toEqual([]);
+            expect(memory.ensures).toEqual([]);
+            expect(value.codex.calls).toEqual([]);
+          }
         }
         const supported = await createIdleSession(value, `Supported after retired ${side}`);
         expect(value.store.requireSession(supported.sessionId).provider).toBe("codex");
@@ -22840,44 +22964,15 @@ describe("HraService", () => {
 
   test("quarantines an exact retired in-flight start without blocking supported startup", async () => {
     const memory = new FakeFactsMemoryLifecycle();
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, Date.now, memory);
-    const profile = value.store.createProfile("Retired start recovery");
-    await value.service.execute({ kind: "project.add", label: "Historical start project", path: value.documents }, { signal });
-    const project = value.store.listProjects()[0];
-    if (project === undefined) throw new Error("Expected a registered project.");
-    const session = value.store.createSession({
-      profileId: profile.id, projectId: project.id,
-      provider: "codex", preset: "ultra", fastEnabled: false,
-    });
-    const key = crypto.randomUUID();
-    const attemptId = `attempt_${crypto.randomUUID().replaceAll("-", "")}`;
-    const evidence = JSON.stringify({
-      kind: "session.start", projectId: project.id,
-      clientMessageId: null, messageDigest: null,
-      runtimeProfile: {
-        profileId: profile.id, processGeneration: profile.processGeneration,
-        observedAt: 2_000, preset: "astra", model: "gpt-6-astra",
-        reasoningEffort: "provider-default", devinVersion: "3000.6.14",
-        protocolVersion: 1, isolatedHome: true,
-      },
-    });
-    const legacy = new Database(value.paths.database, { strict: true });
-    try {
-      legacy.query(
-        "UPDATE sessions SET provider_v39='devin',preset_contract=?,canonical_profile_key='devin:gpt-6-astra:provider-default' WHERE id=?",
-      ).run(devinPresetContract, session.id);
-      legacy.query(
-        "INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at) VALUES (?,?,'session.start',?,?,?,'effect_started',0,0)",
-      ).run(attemptId, key, profile.id, profile.processGeneration, "d".repeat(64));
-      legacy.query(
-        "INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,'session.start',?,?,0)",
-      ).run(attemptId, evidence, createHash("sha256").update(evidence).digest("hex"));
-      legacy.query("INSERT INTO session_start_attempts(attempt_id,session_id,created_at) VALUES (?,?,0)")
-        .run(attemptId, session.id);
-    } finally {
-      legacy.close();
-    }
-    const immutableEvidence = value.store.readMutation(key)?.evidence;
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, Date.now,
+      memory, {}, { canonical39RetiredRecovery: "inflight_start" });
+    const captured = canonical39RetiredRecoveryFixtures.inflight_start.retained;
+    const session = value.store.requireSession(captured.session.id);
+    const key = captured.idempotencyKey;
+    const immutableEvidence = captured.mutation.evidence;
+    expect(value.store.readMutation(key)?.evidence).toEqual(immutableEvidence);
+    expect(value.store.readMutation(key)?.sessionStartId).toBe(captured.session.id);
+    expect(value.store.requireProject(captured.project.id)).toEqual(captured.project);
     try {
       await expect(value.service.recover()).resolves.toBeUndefined();
       expect(value.store.requireSession(session.id)).toMatchObject({
@@ -22887,6 +22982,9 @@ describe("HraService", () => {
       expect(value.codex.calls).toEqual([]);
       expect(memory.ensures).toEqual([]);
       expect(memory.cleanups).toEqual([]);
+      // The archived public project root is metadata only. Fresh supported
+      // work must use this test's own directory, never that historical root.
+      const project = await value.store.createProject("Supported startup project", value.documents);
       const added = await value.service.execute({
         kind: "account.add", label: "Supported after retired start",
       }, { signal }) as { account: { id: string } };
@@ -22904,38 +23002,17 @@ describe("HraService", () => {
 
   test("quarantines a retired queued send after restart without redispatching or blocking supported work", async () => {
     const memory = new FakeFactsMemoryLifecycle();
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, Date.now, memory);
-    const profile = value.store.createProfile("Retired queue restart");
-    const session = legacyDevinSession(value, profile.id);
-    const queueId = createQueueId();
-    const message = "Historical uncertain queued send";
-    const evidence = JSON.stringify({
-      kind: "queue.dispatch", queueId, sessionId: session.id,
-      providerThreadId: session.providerThreadId, profileGeneration: profile.processGeneration,
-      baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
-      clientMessageId: queueId, messageDigest: createHash("sha256").update(message).digest("hex"),
-      runtimeProfile: {
-        profileId: profile.id, processGeneration: profile.processGeneration,
-        observedAt: 1_000, preset: "astra", model: "gpt-6-astra",
-        reasoningEffort: "provider-default", devinVersion: "3000.6.14",
-        protocolVersion: 1, isolatedHome: true,
-      },
-    });
-    const legacy = new Database(value.paths.database, { strict: true });
-    try {
-      legacy.transaction(() => {
-        legacy.query(
-          "INSERT INTO queue_entries(id,session_id,message,state,enqueue_sequence,created_at,updated_at) VALUES (?,?,?,'dispatching',(SELECT next_sequence FROM queue_sequence_authority WHERE singleton=1),1000,1000)",
-        ).run(queueId, session.id, message);
-        legacy.query("UPDATE queue_sequence_authority SET next_sequence=next_sequence+1 WHERE singleton=1").run();
-        legacy.query("INSERT INTO queue_effect_evidence(queue_id,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,1000)")
-          .run(queueId, evidence, createHash("sha256").update(evidence).digest("hex"));
-      }).immediate();
-    } finally {
-      legacy.close();
-    }
-    const immutableEvidence = value.store.readQueueEffect(queueId);
-    value.store.nextDaemonGeneration(`boot_${"c".repeat(32)}`);
+    // The archived39 writer really admitted this dispatch and its runtime
+    // evidence. The fixture performs the current migration and one real boot;
+    // no current queue or provider authority is retagged as historical input.
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, Date.now,
+      memory, {}, { canonical39Retired: "queue_dispatch" });
+    const captured = canonical39RetiredFixtures.queue_dispatch.retained;
+    const session = value.store.requireSession(captured.session.id);
+    const queueId = captured.queue.id;
+    const message = captured.queue.message;
+    const immutableEvidence = captured.queueEffect;
+    expect(value.store.readQueueEffect(queueId)).toEqual(immutableEvidence);
     try {
       await expect(value.service.recover()).resolves.toBeUndefined();
       await value.service.settled();
@@ -23422,7 +23499,9 @@ describe("HraService", () => {
       loginId: "provider-login-restart",
       processGeneration: 2,
     });
-    expect(store.readPendingLoginAuthority(added.account.id, 1)).toBeNull();
+    const beforeStaleRead = serviceFixtureDatabaseSnapshot(paths.database);
+    expect(() => store.readPendingLoginAuthority(added.account.id, 1)).toThrow("PROVIDER_LOGIN_BINDING_PROOF_INVALID");
+    expect(serviceFixtureDatabaseSnapshot(paths.database)).toEqual(beforeStaleRead);
 
     const restartedCodex = new FakeCodex();
     restartedCodex.accountProjection = { signedIn: false };
@@ -23501,20 +23580,25 @@ describe("HraService", () => {
   });
 
   test("rejects login cancellation after an unbound profile generation change", async () => {
-    const { service, codex, store } = await fixture();
+    const { service, codex, store, paths } = await fixture();
     const added = await service.execute({ kind: "account.add", label: "Stale login" }, { signal }) as { account: { id: `acct_${string}` } };
     codex.loginResult = { status: "pending", loginId: "provider-login-stale" };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     store.nextProfileGeneration(added.account.id);
+    const before = serviceFixtureDatabaseSnapshot(paths.database);
+    const calls = [...codex.calls];
     await expect(service.execute({
       kind: "account.login-cancel",
       account: added.account.id,
-    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED",
+      message: "The pending login authority cannot be proved. Inspect the account before changing provider state." });
+    expect(serviceFixtureDatabaseSnapshot(paths.database)).toEqual(before);
+    expect(codex.calls).toEqual(calls);
     expect(codex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(0);
   });
 
   test("preserves exact pending-login cancellation authority across an unexpected provider disconnect", async () => {
-    const { service, codex, store } = await fixture();
+    const { service, codex, store, paths } = await fixture();
     const added = await service.execute({ kind: "account.add", label: "Disconnected login" }, { signal }) as { account: { id: `acct_${string}` } };
     codex.loginResult = { status: "pending", loginId: "provider-login-disconnected" };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
@@ -23530,7 +23614,9 @@ describe("HraService", () => {
       processGeneration: 2,
       state: "login_pending",
     });
-    expect(store.readPendingLoginAuthority(added.account.id, 1)).toBeNull();
+    const beforeStaleRead = serviceFixtureDatabaseSnapshot(paths.database);
+    expect(() => store.readPendingLoginAuthority(added.account.id, 1)).toThrow("PROVIDER_LOGIN_BINDING_PROOF_INVALID");
+    expect(serviceFixtureDatabaseSnapshot(paths.database)).toEqual(beforeStaleRead);
     expect(store.readPendingLoginAuthority(added.account.id, 2)).toMatchObject({
       loginId: "provider-login-disconnected",
       processGeneration: 2,
@@ -23599,8 +23685,9 @@ describe("HraService", () => {
     expect(codex.calls.filter((call) => call === "stop")).toHaveLength(1);
   });
 
-  test("fences pending transcript replay behind projection recovery but keeps settled replay authority-independent", async () => {
-    const { service, codex, cloud, documents, store } = await fixture();
+  test("fences incomplete pending transcript replay without manufacturing source runtime authority", async () => {
+    const value = await fixture();
+    const { service, codex, cloud, documents, store, paths } = value;
     const added = await service.execute(
       { kind: "account.add", label: "Transcript-first replay" },
       { signal },
@@ -23626,15 +23713,16 @@ describe("HraService", () => {
     if (runtime === undefined) throw new Error("Expected the session-start runtime profile.");
     const key = "00000000-0000-4000-8000-00000000010a";
     const message = "finish only the durable transcript";
-    const attempt = store.prepareMutation({
+    const { attempt } = store.prepareSessionInputMutation({
       kind: "session.send",
-      authorityId: session.id,
-      authorityGeneration: profile.processGeneration,
-      request: { message },
+      sessionId: session.id,
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      message, attachments: [], daemonGeneration: value.daemonGeneration, bootId: value.daemonBootId,
       idempotencyKey: key,
     });
     store.beginSessionMutationEffect({
       providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      attachments: [], daemonGeneration: value.daemonGeneration, bootId: value.daemonBootId,
       attemptId: attempt.id,
       message,
       sessionId: session.id,
@@ -23665,12 +23753,9 @@ describe("HraService", () => {
       sourceId: attempt.id,
       effectiveRuntimeProfile: runtime,
     })).toBe(true);
-    store.updateSessionMetadata({
-      sessionId: session.id,
-      expectedRevision: session.revision,
-      preset: "ultra",
-    });
-    store.nextProfileGeneration(profile.id);
+    // This intentionally incomplete current source has a receipt but no
+    // source turn/runtime binding. It proves refusal, not an accepted recovery.
+    const before = serviceFixtureDatabaseSnapshot(paths.database);
     cloud.beforeProjectionUnsettledSessionReturn = () => {
       throw new Error("A digest conflict must not observe current cloud recovery state.");
     };
@@ -23685,6 +23770,7 @@ describe("HraService", () => {
       message: `${message} changed`,
       idempotencyKey: key,
     }, { signal })).rejects.toThrow("IDEMPOTENCY_CONFLICT");
+    expect(serviceFixtureDatabaseSnapshot(paths.database)).toEqual(before);
     delete cloud.beforeProjectionUnsettledSessionReturn;
     delete cloud.beforeProjectionUnsettledProfileReturn;
     cloud.unsettledProjectionSessions.add(session.id);
@@ -23695,6 +23781,7 @@ describe("HraService", () => {
       message,
       idempotencyKey: key,
     }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(serviceFixtureDatabaseSnapshot(paths.database)).toEqual(before);
     expect(store.readSessionUserMessageSource(session.id, "mutation", key))
       .toMatchObject({ status: "pending" });
     expect(store.listSessionEvents({ sessionId: session.id, afterSequence: 0 }).events
@@ -23703,37 +23790,68 @@ describe("HraService", () => {
     cloud.unsettledProjectionSessions.clear();
     cloud.unsettledProjectionProfiles.clear();
 
-    const replayed = await service.execute({
+    await expect(service.execute({
       kind: "session.send",
       session: session.id,
       message,
       idempotencyKey: key,
-    }, { signal });
-    expect(replayed).toMatchObject({
-      idempotencyKey: key,
-      turnId: "turn-transcript-first-replay",
-    });
+    }, { signal })).rejects.toThrow();
+    expect(serviceFixtureDatabaseSnapshot(paths.database)).toEqual(before);
     expect(codex.calls).toEqual(providerCalls);
     expect(store.readSessionUserMessageSource(session.id, "mutation", key))
-      .toMatchObject({ status: "finalized", intent: { actor: "human" } });
+      .toMatchObject({ status: "pending", intent: { actor: "human" } });
     expect(store.listSessionEvents({ sessionId: session.id, afterSequence: 0 }).events
       .filter((event) => event.body.type === "user_message"
-        && event.body.sourceId === key)).toHaveLength(1);
+        && event.body.sourceId === key)).toHaveLength(0);
+  });
+
+  test("keeps a genuinely settled send replay independent of current projection and process authority", async () => {
+    const value = await fixture();
+    const { service, store, paths } = value;
+    const { sessionId } = await createIdleSession(value, "Settled original-authority replay");
+    const originalSession = store.requireSession(sessionId);
+    const authority = store.requireProviderAccountAuthority(originalSession.profileId, "codex");
+    const key = "00000000-0000-4000-8000-00000000010a";
+    const message = "genuinely settled before the process restart";
+    const command = { kind: "session.send" as const, session: sessionId, message, idempotencyKey: key };
+    const first = await service.execute(command, { signal });
+    if (typeof first !== "object" || first === null || Array.isArray(first)) throw new Error("Expected a structured send receipt.");
+    const original = store.readMutation(key);
+    if (original === null) throw new Error("Expected an actual completed provider receipt.");
+    expect(original.state).toBe("applied");
+    const originalAuthorities = store.readMutationProviderAuthorities(original.id);
+    const originalSource = store.readSessionUserMessageSource(sessionId, "mutation", key);
+    expect(originalSource.status).toBe("finalized");
+    const originalRuntime = store.latestSessionRuntimeProfile(sessionId);
+    expect(originalRuntime).toMatchObject({ sourceKind: "turn_start", sourceId: original.id });
+    const originalEvents = store.listSessionEvents({ sessionId, afterSequence: 0 }).events;
+    expect(originalEvents.filter((event) => event.body.type === "user_message" && event.body.sourceId === key)).toHaveLength(1);
+    await service.close();
+    const bootId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
+    const daemonGeneration = store.nextDaemonGeneration(bootId);
+    expect(store.requireProviderAccountAuthority(authority.profileId, "codex").processGeneration)
+      .toBeGreaterThan(authority.processGeneration);
+    const cloud = new FakeCloud();
+    const codex = new FakeCodex();
+    const restarted = new HraService({ store, paths, codex, cloud, daemonGeneration, daemonBootId: bootId,
+      daemonAuthority: new FakeDaemonAuthority(), requestStop: () => undefined });
+    const before = serviceFixtureDatabaseSnapshot(paths.database);
     cloud.beforeProjectionUnsettledSessionReturn = () => {
       throw new Error("A settled replay must not observe current cloud recovery state.");
     };
     cloud.beforeProjectionUnsettledProfileReturn = () => {
       throw new Error("A settled replay must not observe current account recovery state.");
     };
-    await expect(service.execute({
-      kind: "session.send",
-      session: session.id,
-      message,
-      idempotencyKey: key,
-    }, { signal })).resolves.toMatchObject({
-      idempotencyKey: key,
-      turnId: "turn-transcript-first-replay",
-    });
+    const replay = await restarted.execute(command, { signal });
+    expect(replay).toMatchObject({ idempotencyKey: key });
+    expectHistoricalValue(replay, { ...first, session: store.requireSession(sessionId) });
+    expect(store.readMutation(key)).toEqual(original);
+    expect(store.readMutationProviderAuthorities(original.id)).toEqual(originalAuthorities);
+    expect(store.readSessionUserMessageSource(sessionId, "mutation", key)).toEqual(originalSource);
+    expect(store.latestSessionRuntimeProfile(sessionId)).toEqual(originalRuntime);
+    expect(serviceFixtureDatabaseSnapshot(paths.database)).toEqual(before);
+    expect(codex.calls).toEqual([]);
+    await restarted.close();
   });
 
   test("does not resurrect a retained-out send transcript record on exact replay", async () => {
@@ -23960,103 +24078,46 @@ describe("HraService", () => {
     expect(codex.calls.filter((call) => call === "send")).toHaveLength(0);
   });
 
-  test("replays an applied v0.5 Codex high default across restart only under its matching source contract", async () => {
-    const { service, codex, documents, paths, store } = await fixture();
-    const added = await service.execute(
-      { kind: "account.add", label: "v0.5 applied start" },
-      { signal },
-    ) as { account: { id: string } };
-    await service.execute(
-      { kind: "account.login", account: added.account.id, deviceCode: false },
-      { signal },
-    );
-    const project = await service.execute(
-      { kind: "project.add", label: "v0.5 start docs", path: documents },
-      { signal },
-    ) as { project: { id: string } };
-    const key = "00000000-0000-4000-8000-000000000409";
-    const command = {
-      account: added.account.id,
-      fast: false,
-      idempotencyKey: key,
-      kind: "session.start" as const,
-      preset: "high" as const,
-      presetContract: 1 as const,
-    };
-    const first = await service.execute(command, { signal }) as {
-      effectiveRuntimeProfile: EffectiveRuntimeProfile;
-      session: { id: `sess_${string}`; state: string };
-    };
-
-    const profile = store.requireProfileById(added.account.id);
-    // v0.5 resolved an omitted CLI preset to High before dispatch, while its
-    // stored request digest still omitted the then-implicit Codex provider.
-    const releasedRequest = {
-      projectId: project.project.id,
-      preset: "high" as const,
-      fast: false,
-    };
-    const historical = rewriteSessionStartAttemptAsHistoricalFixture({
-      idempotencyKey: key,
-      request: releasedRequest,
-      store,
-    });
-    expect(store.readMutation(key)).toMatchObject({
-      authorityGeneration: profile.processGeneration,
-      requestDigest: historical.requestDigest,
-      evidence: { evidence: historical.evidence },
-      state: "applied",
-    });
-    expect(store.readMutation(key)?.evidence?.evidence).not.toHaveProperty("presetContract");
-    expect(codex.calls.filter((call) => call === "review-session")).toHaveLength(1);
-    expect(codex.calls.filter((call) => call === "start:high")).toHaveLength(1);
-
-    await service.close();
-    expect(store.requireProfileById(profile.id).processGeneration)
-      .toBe(profile.processGeneration + 1);
-    expect(store.nextDaemonGeneration(`boot_${"b".repeat(32)}`)).toBe(1);
-    expect(store.requireProfileById(profile.id).processGeneration)
-      .toBe(profile.processGeneration + 2);
-    const restartedCodex = new FakeCodex();
-    const restarted = new HraService({
-      store,
-      paths,
-      codex: restartedCodex,
-      cloud: new FakeCloud(),
-      daemonAuthority: new FakeDaemonAuthority(),
-      requestStop: () => undefined,
-    });
-    await restarted.recover();
-
-    const replayCommand = {
-      account: added.account.id,
-      fast: false,
-      idempotencyKey: key,
-      kind: "session.start" as const,
-      preset: "high" as const,
-      presetContract: 1 as const,
-    };
-    const providerCallsBeforeReplay = restartedCodex.calls.length;
-    await expect(restarted.execute({
-      account: replayCommand.account,
-      fast: replayCommand.fast,
-      idempotencyKey: replayCommand.idempotencyKey,
-      kind: replayCommand.kind,
-      preset: replayCommand.preset,
-    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
-    expect(restartedCodex.calls).toHaveLength(providerCallsBeforeReplay);
-    await expect(restarted.execute({ ...replayCommand, presetContract: 2 }, { signal }))
-      .rejects.toMatchObject({ code: "CONFLICT" });
-    expect(restartedCodex.calls).toHaveLength(providerCallsBeforeReplay);
-    await expect(restarted.execute(replayCommand, { signal })).resolves.toMatchObject({
-      effectiveRuntimeProfile: first.effectiveRuntimeProfile,
-      idempotencyKey: key,
-      session: { id: first.session.id },
-    });
-    expect(restartedCodex.calls.filter((call) => call === "review-session")).toHaveLength(0);
-    expect(restartedCodex.calls.filter((call) => call === "start:high")).toHaveLength(0);
-    await restarted.close();
-  });
+  test.each(["canonical33_applied", "canonical39_applied"] as const)(
+    "replays an authentic archived start only under its captured source contract (%s)",
+    async (scenario) => {
+      const captured = canonicalSessionStartFixtures[scenario];
+      const { service, codex, store, paths } = await fixture(
+        undefined, new FakeCloud(), () => undefined, () => 40_000, undefined, {},
+        { canonicalSessionStart: scenario },
+      );
+      // The fixture is imported before migration and a real new daemon boot.
+      // Its synthetic provider receipt proves replay, not renewed native custody.
+      expect(store.requireProfileById(captured.profile.id).processGeneration)
+        .toBeGreaterThan(captured.profile.processGeneration);
+      expectHistoricalValue(store.readMutation(captured.idempotencyKey)?.evidence, captured.mutation.evidence);
+      expectHistoricalValue(store.readMutation(captured.idempotencyKey)?.result, captured.mutation.result);
+      expect(store.readMutation(captured.idempotencyKey)?.requestDigest).toBe(captured.mutation.requestDigest);
+      const command = {
+        kind: "session.start" as const,
+        account: captured.profile.id,
+        preset: "high" as const,
+        fast: false,
+        idempotencyKey: captured.idempotencyKey,
+      };
+      const before = serviceFixtureDatabaseSnapshot(paths.database);
+      await expect(service.execute(command, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+      await expect(service.execute({
+        ...command, presetContract: captured.interpretedPresetContract === 1 ? 2 : 1,
+      }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+      await expect(service.execute({
+        ...command, presetContract: captured.interpretedPresetContract,
+      }, { signal })).resolves.toMatchObject({
+        idempotencyKey: captured.idempotencyKey,
+        session: { id: captured.session.id, projectId: captured.project.id },
+        effectiveRuntimeProfile: { model: captured.model, reasoningEffort: "max", processGeneration: 1 },
+      });
+      expectHistoricalValue(store.readMutation(captured.idempotencyKey)?.result, captured.mutation.result);
+      expectHistoricalValue(store.readMutation(captured.idempotencyKey)?.evidence, captured.mutation.evidence);
+      expect(serviceFixtureDatabaseSnapshot(paths.database)).toEqual(before);
+      expect(codex.calls).toEqual([]);
+    },
+  );
 
   test("replays a settled source-bound start against its original project after the default changes", async () => {
     const { service, codex, cloud, documents } = await fixture();
@@ -24156,143 +24217,46 @@ describe("HraService", () => {
     expect(codex.calls).toEqual(providerCalls);
   });
 
-  test("keeps an effect-started v0.5 Codex high start recoverable across authority rebinding", async () => {
-    const { service, documents, paths, store } = await fixture();
-    const added = await service.execute(
-      { kind: "account.add", label: "v0.5 unsettled start" },
-      { signal },
-    ) as { account: { id: `acct_${string}` } };
-    await service.execute(
-      { kind: "account.login", account: added.account.id, deviceCode: false },
-      { signal },
-    );
-    const project = await service.execute(
-      { kind: "project.add", label: "v0.5 unsettled docs", path: documents },
-      { signal },
-    ) as { project: { id: `proj_${string}` } };
-    const profile = store.requireProfileById(added.account.id);
-    const key = "00000000-0000-4000-8000-000000000415";
-    const attempt = store.prepareMutation({
-      authorityGeneration: profile.processGeneration,
-      authorityId: profile.id,
-      idempotencyKey: key,
-      kind: "session.start",
-      request: sessionStartMutationRequest({
+  test.each(["canonical33_effect_started", "canonical39_effect_started"] as const)(
+    "retains an authentic indeterminate start across boot without invented recovery authority (%s)",
+    async (scenario) => {
+      const captured = canonicalSessionStartFixtures[scenario];
+      const { service, codex, store, paths } = await fixture(
+        undefined, new FakeCloud(), () => undefined, () => 40_000, undefined, {},
+        { canonicalSessionStart: scenario },
+      );
+      expect(store.requireProfileById(captured.profile.id).processGeneration)
+        .toBeGreaterThan(captured.profile.processGeneration);
+      expect(store.readMutation(captured.idempotencyKey)).toMatchObject({
+        authorityId: captured.profile.id,
+        authorityGeneration: captured.profile.processGeneration,
+        requestDigest: captured.mutation.requestDigest,
+        state: "ambiguous",
+      });
+      expectHistoricalValue(store.readMutation(captured.idempotencyKey)?.evidence, captured.mutation.evidence);
+      expect(store.requireSession(captured.session.id).state).toBe("recovery_required");
+      const command = {
+        kind: "session.start" as const,
+        account: captured.profile.id,
+        preset: "high" as const,
         fast: false,
-        preset: "high",
-        presetContract: 1,
-        projectId: project.project.id,
-        provider: "codex",
-      }),
-    });
-    const effectiveRuntimeProfile = runtimeProfile(liveAuthorityFor(store, profile.id, "codex"));
-    const starting = store.beginSessionStartEffect({
-      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
-      attemptId: attempt.id,
-      profileId: profile.id,
-      profileGeneration: profile.processGeneration,
-      projectId: project.project.id,
-      provider: "codex",
-      providerAccountKey: codexProviderAccountKey(),
-      providerAuthentication: {
-        profileId: profile.id,
-        processGeneration: profile.processGeneration,
-        provider: "codex",
-        signedIn: true,
-      },
-      preset: "high",
-      fastEnabled: false,
-      evidence: {
-        kind: "session.start",
-        projectId: project.project.id,
-        clientMessageId: null,
-        messageDigest: null,
-        presetContract: 1,
-        runtimeProfile: effectiveRuntimeProfile,
-      },
-    });
-    const releasedRequest = {
-      projectId: project.project.id,
-      preset: "high" as const,
-      fast: false,
-    };
-    const historical = rewriteSessionStartAttemptAsHistoricalFixture({
-      idempotencyKey: key,
-      request: releasedRequest,
-      store,
-    });
-    expect(store.readMutation(key)).toMatchObject({
-      authorityGeneration: profile.processGeneration,
-      evidence: { evidence: historical.evidence },
-      requestDigest: historical.requestDigest,
-      sessionStartId: starting.id,
-      state: "effect_started",
-    });
-    expect(store.readMutation(key)?.evidence?.evidence).not.toHaveProperty("presetContract");
-
-    await service.close();
-    expect(store.requireProfileById(profile.id).processGeneration)
-      .toBe(profile.processGeneration + 1);
-    expect(store.isSessionMutationProviderAuthorityCurrent({
-      attemptId: attempt.id,
-      profileId: profile.id,
-      provider: "codex",
-      originGeneration: profile.processGeneration,
-    })).toBe(true);
-    expect(store.nextDaemonGeneration(`boot_${"c".repeat(32)}`)).toBe(1);
-    expect(store.requireProfileById(profile.id).processGeneration)
-      .toBe(profile.processGeneration + 2);
-    expect(store.isSessionMutationProviderAuthorityCurrent({
-      attemptId: attempt.id,
-      profileId: profile.id,
-      provider: "codex",
-      originGeneration: profile.processGeneration,
-    })).toBe(true);
-    const restartedCodex = new FakeCodex();
-    const restarted = new HraService({
-      store,
-      paths,
-      codex: restartedCodex,
-      cloud: new FakeCloud(),
-      daemonAuthority: new FakeDaemonAuthority(),
-      requestStop: () => undefined,
-    });
-    await restarted.recover();
-    expect(store.readMutation(key)).toMatchObject({
-      authorityGeneration: profile.processGeneration,
-      authorityId: profile.id,
-      evidence: {
-        evidence: {
-          kind: "session.start",
-          runtimeProfile: {
-            model: "gpt-5.6-sol",
-            reasoningEffort: "max",
-          },
-        },
-      },
-      requestDigest: historical.requestDigest,
-      state: "ambiguous",
-    });
-    expect(store.requireSession(starting.id)).toMatchObject({ state: "recovery_required" });
-
-    const replayCommand = {
-      account: profile.id,
-      fast: false,
-      idempotencyKey: key,
-      kind: "session.start" as const,
-      preset: "high" as const,
-      presetContract: 1 as const,
-    };
-    const providerCallsBeforeReplay = restartedCodex.calls.length;
-    await expect(restarted.execute({ ...replayCommand, presetContract: 2 }, { signal }))
-      .rejects.toMatchObject({ code: "CONFLICT" });
-    expect(restartedCodex.calls).toHaveLength(providerCallsBeforeReplay);
-    await expect(restarted.execute(replayCommand, { signal }))
-      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
-    expect(restartedCodex.calls.filter((call) => call === "review-session")).toHaveLength(0);
-    expect(restartedCodex.calls.filter((call) => call === "start:high")).toHaveLength(0);
-    await restarted.close();
-  });
+        idempotencyKey: captured.idempotencyKey,
+      };
+      const before = serviceFixtureDatabaseSnapshot(paths.database);
+      await expect(service.execute(command, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+      await expect(service.execute({
+        ...command, presetContract: captured.interpretedPresetContract === 1 ? 2 : 1,
+      }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+      await expect(service.execute({
+        ...command, presetContract: captured.interpretedPresetContract,
+      }, { signal })).rejects.toMatchObject({
+        code: "RECOVERY_REQUIRED", details: { idempotencyKey: captured.idempotencyKey },
+      });
+      expect(serviceFixtureDatabaseSnapshot(paths.database)).toEqual(before);
+      expectHistoricalValue(store.readMutation(captured.idempotencyKey)?.evidence, captured.mutation.evidence);
+      expect(codex.calls).toEqual([]);
+    },
+  );
 
   test("refuses fresh absent or stale rebound sources before provider contact or mutation preparation", async () => {
     const { service, codex, documents, store } = await fixture();
@@ -24364,7 +24328,7 @@ describe("HraService", () => {
     expect(codex.calls).toHaveLength(providerCallsAfterCurrent);
   });
 
-  test("resumes only current prepared rebound starts while preserving historical recovery lookups", async () => {
+  test("resumes only currently admitted prepared rebound starts", async () => {
     const { service, codex, documents, store } = await fixture();
     const added = await service.execute(
       { kind: "account.add", label: "Prepared source admission" },
@@ -24382,6 +24346,7 @@ describe("HraService", () => {
     const prepare = (idempotencyKey: string, presetContract?: 1 | 2) => store.prepareMutation({
       authorityGeneration: profile.processGeneration,
       authorityId: profile.id,
+      providerAuthorities: [{ role: "primary", authority: store.requireProviderAccountAuthority(profile.id, "codex"), provenance: "session_start" }],
       idempotencyKey,
       kind: "session.start",
       request: sessionStartMutationRequest({
@@ -24392,7 +24357,7 @@ describe("HraService", () => {
         provider: "codex",
       }),
     });
-    const prepareReleasedV05 = (idempotencyKey: string) => store.prepareMutation({
+    const prepareContractless = (idempotencyKey: string) => store.prepareMutation({
       authorityGeneration: profile.processGeneration,
       authorityId: profile.id,
       idempotencyKey,
@@ -24403,35 +24368,6 @@ describe("HraService", () => {
         fast: false,
       },
     });
-    const recordHistoricalStartEvidence = (
-      attemptId: string,
-      runtime: EffectiveRuntimeProfile,
-      presetContract?: 1 | 2,
-    ): void => {
-      const evidence = {
-        kind: "session.start",
-        projectId: project.project.id,
-        clientMessageId: null,
-        messageDigest: null,
-        ...(presetContract === undefined ? {} : { presetContract }),
-        runtimeProfile: runtime,
-      };
-      const evidenceJson = JSON.stringify(evidence);
-      const inspector = new Database(store.paths.database, { create: false, strict: true });
-      try {
-        inspector.query(
-          "INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,?)",
-        ).run(
-          attemptId,
-          evidence.kind,
-          evidenceJson,
-          createHash("sha256").update(evidenceJson).digest("hex"),
-          2_000,
-        );
-      } finally {
-        inspector.close(false);
-      }
-    };
     const base = {
       account: profile.id,
       fast: false,
@@ -24439,8 +24375,9 @@ describe("HraService", () => {
       preset: "high" as const,
     };
 
+    // These are deliberately unadmitted current prepared requests, not historical writer output.
     const legacyPreparedKey = "00000000-0000-4000-8000-00000000040e";
-    prepareReleasedV05(legacyPreparedKey);
+    prepareContractless(legacyPreparedKey);
     const stalePreparedKey = "00000000-0000-4000-8000-00000000040f";
     prepare(stalePreparedKey, 2);
     const providerCallsBefore = codex.calls.length;
@@ -24467,54 +24404,6 @@ describe("HraService", () => {
     expect(store.readMutation(legacyPreparedKey)).toMatchObject({ state: "prepared" });
     expect(store.readMutation(stalePreparedKey)).toMatchObject({ state: "prepared" });
 
-    const legacyStartedKey = "00000000-0000-4000-8000-000000000410";
-    const legacyStarted = prepare(legacyStartedKey);
-    const historicalAstraProfile = {
-      ...runtimeProfile(liveAuthorityFor(store, profile.id, "codex")),
-      model: "gpt-6-astra",
-      reasoningEffort: "max" as const,
-    };
-    recordHistoricalStartEvidence(legacyStarted.id, historicalAstraProfile);
-    expect(store.transitionMutation(legacyStarted.id, "prepared", "effect_started")).toBe(true);
-    await expect(service.execute({
-      ...base,
-      idempotencyKey: legacyStartedKey,
-    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
-    expect(codex.calls).toHaveLength(providerCallsBefore);
-    await expect(service.execute({
-      ...base,
-      idempotencyKey: legacyStartedKey,
-      presetContract: 2,
-    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
-    await expect(service.execute({
-      ...base,
-      idempotencyKey: legacyStartedKey,
-      presetContract: 1,
-    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
-    expect(store.transitionMutation(
-      legacyStarted.id,
-      "effect_started",
-      "failed",
-      { code: "test_settled" },
-    )).toBe(true);
-
-    const staleStartedKey = "00000000-0000-4000-8000-000000000411";
-    const staleStarted = prepare(staleStartedKey, 2);
-    recordHistoricalStartEvidence(staleStarted.id, historicalAstraProfile, 2);
-    expect(store.transitionMutation(staleStarted.id, "prepared", "effect_started")).toBe(true);
-    await expect(service.execute({
-      ...base,
-      idempotencyKey: staleStartedKey,
-      presetContract: 2,
-    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
-    expect(store.transitionMutation(
-      staleStarted.id,
-      "effect_started",
-      "failed",
-      { code: "test_settled" },
-    )).toBe(true);
-    expect(codex.calls).toHaveLength(providerCallsBefore);
-
     const currentPreparedKey = "00000000-0000-4000-8000-000000000412";
     prepare(currentPreparedKey, 1);
     await expect(service.execute({
@@ -24525,26 +24414,233 @@ describe("HraService", () => {
     expect(store.readMutation(currentPreparedKey)).toMatchObject({ state: "applied" });
     expect(codex.calls.filter((call) => call === "review-session")).toHaveLength(1);
     expect(codex.calls.filter((call) => call === "start:high")).toHaveLength(1);
+  });
 
-    const currentReceipt = store.readMutation(currentPreparedKey)?.result;
-    if (currentReceipt === undefined) throw new Error("Expected the current start receipt.");
-    const staleAppliedKey = "00000000-0000-4000-8000-000000000413";
-    const staleApplied = prepare(staleAppliedKey, 2);
-    expect(store.transitionMutation(staleApplied.id, "prepared", "effect_started")).toBe(true);
-    expect(store.transitionMutation(staleApplied.id, "effect_started", "applied", currentReceipt))
-      .toBe(true);
-    await expect(service.execute({
-      ...base,
-      idempotencyKey: staleAppliedKey,
-      presetContract: 2,
-    }, { signal })).resolves.toMatchObject({ session: { preset: "high", state: "idle" } });
-    const providerCallsAfterStaleReplay = codex.calls.length;
-    await expect(service.execute({
-      ...base,
-      idempotencyKey: staleAppliedKey,
-      presetContract: 1,
-    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
-    expect(codex.calls).toHaveLength(providerCallsAfterStaleReplay);
+
+  async function terminalInputCustodyFixture(
+    source: "provider_thread_deleted" | "provider_transport_lost" = "provider_thread_deleted",
+    withInput = true,
+  ) {
+    const factsMemory = new FakeFactsMemoryLifecycle();
+    const memory = new FakeMemory();
+    const value = await fixture(undefined, new FakeCloud(), () => undefined,
+      () => 1_800_000_000_000, factsMemory, {}, { memory });
+    const { sessionId } = await createIdleSession(value, "Terminal local acknowledgment");
+    const current = value.store.requireSession(sessionId);
+    const authority = value.store.requireProviderAccountAuthority(current.profileId, "codex");
+    const runtime = value.store.latestSessionRuntimeProfile(sessionId)?.profile;
+    if (current.providerThreadId === undefined || runtime === undefined) throw new Error("Expected an exact current runtime.");
+    const reference = { digest: "a".repeat(64), name: "retained.txt", byteLength: 4, mediaType: "text/plain" as const };
+    let attemptId: ReturnType<StateStore["prepareSessionInputMutation"]>["attempt"]["id"] | undefined;
+    let idempotencyKey: string | undefined;
+    if (withInput) {
+      idempotencyKey = crypto.randomUUID();
+      const input = {
+        kind: "session.send" as const, sessionId, providerAuthority: authority,
+        idempotencyKey, message: "Retained terminal input", attachments: [reference],
+        daemonGeneration: value.daemonGeneration, bootId: value.daemonBootId,
+      };
+      const reservation = value.store.reserveAttachmentIngress(input);
+      if (reservation.kind !== "reserved") throw new Error("Expected a current reservation.");
+      const prepared = value.store.prepareSessionInputMutation({ ...input, reservation });
+      if (prepared.custody.kind !== "mutation_owned") throw new Error("Expected current mutation custody.");
+      attemptId = prepared.attempt.id;
+      const stored = [{ ...reference, canonicalMediaType: reference.mediaType }];
+      value.store.beginSessionMutationEffect({
+        attemptId, sessionId, providerAuthority: authority, profileGeneration: authority.processGeneration,
+        daemonGeneration: value.daemonGeneration, bootId: value.daemonBootId,
+        message: input.message, attachments: stored,
+        custody: { custodyId: prepared.custody.custodyId, custodyDigest: prepared.custody.custodyDigest },
+        transcript: { accountId: current.profileId, providerGeneration: authority.processGeneration,
+          providerConnectionId: crypto.randomUUID(), actor: "human", message: input.message,
+          attachments: [reference], storedAttachments: stored },
+        evidence: { kind: "session.send", providerThreadId: current.providerThreadId,
+          baseline: { status: "idle", activeTurnId: null, providerUpdatedAt: current.providerUpdatedAt ?? null },
+          clientMessageId: attemptId, messageDigest: createHash("sha256").update(input.message).digest("hex"),
+          messageActor: "human", runtimeProfile: runtime },
+      });
+    }
+    value.store.terminalizeSessionFromProviderDeletion({
+      sessionId, accountId: current.profileId, providerGeneration: authority.processGeneration,
+      providerAuthority: authority, providerConnectionId: null, source,
+    });
+    const terminal = value.store.requireSession(sessionId);
+    expect(terminal.state).toBe("terminal");
+    // Actual service-created memory is still active after the direct storage
+    // terminalization. A newly composed service has a pending cleanup scan.
+    const memoryReceipt = factsMemory.readSession(sessionId);
+    expect(memoryReceipt).toMatchObject({ state: "active", ownerId: current.profileId });
+    const daemonAuthority = new FakeDaemonAuthority();
+    const afterResponse: Array<() => void> = [];
+    let stopCalls = 0;
+    const local = new HraService({
+      store: value.store, paths: value.paths, codex: value.codex, cloud: value.cloud,
+      daemonAuthority, daemonGeneration: value.daemonGeneration, daemonBootId: value.daemonBootId,
+      factsMemory, memory, now: () => 1_800_000_000_000, requestStop: () => { stopCalls++; },
+    });
+    const callsBefore = {
+      provider: [...value.codex.calls], ensures: [...factsMemory.ensures],
+      cleanups: [...factsMemory.cleanups], sweeps: [...factsMemory.sweeps],
+      transfers: [...factsMemory.transfers], forgotten: [...memory.forgottenSessions],
+    };
+    const assertNoExternalWork = () => {
+      expect(value.codex.calls).toEqual(callsBefore.provider);
+      expect(factsMemory.ensures).toEqual(callsBefore.ensures);
+      expect(factsMemory.cleanups).toEqual(callsBefore.cleanups);
+      expect(factsMemory.sweeps).toEqual(callsBefore.sweeps);
+      expect(factsMemory.transfers).toEqual(callsBefore.transfers);
+      expect(memory.forgottenSessions).toEqual(callsBefore.forgotten);
+      expect(factsMemory.readSession(sessionId)).toEqual(memoryReceipt);
+    };
+    value.cloud.beforeProjectionUnsettledSessionReturn = async () => { throw new Error("Local acknowledgment must not inspect cloud authority."); };
+    value.cloud.beforeProjectionUnsettledProfileReturn = async () => { throw new Error("Local acknowledgment must not inspect cloud authority."); };
+    return { ...value, local, terminal, reference, attemptId, idempotencyKey, factsMemory,
+      daemonAuthority, afterResponse, stopCalls: () => stopCalls, assertNoExternalWork };
+  }
+
+  test.each(["provider_thread_deleted", "provider_transport_lost"] as const)(
+    "acknowledges terminal input custody locally without outer memory maintenance (%s)",
+    async (source) => {
+      const f = await terminalInputCustodyFixture(source);
+      if (f.attemptId === undefined || f.idempotencyKey === undefined) throw new Error("Expected retained input.");
+      const original = f.store.readMutation(f.idempotencyKey);
+      const authority = f.store.readMutationProviderAuthorities(f.attemptId);
+      expect(original?.resolution).toMatchObject({ kind: "abandoned", evidence: { source } });
+      expect(f.store.messageAttachmentManifest(f.terminal.id, f.attemptId)).toEqual([f.reference]);
+      const command = { kind: "session.abandon" as const, session: f.terminal.id };
+      await expect(f.local.execute(command, { signal })).resolves.toMatchObject({
+        session: f.terminal,
+        recovery: { resolved: true, resolution: "abandoned", localInputCustodyAcknowledged: true,
+          releasedInputCount: 1, alreadyAcknowledgedInputCount: 0,
+          providerEffectRetried: false, providerStateDeleted: false, providerOutcomeKnown: false },
+      });
+      expect(f.store.readMutation(f.idempotencyKey)).toEqual(original);
+      expect(f.store.readMutationProviderAuthorities(f.attemptId)).toEqual(authority);
+      expect(f.store.messageAttachmentManifest(f.terminal.id, f.attemptId)).toEqual([]);
+      expect(f.store.attachmentCustody(f.reference.digest)).toMatchObject({ referenceCount: 0 });
+      f.assertNoExternalWork();
+      const after = serviceFixtureDatabaseSnapshot(f.paths.database);
+      await expect(f.local.execute(command, { signal })).resolves.toMatchObject({
+        recovery: { releasedInputCount: 0, alreadyAcknowledgedInputCount: 1, providerOutcomeKnown: false },
+      });
+      expect(serviceFixtureDatabaseSnapshot(f.paths.database)).toEqual(after);
+      f.assertNoExternalWork();
+    },
+  );
+
+  test("refuses terminal abandon without an acknowledgment candidate and leaves local history unchanged", async () => {
+    const f = await terminalInputCustodyFixture("provider_thread_deleted", false);
+    const before = serviceFixtureDatabaseSnapshot(f.paths.database);
+    await expect(f.local.execute({ kind: "session.abandon", session: f.terminal.id }, { signal }))
+      .rejects.toMatchObject({ code: "CONFLICT" });
+    expect(serviceFixtureDatabaseSnapshot(f.paths.database)).toEqual(before);
+    f.assertNoExternalWork();
+  });
+
+  test.each(["revision", "daemon"] as const)(
+    "rechecks selected terminal acknowledgment authority before local commit (%s)",
+    async (changed) => {
+      const f = await terminalInputCustodyFixture();
+      let assertions = 0;
+      let afterConcurrentChange = serviceFixtureDatabaseSnapshot(f.paths.database);
+      f.daemonAuthority.beforeAssert = async () => {
+        assertions++;
+        // Entry, account serializer, session serializer, then the final local
+        // commit fence. Cross the last await, not an earlier lock acquisition.
+        if (assertions !== 4) return;
+        if (changed === "daemon") f.daemonAuthority.current = false;
+        else f.store.setSessionTurnState({
+          sessionId: f.terminal.id, expectedRevision: f.terminal.revision, state: "terminal",
+        });
+        afterConcurrentChange = serviceFixtureDatabaseSnapshot(f.paths.database);
+      };
+      const command = f.local.execute({ kind: "session.abandon", session: f.terminal.id }, { signal });
+      if (changed === "daemon") await expect(command).rejects.toBeInstanceOf(DaemonAuthoritySafetyError);
+      else await expect(command).rejects.toMatchObject({ code: "CONFLICT" });
+      expect(assertions).toBe(4);
+      expect(serviceFixtureDatabaseSnapshot(f.paths.database)).toEqual(afterConcurrentChange);
+      f.assertNoExternalWork();
+    },
+  );
+
+  test("maps a closed terminal acknowledgment refusal without leaking storage diagnostics", async () => {
+    const f = await terminalInputCustodyFixture();
+    f.store.acknowledgeTerminalSessionInputCustody = () => { throw new Error("ATTACHMENT_TERMINAL_ACKNOWLEDGMENT_INVALID"); };
+    const before = serviceFixtureDatabaseSnapshot(f.paths.database);
+    await expect(f.local.execute({ kind: "session.abandon", session: f.terminal.id }, { signal }))
+      .rejects.toMatchObject({
+        code: "RECOVERY_REQUIRED",
+        message: "The retained terminal input custody cannot be proved. Inspect the session before acknowledging local cleanup.",
+      });
+    expect(serviceFixtureDatabaseSnapshot(f.paths.database)).toEqual(before);
+    f.assertNoExternalWork();
+  });
+
+  test("refuses an aborted terminal acknowledgment without changing custody or memory", async () => {
+    const f = await terminalInputCustodyFixture();
+    const controller = new AbortController();
+    const reason = new Error("Synthetic terminal acknowledgment cancelled.");
+    controller.abort(reason);
+    const before = serviceFixtureDatabaseSnapshot(f.paths.database);
+    await expect(f.local.execute({ kind: "session.abandon", session: f.terminal.id }, { signal: controller.signal }))
+      .rejects.toBe(reason);
+    expect(serviceFixtureDatabaseSnapshot(f.paths.database)).toEqual(before);
+    f.assertNoExternalWork();
+  });
+
+  test("preserves admitted selection errors and normal maintenance when terminal lookup fails", async () => {
+    const f = await terminalInputCustodyFixture();
+    await expect(f.local.execute({ kind: "session.abandon", session: `sess_${"0".repeat(32)}` }, { signal }))
+      .rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(f.factsMemory.cleanups).toContainEqual({
+      ownerId: f.terminal.profileId, sessionId: f.terminal.id, reason: "archive",
+    });
+    if (f.attemptId === undefined) throw new Error("Expected retained input.");
+    expect(f.store.messageAttachmentManifest(f.terminal.id, f.attemptId)).toEqual([f.reference]);
+  });
+
+  test.each(["recover", "nonterminal_abandon"] as const)(
+    "preserves ordinary memory maintenance outside terminal-only acknowledgment (%s)",
+    async (action) => {
+      const f = await terminalInputCustodyFixture();
+      delete f.cloud.beforeProjectionUnsettledSessionReturn;
+      delete f.cloud.beforeProjectionUnsettledProfileReturn;
+      const live = action === "recover" ? null : f.store.upsertProviderSession({
+        profileId: f.terminal.profileId, provider: "codex",
+        providerAuthority: f.store.requireProviderAccountAuthority(f.terminal.profileId, "codex"),
+        providerAccountKey: codexProviderAccountKey(), providerThreadId: "ordinary-abandon-control",
+        title: "Ordinary live refusal", preset: "high", fastEnabled: false, state: "idle",
+      });
+      const command = action === "recover"
+        ? { kind: "session.recover" as const, session: f.terminal.id }
+        : { kind: "session.abandon" as const, session: live?.id ?? "" };
+      await expect(f.local.execute(command, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+      expect(f.factsMemory.cleanups).toContainEqual({
+        ownerId: f.terminal.profileId, sessionId: f.terminal.id, reason: "archive",
+      });
+      expect(f.factsMemory.sweeps.length).toBeGreaterThan(0);
+      if (f.attemptId === undefined) throw new Error("Expected retained input.");
+      expect(f.store.messageAttachmentManifest(f.terminal.id, f.attemptId)).toEqual([f.reference]);
+      expect(f.store.attachmentCustody(f.reference.digest)).toMatchObject({ referenceCount: 1 });
+    },
+  );
+
+  test("preserves the committed security-scrub lifecycle after terminal-only acknowledgment", async () => {
+    const f = await terminalInputCustodyFixture();
+    const acknowledge = f.store.acknowledgeTerminalSessionInputCustody.bind(f.store);
+    f.store.acknowledgeTerminalSessionInputCustody = (input) => {
+      acknowledge(input);
+      throw new StateSecurityScrubRequiredError(true);
+    };
+    await expect(f.local.execute({ kind: "session.abandon", session: f.terminal.id }, {
+      signal, afterResponse: (callback) => { f.afterResponse.push(callback); },
+    })).rejects.toMatchObject({ code: "UNAVAILABLE", details: { operationCommitted: true } });
+    expect(f.stopCalls()).toBe(0);
+    expect(f.afterResponse).toHaveLength(1);
+    f.afterResponse[0]?.();
+    expect(f.stopCalls()).toBe(1);
+    expect(f.store.attachmentCustody(f.reference.digest)).toMatchObject({ referenceCount: 0 });
+    f.assertNoExternalWork();
   });
 
   test("quarantines an unbound session-start lost response without blind replay", async () => {
@@ -25268,7 +25364,7 @@ describe("HraService", () => {
   });
 
   test("causally recovers an ambiguous queued dispatch with its reviewed runtime profile", async () => {
-    const { service, codex, documents, store } = await fixture();
+    const { service, codex, documents, store, paths } = await fixture();
     const added = await service.execute({ kind: "account.add", label: "Queue causal recovery" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
@@ -25279,35 +25375,72 @@ describe("HraService", () => {
     expect(store.requireQueue(queued.queued.id)).toMatchObject({ state: "ambiguous" });
     expect(store.requireSession(started.session.id)).toMatchObject({ state: "recovery_required" });
     delete codex.startTurnError;
-    codex.readProjection = {
+    const complete = {
       ...codex.readProjection,
       providerUpdatedAt: 10,
-      messages: [
-        ...(codex.readProjection.messages ?? []),
-        {
-          clientId: queued.queued.id,
-          role: "user",
-          text: "different queue body under the same client id",
-        },
-      ],
     };
-    await expect(service.execute({
-      kind: "session.recover",
-      session: started.session.id,
-    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
-    expect(store.readQueueEffect(queued.queued.id)?.resolution).toBeUndefined();
-    codex.readProjection = {
-      ...codex.readProjection,
-      messages: (codex.readProjection.messages ?? []).filter(
-        (message) => message.text !== "different queue body under the same client id",
-      ),
+    const omission = complete.omission;
+    const exactMessage = complete.messages?.find((message) => message.clientId === queued.queued.id);
+    if (omission === undefined || exactMessage === undefined) throw new Error("Expected the fake's exact committed queue projection.");
+    const absentCompleteness = { ...complete };
+    delete absentCompleteness.omission;
+    const variants: readonly CodexSessionProjection[] = [
+      absentCompleteness,
+      { ...complete, messages: [] },
+      { ...complete, omission: { ...omission, incompleteTurnIds: ["synthetic-incomplete-turn"] } },
+      { ...complete, omission: { ...omission, truncatedMessages: 1 } },
+      { ...complete, messages: [...(complete.messages ?? []), { ...exactMessage }] },
+      { ...complete, messages: (complete.messages ?? []).map((message) => message === exactMessage
+        ? { ...message, text: "different queue body under the same client id" } : message) },
+      { ...complete, messages: (complete.messages ?? []).map((message) => message === exactMessage
+        ? { ...message, omission: {
+          omittedUtf8Bytes: 1,
+          originalUtf8Bytes: new TextEncoder().encode(message.text).byteLength + 1,
+          returnedUtf8Bytes: new TextEncoder().encode(message.text).byteLength,
+        } } : message) },
+    ];
+    const requestedDetails: boolean[] = [];
+    const port: CodexRuntimePort = codex;
+    const read = port.readSession.bind(port);
+    port.readSession = async (input) => {
+      requestedDetails.push(input.detail);
+      return await read(input);
     };
+    const snapshot = () => {
+      const database = new Database(paths.database, { strict: true });
+      try {
+        database.exec("PRAGMA query_only=ON");
+        return database.transaction(() => ({
+          schema: database.query("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name").all(),
+          tables: database.query<{ name: string }, []>("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name").all()
+            .map(({ name }) => {
+              if (!/^[A-Za-z0-9_]+$/u.test(name)) throw new Error("Unexpected fixture table name.");
+              const rows = database.query(`SELECT * FROM "${name}" LIMIT 4097`).all();
+              if (rows.length > 4096) throw new Error("Queue recovery fixture exceeded row bound.");
+              return { name, rows: rows.map((row) => JSON.stringify(row)).sort() };
+            }),
+        })).deferred();
+      } finally { database.close(false); }
+    };
+    const before = snapshot();
+    const providerWrites = providerMutationCalls(codex);
+    for (const projection of variants) {
+      codex.readProjection = projection;
+      await expect(service.execute({ kind: "session.recover", session: started.session.id }, { signal }))
+        .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      expect(requestedDetails.splice(0)).toEqual([true]);
+      expect(store.readQueueEffect(queued.queued.id)?.resolution).toBeUndefined();
+      expect(snapshot()).toEqual(before);
+      expect(providerMutationCalls(codex)).toEqual(providerWrites);
+    }
+    codex.readProjection = complete;
 
     expect(await service.execute({ kind: "session.recover", session: started.session.id }, { signal })).toMatchObject({
       queueId: queued.queued.id,
       session: { state: "active", activeTurnId: "turn-next" },
       recovery: { resolution: "proven_applied", providerEffectRetried: false },
     });
+    expect(requestedDetails.splice(0)).toEqual([true]);
     expect(store.readQueueEffect(queued.queued.id)).toMatchObject({ resolution: { kind: "proven_applied" } });
     expect(store.latestSessionRuntimeProfile(started.session.id)).toMatchObject({ revision: 2, sourceKind: "queue_start", sourceId: queued.queued.id });
     expect(codex.calls.filter((call) => call === "send")).toHaveLength(1);
@@ -25328,6 +25461,38 @@ describe("HraService", () => {
     expect(await service.execute({ kind: "session.recover", session: started.session.id }, { signal })).toMatchObject({
       recovery: { resolution: "provider_state_reconciled" },
     });
+  });
+
+  test("abandons an ambiguous queued dispatch using metadata without claiming a complete message set", async () => {
+    const value = await fixture();
+    const { service, store, codex } = value;
+    const { sessionId } = await createIdleSession(value, "Queue metadata abandonment");
+    codex.startTurnError = new IndeterminateCodexEffectError("turn/start", 48);
+    const queued = await service.execute({
+      kind: "session.queue", session: sessionId, message: "Uncertain metadata-only abandonment",
+    }, { signal }) as { queued: { id: `queue_${string}` } };
+    await service.settled();
+    expect(store.requireQueue(queued.queued.id).state).toBe("ambiguous");
+    const original = store.readQueueEffect(queued.queued.id);
+    const providerWrites = providerMutationCalls(codex);
+    codex.readProjection = {
+      providerThreadId: codex.readProjection.providerThreadId,
+      title: codex.readProjection.title,
+      status: "idle",
+    };
+    const details: boolean[] = [];
+    const port: CodexRuntimePort = codex;
+    const read = port.readSession.bind(port);
+    port.readSession = async (input) => { details.push(input.detail); return await read(input); };
+    await expect(service.execute({ kind: "session.abandon", session: sessionId }, { signal }))
+      .resolves.toMatchObject({ queueId: queued.queued.id,
+        recovery: { resolution: "abandoned", providerEffectRetried: false, providerStateDeleted: false } });
+    expect(details).toEqual([false]);
+    expect(store.readQueueEffect(queued.queued.id)).toMatchObject({ resolution: { kind: "abandoned" } });
+    expect(store.readQueueEffect(queued.queued.id)?.evidence).toEqual(original?.evidence);
+    expect(store.listSessionEvents({ sessionId, afterSequence: 0 }).events
+      .filter((event) => event.body.type === "user_message" && event.body.sourceId === queued.queued.id)).toEqual([]);
+    expect(providerMutationCalls(codex)).toEqual(providerWrites);
   });
 
   test("reconciles a retired-generation queued dispatch after daemon rollover without replay", async () => {
@@ -27799,72 +27964,91 @@ describe("HraService", () => {
     expect(responseInFlightOnly.advisory.attention).toBe("response_in_flight");
   });
 
-  test("expires retired pending interactions locally without starving supported deadlines or clearing uncertainty", async () => {
-    let now = 1_000;
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
-    const { sessionId: supportedSessionId } = await createIdleSession(value, "Historical deadlines");
-    const supportedSession = value.store.requireSession(supportedSessionId);
-    const profile = value.store.requireProfileById(supportedSession.profileId);
-    const retiredSession = legacyDevinSession(value, profile.id);
-    value.codex.calls.length = 0;
-    const admit = (requestId: string, sessionId: Parameters<StateStore["admitInteraction"]>[0]["sessionId"], method: string, deadlineAt = 1_000) =>
-      value.store.admitInteraction({
+  test("preserves quarantined retired interactions without starving supported deadlines or clearing uncertainty", async () => {
+    const archive = canonical39RetiredRecoveryFixtures.interaction_deadlines;
+    const captured = archive.retained;
+    let now = archive.fixedTime;
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now,
+      undefined, {}, { canonical39RetiredRecovery: "interaction_deadlines" });
+    // Keep the archived byte image independently readable. The current fixture
+    // already performed the real migration and boot, not a restamped downgrade.
+    const originalPath = join(value.documents, "canonical39-original.sqlite");
+    await writeFile(originalPath, canonical39RetiredRecoveryDatabaseBytes("interaction_deadlines"), { mode: 0o600 });
+    const original = new Database(originalPath, { create: false, strict: true });
+    original.exec("PRAGMA query_only=ON");
+    const inspected = new Database(value.paths.database, { create: false, strict: true });
+    inspected.exec("PRAGMA query_only=ON");
+    try {
+      const columns = original.query("PRAGMA table_info(provider_interactions)").all() as { name: string }[];
+      expect(columns.length).toBeGreaterThan(0);
+      expect(columns.length).toBeLessThan(64);
+      for (const column of columns) expect(column.name).toMatch(/^[a-z_]+$/);
+      const select = columns.map(({ name }) => `"${name}"`).join(",");
+      const sql = `SELECT ${select} FROM provider_interactions WHERE profile_id=? ORDER BY public_id LIMIT 35`;
+      const originalRows = original.query(sql).all(captured.profile.id) as Array<Record<string, unknown> & {
+        state: string; session_id: string | null; revision: number;
+      }>;
+      expect(originalRows).toHaveLength(34);
+      const expectedRows = originalRows.map((row) => row.state === "pending" && row.session_id === null
+        ? { ...row, state: "expired", revision: row.revision + 1, updated_at: now, terminal_at: now }
+        : row);
+      // Only exact-method orphan pending callbacks gain a sidecar and expire
+      // at boot. Bound callbacks lack an original turn authority: quarantine
+      // retains every cell, including prepared responses and unknown outcomes.
+      const retainedRows = () => JSON.stringify(inspected.query(sql).all(captured.profile.id));
+      const expectedBytes = JSON.stringify(expectedRows);
+      expect(retainedRows()).toBe(expectedBytes);
+      expect(value.store.requireInteraction(captured.unknown.publicId)).toMatchObject(captured.unknown);
+      expect(value.codex.calls).toEqual([]);
+      expect(value.codex.validatedInteractionTimeouts).toEqual([]);
+      expect(value.codex.timedOutInteractions).toEqual([]);
+
+      // Quarantined records are not live capacity, an armed deadline timer, or
+      // an attention notification. Exclusion must happen before each limit.
+      expect(value.store.listDueInteractions({ now: now + 1_000, limit: 1 })).toEqual([]);
+      expect(value.store.nextInteractionDeadlineAt()).toBeNull();
+      expect(value.store.readAttentionNotificationSnapshot({ now, limit: 1 })).toEqual({
+        interactions: [], observedAt: now, status: "complete",
+      });
+      const { sessionId } = await createIdleSession(value, "Supported historical deadlines");
+      const session = value.store.requireSession(sessionId);
+      const supported = value.store.admitInteraction({
         publicId: crypto.randomUUID(), sessionId,
         authority: {
-          ...value.store.requireProviderAccountAuthority(profile.id, sessionId === supportedSession.id ? "codex" : "devin"),
-          profileId: profile.id, processGeneration: profile.processGeneration,
+          ...value.store.requireProviderAccountAuthority(session.profileId, "codex"),
           connectionId: value.codex.observationConnectionId,
-          requestId: { type: "string", value: requestId }, method,
-          requestDigest: createHash("sha256").update(requestId).digest("hex"),
-          threadId: sessionId === supportedSession.id ? supportedSession.providerThreadId ?? null : "historical-devin-thread",
+          requestId: { type: "string", value: "supported-after-retired" },
+          method: "item/commandExecution/requestApproval",
+          requestDigest: createHash("sha256").update("supported-after-retired").digest("hex"),
+          threadId: session.providerThreadId ?? null,
           turnId: null, itemId: null, approvalId: null,
         },
         kind: "command_approval", blocking: true,
         display: {
-          kind: "command_approval", summary: "Historical pending approval", reason: null,
+          kind: "command_approval", summary: "Supported pending approval", reason: null,
           commandClass: "test", workingDirectory: null,
           availableDecisions: ["once", "decline", "cancel"],
         },
-        requestedAt: 1_000, deadlineAt,
+        requestedAt: now, deadlineAt: now + 1_001,
       }).record;
-    try {
-      // Fill the first bounded batch: session-bound old methods and orphaned
-      // Devin methods both identify retired authority without a live runtime.
-      const pending = Array.from({ length: 32 }, (_, index) => admit(
-        `retired-${index}`,
-        index % 2 === 0 ? retiredSession.id : null,
-        index % 2 === 0 ? "item/commandExecution/requestApproval" : "devin/session/request_permission",
-      ));
-      const prepared = value.store.prepareInteractionResponse({
-        id: admit("retired-prepared", retiredSession.id, "devin/session/request_permission").publicId,
-        expectedRevision: 1, responseDigest: "a".repeat(64),
+      expect(value.store.readAttentionNotificationSnapshot({ now, limit: 1 })).toEqual({
+        interactions: [supported], observedAt: now, status: "complete",
       });
-      const unknown = value.store.markInteractionResolutionUnknown({
-        id: admit("retired-unknown", null, "devin/session/request_permission").publicId,
-        expectedRevision: 1,
-      });
-      const supported = admit(
-        "supported-after-retired", supportedSession.id,
-        "item/commandExecution/requestApproval", 1_001,
-      );
-      now = 2_000;
-      expect(await value.service.maintainInteractionDeadlines()).toEqual({ examined: 32, failed: 0 });
-      for (const record of pending) {
-        expect(value.store.requireInteraction(record.publicId)).toMatchObject({
-          state: "expired", revision: 2, responseDigest: null,
-        });
-      }
-      expect(value.codex.validatedInteractionTimeouts).toHaveLength(0);
-      expect(value.codex.timedOutInteractions).toHaveLength(0);
-      expect(value.codex.calls).toEqual([]);
+      expect(value.store.nextInteractionDeadlineAt()).toBe(supported.deadlineAt);
+      value.codex.calls.length = 0;
+      now += 2_000;
+      expect(value.store.listDueInteractions({ now, limit: 1 })).toEqual([supported]);
       expect(await value.service.maintainInteractionDeadlines()).toEqual({ examined: 1, failed: 0 });
       expect(value.store.requireInteraction(supported.publicId).state).toBe("expired");
       expect(value.codex.validatedInteractionTimeouts).toHaveLength(1);
       expect(value.codex.timedOutInteractions).toHaveLength(1);
-      expect(value.store.requireInteraction(prepared.publicId)).toEqual(prepared);
-      expect(value.store.requireInteraction(unknown.publicId)).toEqual(unknown);
+      expect(value.store.nextInteractionDeadlineAt()).toBeNull();
+      expect(await value.service.maintainInteractionDeadlines()).toEqual({ examined: 0, failed: 0 });
+      expect(retainedRows()).toBe(expectedBytes);
       expect(value.codex.calls.every((call) => call === "readAccount")).toBe(true);
     } finally {
+      original.close(false);
+      inspected.close(false);
       await value.service.close();
     }
   });

@@ -57,6 +57,8 @@ const predecessors = [
     digest: "ecb4399f80980dfba880341d03d9321218e3700130a8dc5fc7eb6957a30ab4ab" },
   { name: "peer_session_direct_message_source_delete_guard", table: "peer_session_direct_message_sources",
     digest: "48d1575451bd8866a0bba472f46f98f11bf162f2045d0c0cd50906588363207c" },
+  { name: "peer_session_action_transition_guard", table: "peer_session_actions",
+    digest: "2996d0ce6e6c12d03a01524a7aca2361d040f9282d3ec751a22afdde1d93df2f" },
 ] as const;
 
 async function upgrade() {
@@ -134,6 +136,8 @@ describe("retained private48 canonical waypoints and strict joined successors", 
     { name: "queue_transcript_finalization_guard", damage: "reverted", code: "JOINED_QUEUE_TRANSCRIPT_GUARD_INVALID" },
     { name: "peer_session_direct_message_source_delete_guard", damage: "missing", code: "PEER_SESSION_CANCELLATION_UNPROVEN" },
     { name: "peer_session_direct_message_source_delete_guard", damage: "reverted", code: "PEER_SESSION_CANCELLATION_UNPROVEN" },
+    { name: "peer_session_action_transition_guard", damage: "missing", code: "PEER_SESSION_CANCELLATION_UNPROVEN" },
+    { name: "peer_session_action_transition_guard", damage: "reverted", code: "PEER_SESSION_CANCELLATION_UNPROVEN" },
     { name: "peer_session_cancellation_insert", damage: "missing", code: "PEER_SESSION_CANCELLATION_UNPROVEN" },
   ] as const;
   for (const { name, damage, code } of damageCases) {

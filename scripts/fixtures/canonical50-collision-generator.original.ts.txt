@@ -1,0 +1,225 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { existsSync, lstatSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdir } from "node:fs/promises";
+import { isAbsolute, join, relative } from "node:path";
+import { pathToFileURL } from "node:url";
+import { gzipSync } from "node:zlib";
+import { Database } from "bun:sqlite";
+
+// PREPARATION ONLY: the integration owner must review this complete recipe and
+// the selected public API implementations before executing it through the host
+// scheduler. Reuse only this previously qualified, immutable source/dependency
+// tree. Never open its earlier capture outputs or modify the source tree.
+// Every durable database mutation below is an archived public StateStore call.
+// SQL is bounded query-only inspection and a final WAL checkpoint, never DDL,
+// raw row writes, provider execution, network access or an invented old ledger.
+const [sourceRoot, ...extraArguments] = Bun.argv.slice(2);
+assert.ok(typeof sourceRoot === "string" && isAbsolute(sourceRoot));
+assert.deepEqual(extraArguments, []);
+const root = import.meta.dir;
+const output = join(root, "capture");
+const sha256 = (value: string | Uint8Array) => createHash("sha256").update(value).digest("hex");
+const definition = {
+  sourceCommit: "d5376e34dcf2ace99009fd6eeaed3dcae917bcca",
+  sourceTree: "14ccd71d668411851ec5f65e03f16f6e63ec78f7",
+  sourceManifestSha256: "47654cc7d2bc9938ba40869ae276be17c1d6eb975f54c90b411cd217477be335",
+  sourceFileCount: 320,
+  sourceHashes: {
+    "src/storage/state-store.ts": "241521b597607d4007b9eeffae180967de416412d16b71cea6078d058f5c1963",
+    "package.json": "381a05e2bd733f8d67e67303a25f991cfcca783703293f4233fe639ff843b107",
+    "bun.lock": "0a108a3ba2a4b705a96564548592108c9169697ed1f10186c9dfb7f6e3a229ad",
+  },
+  dependencies: { "@hraness/oh": "0.4.1", "@openai/codex": "0.153.2", convex: "1.45.0", effect: "3.22.1", zod: "4.4.3" },
+} as const;
+const readBounded = (path: string, maximumBytes = 8 * 1024 * 1024) => {
+  const stat = lstatSync(path);
+  assert.equal(stat.isFile(), true);
+  assert.ok(stat.size <= maximumBytes);
+  return readFileSync(path);
+};
+const verifySource = () => {
+  assert.equal(lstatSync(sourceRoot).isDirectory(), true);
+  for (const [path, expected] of Object.entries(definition.sourceHashes)) {
+    assert.equal(sha256(readBounded(join(sourceRoot, path))), expected, path);
+  }
+  assert.equal(readBounded(join(sourceRoot, ".bun-version")).toString("utf8").trim(), "1.3.14");
+  const files: { path: string; sha256: string }[] = [];
+  const visit = (directory: string) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      assert.match(entry.name, /^[A-Za-z0-9_.-]+$/);
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) visit(path);
+      else if (entry.isFile()) files.push({ path: relative(sourceRoot, path), sha256: sha256(readBounded(path)) });
+      else throw new Error("Unexpected archived source entry.");
+    }
+  };
+  visit(join(sourceRoot, "src"));
+  files.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+  assert.equal(files.length, definition.sourceFileCount);
+  assert.equal(sha256(JSON.stringify(files)), definition.sourceManifestSha256);
+  const manifest = JSON.parse(readBounded(join(sourceRoot, "package.json")).toString("utf8"));
+  assert.deepEqual(manifest.dependencies, definition.dependencies);
+  for (const [name, version] of Object.entries(definition.dependencies)) {
+    const installed = JSON.parse(readBounded(join(sourceRoot, "node_modules", name, "package.json")).toString("utf8"));
+    assert.equal(installed.version, version);
+  }
+  return files;
+};
+const snapshot = (path: string) => {
+  const database = new Database(path, { create: false, strict: true });
+  database.exec("PRAGMA query_only=ON");
+  try {
+    return database.transaction(() => {
+      const schema = database.query("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name LIMIT 2049").all();
+      assert.ok(schema.length <= 2048);
+      const tables = database.query("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name LIMIT 257").all() as { name: string }[];
+      assert.ok(tables.length <= 256);
+      const rows: Record<string, unknown[]> = {};
+      for (const { name } of tables) {
+        assert.match(name, /^[A-Za-z0-9_]+$/);
+        rows[name] = database.query(`SELECT * FROM "${name}" LIMIT 4097`).all().sort((a, b) => {
+          const left = JSON.stringify(a), right = JSON.stringify(b);
+          return left < right ? -1 : left > right ? 1 : 0;
+        });
+        assert.ok(rows[name].length <= 4096);
+      }
+      const result = { userVersion: database.query("PRAGMA user_version").get(), schema, rows,
+        foreignKeyCheck: database.query("PRAGMA foreign_key_check").all(),
+        inspectionChanges: database.query("SELECT total_changes() AS count").get() };
+      assert.deepEqual(result.foreignKeyCheck, []);
+      assert.deepEqual(result.inspectionChanges, { count: 0 });
+      assert.ok(Buffer.byteLength(JSON.stringify(result)) <= 8 * 1024 * 1024);
+      return result;
+    }).deferred();
+  } finally { database.close(false); }
+};
+
+assert.equal(Bun.version, "1.3.14");
+assert.equal(lstatSync(root).mode & 0o777, 0o700);
+assert.equal(existsSync(output), false, "Never overwrite or resume a capture.");
+const sourceManifest = verifySource();
+const recipe = readBounded(import.meta.path);
+const { StateStore } = await import(pathToFileURL(join(sourceRoot, "src/storage/state-store.ts")).href);
+const { initializeStatePaths, resolveStatePaths } = await import(pathToFileURL(join(sourceRoot, "src/storage/paths.ts")).href);
+await mkdir(output, { mode: 0o700 });
+const paths = resolveStatePaths({ rootDirectory: join(output, "state") });
+await initializeStatePaths(paths);
+assert.equal(existsSync(paths.database), false);
+const clock = { now: 50_000 };
+const store = new StateStore(paths, { now: () => clock.now });
+assert.deepEqual(snapshot(paths.database).userVersion, { user_version: 50 });
+const createdProfile = store.createProfile("Canonical50 synthetic source collision");
+assert.equal(store.allocateNextUsageRevision(createdProfile.id), 1);
+assert.equal(store.nextProfileGeneration(createdProfile.id).processGeneration, 1);
+const email = "canonical50-collision@example.com";
+assert.equal(store.setProfileState(createdProfile.id, 1, "signed_in", { email, plan: "Plus" }), true);
+const profile = store.requireProfile(createdProfile.id);
+const providerAccountKey = `v1:codex:${sha256(email)}`;
+const providerThreadId = "canonical50-synthetic-collision-thread";
+const session = store.upsertProviderSession({ profileId: profile.id, provider: "codex", providerThreadId,
+  providerAccountKey, title: "Canonical50 independent transcript sources", preset: "high", fastEnabled: false, state: "idle" });
+const providerConnectionId = "50000000-0000-4000-8000-000000000050";
+const turnId = "canonical50-synthetic-collision-turn";
+const queueMessage = "Canonical50 queued collision source";
+const mutationMessage = "Canonical50 mutation collision source";
+const runtimeProfile = { profileId: profile.id, processGeneration: 1, observedAt: clock.now,
+  preset: "high", model: "gpt-5.6-sol", reasoningEffort: "max", serviceTier: null, fast: false,
+  approvalPolicy: "on-request", reviewMode: "auto_review", permissionProfile: ":workspace",
+  computerUse: true, pluginCapability: true, enabledApps: [] };
+const queued = store.enqueueIdempotent({ sessionId: session.id, profileGeneration: 1, message: queueMessage,
+  idempotencyKey: "50000000-0000-4000-8000-000000000051" });
+assert.match(queued.id, /^queue_[0-9a-f]{32}$/);
+const queueEvidence = store.beginQueueEffect({ queueId: queued.id, sessionId: session.id,
+  profileGeneration: 1, providerConnectionId, evidence: { kind: "queue.dispatch", queueId: queued.id,
+    sessionId: session.id, providerThreadId, profileGeneration: 1,
+    baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+    clientMessageId: queued.id, messageDigest: sha256(queueMessage), runtimeProfile } });
+clock.now++;
+store.completeQueueEffect({ queueId: queued.id, accountId: profile.id, providerGeneration: 1,
+  providerConnectionId, expectedEvidenceDigest: queueEvidence.digest,
+  expectedSessionRevision: store.requireSession(session.id).revision, applyResponseState: true,
+  turnId, turnStatus: "inProgress", runtimeProfile, message: queueMessage,
+  receipt: { turnId, status: "inProgress" } });
+assert.equal(store.hasSessionUserMessageSource(session.id, "queue", queued.id), true);
+assert.equal(store.hasSessionUserMessageSource(session.id, "mutation", queued.id), false);
+
+// The exact old storage writer, not today's public UUID boundary, creates the
+// collision. Both independent effects exist; queue runtime/turn proof is real
+// public-writer output rather than a raw terminal queue transition shortcut.
+const attempt = store.prepareMutation({ kind: "session.steer", authorityId: session.id,
+  authorityGeneration: 1, request: { message: mutationMessage }, idempotencyKey: queued.id });
+const mutationEvidence = store.beginSessionMutationEffect({ attemptId: attempt.id, sessionId: session.id,
+  profileGeneration: 1, message: mutationMessage,
+  transcript: { accountId: profile.id, providerGeneration: 1, providerConnectionId, actor: "human", message: mutationMessage },
+  evidence: { kind: "session.steer", providerThreadId,
+    baseline: { providerUpdatedAt: null, status: "active", activeTurnId: turnId },
+    activeTurnId: turnId, clientMessageId: attempt.id, messageDigest: sha256(mutationMessage) } });
+const receipt = { steered: true, activeTurnId: turnId };
+assert.equal(store.transitionMutation(attempt.id, "effect_started", "applied", receipt), true);
+assert.equal(store.hasSessionUserMessageSource(session.id, "mutation", queued.id), false);
+const beforeRollover = snapshot(paths.database);
+clock.now++;
+assert.equal(store.nextProfileGeneration(profile.id).processGeneration, 2);
+assert.deepEqual(snapshot(paths.database).rows.mutation_effect_evidence, beforeRollover.rows.mutation_effect_evidence);
+assert.deepEqual(snapshot(paths.database).rows.queue_effect_evidence, beforeRollover.rows.queue_effect_evidence);
+const finalized = store.finalizeSessionUserMessageSource({ sessionId: session.id, sourceKind: "mutation",
+  sourceId: queued.id, turnId });
+assert.equal(finalized.body.type, "user_message");
+assert.equal(store.hasSessionUserMessageSource(session.id, "mutation", queued.id), true);
+assert.equal(store.hasSessionUserMessageSource(session.id, "queue", queued.id), true);
+const events = store.listSessionEvents({ sessionId: session.id, afterSequence: 0 }).events;
+const messages = events.filter((event: { body: { type: string } }) => event.body.type === "user_message");
+assert.equal(messages.length, 2);
+assert.equal(messages[0].body.sourceId, messages[1].body.sourceId);
+assert.deepEqual(messages.map((event: { body: { text: string } }) => event.body.text), [queueMessage, mutationMessage]);
+const finalSnapshot = snapshot(paths.database);
+assert.equal(finalSnapshot.rows.mutation_effect_evidence.length, 1);
+assert.equal(finalSnapshot.rows.queue_effect_evidence.length, 1);
+assert.equal(finalSnapshot.rows.session_turn_runtime_profiles.length, 1);
+assert.equal(finalSnapshot.rows.session_message_event_sources.length, 2);
+assert.deepEqual(finalSnapshot.rows.mutation_effect_evidence, beforeRollover.rows.mutation_effect_evidence);
+assert.deepEqual(finalSnapshot.rows.queue_effect_evidence, beforeRollover.rows.queue_effect_evidence);
+const retained = { profile: store.requireProfile(profile.id), session: store.requireSession(session.id),
+  providerAccountKey, turnId, queued: store.requireQueue(queued.id), mutation: store.readMutation(queued.id),
+  queueEvidence, mutationEvidence, messages, originalProcessGeneration: 1, finalProcessGeneration: 2 };
+store.close();
+const reopened = new StateStore(paths, { now: () => clock.now });
+assert.deepEqual(snapshot(paths.database), finalSnapshot);
+assert.equal(reopened.finalizeSessionUserMessageSource({ sessionId: session.id, sourceKind: "mutation", sourceId: queued.id, turnId }), null);
+assert.equal(reopened.finalizeSessionUserMessageSource({ sessionId: session.id, sourceKind: "queue", sourceId: queued.id, turnId }), null);
+assert.deepEqual(snapshot(paths.database), finalSnapshot);
+reopened.close();
+const checkpoint = new Database(paths.database, { create: false, strict: true });
+const checkpointResult = checkpoint.query("PRAGMA wal_checkpoint(TRUNCATE)").get() as { busy: number };
+checkpoint.close(false);
+assert.equal(checkpointResult.busy, 0);
+const beforeReadonly = sha256(readBounded(paths.database));
+const readonly = new StateStore(paths, { readonly: true });
+assert.equal(readonly.hasSessionUserMessageSource(session.id, "mutation", queued.id), true);
+assert.equal(readonly.hasSessionUserMessageSource(session.id, "queue", queued.id), true);
+assert.deepEqual(snapshot(paths.database), finalSnapshot);
+readonly.close();
+const bytes = readBounded(paths.database, 4 * 1024 * 1024);
+assert.equal(sha256(bytes), beforeReadonly);
+const metadata = { ...definition, schemaVersion: 50, generatorSha256: sha256(recipe), bunVersion: Bun.version,
+  sourceManifestOrdering: "ASCII relative paths", fixedTime: clock.now,
+  scenario: "independently finalized colliding mutation and queue source strings",
+  provenance: { syntheticControlPlaneOnly: true, archivedPublicApisOnly: true, rawSqlRowOrSchemaWrites: false,
+    nativeProviderEffects: 0, networkEffects: 0, randomizedIdentifiers: true, actualHistoricalRollover: true,
+    writableReopenUnchanged: true, readonlyReopenUnchanged: true, readonlyDatabaseHashUnchanged: true,
+    providerRuntimeObservationClaim: false, currentMergedAdmissionClaim: false },
+  databaseSha256: sha256(bytes), databaseBytes: bytes.length, checkpointResult, retained, snapshot: finalSnapshot };
+const metadataText = JSON.stringify(metadata);
+assert.ok(Buffer.byteLength(metadataText) <= 8 * 1024 * 1024);
+for (const forbidden of [root, sourceRoot, "/Users/", "/private/", "/tmp/", "/home/", "/Volumes/"]) {
+  assert.equal(metadataText.includes(forbidden), false);
+  for (const encoding of ["utf8", "utf16le"] as const) assert.equal(bytes.includes(Buffer.from(forbidden, encoding)), false);
+}
+writeFileSync(join(output, "state.sqlite.gz"), gzipSync(bytes), { mode: 0o600, flag: "wx" });
+writeFileSync(join(output, "fixture.json"), JSON.stringify(metadata, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+writeFileSync(join(output, "source-manifest.json"), JSON.stringify(sourceManifest, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+verifySource();
+console.log(JSON.stringify({ generatorSha256: sha256(recipe), sourceCommit: definition.sourceCommit,
+  databaseSha256: sha256(bytes), databaseBytes: bytes.length, archivedReopensUnchanged: true,
+  earlierCapturesOpened: false, currentMergedAdmissionClaim: false }));

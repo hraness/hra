@@ -1,10 +1,15 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, realpath, rm } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import {
+  canonical39SwitchDatabaseBytes,
+  canonical39SwitchFixtures,
+  type Canonical39SwitchScenario,
+} from "../../scripts/fixtures/canonical39-switch";
 import { CLAUDE_PIN, CLAUDE_PIN_MODEL } from "../claude/pin";
 import { IndeterminateCodexEffectError, type HraHostToolCall } from "../codex";
 import { HRA_SESSION_PREAMBLE } from "../domain/hra-preamble";
@@ -717,6 +722,7 @@ type Fixture = Readonly<{
   documents: string;
   factsMemory: SwitchFactsMemory;
   factsMemoryEnabled: boolean;
+  historicalSwitchRows: ReturnType<typeof readCanonical39SwitchRows> | undefined;
   daemonGeneration: number;
   daemonBootId: string;
   paths: ReturnType<typeof resolveStatePaths>;
@@ -724,18 +730,31 @@ type Fixture = Readonly<{
   store: StateStore;
 }>;
 
-async function fixture(
-  nowOrAuthority: (() => number) | Pick<DaemonAuthorityFence, "assertCurrent" | "close"> = Date.now,
-  cloud: OfflineCloud = new OfflineCloud(),
-  factsMemoryEnabled = true,
-): Promise<Fixture> {
-  const now = typeof nowOrAuthority === "function" ? nowOrAuthority : Date.now;
+async function fixturePaths(historical?: Canonical39SwitchScenario) {
   const home = await realpath(await mkdtemp(join(tmpdir(), "hra-switch-")));
   roots.push(home);
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   const documents = join(home, "Documents");
   await mkdir(documents, { recursive: true });
   await initializeStatePaths(paths);
+  // Import the exact archived image before any current StateStore constructor.
+  if (historical !== undefined) {
+    await Bun.write(paths.database, canonical39SwitchDatabaseBytes(historical));
+    await chmod(paths.database, 0o600);
+  }
+  const historicalSwitchRows = historical === undefined ? undefined
+    : readCanonical39SwitchRows(paths.database, canonical39SwitchFixtures[historical].retained.mutation.id);
+  return { paths, documents, historicalSwitchRows };
+}
+
+async function fixture(
+  nowOrAuthority: (() => number) | Pick<DaemonAuthorityFence, "assertCurrent" | "close"> = Date.now,
+  cloud: OfflineCloud = new OfflineCloud(),
+  factsMemoryEnabled = true,
+  historical?: Canonical39SwitchScenario,
+): Promise<Fixture> {
+  const now = typeof nowOrAuthority === "function" ? nowOrAuthority : Date.now;
+  const { paths, documents, historicalSwitchRows } = await fixturePaths(historical);
   const store = new StateStore(paths);
   stores.push(store);
   const daemonBootId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
@@ -765,7 +784,7 @@ async function fixture(
     store,
   });
   services.push(service);
-  return { claude, codex, daemonAuthority, daemonGeneration, daemonBootId, documents, factsMemory, factsMemoryEnabled, paths, service, store };
+  return { claude, codex, daemonAuthority, daemonGeneration, daemonBootId, documents, factsMemory, factsMemoryEnabled, historicalSwitchRows, paths, service, store };
 }
 
 function liveAuthorityFor(
@@ -843,6 +862,7 @@ async function reopenFixture(value: Fixture): Promise<Fixture> {
     daemonBootId,
     factsMemory,
     factsMemoryEnabled: value.factsMemoryEnabled,
+    historicalSwitchRows: value.historicalSwitchRows,
     documents: value.documents,
     paths: value.paths,
     service,
@@ -1354,32 +1374,107 @@ const createLegacyProviderSwitch = async (
   }
 };
 
-const removeTargetAccountAuthorityFromSwitchEvidence = (
-  value: Fixture,
-  idempotencyKey: string,
-): NonNullable<ReturnType<StateStore["readMutation"]>> => {
-  const attempt = value.store.readMutation(idempotencyKey);
-  if (attempt?.evidence?.evidence.kind !== "session.switch") {
-    throw new Error("Expected immutable provider-switch evidence.");
-  }
-  const direct = new Database(value.store.paths.database, { create: false, strict: true });
-  const guard = direct.query("SELECT sql FROM sqlite_master WHERE name='mutation_effect_evidence_immutable_update'")
-    .get() as { sql: string } | null;
-  if (guard === null) throw new Error("Missing immutable effect guard fixture.");
+const expectHistoricalValue = (actual: unknown, expected: unknown): void => {
+  expect(actual).toEqual(expected);
+};
+
+const readCanonical39SwitchRows = (path: string, attemptId: string) => {
+  const database = new Database(path, { create: false, strict: true });
+  database.exec("PRAGMA query_only=ON");
   try {
-    direct.exec("DROP TRIGGER mutation_effect_evidence_immutable_update");
-    const legacyEvidence = { ...attempt.evidence.evidence } as Record<string, unknown>;
-    delete legacyEvidence.targetProviderAccountKey;
-    const legacyEvidenceJson = JSON.stringify(legacyEvidence);
-    const legacyEvidenceDigest = createHash("sha256").update(legacyEvidenceJson).digest("hex");
-    direct.query(
-      "UPDATE mutation_effect_evidence SET evidence_json=?,evidence_digest=? WHERE attempt_id=?",
-    ).run(legacyEvidenceJson, legacyEvidenceDigest, attempt.id);
+    return database.transaction(() => [
+      "SELECT id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,result_json,created_at,updated_at FROM mutation_attempts WHERE id=?",
+      "SELECT attempt_id,evidence_json,evidence_digest,recorded_at FROM mutation_effect_evidence WHERE attempt_id=?",
+      "SELECT attempt_id,provider_thread_id,recorded_at FROM session_provider_switch_targets WHERE attempt_id=?",
+      "SELECT attempt_id,client_message_id,seed_text,runtime_profile_json,recorded_at FROM session_provider_switch_seed_intents WHERE attempt_id=?",
+      "SELECT attempt_id,turn_id,turn_status,recorded_at FROM session_provider_switch_seed_results WHERE attempt_id=?",
+      "SELECT attempt_id,recorded_at FROM session_provider_switch_source_releases WHERE attempt_id=?",
+      "SELECT attempt_id,recorded_at FROM session_provider_switch_target_releases WHERE attempt_id=?",
+      "SELECT session_id,revision,source_kind,source_id,profile_id,process_generation,observed_at,profile_json,recorded_at FROM session_runtime_profiles WHERE source_id=?",
+    ].map((sql) => database.query(`${sql} LIMIT 2`).all(attemptId))).deferred();
+  } finally { database.close(); }
+};
+
+const expectCanonical39SwitchRetained = (
+  value: Fixture,
+  scenario: Canonical39SwitchScenario,
+): void => {
+  const original = canonical39SwitchFixtures[scenario].retained;
+  const attempt = value.store.readMutation(original.idempotencyKey);
+  if (attempt?.evidence?.evidence.kind !== "session.switch") {
+    throw new Error("Expected the archived provider-switch evidence.");
+  }
+  expectHistoricalValue(attempt.evidence, original.effect);
+  expect(attempt.evidence.evidence.targetProviderAccountKey).toBeUndefined();
+  if (scenario === "codex-aliased-target") {
+    // The old API admitted this row; retaining it does not make its target
+    // usable by the current typed reader. Check raw bytes below in either case.
+    expect(() => value.store.readSessionProviderSwitchProgress(attempt.id))
+      .toThrow("SESSION_PROVIDER_SWITCH_TARGET_ALIASES_SOURCE");
+  } else {
+    expectHistoricalValue(value.store.readSessionProviderSwitchProgress(attempt.id), original.progress);
+  }
+  const historicalSwitchRows = value.historicalSwitchRows;
+  if (historicalSwitchRows === undefined) {
+    throw new Error("Expected the archived provider-switch rows.");
+  }
+  expect(readCanonical39SwitchRows(value.paths.database, attempt.id)).toEqual(historicalSwitchRows);
+  const direct = new Database(value.store.paths.database, { create: false, strict: true });
+  direct.exec("PRAGMA query_only=ON");
+  try {
+    expect(direct.query("SELECT evidence_json,evidence_digest,recorded_at FROM mutation_effect_evidence WHERE attempt_id=?")
+      .get(attempt.id)).toEqual({ evidence_json: JSON.stringify(original.effect.evidence),
+      evidence_digest: original.effect.digest, recorded_at: original.effect.recordedAt });
   } finally {
-    direct.exec(guard.sql);
     direct.close();
   }
-  return attempt;
+};
+
+const switchDatabaseSnapshot = (path: string) => {
+  const database = new Database(path, { create: false, strict: true });
+  database.exec("PRAGMA query_only=ON");
+  try {
+    return database.transaction(() => {
+      const tables = database.query("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name LIMIT 513")
+        .all() as { name: string }[];
+      expect(tables.length).toBeLessThanOrEqual(512);
+      return {
+        version: database.query("PRAGMA user_version").get(),
+        schema: database.query("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name").all(),
+        rows: tables.map(({ name }) => {
+          expect(name).toMatch(/^[A-Za-z0-9_]+$/);
+          const rows = database.query(`SELECT * FROM "${name}" LIMIT 4097`).all();
+          expect(rows.length).toBeLessThanOrEqual(4096);
+          return { name, rows: rows.map((row) => JSON.stringify(row)).sort() };
+        }),
+      };
+    }).deferred();
+  } finally { database.close(); }
+};
+
+const expectCanonical39IdentityRefusal = async (
+  value: Fixture,
+  scenario: Canonical39SwitchScenario,
+) => {
+  const original = canonical39SwitchFixtures[scenario].retained;
+  const sessionId = original.session.id;
+  expectCanonical39SwitchRetained(value, scenario);
+  expect(value.store.requireProfile(original.session.profileId).state).toBe("signed_in");
+  expect(value.store.readSessionProviderAccountAuthority(sessionId)).toBeNull();
+  expect(value.store.sessionAccountAuthorityMatches(sessionId, original.session.profileId)).toBe(false);
+  const before = switchDatabaseSnapshot(value.paths.database);
+  for (const kind of ["session.recover", "session.abandon"] as const) {
+    await expect(value.service.execute({ kind, session: sessionId }, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED", message: expect.stringContaining("unprovable provider account identity") });
+    expect(switchDatabaseSnapshot(value.paths.database)).toEqual(before);
+  }
+  expect(value.codex.calls).toEqual([]);
+  expect(value.codex.readAccountCalls).toBe(0);
+  expect(value.codex.endedThreads).toEqual([]);
+  expect(value.claude.calls).toEqual([]);
+  expect(value.claude.accountIdentityReadCalls).toBe(0);
+  expect(value.store.readMutation(original.idempotencyKey)).toMatchObject({ state: "ambiguous" });
+  expectCanonical39SwitchRetained(value, scenario);
 };
 
 const expectCurrentSwitchSuccessors = (
@@ -5000,29 +5095,20 @@ describe("provider portability", () => {
     });
   });
 
-  test("legacy journal: abandons a restarted legacy Codex target without provider access", async () => {
-    const value = await fixture();
-    const { sessionId } = await claudeSession(value);
-    const targetAccountId = await signedInCodexAccount(value, "Legacy restarted Codex target");
-    const idempotencyKey = crypto.randomUUID();
-    await recordHistoricalSwitchProgress(value, {
-      account: targetAccountId, idempotencyKey, provider: "codex", session: sessionId, stage: "seed_settled",
-    });
-    const attempt = value.store.readMutation(idempotencyKey);
-    if (attempt === null) throw new Error("Expected an unsettled provider switch.");
-    expect(value.store.readSessionProviderSwitchProgress(attempt.id)).toMatchObject({
-      seedTurnId: "codex-turn-1",
-      sourceReleased: false,
-      targetProviderThreadId: "codex-thread-1",
-      targetReleased: false,
-    });
-    removeTargetAccountAuthorityFromSwitchEvidence(value, idempotencyKey);
-
-    const restarted = await reopenFixture(value);
-    expectCurrentSwitchSuccessors(restarted, idempotencyKey);
+  test("canonical39: abandons a quarantined Claude-source switch locally without provider access", async () => {
+    const original = canonical39SwitchFixtures["claude-seeded-target"].retained;
+    const sessionId = original.session.id;
+    const idempotencyKey = original.idempotencyKey;
+    const restarted = await fixture(Date.now, new OfflineCloud(), false, "claude-seeded-target");
+    await restarted.service.recover();
+    expectCanonical39SwitchRetained(restarted, "claude-seeded-target");
+    expect(restarted.store.hasUnsettledLegacyProviderAuthorityQuarantineForSession(sessionId)).toBe(true);
     const codexCallsBefore = [...restarted.codex.calls];
     const codexAccountReadsBefore = restarted.codex.readAccountCalls;
     const claudeCallsBefore = [...restarted.claude.calls];
+    expect(codexCallsBefore).toEqual([]);
+    expect(codexAccountReadsBefore).toBe(0);
+    expect(claudeCallsBefore).toEqual([]);
     await expect(restarted.service.execute({
       kind: "session.recover",
       session: sessionId,
@@ -5035,15 +5121,8 @@ describe("provider portability", () => {
       recovery: {
         providerEffectRetried: false,
         providerStateDeleted: false,
-        providerStateUnknown: true,
         resolution: "abandoned",
-        sourceObserved: false,
-        sourceReleased: false,
-        sourceStateUnknown: true,
-        targetAddressable: true,
-        targetReleased: false,
-        targetStateUnknown: true,
-        unaddressableTargetMayExist: false,
+        resolved: true,
       },
       session: { state: "terminal" },
     });
@@ -5051,13 +5130,15 @@ describe("provider portability", () => {
     expect(restarted.codex.readAccountCalls).toBe(codexAccountReadsBefore);
     expect(restarted.codex.endedThreads).toEqual([]);
     expect(restarted.claude.calls).toEqual(claudeCallsBefore);
+    expect(restarted.claude.accountIdentityReadCalls).toBe(0);
     expect(restarted.store.readMutation(idempotencyKey)).toMatchObject({
       resolution: {
-        evidence: { providerStateDeleted: false, providerStateUnknown: true },
+        evidence: { authority: "legacy_provider_authority_quarantined", providerStateDeleted: false, providerEffectRetried: false },
         kind: "abandoned",
       },
       state: "reconciled",
     });
+    expectCanonical39SwitchRetained(restarted, "claude-seeded-target");
   });
 
   test("legacy journal: does not target a replacement Codex account while abandoning a recovered switch", async () => {
@@ -5293,159 +5374,65 @@ describe("provider portability", () => {
     });
   });
 
-  test("legacy journal: never reads or ends a legacy target that aliases the source and lacks an account key", async () => {
-    const value = await fixture();
-    const { sessionId } = await codexSession(value);
-    const idempotencyKey = crypto.randomUUID();
-    value.codex.projection = {
-      ...value.codex.projection,
-      providerThreadId: "codex-thread-2",
-    };
-    await recordHistoricalSwitchProgress(value, {
-      idempotencyKey, provider: "codex", preset: "low", providerThreadId: "codex-thread-2",
-      session: sessionId, stage: "target_started",
-    });
-    const attempt = removeTargetAccountAuthorityFromSwitchEvidence(value, idempotencyKey);
-    const direct = new Database(value.store.paths.database, { create: false, strict: true });
-    const guard = direct.query("SELECT sql FROM sqlite_master WHERE name='session_provider_switch_targets_immutable_update'")
-      .get() as { sql: string } | null;
-    if (guard === null) throw new Error("Missing immutable switch-target fixture guard.");
-    try {
-      direct.exec("DROP TRIGGER session_provider_switch_targets_immutable_update");
-      direct.query(
-        "UPDATE session_provider_switch_targets SET provider_thread_id=? WHERE attempt_id=?",
-      ).run("codex-thread-1", attempt.id);
-    } finally {
-      direct.exec(guard.sql);
-      direct.close();
-    }
-    const callsBefore = [...value.codex.calls];
-    const accountReadsBefore = value.codex.readAccountCalls;
-
-    await expect(value.service.execute({
-      kind: "session.abandon",
-      session: sessionId,
-    }, { signal })).rejects.toThrow("SESSION_PROVIDER_SWITCH_TARGET_ALIASES_SOURCE");
-    expect(value.codex.readAccountCalls).toBe(accountReadsBefore);
-    expect(value.codex.calls).toEqual(callsBefore);
-    expect(value.store.readMutation(idempotencyKey)).toMatchObject({ state: "ambiguous" });
+  test("canonical39: retains an aliased target under unproved account identity without provider access", async () => {
+    const original = canonical39SwitchFixtures["codex-aliased-target"].retained;
+    expect(original.progress.targetProviderThreadId).toBe(original.sourceSession.providerThreadId);
+    expect(Object.hasOwn(original.effect.evidence, "targetProviderAccountKey")).toBe(false);
+    const value = await fixture(Date.now, new OfflineCloud(), false, "codex-aliased-target");
+    await value.service.recover();
+    // The archived API admitted the alias. Migration retains it under
+    // quarantine; the earlier account-identity fence refuses both operations.
+    await expectCanonical39IdentityRefusal(value, "codex-aliased-target");
   });
 
-  test("legacy journal: never reads or ends a distinct legacy target without durable account authority", async () => {
-    const value = await fixture();
-    const { sessionId } = await codexSession(value);
-    const idempotencyKey = crypto.randomUUID();
-    value.codex.projection = {
-      ...value.codex.projection,
-      providerThreadId: "codex-thread-2",
-    };
-    await recordHistoricalSwitchProgress(value, {
-      idempotencyKey, provider: "codex", preset: "low", providerThreadId: "codex-thread-2",
-      session: sessionId, stage: "target_started",
-    });
-    removeTargetAccountAuthorityFromSwitchEvidence(value, idempotencyKey);
-    const callsBefore = [...value.codex.calls];
-    const accountReadsBefore = value.codex.readAccountCalls;
-
-    await expect(value.service.execute({
-      kind: "session.recover",
-      session: sessionId,
-    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
-
-    await expect(value.service.execute({
-      kind: "session.abandon",
-      session: sessionId,
-    }, { signal })).resolves.toMatchObject({
-      recovery: {
-        providerStateDeleted: false,
-        targetAddressable: true,
-      },
-      session: { state: "terminal" },
-    });
-    expect(value.codex.readAccountCalls).toBe(accountReadsBefore);
-    expect(value.codex.calls).toEqual(callsBefore);
-    expect(value.store.readMutation(idempotencyKey)).toMatchObject({
-      resolution: { kind: "abandoned" },
-      state: "reconciled",
-    });
+  test("canonical39: retains a distinct target under unproved account identity without provider access", async () => {
+    const original = canonical39SwitchFixtures["codex-distinct-target"].retained;
+    expect(original.progress.targetProviderThreadId).not.toBe(original.sourceSession.providerThreadId);
+    const value = await fixture(Date.now, new OfflineCloud(), false, "codex-distinct-target");
+    await value.service.recover();
+    await expectCanonical39IdentityRefusal(value, "codex-distinct-target");
   });
 
-  test("abandons a target-bound legacy switch without provider access", async () => {
-    // The original 6f056dc fixture did not supply the optional memory port.
-    // Generic switch history has no memory-transfer receipt; do not invent one.
-    const value = await fixture(Date.now, new OfflineCloud(), false);
-    const { sessionId } = await claudeSession(value);
-    const targetAccountId = await signedInCodexAccount(value, "Legacy Codex target");
-    const idempotencyKey = crypto.randomUUID();
-    await leaveFinalSwitchCommitUnsettled(value, {
-      account: targetAccountId,
-      idempotencyKey,
-      presetContract: legacyPresetContract,
-      provider: "codex",
-      session: sessionId,
-    });
-    const attempt = value.store.readMutation(idempotencyKey);
-    if (attempt === null) throw new Error("Expected an unsettled provider switch.");
-    expect(value.store.readSessionProviderSwitchProgress(attempt.id)).toMatchObject({
-      seedTurnId: "codex-turn-1",
-      sourceReleased: true,
-      targetProviderThreadId: "codex-thread-1",
-      targetReleased: false,
-    });
-    expect(value.store.requireSession(sessionId)).toMatchObject({
+  test("canonical39: retains the bound target runtime without inventing subscription identity", async () => {
+    // Schema39 has no facts-memory authority; this control supplies no port.
+    const original = canonical39SwitchFixtures["claude-bound-target"].retained;
+    const sessionId = original.session.id;
+    const targetAccountId = original.targetProfile.id;
+    const restarted = await fixture(Date.now, new OfflineCloud(), false, "claude-bound-target");
+    await restarted.service.recover();
+    expectCanonical39SwitchRetained(restarted, "claude-bound-target");
+    expect(restarted.store.requireSession(sessionId)).toMatchObject({
       profileId: targetAccountId,
       provider: "codex",
       providerThreadId: "codex-thread-1",
       state: "recovery_required",
     });
-    removeTargetAccountAuthorityFromSwitchEvidence(value, idempotencyKey);
-
-    const restarted = await reopenFixture(value);
-    expectCurrentSwitchSuccessors(restarted, idempotencyKey);
-    const codexCallsBefore = [...restarted.codex.calls];
-    const codexAccountReadsBefore = restarted.codex.readAccountCalls;
-    const claudeCallsBefore = [...restarted.claude.calls];
-    await expect(restarted.service.execute({
-      kind: "session.recover",
-      session: sessionId,
-    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
-
-    const abandoned = await restarted.service.execute({
-      kind: "session.abandon",
-      session: sessionId,
-    }, { signal });
-    expect(abandoned).toMatchObject({
-      recovery: {
-        providerEffectRetried: false,
-        providerStateDeleted: false,
-        resolution: "abandoned",
-        targetAddressable: true,
-        unaddressableTargetMayExist: false,
-      },
-      session: { state: "terminal" },
+    expect(restarted.store.requireCapturedSessionProviderAuthority(sessionId)).toMatchObject({
+      profileId: targetAccountId, providerAccountId: targetAccountId,
+      provider: "codex", bindingGeneration: 1,
+      processGeneration: restarted.store.requireProviderAccountAuthority(targetAccountId, "codex").processGeneration,
     });
-    expect(restarted.codex.calls).toEqual(codexCallsBefore);
-    expect(restarted.codex.readAccountCalls).toBe(codexAccountReadsBefore);
-    expect(restarted.claude.calls).toEqual(claudeCallsBefore);
-    expect(restarted.store.readMutation(idempotencyKey)).toMatchObject({
-      resolution: { kind: "abandoned" },
-      state: "reconciled",
-    });
+    await expectCanonical39IdentityRefusal(restarted, "claude-bound-target");
     expect(restarted.factsMemory.owners.size).toBe(0);
     expect(restarted.factsMemory.cleanups).toEqual([]);
     expect(restarted.factsMemory.transfers).toEqual([]);
+    expectCanonical39SwitchRetained(restarted, "claude-bound-target");
   });
 
-  test("retains actual source memory when abandoning a target-bound legacy switch", async () => {
-    const value = await fixture();
-    const { accountId: sourceAccountId, sessionId } = await claudeSession(value);
-    const targetAccountId = await signedInCodexAccount(value, "Legacy memory target");
-    const idempotencyKey = crypto.randomUUID();
-    await leaveFinalSwitchCommitUnsettled(value, {
-      account: targetAccountId, idempotencyKey, provider: "codex", session: sessionId,
+  test("canonical39: retains post-migration synthetic memory at the earlier account identity refusal", async () => {
+    const original = canonical39SwitchFixtures["claude-bound-target"].retained;
+    const sessionId = original.session.id;
+    const sourceAccountId = original.sourceProfile.id;
+    const targetAccountId = original.targetProfile.id;
+    const idempotencyKey = original.idempotencyKey;
+    const restarted = await fixture(Date.now, new OfflineCloud(), true, "claude-bound-target");
+    await restarted.service.recover();
+    expectCanonical39SwitchRetained(restarted, "claude-bound-target");
+    // The archived image has no memory. This is a new synthetic port owner,
+    // introduced after migration, not historical memory or a transfer receipt.
+    await restarted.factsMemory.ensureSession({
+      sessionId, ownerId: sourceAccountId, expiresAt: Date.now() + 60_000,
     });
-    removeTargetAccountAuthorityFromSwitchEvidence(value, idempotencyKey);
-    const restarted = await reopenFixture(value);
     const attempt = restarted.store.readMutation(idempotencyKey);
     if (attempt === null) throw new Error("Expected the original switch authority.");
     const progress = restarted.store.readSessionProviderSwitchProgress(attempt.id);
@@ -5460,7 +5447,7 @@ describe("provider portability", () => {
     expect(session).toMatchObject({ profileId: targetAccountId, state: "recovery_required" });
 
     await expect(restarted.service.execute({ kind: "session.abandon", session: sessionId }, { signal }))
-      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED", message: expect.stringContaining("facts-memory") });
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED", message: expect.stringContaining("unprovable provider account identity") });
 
     expect(restarted.store.readMutation(idempotencyKey)).toEqual(attempt);
     expect(restarted.store.readSessionProviderSwitchProgress(attempt.id)).toEqual(progress);
@@ -5469,10 +5456,12 @@ describe("provider portability", () => {
     expect(restarted.factsMemory.owners.get(sessionId)).toBe(sourceAccountId);
     expect(restarted.factsMemory.states.get(sessionId)).toBe("active");
     expect(restarted.factsMemory.transfers).toEqual([]);
-    expect(restarted.factsMemory.cleanups.at(-1)).toEqual({ ownerId: targetAccountId, reason: "abandon", sessionId });
+    expect(restarted.factsMemory.cleanups).toEqual([]);
     expect(restarted.codex.calls).toEqual(codexCalls);
     expect(restarted.codex.readAccountCalls).toBe(codexAccountReads);
     expect(restarted.claude.calls).toEqual(claudeCalls);
+    expectCanonical39SwitchRetained(restarted, "claude-bound-target");
+    await expectCanonical39IdentityRefusal(restarted, "claude-bound-target");
   });
 
   test("legacy journal: recovers a seeded Codex target when the Claude source release receipt survived restart", async () => {
