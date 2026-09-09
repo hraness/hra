@@ -21,6 +21,7 @@ const reviewedResourceFunctionSha256s = new Set([
   "af7ba8a59ab723dd7490ff6208468608f861cf85d89006d0aae02fd916b05bd6",
   "1335a9f7eaab4f7abe5eb52faa5544e978df547d7b2b29463c7b416497836a49",
   "aa79753fad24834ea666e2d099583de1ecbf38a2d1f10149893a0b2427c230a3",
+  "7f077d5fb8c52e4dfa18bdf188c9b2ba9e03f28a626080e7d69a5e20b0b9fda6",
 ]);
 const stylexInjector = /stylex-inject|stylexInject|data-stylex|stylesheet-group/u;
 const unreviewedLiteralCall = /createElement\s*\(\s*["']style["']\s*\)|\.insertRule\s*\(/u;
