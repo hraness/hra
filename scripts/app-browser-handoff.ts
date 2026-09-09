@@ -90,7 +90,10 @@ export function parseBrowserPrepared(value: unknown): BrowserPrepared {
 
 /** Exact-size sentinel read; no-follow/nonblocking admission precedes allocation. */
 export async function readBrowserFile(path: string, cap = 64 * 1024 * 1024): Promise<Buffer> {
-  assert.equal(await realpath(path), resolve(path), "Browser handoff input must be physical");
+  // A regular leaf may have several hardlink names. Canonicalize its parent;
+  // no-follow admission and exact identities below guard the selected leaf.
+  const parent = dirname(path);
+  assert.equal(await realpath(parent), resolve(parent), "Browser handoff input parent must be physical");
   const before = await lstat(path);
   assert.ok(before.isFile() && !before.isSymbolicLink() && before.size <= cap, "Unsafe browser handoff input");
   const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
@@ -105,7 +108,7 @@ export async function readBrowserFile(path: string, cap = 64 * 1024 * 1024): Pro
     assert.equal(offset, before.size, "Browser handoff input changed size");
     assert.deepEqual(fileIdentity(await handle.stat()), fileIdentity(before));
     assert.deepEqual(fileIdentity(await lstat(path)), fileIdentity(before));
-    assert.equal(await realpath(path), resolve(path));
+    assert.equal(await realpath(parent), resolve(parent));
     return bytes.subarray(0, offset);
   } finally { await handle.close(); }
 }
