@@ -107,7 +107,7 @@
     "@babel/core": "7.29.7",
     "@convex-dev/auth": "0.0.95",
     "@eslint/js": "9.34.0",
-    "@hraness/design-kit": "github:hraness/design-kit#v0.6.1",
+    "@hraness/design-kit": "github:hraness/design-kit#v0.6.2",
     "@hraness/posthog": "github:hraness/posthog#v0.1.2",
     "@hraness/site-footer": "github:hraness/site-footer#v0.6.1",
     "@hraness/ui": "github:hraness/ui#v0.5.6",
