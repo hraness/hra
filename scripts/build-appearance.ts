@@ -9,7 +9,6 @@ export async function buildHraAppearance(): Promise<string> {
     minify: true,
     sourcemap: "none",
     target: "browser",
-    write: false,
   });
   const output = result.outputs[0];
   if (!result.success || result.outputs.length !== 1 || output === undefined) {
