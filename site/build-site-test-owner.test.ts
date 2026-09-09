@@ -28,6 +28,23 @@ function clock() {
 }
 
 describe("owned site compiler case", () => {
+  test("arms native child ownership before the Vite and StyleX preload", async () => {
+    const requests: BoundedProcessRequest[] = [];
+    const owner = createSiteCompilerCase(options.sourceRoot, { runProcess: async (request) => {
+      requests.push(request); return success();
+    } });
+    await owner.run(async () => { await owner.buildSite(options); });
+    await owner.close();
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.arguments).toEqual([
+      "--preload", "/synthetic/source/scripts/site-test-compiler-preload.ts",
+      "--preload", "/synthetic/source/scripts/register-site-stylex-test-transform.ts",
+      "/synthetic/source/site/build-site-test-driver.ts",
+    ]);
+    expect(requests[0]?.containment).toBe("local");
+    expect(requests[0]?.captureLocalDiagnostics).toBe(true);
+  });
+
   test("closed request serialization roundtrips independently of property order", () => {
     fc.assert(fc.property(fc.boolean(), fc.string({ maxLength: 64 }), fc.string({ maxLength: 64 }),
       fc.string({ maxLength: 64 }), (check, releaseCommit, token, sitekey) => {
