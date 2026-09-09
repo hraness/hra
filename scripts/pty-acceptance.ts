@@ -128,6 +128,64 @@ const boundedTranscript = (stdout: Buffer[], stderr: Buffer[]): string => {
     : bounded;
 };
 
+export const readPseudoTerminalAuthorityLine = (transcript: string, marker: string): number | undefined => {
+  const prefix = `\n${marker}\t`;
+  const start = transcript.indexOf(prefix);
+  if (start < 0) return undefined;
+  const valueStart = start + prefix.length;
+  const end = transcript.indexOf("\n", valueStart);
+  // A numeric prefix is not authority: stdout can split inside the PID.
+  if (end < 0) return undefined;
+  const line = transcript.slice(valueStart, end).replace(/\r$/u, "");
+  if (!/^[1-9][0-9]*$/u.test(line)) return undefined;
+  const value = Number(line);
+  return Number.isSafeInteger(value) && value > 1 && value !== process.pid ? value : undefined;
+};
+
+export const observePseudoTerminalCleanup = (
+  cleanup: Promise<void>,
+): Promise<PromiseSettledResult<void>> => cleanup.then(
+  () => ({ status: "fulfilled", value: undefined }),
+  (reason: unknown) => ({ status: "rejected", reason }),
+);
+
+export const settlePseudoTerminalCleanup = async (input: Readonly<{
+  termination: () => Promise<PromiseSettledResult<void>> | undefined;
+  observeExit: () => Promise<boolean>;
+  requestTermination: () => void;
+  markLingering: () => void;
+  finalize: () => void;
+}>): Promise<Error | undefined> => {
+  let cleanupError: Error | undefined;
+  try {
+    if (input.termination() === undefined) {
+      try {
+        if (!await input.observeExit()) {
+          input.markLingering();
+          input.requestTermination();
+        }
+      } catch (error: unknown) {
+        cleanupError = error instanceof Error
+          ? error
+          : new Error("Pseudo-terminal group observation threw a non-Error value.");
+        input.requestTermination();
+      }
+    }
+    const termination = input.termination();
+    if (termination !== undefined) {
+      const cleanup = await termination;
+      if (cleanup.status === "rejected") {
+        cleanupError ??= cleanup.reason instanceof Error
+          ? cleanup.reason
+          : new Error("Pseudo-terminal cleanup threw a non-Error value.");
+      }
+    }
+    return cleanupError;
+  } finally {
+    input.finalize();
+  }
+};
+
 const groupExists = (groupId: number): boolean => {
   try {
     process.kill(-groupId, 0);
@@ -228,7 +286,7 @@ export async function runInPseudoTerminal(input: PseudoTerminalInput): Promise<P
     let cursor = 0;
     let stepIndex = 0;
     const failureState = { lingering: false, overflowed: false, timedOut: false };
-    let terminationPromise: Promise<void> | undefined;
+    let terminationPromise: Promise<PromiseSettledResult<void>> | undefined;
     let hardSettlementTimer: ReturnType<typeof setTimeout> | undefined;
     let settleWithoutClose: (() => void) | undefined;
 
@@ -242,9 +300,8 @@ export async function runInPseudoTerminal(input: PseudoTerminalInput): Promise<P
       if (Buffer.byteLength(authorityScan) > ptyAuthorityScanMaximumBytes) {
         authorityScan = authorityScan.slice(0, ptyAuthorityScanMaximumBytes);
       }
-      const match = authorityScan.match(new RegExp(`${authorityMarker}\\t([1-9][0-9]*)`, "u"));
-      if (match !== null) {
-        const value = Number(match[1]);
+      const value = readPseudoTerminalAuthorityLine(authorityScan, authorityMarker);
+      if (value !== undefined) {
         if (!Number.isSafeInteger(value) || value <= 1 || value === process.pid) {
           failureState.lingering = true;
           return;
@@ -261,7 +318,7 @@ export async function runInPseudoTerminal(input: PseudoTerminalInput): Promise<P
     const requestBoundedTermination = (): void => {
       if (terminationPromise !== undefined) return;
       try { child.stdin.write("\x03"); } catch { /* The PTY may already be closed. */ }
-      terminationPromise = (async () => {
+      terminationPromise = observePseudoTerminalCleanup((async () => {
         await sleep(ptyInitialInterruptGraceMs);
         signalOwnedGroups("SIGTERM");
         if (await waitForGroupsGone(groupIds, ptyTerminationGraceMs)) return;
@@ -269,7 +326,7 @@ export async function runInPseudoTerminal(input: PseudoTerminalInput): Promise<P
         if (!await waitForGroupsGone(groupIds, ptyForcedTerminationGraceMs)) {
           throw new Error(`Pseudo-terminal cleanup could not prove exit of owned process groups ${groupIds().join(", ")}.`);
         }
-      })();
+      })());
       hardSettlementTimer = setTimeout(() => {
         child.stdin.destroy();
         child.stdout.destroy();
@@ -357,25 +414,19 @@ export async function runInPseudoTerminal(input: PseudoTerminalInput): Promise<P
       result = await resultPromise.catch(() => ({ exitCode: 1, stderr: "", stdout: "" }));
     }
 
-    if (terminationPromise === undefined && !await waitForGroupsGone(groupIds, 250)) {
-      failureState.lingering = true;
-      requestBoundedTermination();
-    }
-    let cleanupError: Error | undefined;
-    if (terminationPromise !== undefined) {
-      try {
-        await terminationPromise;
-      } catch (error: unknown) {
-        cleanupError = error instanceof Error
-          ? error
-          : new Error("Pseudo-terminal cleanup threw a non-Error value.");
-      }
-    }
-    clearTimeout(timeout);
-    if (hardSettlementTimer !== undefined) clearTimeout(hardSettlementTimer);
-    child.stdin.destroy();
-    child.stdout.destroy();
-    child.stderr.destroy();
+    let cleanupError = await settlePseudoTerminalCleanup({
+      termination: () => terminationPromise,
+      observeExit: async () => await waitForGroupsGone(groupIds, 250),
+      requestTermination: requestBoundedTermination,
+      markLingering: () => { failureState.lingering = true; },
+      finalize: () => {
+        clearTimeout(timeout);
+        if (hardSettlementTimer !== undefined) clearTimeout(hardSettlementTimer);
+        child.stdin.destroy();
+        child.stdout.destroy();
+        child.stderr.destroy();
+      },
+    });
 
     if (wrapperObservation.began && authorityPid === undefined) {
       cleanupError ??= new Error("Pseudo-terminal wrapper began without publishing its exact owned process group.");
