@@ -109,6 +109,37 @@ describe("public text policy", () => {
       .toThrow(PublicTextPolicyError);
   });
 
+  test("admits the exact public Direct package and its imported subpaths without opening its scope", async () => {
+    const name = "@hraness/direct";
+    for (const specifier of [name, `${name}/testing`, `${name}/web`, `${name}/tooling/bundle-boundary`]) {
+      expect(() => assertPublicText(`import * as publicModule from ${JSON.stringify(specifier)};`, "public Direct import"))
+        .not.toThrow();
+    }
+    expect(() => assertPublicText(`${name}@0.7.0`, "pinned public Direct package")).not.toThrow();
+    for (const path of ["app/fixtures/product/main.tsx", "app/fixtures/product/definition.ts", "scripts/build-site.ts", "scripts/app-browser.ts"]) {
+      const source = await readFile(join(import.meta.dir, "..", path), "utf8");
+      expect(source).toContain(name);
+      expect(() => assertPublicText(source, path)).not.toThrow();
+    }
+    for (const privatePackage of [["@hraness", "private-package"], ["@unreviewed", "direct"]]) {
+      expect(() => assertPublicText(privatePackage.join("/"), "unreviewed Direct sibling"))
+        .toThrow(PublicTextPolicyError);
+    }
+    fc.assert(fc.property(fc.constantFrom("-", ".", "_", ""), fc.stringMatching(/^[a-z][a-z0-9]{0,12}$/u), (separator, suffix) => {
+      expect(() => assertPublicText(`${name}${separator}${suffix}`, "unreviewed Direct package suffix"))
+        .toThrow(PublicTextPolicyError);
+    }), { numRuns: 40, seed: 20260908 });
+  });
+
+  test("public Direct imports do not exempt nearby credentials or private paths", () => {
+    const publicImport = 'import { installDirectBrowser } from "@hraness/direct/web";';
+    const secret = ["github", "pat", "abcdefghijklmnopqrstuvwxyz123456"].join("_");
+    for (const sensitive of [secret, syntheticPrivatePath()]) {
+      expect(() => assertPublicText(`${publicImport}\n${sensitive}`, "sensitive Direct source"))
+        .toThrow(PublicTextPolicyError);
+    }
+  });
+
   test("allows only the reviewed public Claude capture packages", () => {
     for (const packageName of [
       "@anthropic-ai/claude-code",

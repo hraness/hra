@@ -144,6 +144,20 @@ describe("task-oriented documentation content", () => {
     expect(pageText(pageAt("/docs/status/"))).toContain(publicContent.daemonRolloutNotice);
   });
 
+  test("puts machine sign-in formats before browser enrollment", () => {
+    const pairing = pageAt("/docs/web/").sections.find((section) => section.id === "pair-your-browser");
+    if (pairing === undefined) throw new Error("Missing browser pairing instructions.");
+    const signInIndex = pairing.blocks.findIndex((block) =>
+      blockLinks(block).includes("/docs/web/#cloud-sign-in-and-device-pairing"),
+    );
+    const browserIndex = pairing.blocks.findIndex((block) => blockLinks(block).includes("https://app.hra.sh/"));
+    expect(signInIndex).toBeGreaterThan(-1);
+    expect(browserIndex).toBeGreaterThan(signInIndex);
+    const instructions = blockText(pairing.blocks[signInIndex]!);
+    expect(instructions).toContain("one protected JSON document");
+    expect(instructions).toContain("Complete machine sign-in before enrolling the browser");
+  });
+
   test("teaches actual browser actions without granting browser device or provider authority", () => {
     const text = pageText(pageAt("/docs/web/"));
     expect(text).toContain("app.hra.sh");

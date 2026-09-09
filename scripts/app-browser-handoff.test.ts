@@ -107,6 +107,8 @@ test("ordinary reads refuse symlinks and oversize files; exact snapshots detect 
     await expect(readBrowserFile(join(source, "a.txt"), 4)).rejects.toThrow();
     await symlink(join(source, "a.txt"), join(directory, "alias"));
     await expect(readBrowserFile(join(directory, "alias"))).rejects.toThrow();
+    await symlink(source, join(directory, "parent-alias"));
+    await expect(readBrowserFile(join(directory, "parent-alias", "a.txt"))).rejects.toThrow();
     await writeFile(join(source, "extra.txt"), "extra");
     await expect(verifyBrowserInventory(source, captured)).rejects.toThrow();
     await rm(join(source, "extra.txt"));
@@ -152,7 +154,13 @@ test("stable hardlink identity is recorded and later alias mutation invalidates 
     await writeFile(join(directory, "a"), "source"); await link(join(directory, "a"), join(directory, "b"));
     const row = await browserFile(directory, "a"); expect(row.sha256).toBe(browserDigest("source"));
     expect(row.identity[3]).toBe(2);
+    const alias = await browserFile(directory, "b");
+    expect(alias).toEqual({ ...row, path: "b" });
+    expect(await readBrowserFile(join(directory, "a"))).toEqual(Buffer.from("source"));
+    expect(await readBrowserFile(join(directory, "b"))).toEqual(Buffer.from("source"));
+    const captured = await browserInventory(directory);
     await writeFile(join(directory, "b"), "change");
     expect(await browserFile(directory, "a")).not.toEqual(row);
+    await expect(verifyBrowserInventory(directory, captured)).rejects.toThrow();
   } finally { await rm(directory, { recursive: true }); }
 });

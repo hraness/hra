@@ -53,6 +53,10 @@ preserving sandbox, provider, repository, and release gates.
   `--apply`. It edits only the exact managed policy block in root `AGENTS.md`
   and adds an `@AGENTS.md` import to root `CLAUDE.md` while preserving existing
   Claude-specific guidance.
+  When a repository is already in scope for a change, check and refresh its
+  managed baseline in that same task-owned change and existing final gate,
+  preserving unmanaged rules; do not open a separate rollout solely to repeat
+  expensive checks.
 - **Audit CI ref isolation:** use `hra-ci-ref-audit --root ABSOLUTE-REPO`. Review
   every candidate; fix only workflows whose complete-history gate can import
   unrelated refs, and preserve the complete-history scan itself.
@@ -90,9 +94,27 @@ package or command.
   and autonomously.
 - Prefer short-lived repository workload identities, npm trusted publishing,
   and scoped GitHub App tokens over personal sessions and reusable secrets.
-  Batch unavoidable interactive authentication at the final boundary rather
-  than spreading it across retries or releases.
-
+  Use unattended stable publication and production promotion where provider
+  and repository policies permit. Establish machine authority once and verify
+  it with a non-publishing preflight where available. Retain account 2FA and
+  provider-required approval bound to the exact staged artifact; never remove
+  a package policy declaration or change its coordinate to evade that control.
+  Batch unavoidable authentication at the final boundary.
+- Preserve production and user data. Inspect the exact account, environment,
+  deployment, and data target before writes. For data changes, inspect a dry
+  run or equivalent migration plan and validate recovery before an effect that
+  could lose or corrupt data. Prefer additive, backward-compatible migrations
+  and bounded batches. Record intent, use idempotency or conditional writes,
+  and reconcile uncertain results before retrying. Verify deployed identity,
+  health, and relevant data invariants after delivery. Routine delivery never
+  authorizes resetting, truncating, dropping, or overwriting user data; stop the
+  unsafe operation if preservation or recovery cannot be established.
+- Keep delivery gates proportional to the failure they prevent. Prefer
+  required checks on the current integration candidate, independent agent
+  review, and atomic or conditional integration. Add a merge queue or another
+  approval stage only for a demonstrated coordination or safety need. Replace
+  redundant queues, serial waits, and duplicate checks through reviewed policy
+  changes while retaining evidence for the integrated result.
 - Do not cap agent count merely to reduce fan-out. Parallel reasoning and
   independent implementation lanes remain desirable.
 - Prefer bounded subagents in the current task for research, review, diagnosis,
@@ -106,6 +128,13 @@ package or command.
   waiter. Do not hold a compute lease while waiting on external state.
 - Run the repository's aggregate/final gate once after convergence. Never use a
   receipt to skip a repository-required final replayed-tree or delivery gate.
+  Where reviewed repository policy assigns complete required CI as the final
+  source aggregate, verify the policy's scope, coverage/equivalence evidence,
+  independent impact review, and fresh exact-head, current-base CI result. Keep
+  relevant focused local checks and separate local, native, coupled-run, live,
+  and installation acceptance; do not add a duplicate local aggregate. Diagnose
+  observed failures and stalls independently of a passing CI result. Use the
+  local aggregate when the repository requires it or CI equivalence is uncertain.
 - The host scheduler is an outer layer. Jungle and HRA keep their repository
   schedulers underneath it; invoke `hra-host-run` only around top-level
   commands. Nested `hra-host-run` calls inherit the outer lease and do not
