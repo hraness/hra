@@ -17,7 +17,7 @@ relations:
 
 # Hraness delivery autonomy
 
-Status: active, revision 3 (2026-09-08). The machine-confidence foundation, current-Mac
+Status: active, revision 4 (2026-09-08). The machine-confidence foundation, current-Mac
 bootstrap and HRA, Oh and personal-monorepo-template pilots are delivered. Wider fleet
 adoption and provider-specific rollout remain separately tracked; they do not reopen the
 completed foundation or block an independently admitted artifact.
@@ -40,8 +40,10 @@ The broader roadmap is complete when:
    `AGENTS.md`, while root `CLAUDE.md` imports that policy without replacing project-specific
    Claude guidance.
 3. npm releases after a package's one-time bootstrap use GitHub Actions trusted publishing and
-   provenance. No routine release needs an npm password, OTP, recovery code, personal write
-   token, staged-publication approval, or mutable repository approval variable. A release
+   provenance. Where provider policy permits direct publication, routine releases need no npm
+   password, OTP, recovery code, personal write token, staged-publication approval, or mutable
+   repository approval variable. Provider-required approval stays bound to the exact staged
+   artifact and retains its required authentication. A release
    tag command binds an immutable owner identity to the exact protected-main commit and successful
    CI receipt before any provider mutation. A future dedicated release App may replace that local
    principal only when its credential is isolated from repository-controlled workflows.
@@ -127,14 +129,16 @@ only `contents: read` plus `id-token: write` unless another reviewed release eff
 permission. A package's first publication remains a one-time maintainer ceremony because npm
 cannot attach a trusted publisher to a coordinate that does not yet exist.
 
-Staged publishing is reserved for an exceptional package whose threat model genuinely needs a
-second human admission. It is not the default because [`npm stage approve`](https://docs.npmjs.com/staged-publishing/)
-requires 2FA each time. Hraness does not adopt bypass-2FA granular access tokens: they are
-long-lived personal authority, and npm is removing their direct-publish bypass.
+Use direct publication where npm permits it. The [npm dual-use policy](https://docs.npmjs.com/policies/dual-use/)
+requires interactive publication or staged-artifact promotion for packages subject to that
+policy. Preserve the package declaration and exact staged bytes, complete all automated
+validation first, and batch the required authentication at that boundary. Do not remove a
+declaration, rename a package, or change channels to evade provider controls. Hraness does not
+adopt bypass-2FA granular access tokens to eliminate prompts.
 
 ### D4. Beta is a version lane, not a retag ceremony
 
-High-frequency agent releases use unique semantic prerelease versions such as
+Where provider policy permits unattended publication, high-frequency agent releases use unique semantic prerelease versions such as
 `1.4.0-beta.27` with `npm publish --tag beta`. Stable release trains publish a new stable version
 with `--tag latest` after the repository's required review and checks. A prerelease is never
 "promoted" by moving a dist-tag, because trusted publishing does not authorize dist-tag mutation
@@ -180,6 +184,29 @@ hosted-memory qualification from tag/publication prerequisites. It does not clai
 passed or permit hosted activation, a daemon upgrade, or new Claude platform support. The current
 [release procedure](../../docs/beta-release.md) is authoritative; older checkpoint holds are history.
 
+### D7. Preserve data and remove unnecessary serial work
+
+Autonomous production delivery first binds the exact account, environment, deployment, and
+data target. Data changes require an inspected dry run or equivalent migration plan and a
+validated recovery path before any effect that could lose or corrupt data. Prefer additive,
+backward-compatible migrations and bounded batches. Record intent, use idempotency or
+conditional writes, reconcile uncertain results before retrying, and finish with deployed
+identity, health, and relevant data-invariant readback. Routine delivery does not authorize
+resetting, truncating, dropping, or overwriting user data.
+
+Choose merge queues and additional approval stages only when they address a demonstrated
+coordination or safety need. Prefer current integration-candidate checks, independent agent
+review, and atomic or conditional integration. Replace redundant waits and checks through
+reviewed policy changes with evidence for the integrated result; do not skip an existing gate.
+
+HRA's [final validation policy](../../CONTRIBUTING.md#final-validation) assigns the complete
+required CI gate as the final source aggregate for independently reviewed documentation and
+guidance changes, version-only plugin metadata, and corresponding prose assertions. Focused
+local contracts and existing CI coverage/equivalence tests still run. The final PR head and
+current-base integration candidate need fresh matching CI evidence. Other changes retain the
+local full gate, and explicit local, native, live, installation, and delivery acceptance remains
+separate. This removes a duplicate execution without changing CI command coverage.
+
 ## Workstreams
 
 | Workstream | State | Acceptance evidence |
@@ -187,12 +214,13 @@ passed or permit hosted activation, a daemon upgrade, or new Claude platform sup
 | Machine baseline on the current Mac | Complete | Reviewed 0.4.0 installation, fixture coverage, local `--apply`/`--check` and fresh configuration readback passed; other machines and runtime eligibility are separate. |
 | Canonical repository policy and pilots | Complete | Managed-block tests preserve custom guidance and Claude imports; HRA PR156, Oh PR45 and template PR12 delivered through their own gates. |
 | HRA npm path | Delivered | The machine publication path is delivered without the mutable publication variable; exact tag, artifact, OIDC, provenance and final admission remain required for each release in [the release record](../../docs/beta-release.md). |
-| Wrench npm path | Planned | Direct trusted publication replaces per-version stage approval; package identity and release checks stay green. |
-| Soundfish npm path | Planned | A verified artifact publishes through a trusted workflow; local publish becomes recovery-only. |
+| Wrench npm path | Provider-constrained | Preserve its dual-use declaration and exact staged-artifact approval with required authentication. Automate preparation, validation, staging, and readback; direct OIDC publication is not an available replacement for the provider gate. |
+| Soundfish npm path | Delivered | The direct OIDC workflow completed in [release run 34059355173](https://github.com/hraness/soundfish/actions/runs/34059355173). Routine publication has a supported workload identity; future releases retain their exact-artifact gates. |
 | Wider fleet rollout | Continuing | Remaining repositories and machines require their own scoped adoption and gates. No all-fleet current-state claim is made; preserve dirty primary worktrees. |
-| Provider setup | Planned | One batched npm trust update; GitHub App/ruleset changes only where audit proves they are needed. |
+| Provider setup | Evidence-driven | Ordinary npm publication workflows are present. Change trust, account, GitHub App, or ruleset configuration only for an individually verified remaining gap; no blanket trust update is pending. |
 | Machine-confidence foundation | Complete | HRA PR156 delivered the reviewed canonical global/repository assets, operator guidance and regression tests separating artifact admission from operational activation. |
 | Bounded foundation propagation | Complete | Current-Mac installation and readback plus owner-coordinated HRA, Oh and template delivery are proved. Further fleet propagation is the separate workstream above. |
+| Data-preserving delivery policy | In progress | Local-efficiency 0.4.1 source adds D7 and provider-permitted unattended stable delivery. Focused validation, independent scope review, CI-equivalence tests, fresh complete required CI for the exact final integration candidate, delivery, and installation readback remain required. |
 
 ## Guardrails
 
@@ -209,6 +237,19 @@ passed or permit hosted activation, a daemon upgrade, or new Claude platform sup
   evidence that applies; silence is never proof of completion.
 
 ## Progress log
+
+- 2026-09-08: HRA's reviewed documentation/guidance validation path now uses
+  focused local contracts plus fresh complete required CI as its final source
+  aggregate. CI still covers every full-gate command on macOS and Linux, with
+  command-coverage and shard-equivalence regressions unchanged. Runtime and other
+  executable changes retain the local full gate. Fresh CI for the updated source
+  and installation readback remain pending.
+
+- 2026-09-08, revision 4: the 0.4.1 policy update adds data-preserving autonomous
+  delivery and proportional integration gates. It removes the generic recommendation
+  to batch routine human-gated promotions, while retaining provider-required staged
+  approval. The Wrench direct-publication proposal is withdrawn because its dual-use
+  policy requires interactive admission. Source delivery and installation are pending.
 
 - 2026-09-08, foundation and pilot closeout: HRA PR156 merged the reviewed D6
   policy and tests; local-efficiency 0.4.0 installation, bootstrap check and fresh

@@ -7,7 +7,7 @@ HRA is in public beta development. Open an issue before a large change so the au
 1. Install Bun 1.3.14.
 2. Run `bun install --frozen-lockfile --ignore-scripts`.
 3. Run the focused test beside the code you change.
-4. Run `bun run check` before submitting a change.
+4. Complete the applicable final validation below before merge.
 
 Browser acceptance also requires Node 24.18.1 and the Chromium revision provided
 by the pinned Playwright package. Run `node node_modules/playwright-core/cli.js
@@ -39,9 +39,31 @@ full gate and reject omitted or duplicated commands. They also require all
 three source shards and prove whole-file coverage and failure propagation with
 the pinned runner. Update that contract when changing the gate. Source-file
 sharding does not split a large individual test: independent cases still need
-separate tests within the unchanged per-test deadline. The split does not
-replace the local exact-tree final gate:
-contributors and the integration owner still run `bun run check`.
+separate tests within the unchanged per-test deadline.
+
+## Final validation
+
+Run `bun run check` locally for changes to runtime code, workflows, dependencies,
+build inputs, generated code, test behavior, or any other executable behavior.
+Retain every explicit local, native, live, and installation acceptance requirement.
+
+Changes limited to documentation or agent guidance, reproducible documentation
+catalogs, the version field of an independently versioned plugin manifest, and
+documentation-contract assertions updated only for the revised prose may use
+complete required CI as the final source aggregate. An independent reviewer must
+inspect the complete diff and confirm that no executable behavior or other
+excluded input changed. If that scope is uncertain, run the local full gate.
+
+For this narrow class, run the relevant focused contracts locally, including
+plugin/adoption validation when applicable and the existing CI command-coverage
+and shard-equivalence tests in `scripts/release-workflow.test.ts`. Wait for the
+unchanged complete `Required` CI gate on the final PR head and current-base
+integration candidate. Confirm the checked tree and expected head at merge;
+head or base movement requires fresh matching CI evidence. Record the scope
+review and exact check result. This is the final aggregate for that source
+change; it does not require a duplicate local full run or establish unperformed
+live or installation acceptance. Release, deployment, and production readback
+gates remain separate.
 
 ## Change requirements
 
@@ -55,4 +77,4 @@ By contributing, you agree that your contribution is licensed under the MIT Lice
 
 ## Agent-authored changes
 
-Many changes in this repository are drafted by coding agents (Codex and Claude Code) working from `AGENTS.md` and `kb/plans/`. Independent review, including review by a coding agent, covers the full diff; a separate human sign-off is not required for routine authorized delivery. The deterministic gate (`bun run check`) must pass on the exact tree, and no phase of a plan is marked complete without the acceptance evidence the plan names. Artifact admission and operational activation follow the separate [release policy](docs/beta-release.md). Agent-authored commits carry a `Co-Authored-By` trailer naming the agent. Prose in an agent-authored change follows `WRITING.md` and `STYLE.md` like any other prose.
+Many changes in this repository are drafted by coding agents (Codex and Claude Code) working from `AGENTS.md` and `kb/plans/`. Independent review, including review by a coding agent, covers the full diff; a separate human sign-off is not required for routine authorized delivery. The applicable final validation above must pass on the exact tree, and no phase of a plan is marked complete without the acceptance evidence the plan names. Artifact admission and operational activation follow the separate [release policy](docs/beta-release.md). Agent-authored commits carry a `Co-Authored-By` trailer naming the agent. Prose in an agent-authored change follows `WRITING.md` and `STYLE.md` like any other prose.
