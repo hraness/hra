@@ -115,6 +115,7 @@ export async function buildProductPreview(options: Readonly<{
   // Chunk imports and shell links stay within the mounted preview directory.
   // No production build config or entry is modified.
   config.base = "./";
+  config.esbuild = { legalComments: "inline" };
   config.plugins = [productIoPlugin(root), {
     name: "hra-product-preview-license",
     banner: () => `/*! @license @hraness/direct\n${directLicense}\n*/`,
