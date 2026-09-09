@@ -85,7 +85,7 @@ export function createSiteCompilerCase(sourceRoot: string, dependencies: Readonl
       const options = siteTestBuildOptions.parse(input);
       const request: BoundedProcessRequest = {
         executable: process.execPath,
-        arguments: ["--preload", join(sourceRoot, "scripts/register-site-stylex-test-transform.ts"), join(sourceRoot, "site/build-site-test-driver.ts")],
+        arguments: ["--preload", join(sourceRoot, "scripts/site-test-compiler-preload.ts"), "--preload", join(sourceRoot, "scripts/register-site-stylex-test-transform.ts"), join(sourceRoot, "site/build-site-test-driver.ts")],
         containment: "local", captureLocalDiagnostics: true, cwd: sourceRoot,
         environment: { PATH: process.env.PATH ?? dirname(process.execPath), NO_COLOR: "1" },
         stdin: JSON.stringify(options), signal: controller.signal,

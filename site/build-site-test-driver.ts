@@ -1,5 +1,5 @@
-import { stop } from "esbuild";
 import { buildSite } from "../scripts/build-site";
+import { stopSiteTestCompiler } from "../scripts/site-test-compiler-preload";
 import { siteTestBuildOptions, siteTestBuildTerminal, siteTestBuildTerminalPrefix } from "./build-site-test-protocol";
 import { finishSiteTestBuild } from "./build-site-test-shutdown";
 
@@ -13,6 +13,6 @@ const terminal = await finishSiteTestBuild(() => buildSite({
   ...(options.sourceRoot === undefined ? {} : { sourceRoot: options.sourceRoot }),
   ...(options.releaseCommit === undefined ? {} : { releaseCommit: options.releaseCommit }),
   ...(options.environment === undefined ? {} : { environment: options.environment }),
-}), stop);
+}), stopSiteTestCompiler);
 if (terminal.status === "failure") process.exitCode = 1;
 process.stdout.write(`\n${siteTestBuildTerminalPrefix}${JSON.stringify(siteTestBuildTerminal.parse(terminal))}\n`);
