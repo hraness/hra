@@ -13,8 +13,8 @@ HRA is a control plane for Codex and Claude Code. Codex runs through HRA's exact
 | 0 | Robustness, security, boundaries | Published: bounded daemon concurrency, offline status and work protocol, hardened local and release custody. |
 | 1–2 | Live projection and browser control | Published: encrypted live session projection, provider interactions, autorespond, browser devices, and remote commands. |
 | 3 | Provider seam | Published in v0.5.0: reviewed Codex and Claude Code ports, a pinned Claude dialect, provider-tagged sessions, and provider-specific presets. Claude execution was still refused in that release. |
-| 4 | Claude Code execution | Implemented in the current unreleased source: start, turn, steer, stop, interaction, projection, queue dispatch, foreground Linux sign-in, and bounded sign-in status run through the selected provider. Exact-session resume requires proven prior-process exit or an already-completed exact release. Native listing, rename, usage, web sign-in, and protected turn inspection remain unavailable. |
-| 5 | Conversation portability | Implemented in the current unreleased source: HRA's neutral transcript, local and remote provider switching, and trajectory or JSON export. Switching preserves the HRA record, not provider-native hidden state or cached context. |
+| 4 | Claude Code execution | Included in the admitted v0.7.0 artifact; runtime rollout remains gated. Start, turn, steer, stop, interaction, projection, queue dispatch, foreground Linux sign-in, and bounded sign-in status run through the selected provider. Exact-session resume requires proven prior-process exit or an already-completed exact release. Native listing, rename, usage, web sign-in, and protected turn inspection remain unavailable. |
+| 5 | Conversation portability | Included in the admitted v0.7.0 artifact; runtime rollout remains gated. HRA provides a neutral transcript, local and remote provider switching, and trajectory or JSON export. Switching preserves the HRA record, not provider-native hidden state or cached context. |
 
 ## What HRA will not do
 

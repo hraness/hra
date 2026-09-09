@@ -25,6 +25,7 @@ const allowedPublicScopedPackages = new Set([
   "@babel/core",
   "@hraness/atet",
   "@hraness/design-kit",
+  "@hraness/direct",
   "@hraness/hra",
   "@hraness/oh",
   "@hraness/posthog",

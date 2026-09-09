@@ -48,7 +48,7 @@ This is honest local custody, not a sandbox or forensic erasure guarantee. Anoth
 
 ### Backup, restore, and rollback
 
-`control-plane.sqlite`, `facts-memory-control.sqlite`, `facts-memory-sessions/`, and `project-memory/` are one logical recovery unit. Stop the daemon and require `hra daemon status --json` to report `data.running: false` before taking or restoring a snapshot, then copy or restore the complete private state root at one filesystem checkpoint. Copying only an Oh database, only either control database, or only their main SQLite files without the matching WAL/SHM state is not a supported backup.
+`control-plane.sqlite`, `facts-memory-control.sqlite`, `facts-memory-sessions/`, and `project-memory/` are one logical recovery unit. Run `hra daemon stop --json` and require that command itself to exit zero before taking or restoring a snapshot. Its recovery path proves authority release; `hra daemon status --json` reporting `data.running: false` is only a secondary no-listener check. Stop on any stop or recovery error. Then copy or restore the complete private state root at one filesystem checkpoint. Copying only an Oh database, only either control database, or only their main SQLite files without the matching WAL/SHM state is not a supported backup.
 
 After restore, HRA replays and revalidates both control and physical heads. A partial or mixed-age restore cannot authorize a newer head: unexplained project-memory disagreement freezes canonical-dependent work, and unexplained working-memory custody enters recovery instead of silently accepting either side. Preserve the mismatched backup for diagnosis; do not delete the newer side or edit stored heads to force convergence.
 

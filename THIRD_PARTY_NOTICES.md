@@ -8,6 +8,8 @@ The static hra.sh analytics asset incorporates `@hraness/posthog` version 0.1.2 
 
 The hra.sh site and browser app use the MIT-licensed `@hraness/ui` v0.5.6 and `@hraness/design-kit` v0.6.2 packages for shared semantic themes and appearance controls. The site also uses the MIT-licensed `@hraness/site-footer` v0.6.1 package. `bun.lock` binds their exact immutable release tags.
 
+The isolated product examples on hra.sh incorporate MIT-licensed `@hraness/direct` v0.7.0, copyright 2026 Hraness contributors. Its full license is preserved in the example's JavaScript bundle. Direct is a pinned development dependency, not a runtime dependency of the HRA CLI or the authenticated app.
+
 HRA validates trajectory exports during development against Apache-2.0-licensed `@letta-ai/trajectory` 0.3.0 and MIT-licensed Ajv 8.20.0. These development dependencies are not runtime dependencies of the published CLI.
 
 The `v0.7.1` candidate records its build graph in `bun.lock`, while its install tarball declares direct runtime dependency versions in `package.json`. This candidate is not yet admitted and cannot inherit an earlier version's publication or provenance evidence. Its own release workflow must verify the exact source, tarball and public provenance before admission.

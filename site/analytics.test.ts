@@ -70,6 +70,22 @@ describe("hra.sh analytics boundary", () => {
     })).toBe(false);
   });
 
+  test("admits six exact documentation routes without exposing preview selectors or unknown child paths", () => {
+    const pages = [
+      ["/docs", "docs_index"], ["/docs/start", "guide"], ["/docs/web", "guide"],
+      ["/docs/sessions", "guide"], ["/docs/reference", "reference"], ["/docs/status", "status"],
+    ] as const;
+    expect(hraPostHogSite.routes.map(({ path }) => path)).toEqual(["/", "/privacy", ...pages.map(([path]) => path)]);
+    for (const [path, kind] of pages) {
+      expect(classifyAnalyticsRoute(hraPostHogSite, `https://hra.sh${path}/?token=private#local-account`)).toMatchObject({
+        canonical_path: path, page_kind: kind, content_group: "documentation",
+      });
+    }
+    for (const path of ["/docs/private", "/docs/start/private", "/examples/app/", "/examples/app/index.html?view=settings", "/preview/"]) {
+      expect(classifyAnalyticsRoute(hraPostHogSite, `https://hra.sh${path}`)).toMatchObject({ canonical_path: "/not-found", page_kind: "other" });
+    }
+  });
+
   test("uses anonymous cookieless memory state with invasive capture disabled", () => {
     const config = createPostHogBrowserConfig(hraPostHogSite, {
       href: "https://hra.sh/",
