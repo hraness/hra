@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { runInNewContext } from "node:vm";
 import { parseHTML } from "linkedom";
 import { renderProductPreview } from "./product-preview.tsx";
 import { isProductScene, parsePreviewMessage, productPreviewDisclosure, productScenes } from "./product-scenes.ts";
@@ -6,6 +7,32 @@ import { docsPages } from "./docs-content.ts";
 import { renderDocsHtml } from "./template.ts";
 
 describe("public real-UI examples", () => {
+  test("enhances the server-rendered scene without restarting its initial navigation", async () => {
+    const build = await Bun.build({ entrypoints: [new URL("./site-entry.ts", import.meta.url).pathname], target: "browser", format: "iife", write: false });
+    expect(build.success).toBe(true);
+    const code = await build.outputs[0]!.text();
+    for (const view of Object.keys(productScenes)) {
+      if (!isProductScene(view)) throw new Error("Unregistered test scene");
+      const { document, window } = parseHTML(renderProductPreview(view, "example"));
+      const frame = document.querySelector("iframe")!;
+      const initial = frame.getAttribute("src");
+      const navigations: string[] = [];
+      Object.defineProperty(frame, "src", { get: () => initial, set: (value: string) => { navigations.push(value); } });
+      const observers: Element[] = [];
+      runInNewContext(code, { document, window: { addEventListener() {}, location: { hash: "" } },
+        IntersectionObserver: class { observe(target: Element) { observers.push(target); } disconnect() {} },
+        setTimeout: () => 1, clearTimeout() {} });
+      expect(navigations).toEqual([]);
+      expect(observers).toEqual([frame]);
+      expect(document.querySelector("[data-preview-script-notice]")?.hasAttribute("hidden")).toBe(true);
+      document.querySelector(`[data-preview-view="${view}"]`)!.dispatchEvent(new window.Event("click"));
+      expect(navigations).toEqual([]);
+      const next = view === "overview" ? "conversation" : "overview";
+      document.querySelector(`[data-preview-view="${next}"]`)!.dispatchEvent(new window.Event("click"));
+      expect(navigations).toEqual([`/examples/app/index.html?view=${next}`]);
+    }
+  });
+
   test("parses only exact public readiness messages without evaluating accessors", () => {
     for (const type of ["hra-preview-ready", "hra-preview-failed"] as const) for (const view of Object.keys(productScenes)) {
       if (!isProductScene(view)) throw new Error("Unregistered test scene");

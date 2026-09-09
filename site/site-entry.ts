@@ -83,7 +83,8 @@ for (const figure of document.querySelectorAll<HTMLElement>("[data-product-previ
     if (entries.some((entry) => entry.isIntersecting)) { loading.begin(); observer.disconnect(); }
   }, { rootMargin: "200px" });
   observer.observe(frame);
-  frame.src = previewUrl(current);
+  // The server already set the selected URL. Reassigning even the same value
+  // can abort the initial document while progressive enhancement is loading.
 }
 
 const search = document.querySelector<HTMLInputElement>("#docs-search");
