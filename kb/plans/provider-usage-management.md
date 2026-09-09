@@ -21,8 +21,14 @@ manual-switch and policy-control foundation. Managed automatic movement,
 Claude native fallback activation and the unfinished hosted/browser publisher
 remain dormant. Phases 6 through 9 are not complete.
 
-The September 9 delivery now waits for the combined PR 164 prerequisite,
-including the reviewed PR 167 follow-up, to pass and reach protected `main`.
+The September 9 delivery waits for a compiler-lifecycle repair and fresh
+actual-main acceptance. Combined PR 164, including the reviewed PR 167
+follow-up, reached protected `main` at
+`bdfb0c2ca7aa753e0232844a3e001c0a30626a14`, tree
+`0be440ee932429d174b8b0d6e5eab123f85f0520`. Its PR checks passed, but
+[actual-main CI 34404823161](https://github.com/hraness/hra/actions/runs/34404823161),
+attempt 1, failed Ubuntu remainder. That failed gate remains recorded without
+a blind rerun or a relaxed collection rule.
 PR 140 remains a separate draft foundation candidate. Its pre-diagnostic
 checkpoint is
 `087ec49746d82c0d2eada10e146b19d3734d0449`; its published head remains
@@ -51,8 +57,8 @@ prerequisite `efcb9c4`. The handoff changes four development source/test files,
 without PR 140 ancestry, plan edits or packaged-file changes. It observes only
 the existing local close and termination decisions. It is not a behavioral
 repair and does not change signals, deadlines, recovery journals, collection
-requirements or nonzero-exit refusal. A new exact Linux observation is required
-before selecting a repair.
+requirements or nonzero-exit refusal. At that checkpoint a new exact Linux
+observation was required before selecting a repair.
 
 Focused real-process controls pass 24 cases with 129 assertions, including
 genuine leader exits, a zero-exit leader with a remaining descendant, unchanged
@@ -63,8 +69,54 @@ fresh-build proof, all 20 original site-build cases and 25 owner/property
 contracts. Scoped lint, final typecheck and independent AST review pass.
 The authority runner, group predicate and signal function remain unchanged;
 removing diagnostic-only additions reproduces the original local execution
-control flow. The prerequisite owner must still run fresh exact combined-tree
-CI. These local receipts do not establish the Linux cause or artifact admission.
+control flow. These historical local receipts did not establish the Linux cause
+or artifact admission.
+
+The actual-main failure now identifies the forced-failure branch: the compiler
+leader closed with code 0, but the process group was non-absent, so the existing
+runner forced result 1. The identity-marker case took 21.37738 seconds; this was
+not the 60-second work deadline. Ubuntu passed 167 site cases and failed one,
+with 10,392 assertions. macOS passed all 168 cases with 10,395 assertions.
+These observations do not identify the residual member as esbuild or a zombie.
+
+A bounded native experiment with pinned Bun 1.3.14 and esbuild 0.27.0 found a
+separate concrete lifecycle gap. Three stop-only processes exited without
+observing the compiler child's close event. Three processes that retained the
+actual child and joined its close observed closure before returning. All six
+outer runs proved collection. This establishes event ordering on macOS, not
+Linux residual identity or a reliability rate.
+
+The selected repair is confined to the isolated site-test compiler. An early
+preload admits the exact pinned esbuild module and resolved native command,
+observes genuine child closure at acquisition, and joins every observed close
+before publishing a build terminal. One shared shutdown barrier handles early
+closure, failed spawn, repeated stop and late errors. An independent event-loop
+lease survives the library's own later unref without a timer, signal or second
+cleanup owner. The parent still owns the original deadline, cancellation,
+termination and process-group acceptance. Dependencies, production builders,
+Convex and packaged files are unchanged. Independent source review found no
+concrete blocker. The ordered native/compiler/owner gate passes 54 cases with
+4,141 assertions in 112.70 seconds, including the unchanged identity-marker
+case. The child-join unit suite passes 22 cases with 478 assertions, including
+32 seeded ordering samples. Final native and spawn-scope tests pass 13 cases
+with 60 assertions after test-only type annotations were corrected. Final
+TypeScript and scoped lint pass. The real native cases cover failed spawn
+without an exit event, closure before stop, delayed closure, library unref,
+zero acquisitions, unknown-spawn refusal and cancellation collection. Fresh
+Linux and exact-tree delivery evidence remain required; these focused local
+receipts do not replace the prerequisite owner's integration gates.
+
+The frozen compiler handoff is
+[`c958f4981853e3f0116cd650222a0147d7af1591`](https://github.com/hraness/hra/commit/c958f4981853e3f0116cd650222a0147d7af1591),
+tree `82d82126fb8ab10c4acd59668b7d3c1c017b7993`, with sole parent `bdfb0c2`.
+It is a mechanical cherry-pick of local repair
+`ea0d81092ad9ba0adbed381e9f48f441f50b551a` onto that exact main. All twelve
+executable and test files remain byte-identical. The thirteenth file adds one
+test-boundary description while preserving main's script guidance. The
+prerequisite owner owns its final review, protected PR, fresh Required checks
+and actual-main acceptance. PR 140 remains held until that admitted main is
+available. Neither this public handoff nor the local plan checkpoint is a
+release or deployment.
 
 The proposed Effect Claude lifecycle delta remains a separate later delivery.
 Independent review found that retaining the caller's mutable constructor
