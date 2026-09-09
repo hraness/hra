@@ -99,7 +99,7 @@ async function fixture(run: (database: Database, paths: ReturnType<typeof resolv
   } finally { database?.close(false); await rm(root, { recursive: true, force: true }); }
 }
 
-test("retained combined49 prepared switch admits only the canonical key backfill and restores its exact original fence", async () => {
+test("retained combined49 prepared switch preserves original cells and installs only the exact joined fence successor", async () => {
   await fixture((database, paths) => {
     const originalGuard = readGuard(database);
     const original = snapshot(paths.database);
@@ -118,7 +118,28 @@ test("retained combined49 prepared switch admits only the canonical key backfill
         expect(joined.query("SELECT canonical_profile_key FROM sessions WHERE id=?").get(archived.session.id))
           .toEqual({ canonical_profile_key: canonicalKey });
         expect(rawCells(joined, "sessions", sessionColumns)).toEqual(sessionCells);
-        expect(readGuard(joined)).toBe(originalGuard);
+        // Version 50 restores the exact historical fence (proved by the late
+        // ledger fault below). The final join deliberately replaces only its
+        // target-contract comparison with immutable execution-context proof.
+        const historicalTarget = "AND NEW.preset_contract=switch.target_preset_contract";
+        expect(originalGuard.split(historicalTarget)).toHaveLength(2);
+        const joinedTarget = `AND NEW.preset_contract IS (
+        SELECT context.target_preset_contract FROM session_switch_execution_contexts context
+        JOIN session_switch_execution_context_anchors anchor
+          ON anchor.attempt_id=context.attempt_id AND anchor.context_digest=context.context_digest
+        JOIN session_switch_plan_anchors plan
+          ON plan.attempt_id=context.attempt_id AND plan.plan_digest=context.plan_digest
+          AND plan.recorded_at=context.created_at
+        JOIN session_switch_attempts parent
+          ON parent.attempt_id=context.attempt_id AND parent.journal_sequence=switch.journal_sequence
+        WHERE context.attempt_id=switch.attempt_id AND context.request_digest=switch.request_digest
+          AND context.target_provider_account_id=switch.target_provider_account_id
+          AND context.target_profile_id=switch.target_profile_id AND context.target_provider=switch.target_provider
+          AND context.target_binding_generation=switch.target_binding_generation
+          AND context.target_process_generation=switch.target_process_generation
+          AND context.renderer_version=parent.renderer_version AND context.created_at=parent.created_at
+      )`;
+        expect(readGuard(joined)).toBe(originalGuard.replace(historicalTarget, joinedTarget));
         for (const [table, names] of Object.entries(original.columns)) {
           const cells = original.cells[table];
           if (cells === undefined) throw new Error("Missing original switch cells.");

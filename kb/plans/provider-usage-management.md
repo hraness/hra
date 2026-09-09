@@ -208,6 +208,38 @@ old deadline. Storage fixture, grouped source-case and exact compiled-app
 qualification repairs remain in progress. No merge, release, production
 deployment or daemon activation has been performed for this candidate.
 
+The UI-first join is committed as
+`5f56466df1cebe0d9d7cd54dc0a71f11cec90280`, tree
+`eff127cf87070957322e66043b67dc01dd6635c2`, with the independent archive's
+214 paths, modes and byte hashes bound to those committed inputs. Its complete
+site suite passes 131 cases with 7,207 assertions. The fresh compiled app passes
+20 of 21 static cases; only the unadmitted resource fingerprint fails. The
+current function and entire React closure are byte-identical to the separately
+reviewed prior allocation; the bundle differs only in the joined settings
+explanation. Independent review admits its exact raw SHA-256
+`87ae7be84d98dfd2138dfd2b7709c82e09ce1d595300c3773dfa988ae5ffc2a8`,
+not identifier normalization or a general style exemption. The expanded guard
+matrix passes 49 cases with 426 assertions. Full app and browser acceptance
+remain required on the successor.
+
+Every failure in run `34355008813` is inventoried. The next test-only repairs
+retain the same production guards: actual owner/custody schema dependencies
+in the reduced SQL fixture; the current Sol tuple for a newly created High
+session; the exact final joined switch fence while preserving the historical
+version-50 fence and rollback proof; and the earlier peer-cancellation schema
+refusal with unchanged surviving rows. The latter three full suites pass
+33 cases with 271 assertions. Platform-specific schema derivatives now disable
+rename propagation and prove unrelated objects unchanged. The raw scrub-test
+writer explicitly uses production's secure-delete mode; a deliberate OFF
+probe reproduced the stale-body failure before this correction. Independent
+loop scenarios are split without increasing their per-case deadlines or
+dividing coupled comparisons; the lineage input vector remains exactly the
+original eight seeded values. Private test owners retain late failures and
+join work before cleanup. Independent source review is complete; the remaining
+focused checks and fresh integration typecheck are queued. This successor is
+a validation candidate, not accepted source or a released artifact. Complete
+current-base CI, exact installation and compiled browser gates remain pending.
+
 The September 8 integration checkpoints now include canonical main through
 schema 50 at `ab56d3bc5034abedd12a20b5b405caf42bfa174f`, then the clean
 release-policy join at `9d6e2e12a42215e9201ae2ed3f64ed1b41e5c47d`, tree

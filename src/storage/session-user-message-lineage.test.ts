@@ -12,9 +12,93 @@ import { StateStore } from "./state-store";
 
 const roots: string[] = [];
 const stores: StateStore[] = [];
+type LineageResources = { roots: string[]; stores: Array<Pick<StateStore, "close">> };
+const ownedLineageTeardowns: Array<() => Promise<void>> = [];
 afterEach(async () => {
+  const teardowns = ownedLineageTeardowns.splice(0);
   for (const store of stores.splice(0)) store.close();
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
+  // These owners have private resource lists; a timed-out drain cannot take
+  // resources from a later test's shared fixture cleanup.
+  const results = await Promise.allSettled(teardowns.map(async (teardown) => await teardown()));
+  const failures = results.flatMap((result): unknown[] => result.status === "rejected" ? [result.reason] : []);
+  if (failures.length > 0) throw new AggregateError(failures, "Lineage case teardown failed.");
+});
+
+function ownedLineageCase(
+  runCase: (resources: LineageResources, signal: AbortSignal) => Promise<void>,
+  teardowns = ownedLineageTeardowns,
+): Promise<void> {
+  const resources: LineageResources = { roots: [], stores: [] };
+  const controller = new AbortController();
+  const cancellation = new Error("Owned lineage case is closing.");
+  const task = Promise.resolve().then(async () => {
+    controller.signal.throwIfAborted();
+    await runCase(resources, controller.signal);
+    controller.signal.throwIfAborted();
+  });
+  const settled = task.then(
+    () => ({ status: "fulfilled" } as const),
+    (reason: unknown) => ({ status: "rejected", reason } as const),
+  );
+  teardowns.push(async () => {
+    controller.abort(cancellation);
+    const result = await settled;
+    const failures: unknown[] = result.status === "rejected" && result.reason !== cancellation ? [result.reason] : [];
+    let storeCloseFailed = false;
+    for (const store of resources.stores.splice(0)) {
+      try { store.close(); } catch (error: unknown) {
+        storeCloseFailed = true;
+        failures.push(error);
+      }
+    }
+    if (storeCloseFailed) throw new AggregateError(failures, "Lineage store close failed; owned roots were retained.");
+    for (const root of resources.roots.splice(0)) {
+      try { await rm(root, { recursive: true, force: true }); } catch (error: unknown) { failures.push(error); }
+    }
+    if (failures.length > 0) throw new AggregateError(failures, "Owned lineage teardown failed.");
+  });
+  return task;
+}
+
+describe("owned lineage case lifecycle", () => {
+  test("registers before deferred setup and cancels before resources open", async () => {
+    const teardowns: Array<() => Promise<void>> = [];
+    let opened = false;
+    const task = ownedLineageCase(async () => { opened = true; }, teardowns);
+    expect(teardowns).toHaveLength(1);
+    await teardowns[0]?.();
+    await expect(task).rejects.toThrow("Owned lineage case is closing.");
+    expect(opened).toBe(false);
+  });
+
+  test("joins late setup work and retains its failure before attempting every close", async () => {
+    const teardowns: Array<() => Promise<void>> = [];
+    const entered = Promise.withResolvers<undefined>();
+    const release = Promise.withResolvers<undefined>();
+    const lateFailure = new Error("late lineage setup failure");
+    const closeFailure = new Error("first store close failure");
+    const events: string[] = [];
+    const task = ownedLineageCase(async (resources) => {
+      resources.stores.push({ close: () => { events.push("close-first"); throw closeFailure; } });
+      entered.resolve(undefined);
+      await release.promise;
+      resources.stores.push({ close: () => { events.push("close-late"); } });
+      events.push("raw-failed");
+      throw lateFailure;
+    }, teardowns);
+    await entered.promise;
+    const closing = teardowns[0]?.().catch((error: unknown) => error);
+    await Promise.resolve();
+    expect(events).toEqual([]);
+    release.resolve(undefined);
+    const error = await closing;
+    expect(error).toBeInstanceOf(AggregateError);
+    if (!(error instanceof AggregateError)) throw new Error("Expected late setup and close failures.");
+    expect(error.errors).toEqual([lateFailure, closeFailure]);
+    await expect(task).rejects.toBe(lateFailure);
+    expect(events).toEqual(["raw-failed", "close-first", "close-late"]);
+  });
 });
 
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
@@ -52,14 +136,14 @@ function corrupt(path: string, table: string, change: (db: Database) => void) {
   } finally { db.close(false); }
 }
 
-async function fixture(kind: SourceKind, restarts = 1) {
+async function fixture(kind: SourceKind, restarts = 1, resources: LineageResources = { roots, stores }) {
   const root = await realpath(await mkdtemp(join(tmpdir(), "hra-message-lineage-")));
-  roots.push(root);
+  resources.roots.push(root);
   const paths = resolveStatePaths({ homeDirectory: root, platform: "darwin" });
   await initializeStatePaths(paths);
   let now = 1_800_000_000_000;
   const store = new StateStore(paths, { now: () => now, resolveMachineTimeZone: () => "UTC" });
-  stores.push(store);
+  resources.stores.push(store);
   const bootId = `boot_${randomUUID().replaceAll("-", "")}`;
   const daemonGeneration = store.nextDaemonGeneration(bootId);
   const profile = store.nextProfileGeneration(store.createProfile("Message lineage").id);
@@ -213,14 +297,19 @@ describe("settled user-message original authority across process lineage", () =>
     expect(snapshot(value.paths.database)).toEqual(before);
   });
 
-  test("seeded small restart counts preserve original tuples rather than synthesizing new writers", async () => {
-    await fc.assert(fc.asyncProperty(fc.integer({ min: 1, max: 4 }), async (count) => {
-      const value = await fixture("steer", count);
+  // Preserve the exact eight generated inputs from the former asyncProperty:
+  // 2, 4, 2, 1, 2, 1, 2, 2. Each fresh real-schema fixture has its own deadline.
+  test.each(fc.sample(fc.integer({ min: 1, max: 4 }), { seed: 20_260_910, numRuns: 8 })
+    .map((count, index) => ({ count, sample: index + 1 })))(
+    "seeded small restart counts preserve original tuples rather than synthesizing new writers (sample $sample, restarts $count)",
+    ({ count }) => ownedLineageCase(async (resources, signal) => {
+      const value = await fixture("steer", count, resources);
+      signal.throwIfAborted();
       const current = value.store.requireSessionProviderAuthority(value.session.id);
       const result = value.recover();
       expect(result.messageEvent?.event.providerGeneration).toBe(value.authority.processGeneration);
       expect(current.processGeneration).toBe(value.authority.processGeneration + count);
       expect(value.store.requireSessionProviderAuthority(value.session.id)).toEqual(current);
-    }), { seed: 20_260_910, numRuns: 8 });
-  });
+    }),
+  );
 });

@@ -11981,7 +11981,24 @@ describe("StateStore", () => {
 
     const legacy = new Database(databasePath, { create: false, strict: true });
     try {
+      const pristine = snapshotSwitchContainmentForTest(legacy);
+      const changedObjects = new Set([
+        "session_claude_process_authorities",
+        "session_claude_process_authority_session_guard_insert",
+        "session_claude_process_authority_session_guard_update",
+        "session_claude_process_authority_revision_guard",
+        "sessions_claude_process_authority_rebind_guard",
+        "session_claude_process_authorities_live_identity",
+        "session_claude_process_authorities_session",
+      ]);
+      const unrelatedSchema = (schema: typeof pristine.schema) => schema.filter((row) =>
+        !changedObjects.has(z.object({ name: z.string() }).parse(row).name));
+      // This derivative damages only Claude custody. Platform SQLite defaults
+      // must not rename references in unrelated switch guards or foreign keys.
       legacy.exec(`
+        PRAGMA foreign_keys=OFF;
+        PRAGMA legacy_alter_table=ON;
+        BEGIN IMMEDIATE;
         DROP TRIGGER IF EXISTS session_claude_process_authority_session_guard_insert;
         DROP TRIGGER IF EXISTS session_claude_process_authority_session_guard_update;
         DROP TRIGGER IF EXISTS session_claude_process_authority_revision_guard;
@@ -12009,13 +12026,21 @@ describe("StateStore", () => {
             session_id,pid,pid_domain,proc_start,state,revision,recorded_at,released_at
           FROM session_claude_process_authorities_scoped_backup;
         DROP TABLE session_claude_process_authorities_scoped_backup;
+        COMMIT;
+        PRAGMA legacy_alter_table=OFF;
       `);
+      const corrupted = snapshotSwitchContainmentForTest(legacy);
+      expect(unrelatedSchema(corrupted.schema)).toEqual(unrelatedSchema(pristine.schema));
+      expect(corrupted.version).toEqual(pristine.version);
+      const unrelatedRows = (rows: typeof pristine.rows) => rows.filter(({ name }) =>
+        name !== "session_claude_process_authorities");
+      expect(unrelatedRows(corrupted.rows)).toEqual(unrelatedRows(pristine.rows));
     } finally {
       legacy.close(false);
     }
 
-    expect(() => new StateStore(store.paths))
-      .toThrow("STATE_SCHEMA_V39_OBJECT_MISSING:session_claude_process_authorities_live_identity");
+    expectInertSchemaRefusal(store.paths,
+      "STATE_SCHEMA_V39_OBJECT_MISSING:session_claude_process_authorities_live_identity");
     const primaryKey = new Database(databasePath, { readonly: true, strict: true });
     try {
       expect((primaryKey.query(
@@ -19152,6 +19177,11 @@ describe("StateStore", () => {
     stores.splice(stores.indexOf(store), 1);
 
     const writer = new Database(paths.database, { create: false, strict: true });
+    // Emulate the owned writer configured by migrateWritableDatabase instead
+    // of inheriting platform defaults. A raw writer with secure_delete=OFF can
+    // checkpoint stale body bytes before the owned scrubber gets custody.
+    writer.exec("PRAGMA secure_delete=ON");
+    expect(writer.query("PRAGMA secure_delete").get()).toEqual({ secure_delete: 1 });
     writer.query(
       "UPDATE queue_entries SET state='cancelled',updated_at=updated_at+1 WHERE id=?",
     ).run(first.id);
@@ -24422,6 +24452,7 @@ describe("StateStore", () => {
     stores.splice(stores.indexOf(store), 1);
     const damaged = new Database(paths.database, { create: false, strict: true });
     try {
+      const pristine = snapshotSwitchContainmentForTest(damaged);
       const triggers = damaged.query(
         `SELECT name,sql FROM sqlite_master
          WHERE type='trigger' AND (
@@ -24439,6 +24470,9 @@ describe("StateStore", () => {
         damaged.exec(`DROP TRIGGER ${trigger.name}`);
       }
       damaged.exec(`
+        PRAGMA foreign_keys=OFF;
+        PRAGMA legacy_alter_table=ON;
+        BEGIN IMMEDIATE;
         ALTER TABLE account_rate_limit_reset_policies
           RENAME TO account_rate_limit_reset_policies_strict;
         CREATE TABLE account_rate_limit_reset_policies (
@@ -24453,14 +24487,22 @@ describe("StateStore", () => {
         INSERT INTO account_rate_limit_reset_policies
           SELECT * FROM account_rate_limit_reset_policies_strict;
         DROP TABLE account_rate_limit_reset_policies_strict;
+        COMMIT;
+        PRAGMA legacy_alter_table=OFF;
       `);
       for (const trigger of triggers) damaged.exec(trigger.sql);
+      const corrupted = snapshotSwitchContainmentForTest(damaged);
+      const unrelatedSchema = (schema: typeof pristine.schema) => schema.filter((row) =>
+        z.object({ name: z.string() }).parse(row).name !== "account_rate_limit_reset_policies");
+      expect(unrelatedSchema(corrupted.schema)).toEqual(unrelatedSchema(pristine.schema));
+      expect(corrupted.version).toEqual(pristine.version);
+      expect(corrupted.rows).toEqual(pristine.rows);
+      expect(() => new StateStore(paths, { readonly: true }))
+        .toThrow("STATE_SCHEMA_V28_STRUCTURE_INVALID");
+      expect(snapshotSwitchContainmentForTest(damaged)).toEqual(corrupted);
     } finally {
       damaged.close(false);
     }
-
-    expect(() => new StateStore(paths, { readonly: true }))
-      .toThrow("STATE_SCHEMA_V28_STRUCTURE_INVALID");
   });
 
   test("readonly open rejects a corrupt reset-policy row under exact guards", async () => {
@@ -25935,13 +25977,14 @@ describe("StateStore", () => {
 
     expectInertSchemaRefusal(paths, "STATE_SCHEMA_V42_STRUCTURE_INVALID");
   });
-  test("audits missing Codex usage authority before startup retention", async () => {
-    for (const scopeKind of [
-      "usage_snapshot",
-      "usage_poll_failure",
-      "usage_upload_anchor",
-    ] as const) {
-      const { store } = await fixture();
+  test.each([
+    "usage_snapshot",
+    "usage_poll_failure",
+    "usage_upload_anchor",
+  ] as const)(
+    "audits missing Codex usage authority before startup retention for %s",
+    (scopeKind) => ownedStateStoreCase(async ({ request }) => {
+      const { store } = await request(() => fixture());
       const profile = signInProfile(
         store,
         `Missing ${scopeKind}`,
@@ -25974,8 +26017,8 @@ describe("StateStore", () => {
         now: () => USAGE_LOCAL_RETAIN_AGE_MS + 100_000,
       })).toThrow("ACCOUNT_SCOPED_PROVIDER_AUTHORITY_MISSING");
       expectInertSchemaRefusal(paths, "ACCOUNT_SCOPED_PROVIDER_AUTHORITY_MISSING");
-    }
-  });
+    }),
+  );
 
   test("stores Claude quota and accounting against immutable turn authority", async () => {
     const home = await realpath(await mkdtemp(join(tmpdir(), "hra-provider-usage-")));
@@ -33837,9 +33880,10 @@ describe("StateStore", () => {
     },
   );
 
-  test("peer abandonment fence distinguishes a new inactive observation from missing legacy evidence", async () => {
-    for (const delivery of ["send", "steer", "queue"] as const) {
-      const f = await peerAbandonmentFenceFixture(delivery);
+  test.each(["send", "steer", "queue"] as const)(
+    "peer abandonment fence distinguishes a new inactive observation from missing legacy evidence for %s",
+    (delivery) => ownedStateStoreCase(async ({ request }) => {
+      const f = await request(() => peerAbandonmentFenceFixture(delivery));
       expect(f.abandon(f.baseResolutionEvidence, false)).toMatchObject({ state: "idle" });
       expect(f.resolutionEvidence()).toEqual({
         ...f.baseResolutionEvidence,
@@ -33857,8 +33901,8 @@ describe("StateStore", () => {
       }
       f.changeTurn(f.target.id, "turn-peer-fence-after-idle");
       expect(f.store.admitPeerSessionAction(f.returnRequest()).action.state).toBe("prepared");
-    }
-  });
+    }),
+  );
 
   test("refuses peer self, scope, policy, stale revision, and target-state violations distinctly", async () => {
     const { store, home } = await fixture();

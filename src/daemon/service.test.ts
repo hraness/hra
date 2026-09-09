@@ -1462,7 +1462,14 @@ class TrackingClaudeAuthority extends UnavailableClaudeRuntime {
 const stores: StateStore[] = [];
 const serviceRoots: string[] = [];
 const ownedFixtureTeardowns: Array<() => Promise<void>> = [];
+type ServiceCaseResources = {
+  stores: Array<Pick<StateStore, "close">>;
+  roots: string[];
+  services: Array<Pick<HraService, "close">>;
+};
+const ownedServiceCaseTeardowns: Array<() => Promise<void>> = [];
 afterEach(async () => {
+  const caseTeardowns = ownedServiceCaseTeardowns.splice(0);
   // A timed-out owned fixture can still have an admitted command. Join its
   // request and service before the shared fixture cleanup removes storage.
   for (const teardown of ownedFixtureTeardowns) await teardown();
@@ -1470,6 +1477,11 @@ afterEach(async () => {
   for (const store of stores.splice(0)) store.close();
   await Promise.all(serviceRoots.splice(0).map(async (root) =>
     rm(root, { force: true, recursive: true })));
+  // Each case owns private lists. A late drain cannot claim fixtures from a
+  // subsequent test, even if this afterEach itself reaches its deadline.
+  const results = await Promise.allSettled(caseTeardowns.map(async (teardown) => await teardown()));
+  const failures = results.flatMap((result): unknown[] => result.status === "rejected" ? [result.reason] : []);
+  if (failures.length > 0) throw new AggregateError(failures, "Service case teardown failed.");
 });
 
 type FixtureAdoptionOptions = Readonly<{
@@ -1544,9 +1556,10 @@ async function fixture(
   adoptionOrMemoryOrPlatform: FixtureAdoptionOptions | HraMemoryPort | NodeJS.Platform = {},
   platformOrClaude?: NodeJS.Platform | ClaudeRuntimePort,
   platformOverride: NodeJS.Platform = "linux",
+  resources?: ServiceCaseResources,
 ): Promise<{ service: HraService; store: StateStore; codex: FakeCodex; cloud: FakeCloud; daemonAuthority: FakeDaemonAuthority; daemonGeneration: number; daemonBootId: string; documents: string; eventCursors: SessionEventCursorCodec; paths: ReturnType<typeof resolveStatePaths> }> {
   const home = await realpath(await mkdtemp(join(tmpdir(), "hra-service-")));
-  serviceRoots.push(home);
+  (resources?.roots ?? serviceRoots).push(home);
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   const documents = join(home, "Documents");
   await mkdir(documents, { recursive: true });
@@ -1602,7 +1615,7 @@ async function fixture(
       ? {}
       : { securityScrubCheckpoint: autorespond.securityScrubCheckpoint }),
   });
-  stores.push(store);
+  (resources?.stores ?? stores).push(store);
   // Exercise the same explicit persisted boot fence used by the real daemon;
   // generation zero is not attachment reservation or deletion authority.
   const daemonBootId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
@@ -1625,40 +1638,42 @@ async function fixture(
       ? platformOrClaude
       : platformOverride;
   const managedClaude = adoption.managedClaude ?? explicitClaude ?? autorespond.claude;
+  const service = new HraService({
+    store,
+    paths,
+    codex,
+    cloud,
+    daemonAuthority,
+    daemonGeneration,
+    daemonBootId,
+    ...(desktop === undefined ? {} : { desktop }),
+    ...(managedClaude === undefined ? {} : { claude: managedClaude }),
+    eventCursors,
+    ...(factsMemory === undefined ? {} : { factsMemory }),
+    ...(memory === undefined ? {} : { memory }),
+    ...(autorespond.beforeMemoryClose === undefined
+      ? {}
+      : { beforeMemoryClose: autorespond.beforeMemoryClose }),
+    ...(autorespond.gatewayKeys === undefined ? {} : { gatewayKeys: autorespond.gatewayKeys }),
+    ...(autorespond.proseResponder === undefined ? {} : { proseResponder: autorespond.proseResponder }),
+    ...(adoption.personalCodex === undefined ? {} : { personalCodex: adoption.personalCodex }),
+    ...(adoption.personalClaude === undefined ? {} : { personalClaude: adoption.personalClaude }),
+    ...(adoption.personalDiscovery === undefined ? {} : { personalDiscovery: adoption.personalDiscovery }),
+    ...(adoption.readPersonalCodexAutomations === undefined
+      ? {}
+      : { readPersonalCodexAutomations: adoption.readPersonalCodexAutomations }),
+    ...(adoption.personalCodexHome === undefined ? {} : { personalCodexHome: adoption.personalCodexHome }),
+    ...(adoption.claudeProcessLiveness === undefined ? {} : { claudeProcessLiveness: adoption.claudeProcessLiveness }),
+    ...(adoption.daemonGeneration === undefined
+      ? {}
+      : { daemonGeneration: adoption.daemonGeneration }),
+    now,
+    platform,
+    requestStop,
+  });
+  resources?.services.push(service);
   return {
-    service: new HraService({
-      store,
-      paths,
-      codex,
-      cloud,
-      daemonAuthority,
-      daemonGeneration,
-      daemonBootId,
-      ...(desktop === undefined ? {} : { desktop }),
-      ...(managedClaude === undefined ? {} : { claude: managedClaude }),
-      eventCursors,
-      ...(factsMemory === undefined ? {} : { factsMemory }),
-      ...(memory === undefined ? {} : { memory }),
-      ...(autorespond.beforeMemoryClose === undefined
-        ? {}
-        : { beforeMemoryClose: autorespond.beforeMemoryClose }),
-      ...(autorespond.gatewayKeys === undefined ? {} : { gatewayKeys: autorespond.gatewayKeys }),
-      ...(autorespond.proseResponder === undefined ? {} : { proseResponder: autorespond.proseResponder }),
-      ...(adoption.personalCodex === undefined ? {} : { personalCodex: adoption.personalCodex }),
-      ...(adoption.personalClaude === undefined ? {} : { personalClaude: adoption.personalClaude }),
-      ...(adoption.personalDiscovery === undefined ? {} : { personalDiscovery: adoption.personalDiscovery }),
-      ...(adoption.readPersonalCodexAutomations === undefined
-        ? {}
-        : { readPersonalCodexAutomations: adoption.readPersonalCodexAutomations }),
-      ...(adoption.personalCodexHome === undefined ? {} : { personalCodexHome: adoption.personalCodexHome }),
-      ...(adoption.claudeProcessLiveness === undefined ? {} : { claudeProcessLiveness: adoption.claudeProcessLiveness }),
-      ...(adoption.daemonGeneration === undefined
-        ? {}
-        : { daemonGeneration: adoption.daemonGeneration }),
-      now,
-      platform,
-      requestStop,
-    }),
+    service,
     store,
     codex,
     cloud,
@@ -1748,6 +1763,137 @@ type ServiceFixtureFactory = (...args: Parameters<typeof fixture>) => Promise<
   }
 >;
 
+function ownedServiceCase(
+  runCase: (context: {
+    createFixture: ServiceFixtureFactory;
+    signal: AbortSignal;
+    resources: ServiceCaseResources;
+  }) => Promise<void>,
+  teardowns = ownedServiceCaseTeardowns,
+): Promise<void> {
+  const resources: ServiceCaseResources = { roots: [], stores: [], services: [] };
+  const controller = new AbortController();
+  const cancellation = new Error("Owned service case is closing.");
+  const createFixture: ServiceFixtureFactory = async (
+    desktop, cloud, requestStop, now, factsMemory, autorespond, adoption,
+    platformOrClaude, platformOverride,
+  ) => {
+    controller.signal.throwIfAborted();
+    const value = await fixture(desktop, cloud, requestStop, now, factsMemory,
+      autorespond, adoption, platformOrClaude, platformOverride, resources);
+    controller.signal.throwIfAborted();
+    return {
+      ...value,
+      execute: async (command: LocalCommand): Promise<unknown> => {
+        controller.signal.throwIfAborted();
+        const result = await value.service.execute(command, { signal: controller.signal });
+        controller.signal.throwIfAborted();
+        return result;
+      },
+    };
+  };
+  // Register this raw task before any fixture setup, and observe its rejection
+  // immediately. Timeout cleanup must join it before closing service storage.
+  const task = Promise.resolve().then(async () => {
+    controller.signal.throwIfAborted();
+    await runCase({ createFixture, signal: controller.signal, resources });
+    controller.signal.throwIfAborted();
+  });
+  const settled = task.then(
+    () => ({ status: "fulfilled" } as const),
+    (reason: unknown) => ({ status: "rejected", reason } as const),
+  );
+  teardowns.push(async () => {
+    controller.abort(cancellation);
+    const result = await settled;
+    const failures: unknown[] = result.status === "rejected" && result.reason !== cancellation ? [result.reason] : [];
+    let serviceCloseFailed = false;
+    for (const service of resources.services.splice(0)) {
+      try { await service.close(); } catch (error: unknown) {
+        serviceCloseFailed = true;
+        failures.push(error);
+      }
+    }
+    if (serviceCloseFailed) throw new AggregateError(failures, "Service close failed; owned storage was retained.");
+    let storeCloseFailed = false;
+    for (const store of resources.stores.splice(0)) {
+      try { store.close(); } catch (error: unknown) {
+        storeCloseFailed = true;
+        failures.push(error);
+      }
+    }
+    if (storeCloseFailed) throw new AggregateError(failures, "Store close failed; owned roots were retained.");
+    for (const root of resources.roots.splice(0)) {
+      try { await rm(root, { force: true, recursive: true }); } catch (error: unknown) { failures.push(error); }
+    }
+    if (failures.length > 0) throw new AggregateError(failures, "Owned service teardown failed.");
+  });
+  return task;
+}
+
+describe("owned service case lifecycle", () => {
+  test("registers before deferred setup and cancels before resources open", async () => {
+    const teardowns: Array<() => Promise<void>> = [];
+    let opened = false;
+    const task = ownedServiceCase(async () => { opened = true; }, teardowns);
+    expect(teardowns).toHaveLength(1);
+    await teardowns[0]?.();
+    await expect(task).rejects.toThrow("Owned service case is closing.");
+    expect(opened).toBe(false);
+  });
+
+  test("joins a late case failure and tries every service close before retaining unproved storage", async () => {
+    const teardowns: Array<() => Promise<void>> = [];
+    const entered = Promise.withResolvers<undefined>();
+    const release = Promise.withResolvers<undefined>();
+    const caseFailure = new Error("late service case failure");
+    const closeFailure = new Error("service close failure");
+    const events: string[] = [];
+    const task = ownedServiceCase(async ({ resources }) => {
+      resources.services.push({ close: async () => { events.push("close-first"); throw closeFailure; } });
+      entered.resolve(undefined);
+      await release.promise;
+      resources.services.push({ close: async () => { events.push("close-late"); } });
+      resources.stores.push({ close: () => { events.push("close-store"); } });
+      events.push("raw-failed");
+      throw caseFailure;
+    }, teardowns);
+    await entered.promise;
+    const closing = teardowns[0]?.().catch((error: unknown) => error);
+    await Promise.resolve();
+    expect(events).toEqual([]);
+    release.resolve(undefined);
+    const error = await closing;
+    expect(error).toBeInstanceOf(AggregateError);
+    if (!(error instanceof AggregateError)) throw new Error("Expected case and service close failures.");
+    expect(error.errors).toEqual([caseFailure, closeFailure]);
+    await expect(task).rejects.toBe(caseFailure);
+    expect(events).toEqual(["raw-failed", "close-first", "close-late"]);
+  });
+
+  test("closes stores only after the raw case and every service have joined", async () => {
+    const teardowns: Array<() => Promise<void>> = [];
+    const entered = Promise.withResolvers<undefined>();
+    const release = Promise.withResolvers<undefined>();
+    const events: string[] = [];
+    const task = ownedServiceCase(async ({ resources }) => {
+      resources.services.push({ close: async () => { events.push("close-service"); } });
+      entered.resolve(undefined);
+      await release.promise;
+      resources.stores.push({ close: () => { events.push("close-store"); } });
+      events.push("raw-joined");
+    }, teardowns);
+    await entered.promise;
+    const closing = teardowns[0]?.();
+    await Promise.resolve();
+    expect(events).toEqual([]);
+    release.resolve(undefined);
+    await closing;
+    await expect(task).rejects.toThrow("Owned service case is closing.");
+    expect(events).toEqual(["raw-joined", "close-service", "close-store"]);
+  });
+});
+
 // These cases migrate a FULL-WAL database, create account/project authority,
 // and exercise multiple persisted Claude transitions with fake providers.
 // Allow 15 s for that outer integration work; provider deadlines stay intact.
@@ -1830,10 +1976,11 @@ async function adoptedCodexFixture(
   label: string,
   providerThreadId: string,
   factsMemory?: HraFactsMemoryLifecyclePort,
+  createFixture: ServiceFixtureFactory = fixture,
 ) {
   const personalCodex = new FakeCodex();
   const discovery = new FakePersonalSessionDiscovery();
-  const value = await fixture(
+  const value = await createFixture(
     undefined,
     new FakeCloud(),
     () => undefined,
@@ -1846,18 +1993,10 @@ async function adoptedCodexFixture(
       personalDiscovery: discovery,
     },
   );
-  const added = await value.service.execute(
-    { kind: "account.add", label },
-    { signal },
-  ) as { account: { id: `acct_${string}` } };
-  await value.service.execute(
-    { kind: "account.login", account: added.account.id, deviceCode: false },
-    { signal },
-  );
-  await value.service.execute(
-    { kind: "project.add", label: `${label} project`, path: value.documents },
-    { signal },
-  );
+  const execute = value.execute ?? ((command: LocalCommand) => value.service.execute(command, { signal }));
+  const added = await execute({ kind: "account.add", label }) as { account: { id: `acct_${string}` } };
+  await execute({ kind: "account.login", account: added.account.id, deviceCode: false });
+  await execute({ kind: "project.add", label: `${label} project`, path: value.documents });
   personalCodex.readProjection = {
     providerThreadId,
     title: `${label} personal thread`,
@@ -1874,12 +2013,12 @@ async function adoptedCodexFixture(
     updatedAt: personalAdoptionNow - 11 * 60_000,
     liveness: "not_live",
   }];
-  const enabled = await value.service.execute({
+  const enabled = await execute({
     kind: "session.adoption.set",
     provider: "codex",
     enabled: true,
     account: added.account.id,
-  }, { signal });
+  });
   const session = value.store.findSessionByProviderThread(
     added.account.id,
     providerThreadId,
@@ -1981,6 +2120,7 @@ async function adoptedClaudeFixture(
   signInCodex = true,
   now: () => number = () => personalAdoptionNow,
   memory?: HraMemoryPort,
+  createFixture: ServiceFixtureFactory = fixture,
 ) {
   const personalIdentity: ClaudeProcessIdentity = {
     pid: 63_001,
@@ -1994,7 +2134,7 @@ async function adoptedClaudeFixture(
   });
   const personalClaude = new FakeClaude("personal", personalIdentity);
   const discovery = new FakePersonalSessionDiscovery();
-  const value = await fixture(
+  const value = await createFixture(
     undefined,
     new FakeCloud(),
     () => undefined,
@@ -2010,20 +2150,12 @@ async function adoptedClaudeFixture(
     },
     platform,
   );
-  const added = await value.service.execute(
-    { kind: "account.add", label },
-    { signal },
-  ) as { account: { id: `acct_${string}` } };
+  const execute = value.execute ?? ((command: LocalCommand) => value.service.execute(command, { signal }));
+  const added = await execute({ kind: "account.add", label }) as { account: { id: `acct_${string}` } };
   if (signInCodex) {
-    await value.service.execute(
-      { kind: "account.login", account: added.account.id, deviceCode: false },
-      { signal },
-    );
+    await execute({ kind: "account.login", account: added.account.id, deviceCode: false });
   }
-  await value.service.execute(
-    { kind: "project.add", label: `${label} project`, path: value.documents },
-    { signal },
-  );
+  await execute({ kind: "project.add", label: `${label} project`, path: value.documents });
   personalClaude.projection = {
     providerThreadId,
     title,
@@ -2040,12 +2172,12 @@ async function adoptedClaudeFixture(
     updatedAt: personalAdoptionNow - 1_000,
     liveness: "not_live",
   }];
-  const enabled = await value.service.execute({
+  const enabled = await execute({
     kind: "session.adoption.set",
     provider: "claude",
     enabled: true,
     account: added.account.id,
-  }, { signal });
+  });
   const session = value.store.findSessionByProviderThread(
     added.account.id,
     providerThreadId,
@@ -2131,6 +2263,7 @@ async function nativeClaudeFixture(
 async function claudeAccountFixture(
   initiallySignedIn = false,
   platform: NodeJS.Platform = "linux",
+  createFixture: ServiceFixtureFactory = fixture,
 ) {
   let signedIn = initiallySignedIn;
   let readError: Error | undefined;
@@ -2207,7 +2340,7 @@ async function claudeAccountFixture(
     pinnedVersion: () => CLAUDE_PIN,
     close: async () => undefined,
   };
-  const value = await fixture(
+  const value = await createFixture(
     undefined,
     new FakeCloud(),
     () => undefined,
@@ -7358,7 +7491,7 @@ describe("HraService personal-session adoption", () => {
     expect(value.store.findSessionByProviderThread(value.accountId, providerThreadId)).toBeNull();
   });
 
-  test("keeps account-authority failures source-neutral for native and adopted controllers", async () => {
+  describe("keeps account-authority failures source-neutral for native and adopted controllers", () => {
     const shape = (error: unknown) => {
       const failure = error as CommandFailure;
       return { code: failure.code, message: failure.message, details: failure.details };
@@ -7369,113 +7502,129 @@ describe("HraService personal-session adoption", () => {
       return { ...failure, details: { ...details, accountId: "<account>" } };
     };
 
-    const adopted = await adoptedCodexFixture(
-      "Source-neutral adopted authority",
-      "source-neutral-adopted-codex",
-    );
-    const adoptedAuthority = adopted.personalCodex.claimRequests[0]?.authority;
-    if (adoptedAuthority === undefined) throw new Error("Expected adopted authority.");
-    const replacementAccount = {
-      signedIn: true as const,
-      email: "replacement-source-neutral@example.com",
-      plan: "Plus",
-    };
-    const adoptedMismatch = await adopted.service.observePersonalCodexAccount(
-      adoptedAuthority,
-      replacementAccount,
-    ).catch((error: unknown) => error);
-
-    const native = await fixture();
-    const { sessionId } = await createIdleSession(native, "Source-neutral native authority");
-    const nativeProfile = native.store.requireProfileById(
-      native.store.requireSession(sessionId).profileId,
-    );
-    const nativePaths = profilePaths(native.paths, nativeProfile.id);
-    const nativeMismatch = await native.service.observeCodexAccount({
-      ...liveAuthorityFor(native.store, nativeProfile.id),
-      codexHome: nativePaths.codexHome,
-      desktopUserData: nativePaths.desktopUserData,
-    }, replacementAccount).catch((error: unknown) => error);
-    await Promise.all([adopted.service.settled(), native.service.settled()]);
-
-    expect(adoptedMismatch).toBeInstanceOf(CommandFailure);
-    expect(nativeMismatch).toBeInstanceOf(CommandFailure);
-    expect(withoutAccountIdentity(adoptedMismatch)).toEqual(
-      withoutAccountIdentity(nativeMismatch),
-    );
-    expect(withoutAccountIdentity(adoptedMismatch)).toEqual({
-      code: "RECOVERY_REQUIRED",
-      message: "The provider account changed. HRA refused stale controller authority and is releasing the affected sessions.",
-      details: { accountId: "<account>", provider: "codex" },
-    });
-
-    const pending = await adoptedClaudeFixture(
-      "Source-neutral pending authority",
-      "source-neutral-pending-adopted-claude",
-    );
-    pending.managedClaude.projection = {
-      providerThreadId: "source-neutral-pending-native-claude",
-      title: "Source-neutral pending native Claude",
-      status: "idle",
-      projectRoot: pending.documents,
-      providerUpdatedAt: personalAdoptionNow,
-    };
-    await pending.service.execute({
-      kind: "session.start",
-      account: pending.accountId,
-      provider: "claude",
-      preset: "fable-max",
-      fast: false,
-    }, { signal });
-    const pendingProfile = pending.store.requireProfileById(pending.accountId);
-    const direct = new Database(pending.paths.database, { create: false, strict: true });
-    try {
-      for (const runtimeScope of ["personal", "managed"] as const) {
-        direct.query(
-          `INSERT INTO provider_runtime_account_revocations(
-             profile_id,profile_generation,provider,runtime_scope,current_account_key,
-             state,revision,created_at,updated_at,completed_at
-           ) VALUES (?,?,'claude',?,?, 'releasing',1,?,?,NULL)`,
-        ).run(
-          pendingProfile.id,
-          pendingProfile.processGeneration,
-          runtimeScope,
-          claudeProviderAccountKey(),
-          personalAdoptionNow,
-          personalAdoptionNow,
-        );
+    const expectPrivateDetailsAbsent = (failures: readonly unknown[]) => {
+      for (const failure of failures) {
+        const serialized = JSON.stringify(shape(failure)).toLowerCase();
+        expect(serialized).not.toContain("personal");
+        expect(serialized).not.toContain("managed");
+        expect(serialized).not.toContain("runtimescope");
+        expect(serialized).not.toContain("home");
       }
-    } finally {
-      direct.close();
-    }
+    };
 
-    const adoptedPending = await pending.service.discoverPersonalSessions(
-      "claude",
-      signal,
-    ).catch((error: unknown) => error);
-    const nativePending = await pending.service.execute({
-      kind: "session.start",
-      account: pending.accountId,
-      provider: "claude",
-      preset: "fable-max",
-      fast: false,
-    }, { signal }).catch((error: unknown) => error);
-    expect(adoptedPending).toBeInstanceOf(CommandFailure);
-    expect(nativePending).toBeInstanceOf(CommandFailure);
-    expect(shape(adoptedPending)).toEqual(shape(nativePending));
-    expect(shape(adoptedPending)).toEqual({
-      code: "RECOVERY_REQUIRED",
-      message: "The provider account authority is being released.",
-      details: { accountId: pending.accountId, provider: "claude" },
-    });
+    test("Codex account mismatch retains the paired controller comparison", () => ownedServiceCase(async ({ createFixture, signal }) => {
+      const adopted = await adoptedCodexFixture(
+        "Source-neutral adopted authority",
+        "source-neutral-adopted-codex",
+        undefined,
+        createFixture,
+      );
+      signal.throwIfAborted();
+      const adoptedAuthority = adopted.personalCodex.claimRequests[0]?.authority;
+      if (adoptedAuthority === undefined) throw new Error("Expected adopted authority.");
+      const replacementAccount = {
+        signedIn: true as const,
+        email: "replacement-source-neutral@example.com",
+        plan: "Plus",
+      };
+      const adoptedMismatch = await adopted.service.observePersonalCodexAccount(
+        adoptedAuthority,
+        replacementAccount,
+      ).catch((error: unknown) => error);
 
-    for (const failure of [adoptedMismatch, nativeMismatch, adoptedPending, nativePending]) {
-      const serialized = JSON.stringify(shape(failure)).toLowerCase();
-      expect(serialized).not.toContain("personal");
-      expect(serialized).not.toContain("managed");
-      expect(serialized).not.toContain("runtimescope");
-      expect(serialized).not.toContain("home");
-    }
+      const native = await createFixture();
+      signal.throwIfAborted();
+      const { sessionId } = await createIdleSession(native, "Source-neutral native authority");
+      signal.throwIfAborted();
+      const nativeProfile = native.store.requireProfileById(
+        native.store.requireSession(sessionId).profileId,
+      );
+      const nativePaths = profilePaths(native.paths, nativeProfile.id);
+      const nativeMismatch = await native.service.observeCodexAccount({
+        ...liveAuthorityFor(native.store, nativeProfile.id),
+        codexHome: nativePaths.codexHome,
+        desktopUserData: nativePaths.desktopUserData,
+      }, replacementAccount).catch((error: unknown) => error);
+      await Promise.all([adopted.service.settled(), native.service.settled()]);
+
+      expect(adoptedMismatch).toBeInstanceOf(CommandFailure);
+      expect(nativeMismatch).toBeInstanceOf(CommandFailure);
+      expect(withoutAccountIdentity(adoptedMismatch)).toEqual(
+        withoutAccountIdentity(nativeMismatch),
+      );
+      expect(withoutAccountIdentity(adoptedMismatch)).toEqual({
+        code: "RECOVERY_REQUIRED",
+        message: "The provider account changed. HRA refused stale controller authority and is releasing the affected sessions.",
+        details: { accountId: "<account>", provider: "codex" },
+      });
+      expectPrivateDetailsAbsent([adoptedMismatch, nativeMismatch]);
+    }));
+
+    test("Claude pending release retains the paired controller comparison", () => ownedServiceCase(async ({ createFixture, signal }) => {
+      const pending = await adoptedClaudeFixture(
+        "Source-neutral pending authority",
+        "source-neutral-pending-adopted-claude",
+        undefined, undefined, "linux", true, () => personalAdoptionNow, undefined,
+        createFixture,
+      );
+      signal.throwIfAborted();
+      pending.managedClaude.projection = {
+        providerThreadId: "source-neutral-pending-native-claude",
+        title: "Source-neutral pending native Claude",
+        status: "idle",
+        projectRoot: pending.documents,
+        providerUpdatedAt: personalAdoptionNow,
+      };
+      await pending.service.execute({
+        kind: "session.start",
+        account: pending.accountId,
+        provider: "claude",
+        preset: "fable-max",
+        fast: false,
+      }, { signal });
+      const pendingProfile = pending.store.requireProfileById(pending.accountId);
+      const direct = new Database(pending.paths.database, { create: false, strict: true });
+      try {
+        for (const runtimeScope of ["personal", "managed"] as const) {
+          direct.query(
+            `INSERT INTO provider_runtime_account_revocations(
+               profile_id,profile_generation,provider,runtime_scope,current_account_key,
+               state,revision,created_at,updated_at,completed_at
+             ) VALUES (?,?,'claude',?,?, 'releasing',1,?,?,NULL)`,
+          ).run(
+            pendingProfile.id,
+            pendingProfile.processGeneration,
+            runtimeScope,
+            claudeProviderAccountKey(),
+            personalAdoptionNow,
+            personalAdoptionNow,
+          );
+        }
+      } finally {
+        direct.close();
+      }
+
+      const adoptedPending = await pending.service.discoverPersonalSessions(
+        "claude",
+        signal,
+      ).catch((error: unknown) => error);
+      const nativePending = await pending.service.execute({
+        kind: "session.start",
+        account: pending.accountId,
+        provider: "claude",
+        preset: "fable-max",
+        fast: false,
+      }, { signal }).catch((error: unknown) => error);
+      expect(adoptedPending).toBeInstanceOf(CommandFailure);
+      expect(nativePending).toBeInstanceOf(CommandFailure);
+      expect(shape(adoptedPending)).toEqual(shape(nativePending));
+      expect(shape(adoptedPending)).toEqual({
+        code: "RECOVERY_REQUIRED",
+        message: "The provider account authority is being released.",
+        details: { accountId: pending.accountId, provider: "claude" },
+      });
+      expectPrivateDetailsAbsent([adoptedPending, nativePending]);
+    }));
   });
 
   test("routes an adopted Claude session on Darwin only through personal custody", async () => {
@@ -13675,9 +13824,11 @@ describe("HraService", () => {
     });
   });
 
-  test("refuses historical Claude login recovery without its exact immutable authority", async () => {
-    for (const corruption of ["missing", "binding", "provenance"] as const) {
-      const value = await claudeAccountFixture();
+  test.each(["missing", "binding", "provenance"] as const)(
+    "refuses historical Claude login recovery without its exact immutable authority (%s)",
+    (corruption) => ownedServiceCase(async ({ createFixture, signal }) => {
+      const value = await claudeAccountFixture(false, "linux", createFixture);
+      signal.throwIfAborted();
       const added = await value.service.execute(
         { kind: "account.add", label: "Claude immutable login" },
         { signal },
@@ -13733,8 +13884,8 @@ describe("HraService", () => {
         });
       }
       expect(readAuthorities(prepared.login.attemptId)).toEqual(captured);
-    }
-  });
+    }),
+  );
 
   test("abandons only one exact unsettled Claude fence after explicit child-exit acknowledgement", async () => {
     const value = await claudeAccountFixture();
@@ -21169,9 +21320,11 @@ describe("HraService", () => {
     });
   });
 
-  test("retries bounded pre-evidence baseline and capability failures without replaying a provider effect", async () => {
-    for (const failure of ["baseline", "capability"] as const) {
-      const { service, codex, documents, store } = await fixture();
+  test.each(["baseline", "capability"] as const)(
+    "retries bounded pre-evidence baseline and capability failures without replaying a provider effect (%s)",
+    (failure) => ownedServiceCase(async ({ createFixture, signal }) => {
+      const { service, codex, documents, store } = await createFixture();
+      signal.throwIfAborted();
       const added = await service.execute({ kind: "account.add", label: `Transient ${failure}` }, { signal }) as { account: { id: string } };
       await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
       await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
@@ -21186,8 +21339,8 @@ describe("HraService", () => {
       expect(store.readQueueEffect(queued.queued.id)).toMatchObject({ evidence: { queueId: queued.queued.id } });
       expect(codex.calls.filter((call) => call === "send")).toHaveLength(1);
       expect(codex.maximumConcurrentStartTurns).toBe(1);
-    }
-  });
+    }),
+  );
 
   describe("maps bounded Codex failures to phase-specific safe guidance before dispatch", () => {
     const failures = [

@@ -5,10 +5,14 @@ import { readFileSync } from "node:fs";
 
 import fc from "fast-check";
 
+import { ATTACHMENT_CUSTODY_SCHEMA_OBJECTS } from "./attachment-custody";
+import { ATTACHMENT_CUSTODY_COLUMNS } from "./attachment-custody-schema";
 import { applyEffectEvidenceProvenance, readMutationEffectEvidenceProvenance, readQueueEffectEvidenceProvenance } from "./effect-evidence-provenance";
 import { mutationEvidenceCanonical49Schema, queueEvidenceCanonicalSchema } from "./historical-effect-evidence-codecs";
 import { applyJoinedEvidenceGuards, auditJoinedEvidenceGuards, JOINED_EVIDENCE_GUARDS, JOINED_EVIDENCE_PREDECESSOR_GUARDS } from "./joined-evidence-guards";
+import { QUEUE_ATTACHMENT_SCHEMA_OBJECTS } from "./queue-attachment-identity";
 import { normalizeSchemaSql } from "./schema-cohort";
+import { SESSION_SEND_OWNER_SCHEMA_OBJECTS, SESSION_SEND_REQUEST_FORMAT } from "./session-send-owner";
 
 const databases: Database[] = [];
 afterEach(() => { for (const db of databases.splice(0)) db.close(); });
@@ -20,9 +24,12 @@ const epoch = "00000000-0000-4000-8000-000000000002";
 const failure = "JOINED_EVIDENCE_BOUNDARY_REFUSED";
 const source = readFileSync(new URL("./state-store.ts", import.meta.url), "utf8");
 // Execute actual frozen target/evidence/authority table DDL and original guards
-// without importing StateStore. Unrelated dependencies below are declared
-// minimal projections. This is neither a complete migration nor an archived
-// producer capture. Values are synthetic; provenance uses the real codec/hash.
+// without importing StateStore. The cancellation alternative also needs the
+// real owner/custody/queue artifact tables, even for a non-cancellation row:
+// SQLite resolves its whole predicate before selecting a cleanup proof.
+// Unrelated dependencies below are declared minimal projections. This is neither
+// a complete migration nor an archived producer capture. Values are synthetic;
+// provenance uses the real codec/hash.
 function table(name: string): string {
   const start = source.indexOf(`CREATE TABLE IF NOT EXISTS ${name} (`);
   if (start < 0) throw new Error(`missing real table ${name}`);
@@ -38,6 +45,12 @@ function trigger(name: string): string {
   if (!match) throw new Error(`missing real trigger ${name}`);
   return match[0];
 }
+const cancellationArtifactTables = [
+  "session_send_owners", "session_send_execution_claims", "session_send_owner_outcomes", "session_send_owner_anchors",
+  "attachment_custody_sets", "attachment_custody_anchors", "attachment_custody_dispositions", "attachment_legacy_cleanup_blockers",
+  "queue_attachment_identities", "queue_attachment_identity_anchors",
+] as const;
+const artifactSchemaObjects = [...SESSION_SEND_OWNER_SCHEMA_OBJECTS, ...ATTACHMENT_CUSTODY_SCHEMA_OBJECTS, ...QUEUE_ATTACHMENT_SCHEMA_OBJECTS];
 const runtime = { profileId: profile, processGeneration: 1, observedAt: 100, preset: "high",
   model: "gpt-5.6-sol", reasoningEffort: "max", serviceTier: null, fast: false, approvalPolicy: "on-request",
   reviewMode: "auto_review", permissionProfile: ":workspace", computerUse: true, pluginCapability: true, enabledApps: [] };
@@ -50,7 +63,6 @@ function fixture(options: { kind?: Kind; actor?: "human" | "peer_session"; forma
     CREATE TABLE profiles(id TEXT PRIMARY KEY,state TEXT,process_generation INTEGER) STRICT;
     CREATE TABLE provider_accounts(id TEXT PRIMARY KEY,profile_id TEXT,provider TEXT,binding_generation INTEGER,process_generation INTEGER,readiness TEXT) STRICT;
     CREATE TABLE sessions(id TEXT PRIMARY KEY,profile_id TEXT,provider_v39 TEXT,provider_thread_id TEXT,title TEXT,provider_updated_at INTEGER,active_turn_id TEXT) STRICT;
-    CREATE TABLE mutation_attempts(id TEXT PRIMARY KEY,idempotency_key TEXT UNIQUE,kind TEXT,authority_id TEXT,authority_generation INTEGER,state TEXT,result_json TEXT,transcript_intent_json TEXT,transcript_status TEXT) STRICT;
     CREATE TABLE queue_entries(id TEXT PRIMARY KEY,session_id TEXT,state TEXT,transcript_intent_json TEXT,transcript_status TEXT,message_actor TEXT) STRICT;
     CREATE TABLE autorespond_message_sources(session_id TEXT,source_id TEXT) STRICT;
     CREATE TABLE peer_session_actions(id TEXT PRIMARY KEY,idempotency_key TEXT,target_session_id TEXT,delivery TEXT) STRICT;
@@ -58,10 +70,25 @@ function fixture(options: { kind?: Kind; actor?: "human" | "peer_session"; forma
     CREATE TABLE interaction_provider_authorities(public_id TEXT,provider_account_id TEXT,profile_id TEXT,provider TEXT,binding_generation INTEGER,process_generation INTEGER) STRICT;
     CREATE TABLE session_runtime_profiles(session_id TEXT,revision INTEGER,source_kind TEXT,source_id TEXT,profile_id TEXT,process_generation INTEGER,profile_json TEXT,PRIMARY KEY(session_id,revision)) STRICT;
     CREATE TABLE session_turn_runtime_profiles(session_id TEXT,turn_id TEXT,source_kind TEXT,source_id TEXT,profile_json TEXT) STRICT;`);
-  for (const name of ["mutation_effect_evidence", "queue_effect_evidence", "mutation_resolutions", "queue_effect_resolutions",
+  for (const name of ["mutation_attempts", "mutation_effect_evidence", "queue_effect_evidence", "mutation_resolutions", "queue_effect_resolutions",
     "session_provider_authorities", "mutation_provider_authorities", "queue_provider_authorities",
     "runtime_profile_provider_authorities", "session_event_streams", "session_events", "session_event_provider_authorities",
     "session_message_event_sources", "peer_session_direct_message_sources", "session_provider_authority_successors"]) db.exec(table(name));
+  // Actual additive transcript and request-format declarations, plus the
+  // exported custody declarations. Leave all optional custody values absent;
+  // this fixture does not fabricate an owned send or a cancellation receipt.
+  for (const column of [
+    "transcript_finalized INTEGER NOT NULL DEFAULT 0 CHECK(transcript_finalized IN (0,1))",
+    "transcript_status TEXT NOT NULL DEFAULT 'none' CHECK(transcript_status IN ('none','pending','finalized','unavailable','abandoned'))",
+    "transcript_intent_json TEXT CHECK(transcript_intent_json IS NULL OR (json_valid(transcript_intent_json) AND length(CAST(transcript_intent_json AS BLOB))<=65536))",
+    `request_format TEXT CHECK(request_format IS NULL OR request_format='${SESSION_SEND_REQUEST_FORMAT}')`,
+    ...ATTACHMENT_CUSTODY_COLUMNS,
+  ]) db.exec(`ALTER TABLE mutation_attempts ADD COLUMN ${column}`);
+  for (const name of cancellationArtifactTables) {
+    const object = artifactSchemaObjects.find((candidate) => candidate.type === "table" && candidate.name === name);
+    if (object === undefined) throw new Error(`missing real cancellation artifact table ${name}`);
+    db.exec(object.sql);
+  }
   db.exec("ALTER TABLE session_events ADD COLUMN projection_version INTEGER NOT NULL DEFAULT 2");
   for (const old of JOINED_EVIDENCE_PREDECESSOR_GUARDS) db.exec(old.sql);
   for (const name of ["peer_session_direct_message_source_delete_guard", "session_message_event_source_insert_guard",
@@ -84,7 +111,9 @@ function fixture(options: { kind?: Kind; actor?: "human" | "peer_session"; forma
     db.query("INSERT INTO queue_effect_evidence VALUES(?,?,?,100)").run(queue, raw, options.badDigest ? "0".repeat(64) : hash(raw));
     db.query("INSERT INTO queue_provider_authorities VALUES(?,?,?,'codex',1,1,'queue_prepare',100)").run(queue, profile, profile);
   } else {
-    db.query("INSERT INTO mutation_attempts VALUES(?,?,?, ?,1,'applied',?,?,'pending')").run(attempt, key, `session.${kind}`, session,
+    db.query(`INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,
+      state,result_json,created_at,updated_at,transcript_intent_json,transcript_status)
+      VALUES(?,?,?, ?,1,?,'applied',?,100,100,?,'pending')`).run(attempt, key, `session.${kind}`, session, hash("request"),
       JSON.stringify(kind === "steer" ? { activeTurnId: "raw-turn" } : { turnId: "raw-turn" }), intent);
     const evidence = kind === "send" ? { kind: "session.send", providerThreadId: "native-thread", baseline,
       clientMessageId: attempt, messageDigest: hash("synthetic message"), runtimeProfile: runtime, messageActor: actor }
@@ -223,7 +252,10 @@ describe("joined source-selected SQL evidence boundaries", () => {
       expect(readMutationEffectEvidenceProvenance(f.db, attempt).kind).toBe("opaque");
       applyJoinedEvidenceGuards(f.db);
     }
-    expect(() => f.db.query("DELETE FROM peer_session_direct_message_sources WHERE idempotency_key=?").run(key)).not.toThrow();
+    const before = snapshot(f.db);
+    expect(f.db.query("DELETE FROM peer_session_direct_message_sources WHERE idempotency_key=?").run(key).changes).toBe(1);
+    expect(snapshot(f.db)).toEqual({ ...before, rows: before.rows.map((table) => table.name === "peer_session_direct_message_sources"
+      ? { ...table, rows: [] } : table) });
   });
 
   test.each(["send", "queue"] as const)("source marker cannot use opaque %s evidence despite matching current scalar/event tuple", (kind) => {

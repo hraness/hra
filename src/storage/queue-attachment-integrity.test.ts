@@ -161,14 +161,20 @@ describe("queue attachment durable integrity", () => {
     // absent owned table is corruption, not permission to repair a legacy DB.
     f.database.exec("PRAGMA foreign_keys=OFF; DROP TABLE queue_attachment_identities");
     const before = f.database.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY name").all();
+    const tables = f.database.query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all() as { name: string }[];
+    const retainedRows = () => tables.map(({ name }) => ({ name,
+      rows: f.database.query(`SELECT * FROM "${name.replaceAll('"', '""')}"`).all() }));
+    const rowsBefore = retainedRows();
     expect(() => f.store.prepareMutation({ kind: "session.rename", authorityId: f.session.id, authorityGeneration: f.authority.processGeneration,
       request: {}, idempotencyKey: f.input.idempotencyKey })).toThrow();
     f.close();
-    // Dropping the table also deletes its independently audited retired-provider
-    // guard. Both open modes must refuse that first schema boundary unchanged.
+    // Dropping the table also deletes its independently audited peer-cancellation
+    // guard. Joined canonical admission checks that boundary before the later
+    // retired-provider audit. Both open modes must preserve every surviving row.
     for (const readonly of [false, true]) {
-      expect(() => { f.reopen(readonly); }).toThrow("RETIRED_PROVIDER_ADMISSION_SCHEMA_INVALID");
+      expect(() => { f.reopen(readonly); }).toThrow("PEER_SESSION_CANCELLATION_UNPROVEN");
       expect(f.database.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY name").all()).toEqual(before);
+      expect(retainedRows()).toEqual(rowsBefore);
     }
     expect(f.database.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
   });
