@@ -9,7 +9,7 @@ import { renderPreviewHtml, renderPrivacyHtml, renderSiteHtml } from "./template
 
 describe("public appearance delivery", () => {
   test("the public compiler owns every native menu atom and its focus and viewport constraints", async () => {
-    const path = fileURLToPath(new URL("./appearance-menu.stylex.ts", import.meta.url));
+    const path = fileURLToPath(new URL("../app/src/components/appearance-menu.stylex.ts", import.meta.url));
     const collector = createStylexTransformCollector(fileURLToPath(new URL("..", import.meta.url)));
     const compiled = await collector.transform(await readFile(path, "utf8"), path);
     const css = compiled.rules.map(([, rule]) => rule.ltr).join("\n");

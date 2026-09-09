@@ -778,6 +778,50 @@ export function assertNativeModalFocus(value: unknown): void {
     `Native modal allowed focus on background content: ${JSON.stringify(sample)}`);
 }
 
+/** The fixture's offset ring is visible below the primary button. Its own
+ * Highlight fill is not the paint adjacent to that exposed outline strip. */
+export function assertKeyboardFocusStrip(value: unknown, forced: boolean): void {
+  const sample = record(value);
+  assert.equal(sample.focusVisible, true, "Keyboard focus did not reach Open sheet");
+  assert.equal(sample.forced, forced, "Focus verification lost its native media mode");
+  assert.equal(sample.outline, "solid", "Keyboard focus ring is not visible");
+  assert.ok(typeof sample.width === "number" && Number.isFinite(sample.width) && sample.width >= 2, "Keyboard focus ring is not visible");
+  assert.ok(typeof sample.offset === "number" && Number.isFinite(sample.offset) && sample.offset >= 2, "Focus ring lost its separation from the button fill");
+  if (!forced) return;
+  assert.equal(sample.exposed, true, "The sampled bottom focus strip is clipped or covered");
+
+  type Color = readonly [number, number, number, number];
+  const color = (value: unknown): Color => {
+    assert.ok(typeof value === "string" && value.length <= 100, "Missing computed focus color");
+    const match = /^rgb(a?)\((\d+(?:\.\d+)?), (\d+(?:\.\d+)?), (\d+(?:\.\d+)?)(?:, (\d+(?:\.\d+)?))?\)$/u.exec(value);
+    assert.ok(match !== null && (match[1] === "a") === (match[5] !== undefined), "Unsupported computed focus color");
+    const channels: Color = [Number(match[2]), Number(match[3]), Number(match[4]), Number(match[5] ?? 1)];
+    assert.ok(channels.every(Number.isFinite) && channels.slice(0, 3).every((channel) => channel >= 0 && channel <= 255)
+      && channels[3] >= 0 && channels[3] <= 1, "Invalid computed focus color");
+    return channels;
+  };
+  const over = (foreground: Color, background: Color): Color => [
+    foreground[0] * foreground[3] + background[0] * (1 - foreground[3]),
+    foreground[1] * foreground[3] + background[1] * (1 - foreground[3]),
+    foreground[2] * foreground[3] + background[2] * (1 - foreground[3]), 1,
+  ];
+  assert.ok(Array.isArray(sample.backgrounds) && sample.backgrounds.length > 0 && sample.backgrounds.length <= 16,
+    "Focus strip has no bounded surrounding surface");
+  const backgrounds = sample.backgrounds.map(color);
+  let surface = backgrounds.pop();
+  assert.ok(surface !== undefined && surface[3] === 1, "Focus strip has no opaque background");
+  for (const background of backgrounds.reverse()) surface = over(background, surface);
+  const luminance = (value: Color): number => value.slice(0, 3).reduce((sum, channel, index) => {
+    const normalized = channel / 255;
+    return sum + (normalized <= 0.04045 ? normalized / 12.92 : ((normalized + 0.055) / 1.055) ** 2.4)
+      * ([0.2126, 0.7152, 0.0722][index] ?? 0);
+  }, 0);
+  const ringLuminance = luminance(over(color(sample.color), surface));
+  const surfaceLuminance = luminance(surface);
+  const contrast = (Math.max(ringLuminance, surfaceLuminance) + 0.05) / (Math.min(ringLuminance, surfaceLuminance) + 0.05);
+  assert.ok(contrast >= 3, `Forced-color focus strip lost contrast (${contrast.toFixed(2)}:1)`);
+}
+
 async function primitives(page: Page, profile: Profile, reportNegative: NegativeStylesheetReporter, boundary: RestorationBoundary): Promise<void> {
   const open = page.getByRole("button", { name: "Open dialog", exact: true });
   await styled(open, "card-content");
@@ -859,13 +903,30 @@ async function primitives(page: Page, profile: Profile, reportNegative: Negative
   await menu.waitFor({ state: "hidden" });
   await open.focus();
   await page.keyboard.press("Tab");
-  const focused = await page.locator(":focus").evaluate((element) => {
+  const focused = await page.getByRole("button", { name: "Open sheet", exact: true }).evaluate((element) => {
     const css = getComputedStyle(element);
-    return { outline: css.outlineStyle, width: Number.parseFloat(css.outlineWidth), color: css.outlineColor, background: css.backgroundColor };
+    const box = element.getBoundingClientRect();
+    const width = Number.parseFloat(css.outlineWidth);
+    const offset = Number.parseFloat(css.outlineOffset);
+    // Side strips can meet the fixture's adjacent buttons. Prove this exposed
+    // bottom strip instead, using actual hit testing and its ancestor paint.
+    const points = [0.25, 0.5, 0.75].map((fraction) => ({ x: box.left + box.width * fraction, y: box.bottom + offset + width / 2 }));
+    let exposed = css.opacity === "1"
+      && points.every(({ x, y }) => document.elementFromPoint(x, y) === element.parentElement);
+    const backgrounds: string[] = [];
+    for (let ancestor = element.parentElement; ancestor !== null; ancestor = ancestor.parentElement) {
+      if (backgrounds.length === 16) { exposed = false; break; }
+      const paint = getComputedStyle(ancestor);
+      const bounds = ancestor.getBoundingClientRect();
+      exposed &&= paint.backgroundImage === "none" && paint.opacity === "1"
+        && points.every(({ x, y }) => x >= bounds.left && x < bounds.right && y - width / 2 >= bounds.top && y + width / 2 < bounds.bottom);
+      backgrounds.push(paint.backgroundColor);
+    }
+    return { outline: css.outlineStyle, width, offset, color: css.outlineColor, backgrounds, exposed,
+      focusVisible: document.activeElement === element && element.matches(":focus-visible"),
+      forced: matchMedia("(forced-colors: active)").matches };
   });
-  assert.notEqual(focused.outline, "none");
-  assert.ok(focused.width >= 2, "Keyboard focus ring is not visible");
-  if (profile.forced) assert.notEqual(focused.color, focused.background, "Forced-color focus ring lost contrast");
+  assertKeyboardFocusStrip(focused, profile.forced);
   if (profile.reduced) {
     const duration = await open.evaluate((element) => getComputedStyle(element).transitionDuration);
     assert.ok(duration.split(",").every((part) => Number.parseFloat(part) <= 0.01), "Reduced-motion button transition remains active");

@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { assertAppColorScheme, assertDefaultButtonPresentation, assertDefaultPalette, assertNativeModalFocus, assetContentType, assetPath, boundedBrowserOperation, browserExecutableSha256, browserFailureDetails, inventory, loadedStylesheetControl, productionCsp, siteFoundationFontPaths, siteProductionCsp, siteStylesheetPaths, snapshotStaticSite } from "./app-browser";
+import { assertAppColorScheme, assertDefaultButtonPresentation, assertDefaultPalette, assertKeyboardFocusStrip, assertNativeModalFocus, assetContentType, assetPath, boundedBrowserOperation, browserExecutableSha256, browserFailureDetails, inventory, loadedStylesheetControl, productionCsp, siteFoundationFontPaths, siteProductionCsp, siteStylesheetPaths, snapshotStaticSite } from "./app-browser";
 import { browserIoModules } from "../app/fixtures/browser/config";
 
 function staticSiteFixture(sanitized = false) {
@@ -193,6 +193,25 @@ test("default palette assertions retain semantic roles and respect native forced
     expect(() => assertDefaultPalette({ ...sample, [field]: "wrong" }, false)).toThrow();
     if (field !== "background") expect(() => assertDefaultPalette({ ...forced, [field]: "wrong" }, true)).toThrow();
   }
+});
+
+test("offset focus contrast uses the exposed surface and composites native alpha colors", () => {
+  const sample = { focusVisible: true, forced: true, outline: "solid", width: 2, offset: 2, exposed: true,
+    color: "rgba(0, 65, 198, 0.8)", backgrounds: ["rgba(0, 0, 0, 0)", "rgb(255, 255, 255)"] };
+  // The primary fill may equal the outline; only the offset strip's paint is adjacent.
+  expect(() => assertKeyboardFocusStrip({ ...sample, buttonFill: sample.color }, true)).not.toThrow();
+  expect(() => assertKeyboardFocusStrip({ ...sample, backgrounds: ["rgba(255, 255, 255, 0.9)", "rgb(0, 0, 0)"] }, true)).not.toThrow();
+  expect(() => assertKeyboardFocusStrip({ ...sample, color: "rgb(255, 255, 255)" }, true)).toThrow("lost contrast");
+  expect(() => assertKeyboardFocusStrip({ ...sample, color: "rgba(0, 0, 0, 0.1)" }, true)).toThrow("lost contrast");
+  for (const patch of [
+    { focusVisible: false }, { forced: false }, { outline: "none" }, { outline: "hidden" },
+    { width: 1 }, { width: NaN }, { offset: 0 }, { offset: -2 }, { offset: NaN }, { exposed: false },
+    { backgrounds: [] }, { backgrounds: ["rgba(0, 0, 0, 0)"] }, { backgrounds: Array(17).fill("rgb(255, 255, 255)") },
+    { color: "Highlight" }, { color: "rgb(256, 0, 0)" }, { color: "rgba(0, 0, 0, 2)" }, { color: "rgb(NaN, 0, 0)" },
+    { backgrounds: ["url(image)"] },
+  ]) expect(() => assertKeyboardFocusStrip({ ...sample, ...patch }, true)).toThrow();
+  // Other profiles retain the focus contract without assuming this desktop strip.
+  expect(() => assertKeyboardFocusStrip({ ...sample, forced: false, exposed: false }, false)).not.toThrow();
 });
 
 function stylesheetFixture() {

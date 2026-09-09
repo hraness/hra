@@ -1,5 +1,3 @@
-import { DesignPaletteProvider } from "@hraness/design-kit/react";
-import { hraAppearanceStorageKey } from "../../src/appearance";
 import { StrictMode, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { SignInScreen } from "../../src/auth/sign-in-screen";
@@ -73,4 +71,4 @@ function Fixture() {
 
 const container = document.getElementById("root");
 if (container === null) throw new Error("Missing browser fixture root");
-createRoot(container).render(<StrictMode><DesignPaletteProvider legacyStorageKey={null} storageKey={hraAppearanceStorageKey}><Fixture /></DesignPaletteProvider></StrictMode>);
+createRoot(container).render(<StrictMode><Fixture /></StrictMode>);

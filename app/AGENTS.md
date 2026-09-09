@@ -1,7 +1,7 @@
 # Contents
 
 - `index.html` is the only shell. It carries the mobile viewport with `viewport-fit=cover` and one authored module entry. The sealed build adds a same-origin appearance bootstrap before paint.
-- `src/appearance-entry.ts` and `src/appearance.ts` apply shared themes and restrict preference storage to a bounded palette/mode record; the same bootstrap binds the public site controls.
+- `src/appearance-entry.ts` and `src/appearance.ts` apply shared themes and restrict preference storage to a bounded palette/mode record. The bootstrap binds static controls; each mounted app menu owns and releases its controller reference.
 - `vite.config.ts` and the repository's app build script compile the shell with no inlined asset or style. Every compiler foundation precedes one finalized same-origin StyleX recipe stylesheet.
 - `vercel.json` configures the second Vercel project (`app.hra.sh`) with the F1 Content Security Policy and the no-store shell headers.
 - `src/hra/` re-exports the browser-safe repository modules the app is allowed to reach.
@@ -20,6 +20,7 @@
 
 - Import repository source only from `src/cloud/crypto`, `src/cloud/projection`, `src/cloud/payloads`, `src/cloud/contracts`, `src/cloud/client`, and `src/domain/*`, and reach all of them through `app/src/hra/`. The other `src/cloud` modules are node-only and must never enter the bundle.
 - Never write an inline style attribute or a style element. `style-src 'self'` blocks both. Author component-owned presentation in colocated static StyleX recipes, compiled through the public `@hraness/ui/stylex-build` contract with runtime injection disabled. Retain only tokens, resets, and document grammar in `src/index.css`.
+- Reuse the pure native menu and recipe in `src/components/appearance-menu*` for both app and site. Use the public framework-neutral design-kit palette controller; do not import the aggregate shared React barrels into this closed app graph.
 - Compose primitive styles in base, finite variant/size, then caller `xstyle` order; retain ordinary caller classes last. Reject dynamic StyleX output that requires inline styles. Preserve native control semantics, physical safe-area edges, finite state behavior, and reduced-motion and forced-color contracts.
 - Register the complete app graph and its package manifests before building, seal the generated shell, and finalize once. Load `@hraness/design-kit/compiler-palettes.css` (the UI compiler foundation and palette bridge, with no fonts) before product grammar and the finalized recipe asset. Do not mix standalone package recipe stylesheets with compiler-adopter output or claim an unverified development/HMR path.
 - Use `bun run dev:app` for local development on `127.0.0.1:5183`. It serves immutable, fully compiled revisions; refresh the page to select the latest successful revision. It does not hot-replace modules or styles. Keep failed builds off the public route, retain older revisions for in-flight assets, and restart after dependency or configuration changes. Do not widen the production Content Security Policy for development.

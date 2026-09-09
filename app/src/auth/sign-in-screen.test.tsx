@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { DesignPaletteProvider } from "@hraness/design-kit/react";
 
 const requests: unknown[] = [];
 let finishRequest: (() => void) | undefined;
@@ -30,6 +29,8 @@ const originalDescriptors = new Map(
   installedGlobals.map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]),
 );
 let mountedRoot: Root | null = null;
+let selectPrototype: object;
+let selectValue: PropertyDescriptor | undefined;
 
 beforeEach(() => {
   const { document, window } = parseHTML('<!doctype html><html><body><div id="root"></div></body></html>');
@@ -37,6 +38,19 @@ beforeEach(() => {
   for (const name of installedGlobals) {
     globalRecord[name] = name === "window" ? window : name === "document" ? document : windowRecord[name];
   }
+  // Linkedom omits the browser's writable select.value property.
+  selectPrototype = window.HTMLSelectElement.prototype;
+  selectValue = Object.getOwnPropertyDescriptor(selectPrototype, "value");
+  Object.defineProperty(selectPrototype, "value", {
+    configurable: true,
+    get(this: HTMLSelectElement) { return this.querySelector<HTMLOptionElement>("option[selected]")?.value ?? ""; },
+    set(this: HTMLSelectElement, value: string) {
+      for (const option of this.options) {
+        if (option.value === value) option.setAttribute("selected", "");
+        else option.removeAttribute("selected");
+      }
+    },
+  });
   globalRecord.IS_REACT_ACT_ENVIRONMENT = true;
   requests.length = 0;
   finishRequest = undefined;
@@ -48,6 +62,8 @@ afterEach(() => {
     act(() => { mountedRoot?.unmount(); });
     mountedRoot = null;
   }
+  if (selectValue === undefined) Reflect.deleteProperty(selectPrototype, "value");
+  else Object.defineProperty(selectPrototype, "value", selectValue);
   for (const name of installedGlobals) {
     const descriptor = originalDescriptors.get(name);
     if (descriptor === undefined) Reflect.deleteProperty(globalRecord, name);
@@ -61,9 +77,7 @@ async function renderMounted(): Promise<HTMLElement> {
   if (!(container instanceof HTMLElement)) throw new Error("missing test root");
   mountedRoot = createRoot(container);
   await act(async () => { mountedRoot?.render(
-    <DesignPaletteProvider forcedPreference={{ palette: "catppuccin", mode: "dark" }} legacyStorageKey={null}>
-      <SignInScreen />
-    </DesignPaletteProvider>,
+    <SignInScreen />,
   ); });
   return container;
 }

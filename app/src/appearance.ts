@@ -35,14 +35,19 @@ export function initializeHraAppearance(document: Document) {
   });
 }
 
-/** Native public-site controls share the app's controller without inline styles. */
+/** Static controls are bound once after parsing; React owns its mounted menus. */
 export function bindHraAppearanceMenus(
   document: Document,
   controller: ReturnType<typeof initializeHraAppearance>,
+  mountedMenu?: HTMLDetailsElement,
 ): () => void {
   const view = document.defaultView;
   if (view === null) return () => undefined;
-  const menus = [...document.querySelectorAll<HTMLDetailsElement>("details[data-hra-appearance]")];
+  const menus = mountedMenu === undefined
+    ? [...document.querySelectorAll<HTMLDetailsElement>("details[data-hra-appearance]:not([data-hra-managed])")]
+    : [mountedMenu];
+  if (menus.some((menu) => menu.ownerDocument !== document)) throw new Error("Appearance menu belongs to another document.");
+  if (menus.length === 0) return () => undefined;
   const update = (): void => {
     const { preference } = controller.getSnapshot();
     const modeLabel = preference.mode === "system" ? "System" : preference.mode === "dark" ? "Dark" : "Light";
@@ -51,12 +56,13 @@ export function bindHraAppearanceMenus(
       const mode = menu.querySelector<HTMLSelectElement>("select[data-hra-mode]");
       if (palette !== null) palette.value = preference.palette;
       if (mode !== null) mode.value = preference.mode;
-      menu.querySelector("summary")?.setAttribute("aria-label", `Appearance: ${designPaletteLabels[preference.palette]}, ${modeLabel}`);
+      const summary = menu.querySelector("summary");
+      summary?.setAttribute("aria-label", `Appearance: ${designPaletteLabels[preference.palette]}, ${modeLabel}`);
     }
   };
   const onChange = (event: Event): void => {
     const target = event.target;
-    if (!(target instanceof view.HTMLSelectElement)) return;
+    if (!(target instanceof view.HTMLSelectElement) || target.disabled) return;
     if (!menus.some((menu) => menu.contains(target))) return;
     const { preference } = controller.getSnapshot();
     const palette = designPalettes.find((value) => value === target.value);
@@ -71,21 +77,63 @@ export function bindHraAppearanceMenus(
   };
   const onKeyDown = (event: KeyboardEvent): void => {
     if (event.key !== "Escape") return;
+    const target = event.target;
+    if (!(target instanceof view.Node)) return;
     for (const menu of menus) {
-      if (!menu.open) continue;
+      if (!menu.open || !menu.contains(target)) continue;
+      event.preventDefault();
       menu.open = false;
       menu.querySelector("summary")?.focus();
     }
+  };
+  const onFocusOut = (event: FocusEvent): void => {
+    const target = event.relatedTarget;
+    if (!(target instanceof view.Node)) return;
+    for (const menu of menus) if (!menu.contains(target)) menu.open = false;
   };
   update();
   const unsubscribe = controller.subscribe(update);
   document.addEventListener("change", onChange);
   document.addEventListener("pointerdown", onPointerDown);
   document.addEventListener("keydown", onKeyDown);
+  document.addEventListener("focusout", onFocusOut);
+  for (const menu of menus) {
+    menu.setAttribute("data-ready", "true");
+    const summary = menu.querySelector("summary");
+    summary?.removeAttribute("aria-disabled");
+    summary?.removeAttribute("tabindex");
+    for (const select of menu.querySelectorAll("select")) select.disabled = false;
+  }
+  let disposed = false;
   return () => {
+    if (disposed) return;
+    disposed = true;
     unsubscribe();
     document.removeEventListener("change", onChange);
     document.removeEventListener("pointerdown", onPointerDown);
     document.removeEventListener("keydown", onKeyDown);
+    document.removeEventListener("focusout", onFocusOut);
+    for (const menu of menus) {
+      menu.open = false;
+      menu.setAttribute("data-ready", "false");
+      menu.querySelector("summary")?.setAttribute("aria-disabled", "true");
+      menu.querySelector("summary")?.setAttribute("tabindex", "-1");
+      for (const select of menu.querySelectorAll("select")) select.disabled = true;
+    }
+  };
+}
+
+/** Own one controller reference for exactly the lifetime of a mounted menu. */
+export function mountHraAppearanceMenu(menu: HTMLDetailsElement): () => void {
+  const controller = initializeHraAppearance(menu.ownerDocument);
+  let unbind: () => void;
+  try { unbind = bindHraAppearanceMenus(menu.ownerDocument, controller, menu); }
+  catch (error) { controller.dispose(); throw error; }
+  let disposed = false;
+  return () => {
+    if (disposed) return;
+    disposed = true;
+    unbind();
+    controller.dispose();
   };
 }

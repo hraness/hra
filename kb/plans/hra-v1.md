@@ -16,11 +16,15 @@ tags:
 
 ## Web appearance (2026-09-08)
 
-Status: implementation is integrated with the app and site StyleX build. The adopting pull request and deployment records carry validation and delivery evidence; source review alone does not establish acceptance.
+Status: the native app/site menu integration is implemented. Focused validation passed 44 tests with 728 assertions, changed-file lint, and diff checks. The final aggregate, mandatory browser checks, current-head CI, and production verification remain pending.
 
 The app and website share the design-kit's compiled StyleX palette contract with Sponge. Catppuccin, Gruvbox, Rosé Pine, and Tokyo Night each support light and dark appearance; Catppuccin dark is the default. One final header control selects the theme and appearance. Primary actions, warnings, destructive actions, status labels, input boundaries, and keyboard focus use semantic color roles.
 
 The external bootstrap applies the saved choice before paint without changing the existing content security policies. One bounded browser preference contains only the palette and mode; no account or session data enters this record. The public privacy text describes this storage. The inert website preview keeps a fixed Catppuccin dark appearance.
+
+Both surfaces render the same pure native menu and static StyleX recipe from `app/src/components/appearance-menu*`; `site/appearance-menu.tsx` reexports that component. The app uses the public framework-neutral design-kit controller. Each mounted menu acquires one controller reference and releases its listeners and reference on unmount. The static bootstrap skips app-managed menus, preventing duplicate bindings. System appearance and cross-tab changes update the same controller and menu values. The app no longer imports the aggregate shared React barrels that retained unrelated Jelly code and external URL literals in its closed artifact graph.
+
+The focused checks cover controller adoption, repeated mounting and cleanup, single preference writes, native keyboard behavior, bounded storage, affected screens, public rendering, and the two-file site test-transform admission. They do not establish completed browser or production acceptance.
 
 Acceptance requires focused storage and rendering tests, the complete `bun run check` and `bun run check:browser` gates, browser evidence for all eight variants and preference changes under the tracked policies, and source-bound canonical website/app delivery. This web update does not activate the daemon or hosted command writer and does not change their capacity gates.
 

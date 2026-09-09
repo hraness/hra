@@ -2,7 +2,7 @@
 
 - `content.ts` is the shared public content contract for README and website generation.
 - `template.ts` renders the homepage and privacy page.
-- `appearance-menu.tsx` and `appearance-menu.stylex.ts` render one native header appearance menu. The shared app appearance bootstrap drives it; the preview remains a fixed, inert Catppuccin dark surface.
+- `appearance-menu.tsx` reexports the pure native header menu owned alongside its static recipe in `app/src/components/appearance-menu*`. The shared app appearance bootstrap drives it; the preview remains a fixed, inert Catppuccin dark surface.
 - `marketing.tsx` composes public design-kit server components; `render.ts` is the captured build-time entry for all three HTML routes.
 - `presentation.stylex.ts` and `marketing.stylex.ts` own local component recipes. `foundation.ts` is the build-only CSS entry; `foundation.css` joins approved document foundations and public fonts, without importing legacy component styles. The empty entry chunk stays private.
 - `analytics-site.ts` defines the exact production host, route taxonomy, and event vocabulary.

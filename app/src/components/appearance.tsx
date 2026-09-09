@@ -1,10 +1,18 @@
-import { DesignPaletteMenuButton } from "@hraness/design-kit/react";
 import * as stylex from "@stylexjs/stylex";
+import { useEffect, useRef } from "react";
+import { mountHraAppearanceMenu } from "../appearance";
+import { NativeAppearanceMenu } from "./appearance-menu";
 import { appearanceStyles } from "./appearance.stylex";
 
-/** The shared native menu needs no inline positioning under HRA's CSP. */
+/** Each mounted header adopts the existing bootstrap controller and releases it. */
 export function AppearanceButton() {
-  return <div {...stylex.props(appearanceStyles.control)}><DesignPaletteMenuButton size="default" /></div>;
+  const menu = useRef<HTMLDetailsElement>(null);
+  useEffect(() => {
+    const current = menu.current;
+    if (current === null) return;
+    return mountHraAppearanceMenu(current);
+  }, []);
+  return <div {...stylex.props(appearanceStyles.control)}><NativeAppearanceMenu managed ref={menu} /></div>;
 }
 
 export function AppearanceHeader() {

@@ -1,7 +1,6 @@
 import { describe, expect, mock, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import { parseHTML } from "linkedom";
-import { DesignPaletteProvider } from "@hraness/design-kit/react";
 
 import type { MachineView } from "../model/settings-view";
 
@@ -113,7 +112,7 @@ const { SettingsScreen } = await import("./settings-screen");
 
 describe("Devin account settings", () => {
   test("keeps retired archived sessions read-only while supported sessions can unarchive", () => {
-    const markup = renderToStaticMarkup(<DesignPaletteProvider><SettingsScreen onBack={() => undefined} /></DesignPaletteProvider>);
+    const markup = renderToStaticMarkup(<SettingsScreen onBack={() => undefined} />);
     const { document } = parseHTML(markup);
     const unarchiveButtons = [...document.querySelectorAll("button")]
       .filter((button) => button.textContent === "Unarchive");
@@ -124,7 +123,7 @@ describe("Devin account settings", () => {
   });
 
   test("shows historical Devin accounts as retired without any login path", () => {
-    const markup = renderToStaticMarkup(<DesignPaletteProvider><SettingsScreen onBack={() => undefined} /></DesignPaletteProvider>);
+    const markup = renderToStaticMarkup(<SettingsScreen onBack={() => undefined} />);
 
     expect(markup).toContain("Devin support is retired");
     expect(markup).toContain("read-only");
