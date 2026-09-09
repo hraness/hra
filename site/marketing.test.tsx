@@ -75,9 +75,11 @@ describe("public server marketing composition", () => {
     const setup = guideDocument("/docs/start/");
     const commandBlocks = [...setup.querySelectorAll("main pre")];
     expect(commandBlocks[0]?.textContent).toBe(publicContent.installCommand);
-    const admissionNotice = setup.querySelector('aside[aria-label="Candidate artifact not yet admitted"]');
-    expect(admissionNotice?.textContent).toContain("Only after immutable GitHub and npm release admission");
-    expect(admissionNotice?.querySelector("a")?.getAttribute("href")).toBe("https://github.com/hraness/hra/tree/v0.7.0#install-and-update");
+    const admissionNotice = setup.querySelector('aside[aria-label="CLI artifact admitted; daemon startup blocked"]');
+    expect(admissionNotice).not.toBeNull();
+    expect(admissionNotice?.textContent).toContain("The admitted v0.7.1 artifact may be installed with the command below.");
+    expect(admissionNotice?.textContent).toContain("Neither artifact admission nor installation authorizes daemon startup.");
+    expect(admissionNotice?.querySelector("a")?.getAttribute("href")).toBe("https://github.com/hraness/hra/tree/v0.7.1#get-started");
     expect(admissionNotice?.nextElementSibling).toBe(commandBlocks[0]);
     for (const command of [publicContent.installCommand, publicContent.doctorCommand, publicContent.initCommand]) {
       expect(commandBlocks.some((block) => block.textContent.split("\n").includes(command))).toBe(true);
