@@ -37,6 +37,8 @@ export type BoundedProcessContainment = "authority" | "local";
 
 export type BoundedProcessRequest = Readonly<{
   arguments: readonly string[];
+  /** Opt-in close/termination evidence for spawned local children only. */
+  captureLocalDiagnostics?: true;
   containment: BoundedProcessContainment;
   cwd: string;
   environment: Readonly<NodeJS.ProcessEnv>;
@@ -51,9 +53,21 @@ export type BoundedProcessRequest = Readonly<{
   timeoutMs: number;
 }>;
 
+export type LocalBoundedProcessDiagnostics = Readonly<{
+  version: 1;
+  rawCloseCode: number | null | "unobserved" | "invalid";
+  rawCloseSignal: "none" | "SIGTERM" | "SIGKILL" | "other" | "unobserved";
+  firstTerminationReason: "none" | "residual_group_non_absent" | "output_limit" | "abort" | "timeout" | "journal" | "child_error";
+  forcedExitCode: 1 | 124 | 130 | null;
+  closeGroup: "unobserved" | "absent" | "non_absent";
+  termSignalFailed: boolean;
+  killSignalFailed: boolean;
+}>;
+
 export type CompletedBoundedProcessResult = Readonly<{
   cleanup: "proven";
   exitCode: number;
+  localDiagnostics?: LocalBoundedProcessDiagnostics;
   stderr: Buffer;
   stdout: Buffer;
 }>;
@@ -3877,8 +3891,14 @@ const signalProcessGroup = (
   }
 };
 
+const invalidLocalDiagnosticsCapture = (
+  value: unknown,
+  containment: BoundedProcessContainment,
+): boolean => value !== undefined && (value !== true || containment !== "local");
+
 const invalidRequest = (request: BoundedProcessRequest): boolean =>
   !phasePattern.test(request.phase)
+  || invalidLocalDiagnosticsCapture(request.captureLocalDiagnostics, request.containment)
   || request.signal !== undefined && request.containment !== "local"
   || !Number.isSafeInteger(request.outputMaximumBytes)
   || request.outputMaximumBytes < 1
@@ -4298,7 +4318,19 @@ export const runBoundedProcess = async (
     const isStopping = (): boolean => stopping;
     let leaderClosed = false;
     let observedExitCode = 1;
-    let forcedExitCode: number | undefined;
+    let forcedExitCode: 1 | 124 | 130 | undefined;
+    const localDiagnostics: {
+      -readonly [Key in keyof LocalBoundedProcessDiagnostics]: LocalBoundedProcessDiagnostics[Key]
+    } | undefined = request.captureLocalDiagnostics === true ? {
+      version: 1,
+      rawCloseCode: "unobserved",
+      rawCloseSignal: "unobserved",
+      firstTerminationReason: "none",
+      forcedExitCode: null,
+      closeGroup: "unobserved",
+      termSignalFailed: false,
+      killSignalFailed: false,
+    } : undefined;
     let killTimer: ReturnType<typeof setTimeout> | undefined;
     let settlementTimer: ReturnType<typeof setTimeout> | undefined;
     let quiescenceTimer: ReturnType<typeof setTimeout> | undefined;
@@ -4378,6 +4410,9 @@ export const runBoundedProcess = async (
         ? {
             cleanup,
             exitCode: overflow ? 1 : (forcedExitCode ?? observedExitCode),
+            ...(localDiagnostics === undefined ? {} : {
+              localDiagnostics: { ...localDiagnostics, forcedExitCode: forcedExitCode ?? null },
+            }),
             ...output,
           }
         : {
@@ -4400,8 +4435,12 @@ export const runBoundedProcess = async (
         if (!settled && stopping) scheduleQuiescenceCheck();
       }, 10);
     };
-    const beginTermination = (exitCode: number): void => {
+    const beginTermination = (
+      exitCode: 1 | 124 | 130,
+      reason: Exclude<LocalBoundedProcessDiagnostics["firstTerminationReason"], "none">,
+    ): void => {
       if (settled) return;
+      if (localDiagnostics?.firstTerminationReason === "none") localDiagnostics.firstTerminationReason = reason;
       forcedExitCode ??= exitCode;
       if (stopping) return;
       stopping = true;
@@ -4409,6 +4448,7 @@ export const runBoundedProcess = async (
         try {
           signalProcessGroup(negativeProcessGroupId, "SIGTERM");
         } catch {
+          if (localDiagnostics !== undefined) localDiagnostics.termSignalFailed = true;
           forcedExitCode = 1;
         }
       }
@@ -4423,6 +4463,7 @@ export const runBoundedProcess = async (
           try {
             signalProcessGroup(negativeProcessGroupId, "SIGKILL");
           } catch {
+            if (localDiagnostics !== undefined) localDiagnostics.killSignalFailed = true;
             forcedExitCode = 1;
           }
         }
@@ -4446,10 +4487,10 @@ export const runBoundedProcess = async (
       }
       if (chunk.byteLength > remaining) {
         overflow = true;
-        beginTermination(1);
+        beginTermination(1, "output_limit");
       }
     };
-    const onAbort = (): void => beginTermination(130);
+    const onAbort = (): void => beginTermination(130, "abort");
 
     child.stdout.on("data", (chunk: Buffer) => {
       append(stdoutChunks, chunk);
@@ -4462,22 +4503,36 @@ export const runBoundedProcess = async (
         leaderClosed = true;
         finish("proven");
       }
-      else beginTermination(1);
+      else beginTermination(1, "child_error");
     });
+    const observeCloseGroup = (): boolean => {
+      const exists = groupExists();
+      if (localDiagnostics !== undefined) localDiagnostics.closeGroup = exists ? "non_absent" : "absent";
+      return exists;
+    };
     child.once("close", (code, signal) => {
       leaderClosed = true;
       observedExitCode = code ?? (signal === null ? 1 : 128);
+      if (localDiagnostics !== undefined) {
+        localDiagnostics.rawCloseCode = code === null ? null
+          : Number.isSafeInteger(code) && code >= 0 && code <= 255 ? code : "invalid";
+        localDiagnostics.rawCloseSignal = signal === null ? "none"
+          : signal === "SIGTERM" || signal === "SIGKILL" ? signal : "other";
+      }
       if (stopping) {
-        if (!groupExists()) finish("proven");
+        if (!observeCloseGroup()) finish("proven");
         else scheduleQuiescenceCheck();
         return;
       }
-      if (groupExists()) beginTermination(1);
+      if (observeCloseGroup()) beginTermination(1, "residual_group_non_absent");
       else finish("proven");
     });
     child.stdin.once("error", () => undefined);
     const timeoutTimer = setTimeout(
-      () => beginTermination(journalActivationError === undefined ? 124 : 1),
+      () => beginTermination(
+        journalActivationError === undefined ? 124 : 1,
+        journalActivationError === undefined ? "timeout" : "journal",
+      ),
       journalActivationError === undefined ? request.timeoutMs : 0,
     );
     request.signal?.addEventListener("abort", onAbort, { once: true });
