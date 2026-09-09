@@ -2964,4 +2964,151 @@ describe("Claude pre-acquisition reservation cleanup", () => {
       } finally { await manager.close(); }
     },
   );
+
+  test.each(["resolve", "reject"] as const)(
+    "R1 start-time configuration settles before successful manager close (%s)",
+    async (disposition) => {
+      type Outcome = Readonly<{ status: "fulfilled" }>
+        | Readonly<{ status: "rejected"; reason: unknown }>;
+      const events: string[] = [];
+      const observe = (work: Promise<unknown>, label: string): Promise<Outcome> => work.then(
+        () => { events.push(`${label}-fulfilled`); return { status: "fulfilled" }; },
+        (reason: unknown) => {
+          events.push(`${label}-rejected`);
+          return { status: "rejected", reason };
+        },
+      );
+      const lookupReason: unknown = undefined;
+      let resolveLookup!: (value: string) => void;
+      let rejectLookup!: (reason: unknown) => void;
+      const lookup = new Promise<string>((resolve, reject) => {
+        resolveLookup = resolve;
+        rejectLookup = reject;
+      });
+      // Observe the original handle without replacing what the manager awaits.
+      const lookupObserved = observe(lookup, "lookup");
+      let lookupReleased = false;
+      const releaseLookup = (): void => {
+        if (lookupReleased) return;
+        lookupReleased = true;
+        events.push("lookup-release-requested");
+        if (disposition === "resolve") resolveLookup(CONFIG_DIR);
+        else rejectLookup(lookupReason);
+      };
+      let lookups = 0;
+      let lookupEntered = false;
+      const { manager, launches, processes, bindingAuthority } = harness({
+        configDirFor: () => {
+          lookups++;
+          if (lookups === 2) {
+            lookupEntered = true;
+            events.push("lookup-entered");
+            return lookup;
+          }
+          return CONFIG_DIR;
+        },
+      });
+      const counts = () => ({
+        launches: launches.length,
+        processes: processes.length,
+        provisions: bindingAuthority.provisions.length,
+      });
+      let startObserved: Promise<Outcome> | undefined;
+      let closeObserved: Promise<Outcome> | undefined;
+      let handoff: Promise<void> | undefined;
+      let releaseTimer: ReturnType<typeof setTimeout> | undefined;
+      let beforeRelease: ReturnType<typeof counts> | undefined;
+      let enteredBeforeReturn = false;
+      let primaryFailure: Readonly<{ reason: unknown }> | undefined;
+      try {
+        const review = await manager.reviewSessionStart({
+          authority, fast: false, preset: "fable-max", requirement: presetRequirements["fable-max"],
+          projectRoot: PROJECT_ROOT, signal: signal(),
+        });
+        expect(lookups).toBe(1);
+        events.push("review-completed");
+        const starting = manager.startSession({
+          authority, review, providerThreadId: ADOPTED_PROVIDER_THREAD_ID, signal: signal(),
+        });
+        startObserved = observe(starting, "start");
+        events.push("start-returned");
+        enteredBeforeReturn = lookupEntered;
+        beforeRelease = counts();
+        events.push("close-called");
+        const closing = manager.close();
+        closeObserved = observe(closing, "close");
+        events.push("close-returned");
+        // One later native event-loop turn releases the exact pending lookup.
+        // Its duration is not the oracle: the recorded settlement order is.
+        handoff = new Promise<void>((resolve) => {
+          releaseTimer = setTimeout(() => {
+            events.push("release-handoff-entered");
+            releaseLookup();
+            resolve();
+          }, 0);
+        });
+        const [lookupOutcome, startOutcome, closeOutcome] = await Promise.all([
+          lookupObserved, startObserved, closeObserved, handoff,
+        ]);
+        expect(enteredBeforeReturn).toBe(true);
+        expect(beforeRelease).toEqual({ launches: 0, processes: 0, provisions: 0 });
+        expect(counts()).toEqual({ launches: 0, processes: 0, provisions: 0 });
+        expect(lookups).toBe(2);
+        expect(lookupOutcome.status).toBe(disposition === "resolve" ? "fulfilled" : "rejected");
+        expect(startOutcome.status).toBe("rejected");
+        if (startOutcome.status === "rejected") {
+          if (disposition === "reject") expect(startOutcome.reason).toBe(lookupReason);
+          else expect(startOutcome.reason).toMatchObject({ code: "PROCESS_EXITED" });
+        }
+        expect(closeOutcome.status).toBe("fulfilled");
+        const lookupIndex = events.indexOf(`lookup-${lookupOutcome.status}`);
+        const closeIndex = events.indexOf("close-fulfilled");
+        expect(lookupIndex).toBeGreaterThanOrEqual(0);
+        expect(closeIndex).toBeGreaterThanOrEqual(0);
+        expect(closeIndex < lookupIndex).toBe(false);
+      } catch (reason: unknown) {
+        primaryFailure = { reason };
+      } finally {
+        // Assertion failure cannot strand the original lookup or a started call.
+        releaseLookup();
+        const lookupOutcome = await lookupObserved;
+        const startOutcome = await startObserved;
+        const closeOutcome = await closeObserved;
+        await handoff;
+        if (releaseTimer !== undefined) clearTimeout(releaseTimer);
+        const cleanup = await observe(manager.close(), "cleanup");
+        const lookupIndex = events.indexOf(`lookup-${lookupOutcome.status}`);
+        const closeIndex = events.indexOf("close-fulfilled");
+        const successfulCloseBeforeLookup = lookupIndex >= 0 && closeIndex >= 0
+          ? closeIndex < lookupIndex
+          : null;
+        console.info(JSON.stringify({
+          schema: "hra-r1-config-close-trace-v1",
+          disposition,
+          events,
+          enteredBeforeReturn,
+          beforeRelease,
+          afterJoin: counts(),
+          lookupStatus: lookupOutcome.status,
+          startStatus: startOutcome?.status,
+          originalLookupReasonPreserved: disposition === "reject"
+            && startOutcome?.status === "rejected" && startOutcome.reason === lookupReason,
+          closeStatus: closeOutcome?.status,
+          successfulCloseBeforeLookup,
+          cleanup: {
+            lookupJoined: true,
+            startJoined: startObserved !== undefined,
+            closeJoined: closeObserved !== undefined,
+            handoffJoined: handoff !== undefined,
+            finalCloseStatus: cleanup.status,
+          },
+        }));
+        if (cleanup.status === "rejected" && primaryFailure === undefined) {
+          primaryFailure = { reason: cleanup.reason };
+        }
+      }
+      if (primaryFailure !== undefined) throw primaryFailure.reason;
+    },
+  );
+
 });

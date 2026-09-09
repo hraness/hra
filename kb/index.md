@@ -9,6 +9,7 @@ type: index
 
 - [HRA v1](plans/hra-v1.md)
 - [Personal-home session adoption](plans/session-adoption.md)
+- [Claude connection ownership](plans/effect-claude-session.md)
 - [HRA v2](plans/hra-v2.md)
 - [Model routing and bounded autonomy](plans/model-routing-autonomy.md)
 - [Oh memory and session civilization](plans/oh-memory-civilization.md)
