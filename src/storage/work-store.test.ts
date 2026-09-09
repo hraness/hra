@@ -2227,8 +2227,9 @@ describe("WorkStore original send ownership", () => {
     expect(value.stateStore.readMutation(prepared.effect.nestedMutationKey)).toBeNull();
   });
 
-  test("original send ownership: rejects missing, orphaned, and relocated ownership without legacy fallback", async () => {
-    for (const corruption of ["marker", "owner", "anchor", "orphan", "relocated"] as const) {
+  test.each(["marker", "owner", "anchor", "orphan", "relocated"] as const)(
+    "original send ownership: rejects %s ownership corruption without legacy fallback",
+    async (corruption) => {
       const value = await originalSendOwnerFixture();
       const prepared = prepareOwnerGuardDispatch(value);
       const owner = prepareOriginalSendOwner(value, prepared.effect.nestedMutationKey, workPreparedEffectMessage(prepared.effect));
@@ -2275,8 +2276,8 @@ describe("WorkStore original send ownership", () => {
       expect(value.store.snapshot(prepared.created.work.id)).toEqual(workBefore);
       expect(value.database.query("SELECT * FROM mutation_attempts WHERE id=?").get(owner.owner.attemptId)).toEqual(mutationBefore);
       expect(value.database.query("SELECT COUNT(*) AS count FROM work_nested_effect_settlements").get()).toEqual({ count: 0 });
-    }
-  });
+    },
+  );
 
   test("original send ownership: rejects marker-only nested receipts without accepting Work effects", () => {
     const value = fixture();

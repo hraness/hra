@@ -72,7 +72,7 @@ async function fixture(kind: "attached" | "attachment_only" | "text" = "attached
   const authority = prepared.owner.sourceAuthority;
   const runtimeProfile = effectiveRuntimeProfileSchema.parse({
     profileId: profile.id, processGeneration: profile.processGeneration, observedAt: now, preset: "high",
-    model: "gpt-6-astra", reasoningEffort: "max", serviceTier: null, fast: false,
+    model: "gpt-5.6-sol", reasoningEffort: "max", serviceTier: null, fast: false,
     approvalPolicy: "on-request", reviewMode: "auto_review", permissionProfile: ":workspace",
     computerUse: true, pluginCapability: true, enabledApps: [],
   });
@@ -127,10 +127,12 @@ const insertAccounting = (value: Fixture, attachment = firstAttachment(value)) =
  * state-store.ts blob dbdd1766d70cb6ccb88e7d5651e37ec531138343;
  * runtime-profile.ts blob 9115f760bda97ce3a11a577593baebf3eb364727;
  * provider-accounts.ts blob 422072cc60828c9bc9fe27428296d1428decdc68.
- * Do not derive this oracle from the current claim/profile serializers. */
-function assertV1Bytes(value: Fixture, daemon = value.daemon) {
+ * Do not derive this oracle from the current claim/profile serializers. The
+ * model is independent example input, not a captured historical authority:
+ * newly created High sessions now select Sol without changing the v1 layout. */
+function assertV1Bytes(value: Fixture, model: string, daemon = value.daemon) {
   const runtimeProfile = { profileId: value.profile.id, processGeneration: value.profile.processGeneration,
-    observedAt: value.now, preset: "high", model: "gpt-6-astra", reasoningEffort: "max", serviceTier: null,
+    observedAt: value.now, preset: "high", model, reasoningEffort: "max", serviceTier: null,
     fast: false, approvalPolicy: "on-request", reviewMode: "auto_review", permissionProfile: ":workspace",
     computerUse: true, pluginCapability: true, enabledApps: [] };
   const authority = { profileId: value.authority.profileId, bindingGeneration: value.authority.bindingGeneration,
@@ -153,6 +155,20 @@ function assertV1Bytes(value: Fixture, daemon = value.daemon) {
 }
 
 describe("owned direct-send manifest admission", () => {
+  test("refuses historical Astra evidence for a current Sol session without consuming its owner", async () => {
+    const value = await fixture();
+    expect(value.store.requireSessionPresetRequirement(value.session.id)).toEqual({
+      preset: "high", requirement: { model: "gpt-5.6-sol", effort: "max" },
+    });
+    const historicalRuntime = effectiveRuntimeProfileSchema.parse({ ...value.runtimeProfile, model: "gpt-6-astra" });
+    assertInert(value, () => value.store.beginOwnedDirectSendEffect({
+      ...value.input, evidence: { ...value.evidence, runtimeProfile: historicalRuntime },
+    }), "SESSION_RUNTIME_PROFILE_PRESET_CONTRACT_MISMATCH");
+    expect(value.store.readOwnedSessionSend(value.request.idempotencyKey)?.state).toBe("input_required");
+    expect(value.store.beginOwnedDirectSendEffect(value.input).dispatchGranted).toBe(true);
+    assertV1Bytes(value, "gpt-5.6-sol");
+  });
+
   test("admits attached manifest atomically with one existing-format claim", async () => {
     const value = await fixture();
     const pinsBefore = value.pins();
@@ -161,7 +177,7 @@ describe("owned direct-send manifest admission", () => {
     expect(begun).toMatchObject({ dispatchGranted: true, state: "effect_started", claim: { version: 1, mode: "direct" } });
     expect(begun.claim?.evidenceDigest).toBe(createHash("sha256").update(JSON.stringify(value.evidence)).digest("hex"));
     expect(value.store.messageAttachmentManifest(value.session.id, value.prepared.owner.attemptId)).toEqual(value.references);
-    assertV1Bytes(value);
+    assertV1Bytes(value, "gpt-5.6-sol");
     expect(value.pins()).toEqual(pinsBefore);
     for (const attachment of value.attachments) {
       expect(value.store.attachmentCustody(attachment.digest)).toMatchObject({ digest: attachment.digest,
@@ -173,7 +189,7 @@ describe("owned direct-send manifest admission", () => {
       const reopened = value.open(readonly);
       expect(reopened.readOwnedSessionSend(value.request.idempotencyKey)?.state).toBe("effect_started");
       expect(reopened.messageAttachmentManifest(value.session.id, value.prepared.owner.attemptId)).toEqual(value.references);
-      assertV1Bytes(value);
+      assertV1Bytes(value, "gpt-5.6-sol");
       expect(value.snapshot()).toEqual(beforeReopen);
     }
   });
@@ -185,7 +201,7 @@ describe("owned direct-send manifest admission", () => {
     expect(begun).toMatchObject({ dispatchGranted: true, state: "effect_started" });
     expect(value.store.messageAttachmentManifest(value.session.id, value.prepared.owner.attemptId)).toEqual(value.references);
     expect(value.store.messageAttachmentManifest(value.session.id, value.request.idempotencyKey)).toEqual([]);
-    assertV1Bytes(value);
+    assertV1Bytes(value, "gpt-5.6-sol");
   });
 
   for (const omitted of [false, true]) {
@@ -195,11 +211,11 @@ describe("owned direct-send manifest admission", () => {
       expect(value.store.beginOwnedDirectSendEffect(omitted ? value.claimInput : value.input).dispatchGranted).toBe(true);
       expect(value.store.messageAttachmentManifest(value.session.id, value.prepared.owner.attemptId)).toEqual([]);
       expect(value.database.query("SELECT * FROM attachments").all()).toEqual([]);
-      assertV1Bytes(value);
+      assertV1Bytes(value, "gpt-5.6-sol");
       const before = value.snapshot();
       for (const readonly of [false, true]) {
         expect(value.open(readonly).readOwnedSessionSend(value.request.idempotencyKey)?.state).toBe("effect_started");
-        assertV1Bytes(value);
+        assertV1Bytes(value, "gpt-5.6-sol");
         expect(value.snapshot()).toEqual(before);
       }
       expect(value.database.query("SELECT * FROM session_send_owners").all()).toEqual(ownerBefore);
@@ -284,7 +300,9 @@ describe("owned direct-send manifest admission", () => {
       ).run(value.session.id, value.prepared.owner.attemptId, first.digest,
         corruption === "name" ? "wrong.md" : first.name,
         corruption === "media_type" ? "text/plain" : first.mediaType, first.byteLength, value.now);
-      assertInert(value, () => value.store.beginOwnedDirectSendEffect(value.input), "ATTACHMENT_CUSTODY_CORRUPT");
+      assertInert(value, () => value.store.beginOwnedDirectSendEffect(value.input),
+        corruption === "name" || corruption === "media_type"
+          ? "MESSAGE_ATTACHMENT_IDENTITY_CONFLICT" : "ATTACHMENT_CUSTODY_IDENTITY_CONFLICT");
     });
   }
 
@@ -301,7 +319,7 @@ describe("owned direct-send manifest admission", () => {
       value.database.query("INSERT INTO message_attachments(session_id,source_id,position,digest,name,media_type,byte_length,created_at) VALUES(?,?,2,?,?,?,?,?)")
         .run(value.session.id, value.prepared.owner.attemptId, first.digest, "extra.md", first.mediaType, first.byteLength, value.now);
     } finally { value.database.exec(guard.sql); }
-    assertInert(value, () => value.store.beginOwnedDirectSendEffect(value.input), "ATTACHMENT_CUSTODY_CORRUPT");
+    assertInert(value, () => value.store.beginOwnedDirectSendEffect(value.input), "MESSAGE_ATTACHMENT_COUNT_CONFLICT");
   });
 
   for (const [name, boundary] of [
@@ -315,8 +333,13 @@ describe("owned direct-send manifest admission", () => {
     test(`rolls back the complete admission at the ${name} write boundary`, async () => {
       const value = await fixture();
       const before = value.snapshot();
-      value.database.exec(`CREATE TRIGGER test_owned_manifest_fault ${boundary} BEGIN SELECT RAISE(ABORT,'owned-manifest-fault'); END`);
-      try { assertInert(value, () => value.store.beginOwnedDirectSendEffect(value.input), "owned-manifest-fault"); }
+      // The provenance writer deliberately redacts arbitrary SQLite errors.
+      // Inject its one preserved closed diagnostic at the evidence INSERT so
+      // that receiving it proves this trigger ran, not an earlier corruption
+      // refusal. The identical input must succeed after removing the trigger.
+      const fault = name === "evidence" ? "EFFECT_EVIDENCE_PROVENANCE_LIMIT" : "owned-manifest-fault";
+      value.database.exec(`CREATE TRIGGER test_owned_manifest_fault ${boundary} BEGIN SELECT RAISE(ABORT,'${fault}'); END`);
+      try { assertInert(value, () => value.store.beginOwnedDirectSendEffect(value.input), fault); }
       finally { value.database.exec("DROP TRIGGER test_owned_manifest_fault"); }
       expect(value.snapshot()).toEqual(before);
       expect(value.store.readOwnedSessionSend(value.request.idempotencyKey)?.state).toBe("input_required");
@@ -355,7 +378,7 @@ describe("owned direct-send manifest admission", () => {
       const before = value.snapshot();
       expect(() => loser.beginOwnedDirectSendEffect(value.input)).toThrow("SESSION_SEND_CLAIM_CONFLICT");
       expect(value.snapshot()).toEqual(before);
-      assertV1Bytes(value);
+      assertV1Bytes(value, "gpt-5.6-sol");
     });
   }
 
@@ -387,7 +410,7 @@ describe("owned direct-send manifest admission", () => {
     }), "SESSION_SEND_CLAIM_CONFLICT");
     expect(value.store.beginOwnedDirectSendEffect(value.input).dispatchGranted).toBe(true);
     expect(value.store.messageAttachmentManifest(value.session.id, value.prepared.owner.attemptId)).toEqual(value.references);
-    assertV1Bytes(value);
+    assertV1Bytes(value, "gpt-5.6-sol");
   });
 
   test("retains old-boot owned pins without reviving restart-retired source authority", async () => {
@@ -439,7 +462,7 @@ describe("owned direct-send manifest admission", () => {
       expect(value.store.messageAttachmentManifest(value.session.id, begun.owner.attemptId)).toEqual(value.references);
       for (const attachment of value.attachments) expect(value.cleanup(attachment))
         .toEqual({ kind: "retained", reason: outcome === "ambiguous" ? "reserved" : "referenced" });
-      assertV1Bytes(value);
+      assertV1Bytes(value, "gpt-5.6-sol");
     });
   }
 });

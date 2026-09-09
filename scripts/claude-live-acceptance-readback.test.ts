@@ -41,7 +41,8 @@ const admitClaude = (store: StateStore, profileId: Parameters<StateStore["requir
   }));
   store.observeProviderAccountReadiness({ profileId, provider: "claude",
     expectedBindingGeneration: authority.bindingGeneration, readiness: "signed_in" });
-  return authority;
+  // Readiness changes the binding generation independently of process identity.
+  return claudeProviderAccountAuthoritySchema.parse(store.requireProviderAccountAuthority(profileId, "claude"));
 };
 
 // Real current-schema StateStore records and private filesystem artifacts.
@@ -61,6 +62,8 @@ const fixture = async () => {
     await new Promise<void>((resolveClose, reject) => server.close((error) => error ? reject(error) : resolveClose()));
   };
   cleanups.push(async () => { if (server.listening) await closeSocket(); store.close(); await rm(root, { recursive: true }); });
+  const bootId = `boot_${randomUUID().replaceAll("-", "")}`;
+  const daemonGeneration = store.nextDaemonGeneration(bootId);
   const projectRoot = join(root, "project");
   await mkdir(projectRoot, { mode: 0o700 });
   const project = await store.createProject("Readback test", projectRoot, true);
@@ -92,15 +95,17 @@ const fixture = async () => {
   const connectionId = randomUUID();
   const identity = { pid: 40001, pidDomain: "linux" as const, procStart: "readback-test-child" };
   store.recordClaimedClaudeProcessAuthority({ providerAuthority, providerThreadId: threadId, profileId: profile.id,
-    profileGeneration: providerAuthority.processGeneration, runtimeScope: "managed", sessionId: session.id, identity });
+    profileGeneration: profile.processGeneration, runtimeScope: "managed", sessionId: session.id, identity });
   store.completeSessionStartEffect({ providerAuthority, attemptId: start.id, sessionId: session.id,
     expectedSessionRevision: session.revision, providerThreadId: threadId, state: "idle",
     runtimeProfile: runtime, claudeProcessIdentity: identity,
     receipt: { sessionId: session.id, effectiveRuntimeProfile: runtime } });
   const sendText = "Remember the exact test nonce and echo the returned receipt.";
-  const send = store.prepareMutation({ kind: "session.send", authorityId: session.id,
-    authorityGeneration: providerAuthority.processGeneration, idempotencyKey: sendIdempotencyKey, request: { message: sendText } });
+  const { attempt: send } = store.prepareSessionInputMutation({ kind: "session.send", sessionId: session.id,
+    providerAuthority, idempotencyKey: sendIdempotencyKey, message: sendText, attachments: [],
+    daemonGeneration, bootId });
   store.beginSessionMutationEffect({ providerAuthority, attemptId: send.id, sessionId: session.id, profileGeneration: providerAuthority.processGeneration,
+    attachments: [], daemonGeneration, bootId,
     transcript: { accountId: profile.id, providerGeneration: providerAuthority.processGeneration,
       providerConnectionId: connectionId, actor: "human", message: sendText },
     message: sendText, evidence: { kind: "session.send", providerThreadId: threadId,
@@ -154,8 +159,8 @@ const fixture = async () => {
     workingHead: { digest: headDigest, operationSha256, sequence: 1 } } as const;
   const collector = new ClaudeLiveAcceptanceProofCollector({ runId,
     candidate: { cloudTargetDigest: sha("test cloud"), packageVersion: HRA_VERSION, sourceRevision: "1".repeat(40) } });
-  collector.beginDaemonGeneration(1);
-  collector.armFreshSession({ daemonGeneration: 1, memory, profileGeneration: providerAuthority.processGeneration, profileId: profile.id,
+  collector.beginDaemonGeneration(daemonGeneration);
+  collector.armFreshSession({ daemonGeneration, memory, profileGeneration: providerAuthority.processGeneration, profileId: profile.id,
     providerThreadId: threadId, sendIdempotencyKey, sessionId: session.id });
   const profileDirectories = profilePaths(paths, profile.id);
   await collector.handleManagedHostToolCall({ authority: { id: profile.id, generation: providerAuthority.processGeneration,
@@ -164,7 +169,7 @@ const fixture = async () => {
     call: { authority: providerAuthority,
       callId, connectionId, threadId, turnId, requestId: { type: "string", value: callId }, requestDigest,
       tool: "memory_remember", input: memory }, dispatch: async () => result });
-  collector.corroborateAppliedSend({ daemonGeneration: 1, idempotencyKey: sendIdempotencyKey, sessionId: session.id, turnId });
+  collector.corroborateAppliedSend({ daemonGeneration, idempotencyKey: sendIdempotencyKey, sessionId: session.id, turnId });
   collector.handleManagedHostToolResponseWritten({ bindingId, callId, profileId: profile.id,
     processGeneration: providerAuthority.processGeneration, provider: "claude", providerThreadId: threadId, request, requestDigest });
   const receipt = collector.readProvisionalPrivateReceipt();
@@ -220,7 +225,7 @@ const fixture = async () => {
     await closeSocket();
     await rm(directory, { recursive: true });
     liveness = "not_live";
-    collector.closeDaemonGeneration(1);
+    collector.closeDaemonGeneration(daemonGeneration);
     return collector.readPrivateReceipt();
   };
   return { root, paths, store, input, oracle, stop, directory, bindingPath, configPath, binding, config,
@@ -261,7 +266,7 @@ const startOnlyFixture = async () => {
     const providerThreadId = randomUUID();
     const identity = { pid: 40002, pidDomain: "linux" as const, procStart: "synthetic-start-recovery" };
     store.recordClaimedClaudeProcessAuthority({ providerAuthority, providerThreadId, profileId: profile.id,
-      profileGeneration: providerAuthority.processGeneration, runtimeScope: "managed", sessionId: session.id, identity });
+      profileGeneration: profile.processGeneration, runtimeScope: "managed", sessionId: session.id, identity });
     store.completeSessionStartEffect({ providerAuthority, attemptId: start.id, sessionId: session.id, expectedSessionRevision: session.revision,
       providerThreadId, state: "idle", runtimeProfile: runtime, claudeProcessIdentity: identity,
       receipt: { sessionId: session.id, effectiveRuntimeProfile: runtime } });
@@ -293,6 +298,10 @@ describe("independent Claude private readback", () => {
 
   test("recovers only exact direct-applied start scope before and after process release", async () => {
     const f = await startOnlyFixture(); const started = f.apply();
+    expect(f.providerAuthority.processGeneration).not.toBe(f.profile.processGeneration);
+    expect(f.store.readSessionClaudeProcessAuthority(started.session.id)).toMatchObject({
+      profileGeneration: f.profile.processGeneration, providerAuthority: f.providerAuthority, state: "bound",
+    });
     const expected = { sessionId: started.session.id, profileGeneration: f.providerAuthority.processGeneration };
     const first = f.oracle();
     const scope = await first.recoverStartedSessionScope(f.input);
@@ -300,6 +309,9 @@ describe("independent Claude private readback", () => {
     expect(Object.isFrozen(scope)).toBe(true);
     await expect(first.recoverStartedSessionScope(f.input)).rejects.toThrow("claude_live_acceptance_readback_refused");
     started.release();
+    expect(f.store.readSessionClaudeProcessAuthority(started.session.id, true)).toMatchObject({
+      profileGeneration: f.profile.processGeneration, providerAuthority: f.providerAuthority, state: "released",
+    });
     const stopped = f.oracle();
     expect(await stopped.recoverStartedSessionScope(f.input)).toEqual(expected);
     expect(scope).not.toHaveProperty("processNotLive");
@@ -346,11 +358,17 @@ describe("independent Claude private readback", () => {
     expect(f.store.requireProfile(f.profile.id).state).toBe("signed_out");
     expect(f.providerAuthority.processGeneration).not.toBe(f.profile.processGeneration);
     expect(f.store.requireProviderAccountForProfile(f.profile.id, "claude").readiness).toBe("signed_in");
+    expect(f.store.readSessionClaudeProcessAuthority(f.session.id)).toMatchObject({
+      profileGeneration: f.profile.processGeneration, providerAuthority: f.providerAuthority, state: "bound",
+    });
     const oracle = f.oracle();
     const live = await oracle.captureLive(f.input);
     expect(live).toMatchObject({ phase: "live", soleRemember: true, managedClaudeSignedIn: true,
       proofBindingDigest: f.input.receipt.candidateBindingDigest });
     const stopped = await oracle.verifyStopped({ receipt: await f.stop() });
+    expect(f.store.readSessionClaudeProcessAuthority(f.session.id, true)).toMatchObject({
+      profileGeneration: f.profile.processGeneration, providerAuthority: f.providerAuthority, state: "released",
+    });
     expect(stopped).toMatchObject({ phase: "stopped", snapshotDigest: live.snapshotDigest,
       processReleased: true, processNotLive: true, privateArtifactsAbsent: true, lifecycleInvalidated: true });
     expect(JSON.stringify(stopped)).not.toContain(f.root);
@@ -362,10 +380,16 @@ describe("independent Claude private readback", () => {
 
   test("a sibling Codex generation change does not impersonate Claude lifecycle invalidation", async () => {
     const f = await fixture();
+    const originalProcess = f.store.readSessionClaudeProcessAuthority(f.session.id);
+    expect(originalProcess).toMatchObject({
+      profileGeneration: f.profile.processGeneration, providerAuthority: f.providerAuthority, state: "bound",
+    });
     const oracle = f.oracle(async () => {
       f.store.advanceProfileGeneration(f.profile.id, f.profile.processGeneration);
     });
     const live = await oracle.captureLive(f.input);
+    expect(f.store.requireProfile(f.profile.id).processGeneration).toBe(f.profile.processGeneration + 1);
+    expect(f.store.readSessionClaudeProcessAuthority(f.session.id)).toEqual(originalProcess);
     expect(f.store.requireProviderAccountAuthority(f.profile.id, "claude")).toEqual(f.providerAuthority);
     expect(await oracle.verifyStopped({ receipt: await f.stop() })).toMatchObject({
       phase: "stopped", snapshotDigest: live.snapshotDigest,
@@ -534,9 +558,13 @@ describe("independent Claude private readback", () => {
 
   test("cleanup-only proves retained released custody without minting acceptance proof", async () => {
     const f = await fixture();
+    expect(f.providerAuthority.processGeneration).not.toBe(f.profile.processGeneration);
     const input = { profileId: f.profile.id, profileGeneration: f.providerAuthority.processGeneration, sessionId: f.session.id };
     await expect(f.oracle().verifyCleanupStoppedCustody(input)).rejects.toThrow("claude_live_acceptance_readback_refused");
     await f.stop();
+    expect(f.store.readSessionClaudeProcessAuthority(f.session.id, true)).toMatchObject({
+      profileGeneration: f.profile.processGeneration, providerAuthority: f.providerAuthority, state: "released",
+    });
     const oracle = f.oracle();
     const evidence = await oracle.verifyCleanupStoppedCustody(input);
     expect(evidence).toMatchObject({ source: "independent_cleanup_readback", phase: "cleanup_stopped",

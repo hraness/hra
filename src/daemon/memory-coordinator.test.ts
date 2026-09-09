@@ -62,8 +62,10 @@ type Runtime = Readonly<{
 
 const roots: string[] = [];
 const runtimes: Runtime[] = [];
+const ownedCaseJoins: Promise<void>[] = [];
 
 afterEach(async () => {
+  for (const joined of ownedCaseJoins.splice(0)) await joined;
   for (const runtime of runtimes.splice(0).reverse()) {
     await runtime.coordinator.close().catch(() => undefined);
     try {
@@ -375,6 +377,20 @@ const createFixture = async (wrapLifecycle?: (
     session,
   };
 };
+
+function ownedMemoryCoordinatorCase(
+  runCase: (value: Awaited<ReturnType<typeof createFixture>>) => Promise<void>,
+): Promise<void> {
+  // Register ownership before setup starts. Every request in these cases is
+  // awaited, so joining the raw case also joins work after a test deadline.
+  const setup = Promise.resolve().then(() => createFixture());
+  const caseTask = setup.then(runCase);
+  ownedCaseJoins.push(Promise.allSettled([setup, caseTask]).then(() => undefined));
+  // Observation prevents a timeout from leaving an unhandled rejection; the
+  // unmodified promise still reports the original failure to the test runner.
+  void caseTask.catch(() => undefined);
+  return caseTask;
+}
 
 const operationInput = (index: number, label: string) => ({
   idempotencyKey: `10000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`,
@@ -1708,9 +1724,9 @@ describe("HRA Oh memory coordinator integration", () => {
     });
   });
 
-  test("adopts every exact empty crash-left legacy stage before creating a portable identity", async () => {
-    for (const stage of ["zero-byte", "migrated", "space-created", "bound"] as const) {
-      const value = await createFixture();
+  test.each(["zero-byte", "migrated", "space-created", "bound"] as const)(
+    "adopts every exact empty crash-left legacy stage before creating a portable identity: %s",
+    (stage) => ownedMemoryCoordinatorCase(async (value) => {
       const actor = value.session(value.firstProject, `Legacy ${stage} recovery`);
       const projectDigest = canonicalSha256({ projectId: value.firstProject.id, v: 1 });
       const canonicalDirectory = join(value.paths.projectMemory, projectDigest);
@@ -1767,12 +1783,12 @@ describe("HRA Oh memory coordinator integration", () => {
         },
       });
       expect((status.canonical as Record<string, unknown>).spaceId).toBeUndefined();
-    }
-  });
+    }),
+  );
 
-  test("resumes every exact empty stage after a portable authority reservation", async () => {
-    for (const stage of ["absent", "zero-byte", "migrated", "space-created", "bound"] as const) {
-      const value = await createFixture();
+  test.each(["absent", "zero-byte", "migrated", "space-created", "bound"] as const)(
+    "resumes every exact empty stage after a portable authority reservation: %s",
+    (stage) => ownedMemoryCoordinatorCase(async (value) => {
       const actor = value.session(value.firstProject, `Portable ${stage} recovery`);
       const identity = createPortableProjectMemoryCanonicalIdentity(value.firstProject.id);
       const reserved = value.runtime.store.reserveProjectMemoryAuthority({
@@ -1822,8 +1838,8 @@ describe("HRA Oh memory coordinator integration", () => {
         physicalState: "initialized",
         revision: 2,
       });
-    }
-  });
+    }),
+  );
 
   test("durably rejects a nonempty store left behind after portable reservation", async () => {
     const value = await createFixture();

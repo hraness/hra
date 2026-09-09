@@ -185,6 +185,8 @@ const withoutLifecycle = (receipt: ClaudeLiveAcceptancePrivateReceipt | ClaudeLi
 // These independent admission checks intentionally do not extend any V1 receipt
 // or digest preimage. The private tuple is retained across IO, never inferred
 // from the Codex/profile generation or added retrospectively to old evidence.
+// Process custody preserves its legacy profile counter separately. Compare
+// provider generations only through the independently verified custody tuple.
 const baseClaudeAuthority = (value: ProviderAccountAuthority) => claudeProviderAccountAuthoritySchema.parse({
   provider: value.provider, providerAccountId: value.providerAccountId, profileId: value.profileId,
   bindingGeneration: value.bindingGeneration, processGeneration: value.processGeneration,
@@ -337,7 +339,8 @@ const readCleanupRecords = (store: StateStore, input: ClaudeLiveAcceptanceCleanu
   const process = store.readClaudeProcessAuthority({ runtimeScope: "managed", profileId: input.profileId,
     providerThreadId: session.providerThreadId ?? refused() });
   requireThat(process !== null && process.sessionId === input.sessionId
-    && process.profileGeneration === input.profileGeneration && process.state === "released" && process.releasedAt !== null
+    && process.providerAuthority?.processGeneration === input.profileGeneration
+    && process.state === "released" && process.releasedAt !== null
     && same(process.providerAuthority, captured));
   if (process === null) return refused();
   return { records: { profile, session, authority, process }, providerSnapshot: { current, captured } };
@@ -395,7 +398,7 @@ const readStartedScope = (store: StateStore, input: ClaudeLiveAcceptanceStartedS
     && capabilities.manifestDigest === HRA_SESSION_PREAMBLE.manifestDigest);
   const process = store.readClaudeProcessAuthority({ runtimeScope: "managed", profileId: input.profileId,
     providerThreadId: session.providerThreadId ?? refused() });
-  requireThat(process !== null && process.sessionId === session.id && process.profileGeneration === generation
+  requireThat(process !== null && process.sessionId === session.id && process.providerAuthority?.processGeneration === generation
     && captured.processGeneration === generation && same(process.providerAuthority, captured)
     && ((process.state === "bound" && process.releasedAt === null && same(current.authority, captured))
       || (process.state === "released" && process.releasedAt !== null
@@ -510,7 +513,7 @@ const readRecords = (store: StateStore, input: ClaudeLiveAcceptanceReadbackLiveI
     && store.readMemoryWorkingAttestationFork(submission.workingBindingDigest) === null);
   const process = store.readClaudeProcessAuthority({ runtimeScope: "managed", profileId: r.profileId,
     providerThreadId: r.providerThreadId });
-  requireThat(process?.sessionId === r.sessionId && process.profileGeneration === r.profileGeneration
+  requireThat(process?.sessionId === r.sessionId && process.providerAuthority?.processGeneration === r.profileGeneration
     && process.state === (stopped ? "released" : "bound")
     && (stopped ? process.releasedAt !== null : process.releasedAt === null));
   if (process === null) return refused();

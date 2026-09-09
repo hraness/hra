@@ -2310,21 +2310,15 @@ describe("state-backed cloud daemon adapter", () => {
     ),
   );
 
-  test("rejects compact rows whose body, count, sequence, or turn identity changed", async () => {
-    for (const variant of ["body", "count", "sequence", "turn_id"] as const) {
-      const value = await fixture();
+  test.each(["body", "count", "sequence", "turn_id"] as const)(
+    "rejects compact rows whose body, count, sequence, or turn identity changed: %s",
+    (variant) => ownedCloudAdapterCase(async (value, { createAdapter, request, signal }) => {
       const cachePath = join(value.paths.root, "cloud-projection.sqlite");
-      let adapter = new StateBackedCloudDaemonAdapter({
-        readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
-        executeRemote: () => Promise.resolve({}),
-        paths: value.paths,
-        store: value.store,
-      });
+      let adapter = createAdapter();
+      await request(() => adapter.listSessions({ limit: 25, signal }));
+      await adapter.close();
+      const database = new Database(cachePath, { strict: true });
       try {
-        const signal = new AbortController().signal;
-        await adapter.listSessions({ limit: 25, signal });
-        await adapter.close();
-        const database = new Database(cachePath, { strict: true });
         if (variant === "body") {
           database.query(
             `UPDATE projection_turns
@@ -2350,30 +2344,23 @@ describe("state-backed cloud daemon adapter", () => {
             "UPDATE projection_turns SET turn_id='turn_tampered_0001' WHERE session_id=?",
           ).run(value.sessionId);
         }
-        database.close(false);
-        adapter = new StateBackedCloudDaemonAdapter({
-          readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
-          executeRemote: () => Promise.resolve({}),
-          paths: value.paths,
-          store: value.store,
-        });
-        await expect(adapter.readCompactEvents({
-          afterSequence: 0,
-          limit: 128,
-          sessionPublicId: value.sessionId,
-          signal,
-        })).rejects.toThrow("explicit, potentially history-discarding reseed");
-        expect(adapter.projectionCacheStatus()).toMatchObject({
-          affectedSessions: [value.sessionId],
-          code: "STREAM_RECOVERY_REQUIRED",
-          state: "degraded",
-        });
       } finally {
-        await adapter.close();
-        value.store.close();
+        database.close(false);
       }
-    }
-  });
+      adapter = createAdapter();
+      await expect(request(() => adapter.readCompactEvents({
+        afterSequence: 0,
+        limit: 128,
+        sessionPublicId: value.sessionId,
+        signal,
+      }))).rejects.toThrow("explicit, potentially history-discarding reseed");
+      expect(adapter.projectionCacheStatus()).toMatchObject({
+        affectedSessions: [value.sessionId],
+        code: "STREAM_RECOVERY_REQUIRED",
+        state: "degraded",
+      });
+    }),
+  );
 
   test("invalidates incremental ledger trust after an external SQLite commit", async () => {
     const value = await fixture();
@@ -3611,47 +3598,40 @@ describe("state-backed cloud daemon adapter", () => {
     }
   });
 
-  test("rejects symlink, hardlink, FIFO, and newer-version cache authority before staging recovery", async () => {
-    for (const variant of ["symlink", "hardlink", "fifo", "newer"] as const) {
-      const value = await fixture();
+  test.each(["symlink", "hardlink", "fifo", "newer"] as const)(
+    "rejects symlink, hardlink, FIFO, and newer-version cache authority before staging recovery: %s",
+    (variant) => ownedCloudAdapterCase(async (value, { createAdapter, request, signal }) => {
       const cachePath = join(value.paths.root, "cloud-projection.sqlite");
       if (variant === "symlink") {
-        await symlink("/dev/null", cachePath);
+        await request(() => symlink("/dev/null", cachePath));
       } else if (variant === "hardlink") {
         const source = join(value.paths.root, "projection-hardlink-source");
-        await writeFile(source, "unsafe cache authority", { mode: 0o600 });
-        await link(source, cachePath);
+        await request(() => writeFile(source, "unsafe cache authority", { mode: 0o600 }));
+        await request(() => link(source, cachePath));
       } else if (variant === "fifo") {
         execFileSync("mkfifo", [cachePath]);
       } else {
         const database = new Database(cachePath, { create: true, strict: true });
-        database.exec("PRAGMA user_version=6");
-        database.close(false);
-        await chmod(cachePath, 0o600);
+        try {
+          database.exec("PRAGMA user_version=6");
+        } finally {
+          database.close(false);
+        }
+        await request(() => chmod(cachePath, 0o600));
       }
-      const adapter = new StateBackedCloudDaemonAdapter({
-        readSessionProjectionForCloud: value.codex.readSessionProjectionForCloud,
-        executeRemote: () => Promise.resolve({}),
-        paths: value.paths,
-        store: value.store,
-      });
-      try {
-        const idempotencyKey = `00000000-0000-7000-8000-00000000070${
-          variant === "symlink" ? "4" : variant === "hardlink" ? "5" : variant === "fifo" ? "6" : "7"
-        }`;
-        await expect(adapter.planCompactProjectionRecovery({
-          idempotencyKey,
-          sessionPublicId: value.sessionId,
-          signal: new AbortController().signal,
-        })).rejects.toThrow("refuses unsafe cache authority");
-        expect((await readdir(value.paths.root)).some((name) =>
-          name.includes(`recovery-${idempotencyKey}`))).toBe(false);
-      } finally {
-        await adapter.close();
-        value.store.close();
-      }
-    }
-  });
+      const adapter = createAdapter();
+      const idempotencyKey = `00000000-0000-7000-8000-00000000070${
+        variant === "symlink" ? "4" : variant === "hardlink" ? "5" : variant === "fifo" ? "6" : "7"
+      }`;
+      await expect(request(() => adapter.planCompactProjectionRecovery({
+        idempotencyKey,
+        sessionPublicId: value.sessionId,
+        signal,
+      }))).rejects.toThrow("refuses unsafe cache authority");
+      expect((await request(() => readdir(value.paths.root))).some((name) =>
+        name.includes(`recovery-${idempotencyKey}`))).toBe(false);
+    }),
+  );
 
   test("migrates a legacy v1 cache without changing its stream meaning", async () => {
     const value = await fixture();

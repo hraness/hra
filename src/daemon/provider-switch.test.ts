@@ -6358,7 +6358,7 @@ describe("provider portability", () => {
     expect(value.codex.calls).toEqual(callsBeforeRestart.codex);
   });
 
-  test("retains active idle and unbound Claude ambiguity on daemon loss without provider replay", async () => {
+  test.each(["linux", "darwin"] as const)("retains active idle and unbound Claude ambiguity on daemon loss without provider replay (%s)", async (platform) => {
     const value = await fixture();
     const unrelated = await codexSession(value);
     const added = await value.service.execute(
@@ -6568,6 +6568,7 @@ describe("provider portability", () => {
       daemonAuthority: { assertCurrent: async () => {}, close: () => {} },
       daemonGeneration,
       paths: value.paths,
+      platform,
       requestStop: () => undefined,
       store: value.store,
     });
@@ -6598,10 +6599,17 @@ describe("provider portability", () => {
             ? { state: "not_applicable", reason: "unbound" }
             : { state: "recovery_required", code: "session_quarantined" },
         });
-      await expect(restarted.execute({ kind: "session.show", session: sessionId, detail: false }, { signal }))
-        .resolves.toMatchObject({
+      for (const detail of [false, true]) {
+        const shown = await restarted.execute({ kind: "session.show", session: sessionId, detail }, { signal });
+        expect(shown).toMatchObject({
           session: { state: "recovery_required" },
+          ...(sessionId === unbound.id ? {} : {
+            providerObservation: { state: "recovery_required", code: "session_quarantined" },
+            recovery: { required: true, cleared: false },
+          }),
         });
+        expect(shown).not.toHaveProperty("projection");
+      }
     }
     expect(value.claude.calls).toEqual(callsAfterCleanup);
     await expect(restarted.execute({ kind: "session.status", session: unrelated.sessionId }, { signal }))

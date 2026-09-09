@@ -5471,7 +5471,16 @@ describe("cloud daemon bridge", () => {
     test(`drains a legacy ${serverState} session command without a provider effect`, async () => {
       const cloud = new FakeCloud();
       const executor = new RecordingExecutor();
-      const journal = new MemoryCloudDaemonJournal();
+      const recordedCommands: CloudCommandJournalEntry[] = [];
+      const journal = new class extends MemoryCloudDaemonJournal {
+        override async compareAndSwap(
+          ...args: Parameters<MemoryCloudDaemonJournal["compareAndSwap"]>
+        ) {
+          const committed = await super.compareAndSwap(...args);
+          if (committed !== null) recordedCommands.push(...committed.state.commands);
+          return committed;
+        }
+      }();
       const sessionPublicId = `session_legacy_${serverState}`;
       cloud.heads.set(sessionPublicId, {
         compactHeadSequence: 0,
@@ -5521,6 +5530,8 @@ describe("cloud daemon bridge", () => {
       expect(result.commandsApplied).toBe(0);
       expect(executor.calls).toEqual([]);
       expect(cloud.commandEffectStartCalls).toEqual([]);
+      expect(recordedCommands.length).toBeGreaterThan(0);
+      expect(recordedCommands.every((entry) => entry.localAuthority === null)).toBe(true);
       expect(cloud.requireCommand(commandPublicId)).toMatchObject({
         resultCode: serverState === "effect_started"
           ? "LOCAL_EFFECT_RECOVERY_REQUIRED"

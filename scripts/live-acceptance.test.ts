@@ -204,6 +204,7 @@ const processGroupExists = (pid: number): boolean => {
 };
 
 const workerProofProfileId = `acct_${"1".repeat(32)}` as const;
+const workerProofProviderAccountId = `pact_${"1".repeat(32)}` as const;
 const workerProofProjectId = `proj_${"2".repeat(32)}` as const;
 const workerProofSessionId = `sess_${"3".repeat(32)}` as const;
 const workerProofStartKey = "00000000-0000-4000-8000-000000000421";
@@ -335,7 +336,8 @@ const claudeInjectedWorkerSource = (
     activeSession,
     candidate: descriptor.candidate,
     call: {
-      authority: { processGeneration: 7, profileId: workerProofProfileId },
+      authority: { processGeneration: 7, profileId: workerProofProfileId,
+        provider: "claude", providerAccountId: workerProofProviderAccountId, bindingGeneration: 1 },
       callId: workerProofCallId,
       connectionId: workerProofConnectionId,
       input: workerProofMemory,
@@ -349,6 +351,7 @@ const claudeInjectedWorkerSource = (
     memory: workerProofMemory,
     profile,
     profileId: workerProofProfileId,
+    providerAccountId: workerProofProviderAccountId,
     projectId: workerProofProjectId,
     rememberResult,
     runId: descriptor.runId,
@@ -409,7 +412,7 @@ const claudeInjectedWorkerSource = (
     "    });",
     '    if (command.kind === "session.send") {',
     "      const result = await proof.handleManagedHostToolCall({",
-    "        authority: { generation: 7, id: values.profileId },",
+    '        authority: { generation: 7, id: values.profileId, provider: "claude", providerAccountId: values.providerAccountId, bindingGeneration: 1 },',
     "        call: values.call,",
     "        dispatch: async () => values.rememberResult,",
     "      });",
@@ -1340,7 +1343,7 @@ describe("source-only live acceptance isolation", () => {
         workerProofSendKey,
         "--json",
       ]);
-      expect(sent.exitCode).toBe(0);
+      expect(sent).toMatchObject({ exitCode: 0, stderr: "" });
       expect(sent.stderr).toBe("");
       expect(sent.stdout).not.toContain("configHome");
       expect(sent.stdout).not.toContain(workerProofThreadId);

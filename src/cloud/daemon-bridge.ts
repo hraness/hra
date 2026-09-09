@@ -6487,6 +6487,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
             authority: authorityOf(lease),
             commandPublicId: command.publicId,
             kind: command.kind,
+            localAuthority: null,
             localAuthorityDigest: await sha256Hex(
               "hra-control-plane-cloud-command-legacy-request:v1",
             ),

@@ -30,7 +30,10 @@ Three jobs run `bun run test:source --shard=1/3`, `--shard=2/3` and
 those jobs, retaining serial tests and isolated file globals. The fourth job,
 `bun run check:ci-remainder`, runs every other command from `bun run check`,
 in its original order. All jobs retain the same pinned dependencies, complete
-governed Git history, Linux native verification and 20-minute job limit.
+governed Git history and Linux native verification. Source jobs have a finite
+40-minute job limit; the remainder and browser jobs retain their 20-minute
+limits. Every test retains its own deadline. The larger source allowance
+accommodates measured serial suite duration, not retries or skipped failures.
 The `Required` check succeeds only when all eight jobs and the separate
 compiled app/site browser job succeed.
 

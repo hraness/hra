@@ -137,6 +137,7 @@ const preserveHistory = async (
   fixture: FixtureIdentity,
   generator: string,
   assertHistory: (store: StateStore, captured: Snapshot) => void,
+  reopenModes: readonly boolean[] = [true, false, false, true],
 ): Promise<void> => {
   expect(fixture.sourceRevision).toBe(sourceRevision);
   expect(fixture.sourceTree).toBe(sourceTree);
@@ -185,7 +186,7 @@ const preserveHistory = async (
     // Opening a store is deliberately not a daemon boot, provider observation,
     // attachment read, or native process join. In particular it cannot consume
     // the retired fixture's unused synthetic joined-close receipt.
-    for (const readonly of [true, false, false, true]) {
+    for (const readonly of reopenModes) {
       const beforeBytes = hash(await readFile(paths.database));
       const store = new StateStore(paths, { readonly, now: () => migratedAt + 1, resolveMachineTimeZone: () => "UTC" });
       try {
@@ -229,7 +230,16 @@ const assertPinnedParent = (captured: Snapshot, attemptId: string, queueId: stri
   expect(tableRows(captured, "mutation_resolutions")).toEqual([]);
 };
 
-test("authentic combined49 preserves retained pins, a sealed queue, divergent Claude custody and exact usage through current RW/RO opens", async () => {
+// Each bounded case starts from the original archive and proves the complete
+// upgrade and unchanged-history oracle. Together these adjacent pairs retain
+// every transition in RO -> RW -> RW -> RO, including repeated writable opens.
+const adjacentReopenModes = {
+  "RO -> RW": [true, false],
+  "RW -> RW": [false, false],
+  "RW -> RO": [false, true],
+} as const;
+
+test.each(["RO -> RW", "RW -> RW", "RW -> RO"] as const)("authentic combined49 preserves retained pins, a sealed queue, divergent Claude custody and exact usage through current RW/RO opens (%s)", async (reopenPair) => {
   const archived = combined49Fixture;
   await preserveHistory(combined49DatabaseBytes(), archived, combined49GeneratorSource, (store, captured) => {
     const owner = store.readOwnedSessionSend(archived.ownerRequest.idempotencyKey);
@@ -264,7 +274,7 @@ test("authentic combined49 preserves retained pins, a sealed queue, divergent Cl
       expectCapturedEqual(store.readCodexUsageAuthorityMetadata(scope, archived.sourceProfileId, revision), value);
     }
     expectCapturedEqual(store.latestProviderUsage(archived.sourceAuthority.providerAccountId), archived.usage.projection);
-  });
+  }, adjacentReopenModes[reopenPair]);
 });
 
 test("authentic combined49 preserves a prepared exact switch capsule without creating target, release or seed effects", async () => {
@@ -302,7 +312,7 @@ test("authentic combined49 preserves a prepared exact switch capsule without cre
   });
 });
 
-test("authentic combined49 preserves Devin owner and login history plus unused synthetic close permission without booting", async () => {
+test.each(["RO -> RW", "RW -> RW", "RW -> RO"] as const)("authentic combined49 preserves Devin owner and login history plus unused synthetic close permission without booting (%s)", async (reopenPair) => {
   const archived = combined49RetiredFixture;
   await preserveHistory(combined49RetiredDatabaseBytes(), archived, combined49RetiredGeneratorSource, (store, captured) => {
     expectCapturedEqual(store.readOwnedSessionSend(archived.owner.request.idempotencyKey), archived.owner.history);
@@ -343,5 +353,5 @@ test("authentic combined49 preserves Devin owner and login history plus unused s
     // The captured close witness was supplied to storage synthetically. These
     // preservation reads neither validate OS custody nor consume its permission.
     expect(archived.joinedCloseNotice).toContain("synthetic");
-  });
+  }, adjacentReopenModes[reopenPair]);
 });

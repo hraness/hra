@@ -16663,6 +16663,18 @@ export class HraService {
         ),
       };
     }
+    if (session.provider === "claude" && session.state === "recovery_required") {
+      // A quarantined Claude process is not a transcript reader. Report its
+      // retained local authority without requiring readiness or resuming it.
+      return {
+        session,
+        effectiveRuntimeProfile: publicRuntimeProfile(
+          this.#store.latestSessionRuntimeProfile(session.id)?.profile,
+        ),
+        providerObservation: await this.#ensureSessionObservedLocked(session.id, signal),
+        recovery: { required: true, cleared: false },
+      };
+    }
     const providerThreadId = session.providerThreadId;
     const profile = this.#store.requireProfile(session.profileId);
     if (

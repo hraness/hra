@@ -316,14 +316,16 @@ type Fixture = Readonly<{
 
 const fixtures: Fixture[] = [];
 const fixtureRoots: string[] = [];
+const ownedCaseTeardowns: Array<() => Promise<void>> = [];
 
 afterEach(async () => {
+  for (const teardown of ownedCaseTeardowns.splice(0)) await teardown();
   for (const value of fixtures.splice(0)) value.store.close();
   await Promise.all(fixtureRoots.splice(0).map(async (root) =>
     await rm(root, { force: true, recursive: true })));
 });
 
-async function fixture(): Promise<Fixture> {
+async function fixture(registerStore?: (store: StateStore) => void): Promise<Fixture> {
   const home = await realpath(await mkdtemp(join(tmpdir(), "hra-work-service-")));
   fixtureRoots.push(home);
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
@@ -332,6 +334,7 @@ async function fixture(): Promise<Fixture> {
   await initializeStatePaths(paths);
   let observedAt = 10_000;
   const store = new StateStore(paths, { now: () => observedAt++ });
+  registerStore?.(store);
   const daemonBootId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
   const daemonGeneration = store.nextDaemonGeneration(daemonBootId);
   const runtime = new WorkRuntime();
@@ -394,6 +397,31 @@ async function fixture(): Promise<Fixture> {
   };
   fixtures.push(value);
   return value;
+}
+
+function ownedWorkServiceCase(runCase: (value: Fixture) => Promise<void>): Promise<void> {
+  let store: StateStore | undefined;
+  let value: Fixture | undefined;
+  const setup = Promise.resolve().then(() => fixture((created) => { store = created; }));
+  const caseTask = setup.then(async (created) => {
+    value = created;
+    await runCase(created);
+  });
+  // Each request is awaited by the case or its actor helpers. Join setup and
+  // that raw case before closing the service, storage, or temporary root.
+  const joined = Promise.allSettled([setup, caseTask]);
+  let teardownTask: Promise<void> | undefined;
+  const teardown = (): Promise<void> => {
+    teardownTask ??= joined.then(async () => {
+      if (value === undefined) store?.close();
+      else await value.service.close();
+    });
+    return teardownTask;
+  };
+  ownedCaseTeardowns.push(teardown);
+  const result = caseTask.finally(teardown);
+  void result.catch(() => undefined);
+  return result;
 }
 
 type Actor = Readonly<{
@@ -1499,9 +1527,9 @@ describe("HraService work protocol", () => {
     expect(value.runtime.endSessionCount).toBe(1);
   });
 
-  test("provider disconnect and service close atomically retire claimed, running, and recovery work", async () => {
-    for (const retirementMode of ["provider_disconnect", "service_close"] as const) {
-      const value = await fixture();
+  test.each(["provider_disconnect", "service_close"] as const)(
+    "provider disconnect and service close atomically retire claimed, running, and recovery work: %s",
+    (retirementMode) => ownedWorkServiceCase(async (value) => {
       const claimedActor = await createActor(value);
       const runningActor = await createSiblingActor(value, claimedActor);
       const recoveryActor = await createSiblingActor(value, claimedActor);
@@ -1582,8 +1610,8 @@ describe("HraService work protocol", () => {
           status: "unknown",
           revision: recoveryBefore?.revision,
         });
-    }
-  });
+    }),
+  );
 
   test("accepts queued and steered signals with exact nested receipts", async () => {
     const value = await fixture();

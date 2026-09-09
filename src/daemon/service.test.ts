@@ -95,6 +95,7 @@ import {
   storedAccountUsageSnapshotSchema,
 } from "../domain/usage-metrics";
 import { initializeStatePaths, profilePaths, resolveStatePaths } from "../storage/paths";
+import { resolveUsableCanonicalProjectDirectory } from "../storage/project-directory";
 import {
   InMemoryGatewayKeyStore,
   type GatewayKeyPort,
@@ -2267,13 +2268,16 @@ async function isolatedLoginCompletionFixture(provider: "claude") {
 }
 
 async function createIdleSession(
-  value: Awaited<ReturnType<typeof fixture>>,
+  value: Awaited<ReturnType<typeof fixture>> & {
+    execute?: (command: LocalCommand) => Promise<unknown>;
+  },
   label: string,
 ): Promise<{ sessionId: `sess_${string}` }> {
-  const added = await value.service.execute({ kind: "account.add", label }, { signal }) as { account: { id: string } };
-  await value.service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
-  await value.service.execute({ kind: "project.add", label: `${label} docs`, path: value.documents }, { signal });
-  const started = await value.service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+  const execute = value.execute ?? ((command: LocalCommand) => value.service.execute(command, { signal }));
+  const added = await execute({ kind: "account.add", label }) as { account: { id: string } };
+  await execute({ kind: "account.login", account: added.account.id, deviceCode: false });
+  await execute({ kind: "project.add", label: `${label} docs`, path: value.documents });
+  const started = await execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }) as { session: { id: `sess_${string}` } };
   return { sessionId: started.session.id };
 }
 
@@ -24047,45 +24051,54 @@ describe("HraService", () => {
     store.completeSessionTurnEffect = originalComplete;
   });
 
-  test("quarantines lost provider responses for send, steer, stop, and rename before another key can dispatch", async () => {
-    for (const operation of ["send", "steer", "stop", "rename"] as const) {
-      const { service, codex, documents, store } = await fixture();
-      const added = await service.execute({ kind: "account.add", label: `Lost ${operation}` }, { signal }) as { account: { id: string } };
-      await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
-      await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-      const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: string } };
-      if (operation === "steer" || operation === "stop") {
-        await service.execute({ kind: "session.send", session: started.session.id, message: "activate" }, { signal });
-      }
-      const lost = new IndeterminateCodexEffectError(`turn/${operation}`, 41);
-      if (operation === "send") codex.startTurnError = lost;
-      if (operation === "steer") codex.steerError = lost;
-      if (operation === "stop") codex.interruptError = lost;
-      if (operation === "rename") codex.renameError = lost;
-      const firstKey = `00000000-0000-4000-8000-0000000002${operation === "send" ? "01" : operation === "steer" ? "02" : operation === "stop" ? "03" : "04"}`;
-      const secondKey = `00000000-0000-4000-8000-0000000003${operation === "send" ? "01" : operation === "steer" ? "02" : operation === "stop" ? "03" : "04"}`;
-      const first = operation === "send"
-        ? { kind: "session.send" as const, session: started.session.id, message: "lost", idempotencyKey: firstKey }
-        : operation === "steer"
-          ? { kind: "session.steer" as const, session: started.session.id, message: "lost", idempotencyKey: firstKey }
-          : operation === "stop"
-            ? { kind: "session.stop" as const, session: started.session.id, idempotencyKey: firstKey }
-            : { kind: "session.rename" as const, session: started.session.id, name: "Lost", idempotencyKey: firstKey };
-      const second = operation === "send"
-        ? { kind: "session.send" as const, session: started.session.id, message: "different", idempotencyKey: secondKey }
-        : operation === "steer"
-          ? { kind: "session.steer" as const, session: started.session.id, message: "different", idempotencyKey: secondKey }
-          : operation === "stop"
-            ? { kind: "session.stop" as const, session: started.session.id, idempotencyKey: secondKey }
-            : { kind: "session.rename" as const, session: started.session.id, name: "Different", idempotencyKey: secondKey };
+  test.each(["send", "steer", "stop", "rename"] as const)(
+    "quarantines a lost %s provider response before another key can dispatch",
+    (operation) => {
+      const caseTask: Promise<void> = ownedServiceFixtureWithClose(async (value) => {
+        // Timeout cancellation joins the complete test continuation before
+        // service/store cleanup, including assertions after an admitted call.
+        await Promise.allSettled([caseTask]);
+        await value.service.close();
+      }).then(async ({ execute, codex, documents, store }) => {
+        const added = await execute({ kind: "account.add", label: `Lost ${operation}` }) as { account: { id: string } };
+        await execute({ kind: "account.login", account: added.account.id, deviceCode: false });
+        await execute({ kind: "project.add", label: "Docs", path: documents });
+        const started = await execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }) as { session: { id: string } };
+        if (operation === "steer" || operation === "stop") {
+          await execute({ kind: "session.send", session: started.session.id, message: "activate" });
+        }
+        const lost = new IndeterminateCodexEffectError(`turn/${operation}`, 41);
+        if (operation === "send") codex.startTurnError = lost;
+        if (operation === "steer") codex.steerError = lost;
+        if (operation === "stop") codex.interruptError = lost;
+        if (operation === "rename") codex.renameError = lost;
+        const firstKey = `00000000-0000-4000-8000-0000000002${operation === "send" ? "01" : operation === "steer" ? "02" : operation === "stop" ? "03" : "04"}`;
+        const secondKey = `00000000-0000-4000-8000-0000000003${operation === "send" ? "01" : operation === "steer" ? "02" : operation === "stop" ? "03" : "04"}`;
+        const first = operation === "send"
+          ? { kind: "session.send" as const, session: started.session.id, message: "lost", idempotencyKey: firstKey }
+          : operation === "steer"
+            ? { kind: "session.steer" as const, session: started.session.id, message: "lost", idempotencyKey: firstKey }
+            : operation === "stop"
+              ? { kind: "session.stop" as const, session: started.session.id, idempotencyKey: firstKey }
+              : { kind: "session.rename" as const, session: started.session.id, name: "Lost", idempotencyKey: firstKey };
+        const second = operation === "send"
+          ? { kind: "session.send" as const, session: started.session.id, message: "different", idempotencyKey: secondKey }
+          : operation === "steer"
+            ? { kind: "session.steer" as const, session: started.session.id, message: "different", idempotencyKey: secondKey }
+            : operation === "stop"
+              ? { kind: "session.stop" as const, session: started.session.id, idempotencyKey: secondKey }
+              : { kind: "session.rename" as const, session: started.session.id, name: "Different", idempotencyKey: secondKey };
 
-      await expect(service.execute(first, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
-      expect(store.requireSession(started.session.id)).toMatchObject({ state: "recovery_required" });
-      const providerCalls = codex.calls.filter((call) => call === operation).length;
-      await expect(service.execute(second, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
-      expect(codex.calls.filter((call) => call === operation)).toHaveLength(providerCalls);
-    }
-  });
+        await expect(execute(first)).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+        expect(store.requireSession(started.session.id)).toMatchObject({ state: "recovery_required" });
+        const providerCalls = codex.calls.filter((call) => call === operation).length;
+        await expect(execute(second)).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+        expect(codex.calls.filter((call) => call === operation)).toHaveLength(providerCalls);
+      });
+      void caseTask.catch(() => undefined);
+      return caseTask;
+    },
+  );
 
   test("quarantines a bound session when the session-start receipt cannot commit", async () => {
     const { service, codex, documents, store } = await fixture();
@@ -24248,7 +24261,7 @@ describe("HraService", () => {
   });
 
   test.each(["canonical33_effect_started", "canonical39_effect_started"] as const)(
-    "retains an authentic indeterminate start across boot without invented recovery authority (%s)",
+    "retains an authentic indeterminate start across boot, checking source authority only when its captured root is usable (%s)",
     async (scenario) => {
       const captured = canonicalSessionStartFixtures[scenario];
       const { service, codex, store, paths } = await fixture(
@@ -24273,20 +24286,63 @@ describe("HraService", () => {
         idempotencyKey: captured.idempotencyKey,
       };
       const before = serviceFixtureDatabaseSnapshot(paths.database);
-      await expect(service.execute(command, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
-      await expect(service.execute({
-        ...command, presetContract: captured.interpretedPresetContract === 1 ? 2 : 1,
-      }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
-      await expect(service.execute({
-        ...command, presetContract: captured.interpretedPresetContract,
-      }, { signal })).rejects.toMatchObject({
-        code: "RECOVERY_REQUIRED", details: { idempotencyKey: captured.idempotencyKey },
-      });
+      // The authentic capture retains its original /opt/homebrew project.
+      // Observe that exact path independently before invocation; never relocate
+      // historical authority or derive an expected refusal from the response.
+      const capturedRootUsable = await resolveUsableCanonicalProjectDirectory(captured.project.rootPath) !== null;
+      if (capturedRootUsable) {
+        await expect(service.execute(command, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+        await expect(service.execute({
+          ...command, presetContract: captured.interpretedPresetContract === 1 ? 2 : 1,
+        }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+        await expect(service.execute({
+          ...command, presetContract: captured.interpretedPresetContract,
+        }, { signal })).rejects.toMatchObject({
+          code: "RECOVERY_REQUIRED", details: { idempotencyKey: captured.idempotencyKey },
+        });
+      } else {
+        for (const requested of [
+          command,
+          { ...command, presetContract: captured.interpretedPresetContract === 1 ? 2 as const : 1 as const },
+          { ...command, presetContract: captured.interpretedPresetContract },
+        ]) {
+          await expect(service.execute(requested, { signal })).rejects.toMatchObject({
+            code: "UNAVAILABLE",
+            details: { nextCommand: "hra doctor", repair: "repair_or_select_project" },
+          });
+        }
+      }
       expect(serviceFixtureDatabaseSnapshot(paths.database)).toEqual(before);
       expectHistoricalValue(store.readMutation(captured.idempotencyKey)?.evidence, captured.mutation.evidence);
       expect(codex.calls).toEqual([]);
     },
   );
+
+  test("refuses new starts after the registered project root disappears without changing authority", async () => {
+    const { service, codex, documents, store, paths } = await fixture();
+    const added = await service.execute({ kind: "account.add", label: "Missing start root" }, { signal }) as {
+      account: { id: `acct_${string}` };
+    };
+    expect(store.setProfileState(added.account.id, 0, "signed_in", {
+      email: "missing-start-root@example.com", plan: "Plus",
+    })).toBe(true);
+    await service.execute({ kind: "project.add", label: "Missing root", path: documents }, { signal });
+    await rename(documents, `${documents}-unavailable`);
+    expect(await resolveUsableCanonicalProjectDirectory(documents)).toBeNull();
+    const before = serviceFixtureDatabaseSnapshot(paths.database);
+    for (const presetContract of [undefined, 2, 1] as const) {
+      await expect(service.execute({
+        kind: "session.start", account: added.account.id, preset: "high", fast: false,
+        ...(presetContract === undefined ? {} : { presetContract }),
+      }, { signal })).rejects.toMatchObject({
+        code: "UNAVAILABLE",
+        details: { nextCommand: "hra doctor", repair: "repair_or_select_project" },
+      });
+    }
+    expect(serviceFixtureDatabaseSnapshot(paths.database)).toEqual(before);
+    expect(store.listSessions()).toEqual([]);
+    expect(codex.calls).toEqual([]);
+  });
 
   test("refuses fresh absent or stale rebound sources before provider contact or mutation preparation", async () => {
     const { service, codex, documents, store } = await fixture();
@@ -24720,46 +24776,53 @@ describe("HraService", () => {
     }
   });
 
-  test("requires marked safe advancement for stop and rename recovery and strips internal provenance", async () => {
-    for (const operation of ["stop", "rename"] as const) {
-      const value = await fixture();
-      const { service, codex, store } = value;
-      const { sessionId } = await createIdleSession(value, `Marked ${operation}`);
-      if (operation === "stop") await service.execute({ kind: "session.send", session: sessionId, message: "activate" }, { signal });
-      codex.readProjection = { ...codex.readProjection, providerUpdatedAt: 10_000, providerTimestampUnit: "unix_milliseconds_v1" };
-      const key = crypto.randomUUID();
-      if (operation === "stop") codex.interruptError = new IndeterminateCodexEffectError("turn/interrupt", 63);
-      else codex.renameError = new IndeterminateCodexEffectError("thread/name/set", 64);
-      const command = operation === "stop"
-        ? { kind: "session.stop" as const, session: sessionId, idempotencyKey: key }
-        : { kind: "session.rename" as const, session: sessionId, name: "Recovered", idempotencyKey: key };
-      await expect(service.execute(command, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
-      expect(store.readMutation(key)?.evidence?.evidence).toMatchObject({ providerTimestampUnit: "unix_milliseconds_v1" });
-      const observed = codex.readProjection;
-      for (const invalid of [
-        { providerUpdatedAt: 10_000 }, { providerUpdatedAt: 9_999 },
-        { providerUpdatedAt: -1 }, { providerUpdatedAt: 10_000.5 },
-        { providerUpdatedAt: Number.MAX_SAFE_INTEGER + 1 },
-        { providerUpdatedAt: null }, { providerUpdatedAt: undefined },
-        { providerTimestampUnit: undefined }, { providerTimestampUnit: "unix_seconds" },
-      ]) {
-        // Foreign adapters can return invalid runtime values despite their local type.
-        codex.readProjection = { ...observed, ...invalid } as CodexSessionProjection;
-        await expect(service.execute({ kind: "session.recover", session: sessionId }, { signal }))
-          .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
-        expect(store.readMutation(key)?.state).toBe("ambiguous");
-      }
-      codex.readProjection = observed;
-      const recovered = await service.execute({ kind: "session.recover", session: sessionId }, { signal });
-      expect(recovered).toMatchObject({ recovery: { resolution: "proven_applied", providerEffectRetried: false } });
-      expect(recovered).not.toHaveProperty("projection.providerTimestampUnit");
-      expect(store.readMutation(key)?.resolution?.evidence).toMatchObject({ providerTimestampUnit: "unix_milliseconds_v1", providerUpdatedAt: 10_001 });
-      expect(codex.calls.filter((call) => call === operation)).toHaveLength(1);
-      expect(await service.execute({ kind: "session.show", session: sessionId, detail: false }, { signal }))
-        .not.toHaveProperty("projection.providerTimestampUnit");
-      expect(await service.readSessionProjectionForCloud(sessionId, signal)).not.toHaveProperty("providerTimestampUnit");
-    }
-  });
+  test.each(["stop", "rename"] as const)(
+    "requires marked safe advancement for %s recovery and strips internal provenance",
+    (operation) => {
+      const caseTask: Promise<void> = ownedServiceFixtureWithClose(async (value) => {
+        await Promise.allSettled([caseTask]);
+        await value.service.close();
+      }).then(async (value) => {
+        const { service, execute, codex, store } = value;
+        const { sessionId } = await createIdleSession(value, `Marked ${operation}`);
+        if (operation === "stop") await execute({ kind: "session.send", session: sessionId, message: "activate" });
+        codex.readProjection = { ...codex.readProjection, providerUpdatedAt: 10_000, providerTimestampUnit: "unix_milliseconds_v1" };
+        const key = crypto.randomUUID();
+        if (operation === "stop") codex.interruptError = new IndeterminateCodexEffectError("turn/interrupt", 63);
+        else codex.renameError = new IndeterminateCodexEffectError("thread/name/set", 64);
+        const command = operation === "stop"
+          ? { kind: "session.stop" as const, session: sessionId, idempotencyKey: key }
+          : { kind: "session.rename" as const, session: sessionId, name: "Recovered", idempotencyKey: key };
+        await expect(execute(command)).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+        expect(store.readMutation(key)?.evidence?.evidence).toMatchObject({ providerTimestampUnit: "unix_milliseconds_v1" });
+        const observed = codex.readProjection;
+        for (const invalid of [
+          { providerUpdatedAt: 10_000 }, { providerUpdatedAt: 9_999 },
+          { providerUpdatedAt: -1 }, { providerUpdatedAt: 10_000.5 },
+          { providerUpdatedAt: Number.MAX_SAFE_INTEGER + 1 },
+          { providerUpdatedAt: null }, { providerUpdatedAt: undefined },
+          { providerTimestampUnit: undefined }, { providerTimestampUnit: "unix_seconds" },
+        ]) {
+          // Foreign adapters can return invalid runtime values despite their local type.
+          codex.readProjection = { ...observed, ...invalid } as CodexSessionProjection;
+          await expect(execute({ kind: "session.recover", session: sessionId }))
+            .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+          expect(store.readMutation(key)?.state).toBe("ambiguous");
+        }
+        codex.readProjection = observed;
+        const recovered = await execute({ kind: "session.recover", session: sessionId });
+        expect(recovered).toMatchObject({ recovery: { resolution: "proven_applied", providerEffectRetried: false } });
+        expect(recovered).not.toHaveProperty("projection.providerTimestampUnit");
+        expect(store.readMutation(key)?.resolution?.evidence).toMatchObject({ providerTimestampUnit: "unix_milliseconds_v1", providerUpdatedAt: 10_001 });
+        expect(codex.calls.filter((call) => call === operation)).toHaveLength(1);
+        expect(await execute({ kind: "session.show", session: sessionId, detail: false }))
+          .not.toHaveProperty("projection.providerTimestampUnit");
+        expect(await service.readSessionProjectionForCloud(sessionId, signal)).not.toHaveProperty("providerTimestampUnit");
+      });
+      void caseTask.catch(() => undefined);
+      return caseTask;
+    },
+  );
 
   test("causally reconciles a lost send by exact client id within one provider timestamp tick", async () => {
     const { service, codex, documents, store } = await fixture();

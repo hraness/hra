@@ -272,6 +272,34 @@ test("upgrades exact released v0.5.0 state and restores the whole root for downg
         revision: 1,
         session_id: manifest.state.expectedRows.sessions[0]?.id,
       });
+      // Migration preserves unsealed legacy input for an explicit recovery
+      // decision; it must neither silently settle it nor mint dispatch proof.
+      expect(inspector.query(
+        "SELECT * FROM queue_attachment_quarantines ORDER BY queue_id,ordinal",
+      ).all()).toEqual(manifest.state.expectedRows.queueEntries.map((entry) => ({
+        queue_id: entry.id,
+        ordinal: 1,
+        session_id: entry.session_id,
+        kind: "quarantined",
+        predecessor: null,
+        expected_session_revision: null,
+        reason: "legacy_identity_unproved",
+        recorded_at: 1_800_000_000_000,
+      })));
+      expect(inspector.query("SELECT * FROM queue_attachment_identities").all()).toEqual([]);
+      expect(inspector.query("SELECT * FROM queue_attachment_identity_anchors").all()).toEqual([]);
+      const dispatchStore = new StateStore(paths, { now: () => 1_800_000_000_000 });
+      try {
+        const beforeDispatch = inspector.serialize();
+        for (const entry of manifest.state.expectedRows.queueEntries) {
+          expect(dispatchStore.hasUnsettledQueueAttachmentQuarantineForSession(entry.session_id)).toBe(true);
+          expect(() => dispatchStore.transitionQueue(entry.id, "pending", "dispatching"))
+            .toThrow("QUEUE_ATTACHMENT_IDENTITY_UNPROVED");
+        }
+        expect(inspector.serialize()).toEqual(beforeDispatch);
+      } finally {
+        dispatchStore.close();
+      }
     } finally {
       inspector.close(false);
     }
@@ -286,11 +314,6 @@ test("upgrades exact released v0.5.0 state and restores the whole root for downg
       migrations: manifest.state.expectedRows.migrations,
     }).toEqual({
       ...manifest.state.expectedRows,
-      queueEntries: manifest.state.expectedRows.queueEntries.map((entry) => ({
-        ...entry,
-        message: "[queue message removed after settlement]",
-        state: "cancelled",
-      })),
       sessions: manifest.state.expectedRows.sessions.map((session) => ({
         ...session,
         revision: session.revision + 1,

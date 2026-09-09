@@ -18,8 +18,9 @@ jobs:
     name: Check (${{ matrix.os }}, ${{ matrix.gate }})
     runs-on: ${{ matrix.os }}
     # Source shards and the ordered remainder cover the complete gate while
-    # retaining every phase's own bounded deadline.
-    timeout-minutes: 20
+    # retaining every test's own deadline. The measured serial source suites
+    # need a larger finite job budget than the ordered remainder.
+    timeout-minutes: ${{ matrix.gate == 'remainder' && 20 || 40 }}
     strategy:
       fail-fast: false
       matrix:

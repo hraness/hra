@@ -542,6 +542,7 @@ describe("Claude stream client", () => {
   test("continues draining stderr after the bounded diagnostic count is reached", async () => {
     const process = new FakeClaudeProcess();
     const facts: ClaudeFact[] = [];
+    const completed = Promise.withResolvers<undefined>();
     let yieldedChunks = 0;
     const chunkCount = 32;
     let releaseDrain: (() => void) | undefined;
@@ -554,8 +555,17 @@ describe("Claude stream client", () => {
           yield new Uint8Array(4 * 1024);
         }
         process.emit({
+          claude_code_version: "2.1.260",
+          model: "claude-fable-5-1",
+          permissionMode: "default",
+          session_id: "sess",
+          subtype: "init",
+          tools: [],
+          type: "system",
+        }, {
           duration_ms: 1,
           is_error: false,
+          modelUsage: {},
           num_turns: 1,
           result: "done after stderr",
           session_id: "sess",
@@ -563,6 +573,7 @@ describe("Claude stream client", () => {
           terminal_reason: "completed",
           type: "result",
           usage: {},
+          uuid: "00000000-0000-4000-8000-000000000003",
         });
       },
     };
@@ -578,18 +589,29 @@ describe("Claude stream client", () => {
     };
     const client = new ClaudeStreamClient({
       configDir: CONFIG_DIR,
-      onFact: (fact) => { facts.push(fact); },
+      onFact: (fact) => {
+        facts.push(fact);
+        if (fact.type === "turnCompleted") completed.resolve(undefined);
+      },
       onSafeDiagnostic: (message) => diagnostics.push(message),
       process: drainingProcess,
     });
 
-    await client.startTurn({ message: "work", turnId: "turn-stderr" });
-    releaseDrain?.();
-    await settle();
-    expect(yieldedChunks).toBe(chunkCount);
-    expect(facts.some((fact) => fact.type === "turnCompleted")).toBe(true);
-    process.end();
-    await client.close();
+    const deadline = setTimeout(() => completed.reject(new Error("stderr drain did not complete the turn")), 1_000);
+    try {
+      await client.startTurn({ message: "work", turnId: "turn-stderr" });
+      releaseDrain?.();
+      // Completion is causally after the last stderr chunk, not a guessed
+      // number of microtasks or a timer turn on one JavaScript runtime.
+      await completed.promise;
+      expect(yieldedChunks).toBe(chunkCount);
+      expect(facts.some((fact) => fact.type === "turnCompleted")).toBe(true);
+    } finally {
+      clearTimeout(deadline);
+      releaseDrain?.();
+      process.end();
+      await client.close();
+    }
     expect(diagnostics).toEqual(["claude stderr bytes: 4096+"]);
   });
 

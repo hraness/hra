@@ -50,6 +50,75 @@ and global installation, PTY and daemon-lifecycle check is not reused as final
 acceptance for these changed bytes. No passing final CI, protected merge, usage
 release or deployment is claimed by this checkpoint.
 
+The September 9 candidate `aad5c240621af2d227492406d1c382b9f2918cb2`,
+tree `cd35c5784324624076fefa85cbe273d34fefd94a`, passed fresh isolated
+package installation and compiled browser acceptance, including local/global
+installation, PTY and owned daemon lifecycle. CI run `34309357688`, attempt 1,
+checked the same tree through merge candidate
+`232ec93991b35af56bb0784f8516869dda9502a4` on main
+`4d4447a99bb08b3469e620f7f179b9a7d3e8bf62`. The separate browser job passed,
+but Required failed: the source and script suites exposed stale fixtures,
+two recovery-path defects and job-wide time exhaustion. Tests were still
+progressing when the four source-1/source-2 jobs reached their 20-minute cap.
+That observation does not dismiss their actual assertion failures or admit a
+deadline change without independent coverage review.
+
+Independent coverage review approved increasing only the six source jobs to
+a finite 40-minute allowance. The remainder and browser retain 20 minutes;
+Required retains five minutes. All eight matrix jobs, both operating systems,
+the separate browser job, exact commands, governed history and native checks
+remain unchanged, as do individual test deadlines and failure propagation.
+In the observed run, macOS completed 568 service cases in 1,041 seconds before
+reaching the remaining source-2 files. Ubuntu was still running that file at
+the job cutoff. Source-1 likewise reached only part of StateStore on both
+systems. The last completed tests preceded cancellation by 0.67 to 2.68
+seconds. These measurements justify more aggregate time, not an assertion
+that every suite will finish within 40 minutes or a performance acceptance.
+The unchanged coverage and failure-propagation contract suite passes 28 tests
+with 945 assertions against the reviewed deadline policy. Fresh complete
+matching CI must prove the final candidate.
+
+The repair in progress preserves legacy command disposition as explicitly
+non-executable null authority, and reports a quarantined bound Claude session
+from retained local authority before readiness, platform or provider access.
+The latter regression failed on Linux and passed on Darwin before the repair;
+both platform cases then passed without provider replay. The private Claude
+readback also compared the retained legacy profile counter with a provider
+generation. Its three comparisons now use the independently verified custody
+tuple, preserving full identity, lifecycle, snapshot and process checks.
+The corrected readback suite passes all 47 tests with 161 assertions, including
+divergent counters and unchanged custody across a sibling Codex advancement.
+These are isolated automated proofs, not live provider qualification.
+
+Independent reviews approved the authority repairs and the bounded test-case
+splits. Each split retains its assertions and original per-test deadline;
+owned teardown in the asynchronous service, cloud and memory cases joins work
+before closing storage. The full cloud
+bridge, journal and canonical-memory suites pass 287 tests with 2,464
+assertions. The direct-send manifest and released-state suites pass 32 tests
+with 316 assertions; the selected cloud, memory and Work cases pass 19 tests
+with 73 assertions. Historical captures remain unchanged. Exact rollback
+faults retain complete no-write assertions and successful admission after
+removing the injected trigger. The final service slice passes seven tests with
+97 assertions, preserving the exact historical root while proving unavailable
+root refusal separately. The complete isolated worker suite passes 53 tests
+with 589 assertions, and both platform recovery cases pass with 124 assertions
+across both detail modes. Fresh typecheck, installer pins, all 47 security
+inventory files, Effect architecture and current repository adoption pass.
+
+Independent actual-archive inspection proves only the service and bridge
+changed from the preceding artifact, by 566 and 34 bytes; the other 212
+published files remain byte-identical. The reviewed inventory retains 223
+entries and 11,081 canonical bytes with digest
+`97d355b56cecc48be0058aa522d3267a0f2d696363430fe25ba1ab24adb4b633`.
+This is checkpoint evidence, not final acceptance. Governed main subsequently
+advanced to `041a06a16015ff8b270a413b8c10ab9ca89e4ca2`, incorporating read-only
+exact default-profile display and shared semantic themes. That incoming join
+requires its own reviewed contracts and frozen dependencies. The changed
+source invalidates earlier final browser and installation receipts. A fresh
+joined archive, exact-tree final gates, protected merge, immutable release
+admission and applicable deployment evidence remain required.
+
 The September 8 integration checkpoints now include canonical main through
 schema 50 at `ab56d3bc5034abedd12a20b5b405caf42bfa174f`, then the clean
 release-policy join at `9d6e2e12a42215e9201ae2ed3f64ed1b41e5c47d`, tree
