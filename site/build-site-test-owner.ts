@@ -83,11 +83,19 @@ export function createSiteCompilerCase(sourceRoot: string, dependencies: Readonl
       let result;
       try { result = requireBoundedProcessCleanup(collected); }
       catch (error: unknown) { cleanupUnproven = true; lateFailures.push(error); throw error; }
-      const processFailure = (error?: unknown): Error => new Error("SITE_COMPILER_PROCESS_FAILED", { cause: {
-        exitCode: result.exitCode, stdout: result.stdout.toString("utf8"), stderr: result.stderr.toString("utf8"), error,
-      } });
+      const processFailure = (
+        stage: "output_bound" | "terminal_invalid" | "terminal_exit_mismatch",
+        terminalStatus?: "success" | "failure",
+        error?: unknown,
+      ): Error => {
+        const exitCode = Number.isSafeInteger(result.exitCode) && result.exitCode >= 0 && result.exitCode <= 255
+          ? String(result.exitCode) : "invalid";
+        return new Error(`SITE_COMPILER_PROCESS_FAILED stage=${stage} exit_code=${exitCode} terminal=${terminalStatus ?? "unparsed"} stdout_bytes=${String(result.stdout.byteLength)} stderr_bytes=${String(result.stderr.byteLength)}`, { cause: {
+          exitCode: result.exitCode, stdout: result.stdout.toString("utf8"), stderr: result.stderr.toString("utf8"), error,
+        } });
+      };
       if (result.stdout.byteLength + result.stderr.byteLength >= request.outputMaximumBytes) {
-        throw processFailure();
+        throw processFailure("output_bound");
       }
       // A valid real builder failure wins over cancellation. Transport/cleanup
       // errors never masquerade as the expected malformed-input oracle.
@@ -97,7 +105,7 @@ export function createSiteCompilerCase(sourceRoot: string, dependencies: Readonl
       try { terminal = readSiteTestBuildTerminal(result.stdout); }
       catch (error: unknown) {
         if (controller.signal.aborted && (result.exitCode === 124 || result.exitCode === 130)) controller.signal.throwIfAborted();
-        throw processFailure(error);
+        throw processFailure("terminal_invalid", undefined, error);
       }
       if (terminal.status === "failure" && result.exitCode === 1) {
         const error = new Error(terminal.message);
@@ -105,7 +113,7 @@ export function createSiteCompilerCase(sourceRoot: string, dependencies: Readonl
         if (terminal.stack !== undefined) error.stack = terminal.stack;
         throw error;
       }
-      if (terminal.status !== "success" || result.exitCode !== 0) throw processFailure();
+      if (terminal.status !== "success" || result.exitCode !== 0) throw processFailure("terminal_exit_mismatch", terminal.status);
       checkpoint();
       return terminal.mismatches;
     });
