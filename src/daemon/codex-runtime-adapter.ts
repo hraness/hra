@@ -1065,7 +1065,8 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
 
   async startSession(input: { authority: ProfileAuthority; hostCapabilities?: "current" | "historical_v1"; projectRoot?: string; review: RuntimeStartReview; signal: AbortSignal }): Promise<CodexSessionProjection & { effectiveRuntimeProfile: EffectiveRuntimeProfile }> {
     return await this.#admit(async () => {
-      if (input.hostCapabilities !== undefined && input.hostCapabilities !== "current" && input.hostCapabilities !== "historical_v1") {
+      const hostCapabilityInput: { readonly hostCapabilities?: unknown } = input;
+      if (hostCapabilityInput.hostCapabilities !== undefined && hostCapabilityInput.hostCapabilities !== "current" && hostCapabilityInput.hostCapabilities !== "historical_v1") {
         throw new CodexError("INVALID_INPUT", "The session host-capability mode is invalid");
       }
       if (input.projectRoot === undefined) throw new Error("A project directory is required before starting a session.");

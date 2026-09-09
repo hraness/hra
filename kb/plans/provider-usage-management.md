@@ -24,11 +24,31 @@ remain dormant. Phases 6 through 9 are not complete.
 The next artifact candidate is `v0.8.0`: provider-qualified cached account
 listing and explicit `usage auto` policy controls add public contracts beyond
 `v0.7.0`. Candidate preparation does not admit the artifact or enable automatic
-movement. The independently reviewed main join is committed as
-`7440b6e3ab0e9e45466e6b2bf8544459badf4ecb`, tree
-`6634bacf0af1367b392eadb1d907ea223e9f8424`. Frozen installation, joined tests,
-independent package-inventory review, the exact-tree aggregate and separate
-browser gate, protected merge and immutable release admission remain pending.
+movement. The independently reviewed delivery-policy join is committed as
+`13ea56ce8f3c908e167a1694d858803eed142d70`, tree
+`dfb4e3e92101b14f203489bd80bfc53fe7f93776`, incorporating main
+`4d4447a99bb08b3469e620f7f179b9a7d3e8bf62`. Frozen dependency installation,
+joined fixture and plugin checks, CI-equivalence and browser-handoff contracts,
+and independent actual-archive review passed for their recorded inputs. Fresh
+complete exact-candidate CI, local browser and isolated installation acceptance,
+protected merge and immutable release admission remain required.
+
+PR 140 now carries the foundation candidate. Its first updated CI run,
+`34308421494`, passed compiled browser acceptance but exposed a static-type lint
+error in the Codex start-session host-capability guard. The repair preserves
+the foreign-value rejection before consuming a runtime review or dispatching a
+provider operation. It uses the existing Claude adapter's validation-only
+unknown-valued view rather than deleting the guard or changing the public mode
+union. Scoped lint and three boundary regressions pass with 61 assertions.
+Independent review of the fresh archive proves only that adapter changed by
+124 bytes; the other 213 packaged files remain byte-identical. The reviewed
+inventory retains 223 entries and 11,081 canonical bytes with digest
+`d207841ca7d6969001b536ec686e75165b8b58816781fd81c57e155689f60b46`.
+Package-policy tests pass 11 cases with 42 assertions. Fresh exact-candidate
+validation remains required; the previous archive's successful isolated local
+and global installation, PTY and daemon-lifecycle check is not reused as final
+acceptance for these changed bytes. No passing final CI, protected merge, usage
+release or deployment is claimed by this checkpoint.
 
 The September 8 integration checkpoints now include canonical main through
 schema 50 at `ab56d3bc5034abedd12a20b5b405caf42bfa174f`, then the clean
@@ -36,8 +56,8 @@ release-policy join at `9d6e2e12a42215e9201ae2ed3f64ed1b41e5c47d`, tree
 `78189f73fd35407b433b9a8009a23e8f1c5f5cb3`. The reviewed runtime and historical
 fixture repairs are committed as `4c252d72b5e9f3a90e1897bfd36889a7f3f985a3`,
 tree `313d85318b3533632601f07436b1cfde8d2bd862`. Integration and delivery gates
-remain incomplete. PR 140 remains a draft at `8f05930`; no
-protected-branch merge, usage release or production deployment is claimed.
+remain incomplete. The earlier PR 140 draft at `8f05930` is superseded by the
+foundation candidate above; its successful checks remain historical evidence.
 Earlier exact-tree checks do not cover this integration. Canonical schema 50
 is now governed by PR 151's merge at
 `d5376e34dcf2ace99009fd6eeaed3dcae917bcca`, tree
@@ -59,17 +79,23 @@ verification complete. That successor is included in the current join and does n
 republish the immutable baseline artifact. This is not usage delivery. A later usage release must own
 its own version, exact-source checks, protected merge and artifact admission.
 
-The latest scoped main fetch confirms
+The preceding scoped main join included
 `5027d21d8e4a128f87f2a78810b3f23929404061`, the separate custody-scoped
-attention-key installer after StyleX successor `3da9744`, is the exact current
-join parent. Independent review found no storage or service implementation
+attention-key installer after StyleX successor `3da9744`. Independent review
+found no storage or service implementation
 delta in either successor. The installer requires its own operational handoff
 and does not activate attention or clear hosted capacity gates. The reviewed
 test-fixture resolution preserves registered cleanup, daemon-generation
 authority and the explicitly expected Claude custody refusal without a generic
-catch. Its joined runtime checks remain pending. Frozen dependency installation, the scoped app/site
-test commands and the new separate browser acceptance gate are required in
-addition to the unchanged aggregate check.
+catch. The selected service cases passed. A stale retired-Devin fixture was
+replaced with authentic canonical-39 source history and explicitly separate
+synthetic compact-cache input, preserving immutable source rows and zero
+provider or command effects. The joined retired-provider and four actor cases
+passed five tests with 32 assertions. Plugin checks passed 108 tests with 421
+assertions, and repository adoption was current. CI coverage and handoff checks
+passed 36 tests with 2,593 assertions. Phase 10 now explicitly follows the
+independently reviewed complete-CI source policy while retaining separate local
+browser, native, coupled-run, installation and operational acceptance.
 
 Independent review of the complete seven-file production repair diff against
 `9d6e2e12a42215e9201ae2ed3f64ed1b41e5c47d` found no actionable issues. It
