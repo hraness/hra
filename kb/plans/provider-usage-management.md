@@ -255,6 +255,57 @@ The successor still requires fresh exact-head installation and compiled browser
 acceptance and complete current-base CI. These local results do not establish
 merge, release, deployment, live provider qualification or daemon activation.
 
+The schema-inventory successor is pushed as
+`82637bb9a5423adffb5185dc175fd74eb5dd2c89`, tree
+`f6220f505012fca90ae5fa6a40703bf632318c0f`. Its exact archive passes fresh
+isolated local/global installation, restored PTY and owned daemon lifecycle.
+CI run `34361757449`, attempt 1, checks the same tree through synthetic merge
+`107fdec265f9587fbb805b1986df278ef6d3fd0d` on main
+`13325ffa8e16a61897c90012b85cede588f6bca4`. The browser and five
+source shards pass. macOS remainder and source shard three expose further
+five-second fixture/proof timeouts with late cleanup races. Ubuntu remainder
+passes all script, plugin, hosted, site and app tests and builds, then refuses
+one generated Git hunk heading. All jobs finished without job-wide timeout;
+Required failed. The complete failure inventory governs the next repair.
+
+The history refusal is Git's 80-byte truncation of an allowed public package
+name in duplicated function-heading metadata. The reviewed repair preserves
+raw historical hash receipts, scans sensitive text before any projection,
+and removes trailing heading text only from canonical two-sided hunk headers.
+Literal-LF splitting and leaving carriage-return and Unicode-separator lines
+unprojected keep authored lines intact. All additions, removals, context, paths,
+root commits, merge resolutions and complete governed ancestry remain scanned.
+No scope allowlist or commit-specific exception changes. The initial regression
+reproduced two failures; all six final cases pass with 96 assertions, and the
+16 existing history contracts pass with 406 assertions. The exact previously
+rejected synthetic merge also passes a complete history scan with the repaired
+scanner. Independent source review and focused lint pass. This changes artifact
+validation, not provider behavior or operational activation.
+
+The converged test repairs preserve every original ordered assertion and
+production source. Private owners observe and drain the exact raw setup and
+proof tasks before closing services, stores or roots, preserving genuine late
+failures and retaining storage if service shutdown is unproved. Coupled seed,
+uncertain-peer, readback and prose-budget proofs remain whole five-second
+tests; only fresh fixture/session preparation receives an explicit separate
+five-second setup allowance. The sibling-recovery actor and target scenarios
+become independent owned cases, with cancellation releasing the recovery gate
+even before entry. Publication-boundary regressions cover cancellation between
+request completion and setup-state publication.
+
+Independent source and assertion-equivalence review approves the repairs.
+The final service slice passes 46 cases with 274 assertions, including all
+owned callers, seven lifecycle regressions, both sibling scenarios and the
+complete prose family. The switch slice passes seven cases with 46 assertions;
+the readback slice passes 21 with 142. Scoped lint and whitespace checks pass.
+The first integration typecheck exposed test-only promise-matcher typing
+errors. Explicit identity-matcher types and asynchronous matcher callbacks
+preserve the runtime assertions; their focused checks, lint and fresh final
+integration typecheck pass. The reviewed archive bytes are unchanged.
+Exact-head Required CI, isolated installation and compiled browser acceptance
+remain required before protected merge; release and operational gates stay
+separate.
+
 The September 8 integration checkpoints now include canonical main through
 schema 50 at `ab56d3bc5034abedd12a20b5b405caf42bfa174f`, then the clean
 release-policy join at `9d6e2e12a42215e9201ae2ed3f64ed1b41e5c47d`, tree

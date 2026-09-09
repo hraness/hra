@@ -78,6 +78,21 @@ function createOwnedReadbackCase() {
   };
 }
 
+function runOwnedReadbackSetup<T>(
+  owner: ReturnType<typeof createOwnedReadbackCase>,
+  setup: () => Promise<T>,
+  publish: (value: T) => void,
+): Promise<void> {
+  // Return the exact observed task. An async hook awaiting this promise would
+  // create another, unobserved promise that could reject after Bun timed out.
+  return owner.run(async () => {
+    const value = await owner.request(setup);
+    // Cancellation may run between request resolution and this continuation.
+    // The new request checks synchronously before invoking the publication.
+    await owner.request(async () => { publish(value); });
+  });
+}
+
 const ownedReadbackCases: Array<ReturnType<typeof createOwnedReadbackCase>> = [];
 afterEach(async () => {
   // Capture this case's owners before awaiting anything. A timed-out teardown
@@ -104,6 +119,121 @@ describe("owned readback case lifecycle", () => {
     await closing;
     await expect(setup).rejects.toThrow("Owned readback case is closing.");
     expect(opened).toBe(false);
+  });
+
+  test.each(["cancellation", "late failure"] as const)(
+    "returns the observed setup task and preserves %s without publishing late state",
+    async (outcome) => {
+      const owner = createOwnedReadbackCase();
+      const nextOwner = createOwnedReadbackCase();
+      const entered = Promise.withResolvers<undefined>();
+      const release = Promise.withResolvers<undefined>();
+      const lateFailure = new Error("late fixture creation failure");
+      const events: string[] = [];
+      let published = false;
+      let rawTask: Promise<unknown> | undefined;
+      const observedOwner = {
+        ...owner,
+        run: <T>(operation: () => Promise<T>): Promise<T> => {
+          const task = owner.run(operation);
+          rawTask = task;
+          return task;
+        },
+      };
+      nextOwner.registerCleanup(async () => { events.push("close-next-case"); });
+      const hook = () => runOwnedReadbackSetup(observedOwner, async () => {
+        entered.resolve(undefined);
+        await release.promise;
+        owner.registerCleanup(async () => { events.push("close-late-resource"); });
+        if (outcome === "late failure") throw lateFailure;
+        return "prepared";
+      }, () => { published = true; });
+      const task = hook();
+      expect<Promise<unknown> | undefined>(task).toBe(rawTask);
+      await entered.promise;
+      const closing = owner.close().catch((error: unknown) => error);
+      await Promise.resolve();
+      expect(events).toEqual([]);
+      release.resolve(undefined);
+      if (outcome === "late failure") {
+        await expect(task).rejects.toBe(lateFailure);
+        const error = await closing;
+        expect(error).toBeInstanceOf(AggregateError);
+        if (!(error instanceof AggregateError)) throw new Error("Expected the original late fixture failure.");
+        expect(error.errors).toEqual([lateFailure]);
+      } else {
+        await expect(task).rejects.toThrow("Owned readback case is closing.");
+        expect(await closing).toBeUndefined();
+      }
+      expect(published).toBe(false);
+      expect(events).toEqual(["close-late-resource"]);
+      await nextOwner.close();
+      expect(events).toEqual(["close-late-resource", "close-next-case"]);
+    },
+  );
+
+  test("drains a paused negative readback and its probe assertions before closing storage", async () => {
+    const owner = createOwnedReadbackCase();
+    const entered = Promise.withResolvers<undefined>();
+    const release = Promise.withResolvers<undefined>();
+    const refusal = new Error("expected final-probe readback refusal");
+    const events: string[] = [];
+    let storageClosed = false;
+    let probes = 0;
+    owner.registerCleanup(async () => { storageClosed = true; events.push("close-storage"); });
+    const task = owner.run(async () => {
+      await owner.request(async () => {
+        const readback = (async () => {
+          entered.resolve(undefined);
+          await release.promise;
+          expect(storageClosed).toBe(false);
+          probes = 2;
+          throw refusal;
+        })();
+        await expect(readback).rejects.toBe(refusal);
+        expect(probes).toBe(2);
+        events.push("assertions-complete");
+      });
+      events.push("continued-after-close");
+    });
+    await entered.promise;
+    const closing = owner.close();
+    await Promise.resolve();
+    expect(storageClosed).toBe(false);
+    release.resolve(undefined);
+    await closing;
+    await expect(task).rejects.toThrow("Owned readback case is closing.");
+    expect(events).toEqual(["assertions-complete", "close-storage"]);
+  });
+
+  test("cancels between setup request completion and publication without publishing", async () => {
+    const owner = createOwnedReadbackCase();
+    const boundary = Promise.withResolvers<undefined>();
+    let closing: Promise<void> | undefined;
+    let observedSetup = false;
+    let published = false;
+    const observedOwner = {
+      ...owner,
+      request: <T>(operation: () => Promise<T>): Promise<T> => {
+        const task = owner.request(operation);
+        if (!observedSetup) {
+          observedSetup = true;
+          // This reaction is registered before the helper awaits the same
+          // promise, after the request's own post-operation cancellation check.
+          void task.then(() => {
+            closing = owner.close();
+            boundary.resolve(undefined);
+          }, (error: unknown) => { boundary.reject(error); });
+        }
+        return task;
+      },
+    };
+    const task = runOwnedReadbackSetup(observedOwner, async () => "prepared", () => { published = true; });
+    await boundary.promise;
+    await expect(task).rejects.toThrow("Owned readback case is closing.");
+    if (closing === undefined) throw new Error("Expected cancellation at the publication boundary.");
+    await closing;
+    expect(published).toBe(false);
   });
 
   test.each(["setup", "test"] as const)("joins paused raw %s work before its late-registered cleanup", async (phase) => {
@@ -493,14 +623,15 @@ describe("independent Claude private readback", () => {
 
   describe("coupled live-to-stopped readback", () => {
     let prepared: Readonly<{ owner: ReturnType<typeof createOwnedReadbackCase>; fixture: Awaited<ReturnType<typeof fixture>> }> | undefined;
-    beforeEach(async () => {
+    beforeEach(() => {
       prepared = undefined;
       const owner = createOwnedReadbackCase();
       ownedReadbackCases.push(owner);
-      const value = await owner.run(async () => await fixture(owner.registerCleanup));
-      prepared = { owner, fixture: value };
       // A separate, fresh 5-second setup budget is deliberate. The complete
       // same-oracle live-to-stopped proof still has one 5-second test deadline.
+      return runOwnedReadbackSetup(owner, () => fixture(owner.registerCleanup), (value) => {
+        prepared = { owner, fixture: value };
+      });
     }, 5_000);
 
     test("corroborates real durable rows and exact artifacts before and after shutdown", () => {
@@ -559,26 +690,205 @@ describe("independent Claude private readback", () => {
         expect(live).not.toHaveProperty("bindingGeneration");
       });
     }, 5_000);
+
+    test("freezes caller evidence before asynchronous observations", () => {
+      if (prepared === undefined) throw new Error("Owned readback fixture is not ready.");
+      const { owner, fixture: f } = prepared;
+      return owner.run(async () => {
+        const input = structuredClone(f.input);
+        const oracle = f.oracle(async () => {
+          Object.assign(input.receipt.memory, { title: "caller changed this after capture began" });
+          input.memoryStatus.working.epoch = 2;
+          await Promise.resolve();
+        });
+        const live = await owner.request(async () => await oracle.captureLive(input));
+        const receipt = await owner.request(f.stop);
+        expect(await owner.request(async () => await oracle.verifyStopped({ receipt })))
+          .toMatchObject({ phase: "stopped", snapshotDigest: live.snapshotDigest });
+      });
+    }, 5_000);
+
+    test("requires live and then exact not-live process observations", () => {
+      if (prepared === undefined) throw new Error("Owned readback fixture is not ready.");
+      const { owner, fixture: f } = prepared;
+      return owner.run(async () => {
+        f.setLiveness("unknown");
+        await owner.request(async () => {
+          await expect(f.oracle().captureLive(f.input)).rejects.toThrow("claude_live_acceptance_readback_refused");
+        });
+        f.setLiveness("live");
+        const oracle = f.oracle();
+        await owner.request(async () => await oracle.captureLive(f.input));
+        const receipt = await owner.request(f.stop);
+        f.setLiveness("live");
+        await owner.request(async () => {
+          await expect(oracle.verifyStopped({ receipt })).rejects.toThrow("claude_live_acceptance_readback_refused");
+        });
+      });
+    }, 5_000);
+
+    test("requires removed artifacts even after exact process release", () => {
+      if (prepared === undefined) throw new Error("Owned readback fixture is not ready.");
+      const { owner, fixture: f } = prepared;
+      return owner.run(async () => {
+        const oracle = f.oracle();
+        await owner.request(async () => await oracle.captureLive(f.input));
+        const receipt = await owner.request(f.stop);
+        await owner.request(async () => await mkdir(f.directory, { mode: 0o700 }));
+        await owner.request(async () => await writeFile(f.configPath, JSON.stringify(f.config), { mode: 0o600 }));
+        await owner.request(async () => {
+          await expect(oracle.verifyStopped({ receipt })).rejects.toThrow("claude_live_acceptance_readback_refused");
+        });
+      });
+    }, 5_000);
+
+    test("refuses authority changed during the stopped process observation", () => {
+      if (prepared === undefined) throw new Error("Owned readback fixture is not ready.");
+      const { owner, fixture: f } = prepared;
+      return owner.run(async () => {
+        const oracle = f.oracle();
+        await owner.request(async () => await oracle.captureLive(f.input));
+        const receipt = await owner.request(f.stop);
+        f.observeProcess(() => { f.store.advanceProviderAccountProcessGeneration({ profileId: f.profile.id, provider: "claude",
+          expectedProcessGeneration: f.providerAuthority.processGeneration + 1 }); });
+        await owner.request(async () => {
+          await expect(oracle.verifyStopped({ receipt })).rejects.toThrow("claude_live_acceptance_readback_refused");
+        });
+      });
+    }, 5_000);
+
+    test("does not accept an early stop, a changed final receipt, or an aborted reader", () => {
+      if (prepared === undefined) throw new Error("Owned readback fixture is not ready.");
+      const { owner, fixture: f } = prepared;
+      return owner.run(async () => {
+        const oracle = f.oracle();
+        await owner.request(async () => {
+          await expect(oracle.verifyStopped({ receipt: { ...f.input.receipt, lifecycleInvalidated: true } }))
+            .rejects.toThrow("claude_live_acceptance_readback_refused");
+        });
+        const valid = f.oracle();
+        await owner.request(async () => await valid.captureLive(f.input));
+        const receipt = await owner.request(f.stop);
+        await owner.request(async () => {
+          await expect(valid.verifyStopped({ receipt: { ...receipt, callId: "wrong" } }))
+            .rejects.toThrow("claude_live_acceptance_readback_refused");
+        });
+        const controller = new AbortController(); controller.abort();
+        const aborted = createClaudeLiveAcceptanceReadback({ paths: f.paths, signal: controller.signal,
+          inspectLiveProcess: async () => { throw new Error("must not inspect"); } });
+        await owner.request(async () => {
+          await expect(aborted.captureLive(f.input)).rejects.toThrow("claude_live_acceptance_readback_refused");
+        });
+      });
+    }, 5_000);
+
+    test("cleanup-only proves retained released custody without minting acceptance proof", () => {
+      if (prepared === undefined) throw new Error("Owned readback fixture is not ready.");
+      const { owner, fixture: f } = prepared;
+      return owner.run(async () => {
+        expect(f.providerAuthority.processGeneration).not.toBe(f.profile.processGeneration);
+        const input = { profileId: f.profile.id, profileGeneration: f.providerAuthority.processGeneration, sessionId: f.session.id };
+        await owner.request(async () => {
+          await expect(f.oracle().verifyCleanupStoppedCustody(input)).rejects.toThrow("claude_live_acceptance_readback_refused");
+        });
+        await owner.request(f.stop);
+        expect(f.store.readSessionClaudeProcessAuthority(f.session.id, true)).toMatchObject({
+          profileGeneration: f.profile.processGeneration, providerAuthority: f.providerAuthority, state: "released",
+        });
+        const oracle = f.oracle();
+        const evidence = await owner.request(async () => await oracle.verifyCleanupStoppedCustody(input));
+        expect(evidence).toMatchObject({ source: "independent_cleanup_readback", phase: "cleanup_stopped",
+          retainedSessionProcess: "released_not_live", unreleasedProcessesAbsent: true, privateArtifactsAbsent: true,
+          scopeBindingDigest: canonicalSha256({ domain: "hra.claude.cleanup-readback.v1", ...input }) });
+        expect(evidence).not.toHaveProperty("soleRemember");
+        expect(JSON.stringify(evidence)).not.toContain(f.session.id);
+        await owner.request(async () => {
+          await expect(oracle.captureLive(f.input)).rejects.toThrow("claude_live_acceptance_readback_refused");
+        });
+      });
+    }, 5_000);
+
+    test("cleanup-only refuses missing staged session, wrong generation, extra input, artifacts, and unknown liveness", () => {
+      if (prepared === undefined) throw new Error("Owned readback fixture is not ready.");
+      const { owner, fixture: f } = prepared;
+      return owner.run(async () => {
+        await owner.request(f.stop);
+        const input = { profileId: f.profile.id, profileGeneration: f.providerAuthority.processGeneration, sessionId: f.session.id };
+        for (const invalid of [{ profileId: f.profile.id }, { ...input, profileGeneration: input.profileGeneration + 1 },
+          { profileId: input.profileId, sessionId: input.sessionId }, { ...input, extra: true }]) {
+          await owner.request(async () => {
+            await expect(f.oracle().verifyCleanupStoppedCustody(invalid)).rejects.toThrow("claude_live_acceptance_readback_refused");
+          });
+        }
+        f.setLiveness("unknown");
+        await owner.request(async () => {
+          await expect(f.oracle().verifyCleanupStoppedCustody(input)).rejects.toThrow("claude_live_acceptance_readback_refused");
+        });
+        f.setLiveness("not_live");
+        await owner.request(async () => await mkdir(f.directory, { mode: 0o700 }));
+        await owner.request(async () => {
+          await expect(f.oracle().verifyCleanupStoppedCustody(input)).rejects.toThrow("claude_live_acceptance_readback_refused");
+        });
+      });
+    }, 5_000);
+
+    test("cleanup-only refuses authority changed during its stopped observation", () => {
+      if (prepared === undefined) throw new Error("Owned readback fixture is not ready.");
+      const { owner, fixture: f } = prepared;
+      return owner.run(async () => {
+        await owner.request(f.stop);
+        f.observeProcess(() => { f.store.advanceProviderAccountProcessGeneration({ profileId: f.profile.id, provider: "claude",
+          expectedProcessGeneration: f.providerAuthority.processGeneration + 1 }); });
+        await owner.request(async () => {
+          await expect(f.oracle().verifyCleanupStoppedCustody({ profileId: f.profile.id,
+            profileGeneration: f.providerAuthority.processGeneration, sessionId: f.session.id }))
+            .rejects.toThrow("claude_live_acceptance_readback_refused");
+        });
+      });
+    }, 5_000);
   });
 
-  test.each(["live", "stopped", "cleanup"] as const)("rechecks Claude authority after the final %s process probe", async (phase) => {
-    const f = await fixture();
-    const oracle = f.oracle();
-    if (phase === "stopped") await oracle.captureLive(f.input);
-    const receipt = phase === "live" ? null : await f.stop();
-    let probes = 0;
-    f.observeProcess(() => {
-      if (++probes === 2) f.store.advanceProviderAccountProcessGeneration({
-        profileId: f.profile.id, provider: "claude",
-        expectedProcessGeneration: f.providerAuthority.processGeneration + (phase === "live" ? 0 : 1),
+  describe("final process-probe authority", () => {
+    let prepared: Readonly<{ owner: ReturnType<typeof createOwnedReadbackCase>; fixture: Awaited<ReturnType<typeof fixture>> }> | undefined;
+    beforeEach(() => {
+      prepared = undefined;
+      const owner = createOwnedReadbackCase();
+      ownedReadbackCases.push(owner);
+      // This adds a separate fresh-fixture budget, not more time for readback.
+      // The stopped case keeps capture, stop, and final-probe refusal together.
+      return runOwnedReadbackSetup(owner, () => fixture(owner.registerCleanup), (value) => {
+        prepared = { owner, fixture: value };
       });
-    });
-    const result = phase === "live" ? oracle.captureLive(f.input)
-      : phase === "stopped" ? oracle.verifyStopped({ receipt: receipt ?? (() => { throw new Error("fixture receipt missing"); })() })
-        : oracle.verifyCleanupStoppedCustody({ profileId: f.profile.id,
-          profileGeneration: f.providerAuthority.processGeneration, sessionId: f.session.id });
-    await expect(result).rejects.toThrow("claude_live_acceptance_readback_refused");
-    expect(probes).toBe(2);
+    }, 5_000);
+
+    test.each(["live", "stopped", "cleanup"] as const)(
+      "rechecks Claude authority after the final %s process probe",
+      (phase) => {
+        if (prepared === undefined) throw new Error("Owned readback fixture is not ready.");
+        const { owner, fixture: f } = prepared;
+        return owner.run(async () => {
+          const oracle = f.oracle();
+          if (phase === "stopped") await owner.request(async () => await oracle.captureLive(f.input));
+          const receipt = phase === "live" ? null : await owner.request(f.stop);
+          let probes = 0;
+          f.observeProcess(() => {
+            if (++probes === 2) f.store.advanceProviderAccountProcessGeneration({
+              profileId: f.profile.id, provider: "claude",
+              expectedProcessGeneration: f.providerAuthority.processGeneration + (phase === "live" ? 0 : 1),
+            });
+          });
+          await owner.request(async () => {
+            const result = phase === "live" ? oracle.captureLive(f.input)
+              : phase === "stopped" ? oracle.verifyStopped({ receipt: receipt ?? (() => { throw new Error("fixture receipt missing"); })() })
+                : oracle.verifyCleanupStoppedCustody({ profileId: f.profile.id,
+                  profileGeneration: f.providerAuthority.processGeneration, sessionId: f.session.id });
+            await expect(result).rejects.toThrow("claude_live_acceptance_readback_refused");
+            expect(probes).toBe(2);
+          });
+        });
+      },
+      5_000,
+    );
   });
 
   test.each(["nonce", "key", "attestation", "extra-row", "continuation", "canonical", "auth", "send", "start", "extra-field",
@@ -629,18 +939,6 @@ describe("independent Claude private readback", () => {
     await expect(f.oracle().captureLive(f.input)).rejects.toThrow("claude_live_acceptance_readback_refused");
   });
 
-  test("freezes caller evidence before asynchronous observations", async () => {
-    const f = await fixture();
-    const input = structuredClone(f.input);
-    const oracle = f.oracle(async () => {
-      Object.assign(input.receipt.memory, { title: "caller changed this after capture began" });
-      input.memoryStatus.working.epoch = 2;
-      await Promise.resolve();
-    });
-    const live = await oracle.captureLive(input);
-    expect(await oracle.verifyStopped({ receipt: await f.stop() })).toMatchObject({ phase: "stopped", snapshotDigest: live.snapshotDigest });
-  });
-
   test("refuses failed argv custody and artifacts changed during process inspection", async () => {
     const f = await fixture();
     await expect(f.oracle(async () => { throw new Error("synthetic custody refusal"); }).captureLive(f.input))
@@ -669,96 +967,11 @@ describe("independent Claude private readback", () => {
     },
   );
 
-  test("requires live and then exact not-live process observations", async () => {
-    const f = await fixture();
-    f.setLiveness("unknown");
-    await expect(f.oracle().captureLive(f.input)).rejects.toThrow("claude_live_acceptance_readback_refused");
-    f.setLiveness("live");
-    const oracle = f.oracle();
-    await oracle.captureLive(f.input);
-    const receipt = await f.stop();
-    f.setLiveness("live");
-    await expect(oracle.verifyStopped({ receipt })).rejects.toThrow("claude_live_acceptance_readback_refused");
-  });
 
-  test("requires removed artifacts even after exact process release", async () => {
-    const f = await fixture();
-    const oracle = f.oracle();
-    await oracle.captureLive(f.input);
-    const receipt = await f.stop();
-    await mkdir(f.directory, { mode: 0o700 });
-    await writeFile(f.configPath, JSON.stringify(f.config), { mode: 0o600 });
-    await expect(oracle.verifyStopped({ receipt })).rejects.toThrow("claude_live_acceptance_readback_refused");
-  });
 
-  test("refuses authority changed during the stopped process observation", async () => {
-    const f = await fixture();
-    const oracle = f.oracle();
-    await oracle.captureLive(f.input);
-    const receipt = await f.stop();
-    f.observeProcess(() => { f.store.advanceProviderAccountProcessGeneration({ profileId: f.profile.id, provider: "claude",
-      expectedProcessGeneration: f.providerAuthority.processGeneration + 1 }); });
-    await expect(oracle.verifyStopped({ receipt })).rejects.toThrow("claude_live_acceptance_readback_refused");
-  });
 
-  test("does not accept an early stop, a changed final receipt, or an aborted reader", async () => {
-    const f = await fixture();
-    const oracle = f.oracle();
-    await expect(oracle.verifyStopped({ receipt: { ...f.input.receipt, lifecycleInvalidated: true } }))
-      .rejects.toThrow("claude_live_acceptance_readback_refused");
-    const valid = f.oracle();
-    await valid.captureLive(f.input);
-    const receipt = await f.stop();
-    await expect(valid.verifyStopped({ receipt: { ...receipt, callId: "wrong" } }))
-      .rejects.toThrow("claude_live_acceptance_readback_refused");
-    const controller = new AbortController(); controller.abort();
-    const aborted = createClaudeLiveAcceptanceReadback({ paths: f.paths, signal: controller.signal,
-      inspectLiveProcess: async () => { throw new Error("must not inspect"); } });
-    await expect(aborted.captureLive(f.input)).rejects.toThrow("claude_live_acceptance_readback_refused");
-  });
 
-  test("cleanup-only proves retained released custody without minting acceptance proof", async () => {
-    const f = await fixture();
-    expect(f.providerAuthority.processGeneration).not.toBe(f.profile.processGeneration);
-    const input = { profileId: f.profile.id, profileGeneration: f.providerAuthority.processGeneration, sessionId: f.session.id };
-    await expect(f.oracle().verifyCleanupStoppedCustody(input)).rejects.toThrow("claude_live_acceptance_readback_refused");
-    await f.stop();
-    expect(f.store.readSessionClaudeProcessAuthority(f.session.id, true)).toMatchObject({
-      profileGeneration: f.profile.processGeneration, providerAuthority: f.providerAuthority, state: "released",
-    });
-    const oracle = f.oracle();
-    const evidence = await oracle.verifyCleanupStoppedCustody(input);
-    expect(evidence).toMatchObject({ source: "independent_cleanup_readback", phase: "cleanup_stopped",
-      retainedSessionProcess: "released_not_live", unreleasedProcessesAbsent: true, privateArtifactsAbsent: true,
-      scopeBindingDigest: canonicalSha256({ domain: "hra.claude.cleanup-readback.v1", ...input }) });
-    expect(evidence).not.toHaveProperty("soleRemember");
-    expect(JSON.stringify(evidence)).not.toContain(f.session.id);
-    await expect(oracle.captureLive(f.input)).rejects.toThrow("claude_live_acceptance_readback_refused");
-  });
 
-  test("cleanup-only refuses missing staged session, wrong generation, extra input, artifacts, and unknown liveness", async () => {
-    const f = await fixture();
-    await f.stop();
-    const input = { profileId: f.profile.id, profileGeneration: f.providerAuthority.processGeneration, sessionId: f.session.id };
-    for (const invalid of [{ profileId: f.profile.id }, { ...input, profileGeneration: input.profileGeneration + 1 },
-      { profileId: input.profileId, sessionId: input.sessionId }, { ...input, extra: true }]) {
-      await expect(f.oracle().verifyCleanupStoppedCustody(invalid)).rejects.toThrow("claude_live_acceptance_readback_refused");
-    }
-    f.setLiveness("unknown");
-    await expect(f.oracle().verifyCleanupStoppedCustody(input)).rejects.toThrow("claude_live_acceptance_readback_refused");
-    f.setLiveness("not_live");
-    await mkdir(f.directory, { mode: 0o700 });
-    await expect(f.oracle().verifyCleanupStoppedCustody(input)).rejects.toThrow("claude_live_acceptance_readback_refused");
-  });
-
-  test("cleanup-only refuses authority changed during its stopped observation", async () => {
-    const f = await fixture();
-    await f.stop();
-    f.observeProcess(() => { f.store.advanceProviderAccountProcessGeneration({ profileId: f.profile.id, provider: "claude",
-      expectedProcessGeneration: f.providerAuthority.processGeneration + 1 }); });
-    await expect(f.oracle().verifyCleanupStoppedCustody({ profileId: f.profile.id,
-      profileGeneration: f.providerAuthority.processGeneration, sessionId: f.session.id })).rejects.toThrow("claude_live_acceptance_readback_refused");
-  });
 
   test("cleanup before native start proves no sessions or unsettled start, not provider receipt consumption", async () => {
     const root = await realpath(await mkdtemp("/tmp/hra-clrb-empty-"));

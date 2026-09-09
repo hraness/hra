@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { chmod, mkdtemp, mkdir, realpath, rm } from "node:fs/promises";
@@ -708,11 +708,209 @@ class SwitchFactsMemory implements HraFactsMemoryLifecyclePort {
 const stores: StateStore[] = [];
 const roots: string[] = [];
 const services: HraService[] = [];
+const ownedSwitchCaseTeardowns: Array<() => Promise<void>> = [];
+
+type SwitchCaseResources = {
+  roots: string[];
+  stores: Array<Pick<StateStore, "close">>;
+  services: Array<Pick<HraService, "close">>;
+};
+
+function createOwnedSwitchCase(teardowns = ownedSwitchCaseTeardowns) {
+  const resources: SwitchCaseResources = { roots: [], stores: [], services: [] };
+  const controller = new AbortController();
+  const cancellation = new Error("Owned switch case is closing.");
+  const tasks: Array<Promise<{ status: "fulfilled" } | { status: "rejected"; reason: unknown }>> = [];
+  let closing: Promise<void> | undefined;
+  const request = async <T>(operation: () => Promise<T>): Promise<T> => {
+    controller.signal.throwIfAborted();
+    const result = await operation();
+    controller.signal.throwIfAborted();
+    return result;
+  };
+  const run = (operation: () => Promise<void>): Promise<void> => {
+    // Register and observe the raw hook/test task before it can open resources.
+    // Return this exact promise to Bun so a deadline cannot detach its work.
+    const task = Promise.resolve().then(async () => {
+      controller.signal.throwIfAborted();
+      await operation();
+      controller.signal.throwIfAborted();
+    });
+    tasks.push(task.then(
+      () => ({ status: "fulfilled" } as const),
+      (reason: unknown) => ({ status: "rejected", reason } as const),
+    ));
+    return task;
+  };
+  const close = (): Promise<void> => {
+    if (closing !== undefined) return closing;
+    controller.abort(cancellation);
+    closing = (async () => {
+      const failures: unknown[] = [];
+      for (const result of await Promise.all(tasks)) {
+        if (result.status === "rejected" && result.reason !== cancellation) failures.push(result.reason);
+      }
+      let serviceCloseFailed = false;
+      for (const service of resources.services.splice(0)) {
+        try { await service.close(); } catch (error: unknown) {
+          serviceCloseFailed = true;
+          failures.push(error);
+        }
+      }
+      if (serviceCloseFailed) throw new AggregateError(failures, "Switch service close failed; owned storage was retained.");
+      let storeCloseFailed = false;
+      for (const store of resources.stores.splice(0)) {
+        try { store.close(); } catch (error: unknown) {
+          storeCloseFailed = true;
+          failures.push(error);
+        }
+      }
+      if (storeCloseFailed) throw new AggregateError(failures, "Switch store close failed; owned roots were retained.");
+      for (const root of resources.roots.splice(0)) {
+        try { await rm(root, { force: true, recursive: true }); } catch (error: unknown) { failures.push(error); }
+      }
+      if (failures.length > 0) throw new AggregateError(failures, "Owned switch teardown failed.");
+    })();
+    return closing;
+  };
+  teardowns.push(close);
+  return { close, request, resources, run, signal: controller.signal };
+}
 
 afterEach(async () => {
-  await Promise.all(services.splice(0).map(async (service) => { await service.close(); }));
-  for (const store of stores.splice(0)) store.close();
-  await Promise.all(roots.splice(0).map(async (root) => rm(root, { force: true, recursive: true })));
+  // Capture this case's resources before awaiting; late teardown must never
+  // consume the next case's fixtures from the shared compatibility arrays.
+  const caseTeardowns = ownedSwitchCaseTeardowns.splice(0);
+  const caseServices = services.splice(0);
+  const caseStores = stores.splice(0);
+  const caseRoots = roots.splice(0);
+  await Promise.all(caseTeardowns.map((close) => close()));
+  await Promise.all(caseServices.map(async (service) => { await service.close(); }));
+  for (const store of caseStores) store.close();
+  await Promise.all(caseRoots.map(async (root) => rm(root, { force: true, recursive: true })));
+});
+
+describe("owned switch case lifecycle", () => {
+  test("cancels before deferred setup can open resources", async () => {
+    const owner = createOwnedSwitchCase([]);
+    let opened = false;
+    const task = owner.run(async () => { opened = true; });
+    const closing = owner.close();
+    expect(owner.close()).toBe(closing);
+    await closing;
+    await expect(task).rejects.toBe(owner.signal.reason);
+    expect(opened).toBe(false);
+  });
+
+  test("checks cancellation in the microtask gap before prepared-state publication", async () => {
+    const owner = createOwnedSwitchCase([]);
+    const holder: { value?: string } = {};
+    let closing: Promise<void> | undefined;
+    const setup = owner.run(async () => {
+      const finalRequest = owner.request(async () => "prepared");
+      // Registered before the await continuation: request() has completed its
+      // own cancellation check, but publication has not happened yet.
+      void finalRequest.then(() => {
+        closing = owner.close();
+        void closing.catch(() => undefined);
+      }, () => undefined);
+      const value = await finalRequest;
+      owner.signal.throwIfAborted();
+      holder.value = value;
+    });
+    const failure = await setup.catch((error: unknown) => error);
+    expect(failure).toBe(owner.signal.reason);
+    expect(owner.signal.aborted).toBe(true);
+    await closing;
+    expect(holder.value).toBeUndefined();
+  });
+
+  test.each(["setup", "proof"] as const)("drains paused %s and late resources without closing the next case", async (phase) => {
+    const owner = createOwnedSwitchCase([]);
+    const nextOwner = createOwnedSwitchCase([]);
+    const entered = Promise.withResolvers<undefined>();
+    const release = Promise.withResolvers<undefined>();
+    const events: string[] = [];
+    if (phase === "proof") await owner.run(async () => undefined);
+    owner.resources.services.push({ close: async () => { events.push("close-service"); } });
+    owner.resources.stores.push({ close: () => { events.push("close-store"); } });
+    nextOwner.resources.stores.push({ close: () => { events.push("close-next-store"); } });
+    let observed: Promise<void> | undefined;
+    const hook = () => {
+      observed = owner.run(async () => {
+        entered.resolve(undefined);
+        await release.promise;
+        owner.resources.services.push({ close: async () => { events.push("close-late-service"); } });
+        owner.resources.stores.push({ close: () => { events.push("close-late-store"); } });
+        events.push("raw-settled");
+      });
+      return observed;
+    };
+    const task = hook();
+    expect<Promise<void> | undefined>(task).toBe(observed);
+    await entered.promise;
+    const closing = owner.close();
+    await Promise.resolve();
+    expect(events).toEqual([]);
+    release.resolve(undefined);
+    await closing;
+    await expect(task).rejects.toBe(owner.signal.reason);
+    expect(events).toEqual(["raw-settled", "close-service", "close-late-service", "close-store", "close-late-store"]);
+    await nextOwner.close();
+    expect(events.at(-1)).toBe("close-next-store");
+  });
+
+  test("preserves late failures and attempts every service close while retaining storage on close failure", async () => {
+    const owner = createOwnedSwitchCase([]);
+    const entered = Promise.withResolvers<undefined>();
+    const release = Promise.withResolvers<undefined>();
+    const lateFailure = new Error("late proof failure");
+    const closeFailure = new Error("service close failure");
+    const events: string[] = [];
+    const root = await mkdtemp(join(tmpdir(), "hra-switch-owner-"));
+    roots.push(root);
+    owner.resources.roots.push(root);
+    owner.resources.services.push(
+      { close: async () => { events.push("close-failed-service"); throw closeFailure; } },
+      { close: async () => { events.push("close-other-service"); } },
+    );
+    owner.resources.stores.push({ close: () => { events.push("close-store"); } });
+    const task = owner.run(async () => {
+      entered.resolve(undefined);
+      await release.promise;
+      throw lateFailure;
+    });
+    await entered.promise;
+    const closing = owner.close().catch((error: unknown) => error);
+    release.resolve(undefined);
+    const error = await closing;
+    expect(error).toBeInstanceOf(AggregateError);
+    if (!(error instanceof AggregateError)) throw new Error("Expected late failure and close failure.");
+    expect(error.errors).toEqual([lateFailure, closeFailure]);
+    await expect(task).rejects.toBe(lateFailure);
+    expect(events).toEqual(["close-failed-service", "close-other-service"]);
+    expect(owner.resources.stores).toHaveLength(1);
+    expect(owner.resources.roots).toEqual([root]);
+  });
+
+  test("attempts every store close but retains roots if any store cannot close", async () => {
+    const owner = createOwnedSwitchCase([]);
+    const closeFailure = new Error("store close failure");
+    const events: string[] = [];
+    const root = await mkdtemp(join(tmpdir(), "hra-switch-owner-"));
+    roots.push(root);
+    owner.resources.roots.push(root);
+    owner.resources.stores.push(
+      { close: () => { events.push("close-failed-store"); throw closeFailure; } },
+      { close: () => { events.push("close-other-store"); } },
+    );
+    const error = await owner.close().catch((failure: unknown) => failure);
+    expect(error).toBeInstanceOf(AggregateError);
+    if (!(error instanceof AggregateError)) throw new Error("Expected the store close failure.");
+    expect(error.errors).toEqual([closeFailure]);
+    expect(events).toEqual(["close-failed-store", "close-other-store"]);
+    expect(owner.resources.roots).toEqual([root]);
+  });
 });
 
 type Fixture = Readonly<{
@@ -730,9 +928,9 @@ type Fixture = Readonly<{
   store: StateStore;
 }>;
 
-async function fixturePaths(historical?: Canonical39SwitchScenario) {
+async function fixturePaths(historical?: Canonical39SwitchScenario, resources: SwitchCaseResources = { roots, stores, services }) {
   const home = await realpath(await mkdtemp(join(tmpdir(), "hra-switch-")));
-  roots.push(home);
+  resources.roots.push(home);
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   const documents = join(home, "Documents");
   await mkdir(documents, { recursive: true });
@@ -752,11 +950,12 @@ async function fixture(
   cloud: OfflineCloud = new OfflineCloud(),
   factsMemoryEnabled = true,
   historical?: Canonical39SwitchScenario,
+  resources: SwitchCaseResources = { roots, stores, services },
 ): Promise<Fixture> {
   const now = typeof nowOrAuthority === "function" ? nowOrAuthority : Date.now;
-  const { paths, documents, historicalSwitchRows } = await fixturePaths(historical);
+  const { paths, documents, historicalSwitchRows } = await fixturePaths(historical, resources);
   const store = new StateStore(paths);
-  stores.push(store);
+  resources.stores.push(store);
   const daemonBootId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
   const daemonGeneration = store.nextDaemonGeneration(daemonBootId);
   store.setDefaultApprovalMode("manual");
@@ -783,7 +982,7 @@ async function fixture(
     requestStop: () => undefined,
     store,
   });
-  services.push(service);
+  resources.services.push(service);
   return { claude, codex, daemonAuthority, daemonGeneration, daemonBootId, documents, factsMemory, factsMemoryEnabled, historicalSwitchRows, paths, service, store };
 }
 
@@ -870,26 +1069,31 @@ async function reopenFixture(value: Fixture): Promise<Fixture> {
   };
 }
 
-async function codexSession(value: Fixture): Promise<Readonly<{
+async function codexSession(value: Fixture, requestSignal = signal): Promise<Readonly<{
   accountId: `acct_${string}`;
   sessionId: `sess_${string}`;
 }>> {
+  requestSignal.throwIfAborted();
   const added = await value.service.execute(
     { kind: "account.add", label: "Work" },
-    { signal },
+    { signal: requestSignal },
   ) as { account: { id: `acct_${string}` } };
+  requestSignal.throwIfAborted();
   await value.service.execute(
     { account: added.account.id, deviceCode: false, kind: "account.login" },
-    { signal },
+    { signal: requestSignal },
   );
+  requestSignal.throwIfAborted();
   await value.service.execute(
     { kind: "project.add", label: "Work docs", path: value.documents },
-    { signal },
+    { signal: requestSignal },
   );
+  requestSignal.throwIfAborted();
   const started = await value.service.execute(
     { account: added.account.id, fast: false, kind: "session.start", preset: "high", presetContract: 1 },
-    { signal },
+    { signal: requestSignal },
   ) as { session: { id: `sess_${string}` } };
+  requestSignal.throwIfAborted();
   return { accountId: added.account.id, sessionId: started.session.id };
 }
 
@@ -3206,157 +3410,186 @@ describe("provider portability", () => {
     });
   });
 
-  test("settles a proved seed rejection but never replays an ambiguous seed", async () => {
-    const rejected = await fixture();
-    const rejectedSession = await codexSession(rejected);
-    rejected.claude.startTurnError = new ClaudeError("INVALID_INPUT", "seed rejected");
-    const rejectedKey = "00000000-0000-4000-8000-0000000007a3";
-    await expect(rejected.service.execute({
-      idempotencyKey: rejectedKey,
-      kind: "session.switch",
-      provider: "claude",
-      session: rejectedSession.sessionId,
-    }, { signal })).resolves.toMatchObject({
-      seed: { delivered: false, failureCode: "SEED_INVALID_INPUT" },
-      turnId: null,
-    });
-    expect(rejected.claude.seededMessages).toEqual([]);
-
-    const ambiguous = await fixture();
-    const ambiguousSession = await codexSession(ambiguous);
-    const ambiguousTarget = await ambiguous.service.execute(
-      { kind: "account.add", label: "Ambiguous target" },
-      { signal },
-    ) as { account: { id: `acct_${string}` } };
-    const ambiguousSourceAuthority = liveAuthorityFor(
-      ambiguous.store,
-      ambiguousSession.accountId,
-      "codex",
-    );
-    ambiguous.claude.startTurnError = new Error("transport ended after write");
-    const ambiguousKey = "00000000-0000-4000-8000-0000000007a4";
-    const ambiguousCommand = {
-      idempotencyKey: ambiguousKey,
-      kind: "session.switch" as const,
-      provider: "claude" as const,
-      account: ambiguousTarget.account.id,
-      session: ambiguousSession.sessionId,
+  describe("coupled seed outcomes", () => {
+    type PreparedSeedCase = {
+      rejected: Fixture;
+      rejectedSession: Awaited<ReturnType<typeof codexSession>>;
+      ambiguous: Fixture;
+      ambiguousSession: Awaited<ReturnType<typeof codexSession>>;
+      ambiguousTarget: { account: { id: `acct_${string}` } };
+      ambiguousSourceAuthority: ProfileAuthority;
     };
-    await expect(ambiguous.service.execute(ambiguousCommand, { signal })).rejects.toMatchObject({
-      code: "RECOVERY_REQUIRED",
-    });
-    const calls = [...ambiguous.claude.calls];
-    expect(ambiguous.store.readSessionSwitchByIdempotencyKey(ambiguousKey)).toMatchObject({
-      phase: "reconciliation_required",
-    });
-    await expect(ambiguous.service.execute(ambiguousCommand, { signal })).rejects.toMatchObject({
-      code: "RECOVERY_REQUIRED",
-    });
-    expect(ambiguous.claude.calls).toEqual(calls);
-    expect(ambiguous.claude.seededMessages).toHaveLength(1);
+    let prepared: { owner: ReturnType<typeof createOwnedSwitchCase>; value?: PreparedSeedCase } | undefined;
 
-    const beforeLateFacts = ambiguous.store.requireSession(ambiguousSession.sessionId);
-    const beforeLateEvents = ambiguous.store.listSessionEvents({
-      afterSequence: 0,
-      sessionId: ambiguousSession.sessionId,
-    }).events;
-    await ambiguous.service.observeCodexFact(ambiguousSourceAuthority, {
-      threadId: "codex-thread-1",
-      type: "threadDeleted",
-    });
-    await ambiguous.service.observeClaudeFact(
-      liveAuthorityFor(ambiguous.store, ambiguousTarget.account.id, "claude"),
-      {
-        connectionId: "30000000-0000-4000-8000-000000000002",
-        providerThreadId: "claude-thread-1",
-        reason: "eof",
-        type: "providerDisconnected",
-      },
-    );
-    const interactionCount = ambiguous.store.listInteractions({
-      limit: 10,
-      pendingOnly: false,
-      sessionId: ambiguousSession.sessionId,
-    }).length;
-    await ambiguous.service.observeCodexFact(ambiguousSourceAuthority, {
-      blocking: true,
-      connectionId: "30000000-0000-4000-8000-000000000001",
-      display: {
-        availableDecisions: ["once", "decline", "cancel"],
-        commandClass: "test",
-        kind: "command_approval",
-        reason: null,
-        summary: "Must remain fenced",
-        workingDirectory: null,
-      },
-      kind: "command_approval",
-      provider: {
-        approvalId: null,
-        bindingGeneration: ambiguousSourceAuthority.bindingGeneration,
-        connectionId: "30000000-0000-4000-8000-000000000001",
-        itemId: "late-switch-item",
-        method: "item/commandExecution/requestApproval",
-        processGeneration: ambiguousSourceAuthority.generation,
-        profileId: ambiguousSourceAuthority.id,
-        provider: ambiguousSourceAuthority.provider,
-        providerAccountId: ambiguousSourceAuthority.providerAccountId,
-        requestDigest: "d".repeat(64),
-        requestId: { type: "string", value: "late-switch-request" },
-        threadId: "codex-thread-1",
-        turnId: "late-switch-turn",
-      },
-      type: "interactionRequested",
-    });
-    expect(ambiguous.store.requireSession(ambiguousSession.sessionId)).toEqual(beforeLateFacts);
-    expect(ambiguous.store.listSessionEvents({
-      afterSequence: 0,
-      sessionId: ambiguousSession.sessionId,
-    }).events).toEqual(beforeLateEvents);
-    expect(ambiguous.store.listInteractions({
-      limit: 10,
-      pendingOnly: false,
-      sessionId: ambiguousSession.sessionId,
-    })).toHaveLength(interactionCount);
+    // Two real database/session preparations measured 2.71s versus 0.54s for
+    // the coupled proof locally. Give setup its own 5s allowance; retain every
+    // seed/replay/abandon assertion together under a separate 5s proof deadline.
+    beforeEach(() => {
+      const holder: NonNullable<typeof prepared> = { owner: createOwnedSwitchCase() };
+      prepared = holder;
+      const { owner } = holder;
+      return owner.run(async () => {
+        const rejected = await owner.request(() => fixture(undefined, undefined, true, undefined, owner.resources));
+        const rejectedSession = await owner.request(() => codexSession(rejected, owner.signal));
+        const ambiguous = await owner.request(() => fixture(undefined, undefined, true, undefined, owner.resources));
+        const ambiguousSession = await owner.request(() => codexSession(ambiguous, owner.signal));
+        const ambiguousTarget = await owner.request(() => ambiguous.service.execute(
+          { kind: "account.add", label: "Ambiguous target" },
+          { signal: owner.signal },
+        )) as { account: { id: `acct_${string}` } };
+        const ambiguousSourceAuthority = liveAuthorityFor(ambiguous.store, ambiguousSession.accountId, "codex");
+        // The request's check precedes the await continuation. Check again at
+        // publication and only populate this captured holder, never a later case.
+        owner.signal.throwIfAborted();
+        holder.value = { rejected, rejectedSession, ambiguous, ambiguousSession, ambiguousTarget, ambiguousSourceAuthority };
+      });
+    }, 5_000);
 
-    const providerCallsBeforeAbandon = {
-      claude: [...ambiguous.claude.calls],
-      codex: [...ambiguous.codex.calls],
-    };
-    ambiguous.factsMemory.transferErrorOnce = new Error("abandon transfer unavailable");
-    await expect(ambiguous.service.execute({
-      kind: "session.abandon",
-      session: ambiguousSession.sessionId,
-    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
-    expect(ambiguous.store.readSessionSwitchByIdempotencyKey(ambiguousKey))
-      .toMatchObject({ phase: "reconciliation_required" });
-    expect(ambiguous.factsMemory.cleanups).toHaveLength(0);
-    await expect(ambiguous.service.execute({
-      kind: "session.abandon",
-      session: ambiguousSession.sessionId,
-    }, { signal })).resolves.toMatchObject({
-      idempotencyKey: ambiguousKey,
-      recovery: {
-        providerEffectRetried: false,
-        providerStateDeleted: false,
-        resolution: "abandoned",
-        resolved: true,
-      },
-      session: { profileId: ambiguousTarget.account.id, state: "terminal" },
-    });
-    expect(ambiguous.store.readSessionSwitchByIdempotencyKey(ambiguousKey))
-      .toMatchObject({ phase: "abandoned" });
-    expect(ambiguous.factsMemory.cleanups.at(-1)).toMatchObject({
-      ownerId: ambiguousTarget.account.id,
-      reason: "abandon",
-      sessionId: ambiguousSession.sessionId,
-    });
-    expect(ambiguous.factsMemory.transfers.at(-1)?.operationKey)
-      .toBe(ambiguous.factsMemory.transfers.at(-2)?.operationKey);
-    await expect(ambiguous.service.execute(ambiguousCommand, { signal })).rejects.toMatchObject({
-      code: "CONFLICT",
-    });
-    expect(ambiguous.claude.calls).toEqual(providerCallsBeforeAbandon.claude);
-    expect(ambiguous.codex.calls).toEqual(providerCallsBeforeAbandon.codex);
+    test("settles a proved seed rejection but never replays an ambiguous seed", () => {
+      const current = prepared;
+      if (current?.value === undefined) throw new Error("The coupled seed case was not prepared.");
+      const { rejected, rejectedSession, ambiguous, ambiguousSession, ambiguousTarget, ambiguousSourceAuthority } = current.value;
+      const { request, signal } = current.owner;
+      return current.owner.run(async () => {
+        rejected.claude.startTurnError = new ClaudeError("INVALID_INPUT", "seed rejected");
+        const rejectedKey = "00000000-0000-4000-8000-0000000007a3";
+        await request(async () => expect(rejected.service.execute({
+          idempotencyKey: rejectedKey,
+          kind: "session.switch",
+          provider: "claude",
+          session: rejectedSession.sessionId,
+        }, { signal })).resolves.toMatchObject({
+          seed: { delivered: false, failureCode: "SEED_INVALID_INPUT" },
+          turnId: null,
+        }));
+        expect(rejected.claude.seededMessages).toEqual([]);
+
+        ambiguous.claude.startTurnError = new Error("transport ended after write");
+        const ambiguousKey = "00000000-0000-4000-8000-0000000007a4";
+        const ambiguousCommand = {
+          idempotencyKey: ambiguousKey,
+          kind: "session.switch" as const,
+          provider: "claude" as const,
+          account: ambiguousTarget.account.id,
+          session: ambiguousSession.sessionId,
+        };
+        await request(async () => expect(ambiguous.service.execute(ambiguousCommand, { signal })).rejects.toMatchObject({
+          code: "RECOVERY_REQUIRED",
+        }));
+        const calls = [...ambiguous.claude.calls];
+        expect(ambiguous.store.readSessionSwitchByIdempotencyKey(ambiguousKey)).toMatchObject({
+          phase: "reconciliation_required",
+        });
+        await request(async () => expect(ambiguous.service.execute(ambiguousCommand, { signal })).rejects.toMatchObject({
+          code: "RECOVERY_REQUIRED",
+        }));
+        expect(ambiguous.claude.calls).toEqual(calls);
+        expect(ambiguous.claude.seededMessages).toHaveLength(1);
+
+        const beforeLateFacts = ambiguous.store.requireSession(ambiguousSession.sessionId);
+        const beforeLateEvents = ambiguous.store.listSessionEvents({
+          afterSequence: 0,
+          sessionId: ambiguousSession.sessionId,
+        }).events;
+        await request(() => ambiguous.service.observeCodexFact(ambiguousSourceAuthority, {
+          threadId: "codex-thread-1",
+          type: "threadDeleted",
+        }));
+        await request(() => ambiguous.service.observeClaudeFact(
+          liveAuthorityFor(ambiguous.store, ambiguousTarget.account.id, "claude"),
+          {
+            connectionId: "30000000-0000-4000-8000-000000000002",
+            providerThreadId: "claude-thread-1",
+            reason: "eof",
+            type: "providerDisconnected",
+          },
+        ));
+        const interactionCount = ambiguous.store.listInteractions({
+          limit: 10,
+          pendingOnly: false,
+          sessionId: ambiguousSession.sessionId,
+        }).length;
+        await request(() => ambiguous.service.observeCodexFact(ambiguousSourceAuthority, {
+          blocking: true,
+          connectionId: "30000000-0000-4000-8000-000000000001",
+          display: {
+            availableDecisions: ["once", "decline", "cancel"],
+            commandClass: "test",
+            kind: "command_approval",
+            reason: null,
+            summary: "Must remain fenced",
+            workingDirectory: null,
+          },
+          kind: "command_approval",
+          provider: {
+            approvalId: null,
+            bindingGeneration: ambiguousSourceAuthority.bindingGeneration,
+            connectionId: "30000000-0000-4000-8000-000000000001",
+            itemId: "late-switch-item",
+            method: "item/commandExecution/requestApproval",
+            processGeneration: ambiguousSourceAuthority.generation,
+            profileId: ambiguousSourceAuthority.id,
+            provider: ambiguousSourceAuthority.provider,
+            providerAccountId: ambiguousSourceAuthority.providerAccountId,
+            requestDigest: "d".repeat(64),
+            requestId: { type: "string", value: "late-switch-request" },
+            threadId: "codex-thread-1",
+            turnId: "late-switch-turn",
+          },
+          type: "interactionRequested",
+        }));
+        expect(ambiguous.store.requireSession(ambiguousSession.sessionId)).toEqual(beforeLateFacts);
+        expect(ambiguous.store.listSessionEvents({
+          afterSequence: 0,
+          sessionId: ambiguousSession.sessionId,
+        }).events).toEqual(beforeLateEvents);
+        expect(ambiguous.store.listInteractions({
+          limit: 10,
+          pendingOnly: false,
+          sessionId: ambiguousSession.sessionId,
+        })).toHaveLength(interactionCount);
+
+        const providerCallsBeforeAbandon = {
+          claude: [...ambiguous.claude.calls],
+          codex: [...ambiguous.codex.calls],
+        };
+        ambiguous.factsMemory.transferErrorOnce = new Error("abandon transfer unavailable");
+        await request(async () => expect(ambiguous.service.execute({
+          kind: "session.abandon",
+          session: ambiguousSession.sessionId,
+        }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" }));
+        expect(ambiguous.store.readSessionSwitchByIdempotencyKey(ambiguousKey))
+          .toMatchObject({ phase: "reconciliation_required" });
+        expect(ambiguous.factsMemory.cleanups).toHaveLength(0);
+        await request(async () => expect(ambiguous.service.execute({
+          kind: "session.abandon",
+          session: ambiguousSession.sessionId,
+        }, { signal })).resolves.toMatchObject({
+          idempotencyKey: ambiguousKey,
+          recovery: {
+            providerEffectRetried: false,
+            providerStateDeleted: false,
+            resolution: "abandoned",
+            resolved: true,
+          },
+          session: { profileId: ambiguousTarget.account.id, state: "terminal" },
+        }));
+        expect(ambiguous.store.readSessionSwitchByIdempotencyKey(ambiguousKey))
+          .toMatchObject({ phase: "abandoned" });
+        expect(ambiguous.factsMemory.cleanups.at(-1)).toMatchObject({
+          ownerId: ambiguousTarget.account.id,
+          reason: "abandon",
+          sessionId: ambiguousSession.sessionId,
+        });
+        expect(ambiguous.factsMemory.transfers.at(-1)?.operationKey)
+          .toBe(ambiguous.factsMemory.transfers.at(-2)?.operationKey);
+        await request(async () => expect(ambiguous.service.execute(ambiguousCommand, { signal })).rejects.toMatchObject({
+          code: "CONFLICT",
+        }));
+        expect(ambiguous.claude.calls).toEqual(providerCallsBeforeAbandon.claude);
+        expect(ambiguous.codex.calls).toEqual(providerCallsBeforeAbandon.codex);
+      });
+    }, 5_000);
   });
 
   test("does not release the source after a target Claude disconnects before receipt admission", async () => {

@@ -778,6 +778,18 @@ export const parseGitHistoryCommitList = (value: string): readonly string[] => {
   return Object.freeze(commits);
 };
 
+export const assertGitHistoryPatchPublicText = (patch: string, label: string): void => {
+  assertPublicSensitiveText(patch, label);
+  // Git may truncate its duplicated function heading inside a package name.
+  // Authored lines retain their diff prefix and remain covered across history.
+  const authoredPatch = patch.split("\n").map((line) => {
+    if (/[\r\u2028\u2029]/u.test(line)) return line;
+    const heading = /^(@@ -(?:0|[1-9][0-9]*)(?:,(?:0|[1-9][0-9]*))? \+(?:0|[1-9][0-9]*)(?:,(?:0|[1-9][0-9]*))? @@) [^\n]*$/u.exec(line);
+    return heading?.[1] ?? line;
+  }).join("\n");
+  assertPublicText(authoredPatch, label);
+};
+
 export const assertCompleteGitHistoryPublic = async (repositoryRoot: string): Promise<void> => {
   const temporaryDirectory = await realpath(tmpdir());
   const startedAt = performance.now();
@@ -828,7 +840,7 @@ export const assertCompleteGitHistoryPublic = async (repositoryRoot: string): Pr
       `Git history public-text commit ${commit}`,
       readHistory({ commit, kind: "public_patch" }),
     );
-    assertPublicText(
+    assertGitHistoryPatchPublicText(
       normalizeGitHistoryPatchForPublicScan(commit, "public_patch", authoredPatch),
       `Git history commit ${commit}`,
     );
