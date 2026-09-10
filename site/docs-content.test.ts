@@ -133,7 +133,7 @@ describe("task-oriented documentation content", () => {
     expect(blockText(blocks[0]!)).toContain("Only after immutable GitHub release admission");
     expect(blockText(blocks[0]!)).toContain("admitted v0.7.1 artifact");
     expect(blockText(blocks[0]!)).toContain("Neither artifact admission nor installation authorizes daemon startup.");
-    expect(blockLinks(blocks[0]!)).toContain("https://github.com/hraness/hra/tree/v0.7.1#get-started");
+    expect(blockLinks(blocks[0]!)).toContain("https://github.com/hraness/oompa/tree/v0.7.1#get-started");
     expect(blocks[1]).toEqual({ kind: "commands", commands: [publicContent.installCommand] });
     const text = pageText(page);
     expect(text.indexOf("Candidate artifact not yet admitted")).toBeLessThan(text.indexOf(publicContent.installCommand));

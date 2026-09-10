@@ -123,7 +123,7 @@ const siteTextOutputs = (
     content: `Contact: ${publicContent.links.privateSecurityReport}\nCanonical: ${publicContent.siteUrl}/.well-known/security.txt\nPolicy: ${publicContent.links.security}\nExpires: 2027-08-22T23:59:59Z\nPreferred-Languages: en\n`,
   },
   {
-    path: join(repositoryRoot, "dist/site/.well-known/oompa.json"),
+    path: join(repositoryRoot, "dist/site/.well-known/hra.json"),
     content: JSON.stringify({
       generation: 1,
       product: "Oompa",

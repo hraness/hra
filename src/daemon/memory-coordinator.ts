@@ -96,9 +96,9 @@ const MEMORY_BODY_CHUNK_BYTES = 6 * 1024;
 const MEMORY_TOKEN_BYTES = 128;
 const MEMORY_QUERY_TOKEN_LIMIT = 4;
 const MEMORY_INDEX_TOKEN_LIMIT = 12;
-const MEMORY_PAGE_RELATION = "oompa.memory.page";
-const MEMORY_TOKEN_RELATION = "oompa.memory.token";
-const MEMORY_NOMINATION_ID = "oompa.memory.share";
+const MEMORY_PAGE_RELATION = "hra.memory.page";
+const MEMORY_TOKEN_RELATION = "hra.memory.token";
+const MEMORY_NOMINATION_ID = "hra.memory.share";
 const MEMORY_SNAPSHOT_RECORD_LIMIT = 8_192;
 const MAX_DATE_MILLISECONDS = 8_640_000_000_000_000;
 const MEMORY_SEARCH_POLICY = Object.freeze({
@@ -269,25 +269,25 @@ const metadataFind = [
 
 const listProgram = (): OhMemoryNamedProgramV2 => {
   const terms = metadataTerms();
-  const visible = "oompa.memory.visible-page";
+  const visible = "hra.memory.visible-page";
   return {
     evaluation,
     maximumPageBytes: 64 * 1024,
     maximumRows: 16_384,
     pageSize: 5,
     parameters: [],
-    programId: "oompa.memory.list",
-    purpose: "oompa.memory.list",
+    programId: "hra.memory.list",
+    purpose: "hra.memory.list",
     query: createOhProjectionQueryV1({
       find: metadataFind,
       limit: 16_384,
-      queryId: "oompa.memory.list",
+      queryId: "hra.memory.list",
       where: [literal(visible, terms)],
     }),
     rulePack: createOhProjectionRulePackV1({
-      rulePackId: "oompa.memory.list",
+      rulePackId: "hra.memory.list",
       rulePackRevision: 1,
-      rules: [visibleRule("oompa.memory.list", MEMORY_PAGE_RELATION, visible, terms)],
+      rules: [visibleRule("hra.memory.list", MEMORY_PAGE_RELATION, visible, terms)],
     }),
     v: 2,
   };
@@ -295,28 +295,28 @@ const listProgram = (): OhMemoryNamedProgramV2 => {
 
 const getProgram = (): OhMemoryNamedProgramV2 => {
   const terms = metadataTerms("lookup_key");
-  const visible = "oompa.memory.visible-selected-page";
+  const visible = "hra.memory.visible-selected-page";
   return {
     evaluation,
     maximumPageBytes: 64 * 1024,
     maximumRows: 2,
     pageSize: 2,
     parameters: ["lookup_key"],
-    programId: "oompa.memory.get",
-    purpose: "oompa.memory.get",
+    programId: "hra.memory.get",
+    purpose: "hra.memory.get",
     query: createOhProjectionQueryV1({
       find: [
         "lane", "record_sha256", "title", "summary", "language", "created_at", "updated_at",
         "attested_at", "actor_id", "attestation_sha256",
       ],
       limit: 2,
-      queryId: "oompa.memory.get",
+      queryId: "hra.memory.get",
       where: [literal(visible, terms)],
     }),
     rulePack: createOhProjectionRulePackV1({
-      rulePackId: "oompa.memory.get",
+      rulePackId: "hra.memory.get",
       rulePackRevision: 1,
-      rules: [visibleRule("oompa.memory.get", MEMORY_PAGE_RELATION, visible, terms)],
+      rules: [visibleRule("hra.memory.get", MEMORY_PAGE_RELATION, visible, terms)],
     }),
     v: 2,
   };
@@ -324,7 +324,7 @@ const getProgram = (): OhMemoryNamedProgramV2 => {
 
 const searchProgram = (tokenCount: number): OhMemoryNamedProgramV2 => {
   const terms = metadataTerms();
-  const visible = "oompa.memory.searchable-page";
+  const visible = "hra.memory.searchable-page";
   const tokenNames = Array.from({ length: tokenCount }, (_, index) => `token${index + 1}`);
   const tokenLiterals = tokenNames.map((name) => literal(MEMORY_TOKEN_RELATION, [
     variable("lane"), variable("key"), variable(name),
@@ -336,19 +336,19 @@ const searchProgram = (tokenCount: number): OhMemoryNamedProgramV2 => {
     maximumRows: 16_384,
     pageSize: 5,
     parameters: tokenNames,
-    programId: `oompa.memory.search-${suffix}`,
-    purpose: "oompa.memory.search",
+    programId: `hra.memory.search-${suffix}`,
+    purpose: "hra.memory.search",
     query: createOhProjectionQueryV1({
       find: metadataFind,
       limit: 16_384,
-      queryId: `oompa.memory.search-${suffix}`,
+      queryId: `hra.memory.search-${suffix}`,
       where: [literal(visible, terms), ...tokenLiterals],
     }),
     rulePack: createOhProjectionRulePackV1({
-      rulePackId: `oompa.memory.search-${suffix}`,
+      rulePackId: `hra.memory.search-${suffix}`,
       rulePackRevision: 1,
       rules: [visibleRule(
-        `oompa.memory.search-${suffix}`,
+        `hra.memory.search-${suffix}`,
         MEMORY_PAGE_RELATION,
         visible,
         terms,
@@ -437,9 +437,9 @@ const memoryIndexTokens = (input: Readonly<{
 const userKey = memoryPageUserKey;
 
 const MEMORY_FACT_EXTRACTOR: OhMemoryFactExtractorV1 = Object.freeze({
-  extractorId: "oompa.memory.page",
+  extractorId: "hra.memory.page",
   extractorSha256: canonicalSha256({
-    id: "oompa.memory.page",
+    id: "hra.memory.page",
     normalization: "NFC",
     relations: [MEMORY_PAGE_RELATION, MEMORY_TOKEN_RELATION],
     revision: 3,
@@ -1297,10 +1297,10 @@ export class OompaOhMemoryCoordinator implements OompaMemoryPort {
             return { emptySearch: true, explanations: [], query: null } as const;
           }
           const programId = value.mode === "list"
-            ? "oompa.memory.list"
+            ? "hra.memory.list"
             : value.mode === "get"
-              ? "oompa.memory.get"
-              : `oompa.memory.search-${String(tokens.length)}`;
+              ? "hra.memory.get"
+              : `hra.memory.search-${String(tokens.length)}`;
           const bindings: Record<string, JsonPrimitive> = value.mode === "get"
             ? { lookup_key: value.key }
             : Object.fromEntries(tokens.map((token, index) => [`token${index + 1}`, token]));
@@ -2016,7 +2016,7 @@ export class OompaOhMemoryCoordinator implements OompaMemoryPort {
           keyDigest,
         );
     }
-    const sourceActorId = `oompa.session.${attestation.actorSessionId.replace("sess_", "sess-")}`;
+    const sourceActorId = `hra.session.${attestation.actorSessionId.replace("sess_", "sess-")}`;
     const expectedAttestation = memoryAttestationSha256({
       actorId: sourceActorId,
       actorSessionId: attestation.actorSessionId,
@@ -2082,7 +2082,7 @@ export class OompaOhMemoryCoordinator implements OompaMemoryPort {
           contentDigest,
         );
     }
-    const sourceActorId = `oompa.session.${attestation.actorSessionId.replace("sess_", "sess-")}`;
+    const sourceActorId = `hra.session.${attestation.actorSessionId.replace("sess_", "sess-")}`;
     const expectedAttestation = memoryAttestationSha256({
       actorId: sourceActorId,
       actorSessionId: attestation.actorSessionId,
@@ -2566,9 +2566,9 @@ export class OompaOhMemoryCoordinator implements OompaMemoryPort {
       throw new Error("MEMORY_WORKING_BINDING_MISMATCH");
     }
     return {
-      actorId: `oompa.session.${session.id.replace("sess_", "sess-")}`,
+      actorId: `hra.session.${session.id.replace("sess_", "sess-")}`,
       actorSessionId: session.id,
-      canonicalAuthorityId: `oompa.memory.working_only.${binding.bindingDigest}`,
+      canonicalAuthorityId: `hra.memory.working_only.${binding.bindingDigest}`,
       projectId,
       working: {
         binding,
@@ -2576,7 +2576,7 @@ export class OompaOhMemoryCoordinator implements OompaMemoryPort {
         expectedHandleHash: lifecycle.handleHash,
         expectedHead: lifecycle.head,
       },
-      workingAuthorityId: `oompa.memory.working.${binding.bindingDigest}`,
+      workingAuthorityId: `hra.memory.working.${binding.bindingDigest}`,
     };
   }
 

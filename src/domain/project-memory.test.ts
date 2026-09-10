@@ -33,10 +33,10 @@ describe("project memory canonical identity", () => {
     });
 
     expect(identity.canonicalRealmId).toBe(
-      `oompa:project-memory:${canonicalSpaceId.slice("oompa:project:".length)}`,
+      `hra:project-memory:${canonicalSpaceId.slice("hra:project:".length)}`,
     );
     expect(identity.canonicalAuthorityId).toBe(
-      `oompa.memory.canonical.${canonicalSpaceId.slice("oompa:project:".length)}`,
+      `hra.memory.canonical.${canonicalSpaceId.slice("hra:project:".length)}`,
     );
     expect(identity.authorityDigest).toBe(canonicalSha256({
       bindingDigest: identity.bindingDigest,
@@ -49,7 +49,7 @@ describe("project memory canonical identity", () => {
   test("creates a portable identity independent of the local project id", () => {
     const identity = createPortableProjectMemoryCanonicalIdentity(projectId);
     expect(identity.identityContract).toBe(2);
-    expect(identity.canonicalSpaceId).toMatch(/^oompa:project:space-[a-f0-9]{32}$/u);
+    expect(identity.canonicalSpaceId).toMatch(/^hra:project:space-[a-f0-9]{32}$/u);
     expect(identity.authorityDigest).toBe(canonicalSha256({
       bindingDigest: identity.bindingDigest,
       purpose: PROJECT_MEMORY_DESTINATION_PURPOSE,

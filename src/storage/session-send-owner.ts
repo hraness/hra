@@ -64,7 +64,7 @@ export class SessionSendOwnershipError extends Error {
   }
 }
 export const sessionSendDigest = (kind: string, value: unknown): string =>
-  createHash("sha256").update(JSON.stringify({ domain: `oompa.session-send.${kind}.v1`, value })).digest("hex");
+  createHash("sha256").update(JSON.stringify({ domain: `hra.session-send.${kind}.v1`, value })).digest("hex");
 export const sessionSendEvidenceDigest = (value: unknown): string => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 
 const ownerTables = [

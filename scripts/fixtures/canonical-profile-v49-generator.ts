@@ -86,7 +86,7 @@ assert.equal(sha256(JSON.stringify(runtimeManifest)), source.runtimeManifestSha2
 
 // This literal is deliberately public synthetic input, not a normalized copy
 // of any private project. Fail if it already exists; leave it for owner cleanup.
-const syntheticParent = "/private/tmp/oompa-public-canonical49-profile-fixture";
+const syntheticParent = "/private/tmp/hra-public-canonical49-profile-fixture";
 const syntheticProject = `${syntheticParent}/project`;
 const absent = await lstat(syntheticParent).then(() => false, (error: unknown) => {
   if (z.object({ code: z.literal("ENOENT") }).passthrough().safeParse(error).success) return true;
@@ -102,7 +102,7 @@ const { canonicalWorkJson } = await import(pathToFileURL(join(sourceRoot, "src/s
 const { WorkCapabilityCodec } = await import(pathToFileURL(join(sourceRoot, "src/storage/work-capability.ts")).href) as typeof WorkCapabilityModule;
 const { resolveStatePaths, initializeStatePaths } = await import(pathToFileURL(join(sourceRoot, "src/storage/paths.ts")).href) as typeof StatePathsModule;
 type Store = InstanceType<typeof StateStore>;
-const privateRoot = await realpath(await mkdtemp(join(tmpdir(), "oompa-canonical49-generator-")));
+const privateRoot = await realpath(await mkdtemp(join(tmpdir(), "hra-canonical49-generator-")));
 const paths = resolveStatePaths({ homeDirectory: privateRoot, platform: "linux", rootDirectory: join(privateRoot, "state") });
 await initializeStatePaths(paths);
 const fixedNow = () => 10_000;

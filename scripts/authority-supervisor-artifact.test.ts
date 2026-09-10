@@ -354,7 +354,7 @@ describe("authority supervisor artifact resolver", () => {
         target: expectedArtifact.target,
       });
       expect(opened.executionPath).toMatch(/^\/proc\/\d+\/fd\/\d+$/u);
-      await expect(readlink(opened.executionPath)).resolves.toContain("memfd:oompa-authority-supervisor");
+      await expect(readlink(opened.executionPath)).resolves.toContain("memfd:hra-authority-supervisor");
       await expect(readFile(opened.executionPath).then(digest)).resolves.toBe(expectedArtifact.sha256);
       const inspection = await open(opened.executionPath, constants.O_RDONLY);
       try {

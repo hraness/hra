@@ -69,7 +69,7 @@ The unauthenticated probe above does not establish either fact. On 2026-09-07, a
 
 ## Stream-json contract (captured 2026-09-03)
 
-Spike for the "Providers, models" and Claude Code (W3) sections in [Oompa Web v1](../../kb/plans/oompa-web-v1.md). Pinned facts for this capture: `claude_code_version` `2.1.260` measured with `claude --version` on this machine (the plan's prior ground truth recorded `2.1.259`; treat the exact version as drifting release to release and keep pinning and failing closed on drift, as the plan already requires). None of this is a published contract.
+Spike for the "Providers, models" and Claude Code (W3) sections in [Oompa Web v1](../../kb/plans/hra-web-v1.md). Pinned facts for this capture: `claude_code_version` `2.1.260` measured with `claude --version` on this machine (the plan's prior ground truth recorded `2.1.259`; treat the exact version as drifting release to release and keep pinning and failing closed on drift, as the plan already requires). None of this is a published contract.
 
 ### CLI surface (`claude --help`)
 
@@ -94,7 +94,7 @@ The pinned CLI initializes a stdio MCP server with protocol revision
 `2025-11-25`, then sends `notifications/initialized` and `tools/list`; the exact
 request frames are in `claude-fixtures/mcp-handshake-2.1.260.jsonl.txt`. Oompa's
 bridge admits only that pinned client/version and exposes exactly the eight
-entries in the shared `oompa.host-tools.v1` manifest. Each model-visible tool
+entries in the shared `hra.host-tools.v1` manifest. Each model-visible tool
 schema has `additionalProperties: false`; account, project, provider-thread,
 process-generation, clock, and storage authority are never model arguments.
 

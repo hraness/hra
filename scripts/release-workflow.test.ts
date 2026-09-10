@@ -294,7 +294,7 @@ describe("release workflow", () => {
       expect(source).toContain(
         "`repo:${GITHUB_REPOSITORY_OWNER}@${GITHUB_REPOSITORY_OWNER_ID}/${GITHUB_REPOSITORY_NAME}@${GITHUB_REPOSITORY_ID}:environment:npm-release`",
       );
-      expect(source).not.toContain("`repo:hraness/oompa:ref:${ref}`");
+      expect(source).not.toContain("`repo:hraness/hra:ref:${ref}`");
     }
     expect(releaseRecord).toContain("Current V2 claims from `.11` onward");
     expect(releaseRecord).toContain("Environment claim OID\n`.23` must be exactly `npm-release`");
@@ -552,7 +552,7 @@ describe("release workflow", () => {
     };
     const run = githubReleaseRun("v0.7.1", source);
     const input = {
-      artifacts: [{ name: "oompa.tgz", sha256: "c".repeat(64), size: 7 }],
+      artifacts: [{ name: "hra.tgz", sha256: "c".repeat(64), size: 7 }],
       commitSha: "a".repeat(40),
       run,
       tag: "v0.7.1",
@@ -607,12 +607,12 @@ describe("release workflow", () => {
     expect(readme).not.toContain("Install and verify the admitted v0.8.0 CLI artifact");
     expect(readme).toContain("Only after immutable GitHub release admission, install and verify the v0.8.0 candidate CLI artifact. This does not start the daemon:");
     expect(readme).toContain("The v0.8.0 candidate is not yet admitted");
-    expect(readme).toContain("https://github.com/hraness/hra/tree/v0.7.1#get-started");
+    expect(readme).toContain("https://github.com/hraness/oompa/tree/v0.7.1#get-started");
     expect(releaseNotes).toContain("## Admitted v0.7.0 predecessor");
     expect(releaseNotes).toContain("## Admitted v0.7.1 predecessor");
     for (const surface of [readme, releaseNotes, availability, gettingStarted]) {
       expect(surface).toContain("This release candidate is not yet admitted");
-      expect(surface).toContain("https://github.com/hraness/hra/blob/v0.7.1/docs/beta-release-notes.md#install");
+      expect(surface).toContain("https://github.com/hraness/oompa/blob/v0.7.1/docs/beta-release-notes.md#install");
       expect(surface).toContain("install command");
       expect(surface).toContain("unavailable until");
       const noticePosition = surface.indexOf("This release candidate is not yet admitted");
@@ -633,7 +633,7 @@ describe("release workflow", () => {
     const homepageAvailability = publicContent.questions.find(({ question }) => question === "Can I start using it now?");
     expect(homepageAvailability).toBeDefined();
     expect(homepageAvailability?.answer).toContainEqual({ kind: "link", label: "Check the setup status", href: "/docs/status/" });
-    expect(homepageAvailability?.answer).toContainEqual({ kind: "link", label: "admitted release's immutable installation notes", href: "https://github.com/hraness/hra/blob/v0.7.1/docs/beta-release-notes.md#install" });
+    expect(homepageAvailability?.answer).toContainEqual({ kind: "link", label: "admitted release's immutable installation notes", href: "https://github.com/hraness/oompa/blob/v0.7.1/docs/beta-release-notes.md#install" });
     const homepageAvailabilityText = homepageAvailability?.answer.filter((part) => part.kind === "text").map((part) => part.value).join("");
     expect(homepageAvailabilityText).toContain("The admitted v0.7.1 CLI has its own");
     expect(homepageAvailabilityText).toContain("The v0.8.0 candidate is not yet admitted.");
@@ -671,7 +671,7 @@ describe("release workflow", () => {
     expect(releaseNotes).not.toContain("src/install-preflight.ts | bun -");
     expect(releaseNotes).not.toContain("bun add --global");
     expect(releaseNotes).not.toContain(
-      'bun "$BUN_INSTALL_GLOBAL_DIR/node_modules/oompa/src/install-normalizer.ts"',
+      'bun "$BUN_INSTALL_GLOBAL_DIR/node_modules/hra/src/install-normalizer.ts"',
     );
     expect(releaseNotes).toContain("Optional hosted encrypted sync has been live since 2026-09-03 and is now an open beta.");
     expect(releaseNotes).not.toContain("Cloud enrollment is invitation-only");
@@ -711,7 +711,7 @@ describe("release workflow", () => {
     const installCommandBlocks = [...(installSection ?? "").matchAll(/```(?:sh|shell)\n([\s\S]*?)```/gu)];
     expect(installCommandBlocks).toHaveLength(1);
     const directOompaCommands = installCommandBlocks.flatMap((match) =>
-      (match[1] ?? "").split("\n").map((line) => line.trim()).filter((line) => /\bhra\s/u.test(line)),
+      (match[1] ?? "").split("\n").map((line) => line.trim()).filter((line) => /\boompa\s/u.test(line)),
     );
     expect(directOompaCommands).toEqual(["oompa --version", "oompa doctor --offline"]);
     expect(releaseNotes.indexOf("Current daemon startup and command-writer rollout remain blocked"))
@@ -840,7 +840,7 @@ describe("release workflow", () => {
       "2026-09-15T21:23:46Z",
       "sha512-T3eAkeEJrhVN/3/uYUi5IQ3eYqFbg+ln9VCEF008nJcJqRgiuzm6Oma+uTC1RIcUKWubr4WBFvDcF3iccNdLcw==",
       "814a2911aa248a08145f0b7dfed3b256c9035e29",
-      "npm `latest` names `@hraness/oompa@0.7.0`",
+      "npm `latest` names `@hraness/hra@0.7.0`",
       "cryptographic provenance",
       "This is artifact admission only",
       "separate hosted capacity and target gates",
@@ -879,7 +879,7 @@ describe("release workflow", () => {
       "6feca9bd9eb9b1ad4f915cd764f4235ccd78cca713ee4a9e89bc5395ebd27add",
       "sha512-ccnQnh1NtumzY3KcjiVbWXxl/tANTLM4P7B7YuvXNO2Wz/24TnRznJMFSToIk7s19iH0pqUzgRevHsmBsKBOmg==",
       "b4a1f2d7438b65fdc2a368766f5a746cc3453eb8",
-      "npm `latest` names `@hraness/oompa@0.7.1`",
+      "npm `latest` names `@hraness/hra@0.7.1`",
       "cryptographic publication-attempt-1 provenance", "This is artifact admission only",
       "separate hosted capacity and target gates", "immutable source bytes",
     ]) expect(admitted).toContain(evidence);
@@ -983,7 +983,7 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("## Immutable v0.1.2 partial failure record");
     expect(releaseRecord).toContain("Release workflow run `33373504473`, attempts 1 and 2");
     expect(releaseRecord).toContain("immutable GitHub Release `379612601`");
-    expect(releaseRecord).toContain("Registry readback proves `@hraness/oompa@0.1.2` is absent");
+    expect(releaseRecord).toContain("Registry readback proves `@hraness/hra@0.1.2` is absent");
     expect(releaseRecord).toContain("pins Node 24.20.0 with npm 11.19.0");
     expect(releaseRecord).toContain("proves the exact OIDC exchange before creating another GitHub Release");
     expect(releaseRecord).toContain("forwards numeric repository-owner identity");
@@ -1006,7 +1006,7 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("tag object `5c7e6add3062096c9545b10eaafddfd43f0b903e`");
     expect(releaseRecord).toContain("reviewed `main` commit `586f954945f614c00efd12f13a0d43c6f5bb809c`");
     expect(releaseRecord).toContain("Release workflow run `33417025171`, attempts 1 and 2");
-    expect(releaseRecord).toContain("Actions artifact `9767593195`, named `oompa-release-1`, is 652,281 bytes");
+    expect(releaseRecord).toContain("Actions artifact `9767593195`, named `hra-release-1`, is 652,281 bytes");
     expect(releaseRecord).toContain("`sha256:6816535110350f9bb3d43424caf05f04cc930481a64d9dd4917e0b8e4e7fa4b4`");
     expect(releaseRecord).toContain("expires at `2026-09-07T17:04:20Z`");
     expect(releaseRecord).toContain("651,736-byte tarball with SHA-256 `d9c80317a85139347ec482d7b811aef57045af8175c72cc21e259d0e23249784`");
@@ -1029,7 +1029,7 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("bounded post-publication verification request ended with `TimeoutError`");
     expect(releaseRecord).toContain("Attempt 2 publish job `99611394355`");
     expect(releaseRecord).toContain("skipped the first-publication OIDC dry run");
-    expect(releaseRecord).toContain("Retained Actions artifact `9771995410`, named `oompa-release-2`, is 652,272 bytes");
+    expect(releaseRecord).toContain("Retained Actions artifact `9771995410`, named `hra-release-2`, is 652,272 bytes");
     expect(releaseRecord).toContain("`sha256:5e52442c02ee3fb8abee520df41a19e48ef9047f24eb6f160ece1686b2331efb`");
     expect(releaseRecord).toContain("expires at `2026-09-07T19:14:29Z`");
     expect(releaseRecord).toContain("GitHub asset `538406590` is the 651,736-byte `hraness-hra-0.1.5.tgz`");
@@ -1063,7 +1063,7 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("publish job `100045528708`");
     expect(releaseRecord).toContain("skipped the first-publication OIDC dry run");
     expect(releaseRecord).toContain("completed final public admission");
-    expect(releaseRecord).toContain("Actions artifact `9822648569`, named `oompa-release-3`, is 658,170 bytes");
+    expect(releaseRecord).toContain("Actions artifact `9822648569`, named `hra-release-3`, is 658,170 bytes");
     expect(releaseRecord).toContain("`sha256:4a4b8f796b3facba97b2ef1a92be916d21637060df48451044ac6b736cb464b3`");
     expect(releaseRecord).toContain("expires at `2026-09-08T22:08:27Z`");
     expect(releaseRecord).toContain("GitHub Release `380848789`");
@@ -1072,7 +1072,7 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("`c26a9352a8cefd032794a94c0c05c11319897890a78fa4c6e0eb6f2506635aca`");
     expect(releaseRecord).toContain("asset `540202181`, the 88-byte `SHA256SUMS` file");
     expect(releaseRecord).toContain("`de24d6c71005c7528562fff09200e529adfa119d4c1f469f46562931ceaf96c9`");
-    expect(releaseRecord).toContain("npm `latest` names `@hraness/oompa@0.1.6`");
+    expect(releaseRecord).toContain("npm `latest` names `@hraness/hra@0.1.6`");
     expect(releaseRecord).toContain("`sha512-Olb/QneV4Qy4oRabwINocuhakrJLOsm0omCHcFK5bkFqnzCNn5vYd0LplXTEtPxNe+yWqiSBHi+98v+6bLtbZQ==`");
     expect(releaseRecord).toContain("`a36bc66b0c727741c0306e695da8a13ce2104704`");
     expect(releaseRecord).toContain("provenance is present and independent download comparison is byte-identical");
@@ -1082,7 +1082,7 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("The package gate still scans `rev-list --all`");
     expect(releaseRecord).toContain("coordinate completed its non-executable bootstrap");
     expect(releaseRecord).toContain("npm trusted publishing has exactly one binding");
-    expect(releaseRecord).toContain("Stable `@hraness/oompa@0.7.1` is the current admitted artifact");
+    expect(releaseRecord).toContain("Stable `@hraness/hra@0.7.1` is the current admitted artifact");
     expect(releaseRecord).toContain("The canonical README and website use a two-phase local-release surface");
     expect(releaseRecord).toContain("The `v0.7.1` local CLI artifacts are admitted");
     expect(releaseRecord).toContain("preserves that predecessor's admission record and the pre-admission wording captured in its immutable README and package metadata");
@@ -1100,7 +1100,7 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("tag object `b91b0d30168cc684b762483ea2f652d2a576fe3a`");
     expect(releaseRecord).toContain("Release workflow run `33903621032` completed on attempt 3");
     expect(releaseRecord).toContain("GitHub Release `382922988`");
-    expect(releaseRecord).toContain("npm `latest` names `@hraness/oompa@0.5.0`");
+    expect(releaseRecord).toContain("npm `latest` names `@hraness/hra@0.5.0`");
     expect(releaseRecord).toContain("## Immutable v0.6.0 partial publication record");
     expect(releaseRecord).toContain("tag object `c03c66a27398b2baf6f8dfc9bd04bcee5cc65459`");
     expect(releaseRecord).toContain("commit `576ccd76a6742cd62759ab6176a6a41844846daa`, merged through PR 122");
@@ -1114,7 +1114,7 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("OID `.24` to end in `:ref:refs/tags/v0.6.0`");
     expect(releaseRecord).toContain("DER UTF8String `npm-release` in OID `.23`");
     expect(releaseRecord).toContain("`repo:hraness@307125679/hra@1343008607:environment:npm-release` in OID `.24`");
-    expect(releaseRecord).toContain("Actions artifact `9996840156`, named `oompa-release-2`, is 1,101,922 bytes");
+    expect(releaseRecord).toContain("Actions artifact `9996840156`, named `hra-release-2`, is 1,101,922 bytes");
     expect(releaseRecord).toContain("`sha256:874cde519d9297dbbb41d004cfc716d7ca5f7b589f18cd80297bc7e0d52aff4f`");
     expect(releaseRecord).toContain("created at `2026-09-06T20:45:15Z`");
     expect(releaseRecord).toContain("expires at `2026-09-13T20:45:13Z`");
@@ -1124,7 +1124,7 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("`f9f1bfecddd867e4ca781a2a045dc9573bd91eb9810fef75b2d28e8af0c37813`");
     expect(releaseRecord).toContain("asset `547641805`, the 88-byte `SHA256SUMS`");
     expect(releaseRecord).toContain("`659a510969f0e36f1f5f0e7fef739d4ee743ebb625c2052a2aba770ce30ef6fc`");
-    expect(releaseRecord).toContain("npm `latest` names `@hraness/oompa@0.6.0`");
+    expect(releaseRecord).toContain("npm `latest` names `@hraness/hra@0.6.0`");
     expect(releaseRecord).toContain("`bootstrap` remains `0.1.0-bootstrap.0`");
     expect(releaseRecord).toContain("`sha512-u49sO2O8i2KUFVxUFdeDoPwkQetOLBV31ULsuz5jxQN5nh/BgT55+CnRvAyneoBUsyZ+dZ/u0PsoJeKnRH0vhA==`");
     expect(releaseRecord).toContain("`16c4057d1a055d3f4bcecc4a070dc2b226060523`");
@@ -1140,7 +1140,7 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("Actions artifact `10025888497`");
     expect(releaseRecord).toContain("GitHub Release `384196103`");
     expect(releaseRecord).toContain("`13669691caf3ae63bd6d88a7fab14a71e353ea1793f782d44e3cfcffe450b235`");
-    expect(releaseRecord).toContain("npm `latest` names `@hraness/oompa@0.6.1`");
+    expect(releaseRecord).toContain("npm `latest` names `@hraness/hra@0.6.1`");
     expect(releaseRecord).toContain("This is artifact admission only");
     expect(releaseRecord).toContain("hard-quota-blocked with no activation receipt");
     expect(releaseRecord).toContain("strict successful `Required` checks, resolved review conversations");
@@ -1154,7 +1154,7 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("sole always-bypass to immutable owner User ID `894119`");
     expect(releaseRecord).toContain("Never put creation, update, and deletion in one bypassed ruleset");
     expect(releaseRecord).toContain("outer digest is a transport assertion, not independent release authority");
-    expect(releaseRecord).toContain("`@hraness/oompa@0.1.0-bootstrap.0`");
+    expect(releaseRecord).toContain("`@hraness/hra@0.1.0-bootstrap.0`");
     expect(releaseRecord).toContain("npm also assigns `latest` to the first published version");
     expect(releaseRecord).toContain("resolves through both `bootstrap` and `latest`");
     expect(releaseRecord).toContain("Exact `0.1.6` publication moved `latest`");
@@ -1196,7 +1196,7 @@ describe("release workflow", () => {
       "release-candidate.test.ts",
     ]) expect(await Bun.file(join(import.meta.dir, retired)).exists()).toBeFalse();
     expect(workflow).not.toContain("oompa-weld.vercel.app");
-    expect(workflow).not.toContain("oompa.vercel.app");
+    expect(workflow).not.toContain("hra.vercel.app");
     expect(workflow).not.toContain("convex");
   });
 

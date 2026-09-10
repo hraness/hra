@@ -168,6 +168,61 @@ describe("repository policy adoption", () => {
     expect(statSync(claudePath).mode & 0o777).toBe(0o600);
   });
 
+  test("migrates the previous plugin's managed blocks in place", () => {
+    const root = fixture();
+    const agentsPath = join(root, "AGENTS.md");
+    const claudePath = join(root, "CLAUDE.md");
+    const before = "# Contents\n\n- Untouched before.";
+    const after = "# Guidelines\n\n- Untouched after.\n";
+    const legacyAgents = `${before}\n\n<!-- hra-local-efficiency:start -->\n- Old policy.\n<!-- hra-local-efficiency:end -->\n\n${after}`;
+    const legacyClaude = "# Existing Claude rules\n\n- Preserve me.\n\n<!-- hra-local-efficiency:claude-import:start -->\n@AGENTS.md\n<!-- hra-local-efficiency:claude-import:end -->\n";
+    writeFileSync(agentsPath, legacyAgents);
+    chmodSync(agentsPath, 0o640);
+    writeFileSync(claudePath, legacyClaude);
+    chmodSync(claudePath, 0o600);
+
+    expect(runRepositoryAdoption({ json: false, mode: "check", root }))
+      .toMatchObject({ changed: false, status: "needs-update" });
+    expect(readFileSync(agentsPath, "utf8")).toBe(legacyAgents);
+    expect(readFileSync(claudePath, "utf8")).toBe(legacyClaude);
+
+    expect(runRepositoryAdoption({ json: false, mode: "apply", root }))
+      .toMatchObject({ changed: true, status: "updated" });
+    const adopted = readFileSync(agentsPath, "utf8");
+    expect(adopted).toBe(`${before}\n\n${policy().trimEnd()}\n\n${after}`);
+    expect(adopted).not.toContain("hra-local-efficiency");
+    expect(adopted).not.toContain("- Old policy.");
+    expect(readFileSync(claudePath, "utf8")).toBe(
+      "# Existing Claude rules\n\n- Preserve me.\n\n<!-- oompa-local-efficiency:claude-import:start -->\n@AGENTS.md\n<!-- oompa-local-efficiency:claude-import:end -->\n",
+    );
+    expect(statSync(agentsPath).mode & 0o777).toBe(0o640);
+    expect(statSync(claudePath).mode & 0o777).toBe(0o600);
+    expect(runRepositoryAdoption({ json: false, mode: "check", root }))
+      .toMatchObject({ changed: false, status: "current" });
+  });
+
+  test("refuses mixed legacy and current markers without modifying guidance", () => {
+    const root = fixture();
+    const agentsPath = join(root, "AGENTS.md");
+    const mixed = `<!-- hra-local-efficiency:start -->\n- Old policy.\n<!-- hra-local-efficiency:end -->\n\n${policy()}`;
+    writeFileSync(agentsPath, mixed);
+
+    expect(() => runRepositoryAdoption({ json: false, mode: "check", root }))
+      .toThrow("mix legacy and current");
+    expect(() => runRepositoryAdoption({ json: false, mode: "apply", root }))
+      .toThrow("mix legacy and current");
+    expect(readFileSync(agentsPath, "utf8")).toBe(mixed);
+    expect(() => statSync(join(root, "CLAUDE.md"))).toThrow();
+
+    const duplicatedRoot = fixture();
+    const duplicated = join(duplicatedRoot, "AGENTS.md");
+    const twice = "<!-- hra-local-efficiency:start -->\n<!-- hra-local-efficiency:end -->\n".repeat(2);
+    writeFileSync(duplicated, twice);
+    expect(() => runRepositoryAdoption({ json: false, mode: "apply", root: duplicatedRoot }))
+      .toThrow("duplicate");
+    expect(readFileSync(duplicated, "utf8")).toBe(twice);
+  });
+
   test("creates a missing root AGENTS.md from the policy asset", () => {
     const root = fixture();
 

@@ -114,9 +114,9 @@ const launcherFixture = (overrides: Readonly<{
     if (key.includes("\0rev-parse\0--show-object-format")) return result("sha1\n");
     if (key.includes("\0config\0--null\0--list")) {
       return result(overrides.maskedOrigin === true
-        ? "core.repositoryformatversion\n0\0remote.origin.url\nhttps://attacker.invalid/oompa.git\0url.https://github.com/hraness/oompa.git.insteadof\nhttps://attacker.invalid/oompa.git\0"
+        ? "core.repositoryformatversion\n0\0remote.origin.url\nhttps://attacker.invalid/hra.git\0url.https://github.com/hraness/oompa.git.insteadof\nhttps://attacker.invalid/hra.git\0"
         : `core.repositoryformatversion\n0\0remote.origin.url\n${overrides.wrongOrigin === true
-          ? "https://github.com/attacker/oompa.git"
+          ? "https://github.com/attacker/hra.git"
           : overrides.sshOrigin === true
             ? "git@github.com:hraness/oompa.git"
             : "https://github.com/hraness/oompa.git"}\0`);
@@ -133,7 +133,7 @@ const launcherFixture = (overrides: Readonly<{
     }
     if (key.includes("\0remote\0get-url\0--all\0origin")) {
       return result(overrides.wrongOrigin === true
-        ? "https://github.com/attacker/oompa.git\n"
+        ? "https://github.com/attacker/hra.git\n"
         : overrides.sshOrigin === true
           ? "git@github.com:hraness/oompa.git\n"
           : "https://github.com/hraness/oompa.git\n");
@@ -241,7 +241,7 @@ const realRepositoryLauncherFixture = (
   const events: string[] = [];
   const git = (arguments_: readonly string[]): string => runFixtureGit(root, arguments_);
   git(["init", "--quiet"]);
-  git(["config", "user.email", "fixture@oompa.invalid"]);
+  git(["config", "user.email", "fixture@hra.invalid"]);
   git(["config", "user.name", "Oompa Fixture"]);
   git(["remote", "add", "origin", "https://github.com/hraness/oompa.git"]);
   for (const [path, document] of Object.entries(files)) {

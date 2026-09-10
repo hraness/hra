@@ -698,7 +698,7 @@ const boundedProcessHostIdentity = (): string => {
     throw new BoundedProcessRecoveryJournalError([], "host_identity_unavailable");
   }
   cachedBoundedProcessHostIdentity = createHash("sha256")
-    .update("oompa-bounded-process-host-v1\0", "utf8")
+    .update("hra-bounded-process-host-v1\0", "utf8")
     .update(process.platform, "utf8")
     .update("\0", "utf8")
     .update(raw, "utf8")
@@ -750,7 +750,7 @@ const custodyNameKey = (
   value: string,
 ): string =>
   createHash("sha256")
-    .update("oompa-bounded-process-custody-name-v1\0", "utf8")
+    .update("hra-bounded-process-custody-name-v1\0", "utf8")
     .update(domain, "utf8")
     .update("\0", "utf8")
     .update(value, "utf8")
@@ -2582,7 +2582,7 @@ const recoverBoundedProcessJournalLocked = (directory: string): void => {
   if (failure !== undefined) throw failure;
 };
 
-const authorityProtocolPrefix = "OOMPA_AUTHORITY_SUPERVISOR/1 ";
+const authorityProtocolPrefix = "HRA_AUTHORITY_SUPERVISOR/1 ";
 const authorityControlMaximumBytes = 1_024;
 const authoritySocketMaximumPathBytes = 107;
 
@@ -3922,12 +3922,12 @@ type BoundedProcessDependencies = Readonly<{
 
 const executionGateProgram = [
   "IFS= read -r hra_gate || exit 125",
-  '[ "$hra_gate" = "oompa-release-v1" ] || exit 125',
+  '[ "$hra_gate" = "hra-release-v1" ] || exit 125',
   'exec "$@"',
 ].join("; ");
 
 const executionGateInput = (stdin: string | undefined): string =>
-  `oompa-release-v1\n${stdin ?? ""}`;
+  `hra-release-v1\n${stdin ?? ""}`;
 
 const authorityUnprovenResult = (
   journal: AuthorityPreparedRecoveryJournal

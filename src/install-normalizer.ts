@@ -26,7 +26,7 @@ import { finished } from "node:stream/promises";
 import { createGunzip } from "node:zlib";
 
 export const OOMPA_INSTALL_BUN_VERSION = "1.3.14";
-export const OOMPA_INSTALL_CLI_SHA256 = "5c80f082c02e2026ec2ca8e592211b4906e6994b7196f9292013d0effc92b1f7";
+export const OOMPA_INSTALL_CLI_SHA256 = "5b609e5d8a17484f9c16cd4164a80befef05c5ceeb6fe07fdbb85d0a76dbb580";
 
 const expectedPackageName = "@hraness/oompa";
 const expectedPackageVersion = "0.8.0";
@@ -2008,7 +2008,7 @@ export async function completeOompaStagedInstall(input: InstallArchiveIdentity &
     } finally {
       normalizerBytes.fill(0);
     }
-    await unlinkHeldChild(custody, stagingRoot, ".oompa-install-complete.json", true);
+    await unlinkHeldChild(custody, stagingRoot, ".hra-install-complete.json", true);
     await normalizeOompaBunInstall({ normalizerPath, packageRoot });
     const normalizedTree = await normalizeInstallTree(
       stagingRoot,
@@ -2032,7 +2032,7 @@ export async function completeOompaStagedInstall(input: InstallArchiveIdentity &
       version: 2,
     };
     await writeAtomicJson(
-      join(stagingRoot, ".oompa-install-complete.json"),
+      join(stagingRoot, ".hra-install-complete.json"),
       receipt,
       uid,
       custody,

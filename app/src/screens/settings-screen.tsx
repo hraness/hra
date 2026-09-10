@@ -624,7 +624,7 @@ export function MemorySupervision({ machines, now, ready }: Readonly<{
                   : group.agreement === "disagreed" ? "heads disagree" : "insufficient evidence"}
               </Badge>
             )}
-            description={`Portable space ${shortDigest(group.canonicalSpaceId.slice("oompa:project:".length))}; ${group.projectLabels.join(", ") || "project label unavailable"}.`}
+            description={`Portable space ${shortDigest(group.canonicalSpaceId.slice("hra:project:".length))}; ${group.projectLabels.join(", ") || "project label unavailable"}.`}
             title="Shared memory"
           />
           {group.observations.map((observation) => {

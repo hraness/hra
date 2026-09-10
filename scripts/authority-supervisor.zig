@@ -2,7 +2,7 @@
 //!
 //! This repository-local helper is deliberately not a general sandbox. The
 //! target retains its cwd, environment, ordinary filesystem access, and
-//! ordinary stdio. The one filesystem exception is Oompa's recovery directory,
+//! ordinary stdio. The one filesystem exception is HRA's recovery directory,
 //! which is concealed behind an empty read-only mount before READY so the
 //! target cannot replace the journal lock or tamper with durable custody. A
 //! strict, stable mountinfo preflight first rejects inherited bind aliases of
@@ -26,26 +26,26 @@
 //!     --init-host-pid 2..2147483647 --init-start-time /proc-stat-clock-ticks \
 //!     --init-pid-namespace-inode positive-decimal-inode
 //!
-//! Oompa owns the Unix socket beneath a held 0700 recovery directory. It verifies
+//! HRA owns the Unix socket beneath a held 0700 recovery directory. It verifies
 //! the nonce in READY, sends the matching GO frame, then requires both CLEAN
 //! and the outer helper child exit before accepting cleanup proof. The target
 //! never inherits the control socket or helper arguments; it inherits only
-//! stdin, stdout, and stderr. Oompa writes target stdin only after it sends GO.
+//! stdin, stdout, and stderr. HRA writes target stdin only after it sends GO.
 //!
 //! Control frames are line-oriented UTF-8 on the Unix socket:
 //!
-//!   OOMPA_AUTHORITY_SUPERVISOR/1 READY nonce=<hex> outer_pid=<pid> outer_pgid=<pid> outer_start_time=<ticks> boot_id=<uuid> init_host_pid=<pid> init_start_time=<ticks> init_pid_namespace_inode=<inode> ns_init_pid=1 monotonic_ms=<positive-u64>
-//!   OOMPA_AUTHORITY_SUPERVISOR/1 GO nonce=<hex> deadline_monotonic_ms=<positive-u64>
-//!   OOMPA_AUTHORITY_SUPERVISOR/1 CLEAN nonce=<hex> exit=<0-255>
-//!   OOMPA_AUTHORITY_SUPERVISOR/1 FAIL nonce=<hex> code=<stable-code>
-//!   OOMPA_AUTHORITY_SUPERVISOR/1 RECOVERY_READY nonce=<hex> recovery_pid=<pid> recovery_start_time=<ticks> outer_pid=<pid> outer_start_time=<ticks> init_host_pid=<pid> init_start_time=<ticks> init_pid_namespace_inode=<inode>
-//!   OOMPA_AUTHORITY_SUPERVISOR/1 RECOVERY_GO nonce=<hex>
-//!   OOMPA_AUTHORITY_SUPERVISOR/1 RECOVERY_CLEAN nonce=<hex> recovery_pid=<pid> recovery_start_time=<ticks> outer_pid=<pid> outer_start_time=<ticks> boot_id=<uuid> init_host_pid=<pid> init_start_time=<ticks> init_pid_namespace_inode=<inode> method=<pidfd-sigkill|pidfd-already-exited>
+//!   HRA_AUTHORITY_SUPERVISOR/1 READY nonce=<hex> outer_pid=<pid> outer_pgid=<pid> outer_start_time=<ticks> boot_id=<uuid> init_host_pid=<pid> init_start_time=<ticks> init_pid_namespace_inode=<inode> ns_init_pid=1 monotonic_ms=<positive-u64>
+//!   HRA_AUTHORITY_SUPERVISOR/1 GO nonce=<hex> deadline_monotonic_ms=<positive-u64>
+//!   HRA_AUTHORITY_SUPERVISOR/1 CLEAN nonce=<hex> exit=<0-255>
+//!   HRA_AUTHORITY_SUPERVISOR/1 FAIL nonce=<hex> code=<stable-code>
+//!   HRA_AUTHORITY_SUPERVISOR/1 RECOVERY_READY nonce=<hex> recovery_pid=<pid> recovery_start_time=<ticks> outer_pid=<pid> outer_start_time=<ticks> init_host_pid=<pid> init_start_time=<ticks> init_pid_namespace_inode=<inode>
+//!   HRA_AUTHORITY_SUPERVISOR/1 RECOVERY_GO nonce=<hex>
+//!   HRA_AUTHORITY_SUPERVISOR/1 RECOVERY_CLEAN nonce=<hex> recovery_pid=<pid> recovery_start_time=<ticks> outer_pid=<pid> outer_start_time=<ticks> boot_id=<uuid> init_host_pid=<pid> init_start_time=<ticks> init_pid_namespace_inode=<inode> method=<pidfd-sigkill|pidfd-already-exited>
 //!
 //! READY means a fresh user, mount, and PID namespace exists and its PID 1 is
 //! waiting behind the GO gate. GO carries an absolute CLOCK_MONOTONIC deadline.
 //! Both the outer supervisor and namespace PID 1 enforce it independently, so
-//! a stopped or starved Oompa process cannot extend target authority. CLEAN is
+//! a stopped or starved HRA process cannot extend target authority. CLEAN is
 //! emitted only by the outer supervisor, after it has reaped that PID 1. Linux
 //! kills all remaining tasks in a PID namespace when its init exits, including
 //! double-forked or setsid() children. Any missing CLEAN or missing outer-helper
@@ -59,9 +59,9 @@
 //! deliberately does not attempt the cross-process proc readlink that Linux
 //! denies for a nondumpable init. A failed validation sends no signal. A
 //! post-signal timeout or wait failure remains indeterminate for the caller.
-//! Before RECOVERY_GO, Oompa must bind recovery_pid to the freshly spawned direct
+//! Before RECOVERY_GO, HRA must bind recovery_pid to the freshly spawned direct
 //! child it owns. The sealed, nonce-authenticated, nondumpable helper reports
-//! its own positive recovery_start_time; Oompa binds RECOVERY_CLEAN to that exact
+//! its own positive recovery_start_time; HRA binds RECOVERY_CLEAN to that exact
 //! pair, the child's zero exit, and complete control-channel EOF.
 
 const builtin = @import("builtin");
@@ -74,7 +74,7 @@ comptime {
     }
 }
 
-const protocol_prefix = "OOMPA_AUTHORITY_SUPERVISOR/1 ";
+const protocol_prefix = "HRA_AUTHORITY_SUPERVISOR/1 ";
 const nonce_hex_length = 32;
 const Nonce = [16]u8;
 const boot_id_length = 36;
@@ -225,7 +225,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     };
 
     switch (config.action) {
-        // Oompa deliberately gives a launch target raw standard streams. Refuse
+        // HRA deliberately gives a launch target raw standard streams. Refuse
         // to start rather than let a control socket occupy one of them. This
         // is checked before socket() because socket() may otherwise reuse a
         // missing standard descriptor.
@@ -436,7 +436,7 @@ fn runLaunch(
     prepared_config.target_cwd = target_cwd.ptr;
 
     try unshareAndMapCurrentIdentity(host_uid, host_gid);
-    // The outer supervisor is itself a child of Oompa. It arms PDEATHSIG after
+    // The outer supervisor is itself a child of HRA. It arms PDEATHSIG after
     // uid/gid mapping, then checks the pre-arm race before it can announce
     // READY or fork namespace PID 1.
     try armParentDeath();
@@ -537,7 +537,7 @@ fn runPrepared(
 
     const exit_code = exitCodeFromWaitStatus(result.wait_status);
     // This is the only CLEAN emission site. PID 1 was already reaped above;
-    // this outer process immediately exits after writing CLEAN, and Oompa must
+    // this outer process immediately exits after writing CLEAN, and HRA must
     // observe that exit as the second half of the custody proof.
     try emitClean(fds.control, nonce, exit_code);
     closeIgnore(fds.control);
@@ -550,7 +550,7 @@ fn runRecovery(
     socket: i32,
     launch_parent_pid: linux.pid_t,
 ) SupervisorError!void {
-    // Recovery is a child of Oompa, never the recorded outer helper or Oompa
+    // Recovery is a child of HRA, never the recorded outer helper or HRA
     // itself. Refuse pathological journal input before opening a pidfd.
     if (recovery.outer_pid == linux.getpid() or recovery.outer_pid == launch_parent_pid or recovery.init_host_pid == linux.getpid() or recovery.init_host_pid == launch_parent_pid or recovery.init_host_pid == recovery.outer_pid) {
         return error.RecoveryUnsafeTarget;
@@ -707,7 +707,7 @@ fn initMain(config: LaunchConfig, fds: PreparedFileDescriptors) noreturn {
     closeIgnore(fds.ready_read);
     closeIgnore(fds.lifeline_write);
 
-    // PID 1 never writes raw bytes to Oompa's target stdout/stderr streams, but
+    // PID 1 never writes raw bytes to HRA's target stdout/stderr streams, but
     // retains them so the target can inherit its ordinary raw stdio surface.
 
     armParentDeath() catch initExit(fds.result_write, ResultKind.internal, 1);

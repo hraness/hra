@@ -93,32 +93,71 @@ export function normalizeTrailingNewline(value: string): string {
   return `${value.replace(/\n*$/u, "")}\n`;
 }
 
+export type ManagedMarkerPair = Readonly<{
+  end: string;
+  start: string;
+}>;
+
+const legacyMarkerPrefix = /^(?<lead>[^A-Za-z]*)oompa-/u;
+
+// The plugin was previously named with an hra- prefix; the legacy marker pair
+// is the current pair with that prefix restored.
+export function legacyMarkerAlias(marker: string): string {
+  const alias = marker.replace(legacyMarkerPrefix, "$<lead>hra-");
+  if (alias === marker) throw new Error(`marker has no legacy alias: ${marker}`);
+  return alias;
+}
+
+export function legacyMarkerPair(startMarker: string, endMarker: string): ManagedMarkerPair {
+  return Object.freeze({
+    end: legacyMarkerAlias(endMarker),
+    start: legacyMarkerAlias(startMarker),
+  });
+}
+
+function locateManagedBlock(
+  existing: string,
+  startMarker: string,
+  endMarker: string,
+): { readonly end: number; readonly start: number } | null {
+  const start = existing.indexOf(startMarker);
+  const end = existing.indexOf(endMarker);
+  if (start < 0 && end < 0) return null;
+  if ((start < 0) !== (end < 0)) throw new Error(`managed block is incomplete: ${startMarker}`);
+  if (end < start) throw new Error(`managed block markers are reversed: ${startMarker}`);
+  if (
+    existing.indexOf(startMarker, start + startMarker.length) >= 0
+    || existing.indexOf(endMarker, end + endMarker.length) >= 0
+  ) throw new Error(`managed block markers are duplicated: ${startMarker}`);
+  return { end: end + endMarker.length, start };
+}
+
+// When the current markers are absent and exactly one well-formed legacy
+// block exists, that legacy block is replaced in place, markers included.
 export function replaceManagedBlock(
   current: string | null,
   block: string,
   startMarker: string,
   endMarker: string,
+  legacyMarkers: ManagedMarkerPair | null = null,
 ): string {
   const normalizedBlock = normalizeTrailingNewline(block);
   const existing = current ?? "";
-  const start = existing.indexOf(startMarker);
-  const end = existing.indexOf(endMarker);
-  if ((start < 0) !== (end < 0)) throw new Error(`managed block is incomplete: ${startMarker}`);
-  if (start >= 0 && end < start) throw new Error(`managed block markers are reversed: ${startMarker}`);
-  if (
-    start >= 0
-    && (
-      existing.indexOf(startMarker, start + startMarker.length) >= 0
-      || existing.indexOf(endMarker, end + endMarker.length) >= 0
-    )
-  ) throw new Error(`managed block markers are duplicated: ${startMarker}`);
-  if (start >= 0) {
-    const after = end + endMarker.length;
-    const suffix = existing.slice(after);
+  const legacyPresent = legacyMarkers !== null
+    && (existing.includes(legacyMarkers.start) || existing.includes(legacyMarkers.end));
+  const currentPresent = existing.includes(startMarker) || existing.includes(endMarker);
+  if (legacyPresent && currentPresent) {
+    throw new Error(`managed block markers mix legacy and current: ${startMarker}`);
+  }
+  const located = legacyMarkers !== null && legacyPresent
+    ? locateManagedBlock(existing, legacyMarkers.start, legacyMarkers.end)
+    : locateManagedBlock(existing, startMarker, endMarker);
+  if (located !== null) {
+    const suffix = existing.slice(located.end);
     const replacement = suffix.startsWith("\n") || suffix.startsWith("\r\n")
       ? normalizedBlock.slice(0, -1)
       : normalizedBlock;
-    return `${existing.slice(0, start)}${replacement}${suffix}`;
+    return `${existing.slice(0, located.start)}${replacement}${suffix}`;
   }
   const separator = existing === "" || existing.endsWith("\n\n")
     ? ""
@@ -222,7 +261,7 @@ function pluginIdentityMatches(pluginRoot: string, skillRoot: string, pluginName
 function reservedDanglingCacheTarget(
   existingTarget: string,
   codexHome: string,
-  pluginName: string,
+  pluginNames: readonly string[],
   expectedScript: string,
 ): boolean {
   if (!isAbsolute(existingTarget)) return false;
@@ -237,18 +276,20 @@ function reservedDanglingCacheTarget(
   const segments = relativeTarget.split(sep);
   return segments.length === 7
     && safeSegment.test(segments[0] ?? "")
-    && segments[1] === pluginName
+    && pluginNames.includes(segments[1] ?? "")
     && safeSegment.test(segments[2] ?? "")
     && segments[3] === "skills"
-    && segments[4] === pluginName
+    && segments[4] === segments[1]
     && segments[5] === "scripts"
     && segments[6] === expectedScript;
 }
 
+// A prior install is owned when every identity segment agrees on one of the
+// accepted plugin names: the current name or the legacy name it replaced.
 function managedPriorTarget(
   existingTarget: string,
   target: string,
-  pluginName: string,
+  pluginNames: readonly string[],
   codexHome: string,
 ): boolean {
   const expectedScript = basename(target);
@@ -259,7 +300,8 @@ function managedPriorTarget(
     const canonical = realpathSync(existingTarget);
     if (basename(dirname(canonical)) !== "scripts") return false;
     const skillRoot = dirname(dirname(canonical));
-    if (basename(skillRoot) !== pluginName || basename(dirname(skillRoot)) !== "skills") return false;
+    const pluginName = basename(skillRoot);
+    if (!pluginNames.includes(pluginName) || basename(dirname(skillRoot)) !== "skills") return false;
     const pluginRoot = dirname(dirname(skillRoot));
     if (!pluginIdentityMatches(pluginRoot, skillRoot, pluginName)) return false;
     if (basename(pluginRoot) === pluginName && basename(dirname(pluginRoot)) === "plugins") return true;
@@ -276,24 +318,25 @@ function managedPriorTarget(
       && segments[2] !== "";
   } catch (error: unknown) {
     return missingPath(error)
-      && reservedDanglingCacheTarget(existingTarget, codexHome, pluginName, expectedScript);
+      && reservedDanglingCacheTarget(existingTarget, codexHome, pluginNames, expectedScript);
   }
 }
 
 export function ensureManagedSymlink(
   link: string,
   target: string,
-  pluginName: string,
+  pluginName: string | readonly string[],
   codexHome: string,
 ): "created" | "current" | "updated" {
   if (!isAbsolute(link) || !isAbsolute(target)) throw new Error("managed symlink paths must be absolute");
+  const pluginNames = typeof pluginName === "string" ? [pluginName] : pluginName;
   mkdirSync(dirname(link), { recursive: true, mode: 0o700 });
   try {
     const metadata = lstatSync(link);
     if (!metadata.isSymbolicLink()) throw new Error(`refusing to replace unmanaged command: ${link}`);
     const existingTarget = resolve(dirname(link), readlinkSync(link));
     if (existingTarget === resolve(target)) return "current";
-    if (!managedPriorTarget(existingTarget, target, pluginName, codexHome)) {
+    if (!managedPriorTarget(existingTarget, target, pluginNames, codexHome)) {
       throw new Error(`refusing to replace unrelated command link: ${link}`);
     }
     unlinkSync(link);

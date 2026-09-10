@@ -73,7 +73,7 @@ export function installSyntheticAdoption36Fixture(database: Database, scenario: 
     }
     database.query("INSERT INTO projects(id,label,label_key,root_path,is_default,created_at,updated_at) VALUES(?,?,?, ?,1,?,?)")
       .run(syntheticAdoption36.projectId, "synthetic adoption36", "synthetic adoption36",
-        "/opt/oompa-fixtures/adoption36", syntheticAdoption36.fixedTime, syntheticAdoption36.fixedTime);
+        "/opt/hra-fixtures/adoption36", syntheticAdoption36.fixedTime, syntheticAdoption36.fixedTime);
     const profile = (id: string, label: string, signedIn: boolean): void => {
       const email = signedIn ? `${label.replaceAll(" ", "-")}@example.com` : null;
       database.query(`INSERT INTO profiles(id,label,label_key,state,process_generation,provider_email,

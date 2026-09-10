@@ -128,7 +128,7 @@ const publicFailureCodes = [
 
 type PublicFailureCode = typeof publicFailureCodes[number];
 
-export const commandFailureBrand = Symbol("oompa.command-failure");
+export const commandFailureBrand = Symbol("hra.command-failure");
 
 const publicFailureMessages = {
   INVALID_INPUT: "The local command was rejected as invalid.",

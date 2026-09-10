@@ -250,6 +250,7 @@ describe("host-wide resource wrapper", () => {
       `);
       const environment = { ...process.env };
       delete environment.OOMPA_LOCAL_EFFICIENCY_LEASE;
+      delete environment.HRA_LOCAL_EFFICIENCY_LEASE;
       const result = Bun.spawnSync({
         cmd: [
           process.execPath,
@@ -282,6 +283,152 @@ describe("host-wide resource wrapper", () => {
     }
   });
 
+  test("exports the identical lease under both the current and legacy names", () => {
+    const root = mkdtempSync(join(tmpdir(), "oompa-dual-lease-env-"));
+    try {
+      const modulePath = join(root, "host-resources.js");
+      const leasePath = join(root, "lease-environment.json");
+      const markerPath = join(root, "lease.lock");
+      writeFileSync(modulePath, `
+        import { closeSync, openSync, unlinkSync, writeFileSync } from "node:fs";
+        const markerPath = ${JSON.stringify(markerPath)};
+        export function createHostResourceCoordinator() {
+          return {
+            async withLease(claims, callback) {
+              writeFileSync(markerPath, "{}", { mode: 0o600 });
+              const descriptor = openSync(markerPath, "r+");
+              try {
+                return await callback({ inheritedFileDescriptor: descriptor });
+              } finally {
+                closeSync(descriptor);
+                unlinkSync(markerPath);
+              }
+            },
+          };
+        }
+      `);
+      const environment = { ...process.env };
+      delete environment.OOMPA_LOCAL_EFFICIENCY_LEASE;
+      delete environment.HRA_LOCAL_EFFICIENCY_LEASE;
+      const result = Bun.spawnSync({
+        cmd: [
+          process.execPath,
+          join(import.meta.dir, "host-run.ts"),
+          "--mode=heavy",
+          "--label=dual-lease",
+          "--",
+          process.execPath,
+          "-e",
+          `await Bun.write(${JSON.stringify(leasePath)}, JSON.stringify([
+            process.env.OOMPA_LOCAL_EFFICIENCY_LEASE ?? null,
+            process.env.HRA_LOCAL_EFFICIENCY_LEASE ?? null,
+          ]))`,
+        ],
+        cwd: root,
+        env: {
+          ...environment,
+          OOMPA_ATET_HOST_RESOURCES_MODULE: modulePath,
+          OOMPA_LOCAL_EFFICIENCY_STATE_ROOT: join(root, "state", "host-resources-v1"),
+          OOMPA_LOCAL_EFFICIENCY_TELEMETRY: "off",
+        },
+        stderr: "pipe",
+        stdout: "pipe",
+      });
+      expect(result.exitCode, result.stderr.toString()).toBe(0);
+      const [current, legacy] = JSON.parse(readFileSync(leasePath, "utf8")) as [string | null, string | null];
+      expect(typeof current).toBe("string");
+      expect(legacy).toBe(current);
+      expect(JSON.parse(current as string)).toMatchObject({ label: "dual-lease", version: 2 });
+      expect(parseInheritedLease(current as string)).toEqual({
+        capacity: permitCapacity(),
+        lane: "compute",
+        mode: "heavy",
+        permits: permitsForMode("heavy"),
+      });
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  test("a nested wrapper accepts a live lease issued under the legacy profile id only", () => {
+    const root = mkdtempSync(join(tmpdir(), "oompa-legacy-profile-lease-"));
+    try {
+      const nested = (profileIdPrefix: string): { exitCode: number; stderr: string } => {
+        const modulePath = join(root, `host-resources-${profileIdPrefix.replaceAll(".", "-")}.js`);
+        const markerPath = join(root, `lease-${profileIdPrefix.replaceAll(".", "-")}.lock`);
+        writeFileSync(modulePath, `
+          import { createHash } from "node:crypto";
+          import { chmodSync, closeSync, openSync, unlinkSync, writeFileSync } from "node:fs";
+          const markerPath = ${JSON.stringify(markerPath)};
+          export function createHostResourceCoordinator(options) {
+            const profile = {
+              id: options.profile.id.replace(/^oompa\\.local-efficiency/u, ${JSON.stringify(profileIdPrefix)}),
+              capacities: options.profile.capacities,
+            };
+            return {
+              async withLease(claims, callback) {
+                const document = {
+                  version: 1,
+                  owner: "a".repeat(32),
+                  profileSha256: createHash("sha256").update(JSON.stringify(profile)).digest("hex"),
+                  ticket: "1",
+                  phase: "A",
+                  claims,
+                };
+                writeFileSync(markerPath, JSON.stringify(document), { mode: 0o600 });
+                chmodSync(markerPath, 0o600);
+                const descriptor = openSync(markerPath, "r+");
+                try {
+                  return await callback({ inheritedFileDescriptor: descriptor });
+                } finally {
+                  closeSync(descriptor);
+                  unlinkSync(markerPath);
+                }
+              },
+            };
+          }
+        `);
+        const environment = { ...process.env };
+        delete environment.OOMPA_LOCAL_EFFICIENCY_LEASE;
+        delete environment.HRA_LOCAL_EFFICIENCY_LEASE;
+        const result = Bun.spawnSync({
+          cmd: [
+            process.execPath,
+            join(import.meta.dir, "host-run.ts"),
+            "--mode=shared",
+            "--label=outer-legacy",
+            "--",
+            process.execPath,
+            join(import.meta.dir, "host-run.ts"),
+            "--mode=shared",
+            "--label=nested-legacy",
+            "--",
+            process.execPath,
+            "-e",
+            "process.exit(0)",
+          ],
+          cwd: root,
+          env: {
+            ...environment,
+            OOMPA_ATET_HOST_RESOURCES_MODULE: modulePath,
+            OOMPA_LOCAL_EFFICIENCY_STATE_ROOT: join(root, "state", "host-resources-v1"),
+            OOMPA_LOCAL_EFFICIENCY_TELEMETRY: "off",
+          },
+          stderr: "pipe",
+          stdout: "pipe",
+        });
+        return { exitCode: result.exitCode, stderr: result.stderr.toString() };
+      };
+      const legacy = nested("hra.local-efficiency");
+      expect(legacy.exitCode, legacy.stderr).toBe(0);
+      const foreign = nested("other.local-efficiency");
+      expect(foreign.exitCode).not.toBe(0);
+      expect(foreign.stderr).toContain("does not cover this request");
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
   test("records a canceled attempt before CPU admission", async () => {
     const root = mkdtempSync(join(tmpdir(), "oompa-pre-admission-cancel-"));
     const ready = join(root, "ready");
@@ -309,6 +456,7 @@ describe("host-wide resource wrapper", () => {
       `);
       const environment = { ...process.env };
       delete environment.OOMPA_LOCAL_EFFICIENCY_LEASE;
+      delete environment.HRA_LOCAL_EFFICIENCY_LEASE;
       const wrapper = Bun.spawn({
         cmd: [
           process.execPath,
@@ -378,6 +526,7 @@ describe("host-wide resource wrapper", () => {
       `);
       const environment = { ...process.env };
       delete environment.OOMPA_LOCAL_EFFICIENCY_LEASE;
+      delete environment.HRA_LOCAL_EFFICIENCY_LEASE;
       const result = Bun.spawnSync({
         cmd: [
           process.execPath,
@@ -444,6 +593,7 @@ describe("host-wide resource wrapper", () => {
     `;
     const environment = { ...process.env };
     delete environment.OOMPA_LOCAL_EFFICIENCY_LEASE;
+    delete environment.HRA_LOCAL_EFFICIENCY_LEASE;
     const wrapper = Bun.spawn({
       cmd: [
         process.execPath,
@@ -516,6 +666,7 @@ describe("host-wide resource wrapper", () => {
     `;
     const environment = { ...process.env };
     delete environment.OOMPA_LOCAL_EFFICIENCY_LEASE;
+    delete environment.HRA_LOCAL_EFFICIENCY_LEASE;
     const wrapper = Bun.spawn({
       cmd: [
         process.execPath,
@@ -571,6 +722,7 @@ describe("host-wide resource wrapper", () => {
       const childMarker = join(root, "child-ran");
       const environment = { ...process.env };
       delete environment.OOMPA_LOCAL_EFFICIENCY_LEASE;
+      delete environment.HRA_LOCAL_EFFICIENCY_LEASE;
       const result = Bun.spawnSync({
         cmd: [
           process.execPath,

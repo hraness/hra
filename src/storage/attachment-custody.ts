@@ -48,7 +48,7 @@ export const parseAttachmentInput = (input: unknown): AttachmentIngressInput => 
   } catch (error) { if (error instanceof z.ZodError) fail("ATTACHMENT_CUSTODY_INVALID_INPUT"); throw error; }
 };
 export const attachmentReferencesDigest = (refs: readonly AttachmentReference[]): string => sha(JSON.stringify({
-  domain: "oompa:attachment-custody-references:v1", references: refs.map((ref) => [ref.byteLength, ref.digest, ref.mediaType, ref.name]),
+  domain: "hra:attachment-custody-references:v1", references: refs.map((ref) => [ref.byteLength, ref.digest, ref.mediaType, ref.name]),
 }));
 const memberSchema = z.object({ digest, canonicalMediaType: z.enum(["image/png", "image/jpeg", "image/gif", "image/webp", "text/plain"]),
   byteLength: z.number().int().min(1).max(5242880) }).strict();
@@ -63,7 +63,7 @@ const originSchema = z.object({ version: z.literal(1), id: custodyId, input: inp
   daemonGeneration: generation, bootId, createdAt: unixMillisecondsSchema }).strict()
   .refine((origin) => origin.input.daemon?.daemonGeneration === origin.daemonGeneration && origin.input.daemon.bootId === origin.bootId);
 type Origin = z.infer<typeof originSchema>;
-const proofDigest = (value: unknown): string => sha(JSON.stringify({ domain: "oompa:attachment-custody:v1", value }));
+const proofDigest = (value: unknown): string => sha(JSON.stringify({ domain: "hra:attachment-custody:v1", value }));
 export function attachmentInputProof(input: Omit<AttachmentIngressInput, "daemonGeneration" | "bootId"> & Partial<AttachmentDaemon>, originalRequestDigest?: string): InputProof {
   const refs = input.attachments;
   const request = refs.length === 0 ? { message: input.message } : input.kind === "session.queue"

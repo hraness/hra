@@ -42,7 +42,7 @@ const team = "hraness";
 const teamId = "team_UAd1iD2XogJlbFg4h14mRaPM";
 const canonicalAlias = "oompa.app";
 const fallbackAlias = "oompa-weld.vercel.app";
-const newStagingAlias = "oompa.vercel.app";
+const newStagingAlias = "hra.vercel.app";
 const supportedVercelVersion = "54.18.0";
 const convergenceTimeoutMs = 60_000;
 const domainPageLimit = 20;
@@ -1219,7 +1219,7 @@ export class VercelCutoverProvider implements CutoverProvider {
       throw new DomainCutoverError("command_output_invalid");
     }
     const response = await this.#fetcher(
-      `https://${aliasName}/.well-known/oompa.json?cutover=${crypto.randomUUID()}`,
+      `https://${aliasName}/.well-known/hra.json?cutover=${crypto.randomUUID()}`,
       {
         cache: "no-store",
         headers: { "cache-control": "no-cache" },

@@ -10,7 +10,7 @@ tags:
   - automations
   - app-server
 relations:
-  related-to: [ plans/oompa-web-v1 ]
+  related-to: [ plans/hra-web-v1 ]
 ---
 
 # Codex scheduled tasks (automations) ground truth

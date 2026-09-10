@@ -19,8 +19,8 @@ import { Database } from "bun:sqlite";
 import { z } from "zod";
 
 import {
-  assertReleasedHraReadonlySchema,
-  RELEASED_HRA_SCHEMA_VERSION,
+  assertReleasedOompaReadonlySchema,
+  RELEASED_OOMPA_SCHEMA_VERSION,
 } from "../../scripts/fixtures/released-state/v0.5.0/released-readonly-schema-guard";
 import { resolveStatePaths } from "./paths";
 import { StateStore } from "./state-store";
@@ -211,13 +211,13 @@ test("upgrades exact released v0.5.0 state and restores the whole root for downg
     archiveName: "hraness-hra-0.5.0.tgz",
     archiveSha256: "d0d958a95b15989f639e60ba90a2abefa7d01a3c54af601c300657d365f39063",
     archiveSRI: "sha512-lpiJw1nEDc1CKVpnbtvw4+3+3DZAAKDJ2rvP0VZCwfzatP3gEMh6iTQNQjvZn1z4kyKCQcwo//cRg3/HLyz27Q==",
-    packageName: "@hraness/oompa",
+    packageName: "@hraness/hra",
     stateStoreSha256: "9c40a3a616f308c7387ba2861e3307624f75019aed79608626a0a7325e04caad",
     tag: "v0.5.0",
     tagCommit: "846f5c99f573f97ce99f1f23ac1ea45d93e63042",
     version: "0.5.0",
   });
-  expect(manifest.state.releasedSchemaVersion).toBe(RELEASED_HRA_SCHEMA_VERSION);
+  expect(manifest.state.releasedSchemaVersion).toBe(RELEASED_OOMPA_SCHEMA_VERSION);
   expect(manifest.state.walCheckpoint).toEqual({ busy: 0, checkpointed: 0, log: 0 });
   expect(manifest.downgradeProof).toEqual({
     probedNewerSchemaVersion: 35,
@@ -239,7 +239,7 @@ test("upgrades exact released v0.5.0 state and restores the whole root for downg
       sqlBytes.toString("utf8"),
     );
     expect(materialState(databasePath)).toEqual(manifest.state.expectedRows);
-    expect(() => assertReleasedHraReadonlySchema(databasePath)).not.toThrow();
+    expect(() => assertReleasedOompaReadonlySchema(databasePath)).not.toThrow();
 
     const beforeUpgrade = await materialTree(releasedRoot);
     await cp(releasedRoot, backupRoot, { recursive: true });
@@ -253,7 +253,7 @@ test("upgrades exact released v0.5.0 state and restores the whole root for downg
     let currentSchemaVersion = 0;
     try {
       currentSchemaVersion = (inspector.query("PRAGMA user_version").get() as { user_version: number }).user_version;
-      expect(currentSchemaVersion).toBeGreaterThan(RELEASED_HRA_SCHEMA_VERSION);
+      expect(currentSchemaVersion).toBeGreaterThan(RELEASED_OOMPA_SCHEMA_VERSION);
       expect(inspector.query("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
       expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
       expect(inspector.query(
@@ -320,8 +320,8 @@ test("upgrades exact released v0.5.0 state and restores the whole root for downg
         state: "recovery_required",
       })),
     });
-    expect(() => assertReleasedHraReadonlySchema(databasePath))
-      .toThrow(`STATE_SCHEMA_NEWER:${String(currentSchemaVersion)}:${String(RELEASED_HRA_SCHEMA_VERSION)}`);
+    expect(() => assertReleasedOompaReadonlySchema(databasePath))
+      .toThrow(`STATE_SCHEMA_NEWER:${String(currentSchemaVersion)}:${String(RELEASED_OOMPA_SCHEMA_VERSION)}`);
 
     // Rollback is deliberately a whole-root exchange. Overlaying only the old
     // database could leave current sidecars, profile data, or memory epochs in
@@ -331,9 +331,9 @@ test("upgrades exact released v0.5.0 state and restores the whole root for downg
     const restoredDatabasePath = join(releasedRoot, manifest.state.databaseRelativePath);
     expect(await materialTree(releasedRoot)).toBe(beforeUpgrade);
     expect(materialState(restoredDatabasePath)).toEqual(manifest.state.expectedRows);
-    expect(() => assertReleasedHraReadonlySchema(restoredDatabasePath)).not.toThrow();
+    expect(() => assertReleasedOompaReadonlySchema(restoredDatabasePath)).not.toThrow();
     expect(() => new StateStore(resolveStatePaths({ rootDirectory: releasedRoot }), { readonly: true }))
-      .toThrow(`STATE_SCHEMA_MIGRATION_REQUIRED:${String(RELEASED_HRA_SCHEMA_VERSION)}:${String(currentSchemaVersion)}`);
+      .toThrow(`STATE_SCHEMA_MIGRATION_REQUIRED:${String(RELEASED_OOMPA_SCHEMA_VERSION)}:${String(currentSchemaVersion)}`);
   } finally {
     await rm(temporary, { force: true, recursive: true });
   }

@@ -141,7 +141,7 @@ describe("read-only memory supervision", () => {
     }],
     spaces: [{
       bindingDigest: digest("c"),
-      canonicalSpaceId: `oompa:project:space-${"d".repeat(32)}`,
+      canonicalSpaceId: `hra:project:space-${"d".repeat(32)}`,
       enrollment: "attached" as const,
       head: { digest: digest(head), operationSha256: digest(head), sequence: 2 },
       lastExchangeAt: now,

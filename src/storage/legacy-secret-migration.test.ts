@@ -65,7 +65,7 @@ const addPointer = async (
 
 describe("legacy Keychain secret migration", () => {
   test("pins the former prerelease service without exposing a mutation port", () => {
-    expect(LEGACY_OOMPA_KEYCHAIN_SERVICE).toBe("sh.oompa.control-plane.v1");
+    expect(LEGACY_OOMPA_KEYCHAIN_SERVICE).toBe("sh.hra.control-plane.v1");
     const reader = new BunLegacySecretReader();
     expect(typeof reader.get).toBe("function");
     expect("set" in reader).toBe(false);

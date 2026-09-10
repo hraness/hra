@@ -155,7 +155,7 @@ type FixtureEncoding = (typeof encodings)[number];
 const encode = (text: string, encoding: FixtureEncoding): Buffer =>
   encoding === "utf16be" ? Buffer.from(text, "utf16le").swap16() : Buffer.from(text, encoding);
 type RootSpan = Readonly<{ start: number; end: number; encoding: FixtureEncoding }>;
-const publicProjectRoot = "/private/tmp/oompa-public-canonical43-fixture/project";
+const publicProjectRoot = "/private/tmp/hra-public-canonical43-fixture/project";
 
 const assertNoHostPrefixes = (bytes: Buffer, admittedSpans: readonly RootSpan[] = []): void => {
   for (const prefix of hostPrefixes) {

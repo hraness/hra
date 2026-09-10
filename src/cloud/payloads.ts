@@ -1201,10 +1201,10 @@ export async function profileBindingRegistryDigest(envelope: EncryptedEnvelope):
     ? parseEncryptedEnvelope(snapshot.value, cloudLimits.registryCiphertextCharacters)
     : null;
   if (parsed === null) throw new Error("Invalid profile binding registry envelope.");
-  return await sha256Hex("oompa-profile-binding-registry-envelope:v1\n" + JSON.stringify(parsed));
+  return await sha256Hex("hra-profile-binding-registry-envelope:v1\n" + JSON.stringify(parsed));
 }
 
-const portableMemorySpacePattern = /^oompa:project:space-[a-f0-9]{32}$/u;
+const portableMemorySpacePattern = /^hra:project:space-[a-f0-9]{32}$/u;
 
 function parseMemorySummaryHead(value: unknown): MemorySummaryHead | null {
   if (

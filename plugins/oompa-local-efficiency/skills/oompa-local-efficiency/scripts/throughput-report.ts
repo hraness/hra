@@ -236,7 +236,7 @@ if (import.meta.main) {
     });
     printThroughputReport(buildThroughputReport(events, options.days), options.json);
   } catch (error: unknown) {
-    console.error(`[hra-throughput-report] ${error instanceof Error ? error.message : String(error)}`);
+    console.error(`[oompa-throughput-report] ${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = 1;
   }
 }

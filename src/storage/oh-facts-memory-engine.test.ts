@@ -376,8 +376,8 @@ describe("released Oh SQLite facts-memory adapter", () => {
 
   test("exports and imports exact canonical operations through a callback-scoped host capability", async () => {
     const { broker, engine, root } = await fixture();
-    const realmId = "oompa:project-memory:replication-round-trip";
-    const spaceId = "oompa:project:replication-round-trip";
+    const realmId = "hra:project-memory:replication-round-trip";
+    const spaceId = "hra:project:replication-round-trip";
     const sourceDirectory = await ensurePrivateDirectory(join(root, "replication-source"));
     const targetDirectory = await ensurePrivateDirectory(join(root, "replication-target"));
     const sourceAuthority = createOhSqliteStoreAuthorityV1({
@@ -483,8 +483,8 @@ describe("released Oh SQLite facts-memory adapter", () => {
   test("pins an exact canonical ancestor and rejects equivocation or regression", async () => {
     const { engine, root } = await fixture();
     const directory = await ensurePrivateDirectory(join(root, "replication-heads"));
-    const realmId = "oompa:project-memory:replication-heads";
-    const spaceId = "oompa:project:replication-heads";
+    const realmId = "hra:project-memory:replication-heads";
+    const spaceId = "hra:project:replication-heads";
     const authority = createOhSqliteStoreAuthorityV1({
       path: join(directory, "oh.sqlite"),
       profile: OH_CANONICAL_STORE_PROFILE_V1,
@@ -590,8 +590,8 @@ describe("released Oh SQLite facts-memory adapter", () => {
   test("reads only an exact verified canonical snapshot and refuses physical head drift", async () => {
     const { engine, root } = await fixture();
     const directory = await ensurePrivateDirectory(join(root, "canonical-summary"));
-    const realmId = "oompa:project-memory:canonical-summary";
-    const spaceId = "oompa:project:canonical-summary";
+    const realmId = "hra:project-memory:canonical-summary";
+    const spaceId = "hra:project:canonical-summary";
     const authority = createOhSqliteStoreAuthorityV1({
       path: join(directory, "oh.sqlite"),
       profile: OH_CANONICAL_STORE_PROFILE_V1,
@@ -644,8 +644,8 @@ describe("released Oh SQLite facts-memory adapter", () => {
 
   test("rechecks canonical inode custody after replication and rejects oversized storage", async () => {
     const { engine, root } = await fixture();
-    const realmId = "oompa:project-memory:replication-custody";
-    const spaceId = "oompa:project:replication-custody";
+    const realmId = "hra:project-memory:replication-custody";
+    const spaceId = "hra:project:replication-custody";
     const directory = await ensurePrivateDirectory(join(root, "replication-custody"));
     const authority = createOhSqliteStoreAuthorityV1({
       path: join(directory, "oh.sqlite"),
@@ -748,9 +748,9 @@ describe("released Oh SQLite facts-memory adapter", () => {
       canonical: {
         directory,
         expectedDatabaseFile: inspection.file,
-        realmId: "oompa:project-memory:replaced",
+        realmId: "hra:project-memory:replaced",
         requireExisting: true,
-        spaceId: "oompa:project:replaced",
+        spaceId: "hra:project:replaced",
       },
       working: {
         binding: working,
@@ -774,8 +774,8 @@ describe("released Oh SQLite facts-memory adapter", () => {
       });
       const workingHead = await inspectionHead(broker, working);
       const directory = await ensurePrivateDirectory(join(root, `vacancy-${hidden}`));
-      const spaceId = `oompa:project:vacancy-${hidden}`;
-      const realmId = `oompa:project-memory:vacancy-${hidden}`;
+      const spaceId = `hra:project:vacancy-${hidden}`;
+      const realmId = `hra:project-memory:vacancy-${hidden}`;
       const authority = createOhSqliteStoreAuthorityV1({
         path: join(directory, "oh.sqlite"),
         profile: OH_CANONICAL_STORE_PROFILE_V1,
@@ -834,16 +834,16 @@ describe("released Oh SQLite facts-memory adapter", () => {
     const alien = createOhSqliteStoreAuthorityV1({
       path: join(canonicalDirectory, "oh.sqlite"),
       profile: OH_CANONICAL_STORE_PROFILE_V1,
-      realmId: "oompa:project-memory:space-alien",
-      spaceId: "oompa:project:space-alien",
+      realmId: "hra:project-memory:space-alien",
+      spaceId: "hra:project:space-alien",
     });
     await alien.store.close();
 
     await expect(engine.withMemoryStores({
       canonical: {
         directory: canonicalDirectory,
-        realmId: "oompa:project-memory:space-primary",
-        spaceId: "oompa:project:space-primary",
+        realmId: "hra:project-memory:space-primary",
+        spaceId: "hra:project:space-primary",
       },
       working: {
         binding: working,
@@ -860,7 +860,7 @@ describe("released Oh SQLite facts-memory adapter", () => {
       for (const table of ["oh_spaces", "oh_space_bindings"] as const) {
         expect(database.query<{ space_id: string }, []>(
           `SELECT space_id FROM ${table} ORDER BY space_id`,
-        ).all()).toEqual([{ space_id: "oompa:project:space-alien" }]);
+        ).all()).toEqual([{ space_id: "hra:project:space-alien" }]);
       }
     } finally {
       database.close();
@@ -875,8 +875,8 @@ describe("released Oh SQLite facts-memory adapter", () => {
       operationKey: `create:${working.sessionId}`,
     });
     const workingHead = await inspectionHead(broker, working);
-    const expectedSpaceId = "oompa:project:bootstrap-recovery";
-    const expectedRealmId = "oompa:project-memory:bootstrap-recovery";
+    const expectedSpaceId = "hra:project:bootstrap-recovery";
+    const expectedRealmId = "hra:project-memory:bootstrap-recovery";
 
     for (const state of ["migrated", "space-created"] as const) {
       const directory = await ensurePrivateDirectory(join(root, `bootstrap-${state}`));
@@ -934,8 +934,8 @@ describe("released Oh SQLite facts-memory adapter", () => {
     const canonicalDirectory = await ensurePrivateDirectory(join(root, "hidden-space-rows"));
     const canonicalInput = {
       directory: canonicalDirectory,
-      realmId: "oompa:project-memory:hidden-space-rows",
-      spaceId: "oompa:project:hidden-space-rows",
+      realmId: "hra:project-memory:hidden-space-rows",
+      spaceId: "hra:project:hidden-space-rows",
     } as const;
     const stores = {
       canonical: canonicalInput,
@@ -1254,7 +1254,7 @@ describe("released Oh SQLite facts-memory adapter", () => {
       parentOperationSha256: null,
       sequence: 1,
     });
-    expect(childChanges.operations[0]?.operationId).toMatch(/^oompa\.fork\./u);
+    expect(childChanges.operations[0]?.operationId).toMatch(/^hra\.fork\./u);
     expect(childChanges.operations[0]?.operationId).not.toBe(parentOperation.operationId);
     expect(childChanges.operations[0]?.operationSha256).not.toBe(parentOperation.operationSha256);
     expect((await childAuthority.store.verify()).operations).toBe(1);
@@ -1316,7 +1316,7 @@ describe("released Oh SQLite facts-memory adapter", () => {
       actorId: "hra.memory.host",
       changes: [{ kind: "put", record, v: 1 }],
       expectedHead: await childAuthority.store.head(),
-      operationId: `oompa.fork.${digestParts("hra-oh-fork-operation-v1", [operationKey])}`,
+      operationId: `hra.fork.${digestParts("hra-oh-fork-operation-v1", [operationKey])}`,
     });
     await childAuthority.store.close();
     await expect(engine.inspect({ binding: child, directory: childDirectory }))
@@ -1452,7 +1452,7 @@ describe("released Oh SQLite facts-memory adapter", () => {
       actorId: "hra.memory.host",
       changes: [{ kind: "put", record: source, v: 1 }],
       expectedHead: await interruptedChild.store.head(),
-      operationId: `oompa.fork.${digestParts("hra-oh-fork-operation-v1", [operationKey])}`,
+      operationId: `hra.fork.${digestParts("hra-oh-fork-operation-v1", [operationKey])}`,
     });
     await interruptedChild.store.close();
     control.markCreateAmbiguous(child);
@@ -1678,8 +1678,8 @@ describe("released Oh SQLite facts-memory adapter", () => {
     });
     const workingHead = await inspectionHead(broker, working);
     const canonicalDirectory = await ensurePrivateDirectory(join(root, "project-canonical"));
-    const canonicalRealmId = "oompa:project:capacity-test";
-    const canonicalSpaceId = "oompa:project:capacity-test";
+    const canonicalRealmId = "hra:project:capacity-test";
+    const canonicalSpaceId = "hra:project:capacity-test";
     const canonicalAuthority = createOhSqliteStoreAuthorityV1({
       path: join(canonicalDirectory, "oh.sqlite"),
       profile: OH_CANONICAL_STORE_PROFILE_V1,

@@ -392,7 +392,7 @@ const fixture = async (registerCleanup: (cleanup: ReadbackCleanup) => void = (cl
   const request = { tool: "memory_remember", input: memory } as const;
   const requestDigest = digestClaudeHostToolInvocation(callId, request);
   const keyBytes = createHash("sha256").update([
-    "oompa:host-tool-call:v1", profile.id, threadId, turnId, callId, "memory_remember",
+    "hra:host-tool-call:v1", profile.id, threadId, turnId, callId, "memory_remember",
   ].join("\0")).digest();
   keyBytes[6] = (keyBytes[6] ?? 0) & 15 | 80;
   keyBytes[8] = (keyBytes[8] ?? 0) & 63 | 128;
@@ -446,7 +446,7 @@ const fixture = async (registerCleanup: (cleanup: ReadbackCleanup) => void = (cl
   const configPath = join(directory, "mcp.json");
   const binding = { bindingId, callbackSocketPath: socketPath, capability: "a".repeat(43), version: 1 };
   await writeFile(bindingPath, JSON.stringify(binding), { mode: 0o600 });
-  const config = { mcpServers: { oompa: { args: [CLAUDE_HOST_TOOL_BRIDGE_ENTRYPOINT, "--binding", bindingPath],
+  const config = { mcpServers: { hra: { args: [CLAUDE_HOST_TOOL_BRIDGE_ENTRYPOINT, "--binding", bindingPath],
     command: process.execPath, type: "stdio" } } };
   await writeFile(configPath, JSON.stringify(config), { mode: 0o600 });
   await new Promise<void>((ready, reject) => { server.once("error", reject); server.listen(socketPath, ready); });
@@ -799,7 +799,7 @@ describe("independent Claude private readback", () => {
         const evidence = await owner.request(async () => await oracle.verifyCleanupStoppedCustody(input));
         expect(evidence).toMatchObject({ source: "independent_cleanup_readback", phase: "cleanup_stopped",
           retainedSessionProcess: "released_not_live", unreleasedProcessesAbsent: true, privateArtifactsAbsent: true,
-          scopeBindingDigest: canonicalSha256({ domain: "oompa.claude.cleanup-readback.v1", ...input }) });
+          scopeBindingDigest: canonicalSha256({ domain: "hra.claude.cleanup-readback.v1", ...input }) });
         expect(evidence).not.toHaveProperty("soleRemember");
         expect(JSON.stringify(evidence)).not.toContain(f.session.id);
         await owner.request(async () => {

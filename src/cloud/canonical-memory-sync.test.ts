@@ -349,7 +349,7 @@ async function createRemote() {
   const accountKey = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
   const spaceKey = Uint8Array.from({ length: 32 }, (_, index) => 255 - index);
   const accountBindingDigest = canonicalSha256({ account: "test-owner", v: 1 });
-  const canonicalSpaceId = "oompa:project:space-0123456789abcdef0123456789abcdef";
+  const canonicalSpaceId = "hra:project:space-0123456789abcdef0123456789abcdef";
   const hostedSpaceId = `memory_${encodeBase64Url(new Uint8Array(24).fill(19))}`;
   const binding = {
     bindingDigest: canonicalMemoryBindingDigest(canonicalSpaceId),
@@ -695,7 +695,7 @@ async function advancePortableMemoryPage(
     format: "oh.memory-page.v1",
     language: "en",
     provenance: {
-      actorId: "oompa.session.sess-portable-proof",
+      actorId: "hra.session.sess-portable-proof",
       attestationSha256: canonicalSha256({ attestation: key, v: 1 }),
       attestedAt: instant,
       kind: "host-attested",
@@ -801,7 +801,7 @@ describe("OompaCanonicalMemorySynchronizer", () => {
         projectId: device.projectId,
         state: "attached",
       }),
-      canonicalSpaceId: expect.stringMatching(/^oompa:project:space-[a-f0-9]{32}$/u),
+      canonicalSpaceId: expect.stringMatching(/^hra:project:space-[a-f0-9]{32}$/u),
       hostedSpaceId: expect.stringMatching(/^memory_[A-Za-z0-9_-]{32}$/u),
       projectId: device.projectId,
       replay: false,

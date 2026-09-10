@@ -334,7 +334,7 @@ export function providerUsageIdempotencyKey(input: Readonly<{
   sourceEventId: string;
 }>): string {
   return providerUsageDigest({
-    domain: "oompa:provider-usage-component-idempotency:v2",
+    domain: "hra:provider-usage-component-idempotency:v2",
     authority: usageProviderAccountAuthoritySchema.parse(input.authority),
     component: providerUsageComponentKindSchema.parse(input.component),
     sessionId: sessionIdSchema.parse(input.sessionId),
@@ -644,7 +644,7 @@ export function projectCodexV1Usage(input: Readonly<{
     ...base,
     component: "quota" as const,
     idempotencyKey: providerUsageDigest({
-      domain: "oompa:codex-v1-usage-component:v2",
+      domain: "hra:codex-v1-usage-component:v2",
       authority,
       component: "quota",
       sourceRevision,
@@ -660,7 +660,7 @@ export function projectCodexV1Usage(input: Readonly<{
     ...base,
     component: "accounting" as const,
     idempotencyKey: providerUsageDigest({
-      domain: "oompa:codex-v1-usage-component:v2",
+      domain: "hra:codex-v1-usage-component:v2",
       authority,
       component: "accounting",
       sourceRevision,

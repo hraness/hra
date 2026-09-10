@@ -18,7 +18,9 @@ import { join } from "node:path";
 
 import {
   claudeAutoModeCapability,
+  commandTargets,
   ensureManagedCommandSymlink,
+  legacyCommandTargets,
   parseBootstrapArguments,
 } from "./bootstrap";
 
@@ -35,21 +37,104 @@ afterEach(() => {
   for (const path of temporary.splice(0)) rmSync(path, { recursive: true, force: true });
 });
 
-function createPluginCommand(pluginRoot: string, script: string, body = "#!/usr/bin/env bun\n"): string {
-  const skillRoot = join(pluginRoot, "skills", "oompa-local-efficiency");
+function createPluginCommand(
+  pluginRoot: string,
+  script: string,
+  body = "#!/usr/bin/env bun\n",
+  pluginName = "oompa-local-efficiency",
+): string {
+  const skillRoot = join(pluginRoot, "skills", pluginName);
   const target = join(skillRoot, "scripts", script);
   mkdirSync(join(pluginRoot, ".codex-plugin"), { recursive: true });
   mkdirSync(join(skillRoot, "scripts"), { recursive: true });
   writeFileSync(
     join(pluginRoot, ".codex-plugin", "plugin.json"),
-    `${JSON.stringify({ name: "oompa-local-efficiency", skills: "./skills/" }, null, 2)}\n`,
+    `${JSON.stringify({ name: pluginName, skills: "./skills/" }, null, 2)}\n`,
   );
   writeFileSync(
     join(skillRoot, "SKILL.md"),
-    "---\nname: oompa-local-efficiency\ndescription: Test fixture.\n---\n",
+    `---\nname: ${pluginName}\ndescription: Test fixture.\n---\n`,
   );
   writeFileSync(target, body);
   return target;
+}
+
+function bootstrapArguments(
+  mode: "--apply" | "--check",
+  root: string,
+): string[] {
+  return [
+    process.execPath,
+    import.meta.dir + "/bootstrap.ts",
+    mode,
+    ...(mode === "--apply" ? ["--skip-dependency-install"] : []),
+    "--codex-home",
+    join(root, "codex"),
+    "--claude-home",
+    join(root, "claude"),
+    "--bun-bin",
+    join(root, "bin"),
+  ];
+}
+
+// A fixture in the state the previous plugin identity left behind: legacy
+// markers in every managed file, legacy rule and profile files, and legacy
+// command links into a legacy-named plugin cache.
+function legacyInstallation(root: string): {
+  readonly bunBin: string;
+  readonly claudeHome: string;
+  readonly codexHome: string;
+  readonly environment: Readonly<NodeJS.ProcessEnv>;
+  readonly priorTargets: readonly string[];
+} {
+  const codexHome = join(root, "codex");
+  const claudeHome = join(root, "claude");
+  const bunBin = join(root, "bin");
+  mkdirSync(join(codexHome, "rules"), { recursive: true });
+  mkdirSync(claudeHome, { recursive: true });
+  mkdirSync(bunBin, { recursive: true });
+  writeFileSync(
+    join(codexHome, "AGENTS.md"),
+    "# Existing\n\nKeep me.\n\n<!-- hra-local-efficiency:start -->\n- Old policy.\n<!-- hra-local-efficiency:end -->\n\n# After\n\nKeep this too.  \n",
+  );
+  chmodSync(join(codexHome, "AGENTS.md"), 0o600);
+  writeFileSync(
+    join(codexHome, "config.toml"),
+    "# hra-local-efficiency:config:start\napproval_policy = \"on-request\"\napprovals_reviewer = \"auto_review\"\ndefault_permissions = \":workspace\"\n# hra-local-efficiency:config:end\n# Keep this comment exactly.\n\n[features]\nkeep_me = true\n",
+  );
+  chmodSync(join(codexHome, "config.toml"), 0o600);
+  writeFileSync(
+    join(codexHome, "rules", "hra-local-efficiency.rules"),
+    "# Existing rule before the managed block.\n# hra-local-efficiency:rules:start\n# old managed rule\n# hra-local-efficiency:rules:end\n",
+  );
+  chmodSync(join(codexHome, "rules", "hra-local-efficiency.rules"), 0o600);
+  for (const profile of ["hra-worker.config.toml", "hra-routine.config.toml"]) {
+    writeFileSync(join(codexHome, profile), "model = \"previous\"\n");
+  }
+  writeFileSync(
+    join(claudeHome, "CLAUDE.md"),
+    "# Existing Claude guidance\n\n<!-- hra-local-efficiency:start -->\n- Old policy.\n<!-- hra-local-efficiency:end -->\n",
+  );
+  const priorPlugin = join(codexHome, "plugins", "cache", "hraness", "hra-local-efficiency", "0.4.3");
+  const priorTargets = legacyCommandTargets(bunBin).map(([link, target]) => {
+    const prior = createPluginCommand(
+      priorPlugin,
+      target.split("/").at(-1) as string,
+      "prior managed command\n",
+      "hra-local-efficiency",
+    );
+    symlinkSync(prior, link);
+    return prior;
+  });
+  const modulePath = join(root, "host-resources.js");
+  writeFileSync(modulePath, "export const createHostResourceCoordinator = () => ({})\n");
+  return {
+    bunBin,
+    claudeHome,
+    codexHome,
+    environment: { ...fakeClaude(root), OOMPA_ATET_HOST_RESOURCES_MODULE: modulePath },
+    priorTargets,
+  };
 }
 
 function fakeClaude(
@@ -221,7 +306,7 @@ describe("machine bootstrap", () => {
     expect(claudeGuidance.match(/oompa-local-efficiency:start/gu)).toHaveLength(1);
     expect(statSync(join(claudeHome, "CLAUDE.md")).mode & 0o777).toBe(0o640);
     expect(readlinkSync(join(bunBin, "oompa-host-run"))).toContain("host-run.ts");
-    expect(readlinkSync(join(bunBin, "hra-throughput-report"))).toContain("throughput-report.ts");
+    expect(readlinkSync(join(bunBin, "oompa-throughput-report"))).toContain("throughput-report.ts");
     expect(readlinkSync(join(bunBin, "oompa-ci-ref-audit"))).toContain("ci-ref-audit.ts");
     let rules = readFileSync(rulesPath, "utf8");
     expect(rules).toContain("# Existing rule before the managed block.\n");
@@ -298,6 +383,137 @@ describe("machine bootstrap", () => {
     expect(drifted.exitCode).toBe(1);
     expect(drifted.stderr.toString()).toContain("Codex host-access rule differs");
   });
+
+  test("migrates a previous-identity installation in place", () => {
+    const root = mkdtempSync(join(tmpdir(), "oompa-local-efficiency-bootstrap-migrate-"));
+    temporary.push(root);
+    const { bunBin, claudeHome, codexHome, environment, priorTargets } = legacyInstallation(root);
+    const legacyRules = join(codexHome, "rules", "hra-local-efficiency.rules");
+    const rules = join(codexHome, "rules", "oompa-local-efficiency.rules");
+
+    const drifted = Bun.spawnSync({ cmd: bootstrapArguments("--check", root), env: environment, stderr: "pipe" });
+    expect(drifted.exitCode).toBe(1);
+    const driftReport = drifted.stderr.toString();
+    for (const failure of [
+      `global guidance differs: ${join(codexHome, "AGENTS.md")}`,
+      `Codex config differs: ${join(codexHome, "config.toml")}`,
+      `Codex host-access rule differs: ${rules}`,
+      `legacy Codex rule file present: ${legacyRules}`,
+      `Claude guidance differs: ${join(claudeHome, "CLAUDE.md")}`,
+      `legacy profile present: ${join(codexHome, "hra-worker.config.toml")}`,
+      `legacy profile present: ${join(codexHome, "hra-routine.config.toml")}`,
+      `legacy command link differs: ${join(bunBin, "hra-host-run")}`,
+      `command link differs: ${join(bunBin, "oompa-host-run")}`,
+    ]) expect(driftReport).toContain(failure);
+    expect(existsSync(rules)).toBe(false);
+    expect(readFileSync(legacyRules, "utf8")).toContain("# old managed rule\n");
+
+    const applied = Bun.spawnSync({ cmd: bootstrapArguments("--apply", root), env: environment, stderr: "pipe" });
+    expect(applied.exitCode, applied.stderr.toString()).toBe(0);
+    const guidance = readFileSync(join(codexHome, "AGENTS.md"), "utf8");
+    const codexPolicy = readFileSync(join(import.meta.dir, "..", "assets", "global-agents-block.md"), "utf8");
+    expect(guidance).toBe(`# Existing\n\nKeep me.\n\n${codexPolicy.trimEnd()}\n\n# After\n\nKeep this too.  \n`);
+    expect(guidance).not.toContain("hra-local-efficiency");
+    expect(statSync(join(codexHome, "AGENTS.md")).mode & 0o777).toBe(0o600);
+    const config = readFileSync(join(codexHome, "config.toml"), "utf8");
+    expect(config.startsWith("# oompa-local-efficiency:config:start\n")).toBe(true);
+    expect(config).toContain("# oompa-local-efficiency:config:end\n# Keep this comment exactly.\n\n[features]\nkeep_me = true\n");
+    expect(config).not.toContain("hra-local-efficiency");
+    expect(Bun.TOML.parse(config)).toMatchObject({ approval_policy: "on-request", features: { keep_me: true } });
+    const claudePolicy = readFileSync(join(import.meta.dir, "..", "assets", "global-claude-block.md"), "utf8");
+    expect(readFileSync(join(claudeHome, "CLAUDE.md"), "utf8"))
+      .toBe(`# Existing Claude guidance\n\n${claudePolicy.trimEnd()}\n`);
+    const migratedRules = readFileSync(rules, "utf8");
+    expect(migratedRules.startsWith("# Existing rule before the managed block.\n# oompa-local-efficiency:rules:start\n")).toBe(true);
+    expect(migratedRules).not.toContain("# old managed rule");
+    expect(migratedRules).not.toContain("hra-local-efficiency");
+    expect(migratedRules).toContain(`pattern = [${JSON.stringify(join(bunBin, "oompa-host-run"))}]`);
+    expect(migratedRules).toContain(`pattern = [${JSON.stringify(join(bunBin, "hra-host-run"))}]`);
+    expect(migratedRules).not.toContain('decision = "allow"');
+    expect(statSync(rules).mode & 0o777).toBe(0o600);
+    expect(existsSync(legacyRules)).toBe(false);
+    for (const profile of ["oompa-worker.config.toml", "oompa-routine.config.toml"]) {
+      expect(readFileSync(join(codexHome, profile), "utf8"))
+        .toBe(readFileSync(join(import.meta.dir, "..", "assets", profile), "utf8"));
+      expect(existsSync(join(codexHome, profile.replace("oompa-", "hra-")))).toBe(false);
+    }
+    for (const [link, target] of [...commandTargets(bunBin), ...legacyCommandTargets(bunBin)]) {
+      expect(readlinkSync(link)).toBe(target);
+    }
+    for (const prior of priorTargets) expect(readFileSync(prior, "utf8")).toBe("prior managed command\n");
+
+    const current = Bun.spawnSync({ cmd: bootstrapArguments("--check", root), env: environment, stderr: "pipe" });
+    expect(current.exitCode, current.stderr.toString()).toBe(0);
+
+    rmSync(join(bunBin, "hra-validate"));
+    const missingLegacy = Bun.spawnSync({ cmd: bootstrapArguments("--check", root), env: environment, stderr: "pipe" });
+    expect(missingLegacy.exitCode).toBe(1);
+    expect(missingLegacy.stderr.toString()).toContain(`legacy command link differs: ${join(bunBin, "hra-validate")}`);
+  }, 20_000);
+
+  test("requires legacy command links only where a legacy name already exists", () => {
+    const root = mkdtempSync(join(tmpdir(), "oompa-local-efficiency-bootstrap-fresh-"));
+    temporary.push(root);
+    const bunBin = join(root, "bin");
+    const modulePath = join(root, "host-resources.js");
+    writeFileSync(modulePath, "export const createHostResourceCoordinator = () => ({})\n");
+    const environment = { ...fakeClaude(root), OOMPA_ATET_HOST_RESOURCES_MODULE: modulePath };
+
+    const applied = Bun.spawnSync({ cmd: bootstrapArguments("--apply", root), env: environment, stderr: "pipe" });
+    expect(applied.exitCode, applied.stderr.toString()).toBe(0);
+    for (const [link, target] of legacyCommandTargets(bunBin)) expect(readlinkSync(link)).toBe(target);
+
+    for (const [link] of legacyCommandTargets(bunBin)) rmSync(link);
+    const withoutLegacy = Bun.spawnSync({ cmd: bootstrapArguments("--check", root), env: environment, stderr: "pipe" });
+    expect(withoutLegacy.exitCode, withoutLegacy.stderr.toString()).toBe(0);
+
+    symlinkSync(join(import.meta.dir, "validation-run.ts"), join(bunBin, "hra-validate"));
+    const partialLegacy = Bun.spawnSync({ cmd: bootstrapArguments("--check", root), env: environment, stderr: "pipe" });
+    expect(partialLegacy.exitCode).toBe(1);
+    const report = partialLegacy.stderr.toString();
+    expect(report).toContain(`legacy command link differs: ${join(bunBin, "hra-host-run")}`);
+    expect(report).not.toContain(`legacy command link differs: ${join(bunBin, "hra-validate")}`);
+  }, 20_000);
+
+  test("refuses mixed legacy and current markers and unsafe legacy files without changing them", () => {
+    const root = mkdtempSync(join(tmpdir(), "oompa-local-efficiency-bootstrap-mixed-"));
+    temporary.push(root);
+    const { bunBin, codexHome, environment } = legacyInstallation(root);
+    const agentsPath = join(codexHome, "AGENTS.md");
+    const mixed = `${readFileSync(agentsPath, "utf8")}\n<!-- oompa-local-efficiency:start -->\n<!-- oompa-local-efficiency:end -->\n`;
+    writeFileSync(agentsPath, mixed);
+    const legacyRules = join(codexHome, "rules", "hra-local-efficiency.rules");
+    rmSync(legacyRules);
+    mkdirSync(legacyRules);
+    const legacyProfile = join(codexHome, "hra-worker.config.toml");
+    rmSync(legacyProfile);
+    writeFileSync(join(root, "dotfiles-profile.toml"), "model = \"dotfiles\"\n");
+    symlinkSync(join(root, "dotfiles-profile.toml"), legacyProfile);
+
+    const checked = Bun.spawnSync({ cmd: bootstrapArguments("--check", root), env: environment, stderr: "pipe" });
+    expect(checked.exitCode).toBe(1);
+    expect(checked.stderr.toString()).toContain("managed block markers mix legacy and current");
+    expect(checked.stderr.toString()).toContain(`refusing to migrate non-regular legacy Codex rule file: ${legacyRules}`);
+    expect(checked.stderr.toString()).not.toContain(`legacy profile present: ${legacyProfile}`);
+
+    const applied = Bun.spawnSync({ cmd: bootstrapArguments("--apply", root), env: environment, stderr: "pipe" });
+    expect(applied.exitCode).toBe(1);
+    expect(readFileSync(agentsPath, "utf8")).toBe(mixed);
+    expect(lstatSync(legacyRules).isDirectory()).toBe(true);
+    expect(lstatSync(legacyProfile).isSymbolicLink()).toBe(true);
+    expect(existsSync(join(codexHome, "oompa-worker.config.toml"))).toBe(false);
+    expect(existsSync(join(bunBin, "oompa-host-run"))).toBe(false);
+
+    writeFileSync(agentsPath, mixed.replace("<!-- oompa-local-efficiency:start -->\n<!-- oompa-local-efficiency:end -->\n", ""));
+    rmSync(legacyRules, { recursive: true });
+    const migrated = Bun.spawnSync({ cmd: bootstrapArguments("--apply", root), env: environment, stderr: "pipe" });
+    expect(migrated.exitCode, migrated.stderr.toString()).toBe(0);
+    expect(lstatSync(legacyProfile).isSymbolicLink()).toBe(true);
+    expect(readFileSync(join(root, "dotfiles-profile.toml"), "utf8")).toBe("model = \"dotfiles\"\n");
+    expect(readFileSync(join(codexHome, "oompa-worker.config.toml"), "utf8"))
+      .toBe(readFileSync(join(import.meta.dir, "..", "assets", "oompa-worker.config.toml"), "utf8"));
+    expect(existsSync(join(codexHome, "hra-routine.config.toml"))).toBe(false);
+  }, 20_000);
 
   test("leaves Claude permission settings unchanged when Auto mode is unavailable", () => {
     const root = mkdtempSync(join(tmpdir(), "oompa-local-efficiency-bootstrap-claude-fallback-"));

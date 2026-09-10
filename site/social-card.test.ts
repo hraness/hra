@@ -80,8 +80,8 @@ describe("social card", () => {
       }
       return count;
     };
-    expect(lightPixelsIn(88, 90, 340, 180)).toBeGreaterThan(4_000);
-    expect(lightPixelsIn(400, 90, 1100, 180)).toBe(0);
+    expect(lightPixelsIn(88, 90, 520, 180)).toBeGreaterThan(4_000);
+    expect(lightPixelsIn(560, 90, 1100, 180)).toBe(0);
     // The muted description owns the first row; read-only commands follow it.
     expect(lightPixelsIn(128, 280, 700, 306)).toBeGreaterThan(300);
     expect(lightPixelsIn(128, 328, 700, 354)).toBeGreaterThan(500);
@@ -109,7 +109,7 @@ describe("social card", () => {
       }
     }
     expect(createHash("sha256").update(coverage).digest("hex"))
-      .toBe("5c731ae6d34c3ee86b50ae7890c986d2350b0c76e40f772a28c4be6106028b75");
+      .toBe("cda2ec8b5e10a584153e6f727ceca2e54c85f106482e71602e9607c3b483c9d9");
     expect(mismatchedChannels).toBe(0);
     const luminance = (color: readonly [number, number, number]): number => color.reduce((sum, channel, index) => {
       const value = channel / 255;

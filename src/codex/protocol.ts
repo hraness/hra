@@ -75,7 +75,7 @@ export const codexMatrixDigest = (
 };
 
 const liveAcceptanceCommandPattern = /^\/bin\/echo oompa-live-tool-progress \| \/usr\/bin\/tee \.\/(\.oompa-live-command-proof-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.txt)$/u;
-const liveAcceptanceCommandDigestDomain = "oompa:live-acceptance-command:v1\0";
+const liveAcceptanceCommandDigestDomain = "hra:live-acceptance-command:v1\0";
 
 /**
  * Projects a digest only for Oompa's exact, deliberately non-secret live-gate

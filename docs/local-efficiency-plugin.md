@@ -64,8 +64,8 @@ Each top-level scheduler attempt records one bounded event when telemetry storag
 Review the first seven days of available local measurements with:
 
 ```sh
-hra-throughput-report
-hra-throughput-report --days=14 --json
+oompa-throughput-report
+oompa-throughput-report --days=14 --json
 ```
 
 The report shows queue and run percentiles, failures, permit-weighted runtime, concurrency, and repeated command digests. Repeats are review candidates, not proof of wasted work. Measurements begin after this plugin version is installed; the plugin does not reconstruct historical telemetry from private transcripts.

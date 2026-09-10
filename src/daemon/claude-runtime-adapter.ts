@@ -236,7 +236,7 @@ const INITIALIZATION_FACT_LIMIT = 16;
 
 const requestDigestOf = (requestId: string, request: ClaudeCanUseTool): string =>
   createHash("sha256")
-    .update("oompa:claude-interaction-authority:v1\0", "utf8")
+    .update("hra:claude-interaction-authority:v1\0", "utf8")
     .update(JSON.stringify({ requestId, toolUseId: request.toolUseId }), "utf8")
     .digest("hex");
 
@@ -1110,7 +1110,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
 
   #hostToolCallKey(callId: string): string {
     return createHash("sha256")
-      .update("oompa:claude-runtime-host-call:v1\0", "utf8")
+      .update("hra:claude-runtime-host-call:v1\0", "utf8")
       .update(callId, "utf8")
       .digest("hex");
   }

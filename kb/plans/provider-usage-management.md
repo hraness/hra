@@ -96,28 +96,28 @@ changed. These local changes are not published and invalidate the earlier
 package measurement for final delivery. Fresh package, installation and
 integration gates remain required after the next main join.
 
-[PR 170](https://github.com/hraness/hra/pull/170) independently merged the
+[PR 170](https://github.com/hraness/oompa/pull/170) independently merged the
 protected site-operator input repair at
 `32cf432247843a3c5dbf3ec1a1dc9e75ce5c236a`. Its exact candidate passed
-[CI 34422315527](https://github.com/hraness/hra/actions/runs/34422315527),
+[CI 34422315527](https://github.com/hraness/oompa/actions/runs/34422315527),
 attempt 2, and both CodeQL analyses. Its delivery owner verified fresh
-[actual-main CI 34424163044](https://github.com/hraness/hra/actions/runs/34424163044),
+[actual-main CI 34424163044](https://github.com/hraness/oompa/actions/runs/34424163044),
 attempt 1, with all ten jobs passing, and both analyses in
-[CodeQL 34424162555](https://github.com/hraness/hra/actions/runs/34424162555).
+[CodeQL 34424162555](https://github.com/hraness/oompa/actions/runs/34424162555).
 Guarded site promotion has provider and browser readback, but final HTTP
 verification exposed response-header gaps that remain with that owner.
-[PR 172](https://github.com/hraness/hra/pull/172) carries the separate header
+[PR 172](https://github.com/hraness/oompa/pull/172) carries the separate header
 repair at `47293548d4f3c511f6999d1339434f50b6632b26`; its required CI and
 CodeQL gates are still owned by that task. This usage candidate must join the
 admitted successor before its own final gates; a protected merge alone does
 not prove site promotion or admit v0.8.0.
 
-[PR 169](https://github.com/hraness/hra/pull/169) reached protected main at
+[PR 169](https://github.com/hraness/oompa/pull/169) reached protected main at
 `d270616db2589ada8de2af2da697bb862f5d0aad`, tree
 `82d82126fb8ab10c4acd59668b7d3c1c017b7993`. Fresh actual-main
-[CI 34417046126](https://github.com/hraness/hra/actions/runs/34417046126),
+[CI 34417046126](https://github.com/hraness/oompa/actions/runs/34417046126),
 attempt 1, passed all ten jobs; both analyses in
-[CodeQL 34417046092](https://github.com/hraness/hra/actions/runs/34417046092)
+[CodeQL 34417046092](https://github.com/hraness/oompa/actions/runs/34417046092)
 passed. The prerequisite owner verified all nine exact-main checkouts and
 unchanged branch rules. The separate final browser gate passed six profiles,
 210 evidence rows and three native custody controls, with all 54 owned
@@ -127,7 +127,7 @@ Earlier combined PR 164, including the reviewed PR 167
 follow-up, reached protected `main` at
 `bdfb0c2ca7aa753e0232844a3e001c0a30626a14`, tree
 `0be440ee932429d174b8b0d6e5eab123f85f0520`. Its PR checks passed, but
-[actual-main CI 34404823161](https://github.com/hraness/hra/actions/runs/34404823161),
+[actual-main CI 34404823161](https://github.com/hraness/oompa/actions/runs/34404823161),
 attempt 1, failed Ubuntu remainder. That failed gate remains recorded without
 a blind rerun or a relaxed collection rule.
 PR 140 remains a separate draft foundation candidate. Its published head
@@ -204,7 +204,7 @@ Linux and exact-tree delivery evidence remain required; these focused local
 receipts did not replace the prerequisite owner's later integration gates.
 
 The frozen compiler handoff is
-[`c958f4981853e3f0116cd650222a0147d7af1591`](https://github.com/hraness/hra/commit/c958f4981853e3f0116cd650222a0147d7af1591),
+[`c958f4981853e3f0116cd650222a0147d7af1591`](https://github.com/hraness/oompa/commit/c958f4981853e3f0116cd650222a0147d7af1591),
 tree `82d82126fb8ab10c4acd59668b7d3c1c017b7993`, with sole parent `bdfb0c2`.
 It is a mechanical cherry-pick of local repair
 `ea0d81092ad9ba0adbed381e9f48f441f50b551a` onto that exact main. All twelve
@@ -1924,11 +1924,11 @@ Independent field, punctuation and whole-skeleton calculations bound the compose
 
   Independent actual-archive review approved only the 11,041-byte StateStore addition. All 187 packaged files match source; paths, modes, manifest, entrypoints and exclusions remain unchanged. Tar ordering and header formatting differ between packers and are not claimed byte-identical. The reviewed filesystem inventory retains 197 entries and 9,362 canonical bytes with digest `33137a5bb6c627a119310492709b8a12afee8b9a6cfba4295cfc8623a83c6f35`; direct package admission, installer pins, unchanged security inventory and public-text checks passed. This is metadata preparation only, not the complete quota/reset snapshot, a CLI consumer or a V2 producer. The earlier `6c7e4d1` full gate does not cover this later diff; integration and delivery gates remain required.
 
-  A live prerequisite recheck still found [memory PR 135](https://github.com/hraness/hra/pull/135) open at `cf33a7abfa7ff9b0c6ea42a98c3210f5f02db4d7` with failed Ubuntu and required CI. Main advanced to `b1f7743626bc93c135efdd441e235ac85ddd4c42` for v0.6.3 release preparation; its exact diff from `0aa3fd5` does not change StateStore or resolve the schema-46 collision. Release preparation is not evidence of artifact admission or this feature's deployment. No upstream mutation, CI rerun or task delivery action was taken.
+  A live prerequisite recheck still found [memory PR 135](https://github.com/hraness/oompa/pull/135) open at `cf33a7abfa7ff9b0c6ea42a98c3210f5f02db4d7` with failed Ubuntu and required CI. Main advanced to `b1f7743626bc93c135efdd441e235ac85ddd4c42` for v0.6.3 release preparation; its exact diff from `0aa3fd5` does not change StateStore or resolve the schema-46 collision. Release preparation is not evidence of artifact admission or this feature's deployment. No upstream mutation, CI rerun or task delivery action was taken.
 
 - 2026-09-07, reset-integrity checkpoint aggregate gate passed: exact commit `6c7e4d104c503c2ce38ad37437305cf6cddf4793`, tree `7ffc7e4c7de04ff41f3c91531d0b3c299af59d98`, passed the complete host-scheduled `bun run check`. The isolated verification checkout retained only the exact task ref, remained nonshallow and finished clean. Pins, the 46-file security inventory, full lint, TypeScript, 673 script tests, 108 local-plugin tests, 29 cloud-plugin tests, 4,190 source tests, 286 hosted/site tests, 446 app tests, 10 package-policy tests, all builds, complete governed-history and package checks, restored PTY and isolated local/global installation and daemon lifecycle passed. The total was 5,742 tests with 251,221 assertions and no failures. This receipt covers the composed head, envelope and reset-attempt reader checkpoints, not subsequent metadata work or a complete-feature release. No task push, PR, merge, release or deployment has occurred.
 
-- 2026-09-07, live governed-source delivery check: [memory PR 135](https://github.com/hraness/hra/pull/135) is open at `cf33a7abfa7ff9b0c6ea42a98c3210f5f02db4d7`. CI run `34162099769` passed macOS but failed Ubuntu and its required aggregate; CodeQL passed. The Ubuntu source suite reported 3,379 passing tests and one failure with 152,471 assertions. The failed v20 physical queue-body scrub case found the resolved-ambiguous message sentinel in the main database file after migration, while its preceding terminal-message check passed. This is observed failure evidence, not a proved environmental cause or permission to retry unchanged. No upstream PR mutation, rerun, merge or deployment was performed by this task. Live main is now `0aa3fd563e369f75875136ca1f550016e70035e8`; its new schema-46 collision is recorded above. This branch's independent exact `6c7e4d1` full gate remains separate from that prerequisite CI.
+- 2026-09-07, live governed-source delivery check: [memory PR 135](https://github.com/hraness/oompa/pull/135) is open at `cf33a7abfa7ff9b0c6ea42a98c3210f5f02db4d7`. CI run `34162099769` passed macOS but failed Ubuntu and its required aggregate; CodeQL passed. The Ubuntu source suite reported 3,379 passing tests and one failure with 152,471 assertions. The failed v20 physical queue-body scrub case found the resolved-ambiguous message sentinel in the main database file after migration, while its preceding terminal-message check passed. This is observed failure evidence, not a proved environmental cause or permission to retry unchanged. No upstream PR mutation, rerun, merge or deployment was performed by this task. Live main is now `0aa3fd563e369f75875136ca1f550016e70035e8`; its new schema-46 collision is recorded above. This branch's independent exact `6c7e4d1` full gate remains separate from that prerequisite CI.
 
 - 2026-09-07, reset-attempt reader constraints verified: adversarial review found that the scalar mapper accepted cross-field contradictions forbidden by the original schema-27 table. The same constraints are present in archived canonical-40, private-48 and combined-49 sources. The bounded repair requires current generation not to precede origin generation, update time not to precede creation, and the exact pending, settled or locally closed outcome combination. It adds no current-generation, current-clock, window or inter-attempt ordering assumption and changes no schema, guard or stored evidence.
 

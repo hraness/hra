@@ -1,6 +1,6 @@
 type JsonRecord = Record<string, unknown>;
 
-const schema = "https://oompa.hraness.com/release-identity/v1";
+const schema = "https://hra.hraness.com/release-identity/v1";
 const repository = "hraness/oompa";
 const repositoryId = "1343008607";
 const sha = /^[0-9a-f]{40}$/u;
@@ -82,7 +82,7 @@ function identity(input: GitHubReleaseIdentityInput, createdAttempt: number, pub
 }
 
 function render(value: unknown): string {
-  return `<!-- oompa-release-identity:v1\n${JSON.stringify(value)}\n-->`;
+  return `<!-- hra-release-identity:v1\n${JSON.stringify(value)}\n-->`;
 }
 
 export function draftReleaseBody(input: GitHubReleaseIdentityInput): string {
@@ -99,7 +99,7 @@ export function parseReleaseBody(
   state: "draft" | "published",
 ): Readonly<{ createdAttempt: number; publishedAttempt: number | null }> {
   if (typeof value !== "string" || value.length > 4_096) throw new Error("GitHub Release identity body is invalid.");
-  const prefix = "<!-- oompa-release-identity:v1\n";
+  const prefix = "<!-- hra-release-identity:v1\n";
   const suffix = "\n-->";
   if (!value.startsWith(prefix) || !value.endsWith(suffix)) throw new Error("GitHub Release identity body is missing or edited.");
   let parsed: unknown;

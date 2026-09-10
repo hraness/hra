@@ -1,5 +1,5 @@
 {
-  "alias": "hra.sh",
+  "alias": "oompa.app",
   "convex": {
     "deploymentId": 5089017,
     "deploymentName": "qualified-hummingbird-537",
@@ -11,7 +11,7 @@
   "kind": "current-project-canonical-alias",
   "repository": {
     "id": 1343008607,
-    "name": "hraness/hra"
+    "name": "hraness/oompa"
   },
   "schemaVersion": 1,
   "vercel": {

@@ -40,7 +40,7 @@ describe("attachment custody input and historical request identity", () => {
     expect(observed.requestDigest).toBe(legacyDigest(value));
     expect(observed.requestDigest).not.toBe(sha(JSON.stringify({ kind, authorityId: value.sessionId,
       authorityGeneration: value.providerAuthority.processGeneration, request: { message: value.message, attachments: [] } })));
-    expect(observed.referenceDigest).toBe(sha(JSON.stringify({ domain: "oompa:attachment-custody-references:v1", references: [] })));
+    expect(observed.referenceDigest).toBe(sha(JSON.stringify({ domain: "hra:attachment-custody-references:v1", references: [] })));
     expect(observed.referenceCount).toBe(0);
     expect(observed.members).toEqual([]);
   });
@@ -100,7 +100,7 @@ describe("attachment custody input and historical request identity", () => {
     expect(observed.referenceDigest).toBe(attachmentReferencesDigest([]));
     expect(observed.members).toEqual([]);
     expect(initialEmptyAttachmentInput(proofInput(value))).toEqual({ format: "empty_v1", custodyId: null,
-      digest: sha(JSON.stringify({ domain: "oompa:attachment-custody:v1", value: observed })) });
+      digest: sha(JSON.stringify({ domain: "hra:attachment-custody:v1", value: observed })) });
     expect(() => initialEmptyAttachmentInput(proofInput(input({ attachments: [first] })))).toThrow();
   });
 

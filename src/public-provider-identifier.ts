@@ -12,7 +12,7 @@ import {
 
 const rawProviderIdentifierSchema = z.string().min(1).max(512);
 const publicProviderIdentifierPattern = /^opaque_v2_[a-f0-9]{64}$/u;
-const publicProviderIdentifierDigestDomain = "oompa:public-provider-identifier:v2\0";
+const publicProviderIdentifierDigestDomain = "hra:public-provider-identifier:v2\0";
 const publicProviderIdentifierKeyBytes = 32;
 
 export const PUBLIC_MCP_FORM_SUMMARY = "Codex requests MCP form input";

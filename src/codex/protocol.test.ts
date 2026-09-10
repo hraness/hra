@@ -582,7 +582,7 @@ describe("pinned server requests and safe notifications", () => {
     expect(OOMPA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS).toHaveLength(1);
     expect(OOMPA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS[0]).toMatchObject({
       type: "namespace",
-      name: "oompa",
+      name: "hra",
       tools: [{ type: "function", name: "automation_update" }],
     });
     const serialized = JSON.stringify(OOMPA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS);
@@ -616,7 +616,7 @@ describe("pinned server requests and safe notifications", () => {
     expect(OOMPA_HOST_DYNAMIC_TOOLS).toHaveLength(1);
     expect(OOMPA_HOST_DYNAMIC_TOOLS[0]).toMatchObject({
       type: "namespace",
-      name: "oompa",
+      name: "hra",
     });
     expect(OOMPA_HOST_DYNAMIC_TOOLS[0].tools.map((tool) => tool.name)).toEqual([
       "automation_update",
@@ -636,7 +636,7 @@ describe("pinned server requests and safe notifications", () => {
         threadId: "thread-1",
         turnId: "turn-1",
         callId: "call-2",
-        namespace: "oompa",
+        namespace: "hra",
         tool: "session_message",
         arguments: {
           sessionId: `sess_${"a".repeat(32)}`,
@@ -664,7 +664,7 @@ describe("pinned server requests and safe notifications", () => {
         threadId: "thread-1",
         turnId: "turn-1",
         callId: "call-2",
-        namespace: "oompa",
+        namespace: "hra",
         tool: "sessions_list",
         arguments: {},
       },
@@ -681,7 +681,7 @@ describe("pinned server requests and safe notifications", () => {
       threadId: "thread-1",
       turnId: "turn-1",
       callId: "call-1",
-      namespace: "oompa",
+      namespace: "hra",
       tool: "automation_update",
       arguments: {
         mode: "create",
@@ -711,7 +711,7 @@ describe("pinned server requests and safe notifications", () => {
           mode: "create",
         },
         tool: "automation_update",
-        namespace: "oompa",
+        namespace: "hra",
         callId: "call-1",
         turnId: "turn-1",
         threadId: "thread-1",
@@ -787,7 +787,7 @@ describe("pinned server requests and safe notifications", () => {
         threadId: "thread-1",
         turnId: "turn-1",
         callId: "call-1",
-        namespace: "oompa",
+        namespace: "hra",
         tool: "automation_update",
         arguments: argumentsValue,
       },
@@ -1557,7 +1557,7 @@ describe("pinned server requests and safe notifications", () => {
   test("projects an exact non-secret live command digest and no arbitrary command oracle", () => {
     const command = "/bin/echo oompa-live-tool-progress | /usr/bin/tee ./.oompa-live-command-proof-00000000-0000-4000-8000-000000000001.txt";
     const expectedDigest = createHash("sha256")
-      .update("oompa:live-acceptance-command:v1\0", "utf8")
+      .update("hra:live-acceptance-command:v1\0", "utf8")
       .update(command, "utf8")
       .digest("hex");
     expect(safeLiveAcceptanceCommandDigest(command)).toBe(expectedDigest);

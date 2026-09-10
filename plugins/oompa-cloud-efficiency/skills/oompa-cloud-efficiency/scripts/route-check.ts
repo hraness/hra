@@ -37,7 +37,7 @@ if (import.meta.main) {
     }
     if (options.packet) console.log(`\n${dispatchPacketHeader(report)}`);
   } catch (error: unknown) {
-    console.error(`[hra-cloud-route] ${error instanceof Error ? error.message : String(error)}`);
+    console.error(`[oompa-cloud-route] ${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = 1;
   }
 }

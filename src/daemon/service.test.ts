@@ -16677,7 +16677,7 @@ describe("OompaService", () => {
       const record = value.store.readSessionSwitchByIdempotencyKey(key);
       if (record === null) throw new Error("Expected the committed switch journal.");
       const digest = createHash("sha256").update(JSON.stringify({
-        domain: "oompa:session-switch-facts-memory-owner:v1", attemptId: record.attemptId,
+        domain: "hra:session-switch-facts-memory-owner:v1", attemptId: record.attemptId,
         sourceAuthority: record.sourceAuthority, targetAuthority: record.targetAuthority,
       })).digest("hex");
       expect(factsMemory.transfers).toHaveLength(1);
@@ -18563,7 +18563,7 @@ describe("OompaService", () => {
   test("migrates a signed-in v24 profile and suppresses its first valid window across restart and notification", async () => {
     const now = canonical24ResetFixture.now;
     const firstWindow = now + 3 * 24 * 60 * 60 * 1_000;
-    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-service-v24-reset-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-service-v24-reset-")));
     serviceRoots.push(home);
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);

@@ -7,6 +7,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import {
   canonicalIfPresent,
   command,
+  legacyMarkerPair,
   readText,
   replaceManagedBlock,
   writeAtomic,
@@ -32,8 +33,12 @@ export type RepositoryAdoptionReport = {
 
 const startMarker = "<!-- oompa-local-efficiency:start -->";
 const endMarker = "<!-- oompa-local-efficiency:end -->";
+// Repositories adopted by the previous plugin identity carry the legacy pair;
+// exactly one well-formed legacy block is replaced in place.
+const legacyMarkers = legacyMarkerPair(startMarker, endMarker);
 const claudeStartMarker = "<!-- oompa-local-efficiency:claude-import:start -->";
 const claudeEndMarker = "<!-- oompa-local-efficiency:claude-import:end -->";
+const legacyClaudeMarkers = legacyMarkerPair(claudeStartMarker, claudeEndMarker);
 const claudeImport = "@AGENTS.md";
 
 function withoutInlineCode(line: string): string {
@@ -108,15 +113,21 @@ function repositoryPolicy(): string {
   return policy;
 }
 
+function hasDuplicateMarkers(value: string, start: string, end: string): boolean {
+  return occurrences(value, start) > 1 || occurrences(value, end) > 1;
+}
+
 function expectedAgents(current: string | null): string {
-  if (current !== null) {
-    const starts = occurrences(current, startMarker);
-    const ends = occurrences(current, endMarker);
-    if (starts > 1 || ends > 1) {
-      throw new Error("root AGENTS.md contains duplicate oompa-local-efficiency markers");
-    }
+  if (
+    current !== null
+    && (
+      hasDuplicateMarkers(current, startMarker, endMarker)
+      || hasDuplicateMarkers(current, legacyMarkers.start, legacyMarkers.end)
+    )
+  ) {
+    throw new Error("root AGENTS.md contains duplicate oompa-local-efficiency markers");
   }
-  return replaceManagedBlock(current, repositoryPolicy(), startMarker, endMarker);
+  return replaceManagedBlock(current, repositoryPolicy(), startMarker, endMarker, legacyMarkers);
 }
 
 function hasActiveClaudeImport(value: string): boolean {
@@ -150,14 +161,21 @@ function hasActiveClaudeImport(value: string): boolean {
 
 function expectedClaude(current: string | null): string {
   if (current === null) return `${claudeImport}\n`;
-  const starts = occurrences(current, claudeStartMarker);
-  const ends = occurrences(current, claudeEndMarker);
-  if (starts > 1 || ends > 1) {
+  if (
+    hasDuplicateMarkers(current, claudeStartMarker, claudeEndMarker)
+    || hasDuplicateMarkers(current, legacyClaudeMarkers.start, legacyClaudeMarkers.end)
+  ) {
     throw new Error("root CLAUDE.md contains duplicate oompa-local-efficiency import markers");
   }
-  if (starts === 0 && ends === 0 && hasActiveClaudeImport(current)) return current;
+  const unmarked = [
+    claudeStartMarker,
+    claudeEndMarker,
+    legacyClaudeMarkers.start,
+    legacyClaudeMarkers.end,
+  ].every((marker) => !current.includes(marker));
+  if (unmarked && hasActiveClaudeImport(current)) return current;
   const block = `${claudeStartMarker}\n${claudeImport}\n${claudeEndMarker}\n`;
-  return replaceManagedBlock(current, block, claudeStartMarker, claudeEndMarker);
+  return replaceManagedBlock(current, block, claudeStartMarker, claudeEndMarker, legacyClaudeMarkers);
 }
 
 function guidanceMetadata(path: string, description: string): Stats | null {

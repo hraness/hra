@@ -1569,7 +1569,7 @@ describe("local cloud control", () => {
       environment: {},
       secretCustody: custody,
       transport,
-    })).rejects.toThrow("requires an explicit HRA_CONVEX_URL");
+    })).rejects.toThrow("requires an explicit OOMPA_CONVEX_URL");
     expect(transportCalls).toBe(0);
     expect(custody.values.has("cloud-deployment-authority")).toBe(false);
   });

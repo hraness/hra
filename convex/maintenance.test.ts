@@ -1483,12 +1483,12 @@ describe("bounded cloud retention", () => {
         sessionPublicId: startedNotification.sessionPublicId,
       }]);
       const startedBodyDigest = await sha256Hex(
-        `oompa-attention-body:v1\u0000${startedBody.text}`,
+        `hra-attention-body:v1\u0000${startedBody.text}`,
       );
       const startedDeliveryId = "01912345-6789-7abc-8def-0123456789d1";
       const startedRecipientDigest = "7".repeat(64);
       const startedIdempotencyKey = await sha256Hex([
-        "oompa-attention-resend:v1",
+        "hra-attention-resend:v1",
         startedDeliveryId,
         startedRecipientDigest,
         startedBodyDigest,
@@ -1837,11 +1837,11 @@ describe("bounded cloud retention", () => {
           interactionKind: "command_approval" as const,
           sessionPublicId: session.publicId,
         })));
-        const bodyDigest = await sha256Hex(`oompa-attention-body:v1\u0000${body.text}`);
+        const bodyDigest = await sha256Hex(`hra-attention-body:v1\u0000${body.text}`);
         const deliveryId = `01912345-6789-7abc-8def-0123456789e${String(groupIndex)}`;
         const recipientDigest = String(groupIndex + 7).repeat(64);
         const idempotencyKey = await sha256Hex([
-          "oompa-attention-resend:v1",
+          "hra-attention-resend:v1",
           deliveryId,
           recipientDigest,
           bodyDigest,

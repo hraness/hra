@@ -163,7 +163,7 @@ describe("dedicated switch execution context", () => {
       expect(output).not.toBe(value.context);
       expect(output.targetAuthority).not.toBe(value.context.targetAuthority);
       expect(database.query("SELECT context_digest FROM session_switch_execution_contexts").get()).toEqual({
-        context_digest: digest(JSON.stringify({ domain: "oompa:session-switch-execution-context:v2", ...value.context })),
+        context_digest: digest(JSON.stringify({ domain: "hra:session-switch-execution-context:v2", ...value.context })),
       });
       audit(database);
       expect(snapshot(database)).toEqual(before);

@@ -23,7 +23,7 @@ export function parseQueueAttachmentReferences(value: unknown): AttachmentRefere
   return Array.isArray(value) && value.length === 0 ? [] : attachmentReferenceListSchema.parse(value);
 }
 export const queueAttachmentManifestDigest = (value: unknown): string => hash(JSON.stringify({
-  domain: "oompa:queue-attachment-manifest:v1",
+  domain: "hra:queue-attachment-manifest:v1",
   references: parseQueueAttachmentReferences(value).map((entry) => [entry.byteLength, entry.digest, entry.mediaType, entry.name]),
 }));
 export function queueAttachmentRequestDigest(input: Readonly<{ sessionId: string; authorityGeneration: number; message: string; attachments: readonly AttachmentReference[] }>): string {
@@ -39,7 +39,7 @@ export const queueAttachmentIdentitySchema = z.object({
   attachmentCount: z.number().int().min(0).max(8), createdAt: unixMillisecondsSchema,
 }).strict();
 export type QueueAttachmentIdentity = z.infer<typeof queueAttachmentIdentitySchema>;
-export const queueAttachmentIdentityDigest = (value: QueueAttachmentIdentity): string => hash(JSON.stringify({ domain: "oompa:queue-attachment-identity:v1", value }));
+export const queueAttachmentIdentityDigest = (value: QueueAttachmentIdentity): string => hash(JSON.stringify({ domain: "hra:queue-attachment-identity:v1", value }));
 export const queueAttachmentsProtectedSql = (alias: string): string => `(${alias}.state IN ('pending','dispatching') OR (${alias}.state='ambiguous'
   AND NOT EXISTS(SELECT 1 FROM queue_effect_resolutions resolution WHERE resolution.queue_id=${alias}.id)))`;
 const tables = [

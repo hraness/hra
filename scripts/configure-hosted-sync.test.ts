@@ -265,7 +265,7 @@ describe("fresh hosted configuration", () => {
       false,
       ["verify"],
     );
-    const message = new TextEncoder().encode("oompa-hosted-key-match-v1");
+    const message = new TextEncoder().encode("hra-hosted-key-match-v1");
     const signature = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", privateKey, message);
 
     expect(jwks.keys).toHaveLength(1);
@@ -602,7 +602,7 @@ describe("fresh hosted configuration", () => {
       .toThrow("input_invalid");
     expect(() => parseHostedInput(JSON.stringify({
       ...validInput,
-      siteUrl: "https://oompa.vercel.app",
+      siteUrl: "https://hra.vercel.app",
     }))).toThrow("input_invalid");
     expect(() => parseHostedInput(JSON.stringify({ ...validInput, siteUrl: "https://oompa.app/" })))
       .toThrow("input_invalid");

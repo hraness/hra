@@ -459,14 +459,29 @@ function expectedProfileDigest(profile: {
   return sha256(JSON.stringify(profile));
 }
 
+// A lease inherited from a wrapper installed under the previous plugin
+// identity carries the legacy profile id; both digests describe the same
+// machine-wide scheduler and the same capacities.
+const profileIdPrefixes = Object.freeze(["oompa.local-efficiency", "hra.local-efficiency"]);
+
+function acceptedProfileDigests(profile: {
+  readonly capacities: readonly { readonly limit: number; readonly resource: string }[];
+  readonly id: string;
+}): readonly string[] {
+  return profileIdPrefixes.map((prefix) => expectedProfileDigest({
+    id: `${prefix}/${profile.id}`,
+    capacities: profile.capacities,
+  }));
+}
+
 function assertMarker(
   descriptor: number,
-  profileDigest: string,
+  profileDigests: readonly string[],
   claims: readonly { readonly amount: number; readonly resource: string }[],
 ): void {
   const marker = inheritedMarker(descriptor);
   if (
-    marker.profileSha256 !== profileDigest
+    !profileDigests.includes(marker.profileSha256)
     || JSON.stringify(marker.claims) !== JSON.stringify(claims)
   ) throw new Error("inherited Oompa local-efficiency lease descriptor does not cover this request");
 }
@@ -479,8 +494,8 @@ function assertInheritedLeaseDescriptors(inherited: InheritedLease): void {
   if (inherited.lane !== "compute") {
     assertMarker(
       descriptor,
-      expectedProfileDigest({
-        id: "oompa.local-efficiency/capabilities-v1",
+      acceptedProfileDigests({
+        id: "capabilities-v1",
         capacities: [
           { resource: "browser-auth", limit: 1 },
           { resource: "mac-native", limit: 1 },
@@ -492,8 +507,8 @@ function assertInheritedLeaseDescriptors(inherited: InheritedLease): void {
   }
   assertMarker(
     descriptor,
-    expectedProfileDigest({
-      id: `oompa.local-efficiency/v1-${inherited.capacity}`,
+    acceptedProfileDigests({
+      id: `v1-${inherited.capacity}`,
       capacities: [{ resource: "cpu", limit: inherited.capacity }],
     }),
     [{ resource: "cpu", amount: inherited.permits }],
@@ -654,16 +669,20 @@ export async function runHostCommand(options: HostRunOptions): Promise<number> {
           console.error(
             `[oompa-host-run] admitted ${options.label} after ${waitedSeconds.toFixed(1)}s`,
           );
+          const leaseValue = JSON.stringify({
+            capacity,
+            label: options.label,
+            lane: options.lane,
+            mode: options.mode,
+            permits: permitCount,
+            version: 2,
+          });
+          // Nested wrappers installed under the previous plugin identity read
+          // only the legacy name; both names carry the identical lease.
           const childEnvironment = {
             ...environment,
-            OOMPA_LOCAL_EFFICIENCY_LEASE: JSON.stringify({
-              capacity,
-              label: options.label,
-              lane: options.lane,
-              mode: options.mode,
-              permits: permitCount,
-              version: 2,
-            }),
+            HRA_LOCAL_EFFICIENCY_LEASE: leaseValue,
+            OOMPA_LOCAL_EFFICIENCY_LEASE: leaseValue,
           };
           try {
             const exitCode = await spawnCommand(

@@ -65,7 +65,7 @@ export const oompaMailingListConfig = (
     );
   }
   return {
-    audience: "oompa",
+    audience: "hra",
     kind: "signup",
     turnstileSitekey,
   };

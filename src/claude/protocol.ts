@@ -1192,7 +1192,7 @@ export const claudeInterruptLine = (requestId: string): string =>
 
 export const claudeRequestDigest = (requestId: string, request: ClaudeCanUseTool): string =>
   createHash("sha256")
-    .update("oompa:claude-control-request:v1\0", "utf8")
+    .update("hra:claude-control-request:v1\0", "utf8")
     .update(
       JSON.stringify({
         requestId,
@@ -1205,6 +1205,6 @@ export const claudeRequestDigest = (requestId: string, request: ClaudeCanUseTool
 
 export const claudeResponseDigest = (response: ClaudeControlResponse): string =>
   createHash("sha256")
-    .update("oompa:claude-control-response:v1\0", "utf8")
+    .update("hra:claude-control-response:v1\0", "utf8")
     .update(JSON.stringify(response), "utf8")
     .digest("hex");

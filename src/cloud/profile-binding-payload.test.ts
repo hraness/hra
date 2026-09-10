@@ -130,7 +130,7 @@ describe("read-only profile binding payload", () => {
   });
 
   test("digests the exact bounded registry envelope with its own stable domain separator", async () => {
-    const expected = await sha256Hex("oompa-profile-binding-registry-envelope:v1\n" + JSON.stringify(registryEnvelope));
+    const expected = await sha256Hex("hra-profile-binding-registry-envelope:v1\n" + JSON.stringify(registryEnvelope));
     expect(await profileBindingRegistryDigest(registryEnvelope)).toBe(expected);
     expect(await profileBindingRegistryDigest({ nonce: registryEnvelope.nonce, keyVersion: 1, ciphertext: registryEnvelope.ciphertext, algorithm: "A256GCM" }))
       .toBe(expected);

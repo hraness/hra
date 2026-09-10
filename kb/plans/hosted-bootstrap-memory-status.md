@@ -24,7 +24,7 @@ prove this source defect.
 
 ## Evidence and ordering
 
-The memory tables introduced by [PR #135](https://github.com/hraness/hra/pull/135)
+The memory tables introduced by [PR #135](https://github.com/hraness/oompa/pull/135)
 are present in the schema and genesis inventory but missing from all three
 bootstrap-status inventories. Independent static reviews found that imported
 or inconsistent memory state can therefore appear uninitialized or ready.
@@ -33,10 +33,10 @@ not evidence of an unauthenticated write path. The genesis mutation already
 rejects occupied memory tables and remains unchanged.
 
 The source base is `c9433d6cc42d757b194d1ef1db5f61b2c83f9ed6`. The separate
-history-fixture repair is [PR #143](https://github.com/hraness/hra/pull/143),
+history-fixture repair is [PR #143](https://github.com/hraness/oompa/pull/143),
 initially observed at `b5740ef3296c267d5333b25c6e67b525c415a748`. It owns its
 own validation and is an integration prerequisite, not part of this repair.
-[PR #138](https://github.com/hraness/hra/pull/138) retains its independent
+[PR #138](https://github.com/hraness/oompa/pull/138) retains its independent
 attention-key source checkpoint while both upstream defects are repaired.
 
 ## Implementation and verification
@@ -62,13 +62,13 @@ regression, correct the source forward and rerun its affected tests. Do not
 change live data, weaken readiness checks or adjust history policy to make
 validation pass. The source repair and focused regressions are implemented;
 Focused validation is passing and source checkpoint `b4a9f644` is published on
-[draft PR #146](https://github.com/hraness/hra/pull/146). Fresh integration
+[draft PR #146](https://github.com/hraness/oompa/pull/146). Fresh integration
 validation remains pending. This is not an aggregate or deployment claim.
 
 The frozen, script-disabled dependency install completed with Bun 1.3.14 and
 513 packages. Manifest and lockfile bytes are unchanged. Repository-context
 and bounded percolation commands are blocked by main's existing invalid YAML
-frontmatter in `plans/oompa-web-v1.md`; that unrelated file is not modified here.
+frontmatter in `plans/hra-web-v1.md`; that unrelated file is not modified here.
 The applicable root, Convex and plan guides were read directly. No generated
 catalog was rewritten or whole-vault validation claimed.
 

@@ -8,7 +8,7 @@ import {
 } from "./verify-npm-provenance-crypto.mjs";
 
 const sha = "a".repeat(40);
-const invocation = "https://github.com/hraness/hra/actions/runs/123/attempts/2";
+const invocation = "https://github.com/hraness/oompa/actions/runs/123/attempts/2";
 const repositorySubject = [
   "repo:hraness",
   "307125679/oompa",

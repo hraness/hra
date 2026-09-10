@@ -234,7 +234,7 @@ describe("joined peer causal completeness", () => {
     const meta = { row_id: f.id, parent_kind: retained.parent_kind, parent_authority_id: retained.parent_authority_id,
       parent_authority_generation_decimal: retained.parent_authority_generation_decimal, evidence_kind: retained.evidence_kind,
       stored_digest: hash(json), recorded_at_decimal: retained.recorded_at_decimal, raw_sha256: hash(json), raw_byte_length: Buffer.byteLength(json) };
-    const digest = hash(JSON.stringify({ domain: "oompa:effect-evidence-provenance:v1", scope: "mutation", ...meta,
+    const digest = hash(JSON.stringify({ domain: "hra:effect-evidence-provenance:v1", scope: "mutation", ...meta,
       format: "joined_v1", projection_json: null, opaque_reason: "invalid_shape" }));
     corrupt(f.db, [f.effectTable, proofTable, anchorTable], () => {
       f.db.query(`UPDATE ${f.effectTable} SET evidence_json=?,evidence_digest=? WHERE attempt_id=?`).run(json, hash(json), f.id);

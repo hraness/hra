@@ -8,6 +8,7 @@ import {
   readFileSync,
   readlinkSync,
   realpathSync,
+  unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -15,6 +16,8 @@ import { pathToFileURL } from "node:url";
 
 import {
   ensureExactSymlink,
+  legacyMarkerPair,
+  type ManagedMarkerPair,
   normalizeTrailingNewline,
   readText,
   replaceManagedBlock,
@@ -45,10 +48,13 @@ export type BootstrapOptions = {
 
 const startMarker = "<!-- oompa-local-efficiency:start -->";
 const endMarker = "<!-- oompa-local-efficiency:end -->";
+const legacyMarkers = legacyMarkerPair(startMarker, endMarker);
 const rulesStartMarker = "# oompa-local-efficiency:rules:start";
 const rulesEndMarker = "# oompa-local-efficiency:rules:end";
+const legacyRulesMarkers = legacyMarkerPair(rulesStartMarker, rulesEndMarker);
 const codexConfigStartMarker = "# oompa-local-efficiency:config:start";
 const codexConfigEndMarker = "# oompa-local-efficiency:config:end";
+const legacyCodexConfigMarkers = legacyMarkerPair(codexConfigStartMarker, codexConfigEndMarker);
 const claudeSettings = Object.freeze({
   defaultMode: "auto",
 });
@@ -56,6 +62,16 @@ const minimumClaudeAutoModeVersion = Object.freeze([2, 1, 83] as const);
 const atetRelease = "Atet v2.0.0 host-resource runtime";
 const atetCommit = "58132fa6e8ac09a87d1fdffc17be40c8b1fd9d6d";
 const pluginName = "oompa-local-efficiency";
+// The previous plugin identity. Its installed command links, managed blocks,
+// rule file, and profile files are migrated in place by the bootstrap.
+const legacyPluginName = "hra-local-efficiency";
+const pluginNames: readonly string[] = Object.freeze([pluginName, legacyPluginName]);
+const profileNames = Object.freeze(["oompa-worker.config.toml", "oompa-routine.config.toml"]);
+
+function legacyName(name: string): string {
+  return name.replace(/^oompa-/u, "hra-");
+}
+
 const commandScripts = Object.freeze([
   "host-run.ts",
   "validation-run.ts",
@@ -250,20 +266,35 @@ export function claudeAutoModeCapability(
   }
 }
 
-export function commandTargets(bunBin: string): readonly [string, string][] {
-  return [
-    ["oompa-host-run", "host-run.ts"],
-    ["oompa-validate", "validation-run.ts"],
-    ["oompa-workspace-audit", "workspace-audit.ts"],
-    ["oompa-session-audit", "session-audit.ts"],
-    ["hra-throughput-report", "throughput-report.ts"],
-    ["oompa-ci-ref-audit", "ci-ref-audit.ts"],
-    ["oompa-repo-adoption", "repo-adoption.ts"],
-    ["oompa-local-efficiency", "doctor.ts"],
-  ].map(([name, script]) => [
-    join(bunBin, name as string),
-    join(skillRoot(), "scripts", script as string),
+const commandNames = Object.freeze([
+  Object.freeze(["oompa-host-run", "host-run.ts"] as const),
+  Object.freeze(["oompa-validate", "validation-run.ts"] as const),
+  Object.freeze(["oompa-workspace-audit", "workspace-audit.ts"] as const),
+  Object.freeze(["oompa-session-audit", "session-audit.ts"] as const),
+  Object.freeze(["oompa-throughput-report", "throughput-report.ts"] as const),
+  Object.freeze(["oompa-ci-ref-audit", "ci-ref-audit.ts"] as const),
+  Object.freeze(["oompa-repo-adoption", "repo-adoption.ts"] as const),
+  Object.freeze(["oompa-local-efficiency", "doctor.ts"] as const),
+]);
+
+function commandLinks(
+  bunBin: string,
+  rename: (name: string) => string,
+): readonly [string, string][] {
+  return commandNames.map(([name, script]) => [
+    join(bunBin, rename(name)),
+    join(skillRoot(), "scripts", script),
   ] as const);
+}
+
+export function commandTargets(bunBin: string): readonly [string, string][] {
+  return commandLinks(bunBin, (name) => name);
+}
+
+// Compatibility links under the former command names. Repository guidance that
+// has not been re-adopted still names them.
+export function legacyCommandTargets(bunBin: string): readonly [string, string][] {
+  return commandLinks(bunBin, legacyName);
 }
 
 function missingPath(error: unknown): boolean {
@@ -271,6 +302,62 @@ function missingPath(error: unknown): boolean {
     && error !== null
     && "code" in error
     && error.code === "ENOENT";
+}
+
+function pathExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (error: unknown) {
+    if (missingPath(error)) return false;
+    throw error;
+  }
+}
+
+// A machine that never installed a legacy command name is not asked to add
+// one; a machine that has any legacy name must keep every legacy link current.
+export function legacyCommandsPresent(bunBin: string): boolean {
+  return legacyCommandTargets(bunBin).some(([link]) => pathExists(link));
+}
+
+type LegacyFileMigration = Readonly<{
+  mode: number;
+  path: string;
+}>;
+
+// A legacy file is migrated only while its current-named replacement is
+// absent. A regular single-link legacy file is read and then removed by
+// --apply; a legacy symlink is left in place because it is dotfiles-managed
+// user state; any other legacy entry is refused.
+function legacyFileMigration(
+  currentPath: string,
+  legacyPath: string,
+  description: string,
+): LegacyFileMigration | null {
+  if (pathExists(currentPath)) return null;
+  let metadata;
+  try {
+    metadata = lstatSync(legacyPath);
+  } catch (error: unknown) {
+    if (missingPath(error)) return null;
+    throw error;
+  }
+  if (metadata.isSymbolicLink()) return null;
+  if (!metadata.isFile()) {
+    throw new Error(`refusing to migrate non-regular legacy ${description}: ${legacyPath}`);
+  }
+  if (metadata.nlink !== 1) {
+    throw new Error(`refusing to migrate hard-linked legacy ${description}: ${legacyPath}`);
+  }
+  return { mode: metadata.mode & 0o777, path: legacyPath };
+}
+
+function removeMigratedLegacyFile(migration: LegacyFileMigration): void {
+  const metadata = lstatSync(migration.path);
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1) {
+    throw new Error(`legacy file changed during migration: ${migration.path}`);
+  }
+  unlinkSync(migration.path);
 }
 
 function verifiedRegularText(path: string, maximumBytes: number): string | null {
@@ -301,7 +388,9 @@ function verifiedRegularText(path: string, maximumBytes: number): string | null 
   }
 }
 
-function pluginIdentityMatches(pluginRoot: string, skillRoot_: string): boolean {
+// A prior install is owned when every identity segment agrees on one plugin
+// name, which may be the current name or the legacy name it replaced.
+function pluginIdentityMatches(pluginRoot: string, skillRoot_: string, name: string): boolean {
   const manifestText = verifiedRegularText(
     join(pluginRoot, ".codex-plugin", "plugin.json"),
     16 * 1024,
@@ -314,7 +403,7 @@ function pluginIdentityMatches(pluginRoot: string, skillRoot_: string): boolean 
       typeof manifest !== "object"
       || manifest === null
       || !("name" in manifest)
-      || manifest.name !== pluginName
+      || manifest.name !== name
       || !("skills" in manifest)
       || manifest.skills !== "./skills/"
     ) return false;
@@ -326,7 +415,7 @@ function pluginIdentityMatches(pluginRoot: string, skillRoot_: string): boolean 
   const end = lines.indexOf("---", 1);
   if (end < 2) return false;
   return lines.slice(1, end).filter((line) => line.startsWith("name:")).length === 1
-    && lines.slice(1, end).includes(`name: ${pluginName}`);
+    && lines.slice(1, end).includes(`name: ${name}`);
 }
 
 function isReservedDanglingCacheTarget(
@@ -348,10 +437,10 @@ function isReservedDanglingCacheTarget(
   const segments = relativeTarget.split(sep);
   return segments.length === 7
     && safeMarketplace.test(segments[0] ?? "")
-    && segments[1] === pluginName
+    && pluginNames.includes(segments[1] ?? "")
     && safeVersion.test(segments[2] ?? "")
     && segments[3] === "skills"
-    && segments[4] === pluginName
+    && segments[4] === segments[1]
     && segments[5] === "scripts"
     && segments[6] === expectedScript;
 }
@@ -368,11 +457,12 @@ export function isManagedPriorCommandTarget(
     const target = realpathSync(existingTarget);
     if (basename(target) !== expectedScript || basename(dirname(target)) !== "scripts") return false;
     const skillRoot_ = dirname(dirname(target));
-    if (basename(skillRoot_) !== pluginName || basename(dirname(skillRoot_)) !== "skills") return false;
+    const name = basename(skillRoot_);
+    if (!pluginNames.includes(name) || basename(dirname(skillRoot_)) !== "skills") return false;
     const pluginRoot = dirname(dirname(skillRoot_));
-    if (!pluginIdentityMatches(pluginRoot, skillRoot_)) return false;
+    if (!pluginIdentityMatches(pluginRoot, skillRoot_, name)) return false;
 
-    const sourceCheckout = basename(pluginRoot) === pluginName
+    const sourceCheckout = basename(pluginRoot) === name
       && basename(dirname(pluginRoot)) === "plugins";
     let pluginCache = false;
     try {
@@ -385,7 +475,7 @@ export function isManagedPriorCommandTarget(
         && !relativePlugin.startsWith(`..${sep}`)
         && segments.length === 3
         && segments[0] !== ""
-        && segments[1] === pluginName
+        && segments[1] === name
         && segments[2] !== "";
     } catch { /* A source checkout need not have a plugin cache. */ }
     return sourceCheckout || pluginCache;
@@ -522,6 +612,7 @@ function expectedGlobalAgents(codexHome: string): string {
     asset("global-agents-block.md"),
     startMarker,
     endMarker,
+    legacyMarkers,
   );
 }
 
@@ -608,14 +699,30 @@ function codexConfigBlock(): string {
     + `${codexConfigEndMarker}\n`;
 }
 
+// The legacy marker pair is an alias for the current pair while exactly one of
+// them is present; a document carrying both is refused.
+function codexConfigMarkers(value: string): ManagedMarkerPair {
+  const currentCount = markerOccurrences(value, codexConfigStartMarker)
+    + markerOccurrences(value, codexConfigEndMarker);
+  const legacyCount = markerOccurrences(value, legacyCodexConfigMarkers.start)
+    + markerOccurrences(value, legacyCodexConfigMarkers.end);
+  if (currentCount > 0 && legacyCount > 0) {
+    throw new Error("Codex config managed block markers mix legacy and current");
+  }
+  return legacyCount > 0
+    ? legacyCodexConfigMarkers
+    : { end: codexConfigEndMarker, start: codexConfigStartMarker };
+}
+
 function expectedCodexConfig(codexHome: string): string {
   const configPath = join(codexHome, "config.toml");
   const current = readText(configPath) ?? "";
   parseTomlDocument(current, "Codex config");
+  const markers = codexConfigMarkers(current);
   let unmanaged = removeManagedBlock(
     current,
-    codexConfigStartMarker,
-    codexConfigEndMarker,
+    markers.start,
+    markers.end,
     "Codex config",
   );
   const unmanagedRoot = parseTomlDocument(unmanaged, "Codex config outside the managed block");
@@ -921,44 +1028,80 @@ function expectedGlobalClaude(claudeHome: string): string {
     asset("global-claude-block.md"),
     startMarker,
     endMarker,
+    legacyMarkers,
   );
 }
 
 export function codexRulesPath(codexHome: string): string {
-  return join(codexHome, "rules", "oompa-local-efficiency.rules");
+  return join(codexHome, "rules", `${pluginName}.rules`);
 }
 
-export function managedCodexRule(bunBin: string): string {
-  const hostRun = join(resolve(bunBin), "oompa-host-run");
+export function legacyCodexRulesPath(codexHome: string): string {
+  return join(codexHome, "rules", `${legacyPluginName}.rules`);
+}
+
+function hostRunPromptRule(hostRun: string, commandName: string): string {
   const hostRunJson = JSON.stringify(hostRun);
   const shellWord = `'${hostRun.replaceAll("'", `'"'"'`)}'`;
   const sample = JSON.stringify(
     `${shellWord} --mode=heavy --label=repo-check -- bun run check`,
   );
   const basenameSample = JSON.stringify(
-    "oompa-host-run --mode=heavy --label=repo-check -- bun run check",
+    `${commandName} --mode=heavy --label=repo-check -- bun run check`,
   );
   const lookalikeSample = JSON.stringify(
     `'${`${hostRun}ner`.replaceAll("'", `'"'"'`)}' --mode=heavy --label=repo-check -- bun run check`,
   );
-  return `${rulesStartMarker}\n`
-    + "# Keep this prompt-only: oompa-host-run can wrap arbitrary child commands.\n"
-    + "prefix_rule(\n"
+  return "prefix_rule(\n"
     + `    pattern = [${hostRunJson}],\n`
     + "    decision = \"prompt\",\n"
     + "    justification = \"Oompa host scheduling needs reviewed access to machine-wide state; inspect the complete wrapped command before approval.\",\n"
     + `    match = [${sample}],\n`
     + `    not_match = [${basenameSample}, ${lookalikeSample}],\n`
-    + ")\n"
+    + ")\n";
+}
+
+export function managedCodexRule(bunBin: string): string {
+  const hostRun = join(resolve(bunBin), "oompa-host-run");
+  const legacyHostRun = join(resolve(bunBin), legacyName("oompa-host-run"));
+  return `${rulesStartMarker}\n`
+    + "# Keep this prompt-only: oompa-host-run can wrap arbitrary child commands.\n"
+    + hostRunPromptRule(hostRun, "oompa-host-run")
+    + "# The legacy hra-host-run compatibility link runs the same wrapper.\n"
+    + hostRunPromptRule(legacyHostRun, "hra-host-run")
     + `${rulesEndMarker}\n`;
 }
 
+// While the current rule file is absent, a regular legacy rule file supplies
+// the unmanaged content that the current file inherits.
+function codexRulesMigration(codexHome: string): LegacyFileMigration | null {
+  return legacyFileMigration(
+    codexRulesPath(codexHome),
+    legacyCodexRulesPath(codexHome),
+    "Codex rule file",
+  );
+}
+
 function expectedCodexRules(codexHome: string, bunBin: string): string {
+  const migration = codexRulesMigration(codexHome);
   return replaceManagedBlock(
-    readText(codexRulesPath(codexHome)),
+    readText(migration === null ? codexRulesPath(codexHome) : migration.path),
     managedCodexRule(bunBin),
     rulesStartMarker,
     rulesEndMarker,
+    legacyRulesMarkers,
+  );
+}
+
+function profilePath(codexHome: string, profile: string): string {
+  return join(codexHome, profile);
+}
+
+function profileMigration(codexHome: string, profile: string): LegacyFileMigration | null {
+  return legacyFileMigration(
+    profilePath(codexHome, profile),
+    profilePath(codexHome, legacyName(profile)),
+    "Codex profile",
   );
 }
 
@@ -993,6 +1136,8 @@ export function checkInstallation(
     if (readText(rulesPath) !== expectedCodexRules(options.codexHome, options.bunBin)) {
       failures.push(`Codex host-access rule differs: ${rulesPath}`);
     }
+    const migration = codexRulesMigration(options.codexHome);
+    if (migration !== null) failures.push(`legacy Codex rule file present: ${migration.path}`);
   } catch (error: unknown) {
     failures.push(error instanceof Error ? error.message : String(error));
   }
@@ -1016,18 +1161,29 @@ export function checkInstallation(
   } catch (error: unknown) {
     failures.push(error instanceof Error ? error.message : String(error));
   }
-  for (const profile of ["oompa-worker.config.toml", "oompa-routine.config.toml"]) {
-    const path = join(options.codexHome, profile);
+  for (const profile of profileNames) {
+    const path = profilePath(options.codexHome, profile);
     try {
       if (readText(path) !== normalizeTrailingNewline(asset(profile))) {
         failures.push(`profile differs: ${path}`);
       }
+      const migration = profileMigration(options.codexHome, profile);
+      if (migration !== null) failures.push(`legacy profile present: ${migration.path}`);
     } catch (error: unknown) {
       failures.push(error instanceof Error ? error.message : String(error));
     }
   }
   for (const [link, target] of commandTargets(options.bunBin)) {
     if (!symlinkMatches(target, link)) failures.push(`command link differs: ${link}`);
+  }
+  try {
+    if (legacyCommandsPresent(options.bunBin)) {
+      for (const [link, target] of legacyCommandTargets(options.bunBin)) {
+        if (!symlinkMatches(target, link)) failures.push(`legacy command link differs: ${link}`);
+      }
+    }
+  } catch (error: unknown) {
+    failures.push(error instanceof Error ? error.message : String(error));
   }
   if (!dependencyAvailable(options.runtimeRoot, environment)) {
     failures.push(`missing private dependency: ${atetRelease}`);
@@ -1043,7 +1199,10 @@ async function applyInstallation(options: BootstrapOptions): Promise<void> {
   const configPath = join(options.codexHome, "config.toml");
   const configMode = regularFileModeOrDefault(configPath, "Codex config", 0o600);
   const rulesPath = codexRulesPath(options.codexHome);
-  const rulesMode = regularFileModeOrDefault(rulesPath, "Codex rule file", 0o600);
+  const rulesMigration = codexRulesMigration(options.codexHome);
+  const rulesMode = rulesMigration === null
+    ? regularFileModeOrDefault(rulesPath, "Codex rule file", 0o600)
+    : rulesMigration.mode;
   const claudeSettingsPath = join(claudeHome, "settings.json");
   const claudeSettingsMode = claudeCapability.available
     ? regularFileModeOrDefault(claudeSettingsPath, "Claude settings", 0o600)
@@ -1060,23 +1219,29 @@ async function applyInstallation(options: BootstrapOptions): Promise<void> {
     ? expectedClaudeSettings(claudeHome)
     : null;
   const claudeGuidanceValue = expectedGlobalClaude(claudeHome);
-  const profilePlans = ["oompa-worker.config.toml", "oompa-routine.config.toml"].map((profile) => {
-    const path = join(options.codexHome, profile);
+  const profilePlans = profileNames.map((profile) => {
+    const path = profilePath(options.codexHome, profile);
     const value = normalizeTrailingNewline(asset(profile));
     if (existsSync(path) && lstatSync(path).isSymbolicLink()) {
       if (readText(path) !== value) {
         throw new Error(`refusing to replace differing profile symlink: ${path}`);
       }
-      return { mode: 0, path, symlink: true, value } as const;
+      return { legacy: null, mode: 0, path, symlink: true, value } as const;
     }
+    const legacy = profileMigration(options.codexHome, profile);
     return {
-      mode: regularFileModeOrDefault(path, "Codex profile"),
+      legacy,
+      mode: legacy === null ? regularFileModeOrDefault(path, "Codex profile") : legacy.mode,
       path,
       symlink: false,
       value,
     } as const;
   });
-  for (const [link, target] of commandTargets(options.bunBin)) {
+  const commandPlans = [
+    ...commandTargets(options.bunBin),
+    ...legacyCommandTargets(options.bunBin),
+  ];
+  for (const [link, target] of commandPlans) {
     if (!existsSync(target)) throw new Error(`plugin script is missing: ${target}`);
     preflightManagedCommandSymlink(target, link, options.codexHome);
   }
@@ -1090,14 +1255,17 @@ async function applyInstallation(options: BootstrapOptions): Promise<void> {
   writeAtomic(agentsPath, agentsValue, agentsMode);
   writeAtomic(configPath, configValue, configMode);
   writeAtomic(rulesPath, rulesValue, rulesMode);
+  if (rulesMigration !== null) removeMigratedLegacyFile(rulesMigration);
   if (claudeSettingsValue !== null && claudeSettingsMode !== null) {
     writeAtomic(claudeSettingsPath, claudeSettingsValue, claudeSettingsMode);
   }
   writeAtomic(claudeGuidancePath, claudeGuidanceValue, claudeGuidanceMode);
   for (const profile of profilePlans) {
-    if (!profile.symlink) writeAtomic(profile.path, profile.value, profile.mode);
+    if (profile.symlink) continue;
+    writeAtomic(profile.path, profile.value, profile.mode);
+    if (profile.legacy !== null) removeMigratedLegacyFile(profile.legacy);
   }
-  for (const [link, target] of commandTargets(options.bunBin)) {
+  for (const [link, target] of commandPlans) {
     chmodSync(target, 0o755);
     const result = ensureManagedCommandSymlink(target, link, options.codexHome);
     console.log(`${result.toUpperCase()}\t${link}\t${target}`);
@@ -1127,7 +1295,7 @@ if (import.meta.main) {
         );
       }
       console.log(
-        `PASS\tHRA local efficiency baseline\t${agents}\t${join(options.claudeHome ?? resolvedClaudeHome(), "CLAUDE.md")}\tmode=${metadata.mode & 0o777}`,
+        `PASS\tOompa local efficiency baseline\t${agents}\t${join(options.claudeHome ?? resolvedClaudeHome(), "CLAUDE.md")}\tmode=${metadata.mode & 0o777}`,
       );
     }
   } catch (error) {

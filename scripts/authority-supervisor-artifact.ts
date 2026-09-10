@@ -384,7 +384,7 @@ const fSealShrink = 0x0002;
 const fSealGrow = 0x0004;
 const fSealWrite = 0x0008;
 const requiredMemfdSeals = fSealSeal | fSealShrink | fSealGrow | fSealWrite;
-const sealedMemoryFileName = Buffer.from("oompa-authority-supervisor\0", "utf8");
+const sealedMemoryFileName = Buffer.from("hra-authority-supervisor\0", "utf8");
 
 type LinuxMemfdLibrary = Readonly<{
   close: () => void;

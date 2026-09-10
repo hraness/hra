@@ -65,7 +65,7 @@ const conversationAutomationParams = (argumentsValue: unknown = {
   threadId: "thread-1",
   turnId: "turn-1",
   callId: "call-1",
-  namespace: "oompa",
+  namespace: "hra",
   tool: "automation_update",
   arguments: argumentsValue,
 });
@@ -1462,7 +1462,7 @@ describe("CodexAppServerClient", () => {
         threadId: "thread-1",
         turnId: "turn-1",
         callId: "call-2",
-        namespace: "oompa",
+        namespace: "hra",
         tool: "session_message",
         arguments: {
           sessionId: `sess_${"a".repeat(32)}`,

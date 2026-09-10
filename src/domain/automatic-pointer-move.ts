@@ -44,7 +44,7 @@ export type AutomaticPointerMoveRequest = z.infer<typeof automaticPointerMoveReq
 export function automaticPointerMoveRequestDigest(value: unknown): string {
   const request = automaticPointerMoveRequestSchema.parse(value);
   // The independent operation key is bound by the capsule and storage anchor.
-  return providerUsageDigest({ domain: "oompa:automatic-pointer-move-request:v1",
+  return providerUsageDigest({ domain: "hra:automatic-pointer-move-request:v1",
     provider: request.provider, daemonGeneration: request.daemonGeneration, bootId: request.bootId,
     expectedSourceAuthority: request.expectedSourceAuthority,
     expectedSourceQuotaObservationRevision: request.expectedSourceQuotaObservationRevision,
@@ -242,7 +242,7 @@ export function verifyAutomaticPointerMoveCapsule(value: unknown): AutomaticPoin
 }
 
 export function automaticPointerMoveCapsuleDigest(value: unknown): string {
-  return providerUsageDigest({ domain: "oompa:automatic-pointer-move-capsule:v1", capsule: verifyAutomaticPointerMoveCapsule(value) });
+  return providerUsageDigest({ domain: "hra:automatic-pointer-move-capsule:v1", capsule: verifyAutomaticPointerMoveCapsule(value) });
 }
 
 export type CreateAutomaticPointerMoveCapsuleResult =

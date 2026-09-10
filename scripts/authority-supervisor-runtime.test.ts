@@ -1197,7 +1197,7 @@ void (async () => {
   const outerPid = Number(readyMatch[1]);
   const deadline = BigInt(readyMatch[2]) + 1500n;
   await new Promise((resolve, reject) => accepted.write(
-    "OOMPA_AUTHORITY_SUPERVISOR/1 GO nonce=" + nonce + " deadline_monotonic_ms=" + deadline + "\\n",
+    "HRA_AUTHORITY_SUPERVISOR/1 GO nonce=" + nonce + " deadline_monotonic_ms=" + deadline + "\\n",
     (error) => {
       if (error) { reject(error); return; }
       writeFileSync(goMarker, String(outerPid));
@@ -1495,7 +1495,7 @@ test("authority supervisor holds a target behind GO", async () => {
     scope.assertActive();
     output = consumeOwnedChildOutput(child);
     const ready = await control.nextLine();
-    expect(ready).toMatch(new RegExp(`^OOMPA_AUTHORITY_SUPERVISOR/1 READY nonce=${nonce} `));
+    expect(ready).toMatch(new RegExp(`^HRA_AUTHORITY_SUPERVISOR/1 READY nonce=${nonce} `));
     const monotonicMatch = ready.match(/ monotonic_ms=([1-9][0-9]*)$/u);
     const namespaceMatch = ready.match(/ init_pid_namespace_inode=([1-9][0-9]*) /u);
     expect(monotonicMatch).not.toBeNull();
@@ -1504,12 +1504,12 @@ test("authority supervisor holds a target behind GO", async () => {
     expect(await Bun.file(marker).exists()).toBeFalse();
     scope.assertActive();
     control.write(
-      `OOMPA_AUTHORITY_SUPERVISOR/1 GO nonce=${nonce} deadline_monotonic_ms=${BigInt(monotonicMatch?.[1] ?? "0") + 5_000n}\n`,
+      `HRA_AUTHORITY_SUPERVISOR/1 GO nonce=${nonce} deadline_monotonic_ms=${BigInt(monotonicMatch?.[1] ?? "0") + 5_000n}\n`,
     );
     child.stdin.end();
     const clean = await control.nextLine();
     scope.assertActive();
-    expect(clean).toBe(`OOMPA_AUTHORITY_SUPERVISOR/1 CLEAN nonce=${nonce} exit=0`);
+    expect(clean).toBe(`HRA_AUTHORITY_SUPERVISOR/1 CLEAN nonce=${nonce} exit=0`);
     streamsAtClean = snapshotChildStreamState(child);
     outputAtClean = output.snapshot();
     // The close observer starts before READY; this 15-second deadline starts
@@ -1567,7 +1567,7 @@ test("native deadline kills custody while the Oompa parent is stopped after GO",
     driver.kill("SIGCONT");
     await expect(closed).resolves.toEqual({ code: 0, signal: null });
     expect(JSON.parse(await readFile(markers.result, "utf8"))).toEqual({
-      clean: `OOMPA_AUTHORITY_SUPERVISOR/1 CLEAN nonce=${"2".repeat(32)} exit=124`,
+      clean: `HRA_AUTHORITY_SUPERVISOR/1 CLEAN nonce=${"2".repeat(32)} exit=124`,
       closed: { code: 124, signal: null },
     });
   } catch (error) {
@@ -1608,7 +1608,7 @@ test("namespace PID 1 enforces the deadline while the outer supervisor is stoppe
     expect(await Bun.file(markers.delayed).exists()).toBeFalse();
     await expect(closed).resolves.toEqual({ code: 0, signal: null });
     expect(JSON.parse(await readFile(markers.result, "utf8"))).toEqual({
-      clean: `OOMPA_AUTHORITY_SUPERVISOR/1 CLEAN nonce=${"2".repeat(32)} exit=124`,
+      clean: `HRA_AUTHORITY_SUPERVISOR/1 CLEAN nonce=${"2".repeat(32)} exit=124`,
       closed: { code: 124, signal: null },
     });
   } catch (error) {
@@ -1632,7 +1632,7 @@ test("authority supervisor rejects an inherited bind alias of its recovery direc
   try {
     await expect(closed).resolves.toEqual({ code: 0, signal: null });
     expect(JSON.parse(await readFile(result, "utf8"))).toEqual({
-      firstLine: `OOMPA_AUTHORITY_SUPERVISOR/1 FAIL nonce=${"3".repeat(32)} code=init_not_ready`,
+      firstLine: `HRA_AUTHORITY_SUPERVISOR/1 FAIL nonce=${"3".repeat(32)} code=init_not_ready`,
       closed: { code: 1, signal: null },
     });
     expect(await Bun.file(marker).exists()).toBeFalse();

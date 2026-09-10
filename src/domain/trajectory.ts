@@ -155,7 +155,7 @@ const exportToolId = (input: Readonly<{
   sequence: number;
   callId: string;
 }>): string => `hra_${input.kind}_${createHash("sha256")
-  .update("oompa:trajectory-tool-id:v1\0", "utf8")
+  .update("hra:trajectory-tool-id:v1\0", "utf8")
   .update(JSON.stringify([
     input.provider,
     input.turnId,

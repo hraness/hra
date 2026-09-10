@@ -24,17 +24,17 @@ retains all earlier authority and fixture repairs. Those receipts prove the
 dormant foundation; the later migration has its own delivery evidence below.
 
 The schema50 session/Work persistence slice and its public-site delivery are
-complete. [PR151](https://github.com/hraness/hra/pull/151) merged normally at
+complete. [PR151](https://github.com/hraness/oompa/pull/151) merged normally at
 `2026-09-08T20:16:43Z` as `d5376e34dcf2ace99009fd6eeaed3dcae917bcca`, preserving
 reviewed tree `14ccd71d668411851ec5f65e03f16f6e63ec78f7`; its CI repair closed
-[issue152](https://github.com/hraness/hra/issues/152). Final head
+[issue152](https://github.com/hraness/oompa/issues/152). Final head
 `f3c90515ff4805171becd93165ecd6b0ccf1b02f` passed independent review, a fresh
 exact-tree full `bun run check`,
-[PR CI34272423302](https://github.com/hraness/hra/actions/runs/34272423302)
-and [CodeQL34272420205](https://github.com/hraness/hra/actions/runs/34272420205).
-Fresh actual-main [CI34273862908](https://github.com/hraness/hra/actions/runs/34273862908)
+[PR CI34272423302](https://github.com/hraness/oompa/actions/runs/34272423302)
+and [CodeQL34272420205](https://github.com/hraness/oompa/actions/runs/34272420205).
+Fresh actual-main [CI34273862908](https://github.com/hraness/oompa/actions/runs/34273862908)
 passed all eight jobs and Required;
-[CodeQL34273861597](https://github.com/hraness/hra/actions/runs/34273861597)
+[CodeQL34273861597](https://github.com/hraness/oompa/actions/runs/34273861597)
 and separate `bun run check:package` installation, PTY and daemon-lifecycle
 proof also passed. Exact-source deployment to oompa.app passed independent provider,
 protected-receipt, public-content and browser verification by
@@ -42,7 +42,7 @@ protected-receipt, public-content and browser verification by
 [model-routing implementation log](./model-routing-autonomy.md#implementation-log)
 records that bounded site proof and its limits.
 
-[Policy PR156](https://github.com/hraness/hra/pull/156) subsequently merged as
+[Policy PR156](https://github.com/hraness/oompa/pull/156) subsequently merged as
 `b856c66113c9a8752dbb431fc578287c23279cfe`, superseding the old pre-tag live-proof
 hold without changing model admission or runtime authority. The bounded schema50
 slice is included in admitted v0.7.0; its exact source and artifact evidence are in
@@ -62,7 +62,7 @@ check. PR140's usage owner acknowledged that reservation; its later migration
 tail remains unallocated until this exact source is reviewed and integrated.
 The StyleX branch still uses schema49. No number alone admits a predecessor.
 The complete session/Work migration slice is being validated separately in
-[PR151](https://github.com/hraness/hra/pull/151), on
+[PR151](https://github.com/hraness/oompa/pull/151), on
 `codex/canonical-profile-migration-20260908`; it is not released or activated.
 PR139 merged at `109655a8f7d6edd8916f6d7df277e3402b70a44f`, and PR148 retains
 the candidate-release window. PR148 then merged as protected main
@@ -70,10 +70,10 @@ the candidate-release window. PR148 then merged as protected main
 here. Its owner completed exact-main CI and package/install verification and
 released the main integration window. The joined07faf46 exact-tree local
 aggregate passed, but both protected CI jobs reached their 20-minute limits.
-The installer repair [PR153](https://github.com/hraness/hra/pull/153) merged as
+The installer repair [PR153](https://github.com/hraness/oompa/pull/153) merged as
 `cfc9477da5033019992b7adbf550288c57c965be` after both protected CI platforms
 and Required passed. That actual main is now joined alongside the reviewed CI
-partition under [issue152](https://github.com/hraness/hra/issues/152). Its owner
+partition under [issue152](https://github.com/hraness/oompa/issues/152). Its owner
 completed exact-main CI34266585084, CodeQL and package proof, then released
 the main window. The combined archive and immutable joinedbaf0abc review passed,
 as did its full local gate and CodeQL. CI34267620546 passed both remainder jobs
@@ -91,9 +91,9 @@ wait reduction are preserved in this increment.
 
 PR147's schema49 project companion merged as `c639ad78`; its local and
 protected gates and exact-main
-[CI34188257597](https://github.com/hraness/hra/actions/runs/34188257597)
+[CI34188257597](https://github.com/hraness/oompa/actions/runs/34188257597)
 passed. The foundation's separate exact-main
-[CI34242469558](https://github.com/hraness/hra/actions/runs/34242469558)
+[CI34242469558](https://github.com/hraness/oompa/actions/runs/34242469558)
 also passed. The original foundation began at `380ced9`; that older checkpoint
 is not the current integration base. The mobile runbook source is now joined
 from protected main109655a. Its source and deployment evidence remain in the
@@ -104,9 +104,9 @@ passed its exclusive exact-tree aggregate with exit zero, including final
 package cleanup: 3,790 source tests in 315.26 seconds, 1,102 scripts tests
 with one existing skip, 108 local-plugin, 29 cloud-plugin, 393 hosted/site,
 500 app and 11 package-policy tests with 42 assertions. Both platforms and
-Required passed in [CI34188700143](https://github.com/hraness/hra/actions/runs/34188700143)
+Required passed in [CI34188700143](https://github.com/hraness/oompa/actions/runs/34188700143)
 (macOS 12m16s, Ubuntu 18m07s, Required 3s), and
-[CodeQL34188697946](https://github.com/hraness/hra/actions/runs/34188697946)
+[CodeQL34188697946](https://github.com/hraness/oompa/actions/runs/34188697946)
 passed. These are delivered source-foundation receipts, not canonical
 migration, public artifact or activation evidence.
 
@@ -349,7 +349,7 @@ failed gate is waived and no real canonical migration is complete.
 
 Exact `2c3c074`, tree `956cd29db6c24766366a1285069eeb2fa4ab5460`,
 passed its exclusive local aggregate and both platforms plus Required in
-[CI 34182907000](https://github.com/hraness/hra/actions/runs/34182907000).
+[CI 34182907000](https://github.com/hraness/oompa/actions/runs/34182907000).
 The local source suite passed 3,656 tests in 343.31 seconds; scripts, both
 plugins, hosted and app tests, builds, complete-history and package policy,
 and isolated local/global consumers including PTY and daemon lifecycle also
@@ -597,12 +597,12 @@ This is not an installation, final joined archive or release receipt.
 ### Initial protected CI and fixture repair
 
 PR151's initial head `6eeb9020fd31517ae84e609065914a33595d56d9` failed
-[CI34253643236](https://github.com/hraness/hra/actions/runs/34253643236)
+[CI34253643236](https://github.com/hraness/oompa/actions/runs/34253643236)
 on both platforms with the same 39 source-test failures. Each platform passed
 3,888 source tests; source durations were 656.09 seconds on macOS and
 804.66 seconds on Ubuntu. Both jobs ended before their unchanged deadlines.
 The later site/app/build/package phases were not reached. Separate
-[CodeQL34253639329](https://github.com/hraness/hra/actions/runs/34253639329)
+[CodeQL34253639329](https://github.com/hraness/oompa/actions/runs/34253639329)
 passed. This failed aggregate is retained, not waived by the focused results.
 
 The failures exposed current-source fixtures outside the storage migration
@@ -682,14 +682,14 @@ The retained complete log SHA-256 is
 `ef3c2db755dbe24c9440a31110e963310740c5030d5fbea4d1a442231bb13e75`.
 This receipt belongs only to that tree.
 
-Protected [CI34259494781](https://github.com/hraness/hra/actions/runs/34259494781)
+Protected [CI34259494781](https://github.com/hraness/oompa/actions/runs/34259494781)
 cancelled both platform jobs near the unchanged 20-minute limit; Required
 failed. Ubuntu passed all 3,986 source tests in 856.03 seconds and reached
 package verification, whose final internal cancellation point is not known.
 macOS passed 3,253 source tests before cancellation and did not complete that
 suite. Policy/lint/types took 160.24 seconds on Ubuntu and 315.79 on macOS;
 scripts/plugins added 100.91 and 133.50 seconds. Separate
-[CodeQL34259490765](https://github.com/hraness/hra/actions/runs/34259490765)
+[CodeQL34259490765](https://github.com/hraness/oompa/actions/runs/34259490765)
 passed. No unchanged retry, timeout increase or gate waiver was issued.
 
 A controlled local comparison used three warmup pairs and 12 alternating
@@ -776,7 +776,7 @@ global daemon lifecycle. Its 723,794-byte complete log has SHA-256
 CodeQL34267615163 also passed. These are exactbaf0abc receipts, not successor
 or protected CI acceptance.
 
-[CI34267620546](https://github.com/hraness/hra/actions/runs/34267620546)
+[CI34267620546](https://github.com/hraness/oompa/actions/runs/34267620546)
 passed both remainder jobs in 7m09s and 6m56s, and Ubuntu source in 14m49s.
 macOS source was cancelled at its unchanged 20-minute limit, so Required
 failed. Its complete log contains 2,869 passes and two per-test failures over

@@ -28,7 +28,7 @@ import { MESSAGE_MAX_BYTES, utf8Bytes } from "./values";
 const encoder = new TextEncoder();
 const sha256 = (bytes: Uint8Array): string => createHash("sha256").update(bytes).digest("hex");
 const domainDigest = (domain: string, value: string): string => createHash("sha256")
-  .update(`oompa:managed-forward-${domain}:v1\0`, "utf8").update(value, "utf8").digest("hex");
+  .update(`hra:managed-forward-${domain}:v1\0`, "utf8").update(value, "utf8").digest("hex");
 
 const transcript = (texts: readonly string[] = [], omittedRecords = 0): SessionTranscript => {
   const records: TranscriptRecord[] = texts.map((text, index) => ({
@@ -282,7 +282,7 @@ describe("managed forward renderer", () => {
       + "No records were omitted.\n"
       + "Continue the work from here. Ask before assuming anything the summary does not state.\n"
       + "User: hello";
-    const expectedDigest = createHash("sha256").update("oompa:session-transcript-seed:v1\0", "utf8")
+    const expectedDigest = createHash("sha256").update("hra:session-transcript-seed:v1\0", "utf8")
       .update(expected, "utf8").digest("hex");
     const before = renderTranscriptSeedV1({ transcript: source, fromProvider: "codex", toProvider: "claude" });
     render({ ...base, transcript: source });
@@ -292,7 +292,7 @@ describe("managed forward renderer", () => {
       "secrets, absolute paths, raw tool arguments, and raw tool output were never stored and are not here.",
       "secrets, absolute paths, raw tool arguments, raw tool output, and attachment contents were never embedded and are not here.",
     ).replace("No records were omitted.", "No retained records were omitted.");
-    const currentDigest = createHash("sha256").update("oompa:session-transcript-seed:v1\0", "utf8")
+    const currentDigest = createHash("sha256").update("hra:session-transcript-seed:v1\0", "utf8")
       .update(currentExpected, "utf8").digest("hex");
     expect(renderTranscriptSeed({ transcript: source, fromProvider: "codex", toProvider: "claude" }))
       .toEqual({ text: currentExpected, digest: currentDigest, includedRecords: 1, omittedRecords: 0 });

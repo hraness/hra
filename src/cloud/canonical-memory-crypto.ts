@@ -50,7 +50,7 @@ import {
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
-const portableCanonicalSpaceIdPattern = /^oompa:project:space-[a-f0-9]{32}$/u;
+const portableCanonicalSpaceIdPattern = /^hra:project:space-[a-f0-9]{32}$/u;
 
 // Kept mechanically coupled to USER_RESOURCE_QUOTAS.device by the focused
 // cross-layer contract test. Do not import Convex server code into shipped
@@ -564,7 +564,7 @@ export async function deriveCanonicalMemoryHostedSpaceId(input: Readonly<{
     ?? reject("PORTABLE_SPACE_ID_INVALID");
   const bindingDigest = canonicalMemoryBindingDigest(canonicalSpaceId);
   const routeKey = Uint8Array.from(
-    (await sha256Hex(`oompa-canonical-memory-route-key:v1:${canonicalSpaceId}`))
+    (await sha256Hex(`hra-canonical-memory-route-key:v1:${canonicalSpaceId}`))
       .match(/../gu) ?? [],
     (byte) => Number.parseInt(byte, 16),
   );
@@ -613,10 +613,10 @@ export function parseCanonicalMemorySpaceKey(value: unknown): Uint8Array | null 
 export function canonicalMemoryBindingDigest(canonicalSpaceId: string): string {
   const parsed = parsePortableCanonicalMemorySpaceId(canonicalSpaceId);
   if (parsed === null) reject("PORTABLE_SPACE_ID_INVALID");
-  const identitySuffix = parsed.slice("oompa:project:".length);
+  const identitySuffix = parsed.slice("hra:project:".length);
   return createOhStoreBindingV1({
     profile: OH_CANONICAL_STORE_PROFILE_V1,
-    realmId: `oompa:project-memory:${identitySuffix}`,
+    realmId: `hra:project-memory:${identitySuffix}`,
     spaceId: parsed,
     v: 1,
   }).bindingSha256;

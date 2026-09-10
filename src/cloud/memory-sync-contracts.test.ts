@@ -117,7 +117,7 @@ describe("canonical memory sync wire contracts", () => {
     }])).toHaveLength(1);
     expect(parseCanonicalMemorySpaceConfiguration({
       ...configuration,
-      spaceId: "oompa:project:space-0123456789abcdef0123456789abcdef",
+      spaceId: "hra:project:space-0123456789abcdef0123456789abcdef",
     })).toBeNull();
     expect(parseCanonicalMemorySpaceConfiguration({
       ...configuration,

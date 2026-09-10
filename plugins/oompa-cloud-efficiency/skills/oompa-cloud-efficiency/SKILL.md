@@ -25,7 +25,7 @@ a separate Cloud task; it does not convert or move this active task.
   Codex task after plugin installation or bootstrap so the refreshed skill and
   global guidance are loaded.
 - **Qualify a task:** classify every execution and final-proof requirement,
-  then run `hra-cloud-route` with the exact repository root, intent, model
+  then run `oompa-cloud-route` with the exact repository root, intent, model
   policy, environment profile, owner, and any local-only requirements. Use
   `--online` immediately before dispatch to prove that the remote branch still
   equals the local commit.
@@ -43,6 +43,16 @@ a separate Cloud task; it does not convert or move this active task.
 
 Run scripts directly from the installed skill directory when convenience
 commands have not been bootstrapped yet.
+
+This plugin was previously named `hra-cloud-efficiency`. `bootstrap.ts --apply`
+migrates that installation in place: it replaces exactly one well-formed
+`hra-cloud-efficiency` managed block in global `AGENTS.md` with the current
+block, retargets command links that point at the previous plugin, and installs
+`hra-cloud-adoption`, `hra-cloud-efficiency`, and `hra-cloud-exec`
+compatibility links beside the `oompa-*` commands. `--check` requires those
+links only on a machine that already has one, and both the bootstrap and
+`oompa-cloud-adoption` refuse a file that carries legacy and current markers
+together.
 
 ## Route by hard exclusions first
 
@@ -109,7 +119,7 @@ Example:
 
 ```sh
 umask 077
-hra-cloud-route \
+oompa-cloud-route \
   --root /absolute/repository \
   --intent edit \
   --owner feature-owner \

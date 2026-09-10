@@ -502,7 +502,7 @@ describe("notification policy registry compatibility", () => {
       peerPolicies: [],
       spaces: [{
         bindingDigest: digest("a"),
-        canonicalSpaceId: `oompa:project:space-${"b".repeat(32)}`,
+        canonicalSpaceId: `hra:project:space-${"b".repeat(32)}`,
         enrollment: "not_enrolled",
         head: { digest: digest("c"), operationSha256: null, sequence: 0 },
         lastExchangeAt: null,

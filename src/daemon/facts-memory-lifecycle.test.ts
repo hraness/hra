@@ -284,7 +284,7 @@ describe("Oompa facts-memory lifecycle", () => {
   });
 
   test("migrates v1 custody and quarantines a nonempty legacy head until exact reproof", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-facts-memory-v1-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-facts-memory-v1-")));
     roots.push(home);
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
@@ -340,7 +340,7 @@ describe("Oompa facts-memory lifecycle", () => {
   });
 
   test("migrates v2 custody to v3 without changing its active authority", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-facts-memory-v2-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-facts-memory-v2-")));
     roots.push(home);
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);

@@ -2834,7 +2834,7 @@ const parseCanonicalMemoryHostedCreateWinner = (
 const canonicalMemoryHostedCreateRequestDigest = (
   request: CanonicalMemoryHostedCreateRequest,
 ): string => digestJson({
-  contract: "oompa.canonical-memory.hosted-create-request.v1",
+  contract: "hra.canonical-memory.hosted-create-request.v1",
   request,
 });
 
@@ -2843,7 +2843,7 @@ const canonicalMemoryHostedCreateWinnerDigest = (
   revision: number,
   replay: boolean,
 ): string => digestJson({
-  contract: "oompa.canonical-memory.hosted-create-winner.v1",
+  contract: "hra.canonical-memory.hosted-create-winner.v1",
   replay,
   request,
   revision,
@@ -2852,7 +2852,7 @@ const canonicalMemoryHostedCreateWinnerDigest = (
 const canonicalMemoryHostedHeadProofDigest = (
   envelope: CanonicalMemoryEncryptedEnvelope,
 ): string => digestJson({
-  contract: "oompa.canonical-memory.encrypted-head-proof.v1",
+  contract: "hra.canonical-memory.encrypted-head-proof.v1",
   envelope,
 });
 
@@ -3025,7 +3025,7 @@ const parseCanonicalMemorySyncSpoolOperation = (
   return {
     ...normalized,
     operationDigest: digestJson({
-      contract: "oompa.canonical-memory.operation-envelope.v1",
+      contract: "hra.canonical-memory.operation-envelope.v1",
       operation: normalized,
     }),
   };
@@ -3099,7 +3099,7 @@ const canonicalMemorySyncRequestDigest = (input: Readonly<{
   requestOperation?: CanonicalMemorySyncSpoolOperation;
 }>): string => input.direction === "push" && input.requestOperation !== undefined
   ? digestJson({
-      contract: "oompa.canonical-memory.push-request.v1",
+      contract: "hra.canonical-memory.push-request.v1",
       expectedKeyVersion: input.remote.keyVersion,
       expectedRevision: input.remote.revision,
       operations: [canonicalMemoryWireOperation(input.requestOperation)],
@@ -3108,7 +3108,7 @@ const canonicalMemorySyncRequestDigest = (input: Readonly<{
   : digestJson({
       afterHeadToken: input.localHeadToken,
       afterSequence: input.localHead.sequence,
-      contract: "oompa.canonical-memory.pull-request.v1",
+      contract: "hra.canonical-memory.pull-request.v1",
       expectedGenesisToken: input.remote.genesisToken,
       expectedKeyVersion: input.remote.keyVersion,
       limit: 1,
@@ -3122,7 +3122,7 @@ const canonicalMemorySyncResponseDigest = (input: Readonly<{
   operation?: CanonicalMemorySyncSpoolOperation;
   remote: CanonicalMemoryHostedRemoteObservation;
 }>): string => digestJson({
-  contract: "oompa.canonical-memory.response-observation.v1",
+  contract: "hra.canonical-memory.response-observation.v1",
   direction: input.direction,
   operation: input.operation === undefined
     ? null
@@ -3249,7 +3249,7 @@ const mapCanonicalMemorySyncSpoolOperation = (
   const wireOperation = canonicalMemoryWireOperation(operation);
   const { operationDigest } = operation;
   if (operationDigest !== digestJson({
-    contract: "oompa.canonical-memory.operation-envelope.v1",
+    contract: "hra.canonical-memory.operation-envelope.v1",
     operation: wireOperation,
   })) throw new Error("CANONICAL_MEMORY_SYNC_SPOOL_INVALID");
   return operation;
@@ -4179,7 +4179,7 @@ const parseSessionSwitchCas = (input: SessionSwitchCas): SessionSwitchCas =>
   });
 const malformedSessionSwitchDiagnosticAttemptId = (switchRowId: number): AttemptId =>
   attemptIdSchema.parse(`attempt_${createHash("sha256")
-    .update("oompa:malformed-session-switch-row:v1\0", "utf8")
+    .update("hra:malformed-session-switch-row:v1\0", "utf8")
     .update(String(switchRowId), "utf8")
     .digest("hex")
     .slice(0, 32)}`);
@@ -10251,7 +10251,7 @@ const devinCloseAuthority = (intent: z.infer<typeof devinCloseIntentSchema>) =>
     bindingGeneration: intent.binding_generation, processGeneration: intent.process_generation,
   });
 const devinCloseDigest = (kind: string, value: unknown): string =>
-  createHash("sha256").update(`oompa:devin-joined-close:${kind}:v1\0`).update(JSON.stringify(value)).digest("hex");
+  createHash("sha256").update(`hra:devin-joined-close:${kind}:v1\0`).update(JSON.stringify(value)).digest("hex");
 const devinCloseTables = [
   { name: "devin_joined_close_intents", sql: `CREATE TABLE IF NOT EXISTS devin_joined_close_intents(
     close_id TEXT PRIMARY KEY CHECK(length(close_id)=36),
@@ -14341,12 +14341,12 @@ CREATE TABLE IF NOT EXISTS project_memory_authorities (
     (
       identity_contract=1
       AND length(canonical_space_id)=76
-      AND canonical_space_id GLOB 'oompa:project:*'
+      AND canonical_space_id GLOB 'hra:project:*'
       AND substr(canonical_space_id,13) NOT GLOB '*[^a-f0-9]*'
     ) OR (
       identity_contract=2
       AND length(canonical_space_id)=50
-      AND canonical_space_id GLOB 'oompa:project:space-*'
+      AND canonical_space_id GLOB 'hra:project:space-*'
       AND substr(canonical_space_id,19) NOT GLOB '*[^a-f0-9]*'
     )
   ),
@@ -15713,7 +15713,7 @@ CREATE TABLE IF NOT EXISTS project_memory_portable_adoption_proofs (
   project_id TEXT NOT NULL REFERENCES project_memory_authorities(project_id),
   canonical_space_id TEXT NOT NULL CHECK(
     length(canonical_space_id)=50
-    AND canonical_space_id GLOB 'oompa:project:space-*'
+    AND canonical_space_id GLOB 'hra:project:space-*'
     AND substr(canonical_space_id,19) NOT GLOB '*[^a-f0-9]*'
   ),
   canonical_binding_digest TEXT NOT NULL CHECK(length(canonical_binding_digest)=64 AND canonical_binding_digest NOT GLOB '*[^a-f0-9]*'),
@@ -21408,7 +21408,7 @@ const sessionSwitchTargetStartResultDigest = (input: Readonly<{
   providerUpdatedAt: number | null;
   runtimeProfile: ReviewedRuntimeProfile;
 }>): string => digestJson({
-  domain: "oompa:session-switch-target-start-result:v1",
+  domain: "hra:session-switch-target-start-result:v1",
   providerThreadId: input.providerThreadId,
   state: input.state,
   activeTurnId: input.activeTurnId,
@@ -21453,7 +21453,7 @@ const sessionSwitchReconciliationEvidenceDigest = (input: Readonly<{
   attemptId: AttemptId;
   reconciliation: SessionSwitchReconciliationEvidence;
 }>): string => digestJson({
-  domain: "oompa:session-switch-reconciliation-evidence:v1",
+  domain: "hra:session-switch-reconciliation-evidence:v1",
   attemptId: input.attemptId,
   reconciliation: input.reconciliation,
 });
@@ -21469,7 +21469,7 @@ const sessionSwitchAbandonEvidenceDigest = (input: Readonly<{
   session: SessionRecord;
   recordedAt: number;
 }>): string => digestJson({
-  domain: "oompa:session-switch-abandon-evidence:v1",
+  domain: "hra:session-switch-abandon-evidence:v1",
   attemptId: input.attemptId,
   planDigest: input.planDigest,
   reconciliation: input.reconciliation,
@@ -21534,7 +21534,7 @@ const sessionSwitchPlanDigest = (input: Readonly<{
   transcript: SessionSwitchTranscriptPin;
   createdAt: number;
 }>): string => digestJson({
-  domain: "oompa:session-switch-prepared-plan:v1",
+  domain: "hra:session-switch-prepared-plan:v1",
   attemptId: input.attemptId,
   requestKey: input.requestKey,
   requestDigest: input.requestDigest,
@@ -21565,7 +21565,7 @@ const sessionSwitchTargetNoEffectEvidenceDigest = (input: Readonly<{
   targetAuthority: ProviderAccountAuthority;
   diagnosticCode: string;
 }>): string => digestJson({
-  domain: "oompa:session-switch-target-no-effect:v2",
+  domain: "hra:session-switch-target-no-effect:v2",
   attemptId: input.attemptId,
   requestDigest: input.requestDigest,
   planDigest: input.planDigest,
@@ -21582,7 +21582,7 @@ const sessionSwitchTargetNoEffectAnchorDigest = (input: Readonly<{
   evidenceDigest: string;
   recordedAt: number;
 }>): string => digestJson({
-  domain: "oompa:session-switch-target-no-effect-anchor:v1",
+  domain: "hra:session-switch-target-no-effect-anchor:v1",
   attemptId: input.attemptId,
   requestDigest: input.requestDigest,
   planDigest: input.planDigest,
@@ -21602,7 +21602,7 @@ const sessionSwitchSourceReleaseEvidenceDigest = (input: Readonly<{
   status: "released" | "already_released";
   recordedAt: number;
 }>): string => digestJson({
-  domain: "oompa:session-switch-source-release-evidence:v1",
+  domain: "hra:session-switch-source-release-evidence:v1",
   attemptId: input.attemptId,
   requestDigest: input.requestDigest,
   planDigest: input.planDigest,
@@ -21644,7 +21644,7 @@ const sessionSwitchRebindEvidenceDigest = (input: Readonly<{
   transcript: SessionSwitchTranscriptPin;
   rebind: NonNullable<SessionSwitchRecord["rebind"]>;
 }>): string => digestJson({
-  domain: "oompa:session-switch-rebind-evidence:v2",
+  domain: "hra:session-switch-rebind-evidence:v2",
   attemptId: input.attemptId,
   planDigest: input.planDigest,
   sourceAuthority: input.sourceAuthority,
@@ -21676,7 +21676,7 @@ const sessionSwitchSeedEvidenceDigest = (input: Readonly<{
   messageEventSequence: number | null;
   messageEventDigest: string | null;
 }>): string => digestJson({
-  domain: "oompa:session-switch-seed-evidence:v1",
+  domain: "hra:session-switch-seed-evidence:v1",
   ...input,
 });
 
@@ -22549,7 +22549,7 @@ const mapSessionSwitch = (
         || reviewedRuntimeProfileProvider(runtimeProfile) !== seedAuthority.authority.provider
       ) throw new Error("SESSION_SWITCH_SEED_RUNTIME_PROFILE_AUTHORITY_MISMATCH");
       expectedReceiptDigest = digestJson({
-        domain: "oompa:session-switch-seed-accepted:v1",
+        domain: "hra:session-switch-seed-accepted:v1",
         turnId: row.seed_turn_id,
         turnStatus: row.seed_turn_status,
         runtimeProfile,
@@ -22568,7 +22568,7 @@ const mapSessionSwitch = (
         || publicSession.activeTurnId !== undefined
       ) throw new Error("SESSION_SWITCH_SEED_PUBLIC_RECEIPT_MISMATCH");
       expectedReceiptDigest = createHash("sha256")
-        .update("oompa:session-switch-seed-rejected:v1\0", "utf8")
+        .update("hra:session-switch-seed-rejected:v1\0", "utf8")
         .update(row.seed_failure_code, "utf8")
         .digest("hex");
     }
@@ -27623,19 +27623,19 @@ export class StateStore {
       if (
         settlement.outcome === "accepted"
         && createHash("sha256")
-          .update("oompa:session-transcript-seed:v1\0", "utf8")
+          .update("hra:session-transcript-seed:v1\0", "utf8")
           .update(settlement.seedText, "utf8")
           .digest("hex") !== record.transcript.seedDigest
       ) throw new SessionSwitchStoreError("SESSION_SWITCH_REQUEST_CONFLICT");
       const expectedReceiptDigest = settlement.outcome === "accepted"
         ? digestJson({
-            domain: "oompa:session-switch-seed-accepted:v1",
+            domain: "hra:session-switch-seed-accepted:v1",
             turnId: settlement.turnId,
             turnStatus: settlement.turnStatus,
             runtimeProfile: settlement.runtimeProfile,
           })
         : createHash("sha256")
-            .update("oompa:session-switch-seed-rejected:v1\0", "utf8")
+            .update("hra:session-switch-seed-rejected:v1\0", "utf8")
             .update(settlement.failureCode, "utf8")
             .digest("hex");
       if (settlement.receiptDigest !== expectedReceiptDigest) {

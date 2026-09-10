@@ -81,8 +81,8 @@ describe("Claude host-tool binding authority", () => {
     const config = JSON.parse(configText) as {
       mcpServers: Record<string, { args: string[]; command: string; type: string }>;
     };
-    expect(Object.keys(config.mcpServers)).toEqual(["oompa"]);
-    expect(config.mcpServers.oompa).toEqual({
+    expect(Object.keys(config.mcpServers)).toEqual(["hra"]);
+    expect(config.mcpServers.hra).toEqual({
       args: ["/private/oompa/host-tool-bridge-main.ts", "--binding", lease.bindingPath],
       command: process.execPath,
       type: "stdio",

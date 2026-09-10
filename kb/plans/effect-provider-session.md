@@ -1,6 +1,6 @@
 # Codex provider-session Effect runtime
 
-Design: [issue 118](https://github.com/hraness/hra/issues/118).
+Design: [issue 118](https://github.com/hraness/oompa/issues/118).
 
 Status: done. Implemented, independently reviewed, and merged through pull request 120.
 

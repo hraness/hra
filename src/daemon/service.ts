@@ -353,7 +353,7 @@ const proseAutorespondIdempotencyKey = (
   turnId: string,
 ): string => {
   const digest = createHash("sha256")
-    .update("oompa-prose-autorespond-v1\0")
+    .update("hra-prose-autorespond-v1\0")
     .update(sessionId)
     .update("\0")
     .update(turnId)
@@ -1025,7 +1025,7 @@ const ownerMemoryRequestDigest = (
   command: Extract<LocalCommand, { kind: "memory.remember" | "memory.share" }>,
   actorSessionId: SessionRecord["id"],
 ): string => createHash("sha256")
-  .update("oompa:owner-memory-command:v1\0", "utf8")
+  .update("hra:owner-memory-command:v1\0", "utf8")
   .update(JSON.stringify({
     actorSessionId,
     kind: command.kind,
@@ -1045,7 +1045,7 @@ const conversationAutomationIdempotencyKey = (
   call: ConversationAutomationToolCall,
 ): string => {
   const digest = createHash("sha256")
-    .update("oompa:conversation-automation-call:v1\0", "utf8")
+    .update("hra:conversation-automation-call:v1\0", "utf8")
     .update(authority.id, "utf8")
     .update("\0", "utf8")
     .update(call.threadId, "utf8")
@@ -1064,7 +1064,7 @@ const oompaHostToolIdempotencyKey = (
   call: OompaHostToolCall,
 ): string => {
   const digest = createHash("sha256")
-    .update("oompa:host-tool-call:v1\0", "utf8")
+    .update("hra:host-tool-call:v1\0", "utf8")
     .update(authority.id, "utf8")
     .update("\0", "utf8")
     .update(call.threadId, "utf8")
@@ -12657,7 +12657,7 @@ export class OompaService {
     );
     if (this.#factsMemory === undefined) return;
     const operationDigest = digestText(JSON.stringify({
-      domain: "oompa:session-switch-facts-memory-owner:v1",
+      domain: "hra:session-switch-facts-memory-owner:v1",
       attemptId: record.attemptId,
       sourceAuthority: record.sourceAuthority,
       targetAuthority: record.targetAuthority,
@@ -19340,7 +19340,7 @@ export class OompaService {
         settlement: {
           outcome: "rejected",
           failureCode,
-          receiptDigest: digestText(`oompa:session-switch-seed-rejected:v1\0${failureCode}`),
+          receiptDigest: digestText(`hra:session-switch-seed-rejected:v1\0${failureCode}`),
         },
       });
       this.recordBackgroundDiagnostic("provider_switch_seed_failed", error);
@@ -19441,7 +19441,7 @@ export class OompaService {
             turnStatus: started.status,
             runtimeProfile,
             receiptDigest: digestText(JSON.stringify({
-              domain: "oompa:session-switch-seed-accepted:v1",
+              domain: "hra:session-switch-seed-accepted:v1",
               turnId: started.turnId,
               turnStatus: started.status,
               runtimeProfile,

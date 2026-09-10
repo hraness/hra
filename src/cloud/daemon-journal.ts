@@ -697,7 +697,7 @@ export function emptyCloudSessionSyncCursor(): CloudSessionSyncCursorState {
 }
 
 const remoteSessionCursorDigest = (cursor: string): string =>
-  createHash("sha256").update("oompa-cloud-session-cursor\0").update(cursor).digest("hex");
+  createHash("sha256").update("hra-cloud-session-cursor\0").update(cursor).digest("hex");
 
 const remoteSessionCursorBrentPower = (pageCount: number): number => {
   let power = 1;

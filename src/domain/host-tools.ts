@@ -11,11 +11,11 @@ import {
 } from "./values.ts";
 
 export const OOMPA_HOST_TOOL_MANIFEST_VERSION = 1 as const;
-export const OOMPA_HOST_TOOL_MANIFEST_ID = "oompa.host-tools.v1" as const;
-export const OOMPA_HOST_TOOL_NAMESPACE = "oompa" as const;
+export const OOMPA_HOST_TOOL_MANIFEST_ID = "hra.host-tools.v1" as const;
+export const OOMPA_HOST_TOOL_NAMESPACE = "hra" as const;
 /** Exact UTF-8 ceiling shared by every provider transport and result paginator. */
 export const OOMPA_HOST_TOOL_PUBLIC_RESULT_MAX_BYTES = 64 * 1_024;
-/** Reserve space for Oompa's immutable provenance and untrusted-input wrapper. */
+/** Reserve space for HRA's immutable provenance and untrusted-input wrapper. */
 export const OOMPA_PEER_MESSAGE_MAX_BYTES = MESSAGE_MAX_BYTES - 4_096;
 /** Leaves room for Oh's physical `edition:` key prefix within its 512-character limit. */
 export const OOMPA_MEMORY_LOGICAL_KEY_MAX_LENGTH = 504;
@@ -227,7 +227,7 @@ const hostToolDefinitions = [
   },
   {
     name: "sessions_list",
-    description: "List a bounded page of other Oompa sessions in this session's current project.",
+    description: "List a bounded page of other HRA sessions in this session's current project.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -239,7 +239,7 @@ const hostToolDefinitions = [
   },
   {
     name: "session_inspect",
-    description: "Read bounded provider-neutral state and transcript records for one current-project Oompa session.",
+    description: "Read bounded provider-neutral state and transcript records for one current-project HRA session.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -254,7 +254,7 @@ const hostToolDefinitions = [
   },
   {
     name: "session_message",
-    description: "Send or queue a message for, or steer the active turn of, one current-project Oompa session.",
+    description: "Send or queue a message for, or steer the active turn of, one current-project HRA session.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -365,7 +365,7 @@ const deepFreeze = <T>(value: T): Readonly<T> => {
 };
 
 export const OOMPA_HOST_TOOL_MANIFEST = deepFreeze({
-  description: "Use Oompa's session-bound coordination, memory, and scheduled-work services.",
+  description: "Use HRA's session-bound coordination, memory, and scheduled-work services.",
   id: OOMPA_HOST_TOOL_MANIFEST_ID,
   namespace: OOMPA_HOST_TOOL_NAMESPACE,
   tools: hostToolDefinitions,
@@ -542,8 +542,8 @@ export const isOompaHostToolName = (value: unknown): value is OompaHostToolName 
 
 /** Parse one provider-supplied call against the same closed contract that is advertised. */
 export function parseOompaHostToolRequest(tool: unknown, value: unknown): OompaHostToolRequest {
-  if (!isOompaHostToolName(tool)) throw new TypeError("Unknown Oompa host tool.");
+  if (!isOompaHostToolName(tool)) throw new TypeError("Unknown HRA host tool.");
   const parsed = inputSchemas[tool].safeParse(value);
-  if (!parsed.success) throw new TypeError("Invalid Oompa host-tool input.");
+  if (!parsed.success) throw new TypeError("Invalid HRA host-tool input.");
   return { tool, input: parsed.data } as OompaHostToolRequest;
 }

@@ -13,7 +13,7 @@ import { projectIdSchema, type ProjectId } from "./values";
 
 export { OOMPA_CANONICAL_MEMORY_OPERATION_MAX_BYTES } from "./canonical-memory-sync";
 
-export const PROJECT_MEMORY_DESTINATION_PURPOSE = "oompa.project.canonical";
+export const PROJECT_MEMORY_DESTINATION_PURPOSE = "hra.project.canonical";
 export const projectMemoryIdentityContractSchema = z.union([
   z.literal(1),
   z.literal(2),
@@ -22,9 +22,9 @@ export type ProjectMemoryIdentityContract = z.infer<
   typeof projectMemoryIdentityContractSchema
 >;
 
-const legacyCanonicalSpaceIdSchema = z.string().regex(/^oompa:project:[a-f0-9]{64}$/u);
+const legacyCanonicalSpaceIdSchema = z.string().regex(/^hra:project:[a-f0-9]{64}$/u);
 const portableCanonicalSpaceIdSchema = z.string().regex(
-  /^oompa:project:space-[a-f0-9]{32}$/u,
+  /^hra:project:space-[a-f0-9]{32}$/u,
 );
 
 export const projectMemoryCanonicalSpaceIdSchema = z.union([
@@ -69,10 +69,10 @@ export const PROJECT_MEMORY_EMPTY_HEAD = Object.freeze({
 });
 
 export const legacyProjectMemorySpaceId = (projectId: ProjectId): string =>
-  `oompa:project:${canonicalSha256({ projectId: projectIdSchema.parse(projectId), v: 1 })}`;
+  `hra:project:${canonicalSha256({ projectId: projectIdSchema.parse(projectId), v: 1 })}`;
 
 export const createPortableProjectMemorySpaceId = (): string =>
-  `oompa:project:space-${randomBytes(16).toString("hex")}`;
+  `hra:project:space-${randomBytes(16).toString("hex")}`;
 
 export const deriveProjectMemoryCanonicalIdentity = (input: Readonly<{
   projectId: ProjectId;
@@ -87,9 +87,9 @@ export const deriveProjectMemoryCanonicalIdentity = (input: Readonly<{
     || (identityContract === 2 && !portableCanonicalSpaceIdSchema.safeParse(canonicalSpaceId).success)
   ) throw new Error("PROJECT_MEMORY_IDENTITY_INVALID");
 
-  const identitySuffix = canonicalSpaceId.slice("oompa:project:".length);
-  const canonicalRealmId = `oompa:project-memory:${identitySuffix}`;
-  const canonicalAuthorityId = `oompa.memory.canonical.${identitySuffix}`;
+  const identitySuffix = canonicalSpaceId.slice("hra:project:".length);
+  const canonicalRealmId = `hra:project-memory:${identitySuffix}`;
+  const canonicalAuthorityId = `hra.memory.canonical.${identitySuffix}`;
   const binding = createOhStoreBindingV1({
     profile: OH_CANONICAL_STORE_PROFILE_V1,
     realmId: canonicalRealmId,

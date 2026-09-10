@@ -43,7 +43,7 @@ const body = {
     "Open Oompa to review:",
     "- Command approval: https://app.oompa.app/#/session/session_action_test",
   ].join("\n"),
-  version: 1 as const,
+  version: 2 as const,
 };
 
 const untouchedInactive = {

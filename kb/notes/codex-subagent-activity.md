@@ -10,12 +10,12 @@ tags:
   - app-server
   - web
 relations:
-  related-to: [ plans/oompa-web-v1 ]
+  related-to: [ plans/hra-web-v1 ]
 ---
 
 # Codex subagent activity on the pinned app-server
 
-Ground truth for the "subagent chips" item of W3 in [Oompa Web v1](../plans/oompa-web-v1.md#providers-models). Everything below was read from the TypeScript bindings the pinned executable emits with `codex app-server generate-ts --experimental`, compared against the same output from the previously pinned `0.149.0`.
+Ground truth for the "subagent chips" item of W3 in [Oompa Web v1](../plans/hra-web-v1.md#providers-models). Everything below was read from the TypeScript bindings the pinned executable emits with `codex app-server generate-ts --experimental`, compared against the same output from the previously pinned `0.149.0`.
 
 ## What the pin bought
 

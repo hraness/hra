@@ -31,13 +31,13 @@ describe("independently authored package content", () => {
 
   test("retains candidate, predecessor, startup, privacy, and command-order contracts", () => {
     expect(readme).toContain("The v0.8.0 candidate is not yet admitted.");
-    expect(readme).toContain("For the admitted v0.7.1 artifact, use its [immutable README](https://github.com/hraness/hra/tree/v0.7.1#get-started).");
-    expect(readme).toContain("https://github.com/hraness/hra/blob/v0.7.1/docs/beta-release-notes.md#install");
+    expect(readme).toContain("For the admitted v0.7.1 artifact, use its [immutable README](https://github.com/hraness/oompa/tree/v0.7.1#get-started).");
+    expect(readme).toContain("https://github.com/hraness/oompa/blob/v0.7.1/docs/beta-release-notes.md#install");
     expect(readme).toContain(packageCandidateNotice);
     expect(readme.indexOf(packageCandidateNotice)).toBeLessThan(readme.indexOf(packageInstallCommand));
     expect(readme.indexOf("The v0.8.0 candidate is not yet admitted.")).toBeLessThan(readme.indexOf(packageInstallCommand));
     expect(readme.indexOf(packageInstallPrerequisite)).toBeLessThan(readme.indexOf(packageInstallCommand));
-    expect(readme.indexOf(packageInstallCommand)).toBeLessThan(readme.indexOf("\nhra doctor --offline\n"));
+    expect(readme.indexOf(packageInstallCommand)).toBeLessThan(readme.indexOf("\noompa doctor --offline\n"));
     expect(readme).toContain(packageDaemonNotice);
     expect(readme.indexOf(packageDaemonNotice)).toBeLessThan(readme.indexOf("oompa session start personal --provider codex --json"));
     expect(readme).toContain("[Availability](https://oompa.app/docs/status/)");

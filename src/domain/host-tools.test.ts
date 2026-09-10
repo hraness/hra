@@ -22,8 +22,8 @@ describe("Oompa host-tool contract", () => {
       [...OOMPA_HOST_TOOL_NAMES],
     );
     expect(OOMPA_HOST_TOOL_MANIFEST).toMatchObject({
-      id: "oompa.host-tools.v1",
-      namespace: "oompa",
+      id: "hra.host-tools.v1",
+      namespace: "hra",
       version: 1,
     });
     expect(OOMPA_HOST_TOOL_MANIFEST_DIGEST).toBe(

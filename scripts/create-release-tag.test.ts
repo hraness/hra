@@ -374,10 +374,10 @@ describe("owner-authorized release tag", () => {
     )).not.toThrow();
     expect(() => assertExactOriginUrls(
       "https://github.com/hraness/oompa.git",
-      "https://github.com/attacker/oompa.git",
+      "https://github.com/attacker/hra.git",
     )).toThrow("hraness/oompa as origin");
     expect(() => assertExactOriginUrls(
-      "https://github.com/hraness/oompa.git\nhttps://github.com/attacker/oompa.git",
+      "https://github.com/hraness/oompa.git\nhttps://github.com/attacker/hra.git",
       "https://github.com/hraness/oompa.git",
     )).toThrow("hraness/oompa as origin");
   });

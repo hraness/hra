@@ -32,15 +32,15 @@ export function assertPackageContent(manifest: unknown, readme: unknown): void {
     "# Oompa\n\n`@hraness/oompa` supplies the `oompa` command and local daemon.",
     "Local CLI v0.8.0 is a release candidate, not an admitted artifact",
     "The v0.8.0 candidate is not yet admitted.",
-    "https://github.com/hraness/hra/tree/v0.7.1#get-started",
-    "https://github.com/hraness/hra/blob/v0.7.1/docs/beta-release-notes.md#install",
+    "https://github.com/hraness/oompa/tree/v0.7.1#get-started",
+    "https://github.com/hraness/oompa/blob/v0.7.1/docs/beta-release-notes.md#install",
     "Codex execution supports macOS and Linux; Claude Code execution supports Linux.",
     "Bun 1.3.14",
     "## Get started\n",
     packageCandidateNotice,
     packageInstallPrerequisite,
     "```sh\n" + packageInstallCommand + "\n```",
-    "```sh\nhra doctor --offline\n```",
+    "```sh\noompa doctor --offline\n```",
     packageDaemonNotice,
     "## CLI usage\n",
     "oompa session start personal --provider codex --json",
@@ -56,7 +56,7 @@ export function assertPackageContent(manifest: unknown, readme: unknown): void {
   for (const [before, after] of [
     [packageCandidateNotice, packageInstallCommand],
     [packageInstallPrerequisite, packageInstallCommand],
-    [packageInstallCommand, "\nhra doctor --offline\n"],
+    [packageInstallCommand, "\noompa doctor --offline\n"],
     [packageDaemonNotice, "oompa session start personal --provider codex --json"],
   ] as const) {
     if (text.indexOf(before) >= text.indexOf(after)) {

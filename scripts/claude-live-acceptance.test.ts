@@ -561,7 +561,7 @@ const cleanupEvidence = (input: Readonly<{
   privateArtifactsAbsent: true,
   retainedSessionProcess: "released_not_live",
   scopeBindingDigest: canonicalDigest({
-    domain: "oompa.claude.cleanup-readback.v1",
+    domain: "hra.claude.cleanup-readback.v1",
     profileGeneration: input.profileGeneration ?? null,
     profileId: input.profileId,
     sessionId: input.sessionId ?? null,
@@ -863,7 +863,7 @@ describe("Claude cleanup-only recovery", () => {
       ...base,
       bindingDigest: canonicalDigest({
         ...base,
-        domain: "oompa.claude.live-acceptance.cleanup-authorization.v1",
+        domain: "hra.claude.live-acceptance.cleanup-authorization.v1",
       }),
     };
   };
@@ -937,7 +937,7 @@ describe("Claude cleanup-only recovery", () => {
               ...readyAuthorizationBase,
               bindingDigest: canonicalDigest({
                 ...readyAuthorizationBase,
-                domain: "oompa.claude.live-acceptance.cleanup-authorization.v1",
+                domain: "hra.claude.live-acceptance.cleanup-authorization.v1",
               }),
             },
             worker: { pid: 91_002, state: "ready" },

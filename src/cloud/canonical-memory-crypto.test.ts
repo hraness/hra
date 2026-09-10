@@ -49,8 +49,8 @@ import {
 } from "./crypto";
 import { parseCanonicalMemoryOperation } from "./memory-sync-contracts";
 
-const canonicalSpaceId = "oompa:project:space-0123456789abcdef0123456789abcdef";
-const otherCanonicalSpaceId = "oompa:project:space-fedcba9876543210fedcba9876543210";
+const canonicalSpaceId = "hra:project:space-0123456789abcdef0123456789abcdef";
+const otherCanonicalSpaceId = "hra:project:space-fedcba9876543210fedcba9876543210";
 const hostedSpaceId = `memory_${"A".repeat(32)}`;
 const otherHostedSpaceId = `memory_${"B".repeat(32)}`;
 const keyVersion = 3;
@@ -251,7 +251,7 @@ describe("canonical memory client cryptography", () => {
       canonicalSpaceId,
     })).toBe(identifier);
     expect(parseCanonicalMemoryHostedSpaceId(identifier)).toBe(identifier);
-    expect(identifier).not.toContain("oompa:project:");
+    expect(identifier).not.toContain("hra:project:");
     expect(identifier).not.toContain(canonicalSpaceId.slice(-32));
     expect(await deriveCanonicalMemoryHostedSpaceId({
       accountBindingDigest: canonicalSha256({
@@ -645,7 +645,7 @@ describe("canonical memory client cryptography", () => {
     })).toBeNull();
     expect(parseCanonicalMemoryDescriptorV1({
       ...descriptor,
-      canonicalSpaceId: `oompa:project:${"a".repeat(64)}`,
+      canonicalSpaceId: `hra:project:${"a".repeat(64)}`,
     })).toBeNull();
 
     let reads = 0;

@@ -372,7 +372,7 @@ const fixture49Schema = z.object({
     runtimeManifestSha256: z.string(), stateStoreSha256: z.string(), workStoreSha256: z.string(),
     lockSha256: z.string(), packageSha256: z.string(), bunVersion: z.literal("1.3.14") }).strict(),
   generatorSha256: z.string(), fixedNow: z.literal(10_000), daemonGeneration: z.literal(1),
-  publicSyntheticProject: z.literal("/private/tmp/oompa-public-canonical49-profile-fixture/project"),
+  publicSyntheticProject: z.literal("/private/tmp/hra-public-canonical49-profile-fixture/project"),
   usageV9Maintenance: z.string(), logicalRestoration: z.string(), payloadSha256: z.string(),
   cases: z.array(z.object({ state: z.enum(["claimed", "released", "submitted"]), sessionId: z.string(),
     workId: z.string(), taskId: z.string(), attemptId: z.string(), claim: workOperationSchema,

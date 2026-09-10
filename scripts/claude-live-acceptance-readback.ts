@@ -211,7 +211,7 @@ const requireOriginalMutationAuthority = (
 /** Mirrors the production host-call idempotency preimage, independently of its result. */
 const rememberKey = (receipt: ClaudeLiveAcceptanceProvisionalPrivateReceipt): string => {
   const bytes = createHash("sha256").update([
-    "oompa:host-tool-call:v1", receipt.profileId, receipt.providerThreadId,
+    "hra:host-tool-call:v1", receipt.profileId, receipt.providerThreadId,
     receipt.turnId, receipt.callId, "memory_remember",
   ].join("\0"), "utf8").digest();
   bytes[6] = (bytes[6] ?? 0) & 0x0f | 0x50;
@@ -296,7 +296,7 @@ const readArtifacts = async (paths: StatePaths, receipt: ClaudeLiveAcceptancePro
   }).strict().parse(await privateJson(bindingPath));
   requireThat(binding.bindingId === receipt.bindingId && binding.callbackSocketPath === socketPath);
   const config = await privateJson(configPath);
-  requireThat(same(config, { mcpServers: { oompa: {
+  requireThat(same(config, { mcpServers: { hra: {
     args: [CLAUDE_HOST_TOOL_BRIDGE_ENTRYPOINT, "--binding", bindingPath],
     command: process.execPath, type: "stdio",
   } } }));
@@ -704,7 +704,7 @@ export function createClaudeLiveAcceptanceReadback(options: Readonly<{
         cleanupPhase = "done";
         return Object.freeze({ version: 1 as const, source: "independent_cleanup_readback" as const,
           phase: "cleanup_stopped" as const, snapshotDigest: canonicalSha256(first.records),
-          scopeBindingDigest: canonicalSha256({ domain: "oompa.claude.cleanup-readback.v1", profileId: parsed.profileId,
+          scopeBindingDigest: canonicalSha256({ domain: "hra.claude.cleanup-readback.v1", profileId: parsed.profileId,
             profileGeneration: parsed.profileGeneration ?? null, sessionId: parsed.sessionId ?? null }),
           unreleasedProcessesAbsent: true as const, privateArtifactsAbsent: true as const,
           retainedSessionProcess: first.records.process === null ? "absent" as const : "released_not_live" as const });

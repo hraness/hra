@@ -179,7 +179,7 @@ export const attentionKeyInstallSlot = (target: ConvexTarget): string =>
 export const attentionEnvironmentFingerprint = (
   entries: AttentionEnvironment, target: ConvexTarget, intendedAttentionKey: string,
 ): string => createHmac("sha256", intendedAttentionKey)
-  .update("oompa-attention-environment-fingerprint-v1\0", "utf8")
+  .update("hra-attention-environment-fingerprint-v1\0", "utf8")
   .update(canonicalJson({
     entries: entries.filter(({ name }) => name !== oompaAttentionResendApiKeyEnvironmentName)
       .toSorted((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0),
@@ -200,7 +200,7 @@ export async function installHostedAttentionKey(options: InstallationOptions) {
   try {
     validateArguments(options);
     const input = parseAttentionKeyInstallationInput(options.inputDocument, options.target);
-    const intendedKeyDigest = createHash("sha256").update("oompa-attention-key-observation-v1\0")
+    const intendedKeyDigest = createHash("sha256").update("hra-attention-key-observation-v1\0")
       .update(input.attentionResendApiKey).digest("hex");
     const targetDigest = canonicalDigest(options.target);
     const directory = assertProtectedDirectory(options.evidenceDirectory);

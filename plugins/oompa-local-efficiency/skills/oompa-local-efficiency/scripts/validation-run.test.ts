@@ -70,6 +70,7 @@ function validationEnvironment(): NodeJS.ProcessEnv {
     OOMPA_LOCAL_EFFICIENCY_TELEMETRY: "off",
   };
   delete environment.OOMPA_LOCAL_EFFICIENCY_LEASE;
+  delete environment.HRA_LOCAL_EFFICIENCY_LEASE;
   return environment;
 }
 

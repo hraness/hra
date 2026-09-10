@@ -107,7 +107,7 @@ describe("public content contract", () => {
     expect(llms).toContain(publicContent.statusLine);
     expect(llms).toContain("Local CLI v0.8.0 is a release candidate");
     expect(llms).toContain("v0.7.1 remains the fully admitted public artifact");
-    expect(publicContent.links.admittedInstall).toBe("https://github.com/hraness/hra/blob/v0.7.1/docs/beta-release-notes.md#install");
+    expect(publicContent.links.admittedInstall).toBe("https://github.com/hraness/oompa/blob/v0.7.1/docs/beta-release-notes.md#install");
     const visibleSite = htmlVisibleText(renderSiteHtml());
     expect(visibleSite).toContain("The v0.8.0 candidate is not yet admitted.");
     expect(visibleSite).toContain("The admitted v0.7.1 CLI has its own");
@@ -129,7 +129,7 @@ describe("public content contract", () => {
       expect(surface).not.toContain("v0.8.0 artifacts admitted");
     }
     const historicalAdmission = renderMarkdownBlocks(publicContent.introduction, 2);
-    expect(historicalAdmission).toContain("https://github.com/hraness/hra/actions/runs/34367591503");
+    expect(historicalAdmission).toContain("https://github.com/hraness/oompa/actions/runs/34367591503");
     expect(historicalAdmission).toContain("https://github.com/hraness/oompa/releases/tag/v0.7.1");
     expect(historicalAdmission).toContain("attempt 2");
     expect(historicalAdmission).toContain("artifact admission does not authorize current-daemon startup or hosted command writers");
@@ -151,7 +151,7 @@ describe("public content contract", () => {
       const content = { ...publicContent, releaseVersion: version };
       const llms = renderLlmsText(content);
       expect(llms).toContain("This release candidate is not yet admitted.");
-      expect(llms).toContain("https://github.com/hraness/hra/blob/v0.7.1/docs/beta-release-notes.md#install");
+      expect(llms).toContain("https://github.com/hraness/oompa/blob/v0.7.1/docs/beta-release-notes.md#install");
       expect(llms.indexOf("This release candidate is not yet admitted."))
         .toBeLessThan(llms.indexOf(content.installCommand));
       expect(llms).not.toContain(`Install the admitted v${version} local CLI artifact`);
@@ -472,7 +472,7 @@ describe("public content contract", () => {
       expect(surface).toContain("/docs/status/");
     }
     expect(markdown).toContain("https://github.com/hraness/oompa/releases/tag/v0.7.1");
-    expect(markdown).toContain("https://github.com/hraness/hra/actions/runs/34367591503");
+    expect(markdown).toContain("https://github.com/hraness/oompa/actions/runs/34367591503");
     expect(markdown).toContain("Local v0.8.0 candidate; hosted sync live as an open beta");
     const reference = renderDocsMarkdown("/docs/reference/");
     expect(reference).toContain("Local release boundary");
@@ -1404,7 +1404,7 @@ describe("public content contract", () => {
     expect(oompaMailingListConfig({
       [OOMPA_MAILING_TURNSTILE_SITEKEY_ENV]: sitekey,
     })).toEqual({
-      audience: "oompa",
+      audience: "hra",
       kind: "signup",
       turnstileSitekey: sitekey,
     });
@@ -1417,7 +1417,7 @@ describe("public content contract", () => {
       [OOMPA_MAILING_TURNSTILE_SITEKEY_ENV]: sitekey,
     });
     expect(footer).toContain('data-mailing-list="signup"');
-    expect(footer).toContain('name="audience" type="hidden" value="oompa"');
+    expect(footer).toContain('name="audience" type="hidden" value="hra"');
     expect(footer).toContain('data-action="mailing_hra"');
     expect(footer).toContain(
       'action="https://account.hraness.com/api/mailing/subscribe"',

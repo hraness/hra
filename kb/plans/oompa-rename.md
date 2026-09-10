@@ -20,14 +20,14 @@ Exhaustive means every maintained old-name reference is either migrated or class
 
 The local source checkpoint is `6d20f5fcbfb345c5c9b201278604cc131c7abff9`, tree `fd6312fcc7ff531e04a4c8208c655ce4a86a48e9`. It includes the independently reviewed Claude uncertain-write repair and synthetic safety evidence. It is not a published or deployed Oompa artifact.
 
-The separate site header repair in [PR 172](https://github.com/hraness/hra/pull/172), candidate `644f511583236b4e6c1bb7d2eb96a764b6091755`, has independent source review. Its final package inventory gate failed. Neither that candidate nor its previous tests establishes installation or release admission. Its reviewed source can join the renamed integration candidate; every applicable final gate must then pass on the actual combined tree. Do not publish another intermediate old-name release merely to obtain this source.
+The separate site header repair in [PR 172](https://github.com/hraness/oompa/pull/172), candidate `644f511583236b4e6c1bb7d2eb96a764b6091755`, has independent source review. Its final package inventory gate failed. Neither that candidate nor its previous tests establishes installation or release admission. Its reviewed source can join the renamed integration candidate; every applicable final gate must then pass on the actual combined tree. Do not publish another intermediate old-name release merely to obtain this source.
 
 Old-name release, repository rename, domain promotion, and dependent polish delivery are held until their corresponding rename prerequisites are met. Existing admitted checks may finish under their original owner. Preserve the immutable v0.7.1 artifacts, current production, terminal alias receipts, all user data, and the hosted capacity and activation holds. This rename does not complete or activate the unfinished provider-usage phases.
 
 ## Constraints and decisions
 
 - Keep one integration owner for manifests, lockfiles, generated sources, inventory pins, release workflows, and final delivery. Do not rewrite unrelated work or published history.
-- Preserve the existing repository's numeric identity if an in-place rename can satisfy legacy recovery. The old tagged installer rejects redirects and requires its original repository path. Repository movement is blocked until a reviewed originating-release recovery path is proved; ordinary Git redirects are insufficient.
+- Preserve the existing repository's numeric identity through an in-place rename. The old tagged installers reject redirects and require the original repository path; their interrupted-install recovery is an accepted break because no external installation exists. See the decisions table below.
 - [GitHub's repository rename contract](https://docs.github.com/en/repositories/creating-and-managing-repositories/renaming-a-repository) preserves ordinary Git redirects but does not redirect reusable action calls. Inventory those consumers explicitly.
 - [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/) binds a package to configured repository and workflow identity. A new coordinate or repository path needs its own supported authority and non-publishing preflight. Preserve authentication, provenance, tag protections, and immutable old artifacts.
 - Keep one existing state and daemon-custody root. Do not create a parallel Oompa root beside an existing Oompa writer, copy databases, rename provider-owned homes, regenerate keys, or use a symlink as migration authority.
@@ -40,14 +40,24 @@ Old-name release, repository rename, domain promotion, and dependent polish deli
 - The existing Hraness scheduler remains authoritative during this change. Any renamed plugin entry points must share installed legacy leases and recovery journals until a tested migration retires them.
 - Keep public audit evidence free of private repository content, machine paths, credentials, and provider payloads. Private organization inventories stay outside this public repository.
 
-## Open decisions
+## Unified v0.8.0 workstream
 
-| Decision | Resolver | Required evidence |
-| --- | --- | --- |
-| Exact safe originating-release installer recovery across the repository rename | Integration owner and independent release reviewer | Old pending, ambiguous, completed and absent intent fixtures; pinned old bytes and authority; safe failure and rollback; no intent rewrite or speculative install replay |
-| Extent of visual replacement beyond the orange-circle identity | Product owner | The orange-circle mark is confirmed; the existing layout versus broader playful treatment is a separate preference |
-| New-domain app, authentication and redirect cutover | Site delivery owner | Actual domain/project ownership, TLS, CSP, origin-bound key/enrollment implications, hosted configuration and terminal recovery evidence |
-| Complete organization inventory and archived-history treatment | Integration owner | Fresh default-head identities for every organization repository; index omissions and excluded binary/private-data surfaces disclosed |
+This plan, the [provider usage plan](./provider-usage-management.md) and the [model routing plan](./model-routing-autonomy.md) converge on one delivery: the first Oompa release is v0.8.0, built from the usage-foundation candidate (former PR 140), the site header repair (former PR 172), and the repository rename below. The three earlier Codex tasks are retired; branch `claude/oompa-v0.8.0` is the single integration candidate. Unfinished usage phases (managed movement, hosted usage view, Claude native fallback) and routing phases 5, 6 and 8 keep their own status in their plans and are not completed by the rename.
+
+## Decisions resolved on 2026-09-10
+
+| Decision | Resolution |
+| --- | --- |
+| Repository path rename | Rename `hraness/hra` to `hraness/oompa` in place, keeping numeric repository `1343008607`. GitHub redirects Git, web, raw and release-asset URLs. The published v0.6.x and v0.7.x installers refuse redirects, so their interrupted-install recovery commands stop working after the rename. There are no external installations; the owner's machine holds a complete `hra 0.5.0` install that keeps running from its own authority root. Recorded as an accepted break in the release record; no recovery successor is built. |
+| Install authority root | Oompa installs into `~/.bun/install/oompa` and publishes only the `oompa` command. The old `~/.bun/install/hra` root and `hra` command are untouched until removed by the owner. Legacy unscoped `hra` 0.1.0 layout recognition stays in the runtime unchanged. |
+| State root | The control-plane state root stays `Library/Application Support/HRA Control Plane v1` on macOS and `.local/state/hra-control-plane-v1` on Linux. Existing sessions, profiles, provider homes and recovery journals continue in place; no parallel root is created. |
+| Frozen identifiers | Byte-exact: hash and encryption domains (`hra:*`, `hra-*-v1`, `hra.*` contract ids), persisted SQL names (`hra_*`), the v1 host-tool manifest (`hra.host-tools.v1`, namespace `hra`, MCP server key `hra`) and the v1 session preamble, opaque token prefixes (`hra1.`, `hrac1_`, `hrau1.`), the `.hra-install-complete.json` receipt name, the browser custody database `hra-device-custody`, the public marker paths `.well-known/hra.json` and `.well-known/hra-app.json`, and immutable release records. Source symbols around them are renamed. An Oompa-worded preamble and manifest need a versioned per-session admission and are deferred. |
+| Environment names | Forward `OOMPA_*` names everywhere. Legacy aliases accepted for operator and deployment inputs: `HRA_CONVEX_URL`, the Convex secrets (`HRA_AUTH_HMAC_SECRET`, `HRA_RESEND_API_KEY`, `HRA_ATTENTION_RESEND_API_KEY`, `HRA_AUTH_EMAIL_REPLY_TO`) and the scheduler lease and root variables. Contradictory pairs refuse before any effect. Site analytics and Turnstile keep their existing `NEXT_PUBLIC_*` names. |
+| Attention email | Body version 2 carries the Oompa subject, review line, sender and `app.oompa.app` links. Version 1 rows keep their HRA bytes and sender across retries; the delivery rebuild uses the stored version. |
+| Command name | Only `oompa` is published. No `hra` alias bin. |
+| Visual scope | The orange circle is the favicon and app icon and the social card title reads Oompa. The site header keeps the design-kit wordmark; a header mark is a later design decision. |
+| Vercel identities | Website project `hra` and app project `hra-app` keep their IDs; their production domains become `oompa.app` and `app.oompa.app` with the old hosts redirecting after readback. Project display names may be renamed to `oompa` and `oompa-app` at cutover. |
+| npm | GitHub Releases are canonical. `@hraness/oompa` does not exist on npm and trusted publishing cannot be configured before a first publication, so the npm mirror job is expected to stop at the trusted-publisher exchange until the owner completes a one-time bootstrap publication and trusted-publisher setup. |
 
 ## Phase map
 
@@ -107,7 +117,8 @@ Old-name release, repository rename, domain promotion, and dependent polish deli
 
 ## Phase 5: Organization consumer preparation
 
-- **Status:** Not started
+- **Status:** Inventory complete on 2026-09-10 across 52 organization repositories at their exact default heads (four archived repositories without clones were not inspected). Disposition: the managed `hra-local-efficiency` AGENTS.md block in 46 repositories migrates through `oompa-repo-adoption`; product identity changes are owned per repository in `.github` (profile product table), `jungle` (hraness.com product list, registries, generated catalog, reading taxonomy id, visitor and PostHog keys, two live article links), `suite-accounts` (OIDC registry display name, origin and callback), `accounts` (mailing audience label and description, Turnstile keyring hostnames, trusted origins, OTP brand), `kb` (registry and search-rule fixtures), `skillpack` (docs and plugin descriptions) and small prose sites in act60.me, site-footer, oh, slopcamera, sloptrade-web, sponge, peqnp, peopleblade and qmd. Editorial history in jungle plans and notes stays as written.
+- **Immutable product key:** the accounts suite persists the product id `hra` in identity links, mailing audiences, Turnstile keyring audiences and the OIDC client id `hraness:hra:production:v1`. That key is data, not branding: it stays `hra`, and the site keeps posting mailing audience `hra` with Turnstile action `mailing_hra`. Labels, descriptions, hostnames and callback origins move to Oompa and `oompa.app`, with `hra.sh` retained until the redirect is proved.
 - **Depends on:** Phase 1 and reviewed target contracts. Consumer publication requiring the new artifact depends on Phase 6, not the reverse.
 - **Objective:** Prepare every maintained organization consumer and deliver only backward-compatible prerequisites needed for the product cutover.
 - **Scope:** Product lists, package imports and lockfiles, repository links, install examples, shared footer registries, plugin marketplaces, skills, generated guidance, workflow references and public domain metadata.

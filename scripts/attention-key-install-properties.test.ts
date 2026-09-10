@@ -177,7 +177,7 @@ describe("attention key installation synthetic property contracts", () => {
       const fingerprint = attentionEnvironmentFingerprint(entries, target, key);
       const ordered = [...entries].sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
       // Independently serialize the documented, lexically ordered field set.
-      const expected = createHmac("sha256", key).update("oompa-attention-environment-fingerprint-v1\0", "utf8")
+      const expected = createHmac("sha256", key).update("hra-attention-environment-fingerprint-v1\0", "utf8")
         .update(JSON.stringify({ entries: ordered.map(({ name, value }) => ({ name, value })), target }), "utf8").digest("hex");
       expect(fingerprint).toBe(expected);
       expect(attentionEnvironmentFingerprint(permutation, target, key)).toBe(fingerprint);

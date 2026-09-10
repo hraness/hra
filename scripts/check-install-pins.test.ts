@@ -59,7 +59,7 @@ describe("installer pins", () => {
     const runtime = [
       `export const OOMPA_INSTALL_CLI_SHA256 = "${cliDigest}";`,
       `export const OOMPA_INSTALL_NORMALIZER_SHA256 = "${normalizerDigest}";`,
-      "export const OOMPA_INSTALL_ARCHIVE_URL = \"https://github.com/hraness/hra/releases/download/v0.6.1/hraness-hra-0.6.1.tgz\";",
+      "export const OOMPA_INSTALL_ARCHIVE_URL = \"https://github.com/hraness/oompa/releases/download/v0.6.1/hraness-oompa-0.6.1.tgz\";",
       "",
     ].join("\n");
     const runtimeDigest = digest(runtime);
@@ -68,7 +68,7 @@ describe("installer pins", () => {
       manifest: JSON.stringify({ name: "@hraness/oompa", version: "0.6.1" }),
       normalizer,
       preflight: [
-        "export const OOMPA_INSTALL_PREFLIGHT_SOURCE_URL = \"https://raw.githubusercontent.com/hraness/hra/v0.6.1/src/install-preflight-runtime.ts\";",
+        "export const OOMPA_INSTALL_PREFLIGHT_SOURCE_URL = \"https://raw.githubusercontent.com/hraness/oompa/v0.6.1/src/install-preflight-runtime.ts\";",
         `export const OOMPA_INSTALL_PREFLIGHT_SOURCE_SHA256 = "${runtimeDigest}";`,
         "",
       ].join("\n"),

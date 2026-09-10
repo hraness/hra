@@ -517,10 +517,10 @@ async function insertNotificationFixtures(world: Awaited<ReturnType<typeof revoc
       interactionKind: started.interactionKind,
       sessionPublicId: started.sessionPublicId,
     }]);
-    const bodyDigest = await sha256Hex(`oompa-attention-body:v1\u0000${body.text}`);
+    const bodyDigest = await sha256Hex(`hra-attention-body:v1\u0000${body.text}`);
     const recipientDigest = "9".repeat(64);
     const idempotencyKey = await sha256Hex([
-      "oompa-attention-resend:v1",
+      "hra-attention-resend:v1",
       deliveryId,
       recipientDigest,
       bodyDigest,

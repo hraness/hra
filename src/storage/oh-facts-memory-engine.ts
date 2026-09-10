@@ -1684,8 +1684,8 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
             ephemeral = createOhSqliteStoreAuthorityV1({
               path: ":memory:",
               profile: OH_CANONICAL_STORE_PROFILE_V1,
-              realmId: `oompa:working-only:${binding.bindingDigest}`,
-              spaceId: `oompa:working-only:${this.#spaceId(binding)}`,
+              realmId: `hra:working-only:${binding.bindingDigest}`,
+              spaceId: `hra:working-only:${this.#spaceId(binding)}`,
             });
             await this.#verifyEmptyWorkingOnlyEphemeral(ephemeral);
           } catch (error: unknown) {
@@ -2052,7 +2052,7 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
             actorId: hostActorId,
             changes: snapshot.records.map((record) => ({ kind: "put" as const, record, v: 1 as const })),
             expectedHead: { generation: 0, operationSha256: null },
-            operationId: `oompa.fork.${digestParts("hra-oh-fork-operation-v1", [operationKey])}`,
+            operationId: `hra.fork.${digestParts("hra-oh-fork-operation-v1", [operationKey])}`,
           });
         }
         const verification = await this.#verifyBounded(childAuthority, directory);

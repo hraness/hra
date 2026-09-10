@@ -101,7 +101,7 @@ if (import.meta.main) {
           `SKIP\tClaude Auto mode unavailable (${report.claudeAutoMode.reason}); ordinary permission mode unchanged`,
         );
       }
-      if (report.ok) console.log("PASS\tHRA local efficiency baseline");
+      if (report.ok) console.log("PASS\tOompa local efficiency baseline");
       else for (const failure of report.failures) console.error(`FAIL\t${failure}`);
     }
     if (!report.ok) process.exitCode = 1;

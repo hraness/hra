@@ -98,7 +98,7 @@ const inputSchema = z.object({
 
 const sha256 = (value: Uint8Array): string => createHash("sha256").update(value).digest("hex");
 const digestText = (domain: string, value: string): string => createHash("sha256")
-  .update(`oompa:managed-forward-${domain}:v1\0`, "utf8").update(value, "utf8").digest("hex");
+  .update(`hra:managed-forward-${domain}:v1\0`, "utf8").update(value, "utf8").digest("hex");
 
 /** Re-prove the in-memory representation; this does not attest filesystem custody. */
 const validPreparedAttachment = (attachment: PreparedAttachment): boolean => {

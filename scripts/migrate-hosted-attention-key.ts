@@ -248,7 +248,7 @@ const observe = async (options: ObservationOptions) => {
   const target = parseConvexTarget(options.target);
   const intendedKey = parseHostedAttentionKeyInput(options.inputDocument);
   const intendedKeyDigest = createHash("sha256")
-    .update("oompa-attention-key-observation-v1\0", "utf8")
+    .update("hra-attention-key-observation-v1\0", "utf8")
     .update(intendedKey, "utf8").digest("hex");
   const forbiddenValues = [intendedKey];
   const environment = () => Object.fromEntries(Object.entries(buildConvexChildEnvironment(

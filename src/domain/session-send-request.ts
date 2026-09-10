@@ -70,7 +70,7 @@ export type SessionSendRequest = z.infer<typeof sessionSendRequestSchema>;
 
 const digestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
 const digestText = (domain: string, value: string): string => createHash("sha256")
-  .update(`oompa:session-send-${domain}:v1\0`, "utf8").update(value, "utf8").digest("hex");
+  .update(`hra:session-send-${domain}:v1\0`, "utf8").update(value, "utf8").digest("hex");
 
 /** Original-request v1 identity, distinct from custody and queue reference digests. */
 export function sessionSendAttachmentReferencesDigest(value: unknown): string {

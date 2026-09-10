@@ -175,38 +175,73 @@ export function normalizeTrailingNewline(value: string): string {
   return `${value.replace(/\n*$/u, "")}\n`;
 }
 
+export type ManagedMarkerPair = Readonly<{
+  end: string;
+  start: string;
+}>;
+
+const legacyMarkerPrefix = /^(?<lead>[^A-Za-z]*)oompa-/u;
+
+export function legacyMarkerAlias(marker: string): string {
+  const alias = marker.replace(legacyMarkerPrefix, "$<lead>hra-");
+  if (alias === marker) throw new Error(`marker has no legacy alias: ${marker}`);
+  return alias;
+}
+
+export function legacyMarkerPair(startMarker: string, endMarker: string): ManagedMarkerPair {
+  return Object.freeze({
+    end: legacyMarkerAlias(endMarker),
+    start: legacyMarkerAlias(startMarker),
+  });
+}
+
+function locateManagedBlock(
+  existing: string,
+  startMarker: string,
+  endMarker: string,
+): { readonly end: number; readonly start: number } | null {
+  const start = existing.indexOf(startMarker);
+  const end = existing.indexOf(endMarker);
+  if (start < 0 && end < 0) return null;
+  if ((start < 0) !== (end < 0)) {
+    throw new Error(`managed block is incomplete: ${startMarker}`);
+  }
+  if (end < start) {
+    throw new Error(`managed block markers are reversed: ${startMarker}`);
+  }
+  if (
+    existing.indexOf(startMarker, start + startMarker.length) >= 0
+    || existing.indexOf(endMarker, end + endMarker.length) >= 0
+  ) {
+    throw new Error(`managed block markers are duplicated: ${startMarker}`);
+  }
+  return { end: end + endMarker.length, start };
+}
+
 export function replaceManagedBlock(
   current: string | null,
   block: string,
   startMarker: string,
   endMarker: string,
+  legacyMarkers: ManagedMarkerPair | null = null,
 ): string {
   const normalizedBlock = normalizeTrailingNewline(block);
   const existing = current ?? "";
-  const start = existing.indexOf(startMarker);
-  const end = existing.indexOf(endMarker);
-  if ((start < 0) !== (end < 0)) {
-    throw new Error(`managed block is incomplete: ${startMarker}`);
+  const legacyPresent = legacyMarkers !== null
+    && (existing.includes(legacyMarkers.start) || existing.includes(legacyMarkers.end));
+  const currentPresent = existing.includes(startMarker) || existing.includes(endMarker);
+  if (legacyPresent && currentPresent) {
+    throw new Error(`managed block markers mix legacy and current: ${startMarker}`);
   }
-  if (start >= 0 && end < start) {
-    throw new Error(`managed block markers are reversed: ${startMarker}`);
-  }
-  if (
-    start >= 0
-    && (
-      existing.indexOf(startMarker, start + startMarker.length) >= 0
-      || existing.indexOf(endMarker, end + endMarker.length) >= 0
-    )
-  ) {
-    throw new Error(`managed block markers are duplicated: ${startMarker}`);
-  }
-  if (start >= 0) {
-    const after = end + endMarker.length;
-    const suffix = existing.slice(after);
+  const located = legacyMarkers !== null && legacyPresent
+    ? locateManagedBlock(existing, legacyMarkers.start, legacyMarkers.end)
+    : locateManagedBlock(existing, startMarker, endMarker);
+  if (located !== null) {
+    const suffix = existing.slice(located.end);
     const replacement = suffix.startsWith("\n") || suffix.startsWith("\r\n")
       ? normalizedBlock.slice(0, -1)
       : normalizedBlock;
-    return `${existing.slice(0, start)}${replacement}${suffix}`;
+    return `${existing.slice(0, located.start)}${replacement}${suffix}`;
   }
   const separator = existing === "" || existing.endsWith("\n\n")
     ? ""

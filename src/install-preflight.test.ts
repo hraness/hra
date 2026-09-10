@@ -194,7 +194,7 @@ const readJsonRecord = async (path: string): Promise<Record<string, unknown>> =>
   return value as Record<string, unknown>;
 };
 
-type SyntheticInstallPackageName = "@hraness/oompa" | "oompa";
+type SyntheticInstallPackageName = "@hraness/oompa" | "hra";
 type SyntheticPreviousInstall = Readonly<{
   activePath: string;
   authorityRoot: string;
@@ -210,7 +210,7 @@ const fixturePackageComponents = (
   packageName: SyntheticInstallPackageName,
 ): readonly string[] => packageName === "@hraness/oompa"
   ? ["@hraness", "oompa"]
-  : ["oompa"];
+  : ["hra"];
 
 const measureSyntheticVersion = async (
   versionRoot: string,
@@ -237,7 +237,7 @@ const measureSyntheticVersion = async (
         await visit(path);
         continue;
       }
-      if (path === join(versionRoot, ".oompa-install-complete.json")) continue;
+      if (path === join(versionRoot, ".hra-install-complete.json")) continue;
       entryCount += 1;
       if (entry.isSymbolicLink()) {
         record([
@@ -351,7 +351,7 @@ const createSyntheticPreviousInstall = async (
   await chmod(cliPath, 0o755);
   await writeFile(join(sourceRoot, "install-normalizer.ts"), normalizerBytes, { mode: 0o600 });
   await chmod(join(sourceRoot, "install-normalizer.ts"), 0o600);
-  const receiptPath = join(versionRoot, ".oompa-install-complete.json");
+  const receiptPath = join(versionRoot, ".hra-install-complete.json");
   const tree = await measureSyntheticVersion(versionRoot);
   await writePrivateJson(receiptPath, {
     ...archiveIdentity,
@@ -446,8 +446,8 @@ const runInstaller = async (root: string, poisonStageEnvironment = false): Promi
     ...(poisonStageEnvironment
       ? [
         "  beforeStageWorkerSpawn: () => {",
-        `    process.env.BUN_OPTIONS = ${JSON.stringify("--preload=/private/tmp/oompa-missing-ambient-preload.ts")};`,
-        `    process.env.NODE_OPTIONS = ${JSON.stringify("--require=/private/tmp/oompa-missing-ambient-preload.js")};`,
+        `    process.env.BUN_OPTIONS = ${JSON.stringify("--preload=/private/tmp/hra-missing-ambient-preload.ts")};`,
+        `    process.env.NODE_OPTIONS = ${JSON.stringify("--require=/private/tmp/hra-missing-ambient-preload.js")};`,
         "  },",
       ]
       : []),
@@ -557,7 +557,7 @@ const runOfficialInstaller = async (
     "  if (input === module.OOMPA_INSTALL_REPOSITORY_API_URL) return jsonResponse(repository);",
     "  if (input === module.OOMPA_INSTALL_RELEASE_API_URL) return jsonResponse(release);",
     "  if (input === module.OOMPA_INSTALL_ARCHIVE_URL) {",
-    "    const location = scenario === \"disallowed-redirect\" ? \"https://evil.example/oompa.tgz\" : " + JSON.stringify(allowedAssetUrl) + ";",
+    "    const location = scenario === \"disallowed-redirect\" ? \"https://evil.example/hra.tgz\" : " + JSON.stringify(allowedAssetUrl) + ";",
     "    return new Response(null, { headers: { Location: location }, status: 302 });",
     "  }",
     "  if (input === " + JSON.stringify(allowedAssetUrl) + ") {",
@@ -904,7 +904,7 @@ describe("transactional Oompa installer", () => {
     expect(command).toContain("--retry 3");
     expect(command).toContain("--retry-max-time 60");
     expect(command).toContain(OOMPA_INSTALL_PREFLIGHT_SOURCE_SHA256);
-    expect(() => buildOompaGlobalInstallCommand("https://example.com/oompa.tgz")).toThrow(
+    expect(() => buildOompaGlobalInstallCommand("https://example.com/hra.tgz")).toThrow(
       "exact immutable release archive URL",
     );
     expect(command).not.toContain("| bun - ");
@@ -1208,7 +1208,7 @@ describe("transactional Oompa installer", () => {
       "oompa",
       "versions",
       versions[0] as string,
-      ".oompa-install-complete.json",
+      ".hra-install-complete.json",
     )).exists()).toBeTrue();
     expect(await readJsonRecord(join(
       bunRoot,
@@ -1283,7 +1283,7 @@ describe("transactional Oompa installer", () => {
   test("upgrades and recovers a verified legacy unscoped 0.1.0 installation", async () => {
     const root = await makeRoot("oompa-install-legacy-upgrade-");
     const legacy = await createSyntheticPreviousInstall(root, {
-      packageName: "oompa",
+      packageName: "hra",
       packageVersion: "0.1.0",
     });
     const legacyCliBefore = await readFile(legacy.cliPath);
@@ -1479,7 +1479,7 @@ describe("transactional Oompa installer", () => {
   test("rejects invalid previous package identities before staging", async () => {
     const unsupportedRoot = await makeRoot("oompa-install-legacy-version-refusal-");
     const unsupported = await createSyntheticPreviousInstall(unsupportedRoot, {
-      packageName: "oompa",
+      packageName: "hra",
       packageVersion: "0.1.1",
     });
     await expectPreviousInstallRejectedBeforeStaging(unsupported, "legacy Oompa version receipt is invalid");
@@ -1504,7 +1504,7 @@ describe("transactional Oompa installer", () => {
 
     const manifestRoot = await makeRoot("oompa-install-old-manifest-refusal-");
     const manifest = await createSyntheticPreviousInstall(manifestRoot, {
-      packageName: "oompa",
+      packageName: "hra",
       packageVersion: "0.1.0",
     });
     const manifestValue = await readJsonRecord(manifest.packageManifestPath);
@@ -1515,8 +1515,8 @@ describe("transactional Oompa installer", () => {
 
     const layoutRoot = await makeRoot("oompa-install-receipt-layout-refusal-");
     const layout = await createSyntheticPreviousInstall(layoutRoot, {
-      layoutPackageName: "oompa",
-      manifestPackageName: "oompa",
+      layoutPackageName: "hra",
+      manifestPackageName: "hra",
       packageName: "@hraness/oompa",
       packageVersion: "0.1.4",
     });
@@ -1524,7 +1524,7 @@ describe("transactional Oompa installer", () => {
 
     const mixedRoot = await makeRoot("oompa-install-mixed-layout-refusal-");
     const mixed = await createSyntheticPreviousInstall(mixedRoot, {
-      packageName: "oompa",
+      packageName: "hra",
       packageVersion: "0.1.0",
     });
     const alternatePackageRoot = join(
@@ -1542,7 +1542,7 @@ describe("transactional Oompa installer", () => {
 
     const integrityRoot = await makeRoot("oompa-install-legacy-integrity-refusal-");
     const integrity = await createSyntheticPreviousInstall(integrityRoot, {
-      packageName: "oompa",
+      packageName: "hra",
       packageVersion: "0.1.0",
     });
     const damagedCli = Buffer.from(await readFile(integrity.cliPath));
@@ -1553,7 +1553,7 @@ describe("transactional Oompa installer", () => {
 
     const symlinkRoot = await makeRoot("oompa-install-legacy-root-symlink-refusal-");
     const symlinked = await createSyntheticPreviousInstall(symlinkRoot, {
-      packageName: "oompa",
+      packageName: "hra",
       packageVersion: "0.1.0",
     });
     const heldVersionRoot = `${symlinked.versionRoot}-held`;
@@ -1626,7 +1626,7 @@ describe("transactional Oompa installer", () => {
           "install",
           "global",
           "node_modules",
-          "oompa",
+          "hra",
           "src",
           "cli.ts",
         ),
@@ -1635,7 +1635,7 @@ describe("transactional Oompa installer", () => {
     for (const testCase of cases) {
       const root = await makeRoot(`oompa-install-active-layout-${testCase.label.replaceAll(" ", "-")}-`);
       const fixture = await createSyntheticPreviousInstall(root, {
-        packageName: "oompa",
+        packageName: "hra",
         packageVersion: "0.1.0",
       });
       await replaceSyntheticActiveTarget(fixture, testCase.target(fixture));
@@ -1678,12 +1678,12 @@ describe("transactional Oompa installer", () => {
     const localReceipt = await readJsonRecord(join(
       versionsRoot,
       localVersion as string,
-      ".oompa-install-complete.json",
+      ".hra-install-complete.json",
     ));
     const officialReceipt = await readJsonRecord(join(
       versionsRoot,
       officialVersion as string,
-      ".oompa-install-complete.json",
+      ".hra-install-complete.json",
     ));
     expect(localReceipt.archiveSource).toBe("local");
     expect(localReceipt.archiveSha256).toBe(archiveSha256);
@@ -1753,7 +1753,7 @@ describe("transactional Oompa installer", () => {
   test("rejects a same-size local archive mutation after recording its identity", async () => {
     const root = await makeRoot("oompa-install-local-mutation-");
     await mkdir(join(root, "home"), { mode: 0o700 });
-    const localArchive = join(root, "mutable-oompa.tgz");
+    const localArchive = join(root, "mutable-hra.tgz");
     const original = await readFile(archivePath);
     await writeFile(localArchive, original, { mode: 0o600 });
     const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
@@ -2056,7 +2056,7 @@ describe("transactional Oompa installer", () => {
     const versionsRoot = join(bunRoot, "install", "oompa", "versions");
     const [versionName] = await readdir(versionsRoot);
     expect(versionName).toBeDefined();
-    const receiptPath = join(versionsRoot, versionName as string, ".oompa-install-complete.json");
+    const receiptPath = join(versionsRoot, versionName as string, ".hra-install-complete.json");
     const receipt = await readJsonRecord(receiptPath);
     receipt.archiveSha256 = "0".repeat(64);
     await writeFile(receiptPath, `${JSON.stringify(receipt)}\n`, { mode: 0o600 });

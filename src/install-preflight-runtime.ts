@@ -29,8 +29,8 @@ export const OOMPA_INSTALL_BUN_VERSION = "1.3.14";
 export const OOMPA_INSTALL_PACKAGE_NAME = "@hraness/oompa";
 const OOMPA_LEGACY_INSTALL_PACKAGE_NAME = "hra";
 export const OOMPA_INSTALL_PACKAGE_VERSION = "0.8.0";
-export const OOMPA_INSTALL_CLI_SHA256 = "5c80f082c02e2026ec2ca8e592211b4906e6994b7196f9292013d0effc92b1f7";
-export const OOMPA_INSTALL_NORMALIZER_SHA256 = "29347aa3f95a9beee629345aab9f799159981cd8375c7e04005134c24600a6d5";
+export const OOMPA_INSTALL_CLI_SHA256 = "5b609e5d8a17484f9c16cd4164a80befef05c5ceeb6fe07fdbb85d0a76dbb580";
+export const OOMPA_INSTALL_NORMALIZER_SHA256 = "12cd466439e7b8b13f33ffb63912015d293e62dbc1ccfd76548f2b8ada45e7af";
 export const OOMPA_INSTALL_ARCHIVE_URL = "https://github.com/hraness/oompa/releases/download/v0.8.0/hraness-oompa-0.8.0.tgz";
 export const OOMPA_INSTALL_ARCHIVE_NAME = "hraness-oompa-0.8.0.tgz";
 export const OOMPA_INSTALL_RELEASE_API_URL = "https://api.github.com/repos/hraness/oompa/releases/tags/v0.8.0";
@@ -1917,7 +1917,7 @@ const verifyCompleteVersion = async (
   if (await realpath(versionRoot) !== versionRoot) {
     throw new InstallPreflightError("The Oompa version root is not canonical.");
   }
-  const receipt = parseReceipt(await readSmallJson(join(versionRoot, ".oompa-install-complete.json"), uid));
+  const receipt = parseReceipt(await readSmallJson(join(versionRoot, ".hra-install-complete.json"), uid));
   if (versionName !== versionNameForIdentity(receipt)) {
     throw new InstallPreflightError("The complete Oompa version namespace does not match its archive identity.");
   }
@@ -1987,7 +1987,7 @@ const verifyCompleteVersion = async (
         await visit(path);
         continue;
       }
-      if (path === join(versionRoot, ".oompa-install-complete.json")) continue;
+      if (path === join(versionRoot, ".hra-install-complete.json")) continue;
       entryCount += 1;
       if (entryCount > installTreeEntryMaximum) {
         throw new InstallPreflightError("A complete Oompa version exceeds its entry-count bound.");
@@ -3055,7 +3055,7 @@ const recoverInterruptedInstall = async (input: Readonly<{
     versionComplete = true;
   } catch (error: unknown) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      const receiptExists = await Bun.file(join(intent.versionRoot, ".oompa-install-complete.json")).exists();
+      const receiptExists = await Bun.file(join(intent.versionRoot, ".hra-install-complete.json")).exists();
       if (receiptExists) throw error;
     }
   }
@@ -3070,7 +3070,7 @@ const recoverInterruptedInstall = async (input: Readonly<{
       } catch (error: unknown) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
-      if (await pathExists(join(intent.stagingRoot, ".oompa-install-complete.json"))) {
+      if (await pathExists(join(intent.stagingRoot, ".hra-install-complete.json"))) {
         await completeStagedVersion(intent, input.authorityRoot, input.intentPath, input.uid, input.hooks);
         versionComplete = true;
       }

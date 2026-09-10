@@ -12,15 +12,15 @@ export const OOMPA_CANONICAL_MEMORY_SYNC_BUNDLE_MAX_BYTES =
   OOMPA_CANONICAL_MEMORY_OPERATION_MAX_BYTES + 4 * 1024;
 
 export const CANONICAL_MEMORY_DESCRIPTOR_PURPOSE =
-  "oompa.canonical-memory.encrypted-descriptor.v1";
+  "hra.canonical-memory.encrypted-descriptor.v1";
 export const CANONICAL_MEMORY_SPACE_KEY_WRAP_PURPOSE =
-  "oompa.canonical-memory.space-key-wrap.v1";
+  "hra.canonical-memory.space-key-wrap.v1";
 export const CANONICAL_MEMORY_TERMINAL_HEAD_PROOF_PURPOSE =
-  "oompa.canonical-memory.terminal-head-proof.v1";
+  "hra.canonical-memory.terminal-head-proof.v1";
 export const CANONICAL_MEMORY_OPERATION_BUNDLE_PURPOSE =
-  "oompa.canonical-memory.operation-bundle.v1";
+  "hra.canonical-memory.operation-bundle.v1";
 export const CANONICAL_MEMORY_ADOPTION_PROOF_PURPOSE =
-  "oompa.canonical-memory.adoption-proof.v1";
+  "hra.canonical-memory.adoption-proof.v1";
 // hmacSha256Hex supplies the outer Oompa domain separator and accepts this
 // deliberately narrower purpose alphabet.
 export const CANONICAL_MEMORY_GENESIS_TOKEN_PURPOSE =

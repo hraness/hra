@@ -225,7 +225,7 @@ const canonicalJson = (value: unknown): string => {
 export const digestTranscriptRecords = (
   records: readonly TranscriptRecord[],
 ): string => createHash("sha256")
-  .update("oompa:session-transcript:v1\0", "utf8")
+  .update("hra:session-transcript:v1\0", "utf8")
   .update(canonicalJson(records), "utf8")
   .digest("hex");
 
@@ -609,7 +609,7 @@ export type TranscriptSeed = Readonly<{
 }>;
 
 export const digestTranscriptSeed = (text: string): string => createHash("sha256")
-  .update("oompa:session-transcript-seed:v1\0", "utf8")
+  .update("hra:session-transcript-seed:v1\0", "utf8")
   .update(text, "utf8")
   .digest("hex");
 
@@ -652,7 +652,7 @@ export const renderTranscriptSeedV1 = (input: Readonly<{
   const text = `${header}${lines.join("\n")}`;
   return {
     text,
-    digest: createHash("sha256").update("oompa:session-transcript-seed:v1\0", "utf8").update(text, "utf8").digest("hex"),
+    digest: createHash("sha256").update("hra:session-transcript-seed:v1\0", "utf8").update(text, "utf8").digest("hex"),
     omittedRecords,
     includedRecords: included,
   };

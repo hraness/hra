@@ -338,7 +338,7 @@ const verifyConvexTargetWithRequirement = async (
       response = await fetcher(url, {
         headers: {
           Authorization: `Bearer ${accessToken}`,
-          "Convex-Client": "oompa-hosted-operator-v1",
+          "Convex-Client": "hra-hosted-operator-v1",
         },
         method: "GET",
         redirect: "error",

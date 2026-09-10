@@ -69,7 +69,7 @@ function replaceFixtureProvenance(db: Database, id: string, format: EffectEviden
     "SELECT projection_json,opaque_reason FROM mutation_effect_evidence_provenance WHERE attempt_id=?",
   ).get(id);
   if (meta === null || value === null) throw new Error("Missing provenance fixture.");
-  const digest = hash({ domain: "oompa:effect-evidence-provenance:v1", scope: "mutation", ...meta, format, ...value });
+  const digest = hash({ domain: "hra:effect-evidence-provenance:v1", scope: "mutation", ...meta, format, ...value });
   db.query("UPDATE mutation_effect_evidence_provenance SET format=?,provenance_digest=? WHERE attempt_id=?").run(format, digest, id);
   db.query("UPDATE mutation_effect_evidence_provenance_anchors SET provenance_digest=? WHERE attempt_id=?").run(digest, id);
 }

@@ -170,7 +170,7 @@ const sitePublicFonts = [
 ];
 const sitePublicSupport = [
   "analytics.js", "appearance.js", "site.js", "favicon.svg", "social-card.svg", "social-card.png", "robots.txt", "sitemap.xml", "llms.txt",
-  ".well-known/security.txt", ".well-known/oompa.json",
+  ".well-known/security.txt", ".well-known/hra.json",
   "fonts/nebula-sans/LICENSE.txt", "fonts/nebula-sans/PROVENANCE.md",
   "fonts/geist-mono/OFL.txt", "fonts/geist-mono/PROVENANCE.md",
   ...siteMarkdownPaths,

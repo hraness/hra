@@ -23,7 +23,7 @@ Create one attempt unless the task explicitly justifies more:
 
 ```sh
 umask 077
-hra-cloud-route ... --online --json > /absolute/private/dispatch-ready-route.json
+oompa-cloud-route ... --online --json > /absolute/private/dispatch-ready-route.json
 oompa-cloud-exec --environment ENVIRONMENT_ID --attempts 1 --route-file /absolute/private/dispatch-ready-route.json --prompt-file /absolute/private/task-packet
 ```
 

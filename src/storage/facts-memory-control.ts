@@ -649,7 +649,7 @@ export class FactsMemoryControlStore {
         || binding.epoch !== latest.binding.epoch + 1
         || parent !== undefined
       ) throw new Error("FACTS_MEMORY_STORE_RETIRED");
-      const priorChain = digestParts("oompa-facts-memory-prior-purge-chain-v1", [
+      const priorChain = digestParts("hra-facts-memory-prior-purge-chain-v1", [
         latest.priorPurgeChainDigest ?? "first",
         latest.binding.bindingDigest,
         String(latest.binding.epoch),
@@ -954,7 +954,7 @@ export class FactsMemoryControlStore {
       || current.ownerTransferToId !== toBinding.ownerId
       || current.ownerTransferOperationKey !== operationKey
     ) throw new Error("FACTS_MEMORY_OWNER_TRANSFER_REPLAY_MISMATCH");
-    const priorChain = digestParts("oompa-facts-memory-owner-transfer-purge-chain-v1", [
+    const priorChain = digestParts("hra-facts-memory-owner-transfer-purge-chain-v1", [
       current.priorPurgeChainDigest ?? "first",
       current.binding.sessionId,
       String(current.binding.epoch),

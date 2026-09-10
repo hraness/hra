@@ -66,7 +66,7 @@ Run the route gate locally, then repeat it with `--online` immediately before di
 
 ```sh
 umask 077
-hra-cloud-route \
+oompa-cloud-route \
   --root /absolute/repository \
   --intent edit \
   --owner feature-owner \

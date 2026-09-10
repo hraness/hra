@@ -175,7 +175,7 @@ export function routingEvaluationCaseSetDigest(
   >[],
 ): string {
   return createHash("sha256")
-    .update("oompa-routing-evaluation-case-set-v1\0", "utf8")
+    .update("hra-routing-evaluation-case-set-v1\0", "utf8")
     .update(
       JSON.stringify(
         pairs.map(({ pairId, environmentBinding }) => ({

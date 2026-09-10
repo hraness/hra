@@ -403,7 +403,7 @@ describe("combined49 effect-evidence extension boundaries", () => {
           ...input, conversationAutomationCapability: null,
         }).success).toBe(false);
         expect(mutationEffectEvidence49Schema.safeParse({
-          ...input, conversationAutomationCapability: "oompa.automation_update.v2",
+          ...input, conversationAutomationCapability: "hra.automation_update.v2",
         }).success).toBe(false);
       }
       if (input.kind === "session.switch") {

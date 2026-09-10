@@ -32,7 +32,7 @@ import { ClaudeJsonLineDecoder } from "./jsonl.ts";
 
 export const CLAUDE_HOST_TOOL_BINDING_VERSION = 1 as const;
 export const CLAUDE_HOST_TOOL_CALLBACK_VERSION = 1 as const;
-export const CLAUDE_HOST_TOOL_MCP_SERVER_NAME = "oompa" as const;
+export const CLAUDE_HOST_TOOL_MCP_SERVER_NAME = "hra" as const;
 
 export const CLAUDE_HOST_TOOL_BRIDGE_ENTRYPOINT = fileURLToPath(
   new URL("./host-tool-bridge-main.ts", import.meta.url),
@@ -281,7 +281,7 @@ const publicResultText = (value: ClaudeHostToolPublicResult): string => {
 };
 
 const capabilityDigest = (value: string): Buffer => createHash("sha256")
-  .update("oompa:claude-host-tool-capability:v1\0", "utf8")
+  .update("hra:claude-host-tool-capability:v1\0", "utf8")
   .update(value, "utf8")
   .digest();
 
@@ -771,7 +771,7 @@ export class ClaudeHostToolBindingAuthority {
   }
 
   #completedCallKey(callId: string): string {
-    return createHash("sha256").update("oompa:claude-completed-call:v1\0", "utf8")
+    return createHash("sha256").update("hra:claude-completed-call:v1\0", "utf8")
       .update(callId, "utf8").digest("hex");
   }
 

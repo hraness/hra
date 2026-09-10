@@ -124,7 +124,7 @@ describe("hosted memory summary source", () => {
         { kind: "put", record: futureRecord, v: 1 },
       ],
       expectedHead: await canonical.store.head(),
-      operationId: "oompa.memory.test.summary-first",
+      operationId: "hra.memory.test.summary-first",
     });
     const firstHead = await canonical.store.head();
     await canonical.store.close();
@@ -224,7 +224,7 @@ describe("hosted memory summary source", () => {
         v: 1,
       }],
       expectedHead: await advanced.store.head(),
-      operationId: "oompa.memory.test.summary-unsettled",
+      operationId: "hra.memory.test.summary-unsettled",
     });
     await advanced.store.close();
     const drifted = await new OompaMemorySummarySource({

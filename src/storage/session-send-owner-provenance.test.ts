@@ -21,7 +21,7 @@ import { backfillSessionUserMessageFinalizations } from "./session-user-message-
 const databases: Database[] = [];
 afterEach(() => { for (const database of databases.splice(0)) database.close(); });
 const hash = (value: string): string => createHash("sha256").update(value).digest("hex");
-const ownerHash = (kind: string, value: unknown): string => hash(JSON.stringify({ domain: `oompa.session-send.${kind}.v1`, value }));
+const ownerHash = (kind: string, value: unknown): string => hash(JSON.stringify({ domain: `hra.session-send.${kind}.v1`, value }));
 const attemptId = `attempt_${"a".repeat(32)}`;
 const sessionId = `sess_${"b".repeat(32)}`;
 const profileId = `acct_${"c".repeat(32)}`;

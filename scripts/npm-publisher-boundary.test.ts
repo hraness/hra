@@ -173,12 +173,12 @@ describe("npm trusted-publisher boundary", () => {
     const dryRun = await runNpmPublisher({
       dryRun: true,
       source,
-      tarball: "/tmp/oompa.tgz",
+      tarball: "/tmp/hra.tgz",
     }, { spawn });
     const live = await runNpmPublisher({
       dryRun: false,
       source,
-      tarball: "/tmp/oompa.tgz",
+      tarball: "/tmp/hra.tgz",
     }, { spawn });
     expect(dryRun).toEqual({ exitCode: 0, failure: null, trustedExchangeProven: true });
     expect(live).toEqual({ exitCode: 0, failure: null, trustedExchangeProven: true });
@@ -186,7 +186,7 @@ describe("npm trusted-publisher boundary", () => {
     expect(invocations[0]?.argv).toContain("--dry-run");
     expect(invocations[1]?.argv).not.toContain("--dry-run");
     for (const invocation of invocations) {
-      for (const argument of ["npm", "publish", "/tmp/oompa.tgz", "--ignore-scripts", "--provenance"]) {
+      for (const argument of ["npm", "publish", "/tmp/hra.tgz", "--ignore-scripts", "--provenance"]) {
         expect(invocation.argv).toContain(argument);
       }
       expect(invocation.env.NPM_CONFIG_REGISTRY).toBe("https://registry.npmjs.org");
@@ -229,7 +229,7 @@ describe("npm trusted-publisher boundary", () => {
         HOME: process.env.HOME,
         PATH: process.env.PATH,
       },
-      tarball: "/tmp/oompa.tgz",
+      tarball: "/tmp/hra.tgz",
     }, { spawn });
     expect(result).toEqual({
       exitCode: 0,
@@ -264,7 +264,7 @@ describe("npm trusted-publisher boundary", () => {
       const result = await runNpmPublisher({
         dryRun: true,
         source: exactIdentity,
-        tarball: "/tmp/oompa.tgz",
+        tarball: "/tmp/hra.tgz",
       }, { spawn: fixedSpawn({ exitCode: 1, stderr: `${secret}\n${output}\n` }) });
       expect(result.failure, output).toBe(failure);
       expect(JSON.stringify(result)).not.toContain(secret);
@@ -272,7 +272,7 @@ describe("npm trusted-publisher boundary", () => {
     const withoutMarker = await runNpmPublisher({
       dryRun: true,
       source: exactIdentity,
-      tarball: "/tmp/oompa.tgz",
+      tarball: "/tmp/hra.tgz",
     }, { spawn: fixedSpawn({ stderr: secret }) });
     expect(withoutMarker).toEqual({
       exitCode: 0,
@@ -282,12 +282,12 @@ describe("npm trusted-publisher boundary", () => {
     const genericAfterExchange = await runNpmPublisher({
       dryRun: false,
       source: exactIdentity,
-      tarball: "/tmp/oompa.tgz",
+      tarball: "/tmp/hra.tgz",
     }, {
       spawn: fixedSpawn({
         exitCode: 1,
         stderr: [
-          "npm verbose argv publish /tmp/oompa.tgz --provenance",
+          "npm verbose argv publish /tmp/hra.tgz --provenance",
           "npm verbose oidc Successfully retrieved and set token",
           "private unknown failure",
         ].join("\n"),
@@ -308,7 +308,7 @@ describe("npm trusted-publisher boundary", () => {
     const result = await runNpmPublisher({
       dryRun: true,
       source: exactIdentity,
-      tarball: "/tmp/oompa.tgz",
+      tarball: "/tmp/hra.tgz",
     }, { spawn });
     expect(result.failure).toBe("output_limit_exceeded");
     expect(kills).toBeGreaterThan(0);
@@ -330,7 +330,7 @@ describe("npm trusted-publisher boundary", () => {
     const result = await runNpmPublisher({
       dryRun: true,
       source: exactIdentity,
-      tarball: "/tmp/oompa.tgz",
+      tarball: "/tmp/hra.tgz",
     }, { spawn, timeoutMilliseconds: 5 });
     expect(result.failure).toBe("publisher_timed_out");
     expect(kills).toBe(1);
@@ -341,7 +341,7 @@ describe("npm trusted-publisher boundary", () => {
     const result = await runNpmPublisher({
       dryRun: false,
       source: exactIdentity,
-      tarball: "/tmp/oompa.tgz",
+      tarball: "/tmp/hra.tgz",
     }, {
       spawn: (_argv, options) => {
         userConfig = options.env.NPM_CONFIG_USERCONFIG;
@@ -363,7 +363,7 @@ describe("npm trusted-publisher boundary", () => {
     const result = await runNpmPublisher({
       dryRun: true,
       source: exactIdentity,
-      tarball: "/tmp/oompa.tgz",
+      tarball: "/tmp/hra.tgz",
     }, {
       spawn: (argv, options) => {
         directory = dirname(options.env.NPM_CONFIG_USERCONFIG!);

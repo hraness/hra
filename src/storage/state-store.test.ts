@@ -1874,7 +1874,7 @@ const prepareDedicatedSessionSwitch = (
   const pendingQueue = options.pendingQueueMessage === undefined ? null : store.enqueue(session.id, options.pendingQueueMessage);
   const seedText = `Provider switch seed ${sequence}`;
   const seedDigest = createHash("sha256")
-    .update("oompa:session-transcript-seed:v1\0", "utf8")
+    .update("hra:session-transcript-seed:v1\0", "utf8")
     .update(seedText, "utf8")
     .digest("hex");
   const prepared = store.prepareSessionSwitch({
@@ -3805,7 +3805,7 @@ describe("StateStore", () => {
     const dispatching = advanceDedicatedSessionSwitch(store, prepared, "seed_dispatching");
     const seedAuthority = store.requireSessionProviderAuthority(prepared.session.id);
     const receiptInput = {
-      domain: "oompa:session-switch-seed-accepted:v1",
+      domain: "hra:session-switch-seed-accepted:v1",
       turnId: "seed-turn-701",
       turnStatus: "completed",
       runtimeProfile: prepared.targetRuntime,
@@ -3996,7 +3996,7 @@ describe("StateStore", () => {
         turnStatus: "completed",
         runtimeProfile: prepared.targetRuntime,
         receiptDigest: sessionSwitchDigest({
-          domain: "oompa:session-switch-seed-accepted:v1",
+          domain: "hra:session-switch-seed-accepted:v1",
           turnId: "seed-turn-763",
           turnStatus: "completed",
           runtimeProfile: prepared.targetRuntime,
@@ -4095,13 +4095,13 @@ describe("StateStore", () => {
         outcome: "rejected",
         failureCode: "SEED_REJECTED",
         receiptDigest: createHash("sha256")
-          .update("oompa:session-switch-seed-rejected:v1\0DIFFERENT_REJECTION")
+          .update("hra:session-switch-seed-rejected:v1\0DIFFERENT_REJECTION")
           .digest("hex"),
       },
     })).toThrow("SESSION_SWITCH_REQUEST_CONFLICT");
     expect(store.requireSessionSwitch(rejected.switch.attemptId).phase).toBe("seed_dispatching");
     const rejectedDigest = createHash("sha256")
-      .update("oompa:session-switch-seed-rejected:v1\0SEED_REJECTED")
+      .update("hra:session-switch-seed-rejected:v1\0SEED_REJECTED")
       .digest("hex");
     const settled = store.completeSessionSwitchSeed({
       ...rejected.cas,
@@ -4424,7 +4424,7 @@ describe("StateStore", () => {
         outcome: "rejected",
         failureCode,
         receiptDigest: createHash("sha256")
-          .update(`oompa:session-switch-seed-rejected:v1\0${failureCode}`)
+          .update(`hra:session-switch-seed-rejected:v1\0${failureCode}`)
           .digest("hex"),
       },
     });
@@ -4558,7 +4558,7 @@ describe("StateStore", () => {
             turnStatus: "completed",
             runtimeProfile: prepared.targetRuntime,
             receiptDigest: sessionSwitchDigest({
-              domain: "oompa:session-switch-seed-accepted:v1",
+              domain: "hra:session-switch-seed-accepted:v1",
               turnId: "terminal-seed-turn",
               turnStatus: "completed",
               runtimeProfile: prepared.targetRuntime,
@@ -4897,7 +4897,7 @@ describe("StateStore", () => {
       seedAuthority: prepared.cas.targetAuthority,
       seedAuthorityRevision: store.requireCapturedSessionProviderAuthority(prepared.session.id).authorityRevision,
       settlement: { outcome: "rejected", failureCode: "SEED_REJECTED",
-        receiptDigest: createHash("sha256").update("oompa:session-switch-seed-rejected:v1\0SEED_REJECTED").digest("hex") },
+        receiptDigest: createHash("sha256").update("hra:session-switch-seed-rejected:v1\0SEED_REJECTED").digest("hex") },
     });
     const firstTerminal = reject(first);
     const session = store.requireSession(first.session.id);
@@ -5029,7 +5029,7 @@ describe("StateStore", () => {
         outcome: "rejected",
         failureCode: "SEED_REJECTED",
         receiptDigest: createHash("sha256")
-          .update("oompa:session-switch-seed-rejected:v1\0SEED_REJECTED")
+          .update("hra:session-switch-seed-rejected:v1\0SEED_REJECTED")
           .digest("hex"),
       },
     });
@@ -13696,7 +13696,7 @@ describe("StateStore", () => {
     }
     const personalSourceSeedText = "personal Claude source seed";
     const personalSourceSeed = createHash("sha256")
-      .update("oompa:session-transcript-seed:v1\0", "utf8")
+      .update("hra:session-transcript-seed:v1\0", "utf8")
       .update(personalSourceSeedText, "utf8")
       .digest("hex");
     const sourceSwitch = store.prepareMutation({
@@ -15693,7 +15693,7 @@ describe("StateStore", () => {
         throw new Error("Expected a provider thread for switch alias testing.");
       }
       const seedDigest = createHash("sha256")
-        .update("oompa:session-transcript-seed:v1\0", "utf8")
+        .update("hra:session-transcript-seed:v1\0", "utf8")
         .update(seedName, "utf8")
         .digest("hex");
       const mutation = store.prepareMutation({
@@ -15923,7 +15923,7 @@ describe("StateStore", () => {
       const runtimeProfile = reviewedClaudeProfile({ id: target.id, processGeneration: targetAuthority.processGeneration });
       const key = "00000000-0000-4000-8000-0000000006e0";
       const seedText = "Continue the retained switch.";
-      const seedDigest = createHash("sha256").update("oompa:session-transcript-seed:v1\0")
+      const seedDigest = createHash("sha256").update("hra:session-transcript-seed:v1\0")
         .update(seedText).digest("hex");
       const attempt = store.prepareMutation({
         kind: "session.switch", authorityId: session.id,
@@ -16101,7 +16101,7 @@ describe("StateStore", () => {
 
     const seedText = "Continue this session after switching providers.";
     const seedDigest = createHash("sha256")
-      .update("oompa:session-transcript-seed:v1\0", "utf8")
+      .update("hra:session-transcript-seed:v1\0", "utf8")
       .update(seedText, "utf8")
       .digest("hex");
     const switchAttempt = store.prepareMutation({
@@ -16495,7 +16495,7 @@ describe("StateStore", () => {
       const runtimeProfile = reviewedClaudeProfile({ id: targetAccount.id,
         processGeneration: targetAuthority.processGeneration });
       const seedText = "Keep the captured target profile generation fenced.";
-      const seedDigest = createHash("sha256").update("oompa:session-transcript-seed:v1\0")
+      const seedDigest = createHash("sha256").update("hra:session-transcript-seed:v1\0")
         .update(seedText).digest("hex");
       const attempt = store.prepareMutation({
         authorityGeneration: targetAuthority.processGeneration,
@@ -16655,7 +16655,7 @@ describe("StateStore", () => {
     const claudeProfile = reviewedClaudeProfile({ id: claudeAccount.id, processGeneration: claudeAuthority.processGeneration });
     const seedText = "Continue the adopted session on Claude.";
     const seedDigest = createHash("sha256")
-      .update("oompa:session-transcript-seed:v1\0", "utf8")
+      .update("hra:session-transcript-seed:v1\0", "utf8")
       .update(seedText, "utf8")
       .digest("hex");
     const transcriptDigest = createHash("sha256")
@@ -17050,7 +17050,7 @@ describe("StateStore", () => {
         state: "idle",
       });
       const seedDigest = createHash("sha256")
-        .update("oompa:session-transcript-seed:v1\0", "utf8")
+        .update("hra:session-transcript-seed:v1\0", "utf8")
         .update(seedText, "utf8")
         .digest("hex");
       const attempt = store.prepareMutation({
@@ -30907,7 +30907,7 @@ describe("StateStore", () => {
   });
 
   test("opens and transactionally migrates a real v1 database without losing sessions", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-v1-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-v1-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const legacy = new Database(paths.database, { create: true, strict: true });

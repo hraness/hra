@@ -99,7 +99,7 @@ const harness = async () => {
     competingWritersQuiesced: { ci: true, cli: true, dashboard: true, delegated: true },
     evidenceDirectory: directory, evidenceDirectorySharedAndRetained: true,
     expiresAtMs: 800_000, issuedAtMs: 0,
-    intendedKeyDigest: createHash("sha256").update("oompa-attention-key-observation-v1\0").update(intendedKey).digest("hex"),
+    intendedKeyDigest: createHash("sha256").update("hra-attention-key-observation-v1\0").update(intendedKey).digest("hex"),
     kind: "hosted-attention-key-custody", operationId: "00000000-0000-4000-8000-000000000003",
     preparationDigest: preparation.evidence.selfDigest, schemaVersion: 1, sourceCommit,
     target, targetDigest: canonicalDigest(target),
@@ -152,7 +152,7 @@ describe("custody-scoped attention installation", () => {
     const entries = [{ name: "SECOND", value: "second-secret" }, { name: "FIRST", value: "first-secret" }];
     const fingerprint = attentionEnvironmentFingerprint(entries, target, intendedKey);
     const expected = createHmac("sha256", intendedKey)
-      .update("oompa-attention-environment-fingerprint-v1\0", "utf8")
+      .update("hra-attention-environment-fingerprint-v1\0", "utf8")
       .update(canonicalJson({ entries: entries.toReversed(), target }), "utf8").digest("hex");
     expect(fingerprint).toBe(expected);
     expect(attentionEnvironmentFingerprint(entries.toReversed(), target, intendedKey)).toBe(fingerprint);
@@ -282,7 +282,7 @@ describe("custody-scoped attention installation", () => {
     const intentPath = join(value.directory, attentionKeyInstallSlot(target));
     expect(readProtectedJson(intentPath, attentionKeyInstallIntentSchema).intendedKeyDigest).toBe(value.custody.intendedKeyDigest);
     const otherKey = "re_another_synthetic";
-    const otherKeyDigest = createHash("sha256").update("oompa-attention-key-observation-v1\0").update(otherKey).digest("hex");
+    const otherKeyDigest = createHash("sha256").update("hra-attention-key-observation-v1\0").update(otherKey).digest("hex");
     const originalPreparation = readProtectedJson(value.options.preparationEvidencePath, hostedAttentionKeyObservationSchema);
     const unsignedPreparation = Object.fromEntries(Object.entries(originalPreparation).filter(([name]) => name !== "selfDigest"));
     const otherPreparation = hostedAttentionKeyObservationSchema.parse(withSelfDigest({ ...unsignedPreparation, intendedKeyDigest: otherKeyDigest }));

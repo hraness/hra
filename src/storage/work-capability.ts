@@ -13,7 +13,7 @@ import { positiveRevisionSchema, sessionIdSchema } from "../domain/values";
 export const WORK_CAPABILITY_KEY_BYTES = 32;
 
 const capabilityPrefix = "hrac1_";
-const capabilityDomain = "oompa.work.capability";
+const capabilityDomain = "hra.work.capability";
 const capabilityVersion = 1;
 const capabilityDigestBytes = 32;
 const fenceSchema = positiveRevisionSchema.max(Number.MAX_SAFE_INTEGER);

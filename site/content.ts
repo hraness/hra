@@ -204,7 +204,7 @@ const {
 } = hostedSignupCopy(hostedSignup);
 
 const links = {
-  admittedInstall: "https://github.com/hraness/hra/blob/v0.7.1/docs/beta-release-notes.md#install",
+  admittedInstall: "https://github.com/hraness/oompa/blob/v0.7.1/docs/beta-release-notes.md#install",
   app: "https://app.oompa.app",
   contributing: "https://github.com/hraness/oompa/blob/main/CONTRIBUTING.md",
   documentation: "https://oompa.app/docs/",

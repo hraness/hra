@@ -1709,8 +1709,8 @@ describe("Oompa Oh memory coordinator integration", () => {
     const alien = createOhSqliteStoreAuthorityV1({
       path: join(value.paths.projectMemory, projectDigest, "oh.sqlite"),
       profile: OH_CANONICAL_STORE_PROFILE_V1,
-      realmId: "oompa:project-memory:space-alien",
-      spaceId: "oompa:project:space-alien",
+      realmId: "hra:project-memory:space-alien",
+      spaceId: "hra:project:space-alien",
     });
     await alien.store.close();
 

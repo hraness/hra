@@ -30,7 +30,7 @@ function provenance(tufCachePath = "/fixture/tuf") {
       },
       runDetails: {
         builder: { id: "https://github.com/actions/runner/github-hosted" },
-        metadata: { invocationId: "https://github.com/hraness/hra/actions/runs/123/attempts/2" },
+        metadata: { invocationId: "https://github.com/hraness/oompa/actions/runs/123/attempts/2" },
       },
     },
   };
@@ -267,7 +267,7 @@ test("real overflow kills and collects the Node helper before returning", async 
   const observation = { exited: false };
   const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[], options: { env?: Record<string, string | undefined> }) => {
     expect(argv).toEqual(["node", resolve(import.meta.dir, "verify-npm-provenance-crypto.mjs"), "slsa",
-      "v0.6.0", "a".repeat(40), "https://github.com/hraness/hra/actions/runs/123/attempts/2", cache]);
+      "v0.6.0", "a".repeat(40), "https://github.com/hraness/oompa/actions/runs/123/attempts/2", cache]);
     expect(options.env).toEqual(npmCryptoEnvironment());
     child = originalSpawn(["node", "-e", `
       const fs = require('node:fs');

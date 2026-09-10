@@ -121,7 +121,7 @@ export const digestClaudeHostToolInvocation = (
   callId: string,
   request: OompaHostToolRequest,
 ): string => createHash("sha256")
-  .update("oompa:claude-host-tool-call:v1\0", "utf8")
+  .update("hra:claude-host-tool-call:v1\0", "utf8")
   .update(canonicalJson({ callId, input: request.input, tool: request.tool }), "utf8")
   .digest("hex");
 
@@ -308,7 +308,7 @@ export class ClaudeHostToolMcpServer {
     params: unknown,
   ): Promise<ClaudeMcpDispatch> {
     const digest = createHash("sha256")
-      .update("oompa:claude-mcp-session-request:v1\0", "utf8")
+      .update("hra:claude-mcp-session-request:v1\0", "utf8")
       .update(canonicalJson({
         method,
         params: params ?? null,

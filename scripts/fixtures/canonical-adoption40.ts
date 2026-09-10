@@ -49,7 +49,7 @@ export const canonicalAdoption40Fixture = {
         "pluginCapability": true,
         "enabledApps": []
       },
-      "text": "[Oompa provider handoff]\nThis conversation ran on claude and now runs on codex.\nWhat follows is Oompa's own record of it, not the previous provider's transcript: secrets, absolute paths, raw tool arguments, and raw tool output were never stored and are not here.\nNo records were omitted.\nContinue the work from here. Ask before assuming anything the summary does not state.\n"
+      "text": "[HRA provider handoff]\nThis conversation ran on claude and now runs on codex.\nWhat follows is HRA's own record of it, not the previous provider's transcript: secrets, absolute paths, raw tool arguments, and raw tool output were never stored and are not here.\nNo records were omitted.\nContinue the work from here. Ask before assuming anything the summary does not state.\n"
     },
     "seedTurnId": "canonical40-seed-turn",
     "seedTurnStatus": "completed",

@@ -230,12 +230,12 @@ remain separate from this historical delivery.
 
 ### Delivery evidence
 
-[PR 113](https://github.com/hraness/hra/pull/113) merged on 2026-09-06 at
+[PR 113](https://github.com/hraness/oompa/pull/113) merged on 2026-09-06 at
 `6f056dcafd6435cd11ae504c75e9b1f869955ca7`. Its final source
 `066296513422f6c6bbecd0eff208283e051e04cb` passed 2,775 local tests,
 the full build/package/install gate, and independent adversarial review as
-recorded in the PR. Post-merge [CI 34040242595](https://github.com/hraness/hra/actions/runs/34040242595)
-passed macOS, Ubuntu, and Required; [CodeQL 34040242363](https://github.com/hraness/hra/actions/runs/34040242363)
+recorded in the PR. Post-merge [CI 34040242595](https://github.com/hraness/oompa/actions/runs/34040242595)
+passed macOS, Ubuntu, and Required; [CodeQL 34040242363](https://github.com/hraness/oompa/actions/runs/34040242363)
 also passed for that exact merge commit. These records were read back on
 2026-09-07. They close the original adoption source work, not a later tree's
 validation or release and deployment gates.
@@ -266,11 +266,11 @@ session commands, scheduler, approval authority, or autorespond path.
 
 ## Provider timestamp recovery repair
 
-Status: complete. [PR 122](https://github.com/hraness/hra/pull/122) merged on
+Status: complete. [PR 122](https://github.com/hraness/oompa/pull/122) merged on
 2026-09-06 at `576ccd76a6742cd62759ab6176a6a41844846daa` with successful
-macOS, Ubuntu, Required, and CodeQL checks. [Issue 121](https://github.com/hraness/hra/issues/121)
+macOS, Ubuntu, Required, and CodeQL checks. [Issue 121](https://github.com/hraness/oompa/issues/121)
 closed at 20:03:05 UTC that day. The later Sol/schema join landed through
-[PR 123](https://github.com/hraness/hra/pull/123) at
+[PR 123](https://github.com/hraness/oompa/pull/123) at
 `97cebc44ecd2d27b8c0b6399b0814b1993d94fc1`. These are historical source
 delivery records, not admission of the subsequent memory candidate.
 

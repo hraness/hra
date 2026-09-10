@@ -738,7 +738,7 @@ describe("memory summary payloads", () => {
     }],
     spaces: [{
       bindingDigest: digest("c"),
-      canonicalSpaceId: `oompa:project:space-${"d".repeat(32)}`,
+      canonicalSpaceId: `hra:project:space-${"d".repeat(32)}`,
       enrollment: "attached",
       head: { digest: digest("e"), operationSha256: digest("f"), sequence: 7 },
       lastExchangeAt: 1_699_999_999_500,

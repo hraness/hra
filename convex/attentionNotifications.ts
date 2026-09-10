@@ -695,7 +695,7 @@ function sortedRows(rows: readonly OutboxRow[]): OutboxRow[] {
 }
 
 async function bodyDigest(body: OompaAttentionEmailBody): Promise<string> {
-  return await sha256Hex(`oompa-attention-body:v1\u0000${body.text}`);
+  return await sha256Hex(`hra-attention-body:v1\u0000${body.text}`);
 }
 
 async function deliveryKey(
@@ -704,7 +704,7 @@ async function deliveryKey(
   digest: string,
 ): Promise<string> {
   return await sha256Hex(
-    `oompa-attention-resend:v1\u0000${deliveryId}\u0000${recipientDigest}\u0000${digest}`,
+    `hra-attention-resend:v1\u0000${deliveryId}\u0000${recipientDigest}\u0000${digest}`,
   );
 }
 

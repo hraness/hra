@@ -338,7 +338,7 @@ export const USAGE_LATEST_STALE_MS = 90_000;
  * stable across Codex pins; bump `ACCOUNT_USAGE_SCHEMA_ID` by hand only when
  * a new pin changes what the counter means, which starts a new usage epoch.
  */
-const ACCOUNT_USAGE_DIGEST_DOMAIN = "oompa:codex-account-usage:v2";
+const ACCOUNT_USAGE_DIGEST_DOMAIN = "hra:codex-account-usage:v2";
 export const ACCOUNT_USAGE_SCHEMA_ID = "lifetimeTokens:v1";
 export const ACCOUNT_USAGE_SCHEMA_DIGEST = createHash("sha256")
   .update(`${ACCOUNT_USAGE_DIGEST_DOMAIN}:${ACCOUNT_USAGE_SCHEMA_ID}`)

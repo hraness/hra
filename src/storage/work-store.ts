@@ -287,7 +287,7 @@ const workSignalProviderAuthorityRowSchema = z.object({
 type WorkSignalProviderAuthorityRow = z.infer<typeof workSignalProviderAuthorityRowSchema>;
 const signalProviderAuthorityDigest = (row: Omit<WorkSignalProviderAuthorityRow, "authority_digest">): string =>
   createHash("sha256").update(JSON.stringify({
-    domain: "oompa:work-signal-provider-authority:v1",
+    domain: "hra:work-signal-provider-authority:v1",
     signalId: row.signal_id,
     workId: row.work_id,
     targetSessionId: row.target_session_id,
@@ -1924,7 +1924,7 @@ function digestJson(value: unknown): string {
 function deriveNestedMutationKey(idempotencyKey: string): string {
   if (!isUuidV7(idempotencyKey)) throw new WorkStoreError("BAD_IDEMPOTENCY_KEY");
   const compact = idempotencyKey.replaceAll("-", "");
-  const entropy = digestText(`oompa-work-nested-mutation-v1\0${idempotencyKey}`);
+  const entropy = digestText(`hra-work-nested-mutation-v1\0${idempotencyKey}`);
   const variant = ((Number.parseInt(entropy[3] ?? "0", 16) & 0x3) | 0x8).toString(16);
   const nested = `${compact.slice(0, 12)}7${entropy.slice(0, 3)}${variant}${entropy.slice(4, 19)}`;
   const formatted = `${nested.slice(0, 8)}-${nested.slice(8, 12)}-${nested.slice(12, 16)}-${nested.slice(16, 20)}-${nested.slice(20)}`;

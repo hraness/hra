@@ -522,48 +522,10 @@ export const currentAliasReleaseReceiptSchema = z.object({
   ) context.addIssue({ code: "custom", message: "final_authority_digest_invalid" });
 });
 
-// Read compatibility is intentionally bound to the one terminal receipt emitted by
-// the short-lived receipt-less reconciliation implementation. Current writers keep
-// using currentAliasReleaseReceiptSchema and therefore cannot emit this diagnostic.
-const legacyReceiptlessIntentReceiptSchema = z.object({
-  changed: z.literal(true),
-  finalAuthority: normalizedAliasAuthoritySchema,
-  finalAuthorityDigest: z.literal(
-    "385da6f82d30dd40369d2f95b0c20565865c3c5b3c51c337cdedad0a4591d3fd",
-  ),
-  finalState: z.literal("source"),
-  idempotencyKey: z.literal("1a27c773-2ddd-4fa9-913f-e806826984e0"),
-  intentDigest: z.literal(
-    "0829823d77f1acb1f8e93210ec2117e9a764c0b82692402180db295e732e6f8c",
-  ),
-  kind: z.literal("current-project-canonical-alias-receipt"),
-  planDigest: z.literal(
-    "beac2e091f0ac8ad788ae201c03fb58af2b7524b1e3779fed434dce207260ed3",
-  ),
-  rollbackDiagnostic: z.object({
-    phase: z.literal("target_authority"),
-    reason: z.literal("receiptless_intent"),
-  }).strict(),
-  schemaVersion: z.literal(1),
-  selfDigest: z.literal(
-    "85c0e06922f0c1b9ebc4828feff616dc5ab596ea983cce5d707292f1582c0878",
-  ),
-  sourceRecoveryDigest: z.never().optional(),
-  targetDeploymentId: z.literal("dpl_CKw276hGrZsRJhFUwMyKCJ6tFApM"),
-  targetPhaseDigest: z.never().optional(),
-  targetSourceCommit: z.literal("ab6f3d66cce5d505769907f29f66eef83133b0f2"),
-}).strict().superRefine((value, context) => {
-  if (
-    canonicalDigest(value.finalAuthority) !== value.finalAuthorityDigest
-    || value.finalAuthority.marker.sourceCommit
-      !== value.finalAuthority.source.sourceCommit
-  ) context.addIssue({ code: "custom", message: "legacy_final_authority_invalid" });
-});
-
-const readableCurrentAliasReleaseReceiptSchema = z.union([
-  currentAliasReleaseReceiptSchema,
-  legacyReceiptlessIntentReceiptSchema,
-]);
+// The short-lived receipt-less reconciliation record from the hra.sh era is no
+// longer readable here: this operator binds the oompa.app alias, so any such
+// record fails closed as durable_state_invalid and stays untouched on disk.
+const readableCurrentAliasReleaseReceiptSchema = currentAliasReleaseReceiptSchema;
 
 export type CurrentAliasReadback = z.infer<typeof aliasReadbackSchema>;
 export type CurrentAliasMutationReadback = z.infer<typeof aliasMutationReadbackSchema>;
@@ -1384,7 +1346,7 @@ const inspectCurrentAliasReleaseDurableState = (
       if (currentReceipt.data.selfDigest !== expected.selfDigest) {
         throw new CurrentAliasReleaseError("durable_state_invalid");
       }
-    } else if (!legacyReceiptlessIntentReceiptSchema.safeParse(receipt).success) {
+    } else {
       throw new CurrentAliasReleaseError("durable_state_invalid");
     }
   }
@@ -2199,7 +2161,7 @@ implements CurrentProjectAliasReleaseProvider {
     try {
       this.#guard.assertMayProceed();
       const response = await this.#fetcher(
-        `https://${canonicalAlias}/.well-known/oompa.json?release=${randomUUID()}`,
+        `https://${canonicalAlias}/.well-known/hra.json?release=${randomUUID()}`,
         {
           cache: "no-store",
           headers: { accept: "application/json", "cache-control": "no-cache" },
@@ -2330,7 +2292,7 @@ implements CurrentProjectAliasReleaseProvider {
   async readMarker(): Promise<unknown> {
     try {
       const response = await this.#fetcher(
-        `https://${canonicalAlias}/.well-known/oompa.json?release=${randomUUID()}`,
+        `https://${canonicalAlias}/.well-known/hra.json?release=${randomUUID()}`,
         {
           cache: "no-store",
           headers: { accept: "application/json", "cache-control": "no-cache" },

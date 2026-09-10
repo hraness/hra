@@ -182,7 +182,7 @@ const cleanupAuthorizationSchema = cleanupAuthorizationBaseSchema.extend({
   const { bindingDigest, ...base } = value;
   if (canonicalDigest({
     ...base,
-    domain: "oompa.claude.live-acceptance.cleanup-authorization.v1",
+    domain: "hra.claude.live-acceptance.cleanup-authorization.v1",
   }) !== bindingDigest) {
     context.addIssue({ code: "custom", path: ["bindingDigest"], message: "digest_invalid" });
   }
@@ -297,7 +297,7 @@ export const claudeLiveAcceptanceRecoveryReceiptSchema = z.object({
       value.profileId === undefined
         ? undefined
         : canonicalDigest({
-            domain: "oompa.claude.cleanup-readback.v1",
+            domain: "hra.claude.cleanup-readback.v1",
             profileId: value.profileId,
             profileGeneration: value.profileGeneration ?? null,
             sessionId: value.sessionId ?? null,
@@ -1678,7 +1678,7 @@ const discardProtectedInteractionFile = async (
 const cleanupScopeDigest = (
   value: ClaudeLiveAcceptanceRecoveryReceipt,
 ): string => canonicalDigest({
-  domain: "oompa.claude.cleanup-readback.v1",
+  domain: "hra.claude.cleanup-readback.v1",
   profileId: value.profileId,
   profileGeneration: value.profileGeneration ?? null,
   sessionId: value.sessionId ?? null,
@@ -1714,7 +1714,7 @@ const createCleanupAuthorization = (
     ...base,
     bindingDigest: canonicalDigest({
       ...base,
-      domain: "oompa.claude.live-acceptance.cleanup-authorization.v1",
+      domain: "hra.claude.live-acceptance.cleanup-authorization.v1",
     }),
   });
 };

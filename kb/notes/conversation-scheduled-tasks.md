@@ -11,7 +11,7 @@ that creates a new conversation.
 
 The pinned Codex app-server protocol has no scheduled-task CRUD request. It
 does expose experimental dynamic tools on `thread/start`, so new Oompa-created
-sessions advertise one narrow `oompa.automation_update` tool. That tool operates
+sessions advertise one narrow `hra.automation_update` tool. That tool operates
 only on the session identified by the provider request's authoritative thread
 ID. The public CLI exposes the same storage contract under `oompa session task`.
 Existing provider threads created before this feature remain manageable through

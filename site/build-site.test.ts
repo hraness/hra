@@ -362,7 +362,7 @@ describe("static-site build", () => {
       "dist/site/sitemap.xml",
       "dist/site/llms.txt",
       "dist/site/.well-known/security.txt",
-      "dist/site/.well-known/oompa.json",
+      "dist/site/.well-known/hra.json",
       "dist/site/analytics.js",
       "dist/site/site.js",
       "dist/site/appearance.js",
@@ -479,7 +479,7 @@ describe("static-site build", () => {
     }
 
     expect(JSON.parse(
-      await readFile(join(root, "dist/site/.well-known/oompa.json"), "utf8"),
+      await readFile(join(root, "dist/site/.well-known/hra.json"), "utf8"),
     )).toEqual({
       generation: 1,
       product: "Oompa",
@@ -515,7 +515,7 @@ describe("static-site build", () => {
     const commit = "0123456789abcdef0123456789abcdef01234567";
     await buildSite({ check: false, releaseCommit: commit, repositoryRoot: root, sourceRoot });
     const identity = JSON.parse(
-      await readFile(join(root, "dist/site/.well-known/oompa.json"), "utf8"),
+      await readFile(join(root, "dist/site/.well-known/hra.json"), "utf8"),
     ) as { source?: { commit?: unknown } };
 
     expect(identity.source?.commit).toBe(commit);
@@ -593,7 +593,7 @@ describe("static-site build", () => {
     const root = await createFixtureRoot();
     await buildSite({ check: false, repositoryRoot: root, sourceRoot });
     const identity = JSON.parse(
-      await readFile(join(root, "dist/site/.well-known/oompa.json"), "utf8"),
+      await readFile(join(root, "dist/site/.well-known/hra.json"), "utf8"),
     ) as { version?: unknown };
     // The canonical-alias operator proves this literal after every cutover;
     // it is independent of the package version in package.json.

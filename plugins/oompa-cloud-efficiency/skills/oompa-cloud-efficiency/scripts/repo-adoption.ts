@@ -6,6 +6,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import {
   canonicalIfPresent,
   command,
+  legacyMarkerPair,
   readText,
   replaceManagedBlock,
   writeAtomic,
@@ -28,6 +29,9 @@ export type RepositoryAdoptionReport = {
 
 const startMarker = "<!-- oompa-cloud-efficiency:start -->";
 const endMarker = "<!-- oompa-cloud-efficiency:end -->";
+// Repositories adopted by the previous plugin identity carry the legacy pair;
+// exactly one well-formed legacy block is replaced in place.
+const legacyMarkers = legacyMarkerPair(startMarker, endMarker);
 
 export function parseRepositoryAdoptionArguments(
   arguments_: readonly string[],
@@ -108,6 +112,7 @@ export function runRepositoryAdoption(
     repositoryPolicy(),
     startMarker,
     endMarker,
+    legacyMarkers,
   );
   const needsUpdate = current !== expected;
   if (options.mode === "apply" && needsUpdate) {

@@ -243,7 +243,7 @@ const headToken = async (
   : await deriveCanonicalMemoryHeadToken({ authority: binding, head, spaceKey });
 
 const proofDigest = (value: unknown): string => canonicalSha256({
-  contract: "oompa.canonical-memory.encrypted-head-proof.v1",
+  contract: "hra.canonical-memory.encrypted-head-proof.v1",
   envelope: value,
 });
 

@@ -33,7 +33,7 @@ preserving sandbox, provider, repository, and release gates.
   The workspace audit reports each Hraness repository's managed guidance
   status; use `repo-adoption.ts --apply --root ABSOLUTE-REPO` for each reported
   `needs-update` repository.
-- **Measure local throughput:** run `hra-throughput-report` for the bounded,
+- **Measure local throughput:** run `oompa-throughput-report` for the bounded,
   privacy-safe scheduler history. Treat repeat command digests and silent tasks
   as review heuristics, never as proof of waste or abandonment.
 - **Run heavyweight local work:** resolve `oompa-host-run` to its installed
@@ -66,6 +66,17 @@ are unavailable. `bootstrap.ts` installs or refreshes those commands under the
 user's Bun bin directory. It verifies a minimal pinned Atet host-resource
 runtime in the user's local data directory; it never replaces a global Atet
 package or command.
+
+This plugin was previously named `hra-local-efficiency`. `bootstrap.ts --apply`
+migrates that installation in place: it replaces exactly one well-formed
+`hra-local-efficiency` managed block in each managed file with the current
+block, moves the Codex rule file and the two profile files to their current
+names while keeping their unmanaged content, retargets the `hra-*` command
+links, and installs `hra-*` compatibility links beside the `oompa-*` commands.
+`--check` reports every legacy remnant as drift, requires the compatibility
+links only on a machine that already has a legacy command name, and refuses a
+file that carries both legacy and current markers. `repo-adoption.ts` migrates
+a repository's legacy `AGENTS.md` and `CLAUDE.md` blocks the same way.
 
 ## Preserve the invariants
 

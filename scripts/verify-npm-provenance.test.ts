@@ -209,7 +209,7 @@ describe("npm provenance attestation-set and signer admission", () => {
   });
 
   test("binds the Fulcio certificate to the exact npm-release environment and public workflow run", () => {
-    const invocation = "https://github.com/hraness/hra/actions/runs/123/attempts/2";
+    const invocation = "https://github.com/hraness/oompa/actions/runs/123/attempts/2";
     const repositorySubject = [
       "repo:hraness",
       "307125679/oompa",
@@ -272,10 +272,10 @@ describe("npm provenance attestation-set and signer admission", () => {
     ]) expect(nextTagPolicy.certificateOIDs[oid]).not.toBe(policy.certificateOIDs[oid]);
     expect(nextTagPolicy.certificateIdentityURI).not.toBe(policy.certificateIdentityURI);
     expect(npmProvenanceSignerPolicy(tag, sha,
-      "https://github.com/hraness/hra/actions/runs/123/attempts/1").certificateOIDs["1.3.6.1.4.1.57264.1.21"])
+      "https://github.com/hraness/oompa/actions/runs/123/attempts/1").certificateOIDs["1.3.6.1.4.1.57264.1.21"])
       .not.toBe(der(invocation));
     expect(npmProvenanceSignerPolicy(tag, sha,
-      "https://github.com/hraness/hra/actions/runs/123/attempts/1").certificateIdentityURI)
+      "https://github.com/hraness/oompa/actions/runs/123/attempts/1").certificateIdentityURI)
       .toBe(policy.certificateIdentityURI);
     expect(() => npmProvenanceSignerPolicy(tag, sha,
       "https://github.com/hraness/other/actions/runs/123/attempts/2")).toThrow();

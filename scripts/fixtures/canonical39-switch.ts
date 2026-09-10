@@ -250,7 +250,7 @@ export const canonical39SwitchFixtures = {
         "digest": "6a34af8cf7cea728997bbec94123d813c3de51fc8a65e8ac1b8b2161d81123ae"
       },
       "seed": {
-        "text": "[Oompa provider handoff]\nThis conversation ran on codex and now runs on codex.\nWhat follows is Oompa's own record of it, not the previous provider's transcript: secrets, absolute paths, raw tool arguments, and raw tool output were never stored and are not here.\nNo records were omitted.\nContinue the work from here. Ask before assuming anything the summary does not state.\n",
+        "text": "[HRA provider handoff]\nThis conversation ran on codex and now runs on codex.\nWhat follows is HRA's own record of it, not the previous provider's transcript: secrets, absolute paths, raw tool arguments, and raw tool output were never stored and are not here.\nNo records were omitted.\nContinue the work from here. Ask before assuming anything the summary does not state.\n",
         "digest": "be7de0e0b337c62353e28b8969d82cbe91c21eb592cf4ba26076180ba43455fb",
         "omittedRecords": 0,
         "includedRecords": 0
@@ -583,7 +583,7 @@ export const canonical39SwitchFixtures = {
         "digest": "6a34af8cf7cea728997bbec94123d813c3de51fc8a65e8ac1b8b2161d81123ae"
       },
       "seed": {
-        "text": "[Oompa provider handoff]\nThis conversation ran on codex and now runs on codex.\nWhat follows is Oompa's own record of it, not the previous provider's transcript: secrets, absolute paths, raw tool arguments, and raw tool output were never stored and are not here.\nNo records were omitted.\nContinue the work from here. Ask before assuming anything the summary does not state.\n",
+        "text": "[HRA provider handoff]\nThis conversation ran on codex and now runs on codex.\nWhat follows is HRA's own record of it, not the previous provider's transcript: secrets, absolute paths, raw tool arguments, and raw tool output were never stored and are not here.\nNo records were omitted.\nContinue the work from here. Ask before assuming anything the summary does not state.\n",
         "digest": "be7de0e0b337c62353e28b8969d82cbe91c21eb592cf4ba26076180ba43455fb",
         "omittedRecords": 0,
         "includedRecords": 0
@@ -857,7 +857,7 @@ export const canonical39SwitchFixtures = {
             "pluginCapability": true,
             "enabledApps": []
           },
-          "text": "[Oompa provider handoff]\nThis conversation ran on claude and now runs on codex.\nWhat follows is Oompa's own record of it, not the previous provider's transcript: secrets, absolute paths, raw tool arguments, and raw tool output were never stored and are not here.\nNo records were omitted.\nContinue the work from here. Ask before assuming anything the summary does not state.\n"
+          "text": "[HRA provider handoff]\nThis conversation ran on claude and now runs on codex.\nWhat follows is HRA's own record of it, not the previous provider's transcript: secrets, absolute paths, raw tool arguments, and raw tool output were never stored and are not here.\nNo records were omitted.\nContinue the work from here. Ask before assuming anything the summary does not state.\n"
         },
         "seedTurnId": "codex-turn-1",
         "seedTurnStatus": "completed",
@@ -936,7 +936,7 @@ export const canonical39SwitchFixtures = {
         "digest": "6a34af8cf7cea728997bbec94123d813c3de51fc8a65e8ac1b8b2161d81123ae"
       },
       "seed": {
-        "text": "[Oompa provider handoff]\nThis conversation ran on claude and now runs on codex.\nWhat follows is Oompa's own record of it, not the previous provider's transcript: secrets, absolute paths, raw tool arguments, and raw tool output were never stored and are not here.\nNo records were omitted.\nContinue the work from here. Ask before assuming anything the summary does not state.\n",
+        "text": "[HRA provider handoff]\nThis conversation ran on claude and now runs on codex.\nWhat follows is HRA's own record of it, not the previous provider's transcript: secrets, absolute paths, raw tool arguments, and raw tool output were never stored and are not here.\nNo records were omitted.\nContinue the work from here. Ask before assuming anything the summary does not state.\n",
         "digest": "b65062dfcaace64f8837eb920ccbfba879167b281e7a185ea7a1048617e73401",
         "omittedRecords": 0,
         "includedRecords": 0
@@ -1210,7 +1210,7 @@ export const canonical39SwitchFixtures = {
             "pluginCapability": true,
             "enabledApps": []
           },
-          "text": "[Oompa provider handoff]\nThis conversation ran on claude and now runs on codex.\nWhat follows is Oompa's own record of it, not the previous provider's transcript: secrets, absolute paths, raw tool arguments, and raw tool output were never stored and are not here.\nNo records were omitted.\nContinue the work from here. Ask before assuming anything the summary does not state.\n"
+          "text": "[HRA provider handoff]\nThis conversation ran on claude and now runs on codex.\nWhat follows is HRA's own record of it, not the previous provider's transcript: secrets, absolute paths, raw tool arguments, and raw tool output were never stored and are not here.\nNo records were omitted.\nContinue the work from here. Ask before assuming anything the summary does not state.\n"
         },
         "seedTurnId": "codex-turn-1",
         "seedTurnStatus": "completed",
@@ -1289,7 +1289,7 @@ export const canonical39SwitchFixtures = {
         "digest": "6a34af8cf7cea728997bbec94123d813c3de51fc8a65e8ac1b8b2161d81123ae"
       },
       "seed": {
-        "text": "[Oompa provider handoff]\nThis conversation ran on claude and now runs on codex.\nWhat follows is Oompa's own record of it, not the previous provider's transcript: secrets, absolute paths, raw tool arguments, and raw tool output were never stored and are not here.\nNo records were omitted.\nContinue the work from here. Ask before assuming anything the summary does not state.\n",
+        "text": "[HRA provider handoff]\nThis conversation ran on claude and now runs on codex.\nWhat follows is HRA's own record of it, not the previous provider's transcript: secrets, absolute paths, raw tool arguments, and raw tool output were never stored and are not here.\nNo records were omitted.\nContinue the work from here. Ask before assuming anything the summary does not state.\n",
         "digest": "b65062dfcaace64f8837eb920ccbfba879167b281e7a185ea7a1048617e73401",
         "omittedRecords": 0,
         "includedRecords": 0

@@ -10,8 +10,8 @@ test("authority supervisor keeps control separate from target stdio", async () =
 
   expect(source).toContain("--control-socket");
   expect(source).toContain("--nonce");
-  expect(source).toContain("OOMPA_AUTHORITY_SUPERVISOR/1 READY");
-  expect(source).toContain("OOMPA_AUTHORITY_SUPERVISOR/1 CLEAN");
+  expect(source).toContain("HRA_AUTHORITY_SUPERVISOR/1 READY");
+  expect(source).toContain("HRA_AUTHORITY_SUPERVISOR/1 CLEAN");
   expect(source).toContain("init_host_pid");
   expect(source).toContain("init_start_time");
   expect(source).toContain("init_pid_namespace_inode");

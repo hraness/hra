@@ -14,9 +14,9 @@ Use Bun 1.3.14. Codex execution supports macOS and Linux; Claude Code execution 
 
 Use the exact tagged installer for the artifact you intend to install. It checks the release identity and source digests before installation. Do not replace its command with a moving package tag.
 
-> This release candidate is not yet admitted. The v0.8.0 install command is unavailable until its immutable GitHub artifact passes exact release admission. The optional npm mirror has separate admission. The last admitted release is v0.7.1; use its immutable installation notes for the existing artifact. [Admitted release installation notes](https://github.com/hraness/hra/blob/v0.7.1/docs/beta-release-notes.md#install).
+> This release candidate is not yet admitted. The v0.8.0 install command is unavailable until its immutable GitHub artifact passes exact release admission. The optional npm mirror has separate admission. The last admitted release is v0.7.1; use its immutable installation notes for the existing artifact. [Admitted release installation notes](https://github.com/hraness/oompa/blob/v0.7.1/docs/beta-release-notes.md#install).
 
-The v0.8.0 candidate is not yet admitted. For the admitted v0.7.1 artifact, use its [immutable README](https://github.com/hraness/hra/tree/v0.7.1#get-started).
+The v0.8.0 candidate is not yet admitted. For the admitted v0.7.1 artifact, use its [immutable README](https://github.com/hraness/oompa/tree/v0.7.1#get-started).
 
 Only after immutable GitHub release admission, install and verify the v0.8.0 candidate CLI artifact. This does not start the daemon:
 

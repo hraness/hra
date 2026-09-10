@@ -149,7 +149,7 @@ function assertV1Bytes(value: Fixture, model: string, daemon = value.daemon) {
     evidence, evidenceDigest, createdAt: value.now };
   expect(value.database.query("SELECT claim_json,claim_digest FROM session_send_execution_claims WHERE attempt_id=?")
     .get(value.prepared.owner.attemptId)).toEqual({ claim_json: JSON.stringify(claim),
-    claim_digest: createHash("sha256").update(JSON.stringify({ domain: "oompa.session-send.claim.v1", value: claim })).digest("hex") });
+    claim_digest: createHash("sha256").update(JSON.stringify({ domain: "hra.session-send.claim.v1", value: claim })).digest("hex") });
   expect(value.database.query("SELECT evidence_json,evidence_digest FROM mutation_effect_evidence WHERE attempt_id=?")
     .get(value.prepared.owner.attemptId)).toEqual({ evidence_json: evidenceJson, evidence_digest: evidenceDigest });
 }

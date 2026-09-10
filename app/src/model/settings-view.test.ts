@@ -391,7 +391,7 @@ describe("last reported Codex default", () => {
 
 describe("hosted memory supervision", () => {
   const digest = (scalar: string) => scalar.repeat(64);
-  const canonicalSpaceId = `oompa:project:space-${"d".repeat(32)}`;
+  const canonicalSpaceId = `hra:project:space-${"d".repeat(32)}`;
   const summary = (headScalar: string, observedAt = now) => ({
     coverage: { peerActions: "complete" as const, peerPolicies: "complete" as const, spaces: "complete" as const },
     observedAt,

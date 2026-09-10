@@ -113,30 +113,6 @@ const cliSourcePlan: CurrentProjectAliasReleasePlan = {
   },
 };
 
-const legacyReceiptlessIntentPlan: CurrentProjectAliasReleasePlan = {
-  alias: "oompa.app",
-  convex,
-  idempotencyKey: "1a27c773-2ddd-4fa9-913f-e806826984e0",
-  kind: "current-project-canonical-alias",
-  repository: { id: OOMPA_REPOSITORY_ID, name: OOMPA_REPOSITORY },
-  schemaVersion: 1,
-  vercel: {
-    projectId: OOMPA_VERCEL_PROJECT_ID,
-    source: {
-      deploymentId: "dpl_E8smsZp1C2K594UxHfR4RtJFrnZ6",
-      deploymentUrl: "oompa-bdopeqch0-hraness.vercel.app",
-      sourceCommit: "86648e8ca3623e66c7c2386581386688b30bb061",
-    },
-    target: {
-      deploymentId: "dpl_CKw276hGrZsRJhFUwMyKCJ6tFApM",
-      deploymentUrl: "oompa-i022lu6xk-hraness.vercel.app",
-      sourceCommit: "ab6f3d66cce5d505769907f29f66eef83133b0f2",
-    },
-    teamId: OOMPA_VERCEL_TEAM_ID,
-  },
-  version: OOMPA_RELEASE_VERSION,
-};
-
 const withStateDirectory = async <Value>(
   operation: (directory: string) => Promise<Value>,
 ): Promise<Value> => {
@@ -464,85 +440,6 @@ class FakeProvider implements CurrentProjectAliasReleaseProvider {
   }
 }
 
-class LegacyReceiptlessIntentProvider implements CurrentProjectAliasReleaseProvider {
-  readonly operations: string[] = [];
-
-  async verifyVercelVersion(): Promise<void> {
-    this.operations.push("verify-vercel");
-  }
-
-  async verifyTargetActivityEvidence(): Promise<void> {
-    this.operations.push("verify-target-activity");
-  }
-
-  async verifyConvexTarget(targetValue: ConvexTarget): Promise<void> {
-    this.operations.push(`verify-convex:${String(targetValue.deploymentId)}`);
-    expect(targetValue).toEqual(legacyReceiptlessIntentPlan.convex);
-  }
-
-  async readProject(): Promise<CurrentProjectReadback> {
-    this.operations.push("read-project");
-    return projectReadback;
-  }
-
-  async readDeployment(deploymentId: string): Promise<CurrentDeploymentReadback> {
-    this.operations.push(`read-deployment:${deploymentId}`);
-    const endpoint = deploymentId === legacyReceiptlessIntentPlan.vercel.source.deploymentId
-      ? legacyReceiptlessIntentPlan.vercel.source
-      : deploymentId === legacyReceiptlessIntentPlan.vercel.target.deploymentId
-        ? legacyReceiptlessIntentPlan.vercel.target
-        : undefined;
-    if (endpoint === undefined) throw new Error("unexpected deployment read");
-    return deploymentFor(endpoint);
-  }
-
-  async readAlias(): Promise<CurrentAliasReadback> {
-    this.operations.push("read-alias:source");
-    return aliasFor(legacyReceiptlessIntentPlan.vercel.source);
-  }
-
-  async readMarker(): Promise<unknown> {
-    this.operations.push("read-marker:source");
-    return markerFor(legacyReceiptlessIntentPlan.vercel.source);
-  }
-
-  async setAlias(): Promise<never> {
-    this.operations.push("set-alias:unexpected");
-    throw new Error("unexpected alias mutation");
-  }
-}
-
-const writeLegacyReceiptlessIntentState = async (stateDirectory: string): Promise<void> => {
-  const paths = currentAliasReleaseStatePaths(legacyReceiptlessIntentPlan, stateDirectory);
-  const intent = currentAliasReleaseIntentFor(legacyReceiptlessIntentPlan);
-  expect(intent.planDigest)
-    .toBe("beac2e091f0ac8ad788ae201c03fb58af2b7524b1e3779fed434dce207260ed3");
-  expect(intent.selfDigest)
-    .toBe("0829823d77f1acb1f8e93210ec2117e9a764c0b82692402180db295e732e6f8c");
-  const receipt = withSelfDigest({
-    changed: true,
-    finalAuthority: intent.sourceAuthority,
-    finalAuthorityDigest: intent.sourceAuthorityDigest,
-    finalState: "source" as const,
-    idempotencyKey: intent.idempotencyKey,
-    intentDigest: intent.selfDigest,
-    kind: "current-project-canonical-alias-receipt" as const,
-    planDigest: intent.planDigest,
-    rollbackDiagnostic: {
-      phase: "target_authority" as const,
-      reason: "receiptless_intent" as const,
-    },
-    schemaVersion: 1 as const,
-    targetDeploymentId: legacyReceiptlessIntentPlan.vercel.target.deploymentId,
-    targetSourceCommit: legacyReceiptlessIntentPlan.vercel.target.sourceCommit,
-  });
-  expect(receipt.selfDigest)
-    .toBe("85c0e06922f0c1b9ebc4828feff616dc5ab596ea983cce5d707292f1582c0878");
-  expect(currentAliasReleaseReceiptSchema.safeParse(receipt).success).toBeFalse();
-  await writeFile(paths.intent, `${JSON.stringify(intent)}\n`, { flag: "wx", mode: 0o600 });
-  await writeFile(paths.receipt, `${JSON.stringify(receipt)}\n`, { flag: "wx", mode: 0o600 });
-};
-
 type DirectTransportMode =
   | "ok"
   | "mutation-malformed"
@@ -572,7 +469,7 @@ class FakeDirectVercelTransport {
       JSON.stringify(value),
       { headers: { "content-type": "application/json" }, status },
     );
-    if (url.startsWith("https://oompa.app/.well-known/oompa.json?release=")) {
+    if (url.startsWith("https://oompa.app/.well-known/hra.json?release=")) {
       const headers = new Headers(init.headers);
       expect(headers.has("authorization")).toBeFalse();
       expect(init.method).toBe("GET");
@@ -906,7 +803,7 @@ describe("private descriptor fixture protocol", () => {
 describe("current-project alias plan", () => {
   test("parses the checked exact editorial-image release plan", async () => {
     const document = await readFile(
-      join(import.meta.dir, "..", "docs", "oompa-sh-80c20f7-plan.json"),
+      join(import.meta.dir, "..", "docs", "oompa-app-80c20f7-plan.json"),
       "utf8",
     );
     const parsed = parseCurrentProjectAliasReleasePlan(document);
@@ -1872,7 +1769,7 @@ describe("current-project Vercel provider", () => {
         `/v13/deployments/${source.deploymentId}`,
         `/v13/deployments/${target.deploymentId}`,
         "/v4/aliases/oompa.app",
-        "/.well-known/oompa.json",
+        "/.well-known/hra.json",
         "/v4/aliases/oompa.app",
       ]);
 
@@ -2960,110 +2857,6 @@ describe("durable current-project alias execution", () => {
       });
       expect(provider.operations.filter((operation) => operation.startsWith("set-alias:")))
         .toEqual(writesBeforeReplay);
-    });
-  });
-
-  test("reads only the exact terminal receipt-less recovery record without reviving its writer", async () => {
-    await withStateDirectory(async (stateDirectory) => {
-      await writeLegacyReceiptlessIntentState(stateDirectory);
-      const paths = currentAliasReleaseStatePaths(legacyReceiptlessIntentPlan, stateDirectory);
-      const intentBefore = await readFile(paths.intent);
-      const receiptBefore = await readFile(paths.receipt);
-
-      const preflightProvider = new LegacyReceiptlessIntentProvider();
-      const preflight = await runPreflightCli(
-        legacyReceiptlessIntentPlan,
-        preflightProvider,
-        stateDirectory,
-      );
-      expect(preflight.exitCode).toBe(1);
-      expect(preflight.stdout).toEqual([]);
-      expect(JSON.parse(preflight.stderr.join(""))).toMatchObject({
-        code: "alias_reverted",
-        status: "reverted",
-      });
-      expect(preflightProvider.operations.some((operation) =>
-        operation.startsWith("set-alias:"))).toBeFalse();
-
-      const recoveryProvider = new LegacyReceiptlessIntentProvider();
-      const recovery = await runRecoverSourceCli(
-        legacyReceiptlessIntentPlan,
-        recoveryProvider,
-        stateDirectory,
-      );
-      expect(recovery.exitCode).toBe(1);
-      expect(recovery.stdout).toEqual([]);
-      expect(JSON.parse(recovery.stderr.join(""))).toMatchObject({
-        code: "alias_reverted",
-        status: "reverted",
-      });
-      expect(recoveryProvider.operations.some((operation) =>
-        operation.startsWith("set-alias:"))).toBeFalse();
-      expect(await readFile(paths.intent)).toEqual(intentBefore);
-      expect(await readFile(paths.receipt)).toEqual(receiptBefore);
-
-      const freshProvider = new FakeProvider();
-      const fresh = await runPreflightCli(plan, freshProvider, stateDirectory);
-      expect(fresh.exitCode).toBe(0);
-      expect(fresh.stderr).toEqual([]);
-      expect(JSON.parse(fresh.stdout.join(""))).toMatchObject({
-        observedState: "source",
-        status: "ready",
-      });
-      expect(freshProvider.operations.some((operation) =>
-        operation.startsWith("set-alias:"))).toBeFalse();
-    });
-  });
-
-  test("rejects a self-digested near miss of the legacy receipt before provider reads", async () => {
-    await withStateDirectory(async (stateDirectory) => {
-      await writeLegacyReceiptlessIntentState(stateDirectory);
-      const paths = currentAliasReleaseStatePaths(legacyReceiptlessIntentPlan, stateDirectory);
-      const parsed = JSON.parse(await readFile(paths.receipt, "utf8")) as Readonly<
-        Record<string, unknown>
-      >;
-      const { selfDigest: originalSelfDigest, ...unsigned } = parsed;
-      const tampered = withSelfDigest({
-        ...unsigned,
-        targetDeploymentId: "dpl_TamperedLegacyReceipt1234567890",
-      });
-      expect(tampered.selfDigest).not.toBe(originalSelfDigest);
-      await writeFile(paths.receipt, `${JSON.stringify(tampered)}\n`, { mode: 0o600 });
-
-      const preflightProvider = new LegacyReceiptlessIntentProvider();
-      const preflight = await runPreflightCli(
-        legacyReceiptlessIntentPlan,
-        preflightProvider,
-        stateDirectory,
-      );
-      expect(preflight.exitCode).toBe(75);
-      expect(JSON.parse(preflight.stderr.join(""))).toMatchObject({
-        code: "durable_state_invalid",
-        status: "recovery_required",
-      });
-      expect(preflightProvider.operations).toEqual([]);
-
-      const recoveryProvider = new LegacyReceiptlessIntentProvider();
-      const recovery = await runRecoverSourceCli(
-        legacyReceiptlessIntentPlan,
-        recoveryProvider,
-        stateDirectory,
-      );
-      expect(recovery.exitCode).toBe(75);
-      expect(JSON.parse(recovery.stderr.join(""))).toMatchObject({
-        code: "durable_state_invalid",
-        status: "recovery_required",
-      });
-      expect(recoveryProvider.operations).toEqual([]);
-
-      const freshProvider = new FakeProvider();
-      const fresh = await runPreflightCli(plan, freshProvider, stateDirectory);
-      expect(fresh.exitCode).toBe(75);
-      expect(JSON.parse(fresh.stderr.join(""))).toMatchObject({
-        code: "durable_state_invalid",
-        status: "recovery_required",
-      });
-      expect(freshProvider.operations).toEqual([]);
     });
   });
 

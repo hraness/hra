@@ -36,7 +36,7 @@ const newRepositoryId = 1_343_008_607;
 const teamId = "team_UAd1iD2XogJlbFg4h14mRaPM";
 const canonicalAlias = "oompa.app";
 const fallbackAlias = "oompa-weld.vercel.app";
-const newStagingAlias = "oompa.vercel.app";
+const newStagingAlias = "hra.vercel.app";
 
 const oldEndpoint: CutoverEndpoint = {
   deploymentId: "dpl_ArchiveAccepted1234567890",
@@ -2366,7 +2366,7 @@ describe("domain cutover operator", () => {
     ]);
     expect(requests.every((request) => request.environment.VERCEL_TOKEN === undefined)).toBe(true);
     expect(markerRequests.some((request) => request.startsWith(
-      `https://${fallbackAlias}/.well-known/oompa.json?cutover=`,
+      `https://${fallbackAlias}/.well-known/hra.json?cutover=`,
     ))).toBe(true);
     expect(buildVercelEnvironment({ HOME: "/safe/home", VERCEL_TOKEN: "no" }))
       .toEqual({ HOME: "/safe/home", NO_COLOR: "1", TERM: "dumb" });
@@ -2395,7 +2395,7 @@ describe("domain cutover operator", () => {
         return {
           exitCode: 0,
           stderr: "",
-          stdout: JSON.stringify(domainPage(["not-oompa.example"], 42)),
+          stdout: JSON.stringify(domainPage(["not-hra.example"], 42)),
         };
       },
       vercelCli: "/safe/vercel",
