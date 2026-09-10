@@ -20,7 +20,7 @@ jobs:
     # Source shards and the ordered remainder cover the complete gate while
     # retaining every test's own deadline. The measured serial source suites
     # need a larger finite job budget than the ordered remainder.
-    timeout-minutes: ${{ matrix.gate == 'remainder' && 20 || 40 }}
+    timeout-minutes: ${{ matrix.gate == 'remainder' && 20 || 75 }}
     strategy:
       fail-fast: false
       matrix:

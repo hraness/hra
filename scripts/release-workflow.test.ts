@@ -1212,7 +1212,7 @@ describe("release workflow", () => {
     expect(Object.keys(jobs).sort()).toEqual(["browser", "check", "required"]);
     expect(check.name).toBe("Check (${{ matrix.os }}, ${{ matrix.gate }})");
     expect(check["runs-on"]).toBe("${{ matrix.os }}");
-    expect(check["timeout-minutes"]).toBe("${{ matrix.gate == 'remainder' && 20 || 40 }}");
+    expect(check["timeout-minutes"]).toBe("${{ matrix.gate == 'remainder' && 20 || 75 }}");
     expect(check.if).toBeUndefined();
     expect(check["continue-on-error"]).toBeUndefined();
     expect(check.strategy).toEqual({
