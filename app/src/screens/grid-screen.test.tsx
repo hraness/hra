@@ -28,7 +28,6 @@ await mock.module("../data/device-commands", () => ({
   useSubmitDeviceCommand: () => refuseCommand,
 }));
 await mock.module("../components/session-card", () => ({ SessionCard: () => null }));
-await mock.module("../components/usage-meter", () => ({ UsageMeter: () => null }));
 
 const { GridScreen } = await import("./grid-screen");
 

@@ -1,6 +1,7 @@
 import { installDirectBrowser } from "@hraness/direct/web";
 import { StrictMode, useEffect } from "react";
 import { createRoot } from "react-dom/client";
+import { AppearanceHeader } from "../../src/components/appearance";
 import { ErrorBoundary } from "../../src/components/error-boundary";
 import { GridScreen } from "../../src/screens/grid-screen";
 import { SessionCard } from "../../src/components/session-card";
@@ -84,11 +85,17 @@ const noOrdering = {
   onReset: () => undefined,
 } as const;
 
-/** One conversation card on its own, as the site's conversation scenes show it. */
+/**
+ * One conversation card on its own, as the site's conversation scenes show it,
+ * under the same appearance header every screen carries.
+ */
 function SingleCard({ sessionPublicId }: Readonly<{ sessionPublicId: string }>) {
   const head = useSessionHead(sessionPublicId);
   if (head === null) throw new Error("Unknown product example session.");
-  return <SessionCard head={head} onSummary={() => undefined} ordering={noOrdering} />;
+  return <>
+    <AppearanceHeader />
+    <SessionCard head={head} onSummary={() => undefined} ordering={noOrdering} />
+  </>;
 }
 
 const container = document.getElementById("root");
