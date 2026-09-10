@@ -31,8 +31,6 @@ export type MigratedStateTemplateOptions = Readonly<{
 type MigratedStateTemplate = Readonly<{
   /** The checkpointed current-schema database file. */
   database: string;
-  /** Sidecar suffixes present beside the template after its checkpoint. */
-  sidecars: readonly string[];
   /** Clock reads the real migration chain consumed while building this template. */
   clockReads: number;
 }>;
@@ -41,7 +39,6 @@ type MigratedStateTemplate = Readonly<{
 // fixture sees byte-identical migrated rows on both paths.
 const TEMPLATE_CLOCK_START = 1_000;
 const TEMPLATE_DIRECTORY_PREFIX = "oompa-migrated-state-template-";
-const SIDECAR_SUFFIXES = ["-wal", "-shm"] as const;
 
 const walCheckpointSchema = z.object({
   busy: z.literal(0),
@@ -81,16 +78,15 @@ async function buildMigratedStateTemplate(timeZone: string): Promise<MigratedSta
   } finally {
     database.close(true);
   }
-  const sidecars: string[] = [];
-  for (const suffix of SIDECAR_SUFFIXES) {
-    const sidecar = `${paths.database}${suffix}`;
-    if (!existsSync(sidecar)) continue;
-    if (suffix === "-wal" && lstatSync(sidecar).size !== 0) {
-      throw new Error("The migrated state template still has WAL frames after its checkpoint.");
-    }
-    sidecars.push(suffix);
+  // A truncating checkpoint leaves the WAL empty, and SQLite may remove the
+  // -wal and -shm files once the last connection closes (it does on Linux).
+  // Only the main database file is the template; each opened copy recreates
+  // its own sidecars.
+  const wal = `${paths.database}-wal`;
+  if (existsSync(wal) && lstatSync(wal).size !== 0) {
+    throw new Error("The migrated state template still has WAL frames after its checkpoint.");
   }
-  return { database: paths.database, sidecars, clockReads };
+  return { database: paths.database, clockReads };
 }
 
 /**
@@ -113,11 +109,8 @@ export async function provisionMigratedStateTemplate(
     templates.set(timeZone, template);
     template.catch(() => { templates.delete(timeZone); });
   }
-  const { database, sidecars, clockReads } = await template;
-  for (const suffix of ["", ...sidecars]) {
-    const target = `${paths.database}${suffix}`;
-    copyFileSync(`${database}${suffix}`, target, constants.COPYFILE_EXCL);
-    chmodSync(target, 0o600);
-  }
+  const { database, clockReads } = await template;
+  copyFileSync(database, paths.database, constants.COPYFILE_EXCL);
+  chmodSync(paths.database, 0o600);
   for (let read = 0; read < clockReads; read += 1) options.now?.();
 }
