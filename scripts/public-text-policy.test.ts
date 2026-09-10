@@ -171,6 +171,31 @@ describe("public text policy", () => {
     }), { numRuns: 40 });
   });
 
+  test("admits only the exact public Vercel routing compiler without opening its scope", async () => {
+    const name = "@vercel/routing-utils";
+    for (const specifier of [name, `${name}@6.4.0`, `${name}/reviewed-subpath`]) {
+      expect(() => assertPublicText(specifier, "public routing compiler")).not.toThrow();
+    }
+    for (const path of ["package.json", "kb/plans/hra-v1.md", "scripts/vercel-site-routing.test.ts"]) {
+      const source = await readFile(join(import.meta.dir, "..", path), "utf8");
+      expect(source).toContain(name);
+      expect(() => assertPublicText(source, path)).not.toThrow();
+    }
+    for (const parts of [["@vercel", "unreviewed"], ["@unreviewed", "routing-utils"]]) {
+      expect(() => assertPublicText(parts.join("/"), "unreviewed compiler package"))
+        .toThrow(PublicTextPolicyError);
+    }
+    fc.assert(fc.property(fc.constantFrom("-", ".", "_", ""), fc.stringMatching(/^[a-z][a-z0-9]{0,12}$/u), (separator, suffix) => {
+      expect(() => assertPublicText(`${name}${separator}${suffix}`, "unreviewed compiler suffix"))
+        .toThrow(PublicTextPolicyError);
+    }), { numRuns: 40, seed: 20260910 });
+    const secret = ["github", "pat", "abcdefghijklmnopqrstuvwxyz123456"].join("_");
+    for (const sensitive of [secret, syntheticPrivatePath()]) {
+      expect(() => assertPublicText(`${name}\n${sensitive}`, "sensitive compiler source"))
+        .toThrow(PublicTextPolicyError);
+    }
+  });
+
   test("omits only the physical ignored checkout-root temporary evidence directory", async () => {
     await withPublicCheckout(async (root) => {
       await expect(assertPublicCheckout(root)).resolves.toBeUndefined();
