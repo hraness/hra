@@ -94,7 +94,8 @@ describe("public text policy", () => {
       .not.toThrow();
     expect(() => assertPublicText("@hraness/atet@2.0.0", "historical public dependency"))
       .not.toThrow();
-    expect(() => assertPublicText("@hraness/slopcamera-unreviewed", "unreviewed package suffix"))
+    const unreviewedPackage = ["@hraness/slopcamera", "unreviewed"].join("-");
+    expect(() => assertPublicText(unreviewedPackage, "unreviewed package suffix"))
       .toThrow(PublicTextPolicyError);
     expect(() => assertPublicText("@hraness/hra", "public dependency"))
       .not.toThrow();
