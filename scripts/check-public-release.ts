@@ -122,9 +122,9 @@ const verifiedTagObject = environment("VERIFIED_TAG_OBJECT", /^[0-9a-f]{40}$/u);
 const verifiedTag = environment("VERIFIED_TAG", /^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u);
 const runId = environment("GITHUB_RUN_ID", /^[1-9][0-9]*$/u);
 const runAttempt = environment("GITHUB_RUN_ATTEMPT", /^[1-9][0-9]*$/u);
-const preflightState = environment("HRA_NPM_PREFLIGHT_STATE", /^(?:absent|exact)$/u);
-const preflightRunId = environment("HRA_NPM_PREFLIGHT_RUN_ID", /^[1-9][0-9]*$/u);
-const preflightRunAttempt = environment("HRA_NPM_PREFLIGHT_RUN_ATTEMPT", /^[1-9][0-9]*$/u);
+const preflightState = environment("OOMPA_NPM_PREFLIGHT_STATE", /^(?:absent|exact)$/u);
+const preflightRunId = environment("OOMPA_NPM_PREFLIGHT_RUN_ID", /^[1-9][0-9]*$/u);
+const preflightRunAttempt = environment("OOMPA_NPM_PREFLIGHT_RUN_ATTEMPT", /^[1-9][0-9]*$/u);
 if (preflightRunId !== runId || BigInt(preflightRunAttempt) > BigInt(runAttempt)) {
   throw new Error("Public release admission requires this run's bounded npm preflight observation.");
 }

@@ -36,7 +36,7 @@ export type ClaudeDisposition = "routed" | "reduced" | "ignored";
 
 /**
  * Every `type` (or `type/subtype`) the pinned build emits on the stream-json
- * stdout stream. `routed` becomes a closed HRA fact, `reduced` keeps only
+ * stdout stream. `routed` becomes a closed Oompa fact, `reduced` keeps only
  * bounded reviewed metadata, `ignored` is discarded after its envelope is
  * validated. Anything absent here is a drift notice, never a silent accept.
  */
@@ -58,7 +58,7 @@ export const PINNED_CLAUDE_STREAM_MATRIX = Object.freeze({
   user: "ignored",
 } as const satisfies Readonly<Record<string, ClaudeDisposition>>);
 
-/** Every `control_request.request.subtype` the pinned build sends to HRA. */
+/** Every `control_request.request.subtype` the pinned build sends to Oompa. */
 export const PINNED_CLAUDE_CONTROL_REQUEST_MATRIX = Object.freeze({
   can_use_tool: "routed",
   hook_callback: "ignored",
@@ -86,7 +86,7 @@ export function assertPinnedClaudeVersion(version: string): void {
   if (version !== CLAUDE_PIN) {
     throw new ClaudeError(
       "RUNTIME_MISMATCH",
-      `HRA requires Claude Code ${CLAUDE_PIN}`,
+      `Oompa requires Claude Code ${CLAUDE_PIN}`,
     );
   }
 }
@@ -95,13 +95,13 @@ export function assertPinnedClaudeModel(model: string, effort: string): void {
   if (model !== CLAUDE_PIN_MODEL) {
     throw new ClaudeError(
       "RUNTIME_MISMATCH",
-      `HRA requires the pinned Claude model ${CLAUDE_PIN_MODEL}`,
+      `Oompa requires the pinned Claude model ${CLAUDE_PIN_MODEL}`,
     );
   }
   if ((CLAUDE_PIN_REFUSED_EFFORTS as readonly string[]).includes(effort)) {
     throw new ClaudeError(
       "UNSUPPORTED_CAPABILITY",
-      `HRA never requests the \`${effort}\` reasoning effort`,
+      `Oompa never requests the \`${effort}\` reasoning effort`,
     );
   }
   if (effort !== CLAUDE_PIN_EFFORT) {
@@ -119,6 +119,7 @@ export function assertPinnedClaudeModel(model: string, effort: string): void {
 type UnknownRecord = Record<string, unknown>;
 
 const protocol = (message: string): ClaudeError => new ClaudeError("PROTOCOL_ERROR", message);
+const protocolLimit = (message: string): ClaudeError => new ClaudeError("PROTOCOL_LIMIT", message);
 
 const record = (value: unknown, label: string): UnknownRecord => {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -149,6 +150,93 @@ const safeInteger = (value: unknown, label: string): number => {
 
 const optionalSafeInteger = (value: unknown, label: string): number | undefined =>
   value === undefined || value === null ? undefined : safeInteger(value, label);
+
+const nonnegativeSafeInteger = (value: unknown, label: string): number => {
+  const parsed = safeInteger(value, label);
+  if (parsed < 0) throw protocol(`${label} must be nonnegative`);
+  return parsed;
+};
+
+const optionalNonnegativeSafeInteger = (
+  value: unknown,
+  label: string,
+): number | undefined => value === undefined || value === null
+  ? undefined
+  : nonnegativeSafeInteger(value, label);
+
+const finiteNonnegativeNumber = (value: unknown, label: string): number => {
+  if (
+    typeof value !== "number"
+    || !Number.isFinite(value)
+    || value < 0
+    || value > Number.MAX_SAFE_INTEGER
+  ) throw protocol(`${label} must be a bounded nonnegative number`);
+  return value;
+};
+
+const optionalFiniteNonnegativeNumber = (
+  value: unknown,
+  label: string,
+): number | undefined => value === undefined || value === null
+  ? undefined
+  : finiteNonnegativeNumber(value, label);
+
+const providerCode = (value: unknown, label: string, max = 128): string => {
+  if (typeof value !== "string" || value.length === 0) {
+    throw protocol(`${label} must be a nonempty provider code`);
+  }
+  if (!/^[A-Za-z0-9_.:+/-]+$/u.test(value)) {
+    throw protocol(`${label} contains unsupported provider-code characters`);
+  }
+  if (new TextEncoder().encode(value).byteLength > max) {
+    throw protocol(`${label} must be at most ${max} UTF-8 bytes`);
+  }
+  return value;
+};
+
+const optionalProviderCode = (
+  value: unknown,
+  label: string,
+  max = 128,
+): string | undefined => value === undefined || value === null
+  ? undefined
+  : providerCode(value, label, max);
+
+/** Stable ASCII/code-unit ordering for provider identifiers used in digests. */
+const compareProviderCodes = (left: string, right: string): number =>
+  left === right ? 0 : left < right ? -1 : 1;
+
+const eventId = (value: unknown, label: string): string => {
+  const parsed = string(value, label, 36);
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(parsed)) {
+    throw protocol(`${label} must be a UUID`);
+  }
+  return parsed.toLowerCase();
+};
+
+/**
+ * The pinned provider reports reset instants as Unix seconds. A 12/13-digit
+ * millisecond-shaped value is ambiguous and therefore cannot enter usage
+ * authority.
+ */
+const providerResetTimestampMilliseconds = (value: unknown, label: string): number => {
+  const seconds = nonnegativeSafeInteger(value, label);
+  if (seconds >= 100_000_000_000) {
+    throw protocol(`${label} must be Unix seconds`);
+  }
+  const milliseconds = seconds * 1_000;
+  if (!Number.isSafeInteger(milliseconds)) {
+    throw protocol(`${label} is outside the supported timestamp range`);
+  }
+  return milliseconds;
+};
+
+const optionalProviderResetTimestampMilliseconds = (
+  value: unknown,
+  label: string,
+): number | null => value === undefined || value === null
+  ? null
+  : providerResetTimestampMilliseconds(value, label);
 
 const optionalBoolean = (value: unknown, label: string): boolean | undefined => {
   if (value === undefined || value === null) return undefined;
@@ -251,6 +339,60 @@ export interface ClaudeUsage {
   readonly modelContextWindow: number | null;
 }
 
+export const CLAUDE_RATE_LIMIT_WINDOW_LIMIT = 16;
+export const CLAUDE_RESULT_MODEL_LIMIT = 32;
+
+export type ClaudeKnownRateLimitStatus =
+  | "allowed"
+  | "warning"
+  | "blocked"
+  | "denied"
+  | "rejected";
+
+export type ClaudeRateLimitStatus =
+  | Readonly<{ readonly state: "known"; readonly value: ClaudeKnownRateLimitStatus }>
+  | Readonly<{ readonly state: "unknown"; readonly value: string }>;
+
+export type ClaudeRateLimitWindow = Readonly<{
+  /** Pinned Claude window name. Current evidence establishes account scope only. */
+  id: string;
+  usedPercent: number;
+  resetsAtMs: number;
+}>;
+
+/** Sanitized quota-only projection of one pinned `rate_limit_event`. */
+export type ClaudeRateLimitObservation = Readonly<{
+  status: ClaudeRateLimitStatus;
+  rateLimitType: string | null;
+  resetsAtMs: number | null;
+  overageStatus: string | null;
+  overageDisabledReason: string | null;
+  isUsingOverage: boolean | null;
+  windows: readonly ClaudeRateLimitWindow[];
+}>;
+
+export type ClaudeTokenAccounting = Readonly<{
+  inputTokens: number | null;
+  cacheCreationInputTokens: number | null;
+  cacheReadInputTokens: number | null;
+  outputTokens: number | null;
+  thinkingTokens: number | null;
+}>;
+
+export type ClaudeModelAccounting = ClaudeTokenAccounting & Readonly<{
+  model: string;
+  costUsd: number | null;
+  contextWindow: number | null;
+  maxOutputTokens: number | null;
+}>;
+
+/** Sanitized accounting-only projection of one terminal `result`. */
+export type ClaudeResultAccounting = Readonly<{
+  totalCostUsd: number | null;
+  tokens: ClaudeTokenAccounting;
+  models: readonly ClaudeModelAccounting[];
+}>;
+
 export type ClaudeStreamEvent =
   | {
       readonly type: "session_init";
@@ -310,6 +452,8 @@ export type ClaudeStreamEvent =
     }
   | {
       readonly type: "result";
+      readonly eventId: string | null;
+      readonly sourceEventDigest: string | null;
       readonly sessionId: string;
       readonly isError: boolean;
       readonly stopReason: string | null;
@@ -318,6 +462,7 @@ export type ClaudeStreamEvent =
       readonly numTurns: number;
       readonly durationMs: number;
       readonly usage: ClaudeUsage;
+      readonly accounting: ClaudeResultAccounting | null;
       readonly model: string | null;
     }
   | {
@@ -325,7 +470,13 @@ export type ClaudeStreamEvent =
       readonly requestId: string;
       readonly request: ClaudeCanUseTool;
     }
-  | { readonly type: "rate_limit"; readonly status: string }
+  | {
+      readonly type: "rate_limit";
+      readonly eventId: string;
+      readonly sourceEventDigest: string;
+      readonly sessionId: string;
+      readonly quota: ClaudeRateLimitObservation;
+    }
   | { readonly type: "control_cancel_request"; readonly requestId: string }
   | { readonly type: "ignored"; readonly event: string }
   | { readonly type: "protocol_notice"; readonly event: string };
@@ -362,6 +513,98 @@ const parseQuestions = (input: UnknownRecord): readonly ClaudeQuestion[] | null 
   });
 };
 
+const normalizedSourceDigest = (value: unknown): string =>
+  createHash("sha256").update(JSON.stringify(value)).digest("hex");
+
+const parseTokenAccounting = (value: unknown, label: string): ClaudeTokenAccounting => {
+  const usage = optionalRecord(value, label) ?? {};
+  const details = optionalRecord(usage.output_tokens_details, `${label} output token details`) ?? {};
+  return {
+    cacheCreationInputTokens:
+      optionalNonnegativeSafeInteger(
+        usage.cache_creation_input_tokens,
+        `${label} cache creation input tokens`,
+      ) ?? null,
+    cacheReadInputTokens:
+      optionalNonnegativeSafeInteger(
+        usage.cache_read_input_tokens,
+        `${label} cache read input tokens`,
+      ) ?? null,
+    inputTokens:
+      optionalNonnegativeSafeInteger(usage.input_tokens, `${label} input tokens`) ?? null,
+    outputTokens:
+      optionalNonnegativeSafeInteger(usage.output_tokens, `${label} output tokens`) ?? null,
+    thinkingTokens:
+      optionalNonnegativeSafeInteger(details.thinking_tokens, `${label} thinking tokens`) ?? null,
+  };
+};
+
+const parseModelAccounting = (value: unknown): readonly ClaudeModelAccounting[] => {
+  const modelUsage = optionalRecord(value, "Claude model usage") ?? {};
+  const entries = Object.entries(modelUsage);
+  if (entries.length > CLAUDE_RESULT_MODEL_LIMIT) {
+    throw protocolLimit(
+      `Claude model usage exceeds the ${CLAUDE_RESULT_MODEL_LIMIT}-model limit`,
+    );
+  }
+  return entries
+    .map(([key, rawModel]): ClaudeModelAccounting => {
+      const model = providerCode(key, "Claude model usage key");
+      const parsed = record(rawModel, `Claude model usage ${model}`);
+      const canonicalModel = providerCode(
+        parsed.canonicalModel,
+        `Claude model usage ${model} canonical model`,
+      );
+      if (canonicalModel !== model) {
+        throw protocol(`Claude model usage ${model} must match its canonical model`);
+      }
+      return {
+        cacheCreationInputTokens: optionalNonnegativeSafeInteger(
+          parsed.cacheCreationInputTokens,
+          `Claude model usage ${model} cache creation input tokens`,
+        ) ?? null,
+        cacheReadInputTokens: optionalNonnegativeSafeInteger(
+          parsed.cacheReadInputTokens,
+          `Claude model usage ${model} cache read input tokens`,
+        ) ?? null,
+        contextWindow: optionalNonnegativeSafeInteger(
+          parsed.contextWindow,
+          `Claude model usage ${model} context window`,
+        ) ?? null,
+        costUsd: optionalFiniteNonnegativeNumber(
+          parsed.costUSD,
+          `Claude model usage ${model} cost`,
+        ) ?? null,
+        inputTokens: optionalNonnegativeSafeInteger(
+          parsed.inputTokens,
+          `Claude model usage ${model} input tokens`,
+        ) ?? null,
+        maxOutputTokens: optionalNonnegativeSafeInteger(
+          parsed.maxOutputTokens,
+          `Claude model usage ${model} max output tokens`,
+        ) ?? null,
+        model,
+        outputTokens: optionalNonnegativeSafeInteger(
+          parsed.outputTokens,
+          `Claude model usage ${model} output tokens`,
+        ) ?? null,
+        thinkingTokens: optionalNonnegativeSafeInteger(
+          parsed.thinkingTokens,
+          `Claude model usage ${model} thinking tokens`,
+        ) ?? null,
+      };
+    })
+    .sort((left, right) => compareProviderCodes(left.model, right.model));
+};
+
+const parseResultAccounting = (line: UnknownRecord): ClaudeResultAccounting => ({
+  models: parseModelAccounting(line.modelUsage),
+  tokens: parseTokenAccounting(line.usage, "Claude usage"),
+  totalCostUsd:
+    optionalFiniteNonnegativeNumber(line.total_cost_usd, "Claude total cost") ?? null,
+});
+
+/** The pre-v2 neutral token timeline remains byte-for-byte semantically stable. */
 const parseUsage = (value: unknown): ClaudeUsage => {
   const usage = optionalRecord(value, "Claude usage") ?? {};
   const details = optionalRecord(usage.output_tokens_details, "Claude output token details") ?? {};
@@ -382,6 +625,95 @@ const parseUsage = (value: unknown): ClaudeUsage => {
       inputTokens === null && outputTokens === null
         ? null
         : (inputTokens ?? 0) + cachedInputTokens + (outputTokens ?? 0),
+  };
+};
+
+const parseResultModel = (value: unknown): string | null => {
+  try {
+    const modelUsage = optionalRecord(value, "Claude model usage") ?? {};
+    const entries = Object.entries(modelUsage);
+    if (entries.length !== 1) return null;
+    const [key, rawModel] = entries[0] as [string, unknown];
+    const model = providerCode(key, "Claude model usage key");
+    const parsed = record(rawModel, `Claude model usage ${model}`);
+    return providerCode(
+      parsed.canonicalModel,
+      `Claude model usage ${model} canonical model`,
+    ) === model
+      ? model
+      : null;
+  } catch (error) {
+    if (error instanceof ClaudeError) return null;
+    throw error;
+  }
+};
+
+const KNOWN_RATE_LIMIT_STATUSES = new Set<ClaudeKnownRateLimitStatus>([
+  "allowed",
+  "warning",
+  "blocked",
+  "denied",
+  "rejected",
+]);
+
+const parseRateLimitStatus = (value: unknown): ClaudeRateLimitStatus => {
+  const parsed = providerCode(value, "Claude rate limit status");
+  return KNOWN_RATE_LIMIT_STATUSES.has(parsed as ClaudeKnownRateLimitStatus)
+    ? { state: "known", value: parsed as ClaudeKnownRateLimitStatus }
+    : { state: "unknown", value: parsed };
+};
+
+const parseRateLimitObservation = (value: unknown): ClaudeRateLimitObservation => {
+  const info = record(value, "Claude rate limit info");
+  const rawWindows = optionalRecord(
+    info.unifiedWindows,
+    "Claude unified rate limit windows",
+  ) ?? {};
+  const entries = Object.entries(rawWindows);
+  if (entries.length > CLAUDE_RATE_LIMIT_WINDOW_LIMIT) {
+    throw protocolLimit(
+      `Claude rate limit windows exceed the ${CLAUDE_RATE_LIMIT_WINDOW_LIMIT}-window limit`,
+    );
+  }
+  const windows = entries
+    .map(([key, rawWindow]): ClaudeRateLimitWindow => {
+      const id = providerCode(key, "Claude rate limit window id", 128);
+      const window = record(rawWindow, `Claude rate limit window ${id}`);
+      const utilization = finiteNonnegativeNumber(
+        window.utilization,
+        `Claude rate limit window ${id} utilization`,
+      );
+      if (utilization > 1) {
+        throw protocol(`Claude rate limit window ${id} utilization must be between zero and one`);
+      }
+      return {
+        id,
+        resetsAtMs: providerResetTimestampMilliseconds(
+          window.resetsAt,
+          `Claude rate limit window ${id} reset`,
+        ),
+        usedPercent: utilization * 100,
+      };
+    })
+    .sort((left, right) => compareProviderCodes(left.id, right.id));
+  return {
+    isUsingOverage:
+      optionalBoolean(info.isUsingOverage, "Claude overage use flag") ?? null,
+    overageDisabledReason:
+      optionalProviderCode(
+        info.overageDisabledReason,
+        "Claude overage disabled reason",
+      ) ?? null,
+    overageStatus:
+      optionalProviderCode(info.overageStatus, "Claude overage status") ?? null,
+    rateLimitType:
+      optionalProviderCode(info.rateLimitType, "Claude rate limit type") ?? null,
+    resetsAtMs: optionalProviderResetTimestampMilliseconds(
+      info.resetsAt,
+      "Claude rate limit reset",
+    ),
+    status: parseRateLimitStatus(info.status),
+    windows,
   };
 };
 
@@ -542,29 +874,73 @@ export function parseClaudeStreamLine(value: unknown): ClaudeStreamEvent {
         type: "control_cancel_request",
       };
     case "rate_limit_event": {
-      const info = optionalRecord(line.rate_limit_info, "Claude rate limit info") ?? {};
-      return { status: optionalString(info.status, "Claude rate limit status", 64) ?? "", type: "rate_limit" };
+      try {
+        const parsedEventId = eventId(line.uuid, "Claude rate limit event id");
+        const quota = parseRateLimitObservation(line.rate_limit_info);
+        const sessionId = string(line.session_id, "Claude session id", 128);
+        return {
+          eventId: parsedEventId,
+          quota,
+          sessionId,
+          sourceEventDigest: normalizedSourceDigest({
+            eventId: parsedEventId,
+            quota,
+            sessionId,
+            type: "rate_limit_event",
+          }),
+          type: "rate_limit",
+        };
+      } catch (error) {
+        if (error instanceof ClaudeError) {
+          return { event: "rate_limit_event/invalid", type: "protocol_notice" };
+        }
+        throw error;
+      }
     }
-    case "result":
+    case "result": {
+      const sessionId = string(line.session_id, "Claude session id", 128);
+      const usage = parseUsage(line.usage);
+      let accounting: ClaudeResultAccounting | null = null;
+      let parsedEventId: string | null = null;
+      let sourceEventDigest: string | null = null;
+      try {
+        const parsedAccounting = parseResultAccounting(line);
+        const candidateEventId = eventId(line.uuid, "Claude result event id");
+        const candidateSourceEventDigest = normalizedSourceDigest({
+          accounting: parsedAccounting,
+          eventId: candidateEventId,
+          sessionId,
+          type: "result",
+        });
+        accounting = parsedAccounting;
+        parsedEventId = candidateEventId;
+        sourceEventDigest = candidateSourceEventDigest;
+      } catch (error) {
+        if (!(error instanceof ClaudeError)) throw error;
+      }
       return {
+        accounting,
         durationMs: optionalSafeInteger(line.duration_ms, "Claude duration") ?? 0,
+        eventId: parsedEventId,
         isError: optionalBoolean(line.is_error, "Claude error flag") ?? false,
-        model: null,
+        model: parseResultModel(line.modelUsage),
         numTurns: optionalSafeInteger(line.num_turns, "Claude turn count") ?? 0,
         resultText: optionalString(line.result, "Claude result text", 262_144) ?? "",
-        sessionId: string(line.session_id, "Claude session id", 128),
+        sessionId,
+        sourceEventDigest,
         stopReason: optionalString(line.stop_reason, "Claude stop reason", 128) ?? null,
         terminalReason: optionalString(line.terminal_reason, "Claude terminal reason", 128) ?? null,
         type: "result",
-        usage: parseUsage(line.usage),
+        usage,
       };
+    }
     default:
       return { event: key, type: "protocol_notice" };
   }
 }
 
 // ---------------------------------------------------------------------------
-// can_use_tool -> HRA interaction.
+// can_use_tool -> Oompa interaction.
 // ---------------------------------------------------------------------------
 
 export const CLAUDE_COMMAND_TOOLS: ReadonlySet<string> = new Set(["Bash"]);
@@ -664,7 +1040,7 @@ export const claudeInteractionDisplay = (request: ClaudeCanUseTool): Interaction
             id: `q${String(index)}`,
             options: renderedOptions.map(({ option }) => option),
             question: prompt.text,
-            // Claude's question tool has no secret-answer mode; HRA still marks
+            // Claude's question tool has no secret-answer mode; Oompa still marks
             // every projected answer field as non-secret explicitly.
             secret: false,
             ...(remoteAnswerable ? { remoteAnswerable: true as const } : {}),
@@ -692,8 +1068,8 @@ export const claudeInteractionDisplay = (request: ClaudeCanUseTool): Interaction
 
 /**
  * Claude's `AskUserQuestion` answers are keyed by the literal question text.
- * HRA projects opaque `q<index>` ids instead, so this rebuilds the wire map
- * from the request HRA still holds in memory.
+ * Oompa projects opaque `q<index>` ids instead, so this rebuilds the wire map
+ * from the request Oompa still holds in memory.
  */
 export const claudeAnswerMap = (
   request: ClaudeCanUseTool,
@@ -742,7 +1118,7 @@ export type ClaudeControlResponse =
 /**
  * Builds the `control_response` body. An allow echoes the request's own input
  * verbatim (plus the answer map for a question) and never adds a
- * `permission_suggestions` rule, so HRA can only ever grant `once` scope.
+ * `permission_suggestions` rule, so Oompa can only ever grant `once` scope.
  */
 export const claudeControlResponse = (
   request: ClaudeCanUseTool,
@@ -781,7 +1157,7 @@ export const claudeControlResponseLine = (
  * `image` block carrying its own base64 bytes and a text-ish attachment is a
  * further `text` block with a header naming the file. The message text is
  * always the first block, and with no attachment the emitted line is byte for
- * byte what HRA sent before attachments existed.
+ * byte what Oompa sent before attachments existed.
  */
 export const claudeUserLine = (
   text: string,

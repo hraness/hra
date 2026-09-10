@@ -35,7 +35,7 @@ describe("public server marketing composition", () => {
       expect(links.filter((link) => link.getAttribute("aria-current") === "page").map((link) => link.textContent))
         .toEqual(currentPath === "/" ? ["Product"] : currentPath.startsWith("/docs/") ? ["Docs"] : []);
       expect(header?.querySelector(".hraness-marketing-header__actions > a")?.getAttribute("href")).toBe(publicContent.links.app);
-      expect(header?.querySelector(".hraness-marketing-header__actions > a")?.textContent).toBe("Open HRA");
+      expect(header?.querySelector(".hraness-marketing-header__actions > a")?.textContent).toBe("Open Oompa");
       expect(document.querySelector("[style], style, script")).toBeNull();
     }
   });
@@ -51,7 +51,7 @@ describe("public server marketing composition", () => {
     expect(html).not.toContain(publicContent.installCommand);
     expect(html).not.toContain(publicContent.initCommand);
     expect(document.querySelector("[style], style, script")).toBeNull();
-    expect(document.querySelector("h1")?.id).toBe("hra-title");
+    expect(document.querySelector("h1")?.id).toBe("oompa-title");
     expect(document.querySelector("h1")?.textContent).toBe(publicContent.hero.heading);
     expect(document.querySelectorAll("h1")).toHaveLength(1);
     const heroClasses = classNames(document.querySelector('[data-hraness-marketing="hero"]')?.className);
@@ -67,21 +67,27 @@ describe("public server marketing composition", () => {
     const { document } = parseHTML(renderMarketingPage(publicContent));
     const notice = document.querySelector('.hraness-marketing-hero__copy a[href="/docs/status/"]')?.parentElement;
     expect(notice?.textContent).toContain("New machine setup is temporarily paused.");
+    expect(notice?.textContent).toContain("This release candidate is not yet admitted");
+    expect(notice?.textContent).toContain("current daemon and hosted command-writer rollout remains blocked on capacity");
     expect(notice?.querySelector("a")?.textContent).toBe("Check current availability");
     expect(notice?.querySelector("strong")?.textContent).toBe("New machine setup is temporarily paused.");
     const flow = document.querySelector("#how-it-works");
     expect(flow?.querySelector('a[href="/docs/start/"]')?.parentElement?.textContent)
-      .toBe("These commands run on an initialized, authorized machine. Complete setup first.");
+      .toBe("These commands run only on an initialized, authorized machine after the capacity rollout prerequisites are satisfied. Complete setup first.");
     const flowText = flow?.textContent ?? "";
     expect(flowText.indexOf("initialized, authorized machine")).toBeLessThan(flowText.indexOf(publicContent.hero.steps[0]!.command));
     const setup = guideDocument("/docs/start/");
     const commandBlocks = [...setup.querySelectorAll("main pre")];
+    const installNotice = setup.querySelector('aside[aria-label="Candidate artifact not yet admitted"]');
+    expect(installNotice?.textContent).toContain(publicContent.installNotice);
+    expect(installNotice?.querySelector("a")?.getAttribute("href")).toBe(publicContent.links.admittedInstall);
+    expect(installNotice?.nextElementSibling).toBe(commandBlocks[0]);
     expect(commandBlocks[0]?.textContent).toBe(publicContent.installCommand);
-    const admissionNotice = setup.querySelector('aside[aria-label="CLI artifact admitted; daemon startup blocked"]');
+    const admissionNotice = setup.querySelector('aside[aria-label="Candidate artifact not yet admitted"]');
     expect(admissionNotice).not.toBeNull();
-    expect(admissionNotice?.textContent).toContain("The admitted v0.7.1 artifact may be installed with the command below.");
+    expect(admissionNotice?.textContent).toContain("Only after immutable GitHub release admission");
     expect(admissionNotice?.textContent).toContain("Neither artifact admission nor installation authorizes daemon startup.");
-    expect(admissionNotice?.querySelector("a")?.getAttribute("href")).toBe("https://github.com/hraness/hra/tree/v0.7.1#get-started");
+    expect(admissionNotice?.querySelector('a[href="https://github.com/hraness/oompa/tree/v0.7.1#get-started"]')?.getAttribute("href")).toBe("https://github.com/hraness/oompa/tree/v0.7.1#get-started");
     expect(admissionNotice?.nextElementSibling).toBe(commandBlocks[0]);
     for (const command of [publicContent.installCommand, publicContent.doctorCommand, publicContent.initCommand]) {
       expect(commandBlocks.some((block) => block.textContent.split("\n").includes(command))).toBe(true);
@@ -134,9 +140,9 @@ describe("public server marketing composition", () => {
     ]);
     expect(actionsAt(".hraness-marketing-cta__actions > a")).toEqual([
       ["/docs/start/", "Set up your first machine", "primary"],
-      [publicContent.links.app, "Open HRA", "secondary"],
+      [publicContent.links.app, "Open Oompa", "secondary"],
     ]);
-    expect(textAt(".hraness-marketing-cta__summary")).toBe("Start with one machine and one provider account. The setup guide explains what is available now and walks you through each step.");
+    expect(textAt(".hraness-marketing-cta__summary")).toBe("The setup guide starts with the admitted predecessor and this candidate's unavailable install command. Wait for exact artifact admission and the capacity rollout prerequisites before starting a new machine.");
     expect(textAt(".hraness-marketing-cta__footnote")).toBe(publicContent.hero.boundary);
   });
 

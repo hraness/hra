@@ -16,7 +16,7 @@ import {
 } from "./daemon-startup";
 
 async function pathsFixture() {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-startup-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-startup-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   return paths;

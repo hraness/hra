@@ -17,7 +17,7 @@
 - Store a prepared receipt before every mutation. Bind it to the exact authority generation and reconcile indeterminate outcomes without replay.
 - Use absolute, canonical, no-follow paths for durable state and profile roots. Require user-only permissions.
 - Keep CLI and detached-daemon secret custody noninteractive. Use current-user-owned mode-0700 directories and descriptor-read mode-0600 immutable values; never silently overwrite or delete recovery evidence. Do not depend on a Keychain prompt from an unsigned interpreter process.
-- Keep semantic facts, rules, projections, raw store handles, database locators, and purge authority behind the host-owned facts-memory broker. The HRA control plane may retain only bounded opaque lifecycle authority and exact public heads or receipts.
+- Keep semantic facts, rules, projections, raw store handles, database locators, and purge authority behind the host-owned facts-memory broker. The Oompa control plane may retain only bounded opaque lifecycle authority and exact public heads or receipts.
 - Force both pinned Codex credential stores to file mode at the process boundary and prove their effective values before account, plugin, or session effects.
 - Preserve stdout for requested data. Send diagnostics to stderr. Never print secrets, provider payloads, environment values, or raw local paths in cloud-facing output.
 - Bound lines, frames, pages, bytes, timers, retries, queues, and retained records.

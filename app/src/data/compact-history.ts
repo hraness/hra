@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 
 import { useCustody } from "../custody/custody-context";
 import { pageSize } from "../env";
-import { decryptCompactEvents, type CompactSessionEvent } from "../hra/cloud";
+import { decryptCompactEvents, type CompactSessionEvent } from "../oompa/cloud";
 import { createCancellation } from "../lib/cancellation";
 import { chunkAuthority } from "./chunks";
 import { getChunks } from "./functions";

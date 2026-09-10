@@ -1,9 +1,17 @@
 import { lstat, realpath } from "node:fs/promises";
 import { delimiter, isAbsolute, join } from "node:path";
 
-import { HRA_SESSION_PREAMBLE } from "../domain/hra-preamble.ts";
+import { OOMPA_SESSION_PREAMBLE } from "../domain/oompa-preamble.ts";
 import { ClaudeError } from "./errors.ts";
-import { CLAUDE_PIN, CLAUDE_PIN_EFFORT, CLAUDE_PIN_MODEL } from "./pin.ts";
+import {
+  CLAUDE_NATIVE_FALLBACK_UNAVAILABLE_REASON,
+  CLAUDE_PIN,
+  CLAUDE_PIN_EFFORT,
+  CLAUDE_PIN_FALLBACK_MODEL,
+  CLAUDE_PIN_MODEL,
+  CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY,
+  type ClaudeNativeFallbackCapability,
+} from "./pin.ts";
 import { allowlistedEnvironment } from "./process.ts";
 import { assertPinnedClaudeMatrices, assertPinnedClaudeVersion } from "./protocol.ts";
 
@@ -12,6 +20,7 @@ export interface PinnedClaudeRuntime {
   readonly version: typeof CLAUDE_PIN;
   readonly model: typeof CLAUDE_PIN_MODEL;
   readonly effort: typeof CLAUDE_PIN_EFFORT;
+  readonly nativeFallback: ClaudeNativeFallbackCapability;
   readonly argv: readonly [string, ...string[]];
 }
 
@@ -55,6 +64,84 @@ export interface ResolvePinnedClaudeRuntimeOptions {
   readonly signal?: AbortSignal;
   readonly versionProbeDeadlineMs?: number;
   readonly versionProbeProcessFactory?: ClaudeVersionProbeProcessFactory;
+}
+
+const sha256Pattern = /^[0-9a-f]{64}$/u;
+const hasExactKeys = (
+  value: Readonly<Record<string, unknown>>,
+  expected: readonly string[],
+): boolean => {
+  const keys = Object.keys(value);
+  return keys.length === expected.length && expected.every((key) => key in value);
+};
+
+/**
+ * Builds the two reviewed argv forms without starting a process. Production
+ * resolution passes only the pinned capability above; keeping construction
+ * pure lets the armed shape remain testable while the live gate is closed.
+ */
+export function buildPinnedClaudeRuntimeArgv(input: {
+  readonly executablePath: string;
+  readonly nativeFallback: ClaudeNativeFallbackCapability;
+}): readonly [string, ...string[]] {
+  // Keep the runtime check even though TypeScript callers carry the closed
+  // union: tests, injected adapters, and plain JavaScript can still cross
+  // this exported boundary without the compiler's protection.
+  const nativeFallback = input.nativeFallback as unknown;
+  if (typeof nativeFallback !== "object" || nativeFallback === null || Array.isArray(nativeFallback)) {
+    throw new ClaudeError("INVALID_INPUT", "The Claude native fallback capability is invalid");
+  }
+  const capability = nativeFallback as Readonly<Record<string, unknown>>;
+  if (capability.model !== CLAUDE_PIN_FALLBACK_MODEL) {
+    throw new ClaudeError(
+      "INVALID_INPUT",
+      "The Claude native fallback must match the exact pinned fallback model",
+    );
+  }
+  let fallbackArgument: readonly string[] = [];
+  if (capability.status === "unavailable") {
+    if (!hasExactKeys(capability, ["model", "reason", "status"])
+      || capability.reason !== CLAUDE_NATIVE_FALLBACK_UNAVAILABLE_REASON) {
+      throw new ClaudeError(
+        "INVALID_INPUT",
+        "The unavailable Claude native fallback must carry the reviewed reason",
+      );
+    }
+  } else if (capability.status === "armed") {
+    if (!hasExactKeys(capability, ["evidenceDigest", "model", "status"])
+      || typeof capability.evidenceDigest !== "string"
+      || !sha256Pattern.test(capability.evidenceDigest)) {
+      throw new ClaudeError(
+        "INVALID_INPUT",
+        "An armed Claude native fallback requires one sanitized acceptance evidence digest",
+      );
+    }
+    fallbackArgument = ["--fallback-model", CLAUDE_PIN_FALLBACK_MODEL];
+  } else {
+    throw new ClaudeError(
+      "INVALID_INPUT",
+      "The Claude native fallback capability has an unknown status",
+    );
+  }
+  return [
+    input.executablePath,
+    "--print",
+    "--output-format",
+    "stream-json",
+    "--input-format",
+    "stream-json",
+    "--verbose",
+    "--include-partial-messages",
+    "--permission-mode",
+    "default",
+    "--model",
+    CLAUDE_PIN_MODEL,
+    ...fallbackArgument,
+    "--effort",
+    CLAUDE_PIN_EFFORT,
+    "--system-prompt-snapshot",
+    "on",
+  ];
 }
 
 export interface ClaudeHostToolRuntimeOptions {
@@ -165,7 +252,7 @@ const stopVersionProbe = async (
 /**
  * Binds one process invocation to one durable Claude session. Creation and
  * resume are deliberately distinct flags: a typo must never make Claude
- * allocate a new conversation while HRA believes it reclaimed an old one.
+ * allocate a new conversation while Oompa believes it reclaimed an old one.
  */
 export function claudeSessionArgv(
   runtime: PinnedClaudeRuntime,
@@ -314,34 +401,19 @@ export async function resolvePinnedClaudeRuntime(
   }
   assertPinnedClaudeVersion(version);
 
+  const nativeFallback = CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY;
   return {
-    argv: [
-      executablePath,
-      "--print",
-      "--output-format",
-      "stream-json",
-      "--input-format",
-      "stream-json",
-      "--verbose",
-      "--include-partial-messages",
-      "--permission-mode",
-      "default",
-      "--model",
-      CLAUDE_PIN_MODEL,
-      "--effort",
-      CLAUDE_PIN_EFFORT,
-      "--system-prompt-snapshot",
-      "on",
-    ],
+    argv: buildPinnedClaudeRuntimeArgv({ executablePath, nativeFallback }),
     effort: CLAUDE_PIN_EFFORT,
     executablePath,
     model: CLAUDE_PIN_MODEL,
+    nativeFallback,
     version: CLAUDE_PIN,
   };
 }
 
 /**
- * Adds the bound HRA preamble and session-specific MCP configuration together.
+ * Adds the bound Oompa preamble and session-specific MCP configuration together.
  * The configuration contains only a stdio bridge command and the path of a
  * private binding file; the capability itself never appears in argv.
  */
@@ -364,7 +436,7 @@ export function withClaudeHostToolRuntime(
     argv: [
       ...runtime.argv,
       "--append-system-prompt",
-      HRA_SESSION_PREAMBLE.text,
+      OOMPA_SESSION_PREAMBLE.text,
       "--mcp-config",
       options.mcpConfigPath,
       "--strict-mcp-config",

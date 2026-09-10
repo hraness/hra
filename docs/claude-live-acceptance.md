@@ -1,12 +1,12 @@
 # Claude live acceptance
 
-The optional repository-only Claude qualification proves one fresh managed HRA session can use working memory through the pinned Claude MCP bridge. It is not a prerequisite for tagging or publishing HRA artifacts under the [machine-gated release policy](beta-release.md). It is separate from the [two-device Codex and hosted-memory qualification](live-acceptance.md). Neither proof substitutes for the other, and deterministic tests do not substitute for an authenticated live run.
+The optional repository-only Claude qualification proves one fresh managed Oompa session can use working memory through the pinned Claude MCP bridge. It is not a prerequisite for tagging or publishing Oompa artifacts under the [machine-gated release policy](beta-release.md). It is separate from the [two-device Codex and hosted-memory qualification](live-acceptance.md). Neither proof substitutes for the other, and deterministic tests do not substitute for an authenticated live run.
 
 ## Before running
 
-Use an authorized Linux host with HRA's supported native process-authority backend, Bun 1.3.14, and exact Claude Code 2.1.260. The invoking standard input, output, and error must be real terminals. Use a clean checkout of the candidate being qualified.
+Use an authorized Linux host with Oompa's supported native process-authority backend, Bun 1.3.14, and exact Claude Code 2.1.260. The invoking standard input, output, and error must be real terminals. Use a clean checkout of the candidate being qualified.
 
-Reserve an authorized disposable Claude login and permission for one bounded paid test turn. The gate creates a new isolated HRA profile and project; it does not adopt a personal conversation, copy a credential store, change `HOME`, rotate accounts, or delete a hosted HRA identity. Native login requires the human operator. Do not run it against credentials the operator has not authorized for this test.
+Reserve an authorized disposable Claude login and permission for one bounded paid test turn. The gate creates a new isolated Oompa profile and project; it does not adopt a personal conversation, copy a credential store, change `HOME`, rotate accounts, or delete a hosted Oompa identity. Native login requires the human operator. Do not run it against credentials the operator has not authorized for this test.
 
 Before login, the gate checks the exact runtime and probes its native logout help against the reviewed command and option vocabulary. An unsupported runtime or logout surface refuses before authentication. Synthetic help fixtures are parser tests, not a captured proof of the installed binary.
 
@@ -25,7 +25,7 @@ The gate performs these boundaries in order:
 
 1. Create canonical private test directories and a durable recovery receipt. Spawn an inactive isolated worker, record its exact PID, then deliver the installation descriptor that permits daemon startup.
 2. Add the test profile and complete Claude's production foreground login flow. Interruption must join that flow before daemon shutdown begins.
-3. Start one fresh `fable-max` session with its HRA capability binding, then send one nonce-bound memory task. Approve only the exact memory-remember MCP request for that turn. Any additional or different tool request prevents passing evidence.
+3. Start one fresh `fable-max` session with its Oompa capability binding, then send one nonce-bound memory task. Approve only the exact memory-remember MCP request for that turn. Any additional or different tool request prevents passing evidence.
 4. Capture the actual attributed host call and response-written acknowledgement. Corroborate native start and send receipts before public ID masking. Require the same-turn assistant to consume the unpredictable committed memory receipt, not merely repeat a marker from the prompt.
 5. Independently read the retained native mutation and memory records, owner working-memory query and status, exact private bridge configuration, and live process identity and arguments. The sole-submission check covers retained rows, not an unbounded historical claim.
 6. Stop and join the complete daemon generation. Prove the exact process is released and no longer live, and that its bridge binding, configuration, capability, and socket are absent. `session.stop` alone is not this proof.

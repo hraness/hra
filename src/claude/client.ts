@@ -1,8 +1,9 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 
 import type { PreparedAttachment } from "../domain/attachments.ts";
 import { ClaudeDeltaAssembler, type ClaudeFact } from "./assembler.ts";
-import { ClaudeError } from "./errors.ts";
+import { ClaudeError, IndeterminateClaudeEffectError } from "./errors.ts";
 import { ClaudeJsonLineDecoder } from "./jsonl.ts";
 import type { ClaudeProcess } from "./process.ts";
 import {
@@ -26,11 +27,16 @@ export interface ClaudeStreamClientOptions {
   readonly process: ClaudeProcess;
   /** Absolute reviewed logical home that owns this process. Fences every write. */
   readonly configDir: string;
+  /**
+   * May await fact handling, but not this client's cleanup. Schedule cleanup
+   * under a separate owner after the callback returns.
+   */
   readonly onFact: (fact: ClaudeFact) => void | Promise<void>;
   readonly onSafeDiagnostic?: (message: string) => void;
   readonly maxJsonLineBytes?: number;
   readonly shutdownTermGraceMs?: number;
   readonly shutdownSettlementMs?: number;
+  readonly now?: () => number;
 }
 
 export type ClaudeStreamInitialization = Readonly<{
@@ -49,6 +55,17 @@ type PendingInteraction = {
 const STDERR_DIAGNOSTIC_BYTES = 4 * 1024;
 const PROCESS_TERMINATION_GRACE_MS = 250;
 const PROCESS_FORCE_JOIN_DEADLINE_MS = 1_000;
+// Match the daemon's bounded deferred-fact count, with a separate byte bound
+// below the stream decoder's 8 MiB single-line ceiling.
+const PENDING_TURN_FACT_LIMIT = 256;
+const PENDING_TURN_FACT_BYTES = 1024 * 1024;
+
+type PendingTurnStart = {
+  readonly turnId: string;
+  readonly facts: Array<Readonly<{ fact: ClaudeFact; bytes: number }>>;
+  bytes: number;
+  draining: Promise<void> | null;
+};
 
 const boundedShutdownDuration = (value: number, label: string): number => {
   if (!Number.isSafeInteger(value) || value < 1 || value > 30_000) {
@@ -102,8 +119,9 @@ export class ClaudeStreamClient {
   readonly #process: ClaudeProcess;
   readonly #configDir: string;
   readonly #onFact: ClaudeStreamClientOptions["onFact"];
+  readonly #factDelivery = new AsyncLocalStorage<{ active: boolean }>();
   readonly #onSafeDiagnostic: ((message: string) => void) | undefined;
-  readonly #assembler = new ClaudeDeltaAssembler();
+  readonly #assembler: ClaudeDeltaAssembler;
   readonly #decoder: ClaudeJsonLineDecoder;
   readonly #pending = new Map<string, PendingInteraction>();
   readonly #encoder = new TextEncoder();
@@ -120,9 +138,12 @@ export class ClaudeStreamClient {
   #initializationValue: ClaudeStreamInitialization | undefined;
   #exitResolved = false;
   #closeTask: Promise<void> | null = null;
+  #closeFactsTask: Promise<void> | null = null;
   #state: "open" | "closing" | "closed" | "failed" = "open";
   #disconnectEmitted = false;
   #writeChain: Promise<void> = Promise.resolve();
+  #writesFenced = false;
+  #pendingTurnStart: PendingTurnStart | null = null;
 
   constructor(options: ClaudeStreamClientOptions) {
     if (!options.configDir.startsWith("/")) {
@@ -132,6 +153,9 @@ export class ClaudeStreamClient {
     this.#configDir = options.configDir;
     this.#onFact = options.onFact;
     this.#onSafeDiagnostic = options.onSafeDiagnostic;
+    this.#assembler = new ClaudeDeltaAssembler(
+      options.now === undefined ? {} : { now: options.now },
+    );
     this.#shutdownTermGraceMs = boundedShutdownDuration(
       options.shutdownTermGraceMs ?? PROCESS_TERMINATION_GRACE_MS,
       "Claude TERM grace",
@@ -214,36 +238,126 @@ export class ClaudeStreamClient {
     }
   }
 
-  /** Starts a turn: HRA mints the turn id, then writes the turn's `user` line. */
+  /** Starts a turn: Oompa mints the turn id, then writes the turn's `user` line. */
   async startTurn(input: Readonly<{
     turnId: string;
     message: string;
     attachments?: readonly PreparedAttachment[];
+    onWriteStarted?: () => void;
   }>): Promise<void> {
+    const onWriteStarted = input.onWriteStarted;
     this.#assertOpen();
-    const facts = this.#assembler.beginTurn(input.turnId);
-    await this.#write(claudeUserLine(input.message, input.attachments ?? []));
-    for (const fact of facts) await this.#onFact(fact);
+    if (this.#pendingTurnStart !== null) {
+      throw new ClaudeError("INVALID_INPUT", "A Claude turn start is still settling");
+    }
+    const line = claudeUserLine(input.message, input.attachments ?? []);
+    this.#assembler.beginTurn(input.turnId);
+    const pending: PendingTurnStart = { turnId: input.turnId, facts: [], bytes: 0, draining: null };
+    this.#pendingTurnStart = pending;
+    const write = { started: false };
+    try {
+      await this.#write(line, () => {
+        write.started = true;
+        onWriteStarted?.();
+      });
+      this.#assertOpen();
+      await this.#drainPendingTurnStart(pending, true);
+    } catch (error: unknown) {
+      if (write.started) this.fenceWrites();
+      // A rejected write may have escaped. Retain actual observed history,
+      // but never manufacture a successful start or replace the write error.
+      try {
+        await this.#drainPendingTurnStart(pending, false);
+      } catch {
+        try {
+          this.#onSafeDiagnostic?.("Oompa fact delivery failed after Claude turn admission failed");
+        } catch {
+          // An informational observer cannot replace the admission failure
+          // or prevent the local turn from being abandoned below.
+        }
+      }
+      this.#assembler.abandonTurn("the Claude turn write failed");
+      throw error;
+    }
+  }
+
+  async #emitFact(fact: ClaudeFact): Promise<void> {
+    const pending = this.#pendingTurnStart;
+    if (pending !== null && fact.type !== "rateLimitObserved"
+      && (("turnId" in fact && fact.turnId === pending.turnId)
+        || fact.type === "interactionCanceled")) {
+      const bytes = this.#encoder.encode(JSON.stringify(fact)).byteLength;
+      if (pending.facts.length >= PENDING_TURN_FACT_LIMIT
+        || pending.bytes + bytes > PENDING_TURN_FACT_BYTES) {
+        this.#onSafeDiagnostic?.("Claude pending turn facts exceeded their bounded capacity");
+        throw new ClaudeError("PROTOCOL_LIMIT", "Claude pending turn facts exceeded their bounded capacity");
+      }
+      pending.facts.push({ fact, bytes });
+      pending.bytes += bytes;
+      return;
+    }
+    await this.#deliverFact(fact);
+  }
+
+  async #deliverFact(fact: ClaudeFact): Promise<void> {
+    const callback = { active: true };
+    await this.#factDelivery.run(callback, async () => {
+      try {
+        await this.#onFact(fact);
+      } finally {
+        // Tasks may inherit this context but run after the observer returns.
+        // They are external cleanup owners, not a join of this live callback.
+        callback.active = false;
+      }
+    });
+  }
+
+  async #drainPendingTurnStart(pending: PendingTurnStart, accepted: boolean): Promise<void> {
+    if (pending.draining !== null) return await pending.draining;
+    if (this.#pendingTurnStart !== pending) return;
+    // Install the shared join before observer code can synchronously re-enter.
+    const task = Promise.resolve().then(async () => {
+      let failure: Readonly<{ error: unknown }> | undefined;
+      const deliver = async (fact: ClaudeFact): Promise<void> => {
+        try {
+          await this.#deliverFact(fact);
+        } catch (error: unknown) {
+          failure ??= { error };
+        }
+      };
+      if (accepted) await deliver({ type: "turnStarted", turnId: pending.turnId });
+      for (;;) {
+        const item = pending.facts.shift();
+        if (item === undefined) break;
+        pending.bytes -= item.bytes;
+        await deliver(item.fact);
+      }
+      if (this.#pendingTurnStart === pending) this.#pendingTurnStart = null;
+      if (failure !== undefined) throw failure.error;
+    });
+    pending.draining = task;
+    await task;
   }
 
   /** Steering is the same wire shape: another `user` line while a turn runs. */
   async steer(
     message: string,
     attachments: readonly PreparedAttachment[] = [],
+    onWriteStarted?: () => void,
   ): Promise<void> {
     this.#assertOpen();
     if (this.#assembler.activeTurnId === null) {
       throw new ClaudeError("INVALID_INPUT", "No Claude turn is in flight to steer");
     }
-    await this.#write(claudeUserLine(message, attachments));
+    await this.#write(claudeUserLine(message, attachments), onWriteStarted);
   }
 
   /** Asks the runtime to stop the in-flight turn. Its `result` reads interrupted. */
-  async interrupt(): Promise<void> {
+  async interrupt(onWriteStarted?: () => void): Promise<void> {
     this.#assertOpen();
     if (this.#assembler.activeTurnId === null) return;
     this.#assembler.markInterrupted();
-    await this.#write(claudeInterruptLine(randomUUID()));
+    await this.#write(claudeInterruptLine(randomUUID()), onWriteStarted);
   }
 
   pendingInteraction(requestId: string): PendingInteraction | undefined {
@@ -266,15 +380,22 @@ export class ClaudeStreamClient {
   async resolveInteraction(
     requestId: string,
     decision: ClaudeInteractionDecision,
+    onWriteStarted?: () => void,
   ): Promise<Readonly<{ responseDigest: string }>> {
     this.#assertOpen();
     const validated = this.validateInteractionResolution(requestId, decision);
-    await this.#write(claudeControlResponseLine(requestId, validated.response));
+    await this.#write(claudeControlResponseLine(requestId, validated.response), onWriteStarted);
     this.#pending.delete(requestId);
     return { responseDigest: validated.responseDigest };
   }
 
   async close(): Promise<void> {
+    if (this.#factDelivery.getStore()?.active === true) {
+      // A successful close proves the observer and admitted history joined.
+      // That is impossible while this observer awaits close itself. Reject
+      // before changing custody; a separate owner can still close and retry.
+      throw new ClaudeError("INVALID_INPUT", "Claude fact callbacks cannot join their own client cleanup.");
+    }
     if (this.#closeTask !== null) {
       await this.#closeTask;
       return;
@@ -314,10 +435,13 @@ export class ClaudeStreamClient {
         this.#onSafeDiagnostic?.("claude force termination failed");
       }
     }
-    const [exitSettled, stdoutSettled, stderrSettled] = await Promise.all([
+    const [exitSettled, stdoutSettled, stderrSettled, exitWatcherSettled] = await Promise.all([
       resolvesWithin(this.#exitTask, this.#shutdownSettlementMs),
       settlesWithin(this.#readTask, this.#shutdownSettlementMs),
       settlesWithin(this.#stderrTask, this.#shutdownSettlementMs),
+      // Exit may precede stdout EOF. Its watcher independently owns terminal
+      // observers, so neither the exit promise nor the reader proves this join.
+      settlesWithin(this.#exitWatchTask, this.#shutdownSettlementMs),
     ]);
     if (!exitSettled) {
       throw new ClaudeError(
@@ -325,36 +449,75 @@ export class ClaudeStreamClient {
         "Claude session process could not be joined after forced termination.",
       );
     }
-    if (!stdoutSettled || !stderrSettled) {
+    if (!stdoutSettled || !stderrSettled || !exitWatcherSettled) {
       throw new ClaudeError(
         "TIMEOUT",
         "Claude session output could not be drained after forced termination.",
       );
     }
-    try {
-      for (const fact of this.#assembler.abandonTurn("the Claude runtime was closed")) {
-        await this.#onFact(fact);
+    // One retained owner drains these facts even when a caller times out.
+    // In particular, abandonTurn extracts the completion before delivering
+    // its error fact; recreating this task on retry would lose that completion.
+    const closeFactsTask = this.#closeFactsTask ??= Promise.resolve().then(async () => {
+      let failure: Readonly<{ error: unknown }> | undefined;
+      if (this.#pendingTurnStart !== null) {
+        try {
+          await this.#drainPendingTurnStart(this.#pendingTurnStart, false);
+        } catch (error: unknown) {
+          failure ??= { error };
+        }
       }
+      for (const fact of this.#assembler.abandonTurn("the Claude runtime was closed")) {
+        try {
+          await this.#emitFact(fact);
+        } catch (error: unknown) {
+          failure ??= { error };
+        }
+      }
+      if (failure !== undefined) throw failure.error;
+    });
+    if (!await settlesWithin(closeFactsTask, this.#shutdownSettlementMs)) {
+      throw new ClaudeError(
+        "TIMEOUT",
+        "Claude session terminal facts could not be drained after forced termination.",
+      );
+    }
+    try {
+      await closeFactsTask;
     } finally {
       this.#pending.clear();
       this.#state = "closed";
     }
   }
 
+  /** Close frame admission without inventing process exit or joining an observer. */
+  fenceWrites(): void {
+    this.#writesFenced = true;
+  }
+
   #assertOpen(): void {
     if (this.#state !== "open") {
       throw new ClaudeError("PROCESS_EXITED", "The Claude runtime connection is closed");
     }
+    if (this.#writesFenced) throw new IndeterminateClaudeEffectError("write");
   }
 
-  #write(line: string): Promise<void> {
+  #write(line: string, onWriteStarted?: () => void): Promise<void> {
     const bytes = this.#encoder.encode(line);
     const chained = this.#writeChain.then(async () => {
       // Admission can change while this frame waits behind an earlier write.
       // Recheck at the actual provider boundary so close, disconnect, and
       // account revocation fence every frame that has not begun writing yet.
       this.#assertOpen();
-      await this.#process.write(bytes);
+      try {
+        onWriteStarted?.();
+        await this.#process.write(bytes);
+      } catch (error: unknown) {
+        // Fence synchronously before the recovered chain can release another
+        // queued frame. Cleanup and actual stream facts retain their owners.
+        this.fenceWrites();
+        throw error;
+      }
     });
     this.#writeChain = chained.catch(() => undefined);
     return chained;
@@ -411,9 +574,9 @@ export class ClaudeStreamClient {
     }
     for (const fact of this.#assembler.abandonTurn("the Claude runtime became indeterminate")) {
       try {
-        await this.#onFact(fact);
+        await this.#emitFact(fact);
       } catch {
-        this.#onSafeDiagnostic?.("HRA fact delivery failed during Claude disconnection");
+        this.#onSafeDiagnostic?.("Oompa fact delivery failed during Claude disconnection");
       }
     }
   }
@@ -430,9 +593,9 @@ export class ClaudeStreamClient {
     );
     for (const fact of this.#assembler.abandonTurn("the Claude runtime disconnected")) {
       try {
-        await this.#onFact(fact);
+        await this.#emitFact(fact);
       } catch {
-        this.#onSafeDiagnostic?.("HRA fact delivery failed during Claude disconnection");
+        this.#onSafeDiagnostic?.("Oompa fact delivery failed during Claude disconnection");
       }
     }
     if (reason !== "process_exit") {
@@ -450,8 +613,15 @@ export class ClaudeStreamClient {
         return;
       }
     }
+    if (this.#pendingTurnStart !== null) {
+      try {
+        await this.#drainPendingTurnStart(this.#pendingTurnStart, false);
+      } catch {
+        this.#onSafeDiagnostic?.("Oompa fact delivery failed during Claude disconnection");
+      }
+    }
     this.#disconnectEmitted = true;
-    await this.#onFact({ type: "providerDisconnected", reason });
+    await this.#deliverFact({ type: "providerDisconnected", reason });
   }
 
   async #dispatch(value: unknown): Promise<void> {
@@ -465,7 +635,7 @@ export class ClaudeStreamClient {
         });
       }
       if (fact.type === "interactionCanceled") this.#pending.delete(fact.requestId);
-      await this.#onFact(fact);
+      await this.#emitFact(fact);
       if (fact.type === "sessionBootstrapped") {
         this.#settleInitialization({
           claudeVersion: fact.claudeVersion,
@@ -514,7 +684,7 @@ export class ClaudeStreamClient {
         if (retained < chunk.byteLength) truncated = true;
       }
     } catch {
-      // Diagnostics are advisory; provider stderr never becomes HRA data.
+      // Diagnostics are advisory; provider stderr never becomes Oompa data.
     }
     if (observed > 0) {
       this.#onSafeDiagnostic?.(

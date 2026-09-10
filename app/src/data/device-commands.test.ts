@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import type { CloudPayloadAuthority, DeviceCommandResultPayload } from "../hra/cloud";
+import type { CloudPayloadAuthority, DeviceCommandResultPayload } from "../oompa/cloud";
 import {
   consumeSingleUseDeviceCommandResult,
   DeviceCommandConsumePrecommitError,

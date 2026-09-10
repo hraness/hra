@@ -4,7 +4,18 @@
   "cleanUrls": true,
   "framework": null,
   "outputDirectory": "dist/site",
-  "trailingSlash": true,
+  "redirects": [
+    {
+      "source": "/:path((?!\\.well-known(?:/|$))(?:[^/]+/)*[^/\\.]+)",
+      "destination": "/:path/",
+      "permanent": true
+    },
+    {
+      "source": "/:path((?!\\.well-known(?:/|$))(?:[^/]+/)*[^/]+\\.\\w+)/",
+      "destination": "/:path",
+      "permanent": true
+    }
+  ],
   "headers": [
     {
       "source": "/preview/",
@@ -36,7 +47,7 @@
       ]
     },
     {
-      "source": "/examples/app/:path*",
+      "source": "/examples/app/:path(.*)",
       "headers": [
         {
           "key": "Content-Security-Policy",

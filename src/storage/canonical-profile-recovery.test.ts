@@ -74,7 +74,7 @@ function corruptSessionKey(store: StateStore, sessionId: string, key: string | n
 }
 
 async function fixture() {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-canonical-recovery-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-canonical-recovery-")));
   roots.push(root);
   const paths = resolveStatePaths({ homeDirectory: root, platform: "linux", rootDirectory: join(root, "state") });
   await initializeStatePaths(paths);
@@ -85,6 +85,7 @@ async function fixture() {
   const profile = store.nextProfileGeneration(created.id);
   const email = "canonical-recovery@example.invalid";
   expect(store.setProfileState(profile.id, profile.processGeneration, "signed_in", { email, plan: "Plus" })).toBe(true);
+  const providerAuthority = store.requireProviderAccountAuthority(profile.id, "codex");
   const providerAccountKey = `v1:codex:${createHash("sha256").update(email).digest("hex")}`;
   const projectPath = join(root, "synthetic-project");
   await mkdir(projectPath);
@@ -96,22 +97,24 @@ async function fixture() {
     reviewMode: "auto_review" as const, permissionProfile: ":workspace" as const,
     computerUse: true as const, pluginCapability: true as const, enabledApps: [],
   };
-  return { store, profile, project, providerAccountKey, runtimeProfile };
+  return { store, profile, project, providerAccountKey, runtimeProfile, providerAuthority };
 }
 
 async function queueFixture() {
   const value = await fixture();
-  const { store, profile, project, providerAccountKey, runtimeProfile } = value;
+  const { store, profile, project, providerAccountKey, runtimeProfile, providerAuthority } = value;
   const session = store.upsertProviderSession({
     profileId: profile.id, projectId: project.id, provider: "codex",
     providerThreadId: "synthetic-queue-thread", title: "Synthetic queue session",
-    providerAccountKey, preset: "high", fastEnabled: false, state: "idle", providerUpdatedAt: 10,
+    providerAccountKey, providerAuthority, preset: "high", fastEnabled: false, state: "idle", providerUpdatedAt: 10,
   });
   const message = "Synthetic uncertain queue dispatch.";
-  const queue = store.enqueue(session.id, message);
+  const providerConnectionId = "10000000-0000-4000-8000-000000000009";
+  const queue = store.enqueueIdempotent({ sessionId: session.id, message, idempotencyKey: crypto.randomUUID(),
+    profileGeneration: providerAuthority.processGeneration, providerAuthority, providerConnectionId });
   const evidence = store.beginQueueEffect({
     queueId: queue.id, sessionId: session.id, profileGeneration: profile.processGeneration,
-    providerConnectionId: "10000000-0000-4000-8000-000000000009",
+    providerAuthority, providerConnectionId,
     evidence: {
       kind: "queue.dispatch", queueId: queue.id, sessionId: session.id,
       providerThreadId: "synthetic-queue-thread", profileGeneration: profile.processGeneration,
@@ -126,23 +129,24 @@ async function queueFixture() {
 
 async function startFixture() {
   const value = await fixture();
-  const { store, profile, project, providerAccountKey, runtimeProfile } = value;
+  const { store, profile, project, providerAccountKey, runtimeProfile, providerAuthority } = value;
   const attempt = store.prepareMutation({
     authorityGeneration: profile.processGeneration, authorityId: profile.id,
     idempotencyKey: "00000000-0000-4000-8000-0000000006c0", kind: "session.start",
     request: sessionStartMutationRequest({ projectId: project.id, provider: "codex",
       preset: "high", presetContract: legacyPresetContract, fast: false }),
+    providerAuthorities: [{ role: "primary", authority: providerAuthority, provenance: "session_start" }],
   });
   const session = store.beginSessionStartEffect({
     attemptId: attempt.id, profileId: profile.id, profileGeneration: profile.processGeneration,
-    projectId: project.id, provider: "codex", providerAccountKey, preset: "high", fastEnabled: false,
+    projectId: project.id, provider: "codex", providerAccountKey, providerAuthority, preset: "high", fastEnabled: false,
     evidence: { clientMessageId: null, kind: "session.start", messageDigest: null,
       presetContract: legacyPresetContract, projectId: project.id, runtimeProfile },
   });
   // A real, already-retained source record takes #insertSessionRuntimeProfile's
   // historical replay branch. Do not fabricate its row, JSON, or digest.
   const recordInput = { sessionId: session.id, sourceKind: "session_start" as const,
-    sourceId: attempt.id, profile: runtimeProfile };
+    sourceId: attempt.id, profile: runtimeProfile, providerAuthority };
   const retained = store.recordSessionRuntimeProfile(recordInput);
   expect(store.recordSessionRuntimeProfile(recordInput)).toEqual(retained);
   const bind = { attemptId: attempt.id, sessionId: session.id,

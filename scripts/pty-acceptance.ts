@@ -2,8 +2,8 @@ import { spawn } from "node:child_process";
 import { rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-export const PTY_BEGIN_MARKER = "__HRA_PTY_BEGIN__";
-export const PTY_END_MARKER = "__HRA_PTY_END__";
+export const PTY_BEGIN_MARKER = "__OOMPA_PTY_BEGIN__";
+export const PTY_END_MARKER = "__OOMPA_PTY_END__";
 
 const ptyOutputMaximumBytes = 1024 * 1024;
 const ptyStepMaximumCount = 64;
@@ -36,9 +36,9 @@ type PseudoTerminalInput = Readonly<{
 
 const wrapperSource = (authorityMarker: string): string => `#!/bin/sh
 set -u
-hra_pgid="$($HRA_PTY_PS -o pgid= -p "$$")" || exit 88
+hra_pgid="$($OOMPA_PTY_PS -o pgid= -p "$$")" || exit 88
 if [ "$hra_pgid" -ne "$$" ]; then exit 89; fi
-initial_mode="$($HRA_PTY_STTY -g)" || exit 90
+initial_mode="$($OOMPA_PTY_STTY -g)" || exit 90
 printf '\n${authorityMarker}\t%s\n' "$$"
 printf '\n${PTY_BEGIN_MARKER}\n'
 # The foreground child owns Ctrl-C; keep the harness alive to report its final status.
@@ -46,7 +46,7 @@ trap ':' 2
 "$@"
 command_status=$?
 trap - 2
-final_mode="$($HRA_PTY_STTY -g)" || exit 91
+final_mode="$($OOMPA_PTY_STTY -g)" || exit 91
 if [ "$initial_mode" != "$final_mode" ]; then
   printf '\n${PTY_END_MARKER}\t%s\tchanged\n' "$command_status"
   exit 92
@@ -235,9 +235,9 @@ export async function runInPseudoTerminal(input: PseudoTerminalInput): Promise<P
     }
   }
 
-  const authorityMarker = `__HRA_PTY_AUTHORITY_${crypto.randomUUID()}__`;
-  const wrapperPath = join(input.temporaryDirectory, `.hra-pty-${crypto.randomUUID()}.sh`);
-  const expectPath = join(input.temporaryDirectory, `.hra-pty-${crypto.randomUUID()}.expect`);
+  const authorityMarker = `__OOMPA_PTY_AUTHORITY_${crypto.randomUUID()}__`;
+  const wrapperPath = join(input.temporaryDirectory, `.oompa-pty-${crypto.randomUUID()}.sh`);
+  const expectPath = join(input.temporaryDirectory, `.oompa-pty-${crypto.randomUUID()}.expect`);
   await writeFile(wrapperPath, wrapperSource(authorityMarker), { encoding: "utf8", flag: "wx", mode: 0o700 });
   const timeoutMs = input.timeoutMs ?? 30_000;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 10 * 60_000) {
@@ -263,8 +263,8 @@ export async function runInPseudoTerminal(input: PseudoTerminalInput): Promise<P
         detached: true,
         env: {
           ...input.environment,
-          HRA_PTY_PS: processInspectionExecutable(process.platform),
-          HRA_PTY_STTY: terminalStateExecutable(process.platform),
+          OOMPA_PTY_PS: processInspectionExecutable(process.platform),
+          OOMPA_PTY_STTY: terminalStateExecutable(process.platform),
         },
         stdio: ["pipe", "pipe", "pipe"],
       },

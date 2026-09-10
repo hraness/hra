@@ -16,7 +16,7 @@ import { APP_CSS_PLACEHOLDER, type AppArtifact } from "./build-app.ts";
 export const PRODUCT_PREVIEW_BASE = "/examples/app/";
 export const PRODUCT_PREVIEW_CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src data: blob:; font-src 'self'; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'; worker-src 'none'";
 export const PRODUCT_PREVIEW_CSS_HREF = "./stylex.css";
-const generationId = "hra-product-preview";
+const generationId = "oompa-product-preview";
 const entry = "app/fixtures/product/main.tsx";
 const shellPath = "app/fixtures/product/index.html";
 const hash = (bytes: Uint8Array | string): string => createHash("sha256").update(bytes).digest("hex");
@@ -177,7 +177,7 @@ export async function buildProductPreview(options: Readonly<{
     // The public adapter still owns root, input, output, no inlining and maps.
     // No production appearance bootstrap may enter this offline graph.
     plugins: [productIoPlugin(root), {
-      name: "hra-product-preview-license",
+      name: "oompa-product-preview-license",
       banner: () => `/*! @license @hraness/direct\n${directLicense}\n*/`,
     }, stylexVite({ generation, graphId: "client", rootDirectory: root }), react()],
   }), join(root, entry));

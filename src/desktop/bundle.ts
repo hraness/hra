@@ -156,7 +156,7 @@ export async function inspectChatGptBundle(
   if (supported === undefined) {
     throw new DesktopSwitchError(
       "BUNDLE_UNSUPPORTED",
-      "this signed ChatGPT build has not passed the HRA compatibility probe",
+      "this signed ChatGPT build has not passed the Oompa compatibility probe",
     );
   }
 

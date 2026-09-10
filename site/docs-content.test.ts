@@ -124,17 +124,22 @@ describe("task-oriented documentation content", () => {
     }
   });
 
-  test("shows exact artifact admission before its installer and preserves the blocked-startup prerequisite", () => {
+  test("refuses candidate availability before its install command and preserves the blocked-startup prerequisite", () => {
     const page = pageAt("/docs/start/");
     const blocks = page.sections.flatMap((section) => section.blocks);
-    expect(blocks[0]).toMatchObject({ kind: "notice", label: "CLI artifact admitted; daemon startup blocked" });
-    expect(blockText(blocks[0]!)).toContain("admitted v0.7.1 artifact may be installed");
-    expect(blockText(blocks[0]!)).toContain("Neither artifact admission nor installation authorizes daemon startup");
-    expect(blockLinks(blocks[0]!)).toContain("https://github.com/hraness/hra/tree/v0.7.1#get-started");
+    expect(blocks[0]).toMatchObject({ kind: "notice", label: "Candidate artifact not yet admitted" });
+    expect(blockText(blocks[0]!)).toContain(publicContent.installNotice);
+    expect(blockLinks(blocks[0]!)).toContain(publicContent.links.admittedInstall);
+    expect(blockText(blocks[0]!)).toContain("Only after immutable GitHub release admission");
+    expect(blockText(blocks[0]!)).toContain("admitted v0.7.1 artifact");
+    expect(blockText(blocks[0]!)).toContain("Neither artifact admission nor installation authorizes daemon startup.");
+    expect(blockLinks(blocks[0]!)).toContain("https://github.com/hraness/oompa/tree/v0.7.1#get-started");
     expect(blocks[1]).toEqual({ kind: "commands", commands: [publicContent.installCommand] });
     const text = pageText(page);
-    expect(text.indexOf("CLI artifact admitted; daemon startup blocked")).toBeLessThan(text.indexOf(publicContent.installCommand));
+    expect(text.indexOf("Candidate artifact not yet admitted")).toBeLessThan(text.indexOf(publicContent.installCommand));
     expect(text.indexOf(publicContent.installCommand)).toBeLessThan(text.indexOf(publicContent.doctorCommand));
+    expect(text.indexOf(publicContent.installNotice)).toBeLessThan(text.indexOf(publicContent.installCommand));
+    expect(text).not.toContain("You can install and check v0.8.0 now");
     expect(text.indexOf(publicContent.doctorCommand)).toBeLessThan(text.indexOf(publicContent.initCommand));
     const noticeIndex = blocks.findIndex((block) => block.kind === "notice"
       && blockText(block).includes("Initialization, daemon startup, and hosted command writers remain blocked on capacity"));
@@ -144,9 +149,15 @@ describe("task-oriented documentation content", () => {
     expect(text).toContain("It does not start the daemon");
     expect(text).toContain("Managed Claude login and execution are not available on macOS");
     const start = page.sections.find((section) => section.id === "open-a-conversation");
-    expect(start?.blocks.map(blockText).join("\n")).toContain("hra session start personal --provider claude --preset fable-max");
+    expect(start?.blocks.map(blockText).join("\n")).toContain("oompa session start personal --provider claude --preset fable-max");
     expect(parseCli(["session", "start", "personal", "--provider", "claude", "--preset", "fable-max"])).toMatchObject({ kind: "command", command: { kind: "session.start", provider: "claude", preset: "fable-max" } });
-    expect(pageText(pageAt("/docs/status/"))).toContain(publicContent.daemonRolloutNotice);
+    const status = pageText(pageAt("/docs/status/"));
+    expect(status).toContain(publicContent.daemonRolloutNotice);
+    expect(status).toContain("v0.8.0 is a candidate. v0.7.1 remains admitted.");
+    expect(status).toContain(publicContent.installNotice);
+    expect(status).toContain("The v0.7.1 CLI passed immutable GitHub and npm artifact admission.");
+    expect(status).not.toContain("The v0.8.0 CLI passed");
+    expect(status).not.toContain("v0.8.0 is released");
   });
 
   test("puts machine sign-in formats before browser enrollment", () => {
@@ -155,7 +166,7 @@ describe("task-oriented documentation content", () => {
     const signInIndex = pairing.blocks.findIndex((block) =>
       blockLinks(block).includes("/docs/web/#cloud-sign-in-and-device-pairing"),
     );
-    const browserIndex = pairing.blocks.findIndex((block) => blockLinks(block).some((href) => href === "https://app.hra.sh/"));
+    const browserIndex = pairing.blocks.findIndex((block) => blockLinks(block).some((href) => href === "https://app.oompa.dev/"));
     expect(signInIndex).toBeGreaterThan(-1);
     expect(browserIndex).toBeGreaterThan(signInIndex);
     const instructions = blockText(pairing.blocks[signInIndex]!);
@@ -165,20 +176,20 @@ describe("task-oriented documentation content", () => {
 
   test("teaches actual browser actions without granting browser device or provider authority", () => {
     const text = pageText(pageAt("/docs/web/"));
-    expect(text).toContain("app.hra.sh");
+    expect(text).toContain("app.oompa.dev");
     const hold = text.indexOf("Initialization, daemon startup, and hosted command writers remain blocked on capacity");
     expect(hold).toBeGreaterThan(-1);
-    expect(hold).toBeLessThan(text.indexOf("hra auth login --input-stdin"));
-    expect(hold).toBeLessThan(text.indexOf("hra device approve"));
+    expect(hold).toBeLessThan(text.indexOf("oompa auth login --input-stdin"));
+    expect(hold).toBeLessThan(text.indexOf("oompa device approve"));
     expect(text).toContain("A browser cannot be the first device on an account or approve another device");
-    expect(text).toContain("hra device approve <pending-device-id-or-prefix> --fingerprint <value>");
+    expect(text).toContain("oompa device approve <pending-device-id-or-prefix> --fingerprint <value>");
     expect(text).toContain("Email access alone cannot recover encrypted history");
     expect(text).toContain("With no session selected");
     expect(text).toContain("With a session selected");
     expect(text).toContain("multiple-choice question can be answered here");
     expect(text).toContain("accepting them, granting permission, typing a free-text or Other answer, and completing MCP forms stay on the execution machine");
     expect(text).toContain("Scheduled tasks are read-only here");
-    expect(text).toContain("hra remote allow account-linking");
+    expect(text).toContain("oompa remote allow account-linking");
     expect(text).toContain("Claude sign-in stays in a foreground terminal on Linux");
     expect(text).not.toContain("approvals and autonomy do not read this schedule");
   });
@@ -188,9 +199,13 @@ describe("task-oriented documentation content", () => {
     expect(text).toContain("Claude exposes sign-in status, not account quotas or usage history");
     expect(text).toContain("does not pool subscription limits or automatically move a failed turn");
     expect(text).toContain("native thread, hidden state, and cached context do not transfer");
-    expect(text).toContain("cannot switch to another account profile");
+    expect(text).toContain("only after outstanding memory submissions settle");
+    expect(text).toContain("purges the old working lane and starts a fresh empty epoch");
+    expect(text).toContain("does not carry working-memory contents across accounts");
+    expect(text).toContain("remains recoverable before the session is rebound");
+    expect(text).not.toContain("cannot switch to another account profile");
     expect(text).toContain("An ambiguous result needs inspection, not a new send");
-    expect(text).toContain("ends HRA's local session with provider state still unknown");
+    expect(text).toContain("ends Oompa's local session with provider state still unknown");
     expect(text).toContain("data.eventStream.cursor");
     expect(text).toContain("--cursor <status-cursor> --jsonl");
   });
@@ -198,7 +213,7 @@ describe("task-oriented documentation content", () => {
   test("uses parsed help entry points and documents supported structured output", () => {
     const page = pageAt("/docs/reference/");
     const first = page.sections[0]!.blocks[0];
-    expect(first).toEqual({ kind: "commands", commands: ["hra --help", "hra session --help", "hra help session send"] });
+    expect(first).toEqual({ kind: "commands", commands: ["oompa --help", "oompa session --help", "oompa help session send"] });
     expect(parseCli(["--help"])).toMatchObject({ kind: "help" });
     expect(parseCli(["session", "--help"])).toMatchObject({ kind: "help", group: "session" });
     expect(parseCli(["help", "session", "send"])).toMatchObject({ kind: "help", group: "session", leaf: "send" });

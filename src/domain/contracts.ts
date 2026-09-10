@@ -9,10 +9,10 @@ import {
 import { isAttachmentName } from "./attachments";
 import { autorespondAfterHoursPolicySchema } from "./autorespond-after-hours";
 import {
-  hraMemoryExplainInputSchema,
-  hraMemoryQueryInputSchema,
-  hraMemoryRememberInputSchema,
-  hraMemoryShareInputSchema,
+  oompaMemoryExplainInputSchema,
+  oompaMemoryQueryInputSchema,
+  oompaMemoryRememberInputSchema,
+  oompaMemoryShareInputSchema,
 } from "./host-tools";
 import {
   activePresetBinding,
@@ -41,6 +41,8 @@ import {
 } from "./session-events";
 import { TRANSCRIPT_PAGE_LIMIT } from "./transcript";
 import { ACCOUNT_USAGE_HISTORY_PAGE_LIMIT } from "./usage-metrics";
+import { usageProviderSchema } from "./provider-usage";
+import { automaticUsagePolicyConfigurationUpdateSchema } from "./usage-policy";
 import {
   sessionTaskIntervalMinutesSchema,
   sessionTaskNameSchema,
@@ -117,7 +119,7 @@ export const signedOutSessionListMetadataSchema = z.object({
   providerCompleteness: z.literal("unknown"),
   nextCommand: z.string().min(1).max(256),
 }).strict().superRefine((value, context) => {
-  if (value.nextCommand !== `hra account login ${value.accountSelector}`) {
+  if (value.nextCommand !== `oompa account login ${value.accountSelector}`) {
     context.addIssue({
       code: "custom",
       path: ["nextCommand"],
@@ -341,7 +343,7 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
   // The parser emits an unbound stop request. The CLI must bind it to the
   // observed daemon authority before it crosses the local transport boundary.
   z.object({ kind: z.literal("daemon.stop"), expected: daemonStopAuthoritySchema.optional() }).strict(),
-  z.object({ kind: z.literal("account.list") }).strict(),
+  z.object({ kind: z.literal("account.list"), provider: usageProviderSchema.optional() }).strict(),
   z.object({ kind: z.literal("account.add"), label: labelSchema }).strict(),
   z.object({ kind: z.literal("account.show"), account: selectorSchema, provider: providerSchema.optional() }).strict(),
   z.object({ kind: z.literal("account.login"), account: selectorSchema, deviceCode: z.boolean(), idempotencyKey: idempotencyKeySchema }).strict(),
@@ -392,6 +394,11 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("account.login-cancel"), account: selectorSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("account.logout"), account: selectorSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("account.usage"), account: selectorSchema.optional(), refresh: z.boolean() }).strict(),
+  z.object({ kind: z.literal("usage.auto.status"), provider: usageProviderSchema.optional() }).strict(),
+  z.object({
+    kind: z.literal("usage.auto.set"),
+    ...automaticUsagePolicyConfigurationUpdateSchema.shape,
+  }).strict(),
   z.object({
     kind: z.literal("account.usage-history"),
     account: selectorSchema,
@@ -442,24 +449,24 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("memory.query"),
     session: selectorSchema,
-    value: hraMemoryQueryInputSchema,
+    value: oompaMemoryQueryInputSchema,
   }).strict(),
   z.object({
     kind: z.literal("memory.explain"),
     session: selectorSchema,
-    value: hraMemoryExplainInputSchema,
+    value: oompaMemoryExplainInputSchema,
   }).strict(),
   z.object({
     kind: z.literal("memory.remember"),
     session: selectorSchema,
     idempotencyKey: requiredIdempotencyKeySchema,
-    value: hraMemoryRememberInputSchema,
+    value: oompaMemoryRememberInputSchema,
   }).strict(),
   z.object({
     kind: z.literal("memory.share"),
     session: selectorSchema,
     idempotencyKey: requiredIdempotencyKeySchema,
-    value: hraMemoryShareInputSchema,
+    value: oompaMemoryShareInputSchema,
   }).strict(),
   z.object({
     kind: z.literal("session.list"),
@@ -553,7 +560,7 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
     idempotencyKey: idempotencyKeySchema,
   }).strict(),
   /**
-   * One bounded page of the provider-neutral conversation HRA rebuilt from its
+   * One bounded page of the provider-neutral conversation Oompa rebuilt from its
    * own session events. `after` is an event sequence, not a record index.
    */
   z.object({

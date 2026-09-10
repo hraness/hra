@@ -1,6 +1,11 @@
 import { createHash } from "node:crypto";
 
 import {
+  providerAccountAuthoritySchema,
+  type ProviderAccountId,
+} from "../domain/provider-accounts";
+import type { Provider } from "../domain/presets";
+import {
   hasExactKeys,
   isCommandKind,
   isDeviceCommandKind,
@@ -62,6 +67,36 @@ export const cloudProjectionRecoveryWindowMs = 7 * 24 * 60 * 60 * 1_000;
 export const providerDeletionProjectionRecoveryCode = "PROVIDER_THREAD_DELETED";
 export const invalidIdempotencyProjectionRecoveryCode =
   "IDEMPOTENCY_AUTHORITY_INVALID_BEFORE_EFFECT";
+export const unprovableProviderAuthorityProjectionRecoveryCode =
+  "LOCAL_PROVIDER_AUTHORITY_UNPROVABLE";
+
+export type CloudCommandLocalAuthority = Readonly<{
+  bindingGeneration: number;
+  localSessionId: string;
+  processGeneration: number;
+  profileId: string;
+  provider: Provider;
+  providerAccountId: ProviderAccountId;
+  providerThreadId: string;
+}>;
+
+type DecodedCloudCommandLocalAuthority =
+  | CloudCommandLocalAuthority
+  | null
+  | undefined;
+
+export function isProviderBoundCloudCommandLocalAuthority(
+  value: DecodedCloudCommandLocalAuthority,
+): value is CloudCommandLocalAuthority {
+  return value !== null && value !== undefined;
+}
+
+export function cloudCommandLocalAuthorityDigest(
+  value: CloudCommandLocalAuthority,
+): string {
+  const canonical = parseCommandLocalAuthority(value);
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
 
 function assertSerializedJournalBound(serialized: string): void {
   if (utf8Encoder.encode(serialized).byteLength > maximumSerializedJournalBytes) {
@@ -77,6 +112,12 @@ export type CloudCommandJournalEntry = Readonly<{
   authority: AuthorityTuple;
   commandPublicId: string;
   kind: CommandKind;
+  /**
+   * `undefined` exists only while decoding a pre-provider-authority journal.
+   * `null` is an explicit recovery quarantine for server evidence whose local
+   * journal was already lost. Neither shape may reach a provider effect.
+   */
+  localAuthority?: CloudCommandLocalAuthority | null;
   localAuthorityDigest: string;
   payloadDigest: string;
   sessionPublicId: string;
@@ -155,13 +196,38 @@ export type PendingCloudUsageAccount = Readonly<{
   sourceRevision: number;
 }>;
 
-export type CloudProjectionRecoveryLocalAuthority = Readonly<{
+export type LegacyCloudProjectionRecoveryLocalAuthority = Readonly<{
   profileGeneration: number;
   profileId: string;
   providerUpdatedAt: number | null;
   providerThreadId: string;
   sessionRevision: number;
 }>;
+
+/** Provider-bound local evidence emitted by every new compact recovery. */
+export type CloudProjectionRecoveryLocalAuthority = Readonly<{
+  bindingGeneration: number;
+  processGeneration: number;
+  profileId: string;
+  provider: Provider;
+  providerAccountId: ProviderAccountId;
+  providerUpdatedAt: number | null;
+  providerThreadId: string;
+  sessionRevision: number;
+}>;
+
+type DecodedCloudProjectionRecoveryLocalAuthority =
+  | CloudProjectionRecoveryLocalAuthority
+  | LegacyCloudProjectionRecoveryLocalAuthority;
+
+export function isProviderBoundCloudProjectionRecoveryLocalAuthority(
+  value: DecodedCloudProjectionRecoveryLocalAuthority,
+): value is CloudProjectionRecoveryLocalAuthority {
+  return "bindingGeneration" in value
+    && "processGeneration" in value
+    && "provider" in value
+    && "providerAccountId" in value;
+}
 
 export type CloudProjectionRecoveryBaselineTurn = Readonly<{
   bodyDigest: string;
@@ -202,7 +268,7 @@ type CloudProjectionRecoveryBaseFields = Readonly<{
   expectedTailDigest: string;
   idempotencyKey: string;
   lineageCommitment: string;
-  localAuthority: CloudProjectionRecoveryLocalAuthority;
+  localAuthority: DecodedCloudProjectionRecoveryLocalAuthority;
   requestDigest: string;
   replacementCacheId: string;
   requestedAt: number;
@@ -215,8 +281,10 @@ type CloudProjectionRecoveryBase = CloudProjectionRecoveryBaseFields
 
 type LegacyCloudProjectionRecoveryBase = Omit<
   CloudProjectionRecoveryBaseFields,
-  "baselineInteractions"
->;
+  "baselineInteractions" | "localAuthority"
+> & Readonly<{
+  localAuthority: LegacyCloudProjectionRecoveryLocalAuthority;
+}>;
 
 export type CloudProjectionRecoveryJournalEntry = CloudProjectionRecoveryBase & (
   | Readonly<{ phase: "prepared" | "effect_started" }>
@@ -932,6 +1000,7 @@ function sameCommandBase(
 ): boolean {
   return left.commandPublicId === right.commandPublicId
     && left.kind === right.kind
+    && JSON.stringify(left.localAuthority) === JSON.stringify(right.localAuthority)
     && left.localAuthorityDigest === right.localAuthorityDigest
     && left.payloadDigest === right.payloadDigest
     && left.requestCommitmentVersion === right.requestCommitmentVersion
@@ -993,6 +1062,9 @@ export function addCloudCommandJournalEntry(
 ): CloudDaemonJournalState {
   const canonical = parseCloudDaemonJournal(state);
   const canonicalEntry = parseCommand(entry);
+  if (canonicalEntry.localAuthority === undefined) {
+    throw new Error("Cloud command provider authority is unbound.");
+  }
   const current = canonical.commands.find((candidate) =>
     candidate.commandPublicId === canonicalEntry.commandPublicId);
   if (current !== undefined) {
@@ -1176,6 +1248,12 @@ export function completePendingCloudUsageAccount(
   });
 }
 
+/**
+ * Provider-unbound legacy entries are terminal quarantine candidates: no
+ * local or cloud path may replay them, and an offline blocker must not let
+ * them strand otherwise valid local session authority while the bridge waits
+ * to append their durable rejection receipts.
+ */
 export function hasUnsettledCompactProjectionRecovery(
   state: CloudDaemonJournalState,
   sessionPublicId: string,
@@ -1184,7 +1262,8 @@ export function hasUnsettledCompactProjectionRecovery(
     throw new Error("Cloud projection recovery session authority is invalid.");
   }
   return state.projectionRecoveries.some((entry) =>
-    entry.sessionPublicId === sessionPublicId);
+    entry.sessionPublicId === sessionPublicId
+    && isProviderBoundCloudProjectionRecoveryLocalAuthority(entry.localAuthority));
 }
 
 export function hasUnsettledCompactProjectionRecoveryForProfile(
@@ -1195,7 +1274,8 @@ export function hasUnsettledCompactProjectionRecoveryForProfile(
     throw new Error("Cloud projection recovery profile authority is invalid.");
   }
   return state.projectionRecoveries.some((entry) =>
-    entry.localAuthority.profileId === profileId);
+    entry.localAuthority.profileId === profileId
+    && isProviderBoundCloudProjectionRecoveryLocalAuthority(entry.localAuthority));
 }
 
 function assertProjectionRecoveryReceiptReadNotAborted(signal: AbortSignal): void {
@@ -1237,31 +1317,92 @@ export function supersedeCloudProjectionRecoveryForProviderDeletion(
 }
 
 /**
- * Read-only admission authority that remains available when cloud transport is not.
- * It never owns, clears, or advances recovery evidence.
+ * Legacy compact-recovery evidence did not name the provider-account binding.
+ * Such an unsettled row is readable, but it cannot safely resume or be rebound:
+ * the session's mutable current provider is not historical proof. Convert only
+ * those rows to an explicit terminal quarantine receipt before any effect.
+ */
+export function quarantineUnprovableProviderProjectionRecoveries(
+  state: CloudDaemonJournalState,
+  now: number,
+): CloudDaemonJournalState {
+  assertProjectionRecoveryNow(now);
+  const canonical = pruneExpiredCloudProjectionRecoveryReceipts(state, now);
+  const unprovable = canonical.projectionRecoveries.filter((entry) =>
+    !isProviderBoundCloudProjectionRecoveryLocalAuthority(entry.localAuthority));
+  if (unprovable.length === 0) return canonical;
+  const quarantinedIds = new Set(unprovable.map((entry) => entry.idempotencyKey));
+  const receipts = unprovable.map((entry) => parseCloudProjectionRecoveryTerminalReceipt({
+    idempotencyKey: entry.idempotencyKey,
+    phase: "rejected",
+    rejectionCode: unprovableProviderAuthorityProjectionRecoveryCode,
+    requestedAt: Math.max(entry.requestedAt, now),
+    sessionPublicId: entry.sessionPublicId,
+    sourceDevicePublicId: entry.sourceDevicePublicId,
+    userPublicId: entry.userPublicId,
+  }));
+  return parseCloudDaemonJournal({
+    ...canonical,
+    projectionRecoveries: canonical.projectionRecoveries.filter((entry) =>
+      !quarantinedIds.has(entry.idempotencyKey)),
+    projectionRecoveryReceipts: [...canonical.projectionRecoveryReceipts, ...receipts],
+  });
+}
+
+/**
+ * Local admission authority that remains available when cloud transport is not.
+ * It never owns, clears, or advances provider-bound recovery evidence. Its one
+ * bounded maintenance write terminalizes legacy active evidence that cannot
+ * prove which provider-account binding owned the effect.
  */
 export class CloudDaemonJournalRecoveryBlocker {
   readonly #journal: CloudDaemonJournalPort;
   readonly #isSessionTerminal: ((sessionPublicId: string) => boolean | Promise<boolean>) | undefined;
+  readonly #now: () => number;
 
   constructor(
     journal: CloudDaemonJournalPort,
     options: Readonly<{
       isSessionTerminal?: (sessionPublicId: string) => boolean | Promise<boolean>;
+      now?: () => number;
     }> = {},
   ) {
     this.#journal = journal;
     this.#isSessionTerminal = options.isSessionTerminal;
+    this.#now = options.now ?? Date.now;
+  }
+
+  async #readAfterProviderAuthorityQuarantine(): Promise<CloudDaemonJournalState> {
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const observed = await this.#journal.read();
+      if (observed.state.projectionRecoveries.every((entry) =>
+        isProviderBoundCloudProjectionRecoveryLocalAuthority(entry.localAuthority))) {
+        return observed.state;
+      }
+      const next = quarantineUnprovableProviderProjectionRecoveries(
+        observed.state,
+        this.#now(),
+      );
+      const committed = await this.#journal.compareAndSwap(observed.generation, next);
+      if (committed !== null) return committed.state;
+    }
+    throw new Error("Cloud projection recovery journal changed concurrently.");
   }
 
   async isCompactProjectionRecoveryUnsettled(sessionPublicId: string): Promise<boolean> {
-    const observed = await this.#journal.read();
-    return hasUnsettledCompactProjectionRecovery(observed.state, sessionPublicId);
+    if (!isOpaqueIdentifier(sessionPublicId)) {
+      throw new Error("Cloud projection recovery session authority is invalid.");
+    }
+    const state = await this.#readAfterProviderAuthorityQuarantine();
+    return hasUnsettledCompactProjectionRecovery(state, sessionPublicId);
   }
 
   async isCompactProjectionRecoveryUnsettledForProfile(profileId: string): Promise<boolean> {
-    const observed = await this.#journal.read();
-    return hasUnsettledCompactProjectionRecoveryForProfile(observed.state, profileId);
+    if (!isOpaqueIdentifier(profileId)) {
+      throw new Error("Cloud projection recovery profile authority is invalid.");
+    }
+    const state = await this.#readAfterProviderAuthorityQuarantine();
+    return hasUnsettledCompactProjectionRecoveryForProfile(state, profileId);
   }
 
   async readCompactProjectionRecoveryReceipt(input: Readonly<{
@@ -1276,9 +1417,9 @@ export class CloudDaemonJournalRecoveryBlocker {
     if (!isUuidV7(input.idempotencyKey) || !isOpaqueIdentifier(input.sessionPublicId)) {
       throw new Error("Cloud projection recovery receipt selector is invalid.");
     }
-    const observed = await this.#journal.read();
+    const state = await this.#readAfterProviderAuthorityQuarantine();
     assertProjectionRecoveryReceiptReadNotAborted(input.signal);
-    const receipt = observed.state.projectionRecoveryReceipts.find((entry) =>
+    const receipt = state.projectionRecoveryReceipts.find((entry) =>
       entry.idempotencyKey === input.idempotencyKey);
     if (receipt === undefined) return { status: "absent" };
     if (receipt.sessionPublicId !== input.sessionPublicId) return { status: "conflict" };
@@ -1450,6 +1591,45 @@ function parseDeviceCommand(
     : { ...terminalEntry, requestCommitmentVersion };
 }
 
+function parseCommandLocalAuthority(value: unknown): CloudCommandLocalAuthority {
+  if (
+    !isRecord(value)
+    || !hasExactKeys(value, [
+      "bindingGeneration",
+      "localSessionId",
+      "processGeneration",
+      "profileId",
+      "provider",
+      "providerAccountId",
+      "providerThreadId",
+    ])
+    || !isOpaqueIdentifier(value.localSessionId)
+    || typeof value.providerThreadId !== "string"
+    || value.providerThreadId.length < 1
+    || value.providerThreadId.length > 200
+    || /[\0\r\n]/u.test(value.providerThreadId)
+  ) throw new Error("Cloud daemon journal is corrupt.");
+  const providerAuthority = providerAccountAuthoritySchema.safeParse({
+    bindingGeneration: value.bindingGeneration,
+    processGeneration: value.processGeneration,
+    profileId: value.profileId,
+    provider: value.provider,
+    providerAccountId: value.providerAccountId,
+  });
+  if (!providerAuthority.success || providerAuthority.data.processGeneration < 1) {
+    throw new Error("Cloud daemon journal is corrupt.");
+  }
+  return {
+    bindingGeneration: providerAuthority.data.bindingGeneration,
+    localSessionId: value.localSessionId,
+    processGeneration: providerAuthority.data.processGeneration,
+    profileId: providerAuthority.data.profileId,
+    provider: providerAuthority.data.provider,
+    providerAccountId: providerAuthority.data.providerAccountId,
+    providerThreadId: value.providerThreadId,
+  };
+}
+
 function parseCommand(value: unknown): CloudCommandJournalEntry {
   if (!isRecord(value)) throw new Error("Cloud daemon journal is corrupt.");
   const terminal = value.phase === "terminal";
@@ -1458,7 +1638,7 @@ function parseCommand(value: unknown): CloudCommandJournalEntry {
       || value.requestCommitmentVersion === 3
     ? value.requestCommitmentVersion
     : null;
-  const expected = terminal
+  const legacyExpected = terminal
     ? [
         "authority",
         "commandPublicId",
@@ -1486,10 +1666,18 @@ function parseCommand(value: unknown): CloudCommandJournalEntry {
           : []),
         "sessionPublicId",
       ];
+  const providerBoundExpected = [
+    ...legacyExpected,
+    "localAuthority",
+  ];
   const authority = parseAuthorityTuple(value.authority);
   const kind = parseCommandKind(value.kind);
+  const hasProviderAuthorityKey = "localAuthority" in value;
+  const localAuthority = !hasProviderAuthorityKey || value.localAuthority === null
+    ? value.localAuthority as null | undefined
+    : parseCommandLocalAuthority(value.localAuthority);
   if (
-    !hasExactKeys(value, expected)
+    (!hasExactKeys(value, legacyExpected) && !hasExactKeys(value, providerBoundExpected))
     || authority === null
     || !isUuidV7(value.commandPublicId)
     || kind === null
@@ -1501,16 +1689,35 @@ function parseCommand(value: unknown): CloudCommandJournalEntry {
     || (value.phase !== "prepared"
       && value.phase !== "effect_started"
       && value.phase !== "terminal")
+    || (hasProviderAuthorityKey && localAuthority === undefined)
     || !isOpaqueIdentifier(value.sessionPublicId)
   ) throw new Error("Cloud daemon journal is corrupt.");
-  const base = {
-    authority,
-    commandPublicId: value.commandPublicId,
-    kind,
-    localAuthorityDigest: value.localAuthorityDigest,
-    payloadDigest: value.payloadDigest,
-    sessionPublicId: value.sessionPublicId,
-  };
+  if (
+    isProviderBoundCloudCommandLocalAuthority(localAuthority)
+    && localAuthority.localSessionId !== value.sessionPublicId
+  ) throw new Error("Cloud daemon journal is corrupt.");
+  if (
+    isProviderBoundCloudCommandLocalAuthority(localAuthority)
+    && cloudCommandLocalAuthorityDigest(localAuthority) !== value.localAuthorityDigest
+  ) throw new Error("Cloud daemon journal is corrupt.");
+  const base = hasProviderAuthorityKey
+    ? {
+        authority,
+        commandPublicId: value.commandPublicId,
+        kind,
+        localAuthority: localAuthority ?? null,
+        localAuthorityDigest: value.localAuthorityDigest,
+        payloadDigest: value.payloadDigest,
+        sessionPublicId: value.sessionPublicId,
+      }
+    : {
+        authority,
+        commandPublicId: value.commandPublicId,
+        kind,
+        localAuthorityDigest: value.localAuthorityDigest,
+        payloadDigest: value.payloadDigest,
+        sessionPublicId: value.sessionPublicId,
+      };
   const requester = value.requestingDevicePublicId as string;
   if (value.phase === "prepared") {
     return requestCommitmentVersion === null
@@ -1610,17 +1817,29 @@ function parsePendingUsageAccount(value: unknown): PendingCloudUsageAccount | nu
 
 function parseProjectionRecoveryLocalAuthority(
   value: unknown,
-): CloudProjectionRecoveryLocalAuthority {
+): DecodedCloudProjectionRecoveryLocalAuthority {
+  const legacyKeys = [
+    "profileGeneration",
+    "profileId",
+    "providerThreadId",
+    "providerUpdatedAt",
+    "sessionRevision",
+  ] as const;
+  const providerBoundKeys = [
+    "bindingGeneration",
+    "processGeneration",
+    "profileId",
+    "provider",
+    "providerAccountId",
+    "providerThreadId",
+    "providerUpdatedAt",
+    "sessionRevision",
+  ] as const;
+  if (!isRecord(value)) throw new Error("Cloud daemon journal is corrupt.");
+  const legacy = hasExactKeys(value, legacyKeys);
+  const providerBound = hasExactKeys(value, providerBoundKeys);
   if (
-    !isRecord(value)
-    || !hasExactKeys(value, [
-      "profileGeneration",
-      "profileId",
-      "providerThreadId",
-      "providerUpdatedAt",
-      "sessionRevision",
-    ])
-    || !isSafePositiveInteger(value.profileGeneration)
+    (!legacy && !providerBound)
     || !isOpaqueIdentifier(value.profileId)
     || (value.providerUpdatedAt !== null && !isSafeNonNegativeInteger(value.providerUpdatedAt))
     || typeof value.providerThreadId !== "string"
@@ -1629,6 +1848,31 @@ function parseProjectionRecoveryLocalAuthority(
     || /[\0\r\n]/u.test(value.providerThreadId)
     || !isSafePositiveInteger(value.sessionRevision)
   ) throw new Error("Cloud daemon journal is corrupt.");
+  if (providerBound) {
+    const authority = providerAccountAuthoritySchema.safeParse({
+      bindingGeneration: value.bindingGeneration,
+      processGeneration: value.processGeneration,
+      profileId: value.profileId,
+      provider: value.provider,
+      providerAccountId: value.providerAccountId,
+    });
+    if (!authority.success || authority.data.processGeneration < 1) {
+      throw new Error("Cloud daemon journal is corrupt.");
+    }
+    return {
+      bindingGeneration: authority.data.bindingGeneration,
+      processGeneration: authority.data.processGeneration,
+      profileId: authority.data.profileId,
+      provider: authority.data.provider,
+      providerAccountId: authority.data.providerAccountId,
+      providerUpdatedAt: value.providerUpdatedAt,
+      providerThreadId: value.providerThreadId,
+      sessionRevision: value.sessionRevision,
+    };
+  }
+  if (!isSafePositiveInteger(value.profileGeneration)) {
+    throw new Error("Cloud daemon journal is corrupt.");
+  }
   return {
     profileGeneration: value.profileGeneration,
     profileId: value.profileId,
@@ -1868,7 +2112,21 @@ function parseLegacyCloudProjectionRecoveryEntry(
       && value.phase !== "applied"
       && value.phase !== "rejected")
   ) throw new Error("Cloud daemon journal is corrupt.");
-  const base = parseProjectionRecoveryBaseFields(value);
+  const parsedBase = parseProjectionRecoveryBaseFields(value);
+  if (isProviderBoundCloudProjectionRecoveryLocalAuthority(parsedBase.localAuthority)) {
+    throw new Error("Cloud daemon journal is corrupt.");
+  }
+  const {
+    baselineInteractions,
+    localAuthority,
+    ...legacyFields
+  } = parsedBase;
+  // The legacy shape has no interaction-authority baseline.
+  void baselineInteractions;
+  const base: LegacyCloudProjectionRecoveryBase = {
+    ...legacyFields,
+    localAuthority,
+  };
   if (value.phase === "prepared" || value.phase === "effect_started") {
     return { ...base, phase: value.phase };
   }
@@ -2009,6 +2267,12 @@ function sameCloudProjectionRecoveryBase(
   left: CloudProjectionRecoveryJournalEntry,
   right: CloudProjectionRecoveryJournalEntry,
 ): boolean {
+  const leftProviderBound = isProviderBoundCloudProjectionRecoveryLocalAuthority(
+    left.localAuthority,
+  );
+  const rightProviderBound = isProviderBoundCloudProjectionRecoveryLocalAuthority(
+    right.localAuthority,
+  );
   return sameAuthority(left.authority, right.authority)
     && left.epochPublicId === right.epochPublicId
     && left.expectedCompactStreamEpoch === right.expectedCompactStreamEpoch
@@ -2016,11 +2280,19 @@ function sameCloudProjectionRecoveryBase(
     && left.expectedTailDigest === right.expectedTailDigest
     && left.idempotencyKey === right.idempotencyKey
     && left.lineageCommitment === right.lineageCommitment
-    && left.localAuthority.profileGeneration === right.localAuthority.profileGeneration
     && left.localAuthority.profileId === right.localAuthority.profileId
     && left.localAuthority.providerUpdatedAt === right.localAuthority.providerUpdatedAt
     && left.localAuthority.providerThreadId === right.localAuthority.providerThreadId
     && left.localAuthority.sessionRevision === right.localAuthority.sessionRevision
+    && leftProviderBound === rightProviderBound
+    && (leftProviderBound
+      ? rightProviderBound
+        && left.localAuthority.bindingGeneration === right.localAuthority.bindingGeneration
+        && left.localAuthority.processGeneration === right.localAuthority.processGeneration
+        && left.localAuthority.provider === right.localAuthority.provider
+        && left.localAuthority.providerAccountId === right.localAuthority.providerAccountId
+      : !rightProviderBound
+        && left.localAuthority.profileGeneration === right.localAuthority.profileGeneration)
     && left.requestDigest === right.requestDigest
     && left.replacementCacheId === right.replacementCacheId
     && left.requestedAt === right.requestedAt
@@ -2267,7 +2539,11 @@ function parseCloudDaemonJournalStructure(value: unknown): CloudDaemonJournalSta
 function legacyProjectionRecoveryForStorage(
   entry: CloudProjectionRecoveryJournalEntry,
 ): LegacyCloudProjectionRecoveryJournalEntry | null {
-  if (entry.userPublicId !== null || (entry.baselineInteractions ?? []).length > 0) return null;
+  if (
+    entry.userPublicId !== null
+    || (entry.baselineInteractions ?? []).length > 0
+    || isProviderBoundCloudProjectionRecoveryLocalAuthority(entry.localAuthority)
+  ) return null;
   return Object.fromEntries(Object.entries(entry).filter(([key]) =>
     key !== "baselineInteractions"
     && key !== "sourceDevicePublicId"
@@ -2467,6 +2743,9 @@ export function addCloudProjectionRecovery(
   const canonicalEntry = parseCloudProjectionRecoveryEntry(entry);
   if (!isIdentityBoundCloudProjectionRecovery(canonicalEntry)) {
     throw new Error("Cloud projection recovery identity is unbound.");
+  }
+  if (!isProviderBoundCloudProjectionRecoveryLocalAuthority(canonicalEntry.localAuthority)) {
+    throw new Error("Cloud projection recovery provider authority is unbound.");
   }
   const idempotencyTimestamp = uuidV7Timestamp(canonicalEntry.idempotencyKey);
   const cutoff = now - cloudProjectionRecoveryWindowMs;

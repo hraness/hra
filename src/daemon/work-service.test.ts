@@ -43,7 +43,7 @@ import type {
   RuntimeStartReview,
 } from "./ports";
 import { SessionEventCursorCodec } from "./session-event-cursor";
-import { CommandFailure, HraService } from "./service";
+import { CommandFailure, OompaService } from "./service";
 
 const signal = new AbortController().signal;
 
@@ -71,6 +71,7 @@ const effectiveRuntimeProfile = (
 class WorkRuntime implements CodexRuntimePort {
   readonly provider = "codex" as const;
   discardRuntimeReview(): void {}
+  beforeReviewSessionReturn?: () => Promise<void>;
   beforeStartSessionReturn?: () => Promise<void>;
   startSessionCount = 0;
   endSessionCount = 0;
@@ -108,6 +109,7 @@ class WorkRuntime implements CodexRuntimePort {
   async reviewSessionStart(
     input: Parameters<CodexRuntimePort["reviewSessionStart"]>[0],
   ): Promise<RuntimeStartReview> {
+    await this.beforeReviewSessionReturn?.();
     return {
       reviewId: `session-review-${String(this.#threadSequence + 1)}`,
       kind: "session_start",
@@ -300,27 +302,31 @@ class CurrentDaemonAuthority {
 }
 
 type Fixture = Readonly<{
-  createService: () => HraService;
+  createService: () => OompaService;
+  daemonGeneration: number;
+  daemonBootId: string;
   eventCursors: SessionEventCursorCodec;
   paths: ReturnType<typeof resolveStatePaths>;
   projectRoot: string;
   runtime: WorkRuntime;
-  service: HraService;
+  service: OompaService;
   store: StateStore;
   workStore: WorkStore;
 }>;
 
 const fixtures: Fixture[] = [];
 const fixtureRoots: string[] = [];
+const ownedCaseTeardowns: Array<() => Promise<void>> = [];
 
 afterEach(async () => {
+  for (const teardown of ownedCaseTeardowns.splice(0)) await teardown();
   for (const value of fixtures.splice(0)) value.store.close();
   await Promise.all(fixtureRoots.splice(0).map(async (root) =>
     await rm(root, { force: true, recursive: true })));
 });
 
-async function fixture(): Promise<Fixture> {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-work-service-")));
+async function fixture(registerStore?: (store: StateStore) => void): Promise<Fixture> {
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-work-service-")));
   fixtureRoots.push(home);
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   const projectRoot = join(home, "Documents");
@@ -328,13 +334,13 @@ async function fixture(): Promise<Fixture> {
   await initializeStatePaths(paths);
   let observedAt = 10_000;
   const store = new StateStore(paths, { now: () => observedAt++ });
-  const daemonGeneration = store.nextDaemonGeneration(
-    `boot_${crypto.randomUUID().replaceAll("-", "")}`,
-  );
+  registerStore?.(store);
+  const daemonBootId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
+  const daemonGeneration = store.nextDaemonGeneration(daemonBootId);
   const runtime = new WorkRuntime();
   const eventCursors = new SessionEventCursorCodec(SessionEventCursorCodec.generateKey());
   const workCapabilities = new WorkCapabilityCodec(WorkCapabilityCodec.generateKey());
-  const createService = (): HraService => new HraService({
+  const createService = (): OompaService => new OompaService({
       store,
       paths,
       codex: runtime,
@@ -343,6 +349,7 @@ async function fixture(): Promise<Fixture> {
       eventCursors,
       workCapabilities,
       daemonGeneration,
+      daemonBootId,
       now: () => observedAt++,
       requestStop: () => undefined,
     });
@@ -378,6 +385,8 @@ async function fixture(): Promise<Fixture> {
   );
   const value = {
     createService,
+    daemonGeneration,
+    daemonBootId,
     eventCursors,
     paths,
     projectRoot,
@@ -388,6 +397,31 @@ async function fixture(): Promise<Fixture> {
   };
   fixtures.push(value);
   return value;
+}
+
+function ownedWorkServiceCase(runCase: (value: Fixture) => Promise<void>): Promise<void> {
+  let store: StateStore | undefined;
+  let value: Fixture | undefined;
+  const setup = Promise.resolve().then(() => fixture((created) => { store = created; }));
+  const caseTask = setup.then(async (created) => {
+    value = created;
+    await runCase(created);
+  });
+  // Each request is awaited by the case or its actor helpers. Join setup and
+  // that raw case before closing the service, storage, or temporary root.
+  const joined = Promise.allSettled([setup, caseTask]);
+  let teardownTask: Promise<void> | undefined;
+  const teardown = (): Promise<void> => {
+    teardownTask ??= joined.then(async () => {
+      if (value === undefined) store?.close();
+      else await value.service.close();
+    });
+    return teardownTask;
+  };
+  ownedCaseTeardowns.push(teardown);
+  const result = caseTask.finally(teardown);
+  void result.catch(() => undefined);
+  return result;
 }
 
 type Actor = Readonly<{
@@ -569,14 +603,26 @@ function prepareNestedSend(
   effect: Extract<WorkPreparedEffect, { kind: "dispatch" }>,
 ) {
   const message = workPreparedEffectMessage(effect);
+  const sessionAuthority = value.store.requireSessionProviderAuthority(
+    effect.targetSessionId,
+  );
   return {
-    attempt: value.store.prepareMutation({
+    attempt: value.store.prepareSessionInputMutation({
       kind: "session.send",
-      authorityId: effect.targetSessionId,
-      authorityGeneration: effect.accountGeneration,
-      request: { message },
+      sessionId: effect.targetSessionId,
+      message,
+      attachments: [],
       idempotencyKey: effect.nestedMutationKey,
-    }),
+      providerAuthority: {
+        provider: sessionAuthority.provider,
+        providerAccountId: sessionAuthority.providerAccountId,
+        profileId: sessionAuthority.profileId,
+        bindingGeneration: sessionAuthority.bindingGeneration,
+        processGeneration: effect.accountGeneration,
+      },
+      daemonGeneration: value.daemonGeneration,
+      bootId: value.daemonBootId,
+    }).attempt,
     message,
   };
 }
@@ -592,9 +638,16 @@ function beginNestedSend(
   if (session.state !== "idle" && session.state !== "active" && session.state !== "terminal") {
     throw new Error("Expected an observed provider session.");
   }
+  const providerAuthority = value.store.requireProviderAccountAuthority(
+    actor.accountId,
+    "codex",
+  );
   const runtimeProfile = effectiveRuntimeProfile({
     id: actor.accountId,
     generation: effect.accountGeneration,
+    provider: providerAuthority.provider,
+    providerAccountId: providerAuthority.providerAccountId,
+    bindingGeneration: providerAuthority.bindingGeneration,
     codexHome: value.paths.profiles,
     desktopUserData: value.paths.profiles,
   });
@@ -602,6 +655,10 @@ function beginNestedSend(
     attemptId: nested.attempt.id,
     sessionId: actor.sessionId,
     profileGeneration: effect.accountGeneration,
+    providerAuthority,
+    attachments: [],
+    daemonGeneration: value.daemonGeneration,
+    bootId: value.daemonBootId,
     transcript: {
       accountId: actor.accountId,
       providerGeneration: effect.accountGeneration,
@@ -623,10 +680,10 @@ function beginNestedSend(
     },
     message: nested.message,
   });
-  return { runtimeProfile, session };
+  return { providerAuthority, runtimeProfile, session };
 }
 
-describe("HraService work protocol", () => {
+describe("OompaService work protocol", () => {
   test("preserves v1 replay identity while requiring current v2 source for rebound creation", async () => {
     const value = await fixture();
     const actor = await createActor(value);
@@ -759,9 +816,9 @@ describe("HraService work protocol", () => {
     );
     expect(JSON.parse(value.runtime.startTurnCalls[0]!.message)).toMatchObject({
       control: {
-        apply: { argv: ["hra", "work", "apply", "--input-stdin"] },
+        apply: { argv: ["oompa", "work", "apply", "--input-stdin"] },
         poll: {
-          argv: ["hra", "work", "poll", created.work.id, "--actor", actor.sessionId],
+          argv: ["oompa", "work", "poll", created.work.id, "--actor", actor.sessionId],
         },
         requests: {
           checkpoint: {
@@ -1029,6 +1086,7 @@ describe("HraService work protocol", () => {
       attemptId: nested.attempt.id,
       sessionId: actor.sessionId,
       expectedSessionRevision: begun.session.revision,
+      providerAuthority: begun.providerAuthority,
       message: nested.message,
       providerConnectionId: null,
       providerGeneration: prepared.effect.accountGeneration,
@@ -1264,10 +1322,10 @@ describe("HraService work protocol", () => {
     });
   });
 
-  test("refuses a cross-account provider switch before effects while the session belongs to live Work", async () => {
+  test.each(["before review", "during review"] as const)("refuses a provider switch before effects when the session gains a Work attempt %s", async (timing) => {
     const value = await fixture();
     const actor = await createActor(value);
-    await createJoinClaim(value, actor);
+    if (timing === "before review") await createJoinClaim(value, actor);
     const target = await value.service.execute(
       { kind: "account.add", label: "Switch target" },
       { signal },
@@ -1278,6 +1336,14 @@ describe("HraService work protocol", () => {
     );
     const switchKey = nextKey();
     const startsBefore = value.runtime.startSessionCount;
+    let admittedDuringReview = false;
+    if (timing === "during review") {
+      value.runtime.beforeReviewSessionReturn = async () => {
+        delete value.runtime.beforeReviewSessionReturn;
+        await createJoinClaim(value, actor);
+        admittedDuringReview = true;
+      };
+    }
 
     await expect(value.service.execute({
       kind: "session.switch",
@@ -1294,6 +1360,7 @@ describe("HraService work protocol", () => {
     expect(value.runtime.startSessionCount).toBe(startsBefore);
     expect(value.runtime.startTurnCalls).toHaveLength(0);
     expect(value.runtime.endSessionCount).toBe(0);
+    expect(admittedDuringReview).toBe(timing === "during review");
     expect(value.store.readMutation(switchKey)).toBeNull();
     expect(value.store.requireSession(actor.sessionId)).toMatchObject({
       profileId: actor.accountId,
@@ -1460,9 +1527,9 @@ describe("HraService work protocol", () => {
     expect(value.runtime.endSessionCount).toBe(1);
   });
 
-  test("provider disconnect and service close atomically retire claimed, running, and recovery work", async () => {
-    for (const retirementMode of ["provider_disconnect", "service_close"] as const) {
-      const value = await fixture();
+  test.each(["provider_disconnect", "service_close"] as const)(
+    "provider disconnect and service close atomically retire claimed, running, and recovery work: %s",
+    (retirementMode) => ownedWorkServiceCase(async (value) => {
       const claimedActor = await createActor(value);
       const runningActor = await createSiblingActor(value, claimedActor);
       const recoveryActor = await createSiblingActor(value, claimedActor);
@@ -1505,11 +1572,18 @@ describe("HraService work protocol", () => {
       const profileBefore = value.store.requireProfileById(claimedActor.accountId);
       if (retirementMode === "provider_disconnect") {
         const owned = profilePaths(value.paths, profileBefore.id);
+        const providerAuthority = value.store.requireProviderAccountAuthority(
+          profileBefore.id,
+          "codex",
+        );
         await value.service.observeCodexFact({
           id: profileBefore.id,
           generation: profileBefore.processGeneration,
           codexHome: owned.codexHome,
           desktopUserData: owned.desktopUserData,
+          provider: providerAuthority.provider,
+          providerAccountId: providerAuthority.providerAccountId,
+          bindingGeneration: providerAuthority.bindingGeneration,
         }, {
           type: "providerDisconnected",
           connectionId: "30000000-0000-4000-8000-000000000901",
@@ -1536,8 +1610,8 @@ describe("HraService work protocol", () => {
           status: "unknown",
           revision: recoveryBefore?.revision,
         });
-    }
-  });
+    }),
+  );
 
   test("accepts queued and steered signals with exact nested receipts", async () => {
     const value = await fixture();
@@ -1709,7 +1783,8 @@ describe("HraService work protocol", () => {
 
     const [nestedMutation] = value.store.listUnsettledMutations({ sessionId: actor.sessionId });
     if (
-      nestedMutation?.state !== "ambiguous"
+      nestedMutation?.format !== "legacy"
+      || nestedMutation.state !== "ambiguous"
       || nestedMutation.evidence?.evidence.kind !== "session.send"
     ) throw new Error("Expected one exact ambiguous session.send mutation.");
     const session = value.store.requireSession(actor.sessionId);

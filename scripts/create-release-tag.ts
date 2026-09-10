@@ -17,7 +17,7 @@ const defaultBranch = "main";
 const maximumOutputBytes = 512 * 1_024;
 const stableVersionPattern = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/u;
 const shaPattern = /^[0-9a-f]{40}$/u;
-const exactOriginPattern = /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)(?:hraness\/hra)(?:\.git)?$/u;
+const exactOriginPattern = /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)(?:hraness\/oompa)(?:\.git)?$/u;
 
 type CommandResult = Readonly<{ exitCode: number; stderr: string; stdout: string }>;
 type CommandRunner = (command: readonly string[]) => CommandResult;
@@ -417,7 +417,7 @@ export async function createReleaseTag(
   );
   if (remoteMain !== sha) throw new Error("Release tag creation requires HEAD to equal current remote main.");
 
-  const manifestSchema = z.object({ name: z.literal("@hraness/hra"), version: z.string() });
+  const manifestSchema = z.object({ name: z.literal("@hraness/oompa"), version: z.string() });
   const committedManifest = manifestSchema.parse(requireJson(
     runner,
     ["git", "show", "HEAD:package.json"],

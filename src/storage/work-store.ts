@@ -16,9 +16,21 @@ import {
   type Provider,
 } from "../domain/presets";
 import { isUuidV7 } from "../domain/uuid-v7";
+import { providerAccountAuthoritySchema } from "../domain/provider-accounts";
 import { workReadSuccessWireBytes } from "../domain/terminal-json";
 import { workPreparedEffectMessage } from "../domain/work-message";
 import { MESSAGE_MAX_BYTES, sessionIdSchema } from "../domain/values";
+import { assertLegacyMutationOwnership, SessionSendOwnershipError } from "./session-send-owner";
+import { normalizeSchemaSql } from "./schema-cohort";
+import {
+  CANONICAL_40_WORK_AUTHORITY_TRIGGER_DEFINITIONS,
+  CANONICAL_49_WORK_PRESET_GUARD_DEFINITIONS,
+  CANONICAL_WORK_NON_AUTHORITY_TRIGGER_DEFINITIONS,
+} from "./canonical49-work-schema";
+import {
+  CANONICAL_WORK_CLOCK_SEED_SQL,
+  CANONICAL_WORK_CORE_DEFINITIONS,
+} from "./canonical-work-core-schema";
 import {
   verifyWorkEvidence,
   WorkEvidenceVerificationError,
@@ -66,6 +78,8 @@ import {
   workEventPageSchema,
   workActionCursorPayloadSchema,
   workCapabilitySchema,
+  workIdSchema,
+  workSignalIdSchema,
   workNestedEffectReceiptSchema,
   workOperationResultSchema,
   workOperationSchema,
@@ -133,16 +147,33 @@ const currentWorkSessionAuthorityExistsSql = (
   SELECT 1
   FROM sessions AS authority_session
   JOIN profiles AS authority_profile ON authority_profile.id=authority_session.profile_id
+  JOIN session_provider_authorities AS captured_authority
+    ON captured_authority.session_id=authority_session.id
+      AND captured_authority.profile_id=authority_session.profile_id
+      AND captured_authority.provider=authority_session.provider_v39
+  JOIN provider_accounts AS exact_account
+    ON exact_account.id=captured_authority.provider_account_id
+      AND exact_account.profile_id=captured_authority.profile_id
+      AND exact_account.provider=captured_authority.provider
+      AND exact_account.binding_generation=captured_authority.binding_generation
+      AND exact_account.process_generation=captured_authority.process_generation
   LEFT JOIN session_provider_account_authorities AS provider_authority
     ON provider_authority.session_id=authority_session.id
       AND provider_authority.provider=authority_session.provider_v39
   WHERE authority_session.id=${sessionIdExpression}
     AND authority_session.state IN ('active','idle')
+    AND authority_profile.state!='removed'
+    AND (exact_account.readiness='signed_in' OR (
+      captured_authority.provider IN ('claude','devin')
+      AND exact_account.readiness='unverified'
+      AND captured_authority.routing_provenance='explicit'
+    ))
     ${generationPredicate.length === 0 ? "" : `AND (${generationPredicate})`}
     AND NOT EXISTS (
       SELECT 1 FROM provider_runtime_account_revocations AS authority_revocation
       WHERE authority_revocation.profile_id=authority_session.profile_id
-        AND authority_revocation.profile_generation=authority_profile.process_generation
+        AND (authority_revocation.provider='claude'
+          OR authority_revocation.profile_generation=captured_authority.process_generation)
         AND authority_revocation.provider=authority_session.provider_v39
         AND authority_revocation.runtime_scope=provider_authority.runtime_scope
         AND (
@@ -172,7 +203,7 @@ const currentWorkSessionAuthorityExistsSql = (
     )
     AND (
       (authority_session.provider_v39='claude'
-        AND authority_profile.state IN ('signed_in','signed_out'))
+        AND authority_profile.state!='removed')
       OR (authority_session.provider_v39='codex'
         AND authority_profile.state='signed_in'
         AND authority_profile.provider_email IS NOT NULL
@@ -185,10 +216,141 @@ const currentWorkSessionAuthorityExistsSql = (
             AND legacy_authority.account_key=lower(trim(authority_profile.provider_email))
         ))
       OR (authority_session.provider_v39='devin'
-        AND authority_profile.state IN ('signed_in','signed_out'))
+        AND authority_profile.state!='removed')
     )
 )`;
 
+const workSignalProviderAuthorityObjects = [
+  { name: "work_signal_provider_authorities", type: "table", sql: `CREATE TABLE IF NOT EXISTS work_signal_provider_authorities (
+    signal_id TEXT PRIMARY KEY REFERENCES work_signals(id) ON DELETE CASCADE,
+    work_id TEXT NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+    target_session_id TEXT NOT NULL REFERENCES sessions(id),
+    provider_account_id TEXT NOT NULL REFERENCES provider_accounts(id),
+    profile_id TEXT NOT NULL REFERENCES profiles(id),
+    provider TEXT NOT NULL CHECK(provider IN ('codex','claude','devin')),
+    binding_generation INTEGER NOT NULL CHECK(binding_generation BETWEEN 1 AND 9007199254740991),
+    process_generation INTEGER NOT NULL CHECK(process_generation BETWEEN 0 AND 9007199254740991),
+    session_authority_revision INTEGER NOT NULL CHECK(session_authority_revision BETWEEN 1 AND 9007199254740991),
+    authority_digest TEXT NOT NULL CHECK(length(authority_digest)=64 AND authority_digest NOT GLOB '*[^a-f0-9]*'),
+    provenance TEXT NOT NULL CHECK(provenance='signal_prepare'),
+    recorded_at INTEGER NOT NULL CHECK(recorded_at BETWEEN 0 AND 9007199254740991)
+  ) STRICT;` },
+  { name: "work_signal_provider_authority_insert_guard", type: "trigger", sql: `CREATE TRIGGER IF NOT EXISTS work_signal_provider_authority_insert_guard
+    BEFORE INSERT ON work_signal_provider_authorities
+    WHEN NOT EXISTS (
+      SELECT 1 FROM work_signals signal
+      JOIN sessions session ON session.id=signal.to_session_id
+      JOIN session_provider_authorities captured ON captured.session_id=session.id
+      JOIN provider_accounts account ON account.id=captured.provider_account_id
+      JOIN profiles profile ON profile.id=session.profile_id
+      WHERE signal.id=NEW.signal_id AND signal.work_id=NEW.work_id
+        AND signal.to_session_id=NEW.target_session_id
+        AND session.profile_id=NEW.profile_id AND session.provider_v39=NEW.provider
+        AND session.state IN ('active','idle') AND profile.state!='removed'
+        AND captured.provider_account_id=NEW.provider_account_id
+        AND captured.profile_id=NEW.profile_id AND captured.provider=NEW.provider
+        AND captured.binding_generation=NEW.binding_generation
+        AND captured.process_generation=NEW.process_generation
+        AND captured.authority_revision=NEW.session_authority_revision
+        AND account.profile_id=NEW.profile_id AND account.provider=NEW.provider
+        AND account.binding_generation=NEW.binding_generation
+        AND account.process_generation=NEW.process_generation AND account.readiness!='removed'
+    )
+    BEGIN SELECT RAISE(ABORT,'WORK_SIGNAL_PROVIDER_AUTHORITY_MISMATCH'); END;` },
+  { name: "work_signal_provider_authority_no_update", type: "trigger", sql: `CREATE TRIGGER IF NOT EXISTS work_signal_provider_authority_no_update
+    BEFORE UPDATE ON work_signal_provider_authorities
+    BEGIN SELECT RAISE(ABORT,'WORK_SIGNAL_PROVIDER_AUTHORITY_IMMUTABLE'); END;` },
+  { name: "work_signal_provider_authority_no_delete", type: "trigger", sql: `CREATE TRIGGER IF NOT EXISTS work_signal_provider_authority_no_delete
+    BEFORE DELETE ON work_signal_provider_authorities
+    WHEN NOT EXISTS (SELECT 1 FROM work_purge_authority WHERE work_id=OLD.work_id)
+    BEGIN SELECT RAISE(ABORT,'WORK_SIGNAL_PROVIDER_AUTHORITY_IMMUTABLE'); END;` },
+] as const;
+
+/** Additive provider-account migration objects; never part of the released Work v1 wire. */
+export const WORK_SIGNAL_PROVIDER_AUTHORITY_SCHEMA_SQL = workSignalProviderAuthorityObjects
+  .map((object) => object.sql).join("\n");
+
+const workSignalProviderAuthorityRowSchema = z.object({
+  signal_id: workSignalIdSchema,
+  work_id: workIdSchema,
+  target_session_id: sessionIdSchema,
+  provider_account_id: z.string(),
+  profile_id: z.string(),
+  provider: z.enum(["codex", "claude", "devin"]),
+  binding_generation: z.number().int().positive().safe(),
+  process_generation: z.number().int().nonnegative().safe(),
+  session_authority_revision: z.number().int().positive().safe(),
+  authority_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  provenance: z.literal("signal_prepare"),
+  recorded_at: z.number().int().nonnegative().safe(),
+}).strict();
+type WorkSignalProviderAuthorityRow = z.infer<typeof workSignalProviderAuthorityRowSchema>;
+const signalProviderAuthorityDigest = (row: Omit<WorkSignalProviderAuthorityRow, "authority_digest">): string =>
+  createHash("sha256").update(JSON.stringify({
+    domain: "hra:work-signal-provider-authority:v1",
+    signalId: row.signal_id,
+    workId: row.work_id,
+    targetSessionId: row.target_session_id,
+    authority: providerAccountAuthoritySchema.parse({
+      providerAccountId: row.provider_account_id,
+      profileId: row.profile_id,
+      provider: row.provider,
+      bindingGeneration: row.binding_generation,
+      processGeneration: row.process_generation,
+    }),
+    sessionAuthorityRevision: row.session_authority_revision,
+    provenance: row.provenance,
+    recordedAt: row.recorded_at,
+  })).digest("hex");
+
+const parseWorkSignalProviderAuthority = (value: unknown): WorkSignalProviderAuthorityRow => {
+  const row = workSignalProviderAuthorityRowSchema.parse(value);
+  if (row.authority_digest !== signalProviderAuthorityDigest(row)) {
+    throw new Error("WORK_SIGNAL_PROVIDER_AUTHORITY_CORRUPT");
+  }
+  return row;
+};
+
+export function backfillLegacyWorkSignalProviderAuthorities(database: Database, migratedAt: number): void {
+  // Released signals did not freeze a session authority revision. Even a
+  // nested runtime document cannot prove that missing binding: retain the
+  // instruction bytes and quarantine execution instead of guessing a route.
+  database.query(`INSERT OR IGNORE INTO legacy_provider_authority_quarantines(
+    scope_kind,scope_id,reason,recorded_at
+  ) SELECT 'work_signal',signal.id,'missing_immutable_runtime_authority',?
+    FROM work_signals signal
+    WHERE NOT EXISTS(SELECT 1 FROM work_signal_provider_authorities authority WHERE authority.signal_id=signal.id)`)
+    .run(z.number().int().nonnegative().safe().parse(migratedAt));
+}
+
+export function assertWorkSignalProviderAuthorities(database: Database): void {
+  for (const object of workSignalProviderAuthorityObjects) {
+    const actual = database.query("SELECT sql FROM sqlite_master WHERE type=? AND name=?")
+      .get(object.type, object.name) as { sql: string } | null;
+    if (actual === null || normalizeSchemaSql(actual.sql) !== normalizeSchemaSql(object.sql)) {
+      throw new Error("WORK_SIGNAL_PROVIDER_AUTHORITY_SCHEMA_INVALID");
+    }
+  }
+  if (database.query(`SELECT 1 FROM work_signals signal
+    WHERE NOT EXISTS(SELECT 1 FROM work_signal_provider_authorities authority WHERE authority.signal_id=signal.id)
+      AND NOT EXISTS(SELECT 1 FROM legacy_provider_authority_quarantines quarantine
+        WHERE quarantine.scope_kind='work_signal' AND quarantine.scope_id=signal.id)
+    LIMIT 1`).get() !== null) throw new Error("WORK_SIGNAL_PROVIDER_AUTHORITY_MISSING");
+  let after = "";
+  for (;;) {
+    const rows = database.query("SELECT * FROM work_signal_provider_authorities WHERE signal_id>? ORDER BY signal_id LIMIT 100")
+      .all(after);
+    if (rows.length === 0) break;
+    for (const value of rows) {
+      const row = parseWorkSignalProviderAuthority(value);
+      if (database.query("SELECT 1 FROM work_signals WHERE id=? AND work_id=? AND to_session_id=?")
+        .get(row.signal_id, row.work_id, row.target_session_id) === null) {
+        throw new Error("WORK_SIGNAL_PROVIDER_AUTHORITY_MISMATCH");
+      }
+      after = row.signal_id;
+    }
+  }
+}
 /** Runtime admission is narrower than the immutable v40 schema's historical identities. */
 const supportedWorkSessionAuthorityExistsSql = (
   sessionIdExpression: string,
@@ -1162,8 +1324,7 @@ const exactWorkAuthorityTriggerNameSet: ReadonlySet<string> = new Set(
   exactWorkAuthorityTriggerNames,
 );
 
-const normalizeWorkSchemaSql = (sql: string): string =>
-  sql.replace(/\bIF NOT EXISTS\b/giu, "").replace(/\s+/gu, " ").trim().replace(/;$/u, "");
+const normalizeWorkSchemaSql = normalizeSchemaSql;
 
 // Schema v49 adds this companion without changing the released Work SQL or
 // its frozen v39/v40 authority and non-authority digest preimages.
@@ -1217,69 +1378,22 @@ const exactWorkAuthorityTriggerSql = new Map(
     .map(([name, sql]) => [name, normalizeWorkSchemaSql(sql)] as const),
 );
 
-// Schema v39 shipped these exact contract-2 guards. Current Work routes use
-// the active Codex contract instead, so predecessor admission must compare
-// against frozen v39 SQL rather than deriving history from WORK_SCHEMA_SQL.
-const providerVersion39PresetContractGuardDefinitionSql = new Map<string, string>([
-  ["work_devin_preset_contract_guard", `
-CREATE TRIGGER work_devin_preset_contract_guard
-BEFORE INSERT ON works
-WHEN NEW.preset_contract!=${devinPresetContract} AND EXISTS (
-  SELECT 1 FROM sessions AS s
-  WHERE s.id=NEW.coordinator_session_id AND s.provider_v39='devin'
-)
-BEGIN SELECT RAISE(ABORT,'WORK_DEVIN_PRESET_CONTRACT_MISMATCH'); END;
-`],
-  ["work_session_devin_contract_guard", `
-CREATE TRIGGER work_session_devin_contract_guard
-BEFORE UPDATE OF provider_v39,preset_contract ON sessions
-WHEN NEW.provider_v39='devin' AND (
-  NEW.preset_contract!=${devinPresetContract}
-  OR EXISTS (
-    SELECT 1 FROM works AS w
-    WHERE w.coordinator_session_id=OLD.id
-      AND w.preset_contract!=${devinPresetContract}
-  )
-)
-BEGIN SELECT RAISE(ABORT,'WORK_DEVIN_PRESET_CONTRACT_MISMATCH'); END;
-  `],
-]);
-
-const providerVersion39PresetContractGuardSql = new Map(
-  [...providerVersion39PresetContractGuardDefinitionSql]
-    .map(([name, sql]) => [name, normalizeWorkSchemaSql(sql)] as const),
+// Historical Work admission is closed over archived literals, not the stronger
+// current provider-account/captured-authority predicates.
+const providerVersion40WorkAuthorityDefinitionEntries =
+  CANONICAL_40_WORK_AUTHORITY_TRIGGER_DEFINITIONS;
+const providerVersion40WorkAuthorityTriggerSql = new Map<string, string>(
+  providerVersion40WorkAuthorityDefinitionEntries
+    .map(([name, sql]) => [name, normalizeSchemaSql(sql)] as const),
 );
-const providerVersion40WorkAuthorityTriggerDefinitionSql = new Map<string, string>(
-  exactWorkAuthorityTriggerDefinitionSql,
-);
-for (const [name, sql] of providerVersion39PresetContractGuardDefinitionSql) {
-  providerVersion40WorkAuthorityTriggerDefinitionSql.set(name, sql);
+const canonical49WorkAuthorityTriggerSql = new Map(providerVersion40WorkAuthorityTriggerSql);
+for (const [name, sql] of CANONICAL_49_WORK_PRESET_GUARD_DEFINITIONS) {
+  canonical49WorkAuthorityTriggerSql.set(name, normalizeSchemaSql(sql));
 }
-
-// The v40/v41 predecessor map intentionally starts from the current map only
-// while every other authority trigger remains byte-equivalent to that released
-// surface. Pin the complete normalized map so a later current-schema edit
-// cannot silently redefine which predecessor databases migration admits.
-const providerVersion40WorkAuthorityDefinitionEntries = exactWorkAuthorityTriggerNames.map((name) => {
-  const sql = providerVersion40WorkAuthorityTriggerDefinitionSql.get(name);
-  if (sql === undefined) throw new Error(`WORK_SCHEMA_V40_DEFINITION_MISSING:${name}`);
-  return [name, sql] as const;
-});
-const providerVersion40WorkAuthorityEntries = providerVersion40WorkAuthorityDefinitionEntries
-  .map(([name, sql]) => [name, normalizeWorkSchemaSql(sql)] as const);
-const providerVersion40WorkAuthorityTriggerSql = new Map(
-  providerVersion40WorkAuthorityEntries,
+const canonicalNonAuthorityWorkTriggerSql = new Map<string, string>(
+  CANONICAL_WORK_NON_AUTHORITY_TRIGGER_DEFINITIONS
+    .map(([name, sql]) => [name, normalizeSchemaSql(sql)] as const),
 );
-const providerVersion40WorkAuthorityDigest = createHash("sha256")
-  .update(JSON.stringify(providerVersion40WorkAuthorityEntries))
-  .digest("hex");
-const frozenProviderVersion40WorkAuthorityDigest =
-  "91f02f0c7af299245be21bc28b8005392d536de426875eb5f2804d11744d5ca2";
-if (providerVersion40WorkAuthorityDigest !== frozenProviderVersion40WorkAuthorityDigest) {
-  throw new Error(
-    `WORK_SCHEMA_V40_DEFINITION_DIGEST_INVALID:${providerVersion40WorkAuthorityDigest}`,
-  );
-}
 
 const providerVersion39AddedAuthorityTriggerNames = new Set([
   "work_coordinator_account_authority_guard",
@@ -1291,7 +1405,7 @@ const providerVersion39AddedAuthorityTriggerNames = new Set([
   "work_signal_ack_account_authority_guard",
 ]);
 
-const providerVersion39SignalMemberGuardSql = normalizeWorkSchemaSql(`
+const providerVersion39SignalMemberGuardSql = normalizeSchemaSql(`
 CREATE TRIGGER work_signal_member_guard
 BEFORE INSERT ON work_signals
 WHEN NOT EXISTS (SELECT 1 FROM work_members WHERE work_id=NEW.work_id AND session_id=NEW.from_session_id)
@@ -1417,10 +1531,8 @@ const requiredWorkTriggers = [
   "work_nested_effect_settlements_no_delete",
 ] as const;
 
-// Every other required trigger was unchanged across v40-v42. Compare its body
-// as well as its name, and pin that shared surface so a future current-schema
-// edit cannot silently redefine a predecessor. The v39 assertion below omits
-// the authority additions that version had not shipped yet.
+// Current runtime definitions are distinct from the literal historical map.
+// Check every required body, not only its name.
 const exactNonAuthorityWorkTriggerEntries = requiredWorkTriggers
   .filter((name) => !exactWorkAuthorityTriggerNameSet.has(name))
   .map((name) => [
@@ -1430,20 +1542,10 @@ const exactNonAuthorityWorkTriggerEntries = requiredWorkTriggers
 const exactNonAuthorityWorkTriggerSql: ReadonlyMap<string, string> = new Map(
   exactNonAuthorityWorkTriggerEntries,
 );
-const nonAuthorityWorkTriggerDigest = createHash("sha256")
-  .update(JSON.stringify(exactNonAuthorityWorkTriggerEntries))
-  .digest("hex");
-const frozenNonAuthorityWorkTriggerDigest =
-  "b2973f3c9279e5b6af86c49fbdc59659384451b003c202522e12e7c890eef4b4";
-if (nonAuthorityWorkTriggerDigest !== frozenNonAuthorityWorkTriggerDigest) {
-  throw new Error(
-    `WORK_SCHEMA_NON_AUTHORITY_DEFINITION_DIGEST_INVALID:${nonAuthorityWorkTriggerDigest}`,
-  );
-}
-
 const assertWorkSchemaShape = (
   database: Database,
   expectedAuthorityTriggerSql: ReadonlyMap<string, string> = exactWorkAuthorityTriggerSql,
+  expectedNonAuthorityTriggerSql: ReadonlyMap<string, string> = exactNonAuthorityWorkTriggerSql,
 ): void => {
   const foreignKeys = database.query("PRAGMA foreign_keys").get() as { foreign_keys?: unknown } | null;
   if (foreignKeys?.foreign_keys !== 1) throw new Error("WORK_SCHEMA_FOREIGN_KEYS_DISABLED");
@@ -1489,7 +1591,7 @@ const assertWorkSchemaShape = (
       || normalizeWorkSchemaSql(row.sql) !== expectedAuthorityTriggerSql.get(name)
     ) throw new Error(`WORK_SCHEMA_STALE_TRIGGER:${name}`);
   }
-  for (const [name, expected] of exactNonAuthorityWorkTriggerSql) {
+  for (const [name, expected] of expectedNonAuthorityTriggerSql) {
     const row = triggers.get(name);
     if (
       row?.type !== "trigger"
@@ -1580,14 +1682,54 @@ const assertWorkSchemaShape = (
 // The foreign_key_check scans every child row, so it belongs only on the
 // connection that can repair or refuse the database.
 export function assertLegacyVersion42WorkSchema(database: Database): void {
-  assertWorkSchemaShape(database);
+  assertWorkSchemaShape(database, canonical49WorkAuthorityTriggerSql, canonicalNonAuthorityWorkTriggerSql);
   const integrity = database.query("PRAGMA foreign_key_check").all();
   if (integrity.length !== 0) throw new Error("WORK_SCHEMA_FOREIGN_KEY_VIOLATION");
 }
 
 export function assertWorkSchema(database: Database): void {
-  assertLegacyVersion42WorkSchema(database);
+  assertWorkSchemaShape(database);
+  const integrity = database.query("PRAGMA foreign_key_check").all();
+  if (integrity.length !== 0) throw new Error("WORK_SCHEMA_FOREIGN_KEY_VIOLATION");
   assertWorkProjectAuthoritySchema(database);
+}
+
+const installCanonicalWorkSchema = (database: Database, version: 40 | 42): void => {
+  const install = database.transaction(() => {
+    // CREATE IF NOT EXISTS preserves admitted legacy ALTER placement. Do not
+    // rebuild an existing Work table or import the evolving runtime SQL here.
+    for (const [, , sql] of CANONICAL_WORK_CORE_DEFINITIONS) database.exec(sql);
+    database.exec(CANONICAL_WORK_CLOCK_SEED_SQL);
+    const authority = new Map<string, string>(CANONICAL_40_WORK_AUTHORITY_TRIGGER_DEFINITIONS);
+    if (version === 42) {
+      for (const [name, sql] of CANONICAL_49_WORK_PRESET_GUARD_DEFINITIONS) authority.set(name, sql);
+    }
+    for (const [name, sql] of [...authority, ...CANONICAL_WORK_NON_AUTHORITY_TRIGGER_DEFINITIONS]) {
+      database.exec(`DROP TRIGGER IF EXISTS ${name}`);
+      database.exec(sql);
+    }
+    if (version === 40) assertProviderVersion40WorkSchema(database);
+    else assertLegacyVersion42WorkSchema(database);
+  });
+  install.immediate();
+};
+
+/**
+ * Migration-only canonical40/41 installer. The caller must first admit the
+ * predecessor and install its parent authority tables. This does not install
+ * usage registry predicates or allocate a migration/ledger version.
+ */
+export function installCanonicalVersion40WorkSchema(database: Database): void {
+  installCanonicalWorkSchema(database, 40);
+}
+
+/**
+ * Migration-only canonical42–49 installer. The v49 nullable-project companion
+ * remains a separate append-only step. Existing rows and table DDL stay intact;
+ * parent/custody/full-cohort safety is the surrounding admission's concern.
+ */
+export function installCanonicalVersion42WorkSchema(database: Database): void {
+  installCanonicalWorkSchema(database, 42);
 }
 
 /**
@@ -1607,7 +1749,7 @@ export function installProviderVersion40WorkAuthoritySchema(database: Database):
 
 /** Exact Work authority surface shipped with adoption schema v40. */
 export function assertProviderVersion40WorkSchema(database: Database): void {
-  assertWorkSchemaShape(database, providerVersion40WorkAuthorityTriggerSql);
+  assertWorkSchemaShape(database, providerVersion40WorkAuthorityTriggerSql, canonicalNonAuthorityWorkTriggerSql);
   const integrity = database.query("PRAGMA foreign_key_check").all();
   if (integrity.length !== 0) throw new Error("WORK_SCHEMA_V40_FOREIGN_KEY_VIOLATION");
 }
@@ -1655,8 +1797,7 @@ export function assertProviderVersion39WorkSchema(database: Database): void {
     const row = triggers.get(name);
     const expected = name === "work_signal_member_guard"
       ? providerVersion39SignalMemberGuardSql
-      : providerVersion39PresetContractGuardSql.get(name)
-        ?? exactWorkAuthorityTriggerSql.get(name);
+      : providerVersion40WorkAuthorityTriggerSql.get(name);
     if (
       row?.type !== "trigger"
       || typeof row.tbl_name !== "string"
@@ -1664,14 +1805,14 @@ export function assertProviderVersion39WorkSchema(database: Database): void {
       || normalizeWorkSchemaSql(row.sql) !== expected
     ) throw new Error(`WORK_SCHEMA_V39_STALE_TRIGGER:${name}`);
   }
-  for (const [name, expected] of exactNonAuthorityWorkTriggerSql) {
+  for (const [name, expected] of canonicalNonAuthorityWorkTriggerSql) {
     if (providerVersion39AddedAuthorityTriggerNames.has(name)) continue;
     const row = triggers.get(name);
     if (
       row?.type !== "trigger"
       || typeof row.tbl_name !== "string"
       || typeof row.sql !== "string"
-      || normalizeWorkSchemaSql(row.sql) !== expected
+      || normalizeSchemaSql(row.sql) !== expected
     ) throw new Error(`WORK_SCHEMA_V39_STALE_TRIGGER:${name}`);
   }
   const requiredColumns: Readonly<Record<string, readonly string[]>> = {
@@ -1695,7 +1836,7 @@ export function assertProviderVersion39WorkSchema(database: Database): void {
   }
 }
 
-// Readonly opens (`hra status`, `hra doctor --offline`) verify the same table,
+// Readonly opens (`oompa status`, `oompa doctor --offline`) verify the same table,
 // trigger, column, and clock identity but skip the O(rows) foreign_key_check.
 // A long readonly scan pins a WAL snapshot, and the writer's queue scrub
 // checkpoint must wait for that snapshot before it can truncate the WAL.
@@ -2269,6 +2410,7 @@ export class WorkStore {
     this.#projectProviderIdentifier = options.projectProviderIdentifier;
     this.#database.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
     assertWorkSchema(this.#database);
+    assertWorkSignalProviderAuthorities(this.#database);
     assertLegacyCanonicalProfileStorageSchema(this.#database);
   }
 
@@ -2662,9 +2804,32 @@ export class WorkStore {
     return read.deferred();
   }
 
+  #assertLegacyNestedMutationKey(idempotencyKey: string): void {
+    try {
+      assertLegacyMutationOwnership(this.#database, { idempotencyKey });
+    } catch (error) {
+      if (error instanceof SessionSendOwnershipError) {
+        throw new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED");
+      }
+      throw error;
+    }
+  }
+
+  #assertLegacyPreparedInstruction(row: PreparedEffectRow, instruction: WorkPreparedEffect): void {
+    if (
+      digestText(row.instruction_json) !== row.instruction_digest
+      || instruction.workId !== row.work_id
+      || (instruction.kind === "dispatch" ? instruction.attemptId : instruction.signalId) !== row.subject_id
+      || instruction.kind !== (row.effect_kind === "attempt_dispatch" ? "dispatch" : "signal")
+      || instruction.nestedMutationKey !== deriveNestedMutationKey(row.idempotency_key)
+    ) throw new Error("WORK_EFFECT_INSTRUCTION_CORRUPT");
+    this.#assertLegacyNestedMutationKey(instruction.nestedMutationKey);
+  }
+
   #nestedMutation(effect: WorkPreparedEffect):
     | Readonly<{ state: "absent" | "prepared" | "failed" | "unknown" }>
     | Readonly<{ state: "accepted"; receipt: WorkNestedEffectReceipt }> {
+    this.#assertLegacyNestedMutationKey(effect.nestedMutationKey);
     const table = this.#database.query(
       "SELECT 1 AS present FROM sqlite_master WHERE type='table' AND name='mutation_attempts'",
     ).get() as { present: number } | null;
@@ -2692,7 +2857,9 @@ export class WorkStore {
     const expectedKind = effect.kind === "signal"
       ? effect.mode === "queue" ? "session.queue" : "session.steer"
       : "session.send";
-    const expectedGeneration = effect.accountGeneration;
+    const signalAuthority = effect.kind === "signal" ? this.#signalProviderAuthority(effect) : null;
+    if (effect.kind === "signal" && signalAuthority === null) return { state: "unknown" };
+    const expectedGeneration = signalAuthority?.process_generation ?? effect.accountGeneration;
     const requestDigest = digestText(JSON.stringify({
       kind: expectedKind,
       authorityId: effect.targetSessionId,
@@ -2705,6 +2872,16 @@ export class WorkStore {
       || row.authority_generation !== expectedGeneration
       || row.request_digest !== requestDigest
     ) return { state: "unknown" };
+    if (signalAuthority !== null && this.#database.query(`SELECT 1 FROM mutation_provider_authorities authority
+      WHERE authority.attempt_id=? AND authority.role='primary'
+        AND authority.provider_account_id=? AND authority.profile_id=? AND authority.provider=?
+        AND authority.binding_generation=? AND authority.process_generation=? AND authority.provenance=?
+        AND (SELECT COUNT(*) FROM mutation_provider_authorities captured WHERE captured.attempt_id=authority.attempt_id)=1`)
+      .get(row.id, signalAuthority.provider_account_id, signalAuthority.profile_id, signalAuthority.provider,
+        signalAuthority.binding_generation, signalAuthority.process_generation,
+        effect.kind === "signal" && effect.mode === "queue" ? "session_queue" : "session_steer") === null) {
+      return { state: "unknown" };
+    }
     if (
       (row.state === "applied" && row.result_json !== null)
       || (
@@ -2790,6 +2967,7 @@ export class WorkStore {
   }
 
   #cancelNestedPrepared(effect: WorkPreparedEffect): void {
+    this.#assertLegacyNestedMutationKey(effect.nestedMutationKey);
     const table = this.#database.query(
       "SELECT 1 AS present FROM sqlite_master WHERE type='table' AND name='mutation_attempts'",
     ).get() as { present: number } | null;
@@ -2797,12 +2975,24 @@ export class WorkStore {
     const expectedKind = effect.kind === "signal"
       ? effect.mode === "queue" ? "session.queue" : "session.steer"
       : "session.send";
+    const signalAuthority = effect.kind === "signal" ? this.#signalProviderAuthority(effect) : null;
+    if (effect.kind === "signal" && signalAuthority === null) return;
+    const expectedGeneration = signalAuthority?.process_generation ?? effect.accountGeneration;
     const requestDigest = digestText(JSON.stringify({
       kind: expectedKind,
       authorityId: effect.targetSessionId,
-      authorityGeneration: effect.accountGeneration,
+      authorityGeneration: expectedGeneration,
       request: { message: workPreparedEffectMessage(effect) },
     }));
+    if (signalAuthority !== null && this.#database.query(`SELECT 1 FROM mutation_attempts mutation
+      JOIN mutation_provider_authorities authority ON authority.attempt_id=mutation.id
+      WHERE mutation.idempotency_key=? AND authority.role='primary'
+        AND authority.provider_account_id=? AND authority.profile_id=? AND authority.provider=?
+        AND authority.binding_generation=? AND authority.process_generation=? AND authority.provenance=?
+        AND (SELECT COUNT(*) FROM mutation_provider_authorities captured WHERE captured.attempt_id=mutation.id)=1`)
+      .get(effect.nestedMutationKey, signalAuthority.provider_account_id, signalAuthority.profile_id,
+        signalAuthority.provider, signalAuthority.binding_generation, signalAuthority.process_generation,
+        effect.kind === "signal" && effect.mode === "queue" ? "session_queue" : "session_steer") === null) return;
     this.#database.query(
       `UPDATE mutation_attempts SET state='cancelled',updated_at=?
        WHERE idempotency_key=? AND kind=? AND authority_id=? AND authority_generation=?
@@ -2812,7 +3002,7 @@ export class WorkStore {
       effect.nestedMutationKey,
       expectedKind,
       effect.targetSessionId,
-      effect.accountGeneration,
+      expectedGeneration,
       requestDigest,
     );
   }
@@ -2858,27 +3048,54 @@ export class WorkStore {
     return authority !== null;
   }
 
+  #signalProviderAuthority(effect: WorkSignalInstruction): WorkSignalProviderAuthorityRow | null {
+    try {
+      const row = parseWorkSignalProviderAuthority(this.#database.query(
+        "SELECT * FROM work_signal_provider_authorities WHERE signal_id=?",
+      ).get(effect.signalId));
+      return row.work_id === effect.workId && row.target_session_id === effect.targetSessionId ? row : null;
+    } catch {
+      return null;
+    }
+  }
+
   #signalAuthorityValid(effect: WorkSignalInstruction): boolean {
     this.#canonicalSignalIdentity(effect.signalId, effect.workId);
     this.#canonicalSessionKey(effect.targetSessionId);
     if (this.#requireWork(effect.workId).state !== "active") return false;
+    const frozen = this.#signalProviderAuthority(effect);
+    if (frozen === null) return false;
     const authority = this.#database.query(
       `SELECT 1 AS present
        FROM work_signals AS w
        JOIN work_members AS m ON m.work_id=w.work_id AND m.session_id=w.to_session_id
        JOIN sessions AS s ON s.id=m.session_id
+       JOIN profiles AS p ON p.id=s.profile_id
+       JOIN session_provider_authorities captured ON captured.session_id=s.id
+       JOIN provider_accounts account ON account.id=captured.provider_account_id
        WHERE w.id=? AND w.work_id=? AND w.to_session_id=? AND w.mode=?
          AND w.target_account_generation=?
-         AND ${supportedWorkSessionAuthorityExistsSql(
-           "s.id",
-           "authority_profile.process_generation=w.target_account_generation",
-         )}`,
+         AND s.profile_id=? AND s.provider_v39=?
+         AND captured.provider_account_id=? AND captured.profile_id=s.profile_id
+         AND captured.provider=s.provider_v39 AND captured.binding_generation=?
+         AND captured.process_generation=? AND captured.authority_revision=?
+         AND account.profile_id=captured.profile_id AND account.provider=captured.provider
+         AND account.binding_generation=captured.binding_generation
+         AND account.process_generation=captured.process_generation AND account.readiness!='removed'
+         AND s.state IN ('active','idle') AND p.state!='removed'
+         AND ${supportedWorkSessionAuthorityExistsSql("s.id")}`,
     ).get(
       effect.signalId,
       effect.workId,
       effect.targetSessionId,
       effect.mode,
       effect.accountGeneration,
+      frozen.profile_id,
+      frozen.provider,
+      frozen.provider_account_id,
+      frozen.binding_generation,
+      frozen.process_generation,
+      frozen.session_authority_revision,
     ) as {
       present: number;
     } | null;
@@ -3054,13 +3271,6 @@ export class WorkStore {
         "SELECT * FROM work_prepared_effects WHERE idempotency_key=?",
       ).get(idempotencyKey) as PreparedEffectRow | null;
       if (effect === null) throw new WorkStoreError("ATTEMPT_NOT_FOUND");
-      if (effect.state === "accepted" || effect.state === "failed") {
-        return {
-          executable: false,
-          disposition: "settled",
-          status: this.#effectStatusFromRow(effect),
-        };
-      }
       const instruction = workPreparedEffectSchema.parse(parseStoredJson(effect.instruction_json));
       if (
         digestText(effect.instruction_json) !== effect.instruction_digest
@@ -3068,6 +3278,14 @@ export class WorkStore {
         || (instruction.kind === "dispatch" ? instruction.attemptId : instruction.signalId)
           !== effect.subject_id
       ) throw new Error("WORK_EFFECT_INSTRUCTION_CORRUPT");
+      this.#assertLegacyPreparedInstruction(effect, instruction);
+      if (effect.state === "accepted" || effect.state === "failed") {
+        return {
+          executable: false,
+          disposition: "settled",
+          status: this.#effectStatusFromRow(effect),
+        };
+      }
       const nested = this.#nestedMutation(instruction);
       if (nested.state === "accepted") {
         this.#recordNestedEffectSettlement(effect, instruction, "accepted", nested.receipt);
@@ -3211,6 +3429,7 @@ export class WorkStore {
         || (instruction.kind === "dispatch" ? instruction.attemptId : instruction.signalId)
           !== effect.subject_id
       ) throw new Error("WORK_EFFECT_INSTRUCTION_CORRUPT");
+      this.#assertLegacyPreparedInstruction(effect, instruction);
       const outcome = { kind: "failed" as const, code: failureCode };
       const outcomeDigest = digestText(canonicalWorkJson(outcome));
       if (effect.state === "failed" && effect.outcome_digest === outcomeDigest) {
@@ -4640,13 +4859,20 @@ export class WorkStore {
       let profileId: string | null = null;
       for (const sessionId of uniqueSessionIds) {
         const session = this.#database.query(
-          `SELECT s.profile_id,p.process_generation
+          `SELECT s.profile_id,captured.process_generation,captured.provider
            FROM sessions AS s
-           JOIN profiles AS p ON p.id=s.profile_id
+           JOIN session_provider_authorities AS captured
+             ON captured.session_id=s.id AND captured.profile_id=s.profile_id
+               AND captured.provider=s.provider_v39
+           JOIN provider_accounts AS account
+             ON account.id=captured.provider_account_id
+               AND account.profile_id=captured.profile_id
+               AND account.provider=captured.provider
            WHERE s.id=?`,
         ).get(sessionId) as {
           process_generation: number;
           profile_id: string;
+          provider: Provider;
         } | null;
         if (
           session === null
@@ -4663,7 +4889,18 @@ export class WorkStore {
              AND state IN ('claimed','dispatching','running')
            ORDER BY work_id,created_at,id`,
         ).all(sessionId, expectedProfileGeneration) as AttemptRow[];
-        for (const attempt of attempts) attemptsById.set(attempt.id, attempt);
+        for (const attempt of attempts) {
+          // Retirement may consume an old captured process after its account
+          // has advanced. It never grants a current provider dispatch. Work
+          // task execution remains Codex-only under its original route.
+          const session = this.#database.query(
+            "SELECT profile_id,provider_v39 FROM sessions WHERE id=?",
+          ).get(sessionId) as { profile_id: string; provider_v39: Provider } | null;
+          if (session?.provider_v39 !== "codex" || attempt.account_id !== session.profile_id) {
+            throw new WorkStoreError("REVISION_CONFLICT");
+          }
+          attemptsById.set(attempt.id, attempt);
+        }
       }
       const attempts = [...attemptsById.values()].sort((left, right) =>
         left.work_id.localeCompare(right.work_id)
@@ -5392,6 +5629,9 @@ export class WorkStore {
     }
     const source = normalizeWorkApplyRequestSource(operation, sourceInput);
     this.#authorizeOperation(operation);
+    if (operation.kind === "attempt.dispatch" || operation.kind === "signal.send") {
+      this.#assertLegacyNestedMutationKey(deriveNestedMutationKey(operation.idempotencyKey));
+    }
     const requestDigest = workApplyRequestDigest(operation, source);
     const releaseReplay = this.#replayReleaseTombstone(operation, requestDigest);
     if (releaseReplay !== null) return releaseReplay;
@@ -6444,6 +6684,37 @@ export class WorkStore {
       operation.body,
       now,
     );
+    // The released v1 generation stays a compatibility shadow in the signal
+    // and instruction. Only this independently frozen tuple admits execution.
+    const captured = this.#database.query(`SELECT provider_account_id,profile_id,provider,
+      binding_generation,process_generation,authority_revision
+      FROM session_provider_authorities WHERE session_id=?`).get(operation.targetSessionId);
+    const parsedAuthority = z.object({
+      provider_account_id: z.string(), profile_id: z.string(), provider: z.enum(["codex", "claude", "devin"]),
+      binding_generation: z.number().int().positive().safe(), process_generation: z.number().int().nonnegative().safe(),
+      authority_revision: z.number().int().positive().safe(),
+    }).strict().parse(captured);
+    const frozen = {
+      signal_id: signalId,
+      work_id: operation.workId,
+      target_session_id: operation.targetSessionId,
+      provider_account_id: parsedAuthority.provider_account_id,
+      profile_id: parsedAuthority.profile_id,
+      provider: parsedAuthority.provider,
+      binding_generation: parsedAuthority.binding_generation,
+      process_generation: parsedAuthority.process_generation,
+      session_authority_revision: parsedAuthority.authority_revision,
+      provenance: "signal_prepare" as const,
+      recorded_at: now,
+    };
+    this.#database.query(`INSERT INTO work_signal_provider_authorities(
+      signal_id,work_id,target_session_id,provider_account_id,profile_id,provider,binding_generation,
+      process_generation,session_authority_revision,authority_digest,provenance,recorded_at
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      frozen.signal_id,frozen.work_id,frozen.target_session_id,frozen.provider_account_id,frozen.profile_id,
+      frozen.provider,frozen.binding_generation,frozen.process_generation,frozen.session_authority_revision,
+      signalProviderAuthorityDigest(frozen),frozen.provenance,frozen.recorded_at,
+    );
     const effect: WorkSignalInstruction = {
       kind: "signal",
       workId: operation.workId,
@@ -7065,6 +7336,7 @@ export class WorkStore {
       || instruction.workId !== attempt.work_id
       || digestText(effect.instruction_json) !== effect.instruction_digest
     ) throw new Error("WORK_EFFECT_INSTRUCTION_CORRUPT");
+    this.#assertLegacyPreparedInstruction(effect, instruction);
     const projectedState = resolution === "proven_applied" ? "accepted" : "failed";
     if (
       (effect.state === "accepted" && projectedState !== "accepted")
@@ -7148,6 +7420,7 @@ export class WorkStore {
       || instruction.accountGeneration !== attempt.account_generation
       || digestText(effect.instruction_json) !== effect.instruction_digest
     ) throw new Error("WORK_EFFECT_INSTRUCTION_CORRUPT");
+    this.#assertLegacyPreparedInstruction(effect, instruction);
     let receipt: WorkNestedEffectReceipt | null = null;
     if (effect.state === "accepted" && effect.outcome_json !== null) {
       const outcome = parseDispatchOutcome(parseStoredJson(effect.outcome_json));
@@ -7210,6 +7483,7 @@ export class WorkStore {
       || instruction.nestedMutationKey.length !== 36
       || digestText(effect.instruction_json) !== effect.instruction_digest
     ) throw new Error("WORK_EFFECT_INSTRUCTION_CORRUPT");
+    this.#assertLegacyPreparedInstruction(effect, instruction);
     return this.#nestedMutation(instruction).state;
   }
 
@@ -7373,6 +7647,7 @@ export class WorkStore {
       }
       const instruction = workPreparedEffectSchema.parse(parseStoredJson(effect.instruction_json));
       if (instruction.kind !== "dispatch") throw new Error("WORK_EFFECT_INSTRUCTION_CORRUPT");
+      this.#assertLegacyPreparedInstruction(effect, instruction);
       if (
         parsedOutcome.kind === "accepted"
         && (
@@ -7448,20 +7723,25 @@ export class WorkStore {
       }
       const instruction = workPreparedEffectSchema.parse(parseStoredJson(effect.instruction_json));
       if (instruction.kind !== "signal") throw new Error("WORK_EFFECT_INSTRUCTION_CORRUPT");
-      if (
-        parsedOutcome.kind === "accepted"
-        && (
-          parsedOutcome.receipt.accountGeneration !== instruction.accountGeneration
-          || (instruction.mode === "queue" && parsedOutcome.receipt.kind !== "queue_created")
-          || (instruction.mode === "steer" && parsedOutcome.receipt.kind !== "turn_steered")
-        )
-      ) throw new WorkStoreError("ROUTE_MISMATCH");
+      this.#assertLegacyPreparedInstruction(effect, instruction);
+      // Exact settled replay is historical evidence, not permission to execute.
+      // In particular, legacy accepted signals remain readable after quarantine.
       if (effect.state !== "prepared" && effect.state !== "effect_started") {
         if (effect.outcome_digest !== outcomeDigest) {
           throw new WorkStoreError("IDEMPOTENCY_CONFLICT");
         }
         return this.#signalRecord(effect.subject_id);
       }
+      const providerAuthority = this.#signalProviderAuthority(instruction);
+      if (
+        parsedOutcome.kind === "accepted"
+        && (
+          providerAuthority === null
+          || parsedOutcome.receipt.accountGeneration !== providerAuthority.process_generation
+          || (instruction.mode === "queue" && parsedOutcome.receipt.kind !== "queue_created")
+          || (instruction.mode === "steer" && parsedOutcome.receipt.kind !== "turn_steered")
+        )
+      ) throw new WorkStoreError("ROUTE_MISMATCH");
       if (effect.state === "prepared") throw new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED");
       const signal = this.#database.query(
         "SELECT to_session_id FROM work_signals WHERE id=? AND work_id=?",

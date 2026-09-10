@@ -234,7 +234,7 @@ export function spawnBunClaudeProcess(options: SpawnClaudeProcessOptions): Claud
     .then(async () => await (options.inspectIdentity ?? inspectSpawnedClaudeProcessIdentity)(child.pid))
     .catch((cause: unknown) => {
       // A child whose exact process identity is unknown can never be admitted
-      // as HRA's exclusive writer. Reap it even if a caller forgets to await
+      // as Oompa's exclusive writer. Reap it even if a caller forgets to await
       // the identity promise itself.
       try {
         child.kill("SIGKILL");

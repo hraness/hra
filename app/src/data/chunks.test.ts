@@ -11,7 +11,7 @@ import {
   type CompactSessionEvent,
   type DetailSessionEvent,
   type SessionChunkAuthority,
-} from "../hra/cloud";
+} from "../oompa/cloud";
 import { chunkAad, chunkAuthority, chunksForStream } from "./chunks";
 import { parseSessionChunk, type SessionChunk } from "./wire";
 

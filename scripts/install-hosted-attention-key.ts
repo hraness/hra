@@ -5,8 +5,8 @@ import { isAbsolute, join, resolve } from "node:path";
 import { z } from "zod";
 
 import {
-  hraAttentionResendApiKeyEnvironmentName,
-  hraResendApiKeyEnvironmentName,
+  oompaAttentionResendApiKeyEnvironmentName,
+  oompaResendApiKeyEnvironmentName,
   isStrictResendApiKey,
 } from "../convex/resendApiKey";
 import {
@@ -174,14 +174,14 @@ export function parseAttentionKeyInstallationInput(document: string, target: Con
 }
 
 export const attentionKeyInstallSlot = (target: ConvexTarget): string =>
-  `attention-key-${hraAttentionResendApiKeyEnvironmentName}-${canonicalDigest(parseConvexTarget(target))}.intent.json`;
+  `attention-key-${oompaAttentionResendApiKeyEnvironmentName}-${canonicalDigest(parseConvexTarget(target))}.intent.json`;
 
 export const attentionEnvironmentFingerprint = (
   entries: AttentionEnvironment, target: ConvexTarget, intendedAttentionKey: string,
 ): string => createHmac("sha256", intendedAttentionKey)
   .update("hra-attention-environment-fingerprint-v1\0", "utf8")
   .update(canonicalJson({
-    entries: entries.filter(({ name }) => name !== hraAttentionResendApiKeyEnvironmentName)
+    entries: entries.filter(({ name }) => name !== oompaAttentionResendApiKeyEnvironmentName)
       .toSorted((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0),
     target: parseConvexTarget(target),
   }), "utf8")
@@ -267,11 +267,11 @@ export async function installHostedAttentionKey(options: InstallationOptions) {
       const values = new Map(entries.map(({ name, value }) => [name, value]));
       if (entries.length > 1_024 || values.size !== entries.length) throw new AttentionKeyInstallationError("environment_ambiguous");
       if (!HOSTED_ENVIRONMENT_NAMES.every((name) =>
-        name === hraAttentionResendApiKeyEnvironmentName || values.has(name))) throw new AttentionKeyInstallationError("prerequisites_missing");
-      const otp = values.get(hraResendApiKeyEnvironmentName);
+        name === oompaAttentionResendApiKeyEnvironmentName || values.has(name))) throw new AttentionKeyInstallationError("prerequisites_missing");
+      const otp = values.get(oompaResendApiKeyEnvironmentName);
       if (!isStrictResendApiKey(otp)) throw new AttentionKeyInstallationError("environment_ambiguous");
       if (otp === input.attentionResendApiKey) throw new AttentionKeyInstallationError("otp_key_reused");
-      const attention = values.get(hraAttentionResendApiKeyEnvironmentName);
+      const attention = values.get(oompaAttentionResendApiKeyEnvironmentName);
       const keyState = attention === undefined ? "absent" : attention === input.attentionResendApiKey
         ? "existing_equal" : "existing_mismatched";
       // Reconciliation retains the intended key even if the administrative

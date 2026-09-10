@@ -1449,7 +1449,7 @@ export const workEventCursorWireSchema = z.string()
     return match !== null
       && isCanonicalBase64Url(match[1] ?? "")
       && isCanonicalBase64Url(match[2] ?? "");
-  }, "Must be one canonical HRA cursor envelope.");
+  }, "Must be one canonical Oompa cursor envelope.");
 
 export const workEventCursorPayloadSchema = z.object({
   version: z.literal(1),
@@ -2816,7 +2816,7 @@ export const workProtocolDescriptionSchema = z.object({
   version: z.literal(WORK_PROTOCOL_DESCRIPTION_VERSION),
   wire: z.object({
     applyArgv: z.tuple([
-      z.literal("hra"),
+      z.literal("oompa"),
       z.literal("work"),
       z.literal("apply"),
       z.literal("--input-stdin"),
@@ -2965,7 +2965,7 @@ export const WORK_PROTOCOL_DESCRIPTION: WorkProtocolDescription = {
   protocol: WORK_PROTOCOL,
   version: WORK_PROTOCOL_DESCRIPTION_VERSION,
   wire: {
-    applyArgv: ["hra", "work", "apply", "--input-stdin"],
+    applyArgv: ["oompa", "work", "apply", "--input-stdin"],
     input: "versioned_json_request",
     output: "versioned_json_response",
     streaming: "jsonl",

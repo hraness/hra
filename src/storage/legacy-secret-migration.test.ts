@@ -18,7 +18,7 @@ import { join } from "node:path";
 
 import {
   BunLegacySecretReader,
-  LEGACY_HRA_KEYCHAIN_SERVICE,
+  LEGACY_OOMPA_KEYCHAIN_SERVICE,
   LegacySecretMigrationError,
   migrateLegacySecrets,
   preflightLegacySecretMigration,
@@ -42,7 +42,7 @@ const currentAuthority = { assertCurrent: async (): Promise<void> => undefined }
 type Fixture = Readonly<{ home: string; paths: StatePaths }>;
 
 const createFixture = async (): Promise<Fixture> => {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-legacy-secrets-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-legacy-secrets-")));
   const paths = resolveStatePaths({ rootDirectory: home });
   await mkdir(join(paths.root, "secret-metadata"), { mode: 0o700 });
   return { home, paths };
@@ -65,7 +65,7 @@ const addPointer = async (
 
 describe("legacy Keychain secret migration", () => {
   test("pins the former prerelease service without exposing a mutation port", () => {
-    expect(LEGACY_HRA_KEYCHAIN_SERVICE).toBe("sh.hra.control-plane.v1");
+    expect(LEGACY_OOMPA_KEYCHAIN_SERVICE).toBe("sh.hra.control-plane.v1");
     const reader = new BunLegacySecretReader();
     expect(typeof reader.get).toBe("function");
     expect("set" in reader).toBe(false);

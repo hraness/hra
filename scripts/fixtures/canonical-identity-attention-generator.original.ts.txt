@@ -1,0 +1,387 @@
+// Coordinator-reviewed execution only. Three authentic archived public-writer
+// images; no current writer, raw logical writes, restamping, or native effects.
+// The source40 image is intact. Any later account-key/project corruption is a
+// separately labeled test derivative, never attributed to this old writer.
+// The public project root is inspected for canonical directory/access metadata
+// only. No project file is read, written, executed, or sent to a provider.
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join, relative } from "node:path";
+import { Database } from "bun:sqlite";
+
+const hash = (value: string | Uint8Array) => createHash("sha256").update(value).digest("hex");
+const record = (value: unknown): Record<string, unknown> => {
+  assert.ok(typeof value === "object" && value !== null && !Array.isArray(value));
+  assert.ok(Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
+  return value as Record<string, unknown>;
+};
+const text = (value: unknown): string => { assert.equal(typeof value, "string"); return value as string; };
+const exactKeys = (value: Record<string, unknown>, keys: readonly string[]) =>
+  assert.deepEqual(Object.keys(value).sort(), [...keys].sort());
+const readBounded = (path: string, maximum = 8 * 1024 * 1024) => {
+  const stat = lstatSync(path);
+  assert.ok(stat.isFile() && !stat.isSymbolicLink() && stat.size <= maximum, "CAPTURE_FILE_LIMIT");
+  return readFileSync(path);
+};
+// Check decoded strings and the complete image in UTF-8 and both UTF-16 byte
+// orders, at every byte offset. No exemptions, normalization, or scrubbing.
+const hostRoots = [["", "Users"], ["", "home"], ["", "private"], ["", "tmp"],
+  ["", "var", "folders"]].map((parts) => parts.join("/"));
+hostRoots.push(["", "Users"].join("\\"));
+const assertPrivatePathFree = (value: string | Uint8Array) => {
+  const bytes = typeof value === "string" ? Buffer.from(value) : Buffer.from(value);
+  for (const prefix of hostRoots) {
+    for (const suffix of ["/", "\\", "\u0000", '"', "'"]) {
+      const needle = prefix + suffix;
+      const littleEndian = Buffer.from(needle, "utf16le");
+      const bigEndian = Buffer.from(littleEndian).swap16();
+      for (const encoded of [Buffer.from(needle), littleEndian, bigEndian]) {
+        assert.equal(bytes.includes(encoded), false, "CAPTURE_PRIVATE_PATH");
+      }
+    }
+    if (typeof value === "string") assert.equal(value === prefix || value.includes(prefix + "/") || value.includes(prefix + "\\"), false);
+  }
+};
+const assertDecodedPrivatePathFree = (value: unknown, depth = 0): void => {
+  assert.ok(depth <= 64);
+  if (typeof value === "string") { assertPrivatePathFree(value); return; }
+  if (value === null || typeof value === "number" || typeof value === "boolean") return;
+  if (Array.isArray(value)) {
+    assert.ok(value.length <= 4096);
+    for (const item of value) assertDecodedPrivatePathFree(item, depth + 1);
+    return;
+  }
+  for (const [key, item] of Object.entries(record(value))) {
+    assertPrivatePathFree(key);
+    assertDecodedPrivatePathFree(item, depth + 1);
+  }
+};
+const output = join(import.meta.dir, "capture3");
+assert.equal(Bun.version, "1.3.14");
+assert.ok(lstatSync(import.meta.dir).isDirectory());
+assert.equal(lstatSync(import.meta.dir).mode & 0o777, 0o700);
+assert.equal(existsSync(output), false, "CAPTURE_OUTPUT_ALREADY_EXISTS");
+const recipe = readBounded(import.meta.filename, 64 * 1024);
+const generatorSha256 = hash(recipe);
+assertPrivatePathFree(recipe);
+const dependencies = { "@agentclientprotocol/sdk": "1.4.0", "@hraness/oh": "0.2.7",
+  "@openai/codex": "0.153.2", convex: "1.45.0", zod: "4.4.3" } as const;
+const dependencyManifestHashes: Readonly<Record<string, string>> = {
+  "@agentclientprotocol/sdk": "89bbcd7a71a3cd6e94b7096ef1f239dda62b5fb8aef840d3475af3fbfff3a955",
+  "@hraness/oh": "ad5ea2f55afd7f2147558e8ee0ae73d6d38c96d9ae8ec97dc3aebf6d5dd5b05b",
+  "@openai/codex": "4ecf4eae28684c5fcba8b9a63b946ce22b8cc2e451750f23c04e5088cf4c7a05",
+  convex: "aa9f5baee26b69a88d6b61180e540cce1f52baa31094e7124c8c0393e4b3211e",
+  zod: "c630bd10b52dcf71c112a2bf78dbf2734b9db58d62de663b8d86c2ec2c8cda2e",
+};
+const sources = {
+  canonical39: {
+    commit: "5f2735191640037c86d9949bc1d7f04b2ef09ffe", tree: "12b4cec2c26b328e41d763ecca41c9a844d3dec3",
+    version: 39, sourceFileCount: 282, manifest: "b4a34de0517950f4dc6bb2288c3f5ca79274551095a1aa63436c1099181e71fc",
+    pins: { "src/storage/state-store.ts": "bde901608092489d89aa9acdfde320a0cf2959a6bd3659879cf7ac9dfab43e89",
+      "package.json": "ef8779bd5fa796f395ad3d064710e247a89eb0cbd4023dc069b4daaad8e12d3c",
+      "bun.lock": "5a2b90063d8eb1aa55e18be71abbca59c1f051a9358a2a36ff89698d066b182a",
+      ".bun-version": "56b0485099b6c5427d3b68c042fd05b632d5e52e924c5064473389812227164c" },
+  },
+  canonical40: {
+    commit: "6f056dcafd6435cd11ae504c75e9b1f869955ca7", tree: "b5de09dee16ff661f6dd45fb3a2dac9e96411d10",
+    version: 40, sourceFileCount: 289, manifest: "75e9b44a58e7063be0275839a9e632df71ac3d1e90d9dea789ff4f7b337db3f2",
+    pins: { "src/storage/state-store.ts": "0e9e9f772b9caeb5c1ec80f58927c643643b28ac6cc7ca1ae868028d61cef32f",
+      "package.json": "ef8779bd5fa796f395ad3d064710e247a89eb0cbd4023dc069b4daaad8e12d3c",
+      "bun.lock": "5a2b90063d8eb1aa55e18be71abbca59c1f051a9358a2a36ff89698d066b182a",
+      ".bun-version": "56b0485099b6c5427d3b68c042fd05b632d5e52e924c5064473389812227164c" },
+  },
+} as const;
+type SourceName = keyof typeof sources;
+const verifySource = (name: SourceName) => {
+  const source = sources[name];
+  const root = join(import.meta.dir, name);
+  assert.ok(lstatSync(root).isDirectory() && !lstatSync(root).isSymbolicLink());
+  for (const [path, expected] of Object.entries(source.pins)) assert.equal(hash(readBounded(join(root, path))), expected, "CAPTURE_SOURCE_PIN");
+  const files: { path: string; sha256: string }[] = [];
+  const visit = (directory: string) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      assert.match(entry.name, /^[A-Za-z0-9_.-]+$/u);
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) visit(path);
+      else if (entry.isFile()) files.push({ path: relative(root, path), sha256: hash(readBounded(path)) });
+      else throw new Error("CAPTURE_SOURCE_ENTRY_INVALID");
+    }
+  };
+  visit(join(root, "src"));
+  files.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+  assert.equal(files.length, source.sourceFileCount);
+  assert.equal(hash(JSON.stringify(files)), source.manifest);
+  const declared = record(JSON.parse(readBounded(join(root, "package.json")).toString("utf8")));
+  assert.deepEqual(declared.dependencies, dependencies);
+  for (const [dependency, version] of Object.entries(dependencies)) {
+    const bytes = readBounded(join(root, "node_modules", dependency, "package.json"), 256 * 1024);
+    assert.equal(hash(bytes), dependencyManifestHashes[dependency]);
+    const installed = record(JSON.parse(bytes.toString("utf8")));
+    assert.equal(installed.name, dependency);
+    assert.equal(installed.version, version);
+  }
+  return files;
+};
+const manifests = { canonical39: verifySource("canonical39"), canonical40: verifySource("canonical40") };
+// No archived module is imported until both complete source/dependency pins pass.
+const { StateStore: Store39 } = await import("./canonical39/src/storage/state-store");
+const { StateStore: Store40 } = await import("./canonical40/src/storage/state-store");
+const paths39 = await import("./canonical39/src/storage/paths");
+const paths40 = await import("./canonical40/src/storage/paths");
+await mkdir(output, { mode: 0o700 });
+const fixedTime = 40_039;
+const snapshot = (path: string) => {
+  const db = new Database(path, { create: false, strict: true });
+  try {
+    db.exec("PRAGMA query_only=ON");
+    return db.transaction(() => {
+      const schema = db.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name LIMIT 2049").all()
+        .map((value: unknown) => {
+          const row = record(value);
+          exactKeys(row, ["type", "name", "tbl_name", "sql"]);
+          assert.ok(row.sql === null || typeof row.sql === "string");
+          return { type: text(row.type), name: text(row.name), tbl_name: text(row.tbl_name), sql: row.sql };
+        });
+      assert.ok(schema.length <= 2048);
+      const tables = schema.filter((row) => row.type === "table");
+      assert.ok(tables.length <= 256);
+      const rows: Record<string, Record<string, unknown>[]> = {};
+      for (const { name } of tables) {
+        assert.match(name, /^[A-Za-z_][A-Za-z0-9_]*$/u);
+        const entries = db.query(`SELECT * FROM "${name}" LIMIT 4097`).all().map((value: unknown) => record(value));
+        assert.ok(entries.length <= 4096);
+        entries.sort((a, b) => JSON.stringify(a) < JSON.stringify(b) ? -1 : JSON.stringify(a) > JSON.stringify(b) ? 1 : 0);
+        rows[name] = entries;
+      }
+      const result = { version: db.query("PRAGMA user_version").get(), schema, rows,
+        foreignKeys: db.query("PRAGMA foreign_key_check").all(), changes: db.query("SELECT total_changes() AS count").get() };
+      assert.deepEqual(result.foreignKeys, []);
+      assert.deepEqual(result.changes, { count: 0 });
+      assert.ok(Buffer.byteLength(JSON.stringify(result)) <= 8 * 1024 * 1024);
+      assertDecodedPrivatePathFree(result);
+      return result;
+    }).deferred();
+  } finally { db.close(false); }
+};
+const checkpoint = (path: string) => {
+  const db = new Database(path, { create: false, strict: true });
+  try { assert.deepEqual(db.query("PRAGMA wal_checkpoint(TRUNCATE)").get(), { busy: 0, log: 0, checkpointed: 0 }); }
+  finally { db.close(false); }
+  if (existsSync(`${path}-wal`)) assert.equal(lstatSync(`${path}-wal`).size, 0);
+};
+const summaries: unknown[] = [];
+const preserve = async (name: string, source: SourceName, databasePath: string, retained: unknown,
+  reopen: (readonly: boolean) => void, assertOriginal: (original: ReturnType<typeof snapshot>) => void) => {
+  checkpoint(databasePath);
+  const original = snapshot(databasePath);
+  const version = sources[source].version;
+  assert.deepEqual(original.version, { user_version: version });
+  assert.deepEqual(original.rows.migrations, Array.from({ length: version }, (_, index) => ({ version: index + 1, applied_at: fixedTime }))
+    // Snapshot rows are sorted by exact JSON, not numeric migration version.
+    .sort((a, b) => JSON.stringify(a) < JSON.stringify(b) ? -1 : JSON.stringify(a) > JSON.stringify(b) ? 1 : 0));
+  assertOriginal(original);
+  for (const readonly of [false, true]) {
+    const before = hash(readBounded(databasePath));
+    reopen(readonly);
+    checkpoint(databasePath);
+    assert.deepEqual(snapshot(databasePath), original, "CAPTURE_REOPEN_CHANGED_ROWS_OR_SCHEMA");
+    // Writable archived opens can repeat identical DDL. Do not claim physical
+    // byte equality there; the read-only reopen must also preserve file bytes.
+    if (readonly) assert.equal(hash(readBounded(databasePath)), before, "CAPTURE_READONLY_BYTES_CHANGED");
+  }
+  const bytes = readBounded(databasePath, 4 * 1024 * 1024);
+  assertPrivatePathFree(bytes);
+  const compressed = Bun.gzipSync(bytes);
+  const metadata = { scenario: name, source: sources[source], generatorSha256, bunVersion: Bun.version,
+    dependencies, dependencyManifestHashes, fixedTime, retained, snapshot: original,
+    databaseBytes: bytes.length, databaseSha256: hash(bytes), gzipBytes: compressed.length, gzipSha256: hash(compressed),
+    snapshotSha256: hash(JSON.stringify(original)), schemaSha256: hash(JSON.stringify(original.schema)),
+    rowCounts: Object.fromEntries(Object.entries(original.rows).map(([table, rows]) => [table, rows.length])),
+    ledger: original.rows.migrations, archivedRowsAndSchemaReopensUnchanged: true, archivedReadonlyImageUnchanged: true,
+    proofScope: "exact archived public storage writers with synthetic local state; no live provider or Work dispatch proof",
+    providerEffects: 0, rawLogicalWrites: false, versionRestamped: false, migrationStageImage: false };
+  const metadataBytes = Buffer.from(`${JSON.stringify(metadata, null, 2)}\n`);
+  const manifestBytes = Buffer.from(`${JSON.stringify(manifests[source], null, 2)}\n`);
+  assert.ok(metadataBytes.length <= 16 * 1024 * 1024 && manifestBytes.length <= 1024 * 1024);
+  assertPrivatePathFree(metadataBytes);
+  assertPrivatePathFree(manifestBytes);
+  assertDecodedPrivatePathFree(JSON.parse(metadataBytes.toString("utf8")));
+  assertDecodedPrivatePathFree(manifests[source]);
+  assert.equal(hash(readBounded(import.meta.filename, 64 * 1024)), generatorSha256);
+  verifySource("canonical39");
+  verifySource("canonical40");
+  const directory = join(output, name);
+  await mkdir(directory, { mode: 0o700 });
+  await writeFile(join(directory, "state.sqlite.gz"), compressed, { mode: 0o600, flag: "wx" });
+  await writeFile(join(directory, "fixture.json"), metadataBytes, { mode: 0o600, flag: "wx" });
+  await writeFile(join(directory, "source-manifest.json"), manifestBytes, { mode: 0o600, flag: "wx" });
+  await writeFile(join(directory, "generator.original.ts.txt"), recipe, { mode: 0o600, flag: "wx" });
+  summaries.push({ scenario: name, source: sources[source].commit, version, databaseSha256: hash(bytes),
+    archivedRowsAndSchemaReopensUnchanged: true, archivedReadonlyImageUnchanged: true });
+};
+
+{
+  const paths = paths40.resolveStatePaths({ homeDirectory: join(output, "home40-mixed"), platform: "darwin" });
+  await paths40.initializeStatePaths(paths);
+  const store = new Store40(paths, { now: () => fixedTime });
+  let retained: unknown;
+  try {
+    const bootId = `boot_${"4".repeat(32)}`;
+    const daemonGeneration = store.nextDaemonGeneration(bootId);
+    assert.equal(daemonGeneration, 1);
+    const created = store.nextProfileGeneration(store.createProfile("Canonical40 mixed authority").id);
+    const email = "canonical40-mixed-authority@example.com";
+    assert.equal(store.setProfileState(created.id, created.processGeneration, "signed_in", { email, plan: "Plus" }), true);
+    assert.equal(store.allocateNextUsageRevision(created.id), 1);
+    const profile = store.requireProfile(created.id);
+    const project = await store.createProject("Canonical40 mixed authority", "/opt/homebrew", true);
+    assert.equal(project.rootPath, "/opt/homebrew");
+    const providerAccountKey = `v1:codex:${hash(email.trim().toLowerCase())}`;
+    const proven = store.upsertProviderSession({ profileId: profile.id, provider: "codex",
+      providerThreadId: "canonical40-synthetic-proven-thread", title: "Canonical40 proven control",
+      preset: "high", fastEnabled: false, state: "idle", providerAccountKey });
+    const provenRuntime = store.recordSessionRuntimeProfile({ sessionId: proven.id, sourceKind: "session_start",
+      sourceId: "canonical40-synthetic-proven-runtime", profile: { profileId: profile.id,
+        processGeneration: profile.processGeneration, observedAt: fixedTime, preset: "high",
+        model: "gpt-5.6-sol", reasoningEffort: "max", serviceTier: null, fast: false,
+        approvalPolicy: "on-request", reviewMode: "auto_review", permissionProfile: ":workspace",
+        computerUse: true, pluginCapability: true, enabledApps: [] } });
+    const imported = store.upsertProviderSession({ profileId: profile.id, provider: "codex", projectId: project.id,
+      providerThreadId: "canonical40-synthetic-mixed-thread", title: "Canonical40 mixed owners",
+      preset: "high", fastEnabled: false, state: "idle", providerAccountKey });
+    // Original source40 imports retain contract1; explicit high selection moves
+    // this session to its current contract2, which the old Work writer requires.
+    const partial = store.updateSessionMetadata({ sessionId: imported.id, expectedRevision: imported.revision, preset: "high" });
+    const queue = store.enqueue(partial.id, "Synthetic retained queue; never dispatch.");
+    const mutationKey = "40000000-0000-4000-8000-000000000903";
+    const prepared = store.prepareMutation({ kind: "session.rename", authorityId: partial.id,
+      authorityGeneration: profile.processGeneration, request: { name: "Synthetic retained rename" }, idempotencyKey: mutationKey });
+    assert.equal(prepared.state, "prepared");
+    const sessionTask = store.createSessionTaskStore().create({ sessionId: partial.id, name: "Synthetic active task",
+      prompt: "Retain this old task without dispatch.", minutes: 15, status: "active",
+      idempotencyKey: "40000000-0000-7000-8000-000000000904" });
+    const interaction = store.admitInteraction({ publicId: "40000000-0000-4000-8000-000000000905",
+      sessionId: partial.id, authority: { profileId: profile.id, processGeneration: profile.processGeneration,
+        connectionId: "40000000-0000-4000-8000-000000000906", requestId: { type: "string", value: "synthetic-mixed-approval" },
+        method: "item/fileChange/requestApproval", requestDigest: hash("canonical40 synthetic file approval"),
+        threadId: partial.providerThreadId ?? null, turnId: "canonical40-synthetic-approval-turn",
+        itemId: "canonical40-synthetic-approval-item", approvalId: null },
+      kind: "file_change_approval", blocking: true, display: { kind: "file_change_approval",
+        summary: "Synthetic retained file approval", reason: null, grantRoot: null,
+        availableDecisions: ["once", "decline", "cancel"] } }).record;
+    // Synthetic in-process capability adapter, bound to exact issued authority.
+    // It exercises the archived storage issuer/verifier contract, not a live
+    // capability service, native worker, or transport authentication claim.
+    const issued = new Map<string, string>();
+    const workStore = store.createWorkStore(daemonGeneration,
+      (cursor) => Buffer.from(JSON.stringify(cursor)).toString("base64url"), {
+        issue: (authority) => {
+          const canonical = JSON.stringify(authority);
+          const token = `hrac1_${createHash("sha256").update(`synthetic:${canonical}`).digest("base64url")}`;
+          issued.set(token, canonical);
+          return token;
+        },
+        verify: (token, authority) => issued.get(token) === JSON.stringify(authority),
+      });
+    const work = workStore.apply({ kind: "work.create", idempotencyKey: "40000000-0000-7000-8000-000000000907",
+      clientRef: "canonical40-synthetic-work", coordinatorSessionId: partial.id,
+      objective: "Retain one old claimed Work attempt for authority migration.",
+      routes: [{ accountId: profile.id, projectId: project.id, preset: "high", fast: false }],
+      tasks: [{ clientRef: "canonical40-synthetic-task", dependsOnRefs: [], dependsOnTaskIds: [],
+        objective: "Hold a synthetic claim.", instructions: "Never dispatch this capture.", criteria: ["Retain original claim bytes."],
+        route: { accountId: profile.id, projectId: project.id }, preset: "high", fast: false,
+        priority: 0, maxAttempts: 3, requiredReviews: 0, resultKind: "text", minEvidence: 0 }] });
+    if (work.kind !== "work.create") throw new Error("CAPTURE_WORK_CREATE_RESULT");
+    const workTask = work.tasks[0];
+    if (workTask === undefined || work.tasks.length !== 1) throw new Error("CAPTURE_WORK_TASK_RESULT");
+    const workClaim = workStore.apply({ kind: "task.claim", idempotencyKey: "40000000-0000-7000-8000-000000000908",
+      workId: work.work.id, taskId: workTask.id, expectedTaskRevision: workTask.revision,
+      actorSessionId: partial.id, actorCapability: work.memberCapability, leaseMs: 5000 });
+    if (workClaim.kind !== "task.claim") throw new Error("CAPTURE_WORK_CLAIM_RESULT");
+    assert.equal(workClaim.attempt.status, "claimed");
+    assert.equal(store.sessionAccountAuthorityMatches(proven.id, profile.id), true);
+    assert.equal(store.sessionAccountAuthorityMatches(partial.id, profile.id), true);
+    retained = { profile, project, providerAccountKey, proven, provenRuntime, imported, partial, queue,
+      mutationKey, prepared, mutation: store.readMutation(mutationKey), sessionTask, interaction,
+      work, workTask, workClaim, bootId, daemonGeneration, projectDirectoryInspectedOnly: true };
+  } finally { store.close(); }
+  await preserve("canonical40-mixed-owners", "canonical40", paths.database, retained,
+    (readonly) => { const opened = new Store40(paths, { readonly, now: () => fixedTime }); opened.close(); },
+    (original) => {
+      assert.equal(original.rows.profiles?.length, 1);
+      assert.equal(original.rows.sessions?.length, 2);
+      assert.equal(original.rows.session_provider_account_authorities?.length, 2);
+      assert.equal(original.rows.session_runtime_profiles?.length, 1);
+      assert.equal(original.rows.queue_entries?.length, 1);
+      assert.equal(original.rows.queue_entries?.[0]?.state, "pending");
+      assert.equal(original.rows.mutation_attempts?.length, 1);
+      assert.equal(original.rows.mutation_attempts?.[0]?.state, "prepared");
+      assert.equal(original.rows.mutation_effect_evidence?.length, 0);
+      assert.equal(original.rows.session_tasks?.length, 1);
+      assert.equal(original.rows.session_tasks?.[0]?.status, "active");
+      assert.equal(original.rows.provider_interactions?.length, 1);
+      assert.equal(original.rows.provider_interactions?.[0]?.state, "pending");
+      assert.equal(original.rows.work_attempts?.length, 1);
+      assert.equal(original.rows.work_attempts?.[0]?.state, "claimed");
+      assert.equal(original.rows.usage_snapshots?.length, 0);
+      assert.equal(original.rows.usage_revision_authority?.length, 1);
+    });
+}
+
+for (const pendingCallback of [false, true]) {
+  const name = pendingCallback ? "canonical39-unproved-attention-with-callback" : "canonical39-unproved-attention-without-callback";
+  const paths = paths39.resolveStatePaths({ homeDirectory: join(output, `${name}-home`), platform: "darwin" });
+  await paths39.initializeStatePaths(paths);
+  const store = new Store39(paths, { now: () => fixedTime });
+  let retained: unknown;
+  try {
+    const created = store.nextProfileGeneration(store.createProfile("Canonical39 unproved attention").id);
+    assert.equal(store.setProfileState(created.id, created.processGeneration, "signed_in",
+      { email: "canonical39-unproved-attention@example.com", plan: "Plus" }), true);
+    assert.equal(store.allocateNextUsageRevision(created.id), 1);
+    const profile = store.requireProfile(created.id);
+    const unbound = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false,
+      title: "Canonical39 unproved attention" });
+    const session = store.bindSession({ sessionId: unbound.id, expectedRevision: unbound.revision,
+      providerThreadId: "canonical39-synthetic-unproved-thread", state: "idle" });
+    // No runtime observation or later provider-account authority is supplied.
+    // Source39 genuinely admits this callback from its profile/session tuple.
+    const interaction = pendingCallback ? store.admitInteraction({
+      publicId: "39000000-0000-4000-8000-000000000944", sessionId: session.id,
+      authority: { profileId: profile.id, processGeneration: profile.processGeneration,
+        connectionId: "39000000-0000-4000-8000-000000000945", requestId: { type: "number", value: 44 },
+        method: "item/commandExecution/requestApproval", requestDigest: hash("canonical39 synthetic pending approval"),
+        threadId: session.providerThreadId ?? null, turnId: null, itemId: "canonical39-synthetic-item", approvalId: null },
+      kind: "command_approval", blocking: true, display: { kind: "command_approval",
+        summary: "Synthetic stranded approval", reason: null, commandClass: "fixture", workingDirectory: null,
+        availableDecisions: ["once", "decline", "cancel"] } }).record : null;
+    const state = store.upsertSessionState({ sessionId: session.id, state: "needs_approval", attention: true,
+      reason: "pending command_approval", verbatimRequired: false, verbatimLiteral: undefined,
+      lastActivityAt: 1000, revision: 1 });
+    assert.deepEqual(store.readSessionState(session.id), state);
+    assert.equal(store.eventStreamPosition(session.id).observedThroughSequence, 0);
+    retained = { profile, unbound, session, state, interaction, pendingCallback,
+      daemonGenerationAdvanced: false, runtimeObservationRecorded: false };
+  } finally { store.close(); }
+  await preserve(name, "canonical39", paths.database, retained,
+    (readonly) => { const opened = new Store39(paths, { readonly, now: () => fixedTime }); opened.close(); },
+    (original) => {
+      assert.equal(original.rows.profiles?.length, 1);
+      assert.equal(original.rows.sessions?.length, 1);
+      assert.equal(original.rows.session_states?.length, 1);
+      assert.equal(original.rows.session_runtime_profiles?.length, 0);
+      assert.equal(original.rows.session_turn_runtime_profiles?.length, 0);
+      assert.equal(original.rows.session_events?.length, 0);
+      assert.equal(original.rows.session_provider_account_authorities, undefined);
+      assert.equal(original.rows.provider_interactions?.length, pendingCallback ? 1 : 0);
+      if (pendingCallback) assert.equal(original.rows.provider_interactions?.[0]?.state, "pending");
+      assert.equal(original.rows.usage_snapshots?.length, 0);
+      assert.equal(original.rows.usage_revision_authority?.length, 1);
+    });
+}
+verifySource("canonical39");
+verifySource("canonical40");
+assert.equal(hash(readBounded(import.meta.filename, 64 * 1024)), generatorSha256);
+console.log(JSON.stringify({ generatorSha256, summaries, providerEffects: 0 }));

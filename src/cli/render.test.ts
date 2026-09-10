@@ -640,7 +640,7 @@ describe("CLI rendering", () => {
       "Devices: registered unknown, online unknown (cloud not_attempted)",
     );
     expect(human.stdout.join("")).toContain(
-      "hra session status sess_00000000000000000000000000000000",
+      "oompa session status sess_00000000000000000000000000000000",
     );
 
     const json = capture();
@@ -667,7 +667,7 @@ describe("CLI rendering", () => {
     const added = capture();
     renderSuccess(
       { kind: "account.add", label: "Personal" },
-      { account, next: `hra account login ${accountId}` },
+      { account, next: `oompa account login ${accountId}` },
       false,
       added.output,
     );
@@ -677,7 +677,7 @@ describe("CLI rendering", () => {
       `ID: ${accountId}`,
       "Provider generation: 0",
       "Updated: 1970-01-01T00:00:01.000Z",
-      `Next: hra account login ${accountId}`,
+      `Next: oompa account login ${accountId}`,
       "",
     ].join("\n"));
 
@@ -695,7 +695,7 @@ describe("CLI rendering", () => {
         },
         login: {
           loginId: "PRIVATE-LOGIN-AUTHORITY",
-          next: `hra account login-cancel ${accountId}`,
+          next: `oompa account login-cancel ${accountId}`,
           status: "pending",
         },
         providerProjection: { signedIn: false },
@@ -714,7 +714,7 @@ describe("CLI rendering", () => {
       "Updated: 1970-01-01T00:00:02.000Z",
       "Provider: signed out",
       "Login: pending",
-      `Next: hra account login-cancel ${accountId}`,
+      `Next: oompa account login-cancel ${accountId}`,
       "",
     ].join("\n"));
     expect(shown.stdout.join("")).not.toContain("PRIVATE-LOGIN-AUTHORITY");
@@ -726,7 +726,7 @@ describe("CLI rendering", () => {
     const data = {
       account: { id: accountId, label: "Private" },
       authentication: { provider: "claude", signedIn: false },
-      nextCommand: `hra account login ${accountId} --provider claude`,
+      nextCommand: `oompa account login ${accountId} --provider claude`,
       providerGeneration: 4,
     } as const;
     const human = capture();
@@ -741,7 +741,7 @@ describe("CLI rendering", () => {
       "Label: Private",
       `ID: ${accountId}`,
       "Provider generation: 4",
-      `Next: hra account login ${accountId} --provider claude`,
+      `Next: oompa account login ${accountId} --provider claude`,
       "",
     ].join("\n"));
     const json = capture();
@@ -785,7 +785,7 @@ describe("CLI rendering", () => {
       data.diagnostic,
       "",
     ].join("\n"));
-    expect(human.stdout.join("")).not.toMatch(/signed in|signed out|Account allowance|hra account login /u);
+    expect(human.stdout.join("")).not.toMatch(/signed in|signed out|Account allowance|oompa account login /u);
     const json = capture();
     renderSuccess({ kind: "account.show", account: accountId, provider: "devin" }, data, true, json.output);
     expect(JSON.parse(json.stdout.join(""))).toEqual({
@@ -793,13 +793,13 @@ describe("CLI rendering", () => {
     });
 
     const recovery = capture();
-    const abandonCommand = `hra account login-cancel ${accountId} --provider devin --attempt-id attempt_${"a".repeat(32)} --provider-generation 2 --idempotency-key 00000000-0000-4000-8000-000000000102 --acknowledge-child-exited`;
+    const abandonCommand = `oompa account login-cancel ${accountId} --provider devin --attempt-id attempt_${"a".repeat(32)} --provider-generation 2 --idempotency-key 00000000-0000-4000-8000-000000000102 --acknowledge-child-exited`;
     renderSuccess(
       { kind: "account.show", account: accountId, provider: "devin" },
       { ...data, recovery: {
         required: true,
         diagnostic: "Confirm the original child exited; cleanup does not stop it.",
-        statusCommand: `hra account show ${accountId} --provider devin`,
+        statusCommand: `oompa account show ${accountId} --provider devin`,
         abandonCommand,
       } },
       false,
@@ -807,14 +807,14 @@ describe("CLI rendering", () => {
     );
     expect(recovery.stdout.join("")).toContain("Recovery: required");
     expect(recovery.stdout.join("")).toContain(`Only after confirming the original Devin child exited: ${abandonCommand}`);
-    expect(recovery.stdout.join("")).not.toMatch(/signed in|signed out|Account allowance|hra account login /u);
+    expect(recovery.stdout.join("")).not.toMatch(/signed in|signed out|Account allowance|oompa account login /u);
   });
 
   test("renders Claude recovery and acknowledged local abandon truthfully", () => {
     const accountId = `acct_${"2".repeat(32)}`;
     const attemptId = `attempt_${"3".repeat(32)}`;
     const key = "00000000-0000-4000-8000-000000000317";
-    const abandonCommand = `hra account login-cancel ${accountId} --provider claude --attempt-id ${attemptId} --provider-generation 4 --idempotency-key ${key} --acknowledge-child-exited`;
+    const abandonCommand = `oompa account login-cancel ${accountId} --provider claude --attempt-id ${attemptId} --provider-generation 4 --idempotency-key ${key} --acknowledge-child-exited`;
     const status = capture();
     renderSuccess(
       { kind: "account.show", account: accountId, provider: "claude" },
@@ -825,7 +825,7 @@ describe("CLI rendering", () => {
         recovery: {
           required: true,
           diagnostic: "Credential presence does not prove child exit.",
-          statusCommand: `hra account show ${accountId} --provider claude`,
+          statusCommand: `oompa account show ${accountId} --provider claude`,
           abandonCommand,
         },
       },
@@ -850,7 +850,7 @@ describe("CLI rendering", () => {
       login: { status: "abandoned", localOnly: true, credentialAction: "none" },
     }, false, abandoned.output);
     expect(abandoned.stdout.join("")).toContain(
-      "HRA did not stop Claude or change or delete Claude credentials",
+      "Oompa did not stop Claude or change or delete Claude credentials",
     );
   });
 
@@ -879,7 +879,7 @@ describe("CLI rendering", () => {
       "Email: reader@example.com",
       `Device: pending (${pendingDeviceId})`,
       "Last sync: never",
-      `Next: on an active device, run hra device approve ${pendingDeviceId}`,
+      `Next: on an active device, run oompa device approve ${pendingDeviceId}`,
       "",
     ].join("\n"));
 
@@ -903,7 +903,7 @@ describe("CLI rendering", () => {
       "Cloud account: signed out",
       `Device: known locally (${localDeviceId})`,
       "Last sync: never",
-      "Next: hra auth login --input-stdin",
+      "Next: oompa auth login --input-stdin",
       "",
     ].join("\n"));
   });
@@ -998,7 +998,7 @@ describe("CLI rendering", () => {
     const validDevice = {
       current: true,
       keyVersion: 1,
-      label: "HRA device DDDDDDDD",
+      label: "Oompa device DDDDDDDD",
       labelSource: "encrypted",
       lastSeenAt: null,
       online: false,
@@ -1132,8 +1132,8 @@ describe("CLI rendering", () => {
       "Account key: pairing required",
       "Recovery: an existing account-key holder must pair this device.",
       "Local Codex data: unaffected.",
-      "No existing key holder: hra device key-loss --acknowledge-no-key-holders",
-      "Next: hra device pair",
+      "No existing key holder: oompa device key-loss --acknowledge-no-key-holders",
+      "Next: oompa device pair",
       "",
     ].join("\n"));
 
@@ -1157,9 +1157,9 @@ describe("CLI rendering", () => {
       "Local Codex data: unaffected.",
       "Existing encrypted cloud content: cannot be decrypted.",
       "Recovery: search again for an existing account-key holder, then pair the real key.",
-      "Fallback: erase and reinitialize the HRA cloud account only after that renewed holder search is exhausted. The lost account key cannot be regenerated.",
+      "Fallback: erase and reinitialize the Oompa cloud account only after that renewed holder search is exhausted. The lost account key cannot be regenerated.",
       "No account key, device key, or ciphertext was minted, replaced, or deleted.",
-      "Next: hra device pair",
+      "Next: oompa device pair",
       "",
     ].join("\n"));
 
@@ -1224,7 +1224,7 @@ describe("CLI rendering", () => {
       "  Recover: sess_11111111111111111111111111111111",
       "Projection detail: Recovery failed at [local-path] [redacted]",
       "Projection recoveries: 2 of 150 shown (prepared 1, applied 1)",
-      "Next: hra doctor",
+      "Next: oompa doctor",
       "",
     ].join("\n"));
     expect(target.stdout.join("")).not.toContain("SYNC-STATUS-SECRET");
@@ -1255,7 +1255,7 @@ describe("CLI rendering", () => {
           },
         },
         state: "Cloud sync: unavailable (projection cache)",
-        next: "Next: hra doctor",
+        next: "Next: oompa doctor",
       },
       {
         data: {
@@ -1273,7 +1273,7 @@ describe("CLI rendering", () => {
           },
         },
         state: "Cloud sync: recovery required (projection)",
-        next: `Next: hra sync projection recover sess_${"2".repeat(32)} --acknowledge-gap --idempotency-key 018bcfe5-6800-7000-8000-000000000702`,
+        next: `Next: oompa sync projection recover sess_${"2".repeat(32)} --acknowledge-gap --idempotency-key 018bcfe5-6800-7000-8000-000000000702`,
       },
       {
         data: {
@@ -1296,7 +1296,7 @@ describe("CLI rendering", () => {
           },
         },
         state: "Cloud sync: degraded (projection cache)",
-        next: `Next: hra sync projection recover sess_${"2".repeat(32)} --acknowledge-gap --idempotency-key 018bcfe5-6800-7000-8000-000000000702`,
+        next: `Next: oompa sync projection recover sess_${"2".repeat(32)} --acknowledge-gap --idempotency-key 018bcfe5-6800-7000-8000-000000000702`,
       },
     ];
     for (const entry of cases) {
@@ -1305,6 +1305,23 @@ describe("CLI rendering", () => {
       expect(target.stdout.join("")).toContain(`${entry.state}\n`);
       expect(target.stdout.join("")).toContain(`${entry.next}\n`);
       expect(target.stdout.join("")).not.toContain("Cloud sync: ready");
+    }
+  });
+
+  test("cloud recovery guidance covers both deployment aliases without selecting a different target", () => {
+    for (const [reenable, guidance] of [
+      [{ kind: "use_hosted_default" }, "unset OOMPA_CONVEX_URL and HRA_CONVEX_URL and restart the daemon"],
+      [{ kind: "restore_bound_deployment", deploymentUrl: "https://bound.convex.cloud" },
+        "set OOMPA_CONVEX_URL to https://bound.convex.cloud, unset HRA_CONVEX_URL, and restart the daemon"],
+    ] as const) {
+      for (const kind of ["sync.status", "doctor"] as const) {
+        const cloud = { configured: false, reenable, signedIn: false, unavailability: "disabled" };
+        const target = capture();
+        if (kind === "sync.status") renderSuccess({ kind }, cloud, false, target.output);
+        else renderSuccess({ kind, offline: false }, { cloud, healthy: true, problems: [] }, false, target.output);
+        expect(target.stdout.join("")).toContain(`Next: ${guidance}\n`);
+        expect(target.stderr).toEqual([]);
+      }
     }
   });
 
@@ -1318,7 +1335,7 @@ describe("CLI rendering", () => {
       unavailability: "disabled",
     }, false, target.output);
     expect(target.stdout.join("")).toContain("Cloud sync: unavailable\n");
-    expect(target.stdout.join("")).toContain("Next: unset HRA_CONVEX_URL and restart the daemon\n");
+    expect(target.stdout.join("")).toContain("Next: unset OOMPA_CONVEX_URL and HRA_CONVEX_URL and restart the daemon\n");
 
     const ordinarySelfManaged = capture();
     renderSuccess({ kind: "sync.status" }, {
@@ -1332,7 +1349,7 @@ describe("CLI rendering", () => {
       unavailability: "disabled",
     }, false, ordinarySelfManaged.output);
     expect(ordinarySelfManaged.stdout.join("")).toContain(
-      "Next: set HRA_CONVEX_URL to https://self-managed.convex.cloud and restart the daemon\n",
+      "Next: set OOMPA_CONVEX_URL to https://self-managed.convex.cloud, unset HRA_CONVEX_URL, and restart the daemon\n",
     );
 
     const recovery = capture();
@@ -1354,11 +1371,11 @@ describe("CLI rendering", () => {
       unavailability: "disabled",
     }, false, recovery.output);
     expect(recovery.stdout.join("")).toContain("Cloud sync: unavailable (projection recovery pending)\n");
-    expect(recovery.stdout.join("")).toContain("Recovery prerequisite: unset HRA_CONVEX_URL and restart the daemon.\n");
+    expect(recovery.stdout.join("")).toContain("Recovery prerequisite: unset OOMPA_CONVEX_URL and HRA_CONVEX_URL and restart the daemon.\n");
     expect(recovery.stdout.join("")).toContain(
-      `Next after restart: hra sync projection recover sess_${"2".repeat(32)} --acknowledge-gap --idempotency-key 018bcfe5-6800-7000-8000-000000000702\n`,
+      `Next after restart: oompa sync projection recover sess_${"2".repeat(32)} --acknowledge-gap --idempotency-key 018bcfe5-6800-7000-8000-000000000702\n`,
     );
-    expect(recovery.stdout.join("")).not.toContain("Next: hra sync projection recover");
+    expect(recovery.stdout.join("")).not.toContain("Next: oompa sync projection recover");
 
     const selfManaged = capture();
     renderSuccess({ kind: "sync.status" }, {
@@ -1382,14 +1399,14 @@ describe("CLI rendering", () => {
       unavailability: "disabled",
     }, false, selfManaged.output);
     expect(selfManaged.stdout.join("")).toContain(
-      "Recovery prerequisite: set HRA_CONVEX_URL to https://self-managed.convex.cloud and restart the daemon.\n",
+      "Recovery prerequisite: set OOMPA_CONVEX_URL to https://self-managed.convex.cloud, unset HRA_CONVEX_URL, and restart the daemon.\n",
     );
   });
 
   test("renders doctor results as concise human checks", () => {
     const healthy = capture();
     renderSuccess({ kind: "doctor", offline: false }, { healthy: true, problems: [] }, false, healthy.output);
-    expect(healthy.stdout.join("")).toBe("HRA checks passed.\n");
+    expect(healthy.stdout.join("")).toBe("Oompa checks passed.\n");
 
     const disabledSelfManaged = capture();
     renderSuccess({ kind: "doctor", offline: false }, {
@@ -1405,7 +1422,7 @@ describe("CLI rendering", () => {
       problems: [],
     }, false, disabledSelfManaged.output);
     expect(disabledSelfManaged.stdout.join("")).toBe(
-      "HRA checks passed.\nCloud sync: disabled (optional)\nNext: set HRA_CONVEX_URL to https://self-managed.convex.cloud and restart the daemon\n",
+      "Oompa checks passed.\nCloud sync: disabled (optional)\nNext: set OOMPA_CONVEX_URL to https://self-managed.convex.cloud, unset HRA_CONVEX_URL, and restart the daemon\n",
     );
 
     const unhealthy = capture();
@@ -1413,7 +1430,7 @@ describe("CLI rendering", () => {
       healthy: false,
       problems: ["Repair the local projection cache."],
     }, false, unhealthy.output);
-    expect(unhealthy.stdout.join("")).toBe("HRA checks found 1 problem:\n- Repair the local projection cache.\n");
+    expect(unhealthy.stdout.join("")).toBe("Oompa checks found 1 problem:\n- Repair the local projection cache.\n");
 
     const unhealthyDisabled = capture();
     renderSuccess({ kind: "doctor", offline: false }, {
@@ -1426,11 +1443,11 @@ describe("CLI rendering", () => {
       problems: ["Repair the local projection cache."],
     }, false, unhealthyDisabled.output);
     expect(unhealthyDisabled.stdout.join("")).toBe([
-      "HRA checks found 1 problem:",
+      "Oompa checks found 1 problem:",
       "- Repair the local projection cache.",
       "",
       "Cloud sync: disabled (optional)",
-      "Next: unset HRA_CONVEX_URL and restart the daemon",
+      "Next: unset OOMPA_CONVEX_URL and HRA_CONVEX_URL and restart the daemon",
       "",
     ].join("\n"));
 
@@ -1439,11 +1456,11 @@ describe("CLI rendering", () => {
       healthy: true,
       problems: [1],
     }, false, malformed.output);
-    expect(malformed.stdout.join("")).toBe("HRA checks returned an invalid local result.\n");
+    expect(malformed.stdout.join("")).toBe("Oompa checks returned an invalid local result.\n");
   });
 
   test("never interpolates a noncanonical or hostile device ID into an approval command", () => {
-    const attack = "device_AAAAAAAAAAAAAAAAAAAAAAAA; touch /tmp/HRA-DEVICE-INJECTION";
+    const attack = "device_AAAAAAAAAAAAAAAAAAAAAAAA; touch /tmp/Oompa-DEVICE-INJECTION";
     const target = capture();
     renderSuccess({ kind: "auth.status" }, {
       configured: true,
@@ -1451,9 +1468,9 @@ describe("CLI rendering", () => {
       lastSync: null,
       signedIn: true,
     }, false, target.output);
-    expect(target.stdout.join("")).toContain("Next: hra device list");
-    expect(target.stdout.join("")).not.toContain("hra device approve");
-    expect(target.stdout.join("")).not.toContain("touch /tmp/HRA-DEVICE-INJECTION");
+    expect(target.stdout.join("")).toContain("Next: oompa device list");
+    expect(target.stdout.join("")).not.toContain("oompa device approve");
+    expect(target.stdout.join("")).not.toContain("touch /tmp/Oompa-DEVICE-INJECTION");
   });
 
   test("renders a bound signed-out failure next command without changing JSON details", () => {
@@ -1463,15 +1480,15 @@ describe("CLI rendering", () => {
       details: {
         accountSelector: accountId,
         accountState: "signed_out",
-        nextCommand: `hra account login ${accountId}`,
+        nextCommand: `oompa account login ${accountId}`,
       },
-      message: `Sign in with \`hra account login ${accountId}\` before using this account's Codex runtime.`,
+      message: `Sign in with \`oompa account login ${accountId}\` before using this account's Codex runtime.`,
     };
     const human = capture();
     expect(renderFailure(error, false, human.output)).toBe(6);
     expect(human.stderr.join("")).toBe([
-      `hra: Sign in with \`hra account login ${accountId}\` before using this account's Codex runtime.`,
-      `Next: hra account login ${accountId}`,
+      `oompa: Sign in with \`oompa account login ${accountId}\` before using this account's Codex runtime.`,
+      `Next: oompa account login ${accountId}`,
       "",
     ].join("\n"));
     expect(human.stderr.join("")).not.toContain("accountState");
@@ -1491,7 +1508,7 @@ describe("CLI rendering", () => {
     const malformed = capture();
     renderFailure({
       ...error,
-      details: { ...error.details, nextCommand: `hra account login ${accountId} --unexpected` },
+      details: { ...error.details, nextCommand: `oompa account login ${accountId} --unexpected` },
     }, false, malformed.output);
     expect(malformed.stderr.join("")).not.toContain("\nNext:");
     expect(malformed.stderr.join("")).toContain('"accountState": "signed_out"');
@@ -1500,12 +1517,12 @@ describe("CLI rendering", () => {
     const claudeDetails = {
       accountSelector: accountId,
       accountState: "signed_out",
-      nextCommand: `hra account login ${accountId} --provider claude`,
+      nextCommand: `oompa account login ${accountId} --provider claude`,
       provider: "claude",
     } as const;
     renderFailure({ ...error, details: claudeDetails }, false, claude.output);
     expect(claude.stderr.join("")).toContain(
-      `Next: hra account login ${accountId} --provider claude`,
+      `Next: oompa account login ${accountId} --provider claude`,
     );
 
     const widenedClaude = capture();
@@ -1520,7 +1537,7 @@ describe("CLI rendering", () => {
     const error = {
       code: "UNAVAILABLE",
       details: {
-        nextCommand: "hra doctor",
+        nextCommand: "oompa doctor",
         repair: "repair_or_select_project",
       },
       message: "The selected project directory is unavailable.",
@@ -1528,8 +1545,8 @@ describe("CLI rendering", () => {
     const human = capture();
     expect(renderFailure(error, false, human.output)).toBe(5);
     expect(human.stderr.join("")).toBe([
-      "hra: The selected project directory is unavailable.",
-      "Next: hra doctor",
+      "oompa: The selected project directory is unavailable.",
+      "Next: oompa doctor",
       "",
     ].join("\n"));
 
@@ -1555,7 +1572,7 @@ describe("CLI rendering", () => {
       false,
       stopped.output,
     );
-    expect(stopped.stdout.join("")).toBe("HRA daemon stopped.\n");
+    expect(stopped.stdout.join("")).toBe("Oompa daemon stopped.\n");
 
     const absent = capture();
     renderSuccess(
@@ -1564,12 +1581,12 @@ describe("CLI rendering", () => {
       false,
       absent.output,
     );
-    expect(absent.stdout.join("")).toBe("HRA daemon is already stopped.\n");
+    expect(absent.stdout.join("")).toBe("Oompa daemon is already stopped.\n");
 
     for (const nextCommand of [
-      "hra daemon status --json",
-      "hra doctor --offline",
-      "hra init --yes",
+      "oompa daemon status --json",
+      "oompa doctor --offline",
+      "oompa init --yes",
     ] as const) {
       const recovery = capture();
       renderFailure({
@@ -1578,7 +1595,7 @@ describe("CLI rendering", () => {
         message: "The exact daemon shutdown result requires inspection.",
       }, false, recovery.output);
       expect(recovery.stderr.join("")).toBe([
-        "hra: The exact daemon shutdown result requires inspection.",
+        "oompa: The exact daemon shutdown result requires inspection.",
         `Next: ${nextCommand}`,
         "",
       ].join("\n"));
@@ -1588,7 +1605,7 @@ describe("CLI rendering", () => {
     renderFailure({
       code: "RECOVERY_REQUIRED",
       details: {
-        nextCommand: "hra daemon status --json; touch /tmp/unsafe",
+        nextCommand: "oompa daemon status --json; touch /tmp/unsafe",
       },
       message: "The exact daemon shutdown result requires inspection.",
     }, false, injected.output);
@@ -1605,15 +1622,15 @@ describe("CLI rendering", () => {
   ] as const)("preserves closed daemon stop diagnostic guidance for %s / %s", (authorityPhase, stopRequestState) => {
     const error = {
       code: "RECOVERY_REQUIRED",
-      details: { nextCommand: "hra doctor --offline", authorityPhase, stopRequestState },
+      details: { nextCommand: "oompa doctor --offline", authorityPhase, stopRequestState },
       message: "Daemon authority verification requires inspection.",
     };
     const human = capture();
     expect(renderFailure(error, false, human.output)).toBe(7);
     expect(human.stdout).toEqual([]);
     expect(human.stderr.join("")).toBe([
-      "hra: Daemon authority verification requires inspection.",
-      "Next: hra doctor --offline",
+      "oompa: Daemon authority verification requires inspection.",
+      "Next: oompa doctor --offline",
       "",
     ].join("\n"));
 
@@ -1625,14 +1642,14 @@ describe("CLI rendering", () => {
 
   test("refuses widened or invalid daemon stop diagnostic handoffs", () => {
     const valid = {
-      nextCommand: "hra doctor --offline",
+      nextCommand: "oompa doctor --offline",
       authorityPhase: "release_confirmation",
       stopRequestState: "acknowledged",
     };
     const inheritedPhase: unknown = Object.assign(Object.create({
       authorityPhase: "release_confirmation",
     }) as object, {
-      nextCommand: "hra doctor --offline",
+      nextCommand: "oompa doctor --offline",
       stopRequestState: "acknowledged",
       unexpected: true,
     });
@@ -1652,8 +1669,8 @@ describe("CLI rendering", () => {
       { authorityPhase: valid.authorityPhase, stopRequestState: valid.stopRequestState },
       { nextCommand: valid.nextCommand, stopRequestState: valid.stopRequestState },
       { nextCommand: valid.nextCommand, authorityPhase: valid.authorityPhase },
-      { ...valid, nextCommand: "hra daemon status --json" },
-      { ...valid, nextCommand: "hra doctor --offline; touch /tmp/unsafe" },
+      { ...valid, nextCommand: "oompa daemon status --json" },
+      { ...valid, nextCommand: "oompa doctor --offline; touch /tmp/unsafe" },
       inheritedPhase,
     ]) {
       const human = capture();
@@ -1669,9 +1686,9 @@ describe("CLI rendering", () => {
 
   test("renders only the closed key-loss precondition handoffs", () => {
     for (const [code, nextCommand] of [
-      ["INTERACTION_REQUIRED", "hra auth login --input-stdin"],
-      ["INTERACTION_REQUIRED", "hra device pair"],
-      ["RECOVERY_REQUIRED", "hra auth status"],
+      ["INTERACTION_REQUIRED", "oompa auth login --input-stdin"],
+      ["INTERACTION_REQUIRED", "oompa device pair"],
+      ["RECOVERY_REQUIRED", "oompa auth status"],
     ] as const) {
       const target = capture();
       renderFailure({
@@ -1680,7 +1697,7 @@ describe("CLI rendering", () => {
         message: "Account-key loss acknowledgement requires another local step.",
       }, false, target.output);
       expect(target.stderr.join("")).toBe([
-        "hra: Account-key loss acknowledgement requires another local step.",
+        "oompa: Account-key loss acknowledgement requires another local step.",
         `Next: ${nextCommand}`,
         "",
       ].join("\n"));
@@ -1689,7 +1706,7 @@ describe("CLI rendering", () => {
     const injected = capture();
     renderFailure({
       code: "RECOVERY_REQUIRED",
-      details: { nextCommand: "hra auth status; touch /tmp/unsafe" },
+      details: { nextCommand: "oompa auth status; touch /tmp/unsafe" },
       message: "Account-key loss acknowledgement requires another local step.",
     }, false, injected.output);
     expect(injected.stderr.join("")).not.toContain("\nNext:");
@@ -2361,10 +2378,10 @@ describe("CLI rendering", () => {
     expect(listText).toContain("Marketplace load errors: 2");
     expect(listText).toContain("details withheld");
     expect(listText).toContain("Lifecycle: discovery only.");
-    expect(listText).toContain("HRA blocks that compound effect.");
+    expect(listText).toContain("Oompa blocks that compound effect.");
     expect(listText).not.toContain(sentinel);
     expect(listText).not.toContain("failed at");
-    expect(listText).not.toContain("hra plugin install");
+    expect(listText).not.toContain("oompa plugin install");
 
     const attack = "\u001b]0;owned\u0007\u202etxt";
     const show = capture();
@@ -2800,7 +2817,7 @@ describe("CLI rendering", () => {
       human.output,
     );
     expect(human.stdout.join("")).toContain(
-      `Continue: hra session interactions ${sessionId} --pending --limit 37 --cursor ${cursor}\n`,
+      `Continue: oompa session interactions ${sessionId} --pending --limit 37 --cursor ${cursor}\n`,
     );
     expect(human.stdout.join("")).not.toContain("mutable-label");
 
@@ -2889,7 +2906,7 @@ describe("CLI rendering", () => {
       status.output,
     );
     expect(status.stdout.join("")).toContain(
-      `More pending interactions: hra session interactions ${sessionId} --pending --limit 100\n`,
+      `More pending interactions: oompa session interactions ${sessionId} --pending --limit 100\n`,
     );
     expect(status.stdout.join("")).toContain(
       "Provider: not_applicable (unbound, basis local_state, coverage not_attempted, freshness unknown",
@@ -2931,7 +2948,7 @@ describe("CLI rendering", () => {
       global.output,
     );
     expect(global.stdout.join("")).toContain(
-      `Continue: hra interaction list --limit 100 --cursor ${cursor}\n`,
+      `Continue: oompa interaction list --limit 100 --cursor ${cursor}\n`,
     );
 
     const json = capture();
@@ -2960,7 +2977,7 @@ describe("CLI rendering", () => {
         localCompleteness: "partial",
         providerAccess: "not_attempted",
         providerCompleteness: "unknown",
-        nextCommand: `hra account login ${accountId}`,
+        nextCommand: `oompa account login ${accountId}`,
       },
       sessions: [{
         id: "sess_00000000000000000000000000000000",
@@ -2999,14 +3016,14 @@ describe("CLI rendering", () => {
     expect(human.stdout.join("")).toContain(
       "Codex completeness: partial local cache; more pages available; Codex provider completeness unknown",
     );
-    expect(human.stdout.join("")).toContain(`Sign in to refresh Codex: hra account login ${accountId}`);
+    expect(human.stdout.join("")).toContain(`Sign in to refresh Codex: oompa account login ${accountId}`);
     expect(human.stdout.join("")).toContain("Older imported thread");
     expect(human.stdout.join("")).toContain("Live Claude thread");
     expect(human.stdout.join("")).not.toContain("Claude freshness");
     expect(human.stdout.join("")).not.toContain("Claude provider not contacted");
     expect(human.stdout.join("")).not.toContain("Sign in to refresh Claude");
     expect(human.stdout.join("")).toContain(
-      `Continue: hra session list --account ${accountId} --limit 37 --cursor ${cursor}\n`,
+      `Continue: oompa session list --account ${accountId} --limit 37 --cursor ${cursor}\n`,
     );
     expect(human.stdout.join("")).not.toContain("mutable-label");
 
@@ -3090,7 +3107,7 @@ describe("CLI rendering", () => {
         ...listing,
         listing: {
           ...listing.listing,
-          nextCommand: `hra account login ${accountId}; touch /tmp/unsafe`,
+          nextCommand: `oompa account login ${accountId}; touch /tmp/unsafe`,
         },
       },
       false,
@@ -3200,7 +3217,7 @@ describe("CLI rendering", () => {
       unsupported.output,
     );
     expect(unsupported.stdout.join("")).toContain(
-      "This MCP request cannot be resolved safely through HRA.",
+      "This MCP request cannot be resolved safely through Oompa.",
     );
     expect(unsupported.stdout.join("")).not.toContain(
       "Submit one protected JSON document",
@@ -3237,7 +3254,7 @@ describe("CLI rendering", () => {
     const payload = JSON.parse(internal.stdout.join("")) as { error: Record<string, unknown> };
     expect(payload.error).toEqual({
       code: "INTERNAL",
-      message: "HRA could not complete the request safely.",
+      message: "Oompa could not complete the request safely.",
     });
 
     const oversized = capture();
@@ -3411,7 +3428,7 @@ describe("CLI rendering", () => {
     expect(rendered).toContain("Usage history for Work");
     expect(rendered).toContain("12,345");
     expect(rendered).toContain("account_usage_read_failed");
-    expect(rendered).toContain("Continue: hra account usage-history acct_");
+    expect(rendered).toContain("Continue: oompa account usage-history acct_");
     expect(rendered).toContain("--cursor hrau1.abc.def");
 
     const json = capture();
@@ -3508,6 +3525,37 @@ describe("CLI rendering", () => {
     expect(rendered).toContain("acct_11111111111111111111111111111111: skipped (signed_out)");
     expect(rendered).toContain("5m unavailable (insufficient_history)");
     expect(rendered).not.toContain("must-not-render");
+  });
+
+  test("explains disabled automatic reset management while retaining machine-readable status", () => {
+    const command = { account: "work", kind: "account.usage" as const, refresh: true };
+    const automaticReset = {
+      threshold: { remainingPercent: 1, usedPercent: 99 },
+      policy: { state: "active" },
+      observation: { state: "unavailable", reason: "weekly_window_unavailable" },
+      lastAttempt: null,
+      refresh: { state: "suppressed", reason: "automatic_policy_disabled" },
+    };
+    const data = { usage: [{ account: { id: "acct_" + "0".repeat(32), label: "Work" }, automaticReset }] };
+    const human = capture();
+    renderSuccess(command, data, false, human.output);
+    expect(human.stdout.join("")).toContain("automatic reset refresh: suppressed (automatic management is off)");
+    const json = capture();
+    renderSuccess(command, data, true, json.output);
+    expect(JSON.parse(json.stdout.join("")) as unknown).toMatchObject({ data: { usage: [{ automaticReset }] } });
+    for (const refresh of [
+      { state: "suppressed", reason: "automatic_policy_disabled", idempotencyKey: "private-key" },
+      { state: "suppressed", reason: "automatic_policy_disabled", automaticPolicyRevision: 1 },
+      { state: "suppressed", reason: "automatic_policy_disabled_future" },
+    ]) {
+      for (const asJson of [false, true]) {
+        const refused = capture();
+        expect(() => renderSuccess(command, {
+          usage: [{ ...data.usage[0], automaticReset: { ...automaticReset, refresh } }],
+        }, asJson, refused.output)).toThrow(InvalidCommandResponseError);
+        expect(refused.stdout).toEqual([]);
+      }
+    }
   });
 
   test("rejects malformed or private automatic-reset fields before human or JSON output", () => {

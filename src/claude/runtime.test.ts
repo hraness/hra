@@ -4,10 +4,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { ClaudeError } from "./errors";
-import { CLAUDE_PIN, CLAUDE_PIN_EFFORT, CLAUDE_PIN_MODEL } from "./pin";
-import { HRA_SESSION_PREAMBLE } from "../domain/hra-preamble";
+import {
+  CLAUDE_NATIVE_FALLBACK_UNAVAILABLE_REASON,
+  CLAUDE_PIN,
+  CLAUDE_PIN_EFFORT,
+  CLAUDE_PIN_FALLBACK_MODEL,
+  CLAUDE_PIN_MODEL,
+  CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY,
+  type ClaudeNativeFallbackCapability,
+} from "./pin";
+import { OOMPA_SESSION_PREAMBLE } from "../domain/oompa-preamble";
 import { presetRequirements } from "../domain/presets";
 import {
+  buildPinnedClaudeRuntimeArgv,
   claudeSessionArgv,
   locateClaudeExecutable,
   resolvePinnedClaudeRuntime,
@@ -19,7 +28,7 @@ import {
 const roots: string[] = [];
 
 const scratch = async (): Promise<string> => {
-  const root = await mkdtemp(join(tmpdir(), "hra-claude-"));
+  const root = await mkdtemp(join(tmpdir(), "oompa-claude-"));
   roots.push(root);
   return root;
 };
@@ -46,6 +55,11 @@ describe("pinned Claude runtime", () => {
     expect(runtime.version).toBe(CLAUDE_PIN);
     expect(runtime.model).toBe(CLAUDE_PIN_MODEL);
     expect(runtime.effort).toBe(CLAUDE_PIN_EFFORT);
+    expect(runtime.nativeFallback).toEqual({
+      model: CLAUDE_PIN_FALLBACK_MODEL,
+      reason: CLAUDE_NATIVE_FALLBACK_UNAVAILABLE_REASON,
+      status: "unavailable",
+    });
     expect([...runtime.argv].slice(1)).toEqual([
       "--print",
       "--output-format",
@@ -69,6 +83,98 @@ describe("pinned Claude runtime", () => {
     expect(runtime.argv).not.toContain("--dangerously-skip-permissions");
   });
 
+  test("builds exact disabled and admitted native-fallback argv without starting Claude", () => {
+    const executablePath = "/opt/oompa/bin/claude";
+    expect(buildPinnedClaudeRuntimeArgv({
+      executablePath,
+      nativeFallback: CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY,
+    })).toEqual([
+      executablePath,
+      "--print",
+      "--output-format",
+      "stream-json",
+      "--input-format",
+      "stream-json",
+      "--verbose",
+      "--include-partial-messages",
+      "--permission-mode",
+      "default",
+      "--model",
+      CLAUDE_PIN_MODEL,
+      "--effort",
+      CLAUDE_PIN_EFFORT,
+      "--system-prompt-snapshot",
+      "on",
+    ]);
+
+    expect(buildPinnedClaudeRuntimeArgv({
+      executablePath,
+      nativeFallback: {
+        evidenceDigest: "a".repeat(64),
+        model: CLAUDE_PIN_FALLBACK_MODEL,
+        status: "armed",
+      },
+    })).toEqual([
+      executablePath,
+      "--print",
+      "--output-format",
+      "stream-json",
+      "--input-format",
+      "stream-json",
+      "--verbose",
+      "--include-partial-messages",
+      "--permission-mode",
+      "default",
+      "--model",
+      CLAUDE_PIN_MODEL,
+      "--fallback-model",
+      CLAUDE_PIN_FALLBACK_MODEL,
+      "--effort",
+      CLAUDE_PIN_EFFORT,
+      "--system-prompt-snapshot",
+      "on",
+    ]);
+  });
+
+  test("refuses to arm native fallback without a sanitized evidence digest", () => {
+    expect(() => buildPinnedClaudeRuntimeArgv({
+      executablePath: "/opt/oompa/bin/claude",
+      nativeFallback: {
+        evidenceDigest: "not-a-digest",
+        model: CLAUDE_PIN_FALLBACK_MODEL,
+        status: "armed",
+      },
+    })).toThrow("sanitized acceptance evidence digest");
+  });
+
+  test("refuses any fallback model or unavailable reason outside the reviewed pin", () => {
+    expect(() => buildPinnedClaudeRuntimeArgv({
+      executablePath: "/opt/oompa/bin/claude",
+      nativeFallback: {
+        evidenceDigest: "a".repeat(64),
+        model: "claude-sonnet-5",
+        status: "armed",
+      } as unknown as ClaudeNativeFallbackCapability,
+    })).toThrow("exact pinned fallback model");
+    expect(() => buildPinnedClaudeRuntimeArgv({
+      executablePath: "/opt/oompa/bin/claude",
+      nativeFallback: {
+        extra: true,
+        model: CLAUDE_PIN_FALLBACK_MODEL,
+        reason: CLAUDE_NATIVE_FALLBACK_UNAVAILABLE_REASON,
+        status: "unavailable",
+      } as unknown as ClaudeNativeFallbackCapability,
+    })).toThrow("reviewed reason");
+    expect(() => buildPinnedClaudeRuntimeArgv({
+      executablePath: "/opt/oompa/bin/claude",
+      nativeFallback: {
+        model: CLAUDE_PIN_FALLBACK_MODEL,
+        reason: "operator_override",
+        status: "unavailable",
+      } as unknown as ClaudeNativeFallbackCapability,
+    })).toThrow("reviewed reason");
+  });
+
   test("adds exactly one private MCP configuration under strict isolation", async () => {
     const { configDir, path } = await fakeExecutable();
     const runtime = await resolvePinnedClaudeRuntime({
@@ -85,7 +191,7 @@ describe("pinned Claude runtime", () => {
     ]);
     expect(bound.argv.filter((argument) => argument === "--append-system-prompt")).toHaveLength(1);
     expect(bound.argv[bound.argv.indexOf("--append-system-prompt") + 1])
-      .toBe(HRA_SESSION_PREAMBLE.text);
+      .toBe(OOMPA_SESSION_PREAMBLE.text);
     expect(bound.argv.filter((argument) => argument === "--system-prompt-snapshot")).toHaveLength(1);
     expect(() => withClaudeHostToolRuntime(bound, { mcpConfigPath })).toThrow(ClaudeError);
     expect(() => withClaudeHostToolRuntime(runtime, { mcpConfigPath: "relative/mcp.json" }))
@@ -119,7 +225,7 @@ describe("pinned Claude runtime", () => {
       configDir,
       executablePath: path,
       probeVersion: async () => "2.1.259",
-    })).rejects.toThrow(`HRA requires Claude Code ${CLAUDE_PIN}`);
+    })).rejects.toThrow(`Oompa requires Claude Code ${CLAUDE_PIN}`);
     await expect(resolvePinnedClaudeRuntime({
       configDir,
       executablePath: path,

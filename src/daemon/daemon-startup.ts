@@ -131,7 +131,7 @@ export async function waitForDaemonReady(input: {
           || lastReceipt.updatedAt > startedAt
           || (startedAt - lastReceipt.updatedAt <= 30_000 && processIsAlive(lastReceipt.pid));
         if (currentFailure) {
-          throw new Error(`The HRA daemon failed during startup: ${lastReceipt.failure ?? "unknown failure"}`);
+          throw new Error(`The Oompa daemon failed during startup: ${lastReceipt.failure ?? "unknown failure"}`);
         }
       }
       if (lastReceipt?.state === "ready") {
@@ -156,7 +156,7 @@ export async function waitForDaemonReady(input: {
           && await DaemonLock.isAuthorityHeld(input.paths);
         if (!anotherBootIsLive) {
           const suffix = child.diagnostic === undefined || child.diagnostic.length === 0 ? "" : `: ${child.diagnostic}`;
-          throw new Error(`The HRA daemon process exited with status ${child.exitCode ?? "unknown"}${suffix}`);
+          throw new Error(`The Oompa daemon process exited with status ${child.exitCode ?? "unknown"}${suffix}`);
         }
       }
     } catch (error: unknown) {
@@ -168,7 +168,7 @@ export async function waitForDaemonReady(input: {
   }
   const state = lastReceipt === null ? "no startup receipt" : `${lastReceipt.state} receipt for pid ${lastReceipt.pid}`;
   const diagnostic = lastError instanceof Error ? ` Last observation: ${lastError.message}` : "";
-  throw new Error(`The HRA daemon did not become ready before the startup deadline (${state}).${diagnostic}`);
+  throw new Error(`The Oompa daemon did not become ready before the startup deadline (${state}).${diagnostic}`);
 }
 
 export async function waitForDaemonAuthorityRelease(input: {

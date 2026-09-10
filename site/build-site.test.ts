@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseHTML } from "linkedom";
+import fc from "fast-check";
 import { transform, type Selector } from "lightningcss";
 import { createStylexTransformCollector } from "@hraness/ui/stylex-build";
 import { DIRECT_WIRE_MARKERS } from "@hraness/direct/tooling/bundle-boundary";
@@ -12,10 +13,11 @@ import { DIRECT_WIRE_MARKERS } from "@hraness/direct/tooling/bundle-boundary";
 import {
   assertSiteFontStyleInventory,
   assertSiteBrowserBundle,
-  HRA_POSTHOG_PROJECT_TOKEN_ENV,
+  buildSite as buildSiteDirect,
+  OOMPA_POSTHOG_PROJECT_TOKEN_ENV,
   publishSiteFonts,
   readPackageVersion,
-  resolveHraAnalyticsProjectToken,
+  resolveOompaAnalyticsProjectToken,
 } from "../scripts/build-site.ts";
 import { publicContent } from "./content.ts";
 import { docsPaths, renderDocsMarkdown } from "./docs-content.ts";
@@ -23,16 +25,16 @@ import { PRODUCT_PREVIEW_CSP } from "../scripts/build-product-preview.ts";
 import { renderSocialCardPng, renderSocialCardSvg } from "./social-card.ts";
 import { readPngDimensions } from "./social-card-raster.ts";
 import {
-  HRA_MAILING_TURNSTILE_SITEKEY_ENV,
+  OOMPA_MAILING_TURNSTILE_SITEKEY_ENV,
   renderAskAiAboutThis,
-  renderHraAnalyticsScript,
-  renderHraSiteFooter,
+  renderOompaAnalyticsScript,
+  renderOompaSiteFooter,
   renderDocsPages,
   renderPreviewHtml,
   renderPrivacyHtml,
   renderSiteHtml,
 } from "./template.ts";
-import { HRA_RELEASE_VERSION } from "../scripts/release-evidence";
+import { OOMPA_RELEASE_VERSION } from "../scripts/release-evidence";
 import { mobileHeaderFlowClassName } from "./marketing.stylex.ts";
 import { createSiteCompilerCase, siteCompilerHookMs, siteCompilerOuterMs } from "./build-site-test-owner";
 
@@ -108,7 +110,7 @@ async function inventoryFiles(root: string, prefix = ""): Promise<string[]> {
 }
 
 async function createFontFixture(): Promise<{ source: string; output: string; styles: string }> {
-  const root = await mkdtemp(join(tmpdir(), "hra-font-publication-"));
+  const root = await mkdtemp(join(tmpdir(), "oompa-font-publication-"));
   temporaryRoots.push(root);
   const source = join(root, "source");
   await mkdir(join(source, "fonts/nebula-sans"), { recursive: true });
@@ -120,7 +122,7 @@ async function createFontFixture(): Promise<{ source: string; output: string; st
 }
 
 const createFixtureRoot = async (registerRoot: (root: string) => void = (root) => { temporaryRoots.push(root); }): Promise<string> => {
-  const root = await mkdtemp(join(tmpdir(), "hra-site-test-"));
+  const root = await mkdtemp(join(tmpdir(), "oompa-site-test-"));
   registerRoot(root);
   expect(await realpath(root)).not.toBe(sourceRoot);
   await mkdir(join(root, "site"), { recursive: true });
@@ -167,6 +169,30 @@ afterEach(async () => {
 }, siteCompilerHookMs);
 
 describe("static-site build", () => {
+  test("does not create or require a package README in the site-owned tracked document phase", async () => {
+    const root = await createFixtureRoot();
+    await expect(buildSiteDirect({ check: false, repositoryRoot: root, releaseCommit: "invalid" }))
+      .rejects.toThrow("Release commit must be a lowercase 40-character Git SHA.");
+    await expect(lstat(join(root, "README.md"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await buildSiteDirect({ check: true, repositoryRoot: root })).toEqual([]);
+    await expect(lstat(join(root, "README.md"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("preserves arbitrary package README bytes before compilation and in check mode", async () => {
+    await fc.assert(fc.asyncProperty(fc.uint8Array({ maxLength: 512 }), async (bytes) => {
+      const root = await createFixtureRoot();
+      const path = join(root, "README.md");
+      await writeFile(path, bytes);
+      // This is a real builder boundary before any native compiler starts.
+      // Site-owned tracked documents may change; the package README may not.
+      await expect(buildSiteDirect({ check: false, repositoryRoot: root, releaseCommit: "invalid" }))
+        .rejects.toThrow("Release commit must be a lowercase 40-character Git SHA.");
+      expect(await readFile(path)).toEqual(Buffer.from(bytes));
+      expect(await buildSiteDirect({ check: true, repositoryRoot: root })).toEqual([]);
+      expect(await readFile(path)).toEqual(Buffer.from(bytes));
+    }), { seed: 20_260_909, numRuns: 16 });
+  });
+
   test("rejects Direct runtime or fixture selectors in parent browser bundles", () => {
     expect(() => assertSiteBrowserBundle("document.querySelector('[data-product-preview]')")).not.toThrow();
     for (const marker of [...DIRECT_WIRE_MARKERS, "@hraness/direct", "__direct_scenario", "__direct_fixture"]) {
@@ -270,7 +296,7 @@ describe("static-site build", () => {
   test("keeps documentation code roles separate from inverse marketing roles", async () => {
     const styles = await readFile(join(import.meta.dir, "styles.css"), "utf8");
     const recipes = await readFile(join(import.meta.dir, "presentation.stylex.ts"), "utf8");
-    expect(styles).not.toContain(".hra-inline-code {");
+    expect(styles).not.toContain(".oompa-inline-code {");
     expect(recipes).toContain('overflowWrap: "anywhere"');
     expect(styles).not.toMatch(/(?:^|\n)code\s*\{/u);
     expect(styles).toContain("--hraness-marketing-inverse: var(--inverse-background)");
@@ -282,7 +308,7 @@ describe("static-site build", () => {
   });
 
   test("renders one crawlable Ask AI row on each public page with exact provider prompts", () => {
-    const subjectUrl = "https://hra.sh/privacy/";
+    const subjectUrl = "https://oompa.dev/privacy/";
     const prompt = `Tell me about ${subjectUrl}`;
     const row = renderAskAiAboutThis(subjectUrl);
     const providers = [
@@ -305,7 +331,7 @@ describe("static-site build", () => {
     }
 
     const publicPages = [
-      [renderSiteHtml(), "https://hra.sh/"],
+      [renderSiteHtml(), "https://oompa.dev/"],
       [renderPrivacyHtml(), subjectUrl],
     ] as const;
     for (const [html, canonicalUrl] of publicPages) {
@@ -320,11 +346,14 @@ describe("static-site build", () => {
 
   compilerCase("writes every named public artifact and then passes check mode", async ({ buildSite, createFixtureRoot }) => {
     const root = await createFixtureRoot();
+    const packageReadme = "# Independently authored package README\n";
+    await writeFile(join(root, "README.md"), packageReadme);
     expect(await buildSite({ check: false, repositoryRoot: root, sourceRoot })).toEqual([]);
+    expect(await readFile(join(root, "README.md"), "utf8")).toBe(packageReadme);
     expect(await buildSite({ check: true, repositoryRoot: root, sourceRoot })).toEqual([]);
+    expect(await readFile(join(root, "README.md"), "utf8")).toBe(packageReadme);
 
     const expectedPaths = [
-      "README.md",
       "PRIVACY.md",
       "dist/site/index.html",
       "dist/site/preview/index.html",
@@ -408,8 +437,8 @@ describe("static-site build", () => {
     expect(fontUrls).toHaveLength(13);
     const resolvedFonts = fontUrls.map((url) => {
       expect(url).not.toMatch(/^(?:data:|https?:|\/)/iu);
-      const resolved = new URL(url, `https://hra.sh/${foundationPath}`);
-      expect(resolved.origin).toBe("https://hra.sh");
+      const resolved = new URL(url, `https://oompa.dev/${foundationPath}`);
+      expect(resolved.origin).toBe("https://oompa.dev");
       expect(resolved.search).toBe("");
       expect(resolved.hash).toBe("");
       return decodeURIComponent(resolved.pathname.slice(1));
@@ -453,16 +482,16 @@ describe("static-site build", () => {
       await readFile(join(root, "dist/site/.well-known/hra.json"), "utf8"),
     )).toEqual({
       generation: 1,
-      product: "HRA",
+      product: "Oompa",
       repository: {
         id: 1_343_008_607,
-        path: "hraness/hra",
+        path: "hraness/oompa",
       },
       schemaVersion: 2,
       source: {
         commit: "local",
       },
-      version: HRA_RELEASE_VERSION,
+      version: OOMPA_RELEASE_VERSION,
     });
   });
 
@@ -500,13 +529,13 @@ describe("static-site build", () => {
 
   compilerCase("fails Production closed without valid public analytics and mailing configuration", async ({ buildSite, createFixtureRoot }) => {
     const validToken = "phc_public_production_token";
-    expect(resolveHraAnalyticsProjectToken({ VERCEL_ENV: "preview" })).toBe("");
-    expect(resolveHraAnalyticsProjectToken({
-      [HRA_POSTHOG_PROJECT_TOKEN_ENV]: validToken,
+    expect(resolveOompaAnalyticsProjectToken({ VERCEL_ENV: "preview" })).toBe("");
+    expect(resolveOompaAnalyticsProjectToken({
+      [OOMPA_POSTHOG_PROJECT_TOKEN_ENV]: validToken,
       VERCEL_ENV: "preview",
     })).toBe("");
-    expect(resolveHraAnalyticsProjectToken({
-      [HRA_POSTHOG_PROJECT_TOKEN_ENV]: validToken,
+    expect(resolveOompaAnalyticsProjectToken({
+      [OOMPA_POSTHOG_PROJECT_TOKEN_ENV]: validToken,
       VERCEL_ENV: "production",
     })).toBe(validToken);
 
@@ -515,24 +544,24 @@ describe("static-site build", () => {
       await expect(buildSite({
         check: false,
         environment: {
-          [HRA_POSTHOG_PROJECT_TOKEN_ENV]: projectToken,
+          [OOMPA_POSTHOG_PROJECT_TOKEN_ENV]: projectToken,
           VERCEL_ENV: "production",
         },
         repositoryRoot: root,
         sourceRoot,
-      })).rejects.toThrow(HRA_POSTHOG_PROJECT_TOKEN_ENV);
+      })).rejects.toThrow(OOMPA_POSTHOG_PROJECT_TOKEN_ENV);
     }
 
     const missingTurnstileRoot = await createFixtureRoot();
     await expect(buildSite({
       check: false,
       environment: {
-        [HRA_POSTHOG_PROJECT_TOKEN_ENV]: validToken,
+        [OOMPA_POSTHOG_PROJECT_TOKEN_ENV]: validToken,
         VERCEL_ENV: "production",
       },
       repositoryRoot: missingTurnstileRoot,
       sourceRoot,
-    })).rejects.toThrow(HRA_MAILING_TURNSTILE_SITEKEY_ENV);
+    })).rejects.toThrow(OOMPA_MAILING_TURNSTILE_SITEKEY_ENV);
   });
 
   compilerCase("embeds only the public token in the self-hosted Production bundle", async ({ buildSite, createFixtureRoot }) => {
@@ -541,8 +570,8 @@ describe("static-site build", () => {
     await buildSite({
       check: false,
       environment: {
-        [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: "1x00000000000000000000AA",
-        [HRA_POSTHOG_PROJECT_TOKEN_ENV]: publicToken,
+        [OOMPA_MAILING_TURNSTILE_SITEKEY_ENV]: "1x00000000000000000000AA",
+        [OOMPA_POSTHOG_PROJECT_TOKEN_ENV]: publicToken,
         VERCEL_ENV: "production",
       },
       repositoryRoot: root,
@@ -568,7 +597,7 @@ describe("static-site build", () => {
     ) as { version?: unknown };
     // The canonical-alias operator proves this literal after every cutover;
     // it is independent of the package version in package.json.
-    expect(identity.version).toBe(HRA_RELEASE_VERSION);
+    expect(identity.version).toBe(OOMPA_RELEASE_VERSION);
     expect(identity.version).toBe("0.1.0");
     expect(await readPackageVersion()).not.toBe(identity.version);
   });
@@ -629,7 +658,7 @@ describe("static-site build", () => {
 
     expect(compiledStylesheetJoin(preview).authoredHtml).toBe(renderPreviewHtml());
     expect(preview).toContain('<meta name="robots" content="noindex, nofollow">');
-    expect(preview).toContain('<link rel="canonical" href="https://hra.sh/">');
+    expect(preview).toContain('<link rel="canonical" href="https://oompa.dev/">');
     expect(preview).not.toContain("/analytics.js");
     expect(sitemap).not.toContain("/preview");
   });
@@ -645,12 +674,12 @@ describe("static-site build", () => {
   compilerCase("reports stale tracked public documents without repairing build output", async ({ buildSite, createFixtureRoot }) => {
     const root = await createFixtureRoot();
     await buildSite({ check: false, repositoryRoot: root, sourceRoot });
-    await writeFile(join(root, "README.md"), "stale\n", "utf8");
+    await writeFile(join(root, "PRIVACY.md"), "stale\n", "utf8");
     await writeFile(join(root, "dist/site/stylex.css"), "stale\n", "utf8");
 
     const mismatches = await buildSite({ check: true, repositoryRoot: root, sourceRoot });
-    expect(mismatches).toEqual([join(root, "README.md")]);
-    expect(await readFile(join(root, "README.md"), "utf8")).toBe("stale\n");
+    expect(mismatches).toEqual([join(root, "PRIVACY.md")]);
+    expect(await readFile(join(root, "PRIVACY.md"), "utf8")).toBe("stale\n");
     expect(await readFile(join(root, "dist/site/stylex.css"), "utf8")).toBe("stale\n");
   });
 
@@ -664,13 +693,13 @@ describe("static-site build", () => {
 
     expect(html.match(/<script[^>]+src=/gu)).toHaveLength(3);
     expect(html).toContain('<script src="/appearance.js"></script>');
-    expect(html).toContain(renderHraAnalyticsScript());
+    expect(html).toContain(renderOompaAnalyticsScript());
     expect(html).toContain('src="/site.js"');
-    expect(renderPreviewHtml()).not.toContain(renderHraAnalyticsScript());
+    expect(renderPreviewHtml()).not.toContain(renderOompaAnalyticsScript());
     expect(renderPreviewHtml()).not.toContain('src="/site.js"');
     expect(renderPreviewHtml()).not.toContain('src="/appearance.js"');
-    expect(renderHraSiteFooter({
-      [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: "1x00000000000000000000AA",
+    expect(renderOompaSiteFooter({
+      [OOMPA_MAILING_TURNSTILE_SITEKEY_ENV]: "1x00000000000000000000AA",
     })).toContain(
       'src="https://challenges.cloudflare.com/turnstile/v0/api.js"',
     );
@@ -701,7 +730,7 @@ describe("static-site build", () => {
         ],
       },
       {
-        source: "/examples/app/:path*",
+        source: "/examples/app/:path(.*)",
         headers: [
           {
             key: "Content-Security-Policy",

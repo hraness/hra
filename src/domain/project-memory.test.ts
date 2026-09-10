@@ -6,7 +6,7 @@ import { cloudEnvelopeLimits } from "./cloud-envelope-contract";
 import {
   createPortableProjectMemoryCanonicalIdentity,
   deriveProjectMemoryCanonicalIdentity,
-  HRA_CANONICAL_MEMORY_OPERATION_MAX_BYTES,
+  OOMPA_CANONICAL_MEMORY_OPERATION_MAX_BYTES,
   legacyProjectMemorySpaceId,
   PROJECT_MEMORY_DESTINATION_PURPOSE,
 } from "./project-memory";
@@ -15,7 +15,7 @@ const projectId = "proj_0123456789abcdef0123456789abcdef" as const;
 
 describe("project memory canonical identity", () => {
   test("keeps one encrypted canonical operation inside the hosted envelope", () => {
-    const encryptedBytes = HRA_CANONICAL_MEMORY_OPERATION_MAX_BYTES + 16;
+    const encryptedBytes = OOMPA_CANONICAL_MEMORY_OPERATION_MAX_BYTES + 16;
     const unpaddedBase64UrlCharacters = Math.floor((4 * encryptedBytes + 2) / 3);
     expect(unpaddedBase64UrlCharacters).toBeLessThan(
       cloudEnvelopeLimits.ciphertextCharacters,

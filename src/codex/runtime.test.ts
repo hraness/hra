@@ -5,9 +5,17 @@ import { tmpdir } from "node:os";
 
 import { CodexError } from "./errors.ts";
 import type { CodexProcess } from "./process.ts";
+import type { CodexAuthority } from "./protocol.ts";
 import { launchPinnedCodexAppServer, resolvePinnedCodexRuntime } from "./runtime.ts";
 
 const roots: string[] = [];
+const codexAuthority = (processGeneration: number): CodexAuthority => ({
+  profileId: "profile-a",
+  processGeneration,
+  provider: "codex",
+  providerAccountId: "acct_00000000000000000000000000000000",
+  bindingGeneration: 1,
+});
 const CREDENTIAL_STORE_PREFLIGHT = Object.freeze({
   cliAuth: "file",
   cwd: "/tmp/hra-control-plane/project",
@@ -150,10 +158,10 @@ describe("pinned Codex runtime", () => {
   });
 
   test("forces both credential stores to files in the real pinned app-server", async () => {
-    const codexHome = await realpath(await mkdtemp(join(tmpdir(), "hra-codex-custody-")));
+    const codexHome = await realpath(await mkdtemp(join(tmpdir(), "oompa-codex-custody-")));
     roots.push(codexHome);
     const client = await launchPinnedCodexAppServer({
-      authority: { profileId: "profile-a", processGeneration: 1 },
+      authority: codexAuthority(1),
       credentialStorePreflight: {
         cliAuth: "file",
         cwd: codexHome,
@@ -177,7 +185,7 @@ describe("pinned Codex runtime", () => {
       packageJsonPath,
       bunExecutable: process.execPath,
       processFactory: () => child,
-      authority: { profileId: "profile-a", processGeneration: 1 },
+      authority: codexAuthority(1),
       credentialStorePreflight: CREDENTIAL_STORE_PREFLIGHT,
       expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
       isAuthorityCurrent: () => true,
@@ -223,7 +231,7 @@ describe("pinned Codex runtime", () => {
       packageJsonPath,
       bunExecutable: process.execPath,
       processFactory: () => child,
-      authority: { profileId: "profile-a", processGeneration: 1 },
+      authority: codexAuthority(1),
       credentialStorePreflight: CREDENTIAL_STORE_PREFLIGHT,
       expectedCodexHome: codexHome,
       isAuthorityCurrent: () => true,
@@ -259,7 +267,7 @@ describe("pinned Codex runtime", () => {
       packageJsonPath,
       bunExecutable: process.execPath,
       processFactory: () => child,
-      authority: { profileId: "profile-a", processGeneration: 0 },
+      authority: codexAuthority(0),
       credentialStorePreflight: CREDENTIAL_STORE_PREFLIGHT,
       expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
       isAuthorityCurrent: () => true,
@@ -293,7 +301,7 @@ describe("pinned Codex runtime", () => {
       packageJsonPath,
       bunExecutable: process.execPath,
       processFactory: () => child,
-      authority: { profileId: "profile-a", processGeneration: 1 },
+      authority: codexAuthority(1),
       credentialStorePreflight: CREDENTIAL_STORE_PREFLIGHT,
       expectedCodexHome: codexHome,
       isAuthorityCurrent: () => true,
@@ -329,7 +337,7 @@ describe("pinned Codex runtime", () => {
       packageJsonPath,
       bunExecutable: process.execPath,
       processFactory: () => child,
-      authority: { profileId: "profile-a", processGeneration: 1 },
+      authority: codexAuthority(1),
       credentialStorePreflight: CREDENTIAL_STORE_PREFLIGHT,
       expectedCodexHome: codexHome,
       isAuthorityCurrent: () => true,
@@ -352,7 +360,7 @@ describe("pinned Codex runtime", () => {
       packageJsonPath,
       bunExecutable: process.execPath,
       processFactory: () => child,
-      authority: { profileId: "profile-a", processGeneration: 0 },
+      authority: codexAuthority(0),
       credentialStorePreflight: CREDENTIAL_STORE_PREFLIGHT,
       expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
       isAuthorityCurrent: () => true,

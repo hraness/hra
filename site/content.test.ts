@@ -8,12 +8,13 @@ import {
 } from "@hraness/site-footer";
 
 import {
-  buildHraGlobalInstallCommand,
-  HRA_INSTALL_PREFLIGHT_SOURCE_URL,
+  buildOompaGlobalInstallCommand,
+  OOMPA_INSTALL_PREFLIGHT_SOURCE_URL,
 } from "../src/install-preflight";
 import { helpGroupNames, usageForGroup } from "../src/cli/parser";
 import packageJson from "../package.json";
 import {
+  admittedReleaseVersion,
   hostedSignupCopy,
   isAdmittedRelease,
   publicContent,
@@ -22,16 +23,15 @@ import {
   renderLlmsText,
   renderMarkdownBlocks,
   renderPrivacyMarkdown,
-  renderReadmeMarkdown,
   renderSitemapXml,
   siteDocumentPaths,
 } from "./content.ts";
 import { docsPages, docsPathForSection, docsPaths, findDocsPage, renderDocsMarkdown, type DocsPath } from "./docs-content.ts";
 import {
-  HRA_MAILING_TURNSTILE_SITEKEY_ENV,
-  hraMailingListConfig,
-  renderHraAnalyticsScript,
-  renderHraSiteFooter,
+  OOMPA_MAILING_TURNSTILE_SITEKEY_ENV,
+  oompaMailingListConfig,
+  renderOompaAnalyticsScript,
+  renderOompaSiteFooter,
   renderDocsHtml,
   renderPreviewHtml,
   renderPrivacyHtml,
@@ -45,14 +45,12 @@ const htmlText = (value: string): string => value
   .replaceAll('"', "&quot;")
   .replaceAll("'", "&#39;");
 
-const htmlVisibleText = (value: string): string => value
-  .replaceAll(/<[^>]+>/gu, "")
-  .replaceAll("&quot;", '"')
-  .replaceAll("&#39;", "'")
-  .replaceAll("&#x27;", "'")
-  .replaceAll("&lt;", "<")
-  .replaceAll("&gt;", ">")
-  .replaceAll("&amp;", "&");
+// Test-only document text, not a sanitizer or computed-visibility check. Keep
+// adjacent documents in order and never reinterpret decoded text as markup.
+const htmlVisibleText = (value: string): string => [...parseHTML(value).document.childNodes]
+  .filter((node) => node.nodeType === node.ELEMENT_NODE || node.nodeType === node.TEXT_NODE)
+  .map((node) => node.textContent ?? "")
+  .join("");
 
 function oneElement(html: string, selector: string) {
   const elements = parseHTML(html).document.querySelectorAll(selector);
@@ -88,53 +86,77 @@ const renderDocumentationMarkdown = (...paths: readonly DocsPath[]): string =>
   paths.map(renderDocsMarkdown).join("\n");
 
 describe("public content contract", () => {
-  test("records exact artifact admission without claiming runtime activation", () => {
-    expect(publicContent.releaseVersion).toBe("0.7.1");
+  test("projects parsed text once without treating escaped markup as elements", () => {
+    const first = '<!doctype html><html><head><title>first</title></head><body>'
+      + '<p title="attribute > tail">&lt;script&gt;literal&lt;/script&gt; &amp;lt;kept&amp;gt; &quot;&#39;&#x27;</p>'
+      + '<!-- hidden comment --><p>last</p></body></html>';
+    const second = '<!doctype html><html><body><p>second</p></body></html>';
+    const { document } = parseHTML(first);
+    expect(document.querySelectorAll("script")).toHaveLength(0);
+    expect(htmlVisibleText(first)).toBe('first<script>literal</script> &lt;kept&gt; "\'\'last');
+    expect(htmlVisibleText(`${first}\n${second}`)).toBe('first<script>literal</script> &lt;kept&gt; "\'\'last\nsecond');
+    expect(htmlVisibleText('before<!-- comment --><span>middle</span>after')).toBe("beforemiddleafter");
+  });
+
+  test("keeps the unadmitted candidate separate from the exact admitted predecessor", () => {
+    expect(publicContent.releaseVersion).toBe("0.8.0");
+    expect(admittedReleaseVersion).toBe("0.7.1");
     expect(publicReleaseState).toBe("staged");
     expect(publicContent.endpoints.betaTag).toBe("beta-not-yet-live");
-    const readme = renderReadmeMarkdown();
     const llms = renderLlmsText();
     expect(llms).toContain(publicContent.statusLine);
-    expect(llms).toContain("Local CLI v0.7.1 is the fully admitted public artifact");
-    expect(readme).toContain("The v0.7.1 CLI artifacts passed immutable GitHub and npm release admission");
-    expect(readme).toContain("https://github.com/hraness/hra/actions/runs/34367591503");
-    expect(readme.indexOf("The v0.7.1 CLI artifacts passed")).toBeLessThan(readme.indexOf(publicContent.installCommand));
+    expect(llms).toContain("Local CLI v0.8.0 is a release candidate");
+    expect(llms).toContain("v0.7.1 remains the fully admitted public artifact");
+    expect(publicContent.links.admittedInstall).toBe("https://github.com/hraness/oompa/blob/v0.7.1/docs/beta-release-notes.md#install");
     const visibleSite = htmlVisibleText(renderSiteHtml());
-    expect(visibleSite).not.toContain("The v0.7.1 candidate is not yet admitted.");
+    expect(visibleSite).toContain("The v0.8.0 candidate is not yet admitted.");
     expect(visibleSite).toContain("The admitted v0.7.1 CLI has its own");
+    expect(visibleSite).not.toContain("The v0.7.1 candidate is not yet admitted.");
     expect(visibleSite).toContain("Starting or upgrading a daemon and enabling hosted commands are paused until the capacity checks pass.");
-    for (const surface of [readme, llms]) {
+    expect(visibleSite).not.toContain("v0.8.0 artifacts admitted");
+    for (const surface of [llms]) {
+      expect(surface).toContain("Only after immutable GitHub release admission");
       expect(surface).not.toContain("v0.7.1 candidate");
+      expect(surface).not.toContain("v0.8.0 artifacts admitted");
       expect(surface).toContain(publicContent.daemonRolloutNotice);
     }
     for (const surface of [renderDocumentationMarkdown("/docs/status/"), htmlVisibleText(renderDocumentationHtml("/docs/status/"))]) {
-      expect(surface).toContain("v0.7.1 artifacts are admitted. Daemon rollout remains blocked.");
+      expect(surface).toContain("v0.8.0 is a candidate. v0.7.1 remains admitted.");
+      expect(surface).toContain("The v0.8.0 candidate is not yet admitted and requires its own immutable GitHub proof.");
       expect(surface).toContain("The v0.7.1 CLI passed immutable GitHub and npm artifact admission.");
-      expect(surface).toContain(publicContent.daemonRolloutNotice);
       expect(surface).not.toContain("v0.7.1 candidate");
+      expect(surface).toContain(publicContent.daemonRolloutNotice);
+      expect(surface).not.toContain("v0.8.0 artifacts admitted");
     }
-    const admission = renderMarkdownBlocks(publicContent.introduction, 2);
-    expect(admission).toContain("https://github.com/hraness/hra/actions/runs/34367591503");
-    expect(admission).toContain("https://github.com/hraness/hra/releases/tag/v0.7.1");
-    expect(admission).toContain("attempt 2");
-    expect(admission).toContain("artifact admission does not authorize current-daemon startup or hosted command writers");
+    const historicalAdmission = renderMarkdownBlocks(publicContent.introduction, 2);
+    expect(historicalAdmission).toContain("https://github.com/hraness/oompa/actions/runs/34367591503");
+    expect(historicalAdmission).toContain("https://github.com/hraness/oompa/releases/tag/v0.7.1");
+    expect(historicalAdmission).toContain("attempt 2");
+    expect(historicalAdmission).toContain("artifact admission does not authorize current-daemon startup or hosted command writers");
+    expect(historicalAdmission).toContain("does not admit v0.8.0");
   });
 
   test("never transfers current admission to another version", () => {
     expect(isAdmittedRelease("0.7.1")).toBe(true);
+    const admittedContent = { ...publicContent, releaseVersion: admittedReleaseVersion };
+    expect(renderLlmsText(admittedContent)).toContain("Install the admitted v0.7.1 local CLI artifact");
+    for (const surface of [renderLlmsText(admittedContent)]) {
+      expect(surface).not.toContain("The v0.7.1 candidate is not yet admitted");
+      expect(surface).toContain(admittedContent.daemonRolloutNotice);
+    }
     for (const version of ["0.7.0", "0.7.2", "0.8.0", "v0.7.1", "0.7.1-beta.1", ""]) {
       expect(isAdmittedRelease(version)).toBe(false);
     }
     for (const version of ["0.7.2", "0.8.0"]) {
       const content = { ...publicContent, releaseVersion: version };
-      const readme = renderReadmeMarkdown(content);
-      expect(readme).toContain(`The v${version} candidate is not yet admitted.`);
-      expect(readme).toContain("For the admitted v0.7.1 artifact");
-      expect(readme.indexOf(`The v${version} candidate is not yet admitted.`))
-        .toBeLessThan(readme.indexOf(content.installCommand));
-      expect(readme).not.toContain(`The v${version} CLI artifacts passed`);
-      for (const surface of [readme, renderLlmsText(content)]) {
-        expect(surface).toContain("Only after immutable GitHub and npm release admission");
+      const llms = renderLlmsText(content);
+      expect(llms).toContain("This release candidate is not yet admitted.");
+      expect(llms).toContain("https://github.com/hraness/oompa/blob/v0.7.1/docs/beta-release-notes.md#install");
+      expect(llms.indexOf("This release candidate is not yet admitted."))
+        .toBeLessThan(llms.indexOf(content.installCommand));
+      expect(llms).not.toContain(`Install the admitted v${version} local CLI artifact`);
+      for (const surface of [llms]) {
+        expect(surface).toContain("Only after immutable GitHub release admission");
         expect(surface).toContain(content.daemonRolloutNotice);
       }
     }
@@ -146,8 +168,8 @@ describe("public content contract", () => {
     expect(readme).toContain("The v0.7.0 release retains this policy without enabling it.");
     expect(readme).toContain("They use a separate local opt-in, disabled on new and upgraded installations.");
     expect(readme).toContain("After the applicable artifact admission and daemon rollout gates are satisfied");
-    expect(readme).toContain("hra autorespond-after-hours enable --revision <revision>");
-    expect(readme).toContain("hra autorespond-after-hours disable --revision <revision>");
+    expect(readme).toContain("oompa autorespond-after-hours enable --revision <revision>");
+    expect(readme).toContain("oompa autorespond-after-hours disable --revision <revision>");
     expect(readme).toContain("Prose always stays at three, ten, and forty.");
     expect(readme).toContain("Both paths spend the same counters.");
     expect(readme).toContain("Policy changes and schedule boundaries never reset or refund them");
@@ -164,51 +186,50 @@ describe("public content contract", () => {
       expect(surface).toContain("reserves its budget before provider dispatch");
       expect(surface).toContain("pauses automatic approvals for 24 hours");
       expect(surface).toContain("requires a new human message to reopen its consecutive budget");
-      expect(surface).toContain("hra autorespond status --session <session>");
-      expect(surface).not.toMatch(/hra autorespond status`? (?:shows the counters|reports the hold)/u);
+      expect(surface).toContain("oompa autorespond status --session <session>");
+      expect(surface).not.toMatch(/oompa autorespond status`? (?:shows the counters|reports the hold)/u);
       expect(surface).toContain("A newer question or changed authority cancels the stale reply");
     }
   });
-  test("publishes the exact HRA release identity", () => {
+  test("publishes the exact Oompa release identity", () => {
     expect(publicContent).toMatchObject({
-      doctorCommand: "hra doctor --offline",
-      initCommand: "hra init --yes",
-      installCommand: buildHraGlobalInstallCommand(
-        "https://github.com/hraness/hra/releases/download/v0.7.1/hraness-hra-0.7.1.tgz",
+      doctorCommand: "oompa doctor --offline",
+      initCommand: "oompa init --yes",
+      installCommand: buildOompaGlobalInstallCommand(
+        "https://github.com/hraness/oompa/releases/download/v0.8.0/hraness-oompa-0.8.0.tgz",
       ),
       links: {
-        github: "https://github.com/hraness/hra",
+        github: "https://github.com/hraness/oompa",
       },
-      productName: "HRA",
-      siteUrl: "https://hra.sh",
+      productName: "Oompa",
+      siteUrl: "https://oompa.dev",
     });
   });
 
-  test("opens the concise README with the product, its interfaces, and a guarded install path", () => {
-    const markdown = renderReadmeMarkdown();
-    const lines = markdown.split("\n");
-    const badgeLine = publicContent.badges.map((badge) =>
-      `[![${badge.alt}](${badge.image})](${badge.href})`,
-    ).join(" ");
-    expect(lines[0]).toBe("# HRA");
-    expect(lines[1]).toBe(`${badgeLine}\\`);
-    expect(lines[2]).toBe(publicContent.thesis);
+  test("keeps website positioning and install claims independent of the technical package description", () => {
+    const markdown = renderLlmsText();
+    expect(markdown.split("\n")[0]).toBe("# Oompa");
+    expect(markdown).toContain(publicContent.thesis);
+    expect(markdown).toContain(publicContent.statusLine);
+    expect(publicContent.statusLine).toContain("Local CLI v0.8.0 is a release candidate, not an admitted artifact");
+    expect(publicContent.statusLine).toContain("hosted sync is live as an open beta");
+    expect(markdown).toContain(publicContent.installNotice);
+    expect(markdown).toContain(publicContent.links.admittedInstall);
+    expect(markdown.indexOf(publicContent.installNotice)).toBeLessThan(markdown.indexOf(publicContent.installCommand));
     expect(publicContent.thesis).toContain("browser");
     expect(publicContent.thesis).toContain("terminal");
     expect(publicContent.thesis).toContain("execution on your own machines");
-    expect(markdown).toContain(`[Open HRA](${publicContent.links.app})`);
-    expect(markdown).toContain(`[Documentation](${publicContent.links.documentation})`);
-    expect(markdown).toContain(publicContent.hero.summary);
+    expect(renderSiteHtml()).toContain(`href="${publicContent.links.app}"`);
+    expect(markdown).toContain(`Documentation: ${publicContent.links.documentation}`);
+    expect(htmlVisibleText(renderSiteHtml())).toContain(publicContent.hero.summary);
     expect(markdown.indexOf(publicContent.thesis)).toBeLessThan(markdown.indexOf(publicContent.installCommand));
     expect(markdown.indexOf(publicContent.installCommand)).toBeLessThan(markdown.indexOf(publicContent.doctorCommand));
     expect(markdown).toContain(publicContent.daemonRolloutNotice);
-    expect(markdown).toContain("/docs/status/#install-and-update");
-    expect(markdown).not.toContain("## Command reference\n");
-    expect(markdown).not.toContain("### Update runbook\n");
-    expect(markdown).not.toContain("## First account\n");
-    expect(markdown).not.toContain("## Privacy\n");
-    expect(markdown).not.toContain(`\n${publicContent.initCommand}\n`);
-    expect(markdown).toContain("1. **Start:** `" + publicContent.hero.steps[0]!.command + "`.");
+    expect(markdown).toContain("/docs/status/");
+    expect(htmlVisibleText(renderSiteHtml())).toContain(publicContent.hero.steps[0]!.command);
+    expect(packageJson.description).not.toBe(publicContent.description);
+    expect(markdown).not.toContain(packageJson.description);
+    expect(renderSiteHtml()).not.toContain(packageJson.description);
   });
 
   test("publishes trust-signal badges pinned to the package manifest", () => {
@@ -230,14 +251,14 @@ describe("public content contract", () => {
       expect(badge.image).toMatch(/^https:\/\/img\.shields\.io\//u);
       expect(badge.href).toMatch(/^https:\/\//u);
     }
-    expect(publicContent.badges[2]?.image).toContain("/hraness/hra/ci.yml?branch=main");
+    expect(publicContent.badges[2]?.image).toContain("/hraness/oompa/ci.yml?branch=main");
     expect(publicContent.badges[4]?.image).toBe("https://img.shields.io/badge/Bun-1.3.14-14151a");
     expect(publicContent.badges[5]?.image).toBe("https://img.shields.io/badge/runtime-Codex%200.153.2-0b5fa5");
     expect(publicContent.badges[6]?.image).toBe("https://img.shields.io/badge/runtime-Claude%20Code%202.1.260-6f42c1");
     expect(renderSiteHtml()).not.toContain("img.shields.io");
   });
 
-  test("states one neutral positioning in the manifest, JSON-LD, social card, and llms.txt", () => {
+  test("states one neutral website positioning in JSON-LD, social card, and llms.txt", () => {
     const html = renderSiteHtml();
     const jsonLd = /<script type="application\/ld\+json">([\s\S]*?)<\/script>/u.exec(html)?.[1];
     expect(jsonLd).toBeDefined();
@@ -245,7 +266,6 @@ describe("public content contract", () => {
 
     expect(publicContent.tagline).toBe("Workspace for Codex and Claude Code");
     expect(publicContent.providerRoadmap).toBe("Codex and Claude Code, side by side.");
-    expect(packageJson.description).toBe(publicContent.description);
     expect(publicContent.description).toContain("workspace for Codex and Claude Code");
     expect(publicContent.description).toContain("browser or terminal");
     expect(structured).toMatchObject({
@@ -256,7 +276,9 @@ describe("public content contract", () => {
       maintainer: { "@type": "Organization", name: "Hraness", url: "https://hraness.com/" },
     });
     expect(structured).not.toHaveProperty("softwareVersion");
-    expect(publicContent.description).not.toContain("release candidate");
+    expect(publicContent.description).toContain("v0.8.0 is a release candidate");
+    expect(publicContent.description).toContain("v0.7.1 remains admitted");
+    expect(publicContent.description).toContain("daemon and hosted command-writer rollout remains blocked on capacity");
     expect(html).toContain('href="/docs/status/"');
     expect(html).toContain(`<title>${publicContent.productName} | ${publicContent.tagline}</title>`);
     const eyebrow = oneElement(html, "p.hraness-marketing-hero__eyebrow");
@@ -266,19 +288,19 @@ describe("public content contract", () => {
     expect(previewEyebrow.textContent).toBe(publicContent.tagline);
     expectCompiledClasses(previewEyebrow);
     expect(publicContent.socialCard).toEqual({
-      alt: "HRA command-line card showing offline diagnostics and read-only status. Codex and Claude Code, in a web workspace and CLI.",
+      alt: "Oompa command-line card showing offline diagnostics and read-only status · v0.8.0 candidate · daemon rollout blocked on capacity · oompa.dev",
       height: 630,
       path: "/social-card.png",
       width: 1200,
     });
     for (const document of [html, renderPrivacyHtml(), renderPreviewHtml()]) {
-      expect(document).toContain('<meta property="og:image" content="https://hra.sh/social-card.png">');
+      expect(document).toContain('<meta property="og:image" content="https://oompa.dev/social-card.png">');
       expect(document).toContain('<meta property="og:image:type" content="image/png">');
       expect(document).toContain('<meta property="og:image:width" content="1200">');
       expect(document).toContain('<meta property="og:image:height" content="630">');
       expect(document).toContain(`<meta property="og:image:alt" content="${publicContent.socialCard.alt}">`);
       expect(document).toContain('<meta name="twitter:card" content="summary_large_image">');
-      expect(document).toContain('<meta name="twitter:image" content="https://hra.sh/social-card.png">');
+      expect(document).toContain('<meta name="twitter:image" content="https://oompa.dev/social-card.png">');
       expect(document).not.toContain("social-card.svg");
     }
     const llms = renderLlmsText();
@@ -296,13 +318,13 @@ describe("public content contract", () => {
       "Stable working and shared project memory",
       "reads that lane together with durable project memory",
       "shares one attested page only through conflict-checked adoption",
-      "hra memory status|list|get|search|explain|remember|share",
+      "oompa memory status|list|get|search|explain|remember|share",
       "Claude Code uses its live provider-neutral projection while the exact controller is present",
       "only after prior-process exit or an already-completed exact process release is proven",
       "Provider-native rename remains Codex-only",
       "Protected full-turn inspection remains Codex-only",
-      "For Claude, HRA admits only the pinned Fable profile and reviewed host-tool boundary",
-      "Bound Codex and Claude Code models use closed HRA tools",
+      "For Claude, Oompa admits only the pinned Fable profile and reviewed host-tool boundary",
+      "Bound Codex and Claude Code models use closed Oompa tools",
       "Attributed peer coordination",
       "list, inspect, and message only bounded same-project peers",
       "Retired sessions cannot participate",
@@ -315,12 +337,12 @@ describe("public content contract", () => {
       "causal cycles, and a ninth hop",
       "120 new peer actions per actor and per project in a rolling hour",
       "25,000-action project cap fails closed",
-      "hra session start <account> [--project <project>] [--provider <codex|claude>] [--preset <low|high|ultra|fable-max>] [--fast]",
-      "hra session peer-policy get <session> [--json]",
-      "hra session peer-policy set <session> <off|inspect|coordinate> --revision <n> [--json]",
-      "hra session preset <session> <low|high|ultra|fable-max>",
-      "hra session switch <session> --provider <codex|claude> [--preset <low|high|ultra|fable-max>] [--account <account>]",
-      "hra session export <session> [--format <trajectory|json>] [--out <path>]",
+      "oompa session start <account> [--project <project>] [--provider <codex|claude>] [--preset <low|high|ultra|fable-max>] [--fast]",
+      "oompa session peer-policy get <session> [--json]",
+      "oompa session peer-policy set <session> <off|inspect|coordinate> --revision <n> [--json]",
+      "oompa session preset <session> <low|high|ultra|fable-max>",
+      "oompa session switch <session> --provider <codex|claude> [--preset <low|high|ultra|fable-max>] [--account <account>]",
+      "oompa session export <session> [--format <trajectory|json>] [--out <path>]",
     ];
 
     for (const claim of claims) {
@@ -330,17 +352,13 @@ describe("public content contract", () => {
     for (const surface of [markdown, html, renderLlmsText()]) {
       expect(surface).not.toContain("Codex is supported today; Claude is next.");
       expect(surface).not.toContain("Codex today, Claude next.");
-      expect(surface).not.toContain("Claude authentication happens outside HRA");
-      expect(surface).not.toContain("HRA does not expose Claude login");
+      expect(surface).not.toContain("Claude authentication happens outside Oompa");
+      expect(surface).not.toContain("Oompa does not expose Claude login");
     }
   });
 
   test("identifies the product maintainer without repeating a brand explanation", () => {
-    const markdown = renderReadmeMarkdown();
     expect(publicContent.maintainer).toEqual({ name: "Hraness", url: "https://hraness.com/" });
-    expect(markdown).toContain("HRA is maintained by [Hraness](https://hraness.com/) and published under the MIT license.");
-    expect(markdown.match(/HRA is maintained by/gu)).toHaveLength(1);
-    expect(markdown).not.toContain("short for harness");
     const resources = oneElement(renderSiteHtml(), "aside.project-resources");
     expect(resources.textContent).toContain("MIT licensed");
     expect(resources.querySelector('a[href="https://hraness.com/"]')).toBeNull();
@@ -349,13 +367,11 @@ describe("public content contract", () => {
 
   test("publishes no em dash on any generated public surface", () => {
     for (const [label, surface] of [
-      ["README", renderReadmeMarkdown()],
       ["PRIVACY", renderPrivacyMarkdown()],
       ["llms.txt", renderLlmsText()],
       ["site", renderSiteHtml()],
       ["privacy page", renderPrivacyHtml()],
       ["preview", renderPreviewHtml()],
-      ["package description", packageJson.description],
       ...docsPages.map((page) => [page.path, renderDocsHtml(page)] as const),
       ...docsPages.map((page) => [`${page.path}index.md`, renderDocsMarkdown(page.path)] as const),
     ] as const) {
@@ -392,6 +408,11 @@ describe("public content contract", () => {
     const html = renderDocumentationHtml("/docs/reference/");
     const document = parseHTML(html).document;
     const commands = [...document.querySelectorAll("pre.command-list")];
+    for (const version of ["v0.7.1", "v0.8.0"]) {
+      const versionCodes = [...document.querySelectorAll("code.oompa-inline-code")].filter((code) => code.textContent === version);
+      expect(versionCodes.length).toBeGreaterThan(0);
+      for (const code of versionCodes) expectCompiledClasses(code);
+    }
     expect(commands.length).toBeGreaterThan(0);
     for (const command of commands) {
       expect(command.getAttribute("tabindex")).toBe("0");
@@ -411,8 +432,9 @@ describe("public content contract", () => {
     expect(document.querySelectorAll("code:not([class])")).toHaveLength(0);
   });
 
-  test("keeps admitted artifacts distinct from runtime status in the owning guide", () => {
+  test("separates the unadmitted candidate from its admitted predecessor in the owning status guide", () => {
     expect(publicReleaseState).toBe("staged");
+    expect(publicContent.releaseVersion).toBe("0.8.0");
     expect(publicContent.endpoints).toEqual({
       betaTag: "beta-not-yet-live", githubRepository: "live", hostedSync: "live", website: "live",
     });
@@ -421,23 +443,52 @@ describe("public content contract", () => {
     for (const surface of [markdown, html]) {
       expect(surface).toContain("v0.7.1");
       expect(surface).toContain("passed immutable GitHub and npm artifact admission");
-      expect(surface).toContain("v0.7.1 artifacts are admitted");
+      expect(surface).toContain("The v0.8.0 candidate is not yet admitted");
       expect(surface).not.toContain("The v0.7.1 candidate is not yet admitted");
+      expect(surface).not.toContain("v0.8.0 is released");
       expect(surface).toContain("daemon and hosted command-writer rollout remains blocked on capacity");
       expect(surface).toContain("Artifact availability and the live sync service do not clear this gate");
       expect(surface).not.toContain("v0.7.0 candidate");
       expect(surface).not.toContain("v0.7.0 is a release candidate");
+      expect(surface).toContain("This release candidate is not yet admitted");
+      expect(surface).toContain(publicContent.installNotice);
+      expect(surface).not.toContain("v0.8.0 artifacts admitted");
+      expect(surface).not.toContain("v0.8.0 is the fully admitted public artifact");
+      expect(surface).not.toContain("beta-not-yet-live");
+
       expect(surface).not.toContain("Beta not yet live");
     }
-    for (const surface of [renderReadmeMarkdown(), renderLlmsText()]) {
+    for (const surface of [renderLlmsText(), markdown, renderDocsMarkdown("/docs/start/")]) {
+      expect(surface).toContain(publicContent.links.admittedInstall);
+      const noticePosition = surface.indexOf(publicContent.installNotice);
+      const commandPosition = surface.indexOf(publicContent.installCommand);
+      expect(noticePosition).toBeGreaterThanOrEqual(0);
+      expect(commandPosition).toBeGreaterThanOrEqual(0);
+      expect(noticePosition).toBeLessThan(commandPosition);
+    }
+    for (const surface of [renderLlmsText()]) {
       expect(surface).toContain("admitted v0.7.1");
       expect(surface).toContain(publicContent.daemonRolloutNotice);
       expect(surface).toContain("/docs/status/");
     }
-    expect(renderDocsMarkdown("/docs/reference/")).toContain("admitted local CLI release");
-    expect(renderLlmsText()).toContain("Install the admitted v0.7.1 local CLI artifact");
-    expect(renderReadmeMarkdown()).toContain("Install and verify the admitted v0.7.1 CLI artifact. This does not start the daemon:");
-    expect(renderReadmeMarkdown()).not.toContain("The v0.7.1 candidate is not yet admitted");
+    expect(markdown).toContain("https://github.com/hraness/oompa/releases/tag/v0.7.1");
+    expect(markdown).toContain("https://github.com/hraness/oompa/actions/runs/34367591503");
+    expect(markdown).toContain("Local v0.8.0 candidate; hosted sync live as an open beta");
+    const reference = renderDocsMarkdown("/docs/reference/");
+    expect(reference).toContain("Local release boundary");
+    expect(reference).toContain("v0.7.1");
+    expect(reference).toContain("admitted local CLI release and are retained in the `v0.8.0` candidate");
+    expect(renderLlmsText()).toContain("Only after immutable GitHub release admission, install the v0.8.0 local CLI artifact");
+    for (const path of ["/docs/start/", "/docs/status/"] as const) {
+      const guideHtml = renderDocumentationHtml(path);
+      expect(guideHtml).toContain(publicContent.links.admittedInstall);
+      const notice = 'aside[aria-label="Candidate artifact not yet admitted"]';
+      expect(oneElement(guideHtml, notice).textContent).toContain(publicContent.installNotice);
+      const guide = parseHTML(guideHtml).document;
+      const firstCommand = guide.querySelector("pre.command-list");
+      expect(firstCommand).not.toBeNull();
+      expect(elementPosition(guideHtml, notice)).toBeLessThan([...guide.querySelectorAll("*")].indexOf(firstCommand!));
+    }
     const notices = [...parseHTML(renderSiteHtml()).document.querySelectorAll("p")]
       .filter((paragraph) => paragraph.textContent.startsWith("New machine setup is temporarily paused"));
     expect(notices).toHaveLength(1);
@@ -447,7 +498,7 @@ describe("public content contract", () => {
   test("keeps startup prerequisites adjacent to setup without turning the homepage into a runbook", () => {
     const prerequisite = publicContent.daemonRolloutNotice;
     expect(prerequisite).toContain("Do not initialize, start, or autostart");
-    expect(prerequisite).toContain("autostart a current daemon until");
+    expect(prerequisite).toContain("either the admitted v0.7.1 daemon or the v0.8.0 candidate");
     expect(prerequisite).toContain("protected two-pass zero-debt capacity evidence and its exact .activated readback receipt");
     expect(prerequisite).toContain("target marker-2 proofs before globally enabling hosted writers");
     const setupHtml = renderDocumentationHtml("/docs/start/");
@@ -456,8 +507,6 @@ describe("public content contract", () => {
       .toBeLessThan(setup.indexOf(publicContent.initCommand));
     expect(setup.indexOf(publicContent.doctorCommand)).toBeLessThan(setup.indexOf(publicContent.initCommand));
     expect(oneElement(setupHtml, "#connect-an-account aside.notice").textContent).toContain("before the steps below");
-    const readme = renderReadmeMarkdown();
-    expect(readme.indexOf(prerequisite)).toBeLessThan(readme.indexOf(publicContent.hero.steps[0]!.command));
     const llms = renderLlmsText();
     expect(llms.indexOf(prerequisite)).toBeLessThan(llms.indexOf(publicContent.initCommand));
     const home = htmlVisibleText(renderSiteHtml());
@@ -467,11 +516,11 @@ describe("public content contract", () => {
   });
 
   test.each([
-    ["first-account", "First account", "hra account add personal"],
-    ["first-session", "First session", "hra session start personal --provider codex"],
-    ["cloud-sign-in-and-device-pairing", "Cloud sign-in and device pairing", "hra auth login --input-stdin"],
-    ["terminal-and-agent-interfaces", "Terminal and agent interfaces", "hra"],
-    ["presets-and-permissions", "Presets and permissions", "hra init --yes"],
+    ["first-account", "First account", "oompa account add personal"],
+    ["first-session", "First session", "oompa session start personal --provider codex"],
+    ["cloud-sign-in-and-device-pairing", "Cloud sign-in and device pairing", "oompa auth login --input-stdin"],
+    ["terminal-and-agent-interfaces", "Terminal and agent interfaces", "oompa"],
+    ["presets-and-permissions", "Presets and permissions", "oompa init --yes"],
   ])("guards the directly linked %s first-run section before its startup instructions", (id, heading, command) => {
     const section = publicContent.sections.find((entry) => entry.id === id);
     expect(section?.blocks[0]).toEqual({
@@ -494,7 +543,6 @@ describe("public content contract", () => {
   test("states one hosted sign-up claim everywhere and switches it in one place", () => {
     expect(publicContent.hostedSignup).toBe("open");
     for (const surface of [
-      renderReadmeMarkdown(),
       renderSiteHtml(),
       renderPrivacyMarkdown(),
     ]) {
@@ -528,10 +576,10 @@ describe("public content contract", () => {
     ];
 
     for (const command of [
-      "hra auth login --input-stdin",
-      "hra auth login --input-fd <fd>",
-      "hra auth delete --acknowledge-erasure",
-      "hra device pair",
+      "oompa auth login --input-stdin",
+      "oompa auth login --input-fd <fd>",
+      "oompa auth delete --acknowledge-erasure",
+      "oompa device pair",
     ]) {
       expect(markdown).toContain(command);
       expect(visibleHtml).toContain(command);
@@ -545,17 +593,17 @@ describe("public content contract", () => {
       expect(surface).not.toContain("auth login --code");
     }
     expect(markdown).toContain(
-      "hra device approve <pending-device-id-or-prefix> --fingerprint <value>"
+      "oompa device approve <pending-device-id-or-prefix> --fingerprint <value>"
       + " [--idempotency-key <current-uuidv7>]",
     );
-    expect(visibleHtml).toContain("hra device approve <pending-device-id-or-prefix>");
+    expect(visibleHtml).toContain("oompa device approve <pending-device-id-or-prefix>");
     for (const claim of [
-      "hra device key-loss --acknowledge-no-key-holders",
+      "oompa device key-loss --acknowledge-no-key-holders",
       "the account key as a closed status",
       "recovery requires an existing account-key holder",
       "no remaining holder makes the encrypted content unrecoverable",
       "authenticated, registered, active installation",
-      "current HRA cloud identity's isolated local custody",
+      "current Oompa cloud identity's isolated local custody",
       "current auth token generation, identity, auth epoch, registered device, and pairing observation agree exactly",
       "no network, provider, or cloud mutation",
       "does not mint, replace, or delete a key or ciphertext",
@@ -566,7 +614,7 @@ describe("public content contract", () => {
       "Search again for an existing holder",
       "the real key restores ready status and supersedes the acknowledgement",
       "Only after that renewed holder search is exhausted",
-      "erasing and reinitializing the HRA cloud account",
+      "erasing and reinitializing the Oompa cloud account",
       "does not regenerate the lost account key",
       "not the default response to a key-loss acknowledgement",
     ]) {
@@ -601,22 +649,22 @@ describe("public content contract", () => {
     const html = htmlVisibleText(renderDocumentationHtml("/docs/sessions/"));
     for (const surface of [markdown, html]) {
       expect(surface).toContain("the daemon restarts before completion");
-      expect(surface).toContain("hra account show personal");
-      expect(surface).toContain("hra account login-cancel");
+      expect(surface).toContain("oompa account show personal");
+      expect(surface).toContain("oompa account login-cancel");
       expect(surface).toContain("exact current-generation provider login");
-      expect(surface).toContain("Verification URLs and user codes never enter local durable HRA state, logs, or ordinary command output");
+      expect(surface).toContain("Verification URLs and user codes never enter local durable Oompa state, logs, or ordinary command output");
       expect(surface).toContain("account-key-encrypted, one-read hosted result");
       expect(surface).toContain("always selects device-code mode");
       expect(surface).toContain("--handoff-file /absolute/private/login.json --json");
       expect(surface).toContain("A same-key replay never claims or rewrites a handoff");
       expect(surface).toContain("after completion or cancellation it reports the terminal account state");
-      expect(surface).toContain("hra account login personal --provider claude");
+      expect(surface).toContain("oompa account login personal --provider claude");
       expect(surface).toContain("CLAUDE_CONFIG_DIR");
-      expect(surface).toContain("Claude exposes no HRA device-code, handoff-file, or web-linking protocol");
+      expect(surface).toContain("Claude exposes no Oompa device-code, handoff-file, or web-linking protocol");
       expect(surface).toContain("retains the one-child fence even if Claude reports signed in");
       expect(surface).toContain("After confirming that original child has exited");
       expect(surface).toContain("recovery does not stop Claude or read, change, or delete a credential");
-      expect(surface).not.toContain("HRA does not implement Claude Code sign-in");
+      expect(surface).not.toContain("Oompa does not implement Claude Code sign-in");
     }
   });
 
@@ -627,21 +675,33 @@ describe("public content contract", () => {
       expect(surface).toContain("Devin support has been removed");
       expect(surface).toContain("Existing Devin history is read-only");
       expect(surface).not.toContain("devin acp");
-      expect(surface).not.toContain("hra account login personal --provider devin");
+      expect(surface).not.toContain("oompa account login personal --provider devin");
       expect(surface).not.toContain("|devin");
       expect(surface).not.toContain("|astra");
     }
   });
 
+  test("preserves the adopted provider-usage boundary in its owning guides' Markdown and HTML", () => {
+    for (const surface of [renderDocumentationMarkdown("/docs/sessions/", "/docs/status/"), htmlVisibleText(renderDocumentationHtml("/docs/sessions/", "/docs/status/"))]) {
+      expect(surface).toContain("Automatic account movement is not exposed yet.");
+      expect(surface).toContain("Explicit sessions and work tasks stay pinned to the account you selected.");
+      expect(surface).toContain("Claude and Devin accounts never rotate automatically, and Oompa never replays a failed or ambiguous turn under another account.");
+      expect(surface).toContain("The experimental desktop switch never copies");
+      expect(surface).toContain("changes Keychain blindly, responds to a provider limit, or retries an uncertain switch.");
+      expect(surface).toContain("The separately adopted provider-usage contract permits bounded managed Codex movement only under fresh local authority; explicit sessions, work tasks, Claude accounts, and cross-machine execution remain outside that boundary.");
+      expect(surface).not.toContain("rotates accounts to evade a provider limit");
+    }
+  });
+
   test("publishes an explicit read-only plugin boundary", () => {
     const claims = [
-      "hra plugin list <account> [--project <project>] [--refresh]",
-      "hra plugin show <account> <plugin> [--project <project>] [--refresh]",
+      "oompa plugin list <account> [--project <project>] [--refresh]",
+      "oompa plugin show <account> <plugin> [--project <project>] [--refresh]",
       "Plugin commands are read-only discovery.",
       "Pinned Codex 0.153.2 has no safely separated install, enablement, and OAuth lifecycle surface",
-      "HRA therefore does not expose plugin install, enable, disable, OAuth, or permission effects.",
+      "Oompa therefore does not expose plugin install, enable, disable, OAuth, or permission effects.",
       "The pinned tool-suggestion form that can invoke that compound plugin or connector lifecycle is also rejected before admission.",
-      "Other standard MCP forms are brokered only when their pinned schema fits HRA's closed primitive-field contract.",
+      "Other standard MCP forms are brokered only when their pinned schema fits Oompa's closed primitive-field contract.",
       "Opaque openai/form, unsupported schema constructs, and URL elicitation fail before durable admission",
     ];
     const markdown = renderDocumentationMarkdown("/docs/reference/");
@@ -654,7 +714,7 @@ describe("public content contract", () => {
 
   test("publishes informed protected approval inspection", () => {
     const claims = [
-      "hra interaction inspect <interaction-id> --revision <n> [--handoff-file <absolute-path>]",
+      "oompa interaction inspect <interaction-id> --revision <n> [--handoff-file <absolute-path>]",
       "intentionally returns only a durable safe summary",
       "complete authority still held by the live provider callback",
       "ordinary stdout receives only safe binding and cleanup metadata",
@@ -720,16 +780,16 @@ describe("public content contract", () => {
       "The machine that created a provider session remains its only executor in v1.",
       "send, queue, steer, stop, preset, provider-switch, and Codex Fast commands",
       "Project directories are local-only and are neither synced nor remotely changed.",
-      "hra remote send <cloud-session> <message>",
-      "hra remote command <uuidv7>",
-      "hra remote provider <cloud-session> <codex|claude> [--preset <low|high|ultra|fable-max>]",
+      "oompa remote send <cloud-session> <message>",
+      "oompa remote command <uuidv7>",
+      "oompa remote provider <cloud-session> <codex|claude> [--preset <low|high|ultra|fable-max>]",
       "--idempotency-key <current-uuidv7>",
       "includes interaction events with a public interaction ID, kind, state, revision, blocking status, bounded safe summary, and a nested version 2 remote policy",
       "Another device may decline a pending command, permission, or file-change request with",
       "every MCP answer stays on the execution machine",
       "Transcript upload is bound to a durable local stream ledger",
-      "HRA never resets, aliases, overwrites, or destructively reseeds encrypted history.",
-      "hra sync projection recover <local-session> --acknowledge-gap [--idempotency-key <uuidv7>] [--json]",
+      "Oompa never resets, aliases, overwrites, or destructively reseeds encrypted history.",
+      "oompa sync projection recover <local-session> --acknowledge-gap [--idempotency-key <uuidv7>] [--json]",
       "performs no daemon call and returns",
       "JSON mode never prompts.",
       "preserves all older encrypted cloud history and changes no provider or app state.",
@@ -748,7 +808,7 @@ describe("public content contract", () => {
     const markdown = renderDocsMarkdown("/docs/web/");
     const html = htmlVisibleText(renderDocumentationHtml("/docs/web/"));
     const privacy = renderPrivacyMarkdown();
-    const command = "hra sync projection recover <local-session> --acknowledge-gap [--idempotency-key <uuidv7>] [--json]";
+    const command = "oompa sync projection recover <local-session> --acknowledge-gap [--idempotency-key <uuidv7>] [--json]";
 
     expect(markdown).toContain(command);
     expect(html).toContain(command);
@@ -783,7 +843,6 @@ describe("public content contract", () => {
       }
     }
     expect(parseHTML(home).document.querySelectorAll("section.documentation-section")).toHaveLength(0);
-    expect(renderReadmeMarkdown()).not.toContain("## Command reference\n");
   });
 
   test("keeps the full privacy boundary on its canonical HTML and Markdown surfaces", () => {
@@ -807,15 +866,15 @@ describe("public content contract", () => {
       "browser extensions, accessibility APIs, screenshots, and explicit user selection can observe rendered text",
       "Email access alone does not recover that key.",
       "an uncontested, unrevoked copy can impersonate that device",
-      "HRA uses Convex to authenticate the HRA identity",
-      "HRA uses Resend to deliver verification email.",
+      "Oompa uses Convex to authenticate the Oompa identity",
+      "Oompa uses Resend to deliver verification email.",
       "one-time verification code and message content",
       "anonymous, cookieless PostHog analytics",
       "Collection runs only on the canonical production host",
       "honors Do Not Track",
       "disables person profiles, autocapture, heatmaps, feature flags, surveys, conversations, and session recording",
-      "HRA sends no form values, account identity, provider or session data, URL query, or fragment.",
-      "Vercel serves hra.sh",
+      "Oompa sends no form values, account identity, provider or session data, URL query, or fragment.",
+      "Vercel serves oompa.dev",
       "GitHub hosts the source repository, releases, and release downloads",
     ];
     const surfaces = [
@@ -828,7 +887,6 @@ describe("public content contract", () => {
         expect(surface).toContain(claim.replaceAll("'", "&#39;"));
       }
     }
-    expect(renderReadmeMarkdown()).toContain(publicContent.links.privacy);
     expect(renderSiteHtml()).toContain('href="/privacy/"');
   });
 
@@ -836,13 +894,13 @@ describe("public content contract", () => {
     const markdown = renderDocumentationMarkdown("/docs/status/");
     const html = htmlVisibleText(renderDocumentationHtml("/docs/status/"));
     const surfaces = [markdown, html];
-    expect(publicContent.installCommand).toContain(HRA_INSTALL_PREFLIGHT_SOURCE_URL);
+    expect(publicContent.installCommand).toContain(OOMPA_INSTALL_PREFLIGHT_SOURCE_URL);
     expect(publicContent.installCommand).toContain("unset BUN_OPTIONS NODE_OPTIONS");
     expect(publicContent.installCommand).toContain(
       "| command bun --no-env-file --config=/dev/null -e '",
     );
     expect(publicContent.installCommand).toContain(
-      "-- https://github.com/hraness/hra/releases/download/v0.7.1/hraness-hra-0.7.1.tgz",
+      "-- https://github.com/hraness/oompa/releases/download/v0.8.0/hraness-oompa-0.8.0.tgz",
     );
     expect(publicContent.installCommand).toContain("hra-install-safe");
     expect(publicContent.installCommand).not.toContain("bun add --global");
@@ -850,24 +908,24 @@ describe("public content contract", () => {
     expect(markdown).toContain(publicContent.installCommand);
     expect(html).toContain(publicContent.installCommand);
     for (const surface of surfaces) {
-      expect(surface).toContain("HRA requires Bun 1.3.14");
+      expect(surface).toContain("Oompa requires Bun 1.3.14");
       expect(surface).toContain("curl with HTTPS and TLS 1.2 support");
       expect(surface).toContain("support macOS and Linux");
       expect(surface).toContain("Codex effects run on both platforms");
       expect(surface).toContain("Claude Code effects run on Linux only");
       expect(surface).toContain("refuses new Claude Code effects on macOS pending authenticated isolated-Keychain and detached-read acceptance");
-      expect(surface).toContain(HRA_INSTALL_PREFLIGHT_SOURCE_URL);
+      expect(surface).toContain(OOMPA_INSTALL_PREFLIGHT_SOURCE_URL);
       expect(surface).toContain("hra-install-safe");
       expect(surface).toContain("fresh random private staging root");
       expect(surface).toContain("GitHub repository ID 1343008607");
-      expect(surface).toContain("published immutable v0.7.1 release");
+      expect(surface).toContain("published immutable v0.8.0 release");
       expect(surface).toContain("removes ambient Bun, Node, and native-library injection variables");
       expect(surface).toContain("disables Bun dotenv loading");
       expect(surface).toContain("/dev/null as the only Bun configuration");
       expect(surface).toContain("immutable release metadata");
       expect(surface).toContain("verified in-memory snapshot");
       expect(surface).toContain("bounded package-file manifest");
-      expect(surface).toContain("every extracted HRA package path and SHA-256");
+      expect(surface).toContain("every extracted Oompa package path and SHA-256");
       expect(surface).toContain("separate full-digest version namespaces");
       expect(surface).toContain("lifecycle scripts disabled");
       expect(surface).toContain("complete staged tree");
@@ -876,16 +934,16 @@ describe("public content contract", () => {
       expect(surface).toContain("detached staging worker and its Bun package-install child repeat the runtime neutralization");
       expect(surface).toContain("configured registry, proxy, and certificate trust inputs");
       expect(surface).toContain("prior verified command remains active throughout staging");
-      expect(surface).toContain("atomically replaces only the $BUN_INSTALL/bin/hra symlink");
+      expect(surface).toContain("atomically replaces only the $BUN_INSTALL/bin/oompa symlink");
       expect(surface).toContain("next invocation of that exact release's installer recovers or removes only the proven private stage");
       expect(surface).toContain("another release's installer refuses the durable intent");
       expect(surface).toContain("invoking shell, PATH-selected pinned Bun binary");
       expect(surface).toContain("Existing trustedDependencies remain unchanged");
-      expect(surface).toContain("hra daemon stop");
-      expect(surface).toContain("hra daemon status --json");
-      expect(surface).toContain("hra daemon start");
-      expect(surface).toContain("Install the admitted v0.7.1 exact release, then verify the installed version and offline health");
-      expect(surface).not.toContain("bun remove --global hra");
+      expect(surface).toContain("oompa daemon stop");
+      expect(surface).toContain("oompa daemon status --json");
+      expect(surface).toContain("oompa daemon start");
+      expect(surface).toContain("Only after immutable GitHub release admission for v0.8.0, install its exact release and verify the installed version and offline health");
+      expect(surface).not.toContain("bun remove --global oompa");
       expect(surface).not.toContain("uninstall the package");
     }
   });
@@ -915,7 +973,7 @@ describe("public content contract", () => {
       "Never install a moving branch on a release machine",
       "never run an older daemon against this state root after the current daemon has started",
       "Settle any durable installer intent left by an interrupted installation",
-      "$BUN_INSTALL/install/hra/install-intent.json",
+      "$BUN_INSTALL/install/oompa/install-intent.json",
       "Do not edit or delete that file or its staging or version directories",
       "the exact immutable install command from the originating release's trusted README or release notes",
       "If that installer refuses the intent, stop installation and use bounded read-only diagnosis while preserving the intent and its directories",
@@ -933,7 +991,7 @@ describe("public content contract", () => {
       "do not invent an unsupported option",
       "This command has no idempotency key",
       "Block the update on any remaining prepared or indeterminate local mutation",
-      "HRA exposes no general command to cancel a prepared session start or provider switch",
+      "Oompa exposes no general command to cancel a prepared session start or provider switch",
       "Do not generate a fresh key or edit SQLite as a workaround",
       "durable local outbox",
       "current tab's returned command handle and public ID",
@@ -986,8 +1044,8 @@ describe("public content contract", () => {
       "6. Stop the daemon and prove that it released authority:",
       "",
       "   ```text",
-      "   hra daemon stop --json",
-      "   hra daemon status --json",
+      "   oompa daemon stop --json",
+      "   oompa daemon status --json",
       "   ```",
       "",
       "   Require the stop command itself to exit zero; its recovery path is the authority-release proof. Treat a status response containing `data.running: false` only as a secondary no-listener confirmation. Status alone does not prove authority release. Stop on any stop or recovery error.",
@@ -996,11 +1054,11 @@ describe("public content contract", () => {
       "9. Start the current daemon. This is the no-downgrade boundary: after this command begins, never launch an older daemon against the same state root. Prove post-migration health before syncing, then inspect every retained CLI session-command ID:",
       "",
       "   ```text",
-      "   hra daemon start",
-      "   hra doctor --offline",
-      "   hra sync now --json",
-      "   hra sync status",
-      "   hra remote command <uuidv7>",
+      "   oompa daemon start",
+      "   oompa doctor --offline",
+      "   oompa sync now --json",
+      "   oompa sync status",
+      "   oompa remote command <uuidv7>",
       "   ```",
     ].join("\n"));
     expect(markdown.indexOf("1. Settle any durable installer intent")).toBeLessThan(
@@ -1020,7 +1078,7 @@ describe("public content contract", () => {
       rawHtml.indexOf("Optional full local-data removal"),
     );
     expect(parseHTML(runbookHtml).document.querySelectorAll("li")).toHaveLength(10);
-    expect(htmlVisibleText(runbookHtml)).toMatch(/Stop the daemon[\s\S]+?hra daemon stop --json[\s\S]+?Status alone does not prove authority release/u);
+    expect(htmlVisibleText(runbookHtml)).toMatch(/Stop the daemon[\s\S]+?oompa daemon stop --json[\s\S]+?Status alone does not prove authority release/u);
     expect(markdown).not.toContain("Before replacing the installed binary");
   });
 
@@ -1066,22 +1124,22 @@ describe("public content contract", () => {
     const html = htmlVisibleText(rawHtml);
     const claims = [
       "Human terminal",
-      "hra session start personal --provider codex",
+      "oompa session start personal --provider codex",
       "/account personal",
       "/session <session-id>",
       "Agent caller",
       "data.session.id",
       "data.eventStream.cursor",
-      "hra session start personal --provider codex --json",
-      "hra session status <session-id> --json",
-      "hra session watch <session-id> --cursor <status-cursor> --jsonl",
+      "oompa session start personal --provider codex --json",
+      "oompa session status <session-id> --json",
+      "oompa session watch <session-id> --cursor <status-cursor> --jsonl",
       "--follow",
       "equivalent compatibility spelling",
-      "hra session interactions <session-id> --pending --json",
+      "oompa session interactions <session-id> --pending --json",
       "Claude Code and provider switching",
-      "hra session start personal --provider claude --preset fable-max --json",
-      "hra session switch <session-id> --provider claude --preset fable-max",
-      "hra session export <session-id> --format json",
+      "oompa session start personal --provider claude --preset fable-max --json",
+      "oompa session switch <session-id> --provider claude --preset fable-max",
+      "oompa session export <session-id> --format json",
       "seeds a fresh provider-native runtime from the latest retained tail",
       "does not move a provider-native thread",
       "accepted direct, queued, Work and scheduled automation, autorespond, and provider-switch handoff messages with actor provenance",
@@ -1089,16 +1147,16 @@ describe("public content contract", () => {
       "Retention is capped at 50,000 events, 64 MiB, and seven days",
       "Keep following while a separate one-shot invocation handles the approval, question, permission grant, or supported MCP form.",
       "Scheduled work in the same conversation",
-      "hra session task create <session-id> --name daily-review --every-minutes 1440",
-      "hra session task list <session-id>",
-      "hra session task show <session-id> <task-id>",
-      "hra session task edit <session-id> <task-id> --revision <revision> --pause",
-      "hra session task edit <session-id> <task-id> --revision <revision> --resume",
-      "hra session task delete <session-id> <task-id> --revision <revision>",
+      "oompa session task create <session-id> --name daily-review --every-minutes 1440",
+      "oompa session task list <session-id>",
+      "oompa session task show <session-id> <task-id>",
+      "oompa session task edit <session-id> <task-id> --revision <revision> --pause",
+      "oompa session task edit <session-id> <task-id> --revision <revision> --resume",
+      "oompa session task delete <session-id> <task-id> --revision <revision>",
       "A task cannot independently retarget its account, provider, project, model, or execution environment",
       "later explicit changes to the session apply to future runs",
       "Missed intervals coalesce into one queued turn",
-      "HRA never creates a replacement provider conversation or writes a provider's private automation registry",
+      "Oompa never creates a replacement provider conversation or writes a provider's private automation registry",
     ];
 
     expect(markdown).toContain("## First session");
@@ -1108,14 +1166,14 @@ describe("public content contract", () => {
       expect(html).toContain(claim);
     }
     expect(publicContent.hero.steps[0]).toMatchObject({
-      command: "hra session start personal --provider codex --json",
+      command: "oompa session start personal --provider codex --json",
     });
     expect(publicContent.hero.steps[2]).toMatchObject({
-      command: "hra session switch <session-id> --provider claude --preset fable-max",
-      detail: "Continue on your signed-in Claude Code profile. HRA carries over the conversation it has retained and flags any missing history.",
+      command: "oompa session switch <session-id> --provider claude --preset fable-max",
+      detail: "Continue on your signed-in Claude Code profile. Oompa carries over the conversation it has retained and flags any missing history.",
     });
-    expect(markdown).toContain("New HRA-created Codex sessions that use `high` or `ultra`");
-    expect(html).toContain("New HRA-created Codex sessions that use high or ultra");
+    expect(markdown).toContain("New Oompa-created Codex sessions that use `high` or `ultra`");
+    expect(html).toContain("New Oompa-created Codex sessions that use high or ultra");
     expect(markdown).toContain("The `low` and `fable-max` bindings are unchanged");
     expect(markdown).not.toContain("every explicit preset selection use the Sol mapping");
     expect(markdown).toContain("sessions already bound to historical contract 2 keep their exact Astra model and effort");
@@ -1128,7 +1186,7 @@ describe("public content contract", () => {
     const html = htmlVisibleText(renderDocumentationHtml("/docs/reference/"));
     const claims = [
       "Bounded local status",
-      "hra status [--json]",
+      "oompa status [--json]",
       "bounded, effect-free read of local SQLite state",
       "does not start, stop, or contact the daemon",
       "at most 50 ID-and-revision action records",
@@ -1165,9 +1223,9 @@ describe("public content contract", () => {
     const documentedCommands = publicContent.sections.flatMap((section) =>
       section.blocks.flatMap((block) => block.kind === "commands" ? block.commands : []),
     );
-    expect(documentedCommands).toContain("hra status [--json]");
-    expect(documentedCommands).toContain("hra session watch <session> [--cursor <cursor>] [--jsonl]");
-    expect(documentedCommands.some((command) => command.startsWith("hra session wait"))).toBe(false);
+    expect(documentedCommands).toContain("oompa status [--json]");
+    expect(documentedCommands).toContain("oompa session watch <session> [--cursor <cursor>] [--jsonl]");
+    expect(documentedCommands.some((command) => command.startsWith("oompa session wait"))).toBe(false);
     expect(documentedCommands.some((command) => /<\d+-\d+>/u.test(command))).toBe(false);
   });
 
@@ -1180,7 +1238,7 @@ describe("public content contract", () => {
       "Configuring a gateway key explicitly enables the separate prose-approval path",
       "openai/gpt-5-nano",
       "one request with a 10-second deadline and no retry",
-      "The model cannot create arbitrary text that HRA will send",
+      "The model cannot create arbitrary text that Oompa will send",
       "a byte-exact substring already present in the assistant message",
       "Claude Code public profiles include the pinned CLI, model, reasoning effort, default permission mode, and stream formats",
       "omits that custody identity and legacy isolation marker",
@@ -1208,7 +1266,7 @@ describe("public content contract", () => {
       expect(usageSection).toBeDefined();
       for (const line of usageSection?.split("\n").slice(1) ?? []) {
         const command = line.trim();
-        if (command.startsWith("hra ")) expect(documentedCommands).toContain(command);
+        if (command.startsWith("oompa ")) expect(documentedCommands).toContain(command);
       }
     }
   });
@@ -1218,8 +1276,8 @@ describe("public content contract", () => {
     const html = htmlVisibleText(renderDocumentationHtml("/docs/status/"));
     const claims = [
       "Optional full local-data removal",
-      "hra auth delete --acknowledge-erasure",
-      "hra account logout <profile>",
+      "oompa auth delete --acknowledge-erasure",
+      "oompa account logout <profile>",
       "data.running",
       "$HOME/Library/Application Support/HRA Control Plane v1",
       "$HOME/.local/state/hra-control-plane-v1",
@@ -1269,7 +1327,7 @@ describe("public content contract", () => {
     }
     for (const [status, meaning] of statuses) {
       expect(markdown).toContain(`- \`${status}\`: ${meaning}`);
-      const codes = [...parseHTML(html).document.querySelectorAll("li > code.hra-inline-code")]
+      const codes = [...parseHTML(html).document.querySelectorAll("li > code.oompa-inline-code")]
         .filter((code) => code.textContent === status && code.parentElement?.textContent === `${status}: ${meaning}`);
       expect(codes).toHaveLength(1);
       expectCompiledClasses(codes[0]!);
@@ -1289,7 +1347,7 @@ describe("public content contract", () => {
   test("contains JSON-LD, owned appearance bootstrap, and one owned analytics module on public pages", () => {
     const html = renderSiteHtml();
     const privacy = renderPrivacyHtml();
-    expect(html).toContain('<link rel="canonical" href="https://hra.sh/">');
+    expect(html).toContain('<link rel="canonical" href="https://oompa.dev/">');
     expect(html).toContain('<meta property="og:type" content="website">');
     expect(html).toContain('<link rel="stylesheet" href="/styles.css">');
     expect(html).toContain('<script type="application/ld+json">');
@@ -1297,17 +1355,17 @@ describe("public content contract", () => {
     expect(html.match(/<script[^>]+src=/gu)).toHaveLength(3);
     expect(html).toContain('<script src="/site.js" type="module"></script>');
     expect(html).toContain('<script src="/appearance.js"></script>');
-    expect(html).toContain(renderHraAnalyticsScript());
-    expect(privacy).toContain(renderHraAnalyticsScript());
-    expect(renderPreviewHtml()).not.toContain(renderHraAnalyticsScript());
+    expect(html).toContain(renderOompaAnalyticsScript());
+    expect(privacy).toContain(renderOompaAnalyticsScript());
+    expect(renderPreviewHtml()).not.toContain(renderOompaAnalyticsScript());
     expect(html).not.toContain("onclick=");
     for (const page of docsPages) {
       const document = parseHTML(renderDocsHtml(page)).document;
-      expect(document.querySelector('link[rel="canonical"]')?.getAttribute("href")).toBe(`https://hra.sh${page.path}`);
+      expect(document.querySelector('link[rel="canonical"]')?.getAttribute("href")).toBe(`https://oompa.dev${page.path}`);
       expect([...document.querySelectorAll("script[src]")].map((script) => script.getAttribute("src"))).toEqual(["/appearance.js", "/analytics.js", "/site.js"]);
       expect(document.documentElement.getAttribute("data-palette")).toBe("catppuccin");
       expect(document.documentElement.getAttribute("data-theme")).toBe("dark");
-      expect(document.querySelectorAll("details[data-hra-appearance]")).toHaveLength(1);
+      expect(document.querySelectorAll("details[data-oompa-appearance]")).toHaveLength(1);
       expect(document.querySelectorAll('script[type="application/ld+json"]')).toHaveLength(1);
     }
   });
@@ -1341,22 +1399,22 @@ describe("public content contract", () => {
     }
   });
 
-  test("renders only the HRA mailing audience when Turnstile is configured", () => {
+  test("renders only the Oompa mailing audience when Turnstile is configured", () => {
     const sitekey = "1x00000000000000000000AA";
-    expect(hraMailingListConfig({
-      [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: sitekey,
+    expect(oompaMailingListConfig({
+      [OOMPA_MAILING_TURNSTILE_SITEKEY_ENV]: sitekey,
     })).toEqual({
       audience: "hra",
       kind: "signup",
       turnstileSitekey: sitekey,
     });
-    expect(hraMailingListConfig({})).toEqual({ kind: "none" });
-    expect(hraMailingListConfig({
-      [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: "",
+    expect(oompaMailingListConfig({})).toEqual({ kind: "none" });
+    expect(oompaMailingListConfig({
+      [OOMPA_MAILING_TURNSTILE_SITEKEY_ENV]: "",
     })).toEqual({ kind: "none" });
 
-    const footer = renderHraSiteFooter({
-      [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: sitekey,
+    const footer = renderOompaSiteFooter({
+      [OOMPA_MAILING_TURNSTILE_SITEKEY_ENV]: sitekey,
     });
     expect(footer).toContain('data-mailing-list="signup"');
     expect(footer).toContain('name="audience" type="hidden" value="hra"');
@@ -1371,16 +1429,16 @@ describe("public content contract", () => {
   });
 
   test("fails production closed on missing or malformed Turnstile configuration", () => {
-    expect(hraMailingListConfig({ VERCEL_ENV: "preview" }))
+    expect(oompaMailingListConfig({ VERCEL_ENV: "preview" }))
       .toEqual({ kind: "none" });
     for (const turnstileSitekey of [undefined, ""]) {
       expect(() => {
-        hraMailingListConfig({
-          [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: turnstileSitekey,
+        oompaMailingListConfig({
+          [OOMPA_MAILING_TURNSTILE_SITEKEY_ENV]: turnstileSitekey,
           VERCEL_ENV: "production",
         });
       })
-        .toThrow(HRA_MAILING_TURNSTILE_SITEKEY_ENV);
+        .toThrow(OOMPA_MAILING_TURNSTILE_SITEKEY_ENV);
     }
     for (const turnstileSitekey of [
       "too-short",
@@ -1388,11 +1446,11 @@ describe("public content contract", () => {
       "x".repeat(101),
     ]) {
       expect(() => {
-        hraMailingListConfig({
-          [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: turnstileSitekey,
+        oompaMailingListConfig({
+          [OOMPA_MAILING_TURNSTILE_SITEKEY_ENV]: turnstileSitekey,
         });
       })
-        .toThrow(HRA_MAILING_TURNSTILE_SITEKEY_ENV);
+        .toThrow(OOMPA_MAILING_TURNSTILE_SITEKEY_ENV);
     }
   });
 
@@ -1400,7 +1458,7 @@ describe("public content contract", () => {
     const preview = renderPreviewHtml();
     expectCompiledClasses(oneElement(preview, "body.preview-page"));
     expect(preview).toContain('<meta name="robots" content="noindex, nofollow">');
-    expect(preview).toContain('<link rel="canonical" href="https://hra.sh/">');
+    expect(preview).toContain('<link rel="canonical" href="https://oompa.dev/">');
     const title = oneElement(preview, "h1#preview-title");
     expect(title.textContent).toBe(publicContent.productName);
     expectCompiledClasses(title);
@@ -1440,7 +1498,6 @@ describe("public content contract", () => {
     const publicDocuments = [
       renderSiteHtml(),
       renderLlmsText(),
-      renderReadmeMarkdown(),
       renderSitemapXml(),
     ];
 
@@ -1459,8 +1516,8 @@ describe("public content contract", () => {
     const memory = await readFile(new URL("../docs/facts-memory.md", import.meta.url), "utf8");
     const backup = memory.split("### Backup, restore, and rollback\n")[1]?.split("\n## ")[0];
     expect(backup).toBeDefined();
-    expect(backup).toContain("Run `hra daemon stop --json` and require that command itself to exit zero before taking or restoring a snapshot");
-    expect(backup).toContain("`hra daemon status --json` reporting `data.running: false` is only a secondary no-listener check");
+    expect(backup).toContain("Run `oompa daemon stop --json` and require that command itself to exit zero before taking or restoring a snapshot");
+    expect(backup).toContain("`oompa daemon status --json` reporting `data.running: false` is only a secondary no-listener check");
     expect(backup).toContain("Stop on any stop or recovery error");
     expect(backup).toContain("complete private state root at one filesystem checkpoint");
   });

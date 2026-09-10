@@ -1,7 +1,7 @@
 /*
  * Autorespond policy for brokered provider approvals.
  *
- * When a session runs in `auto:all`, HRA answers command and permission
+ * When a session runs in `auto:all`, Oompa answers command and permission
  * approvals immediately with the accept decision at `once` scope.
  * `auto:workspace` remains fail-closed until adapters can attest exact private
  * authority against a bound project root. File changes, questions, and MCP

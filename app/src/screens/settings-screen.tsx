@@ -39,7 +39,7 @@ import {
   type DeviceCommandResultPayload,
   type RemoteCommandPayload,
   type SupportedPreset,
-} from "../hra/cloud";
+} from "../oompa/cloud";
 import { formatRelativeTime, formatUtcDay } from "../model/relative-time";
 import {
   accountLoginStartCommand,
@@ -416,7 +416,7 @@ function MachineCard({
             {machine.online ? "online" : "offline"}
           </Badge>
         )}
-        description={`hra ${machine.daemonVersion}, heartbeat ${formatRelativeTime(machine.heartbeatAt, now)}`}
+        description={`oompa ${machine.daemonVersion}, heartbeat ${formatRelativeTime(machine.heartbeatAt, now)}`}
         title={machine.label}
       >
         {target === null ? (
@@ -457,7 +457,7 @@ function MachineCard({
         <p {...stylex.props(styles.quiet)}>
           Read-only here. This local opt-in does not by itself activate hosted delivery.
         </p>
-        <CommandHint>hra notification-email status</CommandHint>
+        <CommandHint>oompa notification-email status</CommandHint>
       </SettingsRow>
 
       <SettingsRow
@@ -502,7 +502,7 @@ function MachineCard({
       {machine.sessionAdoption === null ? (
         <SettingsRow
           control={<Badge tone="neutral">unavailable</Badge>}
-          description="Update HRA on this machine to publish its local adoption status."
+          description="Update Oompa on this machine to publish its local adoption status."
           title="Personal sessions"
         />
       ) : personalSessionProviders.map(({ label, provider }) => {
@@ -516,7 +516,7 @@ function MachineCard({
                 {adoption.enabled ? "enabled" : "off"}
               </Badge>
             )}
-            description={`${adoption.pending} pending, ${adoption.adopted} adopted, and ${adoption.fenced} fenced. ${adoption.enabled ? "New discovery is enabled." : "Disabling discovery does not change sessions already under HRA control."}`}
+            description={`${adoption.pending} pending, ${adoption.adopted} adopted, and ${adoption.fenced} fenced. ${adoption.enabled ? "New discovery is enabled." : "Disabling discovery does not change sessions already under Oompa control."}`}
             key={provider}
             title={`${label} personal sessions`}
           >
@@ -569,7 +569,7 @@ export function MemorySupervision({ machines, now, ready }: Readonly<{
   });
   return (
     <SettingsSection
-      description="Read-only encrypted observations from each daemon: up to 100 spaces, 200 peer policies, 50 recently updated peer actions, and 32 recent record keys per space. This bounded view is not an audit log, and HRA never chooses a winning head here."
+      description="Read-only encrypted observations from each daemon: up to 100 spaces, 200 peer policies, 50 recently updated peer actions, and 32 recent record keys per space. This bounded view is not an audit log, and Oompa never chooses a winning head here."
       title="Memory and peer activity"
     >
       {machines.length === 0 ? <SettingsCard><EmptyRow>No daemon summaries are available.</EmptyRow></SettingsCard> : null}
@@ -817,9 +817,9 @@ export function AccountRow({
   const activeCommand = useRef<string | null>(null);
   const mounted = useRef(true);
   const localLoginCommand = account.provider === "codex"
-    ? `hra account login ${account.publicId}`
-    : `hra account login ${account.publicId} --provider ${account.provider}`;
-  const lostHandoffInstruction = `Check status first. If a login is still pending and you cannot finish it, run \`hra account login-cancel ${account.publicId}\` on ${account.machineLabel} before linking again.`;
+    ? `oompa account login ${account.publicId}`
+    : `oompa account login ${account.publicId} --provider ${account.provider}`;
+  const lostHandoffInstruction = `Check status first. If a login is still pending and you cannot finish it, run \`oompa account login-cancel ${account.publicId}\` on ${account.machineLabel} before linking again.`;
   const busy = loginAction.phase !== "idle";
 
   const updateLoginAction = useCallback((next: AccountLoginActionState) => {
@@ -883,7 +883,7 @@ export function AccountRow({
       .then((result) => {
         if (!mounted.current || activeCommand.current !== command.publicId) return;
         if (result === null) {
-          setStatus(`No login handoff was available. It expired, was already read, or requires an HRA update on the machine. ${lostHandoffInstruction}`);
+          setStatus(`No login handoff was available. It expired, was already read, or requires an Oompa update on the machine. ${lostHandoffInstruction}`);
           releaseLoginHandoff(command.publicId);
           return;
         }
@@ -893,7 +893,7 @@ export function AccountRow({
         ) {
           setRelay(result);
         } else if (result.kind === "account_login_start") {
-          setStatus("The machine returned a legacy login handoff. Update HRA on the machine before trying again.");
+          setStatus("The machine returned a legacy login handoff. Update Oompa on the machine before trying again.");
         }
         releaseLoginHandoff(command.publicId);
       })
@@ -911,7 +911,7 @@ export function AccountRow({
             `The one-time login handoff was consumed but could not be read. Unlock this browser again. ${lostHandoffInstruction}`,
           );
         } else {
-          setStatus("The machine returned an incompatible login handoff. Update HRA on the machine before trying again.");
+          setStatus("The machine returned an incompatible login handoff. Update Oompa on the machine before trying again.");
         }
         releaseLoginHandoff(command.publicId);
       });
@@ -931,7 +931,7 @@ export function AccountRow({
       if (consumedCommand.current === command.publicId) return;
       setStatus(command.resultSingleUse
         ? `No login handoff was available. It expired or was already read. ${lostHandoffInstruction}`
-        : "The machine returned a legacy login handoff. Update HRA on the machine before trying again.");
+        : "The machine returned a legacy login handoff. Update Oompa on the machine before trying again.");
     }
     releaseLoginHandoff(command.publicId);
   }, [command, lostHandoffInstruction, releaseLoginHandoff]);
@@ -976,7 +976,7 @@ export function AccountRow({
       .then((result) => {
         if (!mounted.current || activeCommand.current !== command.publicId) return;
         if (result.kind !== "account_login_status") {
-          setStatus("The machine returned an incompatible login status. Update HRA on the machine before trying again.");
+          setStatus("The machine returned an incompatible login status. Update Oompa on the machine before trying again.");
           return;
         }
         if (result.status !== "pending") setRelay(null);
@@ -1122,7 +1122,7 @@ function DeviceRow({ device, now }: Readonly<{ device: DeviceView; now: number }
     >
       {device.status === "revoked"
         ? null
-        : <CommandHint>{`hra device revoke ${device.publicId}`}</CommandHint>}
+        : <CommandHint>{`oompa device revoke ${device.publicId}`}</CommandHint>}
     </SettingsRow>
   );
 }
@@ -1175,7 +1175,7 @@ export function SettingsScreen({ onBack }: Readonly<{ onBack: () => void }>) {
           {!registries.loading && registries.machines.length === 0 ? (
             <SettingsCard>
               <EmptyRow>
-                No machine has published its settings yet. Run hra on a machine and let it sync
+                No machine has published its settings yet. Run oompa on a machine and let it sync
                 once.
               </EmptyRow>
             </SettingsCard>
@@ -1269,19 +1269,19 @@ export function SettingsScreen({ onBack }: Readonly<{ onBack: () => void }>) {
               description="Relaying a login link to this browser is off until a machine opts in."
               title="Allow linking from the browser"
             >
-              <CommandHint>hra remote allow account-linking</CommandHint>
+              <CommandHint>oompa remote allow account-linking</CommandHint>
             </SettingsRow>
             <SettingsRow
               description="Codex and Claude sign in on the machine that owns their isolated provider home."
               title="Link an account from the machine"
             >
-              <CommandHint>hra account login &lt;profile&gt; [--provider &lt;provider&gt;]</CommandHint>
+              <CommandHint>oompa account login &lt;profile&gt; [--provider &lt;provider&gt;]</CommandHint>
             </SettingsRow>
           </SettingsCard>
         </SettingsSection>
 
         <SettingsSection
-          description="A browser device cannot administer the account, so revoke from a machine with hra installed."
+          description="A browser device cannot administer the account, so revoke from a machine with oompa installed."
           title="Devices"
         >
           <SettingsCard>

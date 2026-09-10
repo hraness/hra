@@ -1,7 +1,7 @@
 type JsonRecord = Record<string, unknown>;
 
 const schema = "https://hra.hraness.com/release-identity/v1";
-const repository = "hraness/hra";
+const repository = "hraness/oompa";
 const repositoryId = "1343008607";
 const sha = /^[0-9a-f]{40}$/u;
 const positiveDecimal = /^[1-9][0-9]*$/u;

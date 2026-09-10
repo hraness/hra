@@ -7,7 +7,7 @@ import Ajv2020 from "ajv/dist/2020.js";
 
 import { sessionTranscriptSchema, TRANSCRIPT_SEED_HEADER } from "./transcript";
 import {
-  hraTrajectoryExportContextSchema,
+  oompaTrajectoryExportContextSchema,
   TRAJECTORY_EMPTY_ASSISTANT_CONTENT,
   TRAJECTORY_SCHEMA_ID,
   trajectoryRecordSchema,
@@ -35,7 +35,7 @@ describe("trajectory v1 export", () => {
     expect(trajectoryV1Schema.$id).toBe(TRAJECTORY_SCHEMA_ID);
   });
 
-  test("validates every HRA mapping against the pinned upstream schema", () => {
+  test("validates every Oompa mapping against the pinned upstream schema", () => {
     const transcript = sessionTranscriptSchema.parse({
       version: 1,
       sessionId,
@@ -125,11 +125,11 @@ describe("trajectory v1 export", () => {
       .toBe(true);
     expect(() => validateTranscript(document, { partial: true })).not.toThrow();
 
-    expect(document[0]).toEqual({ role: "meta", source: "hra" });
+    expect(document[0]).toEqual({ role: "meta", source: "oompa" });
     const contextRecord = document[1];
-    if (contextRecord?.role !== "observation") throw new Error("Expected the HRA export context observation.");
+    if (contextRecord?.role !== "observation") throw new Error("Expected the Oompa export context observation.");
     expect(contextRecord.timestamp).toBe(isoTimestamp);
-    expect(hraTrajectoryExportContextSchema.parse(JSON.parse(contextRecord.content))).toEqual({
+    expect(oompaTrajectoryExportContextSchema.parse(JSON.parse(contextRecord.content))).toEqual({
       hra_export_context: 1,
       session_id: sessionId,
       provider: "claude",
@@ -223,11 +223,11 @@ describe("trajectory v1 export", () => {
     const document = transcriptToTrajectory({ transcript, provider: "codex", createdAt: timestamp });
     const users = document.filter((record) => record.role === "user");
     expect(users.map((record) => record.content)).toEqual([
-      `[hra human] ${TRANSCRIPT_SEED_HEADER}\nhuman text`,
-      `[hra automation] ${TRANSCRIPT_SEED_HEADER}\nautomation text`,
-      `[hra autorespond] ${TRANSCRIPT_SEED_HEADER}\nautorespond text`,
+      `[oompa human] ${TRANSCRIPT_SEED_HEADER}\nhuman text`,
+      `[oompa automation] ${TRANSCRIPT_SEED_HEADER}\nautomation text`,
+      `[oompa autorespond] ${TRANSCRIPT_SEED_HEADER}\nautorespond text`,
       `${TRANSCRIPT_SEED_HEADER}\nreal handoff`,
-      "[hra provider handoff] header was unavailable",
+      "[oompa provider handoff] header was unavailable",
     ]);
     expect(() => validateTranscript(document, { partial: true })).not.toThrow();
   });
@@ -292,7 +292,7 @@ describe("trajectory v1 export", () => {
       createdAt: timestamp,
     })[2]).toMatchObject({
       role: "user",
-      content: "[hra peer session] Review this invariant.",
+      content: "[oompa peer session] Review this invariant.",
     });
   });
 
@@ -371,7 +371,7 @@ describe("trajectory v1 export", () => {
     expect(() => trajectoryRecordSchema.parse({
       type: "meta",
       version: 1,
-      source: "hra",
+      source: "oompa",
     })).toThrow();
     expect(() => trajectoryRecordSchema.parse({
       role: "assistant",

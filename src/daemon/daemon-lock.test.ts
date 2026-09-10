@@ -16,14 +16,14 @@ import {
 } from "./daemon-lock";
 
 async function pathsFixture() {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-lock-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-lock-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   return paths;
 }
 
 async function receiptObservationFixture() {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-receipt-observation-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-receipt-observation-")));
   const paths = resolveStatePaths({ rootDirectory: root });
   await initializeStatePaths(paths);
   return paths;

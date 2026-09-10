@@ -1,6 +1,6 @@
 # Contents
 
-- `schema.ts` defines HRA cloud identity, device, envelope, projection, lease, command, and retention state.
+- `schema.ts` defines Oompa cloud identity, device, envelope, projection, lease, command, and retention state.
 - Auth modules implement verified-email login and device enrollment.
 - Sync and command modules authorize exact device and lease generations. Session commands are lease-fenced; device commands are addressed to a device and fenced by that daemon's boot authority instead.
 - Tests prove rate limits, transactions, encryption boundaries, recovery, and retention.

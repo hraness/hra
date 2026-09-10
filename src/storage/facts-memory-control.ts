@@ -36,18 +36,23 @@ const lifecycleStateSchema = z.enum([
 ]);
 const createKindSchema = z.enum(["create", "fork"]);
 export const factsMemoryCleanupReasonSchema = z.enum(["abandon", "archive", "expired"]);
+const storedFactsMemoryCleanupReasonSchema = z.enum([
+  ...factsMemoryCleanupReasonSchema.options,
+  "provider_switch",
+]);
 const operationKeySchema = z.string().min(1).max(200);
 const epochSchema = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const sequenceSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 
 export type FactsMemoryCleanupReason = z.infer<typeof factsMemoryCleanupReasonSchema>;
+export type StoredFactsMemoryCleanupReason = z.infer<typeof storedFactsMemoryCleanupReasonSchema>;
 export type FactsMemoryLifecycleState = z.infer<typeof lifecycleStateSchema>;
 export type LegacyFactsMemoryHead = Readonly<{ digest: string; sequence: number }>;
 
 export type FactsMemoryControlRecord = Readonly<{
   binding: FactsMemoryBinding;
   cleanupOperationKey: string | null;
-  cleanupReason: FactsMemoryCleanupReason | null;
+  cleanupReason: StoredFactsMemoryCleanupReason | null;
   cleanupReceiptDigest: string | null;
   createKind: "create" | "fork";
   createOperationKey: string;
@@ -59,6 +64,9 @@ export type FactsMemoryControlRecord = Readonly<{
   legacyHead: LegacyFactsMemoryHead | null;
   legacyParentHead: LegacyFactsMemoryHead | null;
   parent: FactsMemoryCheckpoint | null;
+  ownerTransferFromId: string | null;
+  ownerTransferOperationKey: string | null;
+  ownerTransferToId: string | null;
   priorPurgeChainDigest: string | null;
   purgedAt: number | null;
   revision: number;
@@ -70,7 +78,7 @@ export type FactsMemoryControlRecord = Readonly<{
 const rowSchema = z.object({
   binding_digest: factsMemoryDigestSchema,
   cleanup_operation_key: z.string().min(1).max(200).nullable(),
-  cleanup_reason: factsMemoryCleanupReasonSchema.nullable(),
+  cleanup_reason: storedFactsMemoryCleanupReasonSchema.nullable(),
   cleanup_receipt_digest: factsMemoryDigestSchema.nullable(),
   create_kind: createKindSchema,
   create_operation_key: z.string().min(1).max(200),
@@ -87,6 +95,9 @@ const rowSchema = z.object({
   legacy_parent_head_digest: factsMemoryDigestSchema.nullable(),
   legacy_parent_head_sequence: sequenceSchema.nullable(),
   owner_id: profileIdSchema,
+  owner_transfer_from_id: profileIdSchema.nullable(),
+  owner_transfer_operation_key: operationKeySchema.nullable(),
+  owner_transfer_to_id: profileIdSchema.nullable(),
   parent_binding_digest: factsMemoryDigestSchema.nullable(),
   parent_epoch: epochSchema.nullable(),
   parent_head_digest: factsMemoryDigestSchema.nullable(),
@@ -139,7 +150,24 @@ const lifecycleColumns = [
   "revision",
   "created_at",
   "updated_at",
+  "owner_transfer_from_id",
+  "owner_transfer_to_id",
+  "owner_transfer_operation_key",
 ] as const;
+const ownerTransferTransitionColumns = new Set<(typeof lifecycleColumns)[number]>([
+  "state",
+  "cleanup_reason",
+  "cleanup_operation_key",
+  "revision",
+  "updated_at",
+  "owner_transfer_from_id",
+  "owner_transfer_to_id",
+  "owner_transfer_operation_key",
+]);
+const ownerTransferStableEvidenceSql = lifecycleColumns
+  .filter((column) => !ownerTransferTransitionColumns.has(column))
+  .map((column) => `NEW.${column} IS OLD.${column}`)
+  .join("\n    AND ");
 
 const digestParts = (domain: string, parts: readonly string[]): string => {
   const digest = createHash("sha256");
@@ -194,7 +222,7 @@ CREATE TABLE IF NOT EXISTS facts_memory_lifecycles (
   store_created_at INTEGER,
   create_receipt_digest TEXT,
   expires_at INTEGER NOT NULL CHECK(expires_at>=0),
-  cleanup_reason TEXT CHECK(cleanup_reason IN ('abandon','archive','expired')),
+  cleanup_reason TEXT CHECK(cleanup_reason IN ('abandon','archive','expired','provider_switch')),
   cleanup_operation_key TEXT UNIQUE,
   cleanup_receipt_digest TEXT,
   purged_at INTEGER,
@@ -202,6 +230,9 @@ CREATE TABLE IF NOT EXISTS facts_memory_lifecycles (
   revision INTEGER NOT NULL CHECK(revision>0),
   created_at INTEGER NOT NULL CHECK(created_at>=0),
   updated_at INTEGER NOT NULL CHECK(updated_at>=created_at),
+  owner_transfer_from_id TEXT,
+  owner_transfer_to_id TEXT,
+  owner_transfer_operation_key TEXT UNIQUE,
   CHECK(
     (create_kind='create' AND parent_session_id IS NULL AND parent_epoch IS NULL AND parent_owner_id IS NULL AND parent_binding_digest IS NULL AND parent_head_sequence IS NULL AND parent_head_operation_sha256 IS NULL AND parent_head_digest IS NULL AND legacy_parent_head_sequence IS NULL AND legacy_parent_head_digest IS NULL)
     OR
@@ -225,7 +256,27 @@ CREATE TABLE IF NOT EXISTS facts_memory_lifecycles (
   ),
   CHECK(state!='active' OR handle_hash IS NOT NULL),
   CHECK(state!='purged' OR (cleanup_receipt_digest IS NOT NULL AND purged_at IS NOT NULL)),
-  CHECK(prior_purge_chain_digest IS NULL OR length(prior_purge_chain_digest)=64)
+  CHECK(prior_purge_chain_digest IS NULL OR length(prior_purge_chain_digest)=64),
+  CHECK(
+    (owner_transfer_from_id IS NULL AND owner_transfer_to_id IS NULL AND owner_transfer_operation_key IS NULL)
+    OR
+    (
+      owner_transfer_from_id GLOB 'acct_[0-9a-f]*' AND length(owner_transfer_from_id)=37
+      AND owner_transfer_to_id GLOB 'acct_[0-9a-f]*' AND length(owner_transfer_to_id)=37
+      AND owner_transfer_from_id<>owner_transfer_to_id
+      AND length(owner_transfer_operation_key) BETWEEN 1 AND 200
+      AND owner_transfer_operation_key<>create_operation_key
+      AND (
+        (
+          owner_id=owner_transfer_from_id AND state IN ('cleanup_pending','purged')
+          AND cleanup_reason='provider_switch'
+          AND cleanup_operation_key=owner_transfer_operation_key
+        )
+        OR
+        (owner_id=owner_transfer_to_id AND create_kind='create')
+      )
+    )
+  )
 ) STRICT;
 CREATE INDEX IF NOT EXISTS facts_memory_expiry
   ON facts_memory_lifecycles(expires_at,session_id)
@@ -236,15 +287,77 @@ BEFORE UPDATE OF session_id,epoch,owner_id,binding_digest,create_kind,create_ope
   parent_head_operation_sha256,parent_head_digest,legacy_parent_head_sequence,legacy_parent_head_digest
 ON facts_memory_lifecycles
 WHEN NOT (
-  OLD.state='purged' AND OLD.cleanup_reason='expired'
-  AND NEW.session_id=OLD.session_id AND NEW.owner_id=OLD.owner_id AND NEW.epoch=OLD.epoch+1
-  AND NEW.create_kind='create' AND NEW.parent_session_id IS NULL AND NEW.parent_epoch IS NULL
-  AND NEW.parent_owner_id IS NULL AND NEW.parent_binding_digest IS NULL
-  AND NEW.parent_head_sequence IS NULL AND NEW.parent_head_operation_sha256 IS NULL
-  AND NEW.parent_head_digest IS NULL AND NEW.legacy_parent_head_sequence IS NULL
-  AND NEW.legacy_parent_head_digest IS NULL
+  (
+    OLD.state='purged' AND OLD.cleanup_reason='expired'
+    AND NEW.session_id=OLD.session_id AND NEW.owner_id=OLD.owner_id AND NEW.epoch=OLD.epoch+1
+    AND NEW.create_kind='create' AND NEW.parent_session_id IS NULL AND NEW.parent_epoch IS NULL
+    AND NEW.parent_owner_id IS NULL AND NEW.parent_binding_digest IS NULL
+    AND NEW.parent_head_sequence IS NULL AND NEW.parent_head_operation_sha256 IS NULL
+    AND NEW.parent_head_digest IS NULL AND NEW.legacy_parent_head_sequence IS NULL
+    AND NEW.legacy_parent_head_digest IS NULL AND NEW.state='reserved'
+    AND NEW.handle_hash IS NULL AND NEW.head_sequence IS NULL
+    AND NEW.head_operation_sha256 IS NULL AND NEW.head_digest IS NULL
+    AND NEW.legacy_head_sequence IS NULL AND NEW.legacy_head_digest IS NULL
+    AND NEW.store_created_at IS NULL AND NEW.create_receipt_digest IS NULL
+    AND NEW.cleanup_reason IS NULL AND NEW.cleanup_operation_key IS NULL
+    AND NEW.cleanup_receipt_digest IS NULL AND NEW.purged_at IS NULL
+    AND NEW.owner_transfer_from_id IS OLD.owner_transfer_from_id
+    AND NEW.owner_transfer_to_id IS OLD.owner_transfer_to_id
+    AND NEW.owner_transfer_operation_key IS OLD.owner_transfer_operation_key
+  )
+  OR
+  (
+    OLD.state='purged' AND OLD.cleanup_reason='provider_switch'
+    AND OLD.cleanup_operation_key=OLD.owner_transfer_operation_key
+    AND OLD.owner_id=OLD.owner_transfer_from_id
+    AND OLD.owner_transfer_to_id IS NOT NULL
+    AND NEW.session_id=OLD.session_id AND NEW.epoch=OLD.epoch+1
+    AND NEW.owner_id=OLD.owner_transfer_to_id
+    AND NEW.owner_transfer_from_id=OLD.owner_transfer_from_id
+    AND NEW.owner_transfer_to_id=OLD.owner_transfer_to_id
+    AND NEW.owner_transfer_operation_key=OLD.owner_transfer_operation_key
+    AND NEW.create_kind='create' AND NEW.parent_session_id IS NULL AND NEW.parent_epoch IS NULL
+    AND NEW.parent_owner_id IS NULL AND NEW.parent_binding_digest IS NULL
+    AND NEW.parent_head_sequence IS NULL AND NEW.parent_head_operation_sha256 IS NULL
+    AND NEW.parent_head_digest IS NULL AND NEW.legacy_parent_head_sequence IS NULL
+    AND NEW.legacy_parent_head_digest IS NULL AND NEW.state='reserved'
+    AND NEW.handle_hash IS NULL AND NEW.head_sequence IS NULL
+    AND NEW.head_operation_sha256 IS NULL AND NEW.head_digest IS NULL
+    AND NEW.legacy_head_sequence IS NULL AND NEW.legacy_head_digest IS NULL
+    AND NEW.store_created_at IS NULL AND NEW.create_receipt_digest IS NULL
+    AND NEW.cleanup_reason IS NULL AND NEW.cleanup_operation_key IS NULL
+    AND NEW.cleanup_receipt_digest IS NULL AND NEW.purged_at IS NULL
+    AND length(NEW.prior_purge_chain_digest)=64
+  )
 )
 BEGIN SELECT RAISE(ABORT,'facts memory identity is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS facts_memory_owner_transfer_provenance_guard
+BEFORE UPDATE OF owner_transfer_from_id,owner_transfer_to_id,owner_transfer_operation_key
+ON facts_memory_lifecycles
+WHEN NOT (
+  (
+    OLD.state NOT IN ('cleanup_pending','purged')
+    AND OLD.cleanup_reason IS NULL AND OLD.cleanup_operation_key IS NULL
+    AND NEW.state='cleanup_pending' AND NEW.cleanup_reason='provider_switch'
+    AND NEW.cleanup_operation_key=NEW.owner_transfer_operation_key
+    AND NEW.owner_transfer_from_id=OLD.owner_id
+    AND NEW.owner_transfer_to_id<>OLD.owner_id
+    AND NEW.revision=OLD.revision+1 AND NEW.updated_at>=OLD.updated_at
+    AND ${ownerTransferStableEvidenceSql}
+  )
+  OR
+  (
+    OLD.state='purged' AND OLD.cleanup_reason='expired'
+    AND OLD.cleanup_receipt_digest IS NOT NULL AND OLD.purged_at IS NOT NULL
+    AND NEW.state='purged' AND NEW.cleanup_reason='provider_switch'
+    AND NEW.cleanup_operation_key=NEW.owner_transfer_operation_key
+    AND NEW.owner_transfer_from_id=OLD.owner_id
+    AND NEW.owner_transfer_to_id<>OLD.owner_id
+    AND NEW.revision=OLD.revision+1 AND NEW.updated_at>=OLD.updated_at
+    AND ${ownerTransferStableEvidenceSql}
+  )
+)
+BEGIN SELECT RAISE(ABORT,'facts memory owner transfer provenance is immutable'); END;
 `;
 
 const isSqliteUniqueConstraint = (error: unknown): boolean =>
@@ -260,10 +373,16 @@ const assertControlSchema = (database: Database): void => {
   const tables = database.query(
     "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
   ).all().map((row) => schemaNameRowSchema.parse(row).name);
+  const triggers = database.query(
+    "SELECT name FROM sqlite_schema WHERE type='trigger' ORDER BY name",
+  ).all().map((row) => schemaNameRowSchema.parse(row).name);
   const columns = readSchemaColumns(database);
   if (
     tables.length !== 1
     || tables[0] !== "facts_memory_lifecycles"
+    || triggers.length !== 2
+    || triggers[0] !== "facts_memory_identity_immutable"
+    || triggers[1] !== "facts_memory_owner_transfer_provenance_guard"
     || columns.some((column, index) => lifecycleColumns[index] !== column)
     || columns.length !== lifecycleColumns.length
   ) throw new Error("FACTS_MEMORY_CONTROL_SCHEMA_UNEXPECTED");
@@ -332,6 +451,9 @@ const mapRow = (value: unknown): FactsMemoryControlRecord => {
       row.legacy_parent_head_digest,
     ),
     parent,
+    ownerTransferFromId: row.owner_transfer_from_id,
+    ownerTransferOperationKey: row.owner_transfer_operation_key,
+    ownerTransferToId: row.owner_transfer_to_id,
     priorPurgeChainDigest: row.prior_purge_chain_digest,
     purgedAt: row.purged_at,
     revision: row.revision,
@@ -395,6 +517,33 @@ const migrateV1 = (database: Database): void => {
   `);
 };
 
+const migrateV2 = (database: Database): void => {
+  database.exec(`
+    DROP TRIGGER IF EXISTS facts_memory_identity_immutable;
+    DROP INDEX IF EXISTS facts_memory_expiry;
+    ALTER TABLE facts_memory_lifecycles RENAME TO facts_memory_lifecycles_v2;
+    ${schemaSql}
+    INSERT INTO facts_memory_lifecycles(
+      session_id,epoch,owner_id,binding_digest,create_kind,create_operation_key,
+      parent_session_id,parent_epoch,parent_owner_id,parent_binding_digest,parent_head_sequence,
+      parent_head_operation_sha256,parent_head_digest,legacy_parent_head_sequence,
+      legacy_parent_head_digest,state,handle_hash,head_sequence,head_operation_sha256,head_digest,
+      legacy_head_sequence,legacy_head_digest,store_created_at,create_receipt_digest,expires_at,
+      cleanup_reason,cleanup_operation_key,cleanup_receipt_digest,purged_at,prior_purge_chain_digest,
+      revision,created_at,updated_at
+    )
+    SELECT session_id,epoch,owner_id,binding_digest,create_kind,create_operation_key,
+      parent_session_id,parent_epoch,parent_owner_id,parent_binding_digest,parent_head_sequence,
+      parent_head_operation_sha256,parent_head_digest,legacy_parent_head_sequence,
+      legacy_parent_head_digest,state,handle_hash,head_sequence,head_operation_sha256,head_digest,
+      legacy_head_sequence,legacy_head_digest,store_created_at,create_receipt_digest,expires_at,
+      cleanup_reason,cleanup_operation_key,cleanup_receipt_digest,purged_at,prior_purge_chain_digest,
+      revision,created_at,updated_at
+    FROM facts_memory_lifecycles_v2;
+    DROP TABLE facts_memory_lifecycles_v2;
+  `);
+};
+
 export class FactsMemoryControlStore {
   readonly #database: Database;
   readonly #now: () => number;
@@ -432,12 +581,17 @@ export class FactsMemoryControlStore {
     try {
       this.#database.exec("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;");
       const version = schemaVersionRowSchema.parse(this.#database.query("PRAGMA user_version").get()).user_version;
-      if (version > 2) throw new Error("FACTS_MEMORY_CONTROL_VERSION_UNSUPPORTED");
+      if (version > 3) throw new Error("FACTS_MEMORY_CONTROL_VERSION_UNSUPPORTED");
       this.#database.transaction(() => {
+        // v3 owns this guard and repairs its exact definition on every open.
+        // Older v3 databases therefore gain the expired-purge transfer path
+        // without rewriting any custody row or weakening other transitions.
+        this.#database.exec("DROP TRIGGER IF EXISTS facts_memory_owner_transfer_provenance_guard");
         if (version === 1) migrateV1(this.#database);
+        else if (version === 2) migrateV2(this.#database);
         else this.#database.exec(schemaSql);
         assertControlSchema(this.#database);
-        this.#database.exec("PRAGMA user_version=2");
+        this.#database.exec("PRAGMA user_version=3");
       }).immediate();
       assertPrivateDatabaseFile(path);
     } catch (error) {
@@ -467,6 +621,7 @@ export class FactsMemoryControlStore {
     const binding = factsMemoryBindingSchema.parse(input.binding);
     const createOperationKey = operationKeySchema.parse(input.createOperationKey);
     const expiresAt = unixMillisecondsSchema.parse(input.expiresAt);
+    this.#assertCreateOperationKeyAvailable(createOperationKey, binding.sessionId);
     const parent = input.parent === undefined ? undefined : factsMemoryCheckpointSchema.parse(input.parent);
     if (parent !== undefined && parent.sessionId === binding.sessionId) throw new Error("FACTS_MEMORY_SELF_FORK");
     if (parent !== undefined && parent.ownerId !== binding.ownerId) {
@@ -585,6 +740,292 @@ export class FactsMemoryControlStore {
     return record;
   }
 
+  reserveFreshOwnerTransfer(input: Readonly<{
+    binding: FactsMemoryBinding;
+    createOperationKey: string;
+    expiresAt: number;
+    fromOwnerId: string;
+    operationKey: string;
+  }>): FactsMemoryControlRecord {
+    const binding = factsMemoryBindingSchema.parse(input.binding);
+    const createOperationKey = operationKeySchema.parse(input.createOperationKey);
+    const expiresAt = unixMillisecondsSchema.parse(input.expiresAt);
+    const fromOwnerId = profileIdSchema.parse(input.fromOwnerId);
+    const operationKey = operationKeySchema.parse(input.operationKey);
+    if (binding.epoch !== 1) throw new Error("FACTS_MEMORY_EPOCH_INVALID");
+    if (binding.ownerId === fromOwnerId) throw new Error("FACTS_MEMORY_OWNER_TRANSFER_NOT_REQUIRED");
+    if (operationKey === createOperationKey) throw new Error("FACTS_MEMORY_OPERATION_KEY_REUSED");
+    this.#assertCreateOperationKeyAvailable(createOperationKey, binding.sessionId);
+    const now = unixMillisecondsSchema.parse(this.#now());
+    if (this.get(binding.sessionId) === null) {
+      this.#assertOwnerTransferOperationKeyAvailable(operationKey);
+      try {
+        this.#database.query(
+          `INSERT INTO facts_memory_lifecycles(
+             session_id,epoch,owner_id,binding_digest,create_kind,create_operation_key,
+             state,expires_at,revision,created_at,updated_at,owner_transfer_from_id,
+             owner_transfer_to_id,owner_transfer_operation_key
+           ) VALUES (?,?,?,?,? ,?,'reserved',?,1,?,?,?,?,?)`,
+        ).run(
+          binding.sessionId,
+          binding.epoch,
+          binding.ownerId,
+          binding.bindingDigest,
+          "create",
+          createOperationKey,
+          expiresAt,
+          now,
+          now,
+          fromOwnerId,
+          binding.ownerId,
+          operationKey,
+        );
+      } catch (error: unknown) {
+        if (!isSqliteUniqueConstraint(error)) throw error;
+        if (this.get(binding.sessionId) === null) throw error;
+      }
+    }
+    let record = this.requireOwnerTransferTarget({
+      binding,
+      fromOwnerId,
+      operationKey,
+    });
+    if (record.createKind !== "create" || record.createOperationKey !== createOperationKey) {
+      throw new Error("FACTS_MEMORY_OWNER_TRANSFER_REPLAY_MISMATCH");
+    }
+    record = this.#extendExpiry(record, expiresAt);
+    return record;
+  }
+
+  beginOwnerTransfer(input: Readonly<{
+    binding: FactsMemoryBinding;
+    operationKey: string;
+    toOwnerId: string;
+  }>): FactsMemoryControlRecord {
+    const current = this.requireExact(input.binding);
+    const operationKey = operationKeySchema.parse(input.operationKey);
+    const toOwnerId = profileIdSchema.parse(input.toOwnerId);
+    if (current.binding.ownerId === toOwnerId) {
+      throw new Error("FACTS_MEMORY_OWNER_TRANSFER_NOT_REQUIRED");
+    }
+    if (current.state === "cleanup_pending" || current.state === "purged") {
+      if (
+        current.cleanupReason === "provider_switch"
+        && current.cleanupOperationKey === operationKey
+        && current.ownerTransferFromId === current.binding.ownerId
+        && current.ownerTransferToId === toOwnerId
+        && current.ownerTransferOperationKey === operationKey
+      ) return current;
+      if (current.cleanupReason === "provider_switch") {
+        throw new Error("FACTS_MEMORY_OWNER_TRANSFER_REPLAY_MISMATCH");
+      }
+      throw new Error("FACTS_MEMORY_STORE_RETIRED");
+    }
+    const unresolvedChild = this.#database.query(
+      `SELECT session_id FROM facts_memory_lifecycles
+       WHERE parent_session_id=? AND parent_epoch=?
+         AND state IN ('reserved','creating','create_ambiguous','recovery_required')
+       ORDER BY session_id LIMIT 1`,
+    ).get(current.binding.sessionId, current.binding.epoch);
+    if (unresolvedChild !== null) throw new Error("FACTS_MEMORY_PARENT_REFERENCED");
+    this.#assertOwnerTransferOperationKeyAvailable(operationKey);
+    const changed = this.#database.query(
+      `UPDATE facts_memory_lifecycles SET state='cleanup_pending',cleanup_reason='provider_switch',
+       cleanup_operation_key=?,owner_transfer_from_id=?,owner_transfer_to_id=?,
+       owner_transfer_operation_key=?,revision=revision+1,updated_at=?
+       WHERE session_id=? AND epoch=? AND owner_id=? AND binding_digest=? AND revision=?
+         AND state NOT IN ('cleanup_pending','purged')`,
+    ).run(
+      operationKey,
+      current.binding.ownerId,
+      toOwnerId,
+      operationKey,
+      this.#now(),
+      current.binding.sessionId,
+      current.binding.epoch,
+      current.binding.ownerId,
+      current.binding.bindingDigest,
+      current.revision,
+    );
+    if (changed.changes !== 1) throw new Error("FACTS_MEMORY_OWNER_TRANSFER_CAS_CONFLICT");
+    return this.requireExact(current.binding);
+  }
+
+  adoptExpiredPurgeForOwnerTransfer(input: Readonly<{
+    binding: FactsMemoryBinding;
+    operationKey: string;
+    toOwnerId: string;
+  }>): FactsMemoryControlRecord {
+    const current = this.requireExact(input.binding);
+    const operationKey = operationKeySchema.parse(input.operationKey);
+    const toOwnerId = profileIdSchema.parse(input.toOwnerId);
+    if (current.binding.ownerId === toOwnerId) {
+      throw new Error("FACTS_MEMORY_OWNER_TRANSFER_NOT_REQUIRED");
+    }
+    if (current.cleanupReason === "provider_switch") {
+      if (
+        current.state === "purged"
+        && current.cleanupOperationKey === operationKey
+        && current.ownerTransferFromId === current.binding.ownerId
+        && current.ownerTransferToId === toOwnerId
+        && current.ownerTransferOperationKey === operationKey
+      ) return current;
+      throw new Error("FACTS_MEMORY_OWNER_TRANSFER_REPLAY_MISMATCH");
+    }
+    if (
+      current.state !== "purged"
+      || current.cleanupReason !== "expired"
+      || current.cleanupOperationKey === null
+      || current.cleanupReceiptDigest === null
+      || current.purgedAt === null
+    ) throw new Error("FACTS_MEMORY_STORE_RETIRED");
+    this.#assertOwnerTransferOperationKeyAvailable(operationKey);
+    const changed = this.#database.query(
+      `UPDATE facts_memory_lifecycles SET cleanup_reason='provider_switch',cleanup_operation_key=?,
+       owner_transfer_from_id=?,owner_transfer_to_id=?,owner_transfer_operation_key=?,
+       revision=revision+1,updated_at=?
+       WHERE session_id=? AND epoch=? AND owner_id=? AND binding_digest=? AND revision=?
+         AND state='purged' AND cleanup_reason='expired' AND cleanup_operation_key=?
+         AND cleanup_receipt_digest=? AND purged_at=?`,
+    ).run(
+      operationKey,
+      current.binding.ownerId,
+      toOwnerId,
+      operationKey,
+      this.#now(),
+      current.binding.sessionId,
+      current.binding.epoch,
+      current.binding.ownerId,
+      current.binding.bindingDigest,
+      current.revision,
+      current.cleanupOperationKey,
+      current.cleanupReceiptDigest,
+      current.purgedAt,
+    );
+    if (changed.changes !== 1) throw new Error("FACTS_MEMORY_OWNER_TRANSFER_CAS_CONFLICT");
+    return this.requireExact(current.binding);
+  }
+
+  advanceOwnerTransfer(input: Readonly<{
+    createOperationKey: string;
+    expiresAt: number;
+    fromBinding: FactsMemoryBinding;
+    operationKey: string;
+    toBinding: FactsMemoryBinding;
+  }>): FactsMemoryControlRecord {
+    const fromBinding = factsMemoryBindingSchema.parse(input.fromBinding);
+    const toBinding = factsMemoryBindingSchema.parse(input.toBinding);
+    const createOperationKey = operationKeySchema.parse(input.createOperationKey);
+    const operationKey = operationKeySchema.parse(input.operationKey);
+    const expiresAt = unixMillisecondsSchema.parse(input.expiresAt);
+    if (operationKey === createOperationKey) throw new Error("FACTS_MEMORY_OPERATION_KEY_REUSED");
+    this.#assertCreateOperationKeyAvailable(createOperationKey, fromBinding.sessionId);
+    if (
+      fromBinding.sessionId !== toBinding.sessionId
+      || fromBinding.ownerId === toBinding.ownerId
+      || toBinding.epoch !== fromBinding.epoch + 1
+    ) throw new Error("FACTS_MEMORY_OWNER_TRANSFER_AUTHORITY_INVALID");
+    const observed = this.get(fromBinding.sessionId);
+    if (observed === null) throw new Error("FACTS_MEMORY_NOT_FOUND");
+    if (
+      observed.binding.bindingDigest === toBinding.bindingDigest
+      && observed.binding.epoch === toBinding.epoch
+      && observed.binding.ownerId === toBinding.ownerId
+    ) {
+      let replay = this.requireOwnerTransferTarget({
+        binding: toBinding,
+        fromOwnerId: fromBinding.ownerId,
+        operationKey,
+      });
+      if (replay.createKind !== "create" || replay.createOperationKey !== createOperationKey) {
+        throw new Error("FACTS_MEMORY_OWNER_TRANSFER_REPLAY_MISMATCH");
+      }
+      replay = this.#extendExpiry(replay, expiresAt);
+      return replay;
+    }
+    const current = this.requireExact(fromBinding);
+    if (
+      current.state !== "purged"
+      || current.cleanupReason !== "provider_switch"
+      || current.cleanupOperationKey !== operationKey
+      || current.cleanupReceiptDigest === null
+      || current.purgedAt === null
+      || current.ownerTransferFromId !== fromBinding.ownerId
+      || current.ownerTransferToId !== toBinding.ownerId
+      || current.ownerTransferOperationKey !== operationKey
+    ) throw new Error("FACTS_MEMORY_OWNER_TRANSFER_REPLAY_MISMATCH");
+    const priorChain = digestParts("hra-facts-memory-owner-transfer-purge-chain-v1", [
+      current.priorPurgeChainDigest ?? "first",
+      current.binding.sessionId,
+      String(current.binding.epoch),
+      current.binding.ownerId,
+      current.binding.bindingDigest,
+      current.cleanupReason,
+      operationKey,
+      current.cleanupReceiptDigest,
+      String(current.purgedAt),
+      toBinding.ownerId,
+    ]);
+    const now = unixMillisecondsSchema.parse(this.#now());
+    const changed = this.#database.query(
+      `UPDATE facts_memory_lifecycles SET epoch=?,owner_id=?,binding_digest=?,create_kind='create',
+       create_operation_key=?,parent_session_id=NULL,parent_epoch=NULL,parent_owner_id=NULL,
+       parent_binding_digest=NULL,parent_head_sequence=NULL,parent_head_operation_sha256=NULL,
+       parent_head_digest=NULL,legacy_parent_head_sequence=NULL,legacy_parent_head_digest=NULL,
+       state='reserved',handle_hash=NULL,head_sequence=NULL,head_operation_sha256=NULL,
+       head_digest=NULL,legacy_head_sequence=NULL,legacy_head_digest=NULL,store_created_at=NULL,
+       create_receipt_digest=NULL,expires_at=?,cleanup_reason=NULL,cleanup_operation_key=NULL,
+       cleanup_receipt_digest=NULL,purged_at=NULL,prior_purge_chain_digest=?,revision=revision+1,
+       created_at=?,updated_at=?
+       WHERE session_id=? AND epoch=? AND owner_id=? AND binding_digest=? AND revision=?
+         AND state='purged' AND cleanup_reason='provider_switch' AND cleanup_operation_key=?
+         AND owner_transfer_from_id=? AND owner_transfer_to_id=?
+         AND owner_transfer_operation_key=?`,
+    ).run(
+      toBinding.epoch,
+      toBinding.ownerId,
+      toBinding.bindingDigest,
+      createOperationKey,
+      expiresAt,
+      priorChain,
+      now,
+      now,
+      fromBinding.sessionId,
+      fromBinding.epoch,
+      fromBinding.ownerId,
+      fromBinding.bindingDigest,
+      current.revision,
+      operationKey,
+      fromBinding.ownerId,
+      toBinding.ownerId,
+      operationKey,
+    );
+    if (changed.changes !== 1) throw new Error("FACTS_MEMORY_OWNER_TRANSFER_CAS_CONFLICT");
+    return this.requireOwnerTransferTarget({
+      binding: toBinding,
+      fromOwnerId: fromBinding.ownerId,
+      operationKey,
+    });
+  }
+
+  requireOwnerTransferTarget(input: Readonly<{
+    binding: FactsMemoryBinding;
+    fromOwnerId: string;
+    operationKey: string;
+  }>): FactsMemoryControlRecord {
+    const binding = factsMemoryBindingSchema.parse(input.binding);
+    const fromOwnerId = profileIdSchema.parse(input.fromOwnerId);
+    const operationKey = operationKeySchema.parse(input.operationKey);
+    const current = this.requireExact(binding);
+    if (
+      fromOwnerId === binding.ownerId
+      || current.ownerTransferFromId !== fromOwnerId
+      || current.ownerTransferToId !== binding.ownerId
+      || current.ownerTransferOperationKey !== operationKey
+    ) throw new Error("FACTS_MEMORY_OWNER_TRANSFER_REPLAY_MISMATCH");
+    return current;
+  }
+
   requireExact(binding: FactsMemoryBinding): FactsMemoryControlRecord {
     const parsed = factsMemoryBindingSchema.parse(binding);
     const record = this.get(parsed.sessionId);
@@ -690,6 +1131,7 @@ export class FactsMemoryControlStore {
         || current.cleanupReceiptDigest === null
         || current.purgedAt === null
       ) throw new Error("FACTS_MEMORY_CLEANUP_REPLAY_MISMATCH");
+      this.#assertCleanupOperationKeyAvailable(operationKey, current.binding.sessionId);
       const reusedValue = this.#database.query(
         "SELECT session_id FROM facts_memory_lifecycles WHERE cleanup_operation_key=?",
       ).get(operationKey);
@@ -718,6 +1160,7 @@ export class FactsMemoryControlStore {
       }
       return current;
     }
+    this.#assertCleanupOperationKeyAvailable(operationKey, current.binding.sessionId);
     const unresolvedChild = this.#database.query(
       `SELECT session_id FROM facts_memory_lifecycles
        WHERE parent_session_id=? AND parent_epoch=?
@@ -815,6 +1258,68 @@ export class FactsMemoryControlStore {
   /** Test/operator proof that the control plane contains authority metadata, never facts. */
   schemaColumns(): readonly string[] {
     return readSchemaColumns(this.#database);
+  }
+
+  #assertOwnerTransferOperationKeyAvailable(operationKey: string): void {
+    const reusedValue = this.#database.query(
+      `SELECT session_id FROM facts_memory_lifecycles
+       WHERE create_operation_key=? OR cleanup_operation_key=? OR owner_transfer_operation_key=?
+       ORDER BY session_id LIMIT 1`,
+    ).get(operationKey, operationKey, operationKey);
+    if (reusedValue === null) return;
+    operationKeyOwnerRowSchema.parse(reusedValue);
+    throw new Error("FACTS_MEMORY_OPERATION_KEY_REUSED");
+  }
+
+  #assertCreateOperationKeyAvailable(operationKey: string, sessionId: string): void {
+    const reusedValue = this.#database.query(
+      `SELECT session_id FROM facts_memory_lifecycles
+       WHERE cleanup_operation_key=? OR owner_transfer_operation_key=?
+         OR (create_operation_key=? AND session_id<>?)
+       ORDER BY session_id LIMIT 1`,
+    ).get(operationKey, operationKey, operationKey, sessionId);
+    if (reusedValue === null) return;
+    operationKeyOwnerRowSchema.parse(reusedValue);
+    throw new Error("FACTS_MEMORY_OPERATION_KEY_REUSED");
+  }
+
+  #assertCleanupOperationKeyAvailable(operationKey: string, sessionId: string): void {
+    const reusedValue = this.#database.query(
+      `SELECT session_id FROM facts_memory_lifecycles
+       WHERE create_operation_key=? OR owner_transfer_operation_key=?
+         OR (cleanup_operation_key=? AND session_id<>?)
+       ORDER BY session_id LIMIT 1`,
+    ).get(operationKey, operationKey, operationKey, sessionId);
+    if (reusedValue === null) return;
+    operationKeyOwnerRowSchema.parse(reusedValue);
+    throw new Error("FACTS_MEMORY_OPERATION_KEY_REUSED");
+  }
+
+  #extendExpiry(
+    record: FactsMemoryControlRecord,
+    expiresAt: number,
+  ): FactsMemoryControlRecord {
+    if (
+      expiresAt <= record.expiresAt
+      || record.state === "cleanup_pending"
+      || record.state === "purged"
+    ) return record;
+    const extended = this.#database.query(
+      `UPDATE facts_memory_lifecycles SET expires_at=?,revision=revision+1,updated_at=?
+       WHERE session_id=? AND epoch=? AND owner_id=? AND binding_digest=? AND revision=?
+         AND expires_at<? AND state NOT IN ('cleanup_pending','purged')`,
+    ).run(
+      expiresAt,
+      this.#now(),
+      record.binding.sessionId,
+      record.binding.epoch,
+      record.binding.ownerId,
+      record.binding.bindingDigest,
+      record.revision,
+      expiresAt,
+    );
+    if (extended.changes !== 1) throw new Error("FACTS_MEMORY_EXPIRY_CAS_CONFLICT");
+    return this.requireExact(record.binding);
   }
 
   #changeState(

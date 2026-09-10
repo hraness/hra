@@ -18,7 +18,7 @@ import {
 import { FactsMemoryControlStore } from "../storage/facts-memory-control";
 import { initializeStatePaths, resolveStatePaths } from "../storage/paths";
 import {
-  HraFactsMemoryLifecycle,
+  OompaFactsMemoryLifecycle,
   type FactsMemoryAttestationLifecyclePort,
   type FactsMemoryBrokerInspection,
   type FactsMemoryBrokerPort,
@@ -26,6 +26,7 @@ import {
 
 const ownerId = `acct_${"a".repeat(32)}`;
 const anotherOwnerId = `acct_${"b".repeat(32)}`;
+const thirdOwnerId = `acct_${"c".repeat(32)}`;
 const sessionId = `sess_${"1".repeat(32)}`;
 const childSessionId = `sess_${"2".repeat(32)}`;
 const otherParentSessionId = `sess_${"3".repeat(32)}`;
@@ -259,19 +260,19 @@ afterEach(async () => {
 });
 
 const fixture = async () => {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-facts-memory-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-facts-memory-")));
   roots.push(home);
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const control = new FactsMemoryControlStore(paths.factsMemoryControl, { now: () => 50 });
   controls.push(control);
   const broker = new FakeBroker();
-  return { broker, control, lifecycle: new HraFactsMemoryLifecycle({ broker, control }), paths };
+  return { broker, control, lifecycle: new OompaFactsMemoryLifecycle({ broker, control }), paths };
 };
 
-describe("HRA facts-memory lifecycle", () => {
+describe("Oompa facts-memory lifecycle", () => {
   test("refuses a control database containing any semantic table", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-facts-memory-schema-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-facts-memory-schema-")));
     roots.push(home);
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
@@ -330,6 +331,61 @@ describe("HRA facts-memory lifecycle", () => {
       state: "recovery_required",
     });
     expect(migrated.schemaColumns()).toContain("head_operation_sha256");
+    expect(migrated.schemaColumns()).toContain("owner_transfer_from_id");
+    expect(migrated.schemaColumns()).toContain("owner_transfer_to_id");
+    expect(migrated.schemaColumns()).toContain("owner_transfer_operation_key");
+    const migratedInspector = new Database(paths.factsMemoryControl, { readonly: true });
+    expect(migratedInspector.query("PRAGMA user_version").get()).toEqual({ user_version: 3 });
+    migratedInspector.close(false);
+  });
+
+  test("migrates v2 custody to v3 without changing its active authority", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-facts-memory-v2-")));
+    roots.push(home);
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    const binding = createFactsMemoryBinding({ ownerId, sessionId });
+    const seed = new FactsMemoryControlStore(paths.factsMemoryControl, { now: () => 1 });
+    const reserved = seed.reserve({
+      binding,
+      createOperationKey: `create:${sessionId}`,
+      expiresAt: 1_000,
+    });
+    seed.finalizeActive(reserved.binding, storeReceipt(binding));
+    seed.close();
+
+    const database = new Database(paths.factsMemoryControl);
+    database.exec(`
+      DROP TRIGGER facts_memory_identity_immutable;
+      DROP TRIGGER facts_memory_owner_transfer_provenance_guard;
+      DROP INDEX facts_memory_expiry;
+      ALTER TABLE facts_memory_lifecycles RENAME TO facts_memory_lifecycles_v3_seed;
+      CREATE TABLE facts_memory_lifecycles AS SELECT
+        session_id,epoch,owner_id,binding_digest,create_kind,create_operation_key,
+        parent_session_id,parent_epoch,parent_owner_id,parent_binding_digest,parent_head_sequence,
+        parent_head_operation_sha256,parent_head_digest,legacy_parent_head_sequence,
+        legacy_parent_head_digest,state,handle_hash,head_sequence,head_operation_sha256,head_digest,
+        legacy_head_sequence,legacy_head_digest,store_created_at,create_receipt_digest,expires_at,
+        cleanup_reason,cleanup_operation_key,cleanup_receipt_digest,purged_at,prior_purge_chain_digest,
+        revision,created_at,updated_at
+      FROM facts_memory_lifecycles_v3_seed;
+      DROP TABLE facts_memory_lifecycles_v3_seed;
+      PRAGMA user_version=2;
+    `);
+    database.close(false);
+
+    const migrated = new FactsMemoryControlStore(paths.factsMemoryControl, { now: () => 2 });
+    controls.push(migrated);
+    expect(migrated.get(sessionId)).toMatchObject({
+      binding,
+      ownerTransferFromId: null,
+      ownerTransferOperationKey: null,
+      ownerTransferToId: null,
+      state: "active",
+    });
+    const inspector = new Database(paths.factsMemoryControl, { readonly: true });
+    expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 3 });
+    inspector.close(false);
   });
 
   test("single-flights create, persists only bounded authority, and replays exactly", async () => {
@@ -386,6 +442,548 @@ describe("HRA facts-memory lifecycle", () => {
       createOperationKey: `create:${sessionId}`,
       expiresAt: 1_000,
     })).toThrow("FACTS_MEMORY_OPERATION_KEY_REUSED");
+  });
+
+  test("purges source custody, advances one epoch, and exactly replays an owner transfer", async () => {
+    const { broker, control, lifecycle } = await fixture();
+    await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 1_000 });
+    const operationKey = "switch-attempt:exact-owner-transfer";
+    const transferred = await lifecycle.transferSessionOwner({
+      expiresAt: 2_000,
+      fromOwnerId: ownerId,
+      operationKey,
+      sessionId,
+      toOwnerId: anotherOwnerId,
+    });
+    expect(transferred).toMatchObject({ epoch: 2, sessionId, state: "active" });
+    expect(control.get(sessionId)).toMatchObject({
+      binding: { epoch: 2, ownerId: anotherOwnerId },
+      ownerTransferFromId: ownerId,
+      ownerTransferOperationKey: operationKey,
+      ownerTransferToId: anotherOwnerId,
+      priorPurgeChainDigest: expect.any(String),
+      state: "active",
+    });
+    expect(broker.createCalls).toBe(2);
+    expect(broker.purgeCalls).toBe(1);
+
+    expect(await lifecycle.transferSessionOwner({
+      expiresAt: 2_000,
+      fromOwnerId: ownerId,
+      operationKey,
+      sessionId,
+      toOwnerId: anotherOwnerId,
+    })).toEqual(transferred);
+    expect(broker.createCalls).toBe(2);
+    expect(broker.purgeCalls).toBe(1);
+    await expect(lifecycle.ensureSession({
+      expiresAt: 3_000,
+      ownerId: anotherOwnerId,
+      sessionId,
+    })).resolves.toMatchObject({ epoch: 2, state: "active" });
+  });
+
+  test("retains exact transfer authority across same-owner expiry reactivation", async () => {
+    const { control, lifecycle } = await fixture();
+    await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 100 });
+    const input = {
+      expiresAt: 100,
+      fromOwnerId: ownerId,
+      operationKey: "switch-attempt:survives-target-expiry",
+      sessionId,
+      toOwnerId: anotherOwnerId,
+    } as const;
+    await lifecycle.transferSessionOwner(input);
+    expect(await lifecycle.sweepExpired(100)).toEqual({ attempted: 1, failed: 0, purged: 1 });
+    expect(control.get(sessionId)).toMatchObject({
+      binding: { epoch: 2, ownerId: anotherOwnerId },
+      cleanupReason: "expired",
+      ownerTransferOperationKey: input.operationKey,
+      state: "purged",
+    });
+    await expect(lifecycle.transferSessionOwner({
+      ...input,
+      expiresAt: 200,
+    })).resolves.toMatchObject({ epoch: 3, state: "active" });
+    expect(control.get(sessionId)).toMatchObject({
+      binding: { epoch: 3, ownerId: anotherOwnerId },
+      ownerTransferFromId: ownerId,
+      ownerTransferOperationKey: input.operationKey,
+      ownerTransferToId: anotherOwnerId,
+    });
+    await expect(lifecycle.transferSessionOwner({
+      ...input,
+      expiresAt: 200,
+    })).resolves.toMatchObject({ epoch: 3, state: "active" });
+  });
+
+  test("adopts an expired source purge into one exact owner transfer without resurrection", async () => {
+    const { broker, control, lifecycle, paths } = await fixture();
+    await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 100 });
+    expect(await lifecycle.sweepExpired(100)).toEqual({ attempted: 1, failed: 0, purged: 1 });
+    expect(broker.receipts.has(sessionId)).toBe(false);
+    const expired = control.get(sessionId);
+    expect(expired).toMatchObject({
+      binding: { epoch: 1, ownerId },
+      cleanupReason: "expired",
+      state: "purged",
+    });
+
+    const input = {
+      expiresAt: 200,
+      fromOwnerId: ownerId,
+      operationKey: "switch-attempt:expired-source",
+      sessionId,
+      toOwnerId: anotherOwnerId,
+    } as const;
+    const inspector = new Database(paths.factsMemoryControl);
+    expect(() => inspector.query(
+      `UPDATE facts_memory_lifecycles SET cleanup_reason='provider_switch',cleanup_operation_key=?,
+       owner_transfer_from_id=?,owner_transfer_to_id=?,owner_transfer_operation_key=?,
+       cleanup_receipt_digest=?,purged_at=purged_at+1,prior_purge_chain_digest=?,
+       handle_hash=?,head_digest=?,store_created_at=store_created_at+1,create_receipt_digest=?,
+       expires_at=expires_at+1,created_at=created_at+1,revision=revision+1,updated_at=updated_at+1
+       WHERE session_id=?`,
+    ).run(
+      input.operationKey,
+      ownerId,
+      anotherOwnerId,
+      input.operationKey,
+      "9".repeat(64),
+      "8".repeat(64),
+      "7".repeat(64),
+      "6".repeat(64),
+      "5".repeat(64),
+      sessionId,
+    )).toThrow("facts memory owner transfer provenance is immutable");
+    inspector.close(false);
+    expect(control.get(sessionId)).toEqual(expired);
+
+    const advance = control.advanceOwnerTransfer.bind(control);
+    let loseAdoptionResponse = true;
+    control.advanceOwnerTransfer = (value) => {
+      if (loseAdoptionResponse) {
+        loseAdoptionResponse = false;
+        throw new Error("crash after expired purge adoption");
+      }
+      return advance(value);
+    };
+    await expect(lifecycle.transferSessionOwner(input))
+      .rejects.toThrow("crash after expired purge adoption");
+    expect(control.get(sessionId)).toMatchObject({
+      binding: { epoch: 1, ownerId },
+      cleanupOperationKey: input.operationKey,
+      cleanupReason: "provider_switch",
+      ownerTransferFromId: ownerId,
+      ownerTransferOperationKey: input.operationKey,
+      ownerTransferToId: anotherOwnerId,
+      state: "purged",
+    });
+    expect(broker.receipts.has(sessionId)).toBe(false);
+    expect(broker.createCalls).toBe(1);
+    expect(broker.purgeCalls).toBe(1);
+
+    await expect(lifecycle.transferSessionOwner({
+      ...input,
+      operationKey: "switch-attempt:expired-source-changed",
+    })).rejects.toThrow("FACTS_MEMORY_OWNER_TRANSFER_REPLAY_MISMATCH");
+    await expect(lifecycle.transferSessionOwner({
+      ...input,
+      fromOwnerId: thirdOwnerId,
+    })).rejects.toThrow("FACTS_MEMORY_AUTHORITY_MISMATCH");
+
+    const transferred = await lifecycle.transferSessionOwner(input);
+    expect(transferred).toMatchObject({
+      epoch: 2,
+      state: "active",
+    });
+    expect(control.get(sessionId)).toMatchObject({
+      binding: { epoch: 2, ownerId: anotherOwnerId },
+      ownerTransferOperationKey: input.operationKey,
+      state: "active",
+    });
+    expect(broker.receipts.get(sessionId)?.bindingDigest).toBe(transferred.bindingDigest);
+    expect(broker.createCalls).toBe(2);
+    expect(broker.purgeCalls).toBe(1);
+    await expect(lifecycle.transferSessionOwner(input)).resolves.toEqual(transferred);
+
+    await lifecycle.cleanupSession({
+      ownerId: anotherOwnerId,
+      reason: "abandon",
+      sessionId,
+    });
+    await expect(lifecycle.transferSessionOwner(input)).resolves.toMatchObject({
+      state: "purged",
+    });
+    expect(broker.createCalls).toBe(2);
+  });
+
+  test("finishes a pending expired source purge before adopting switch custody", async () => {
+    const { broker, control, lifecycle } = await fixture();
+    await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 100 });
+    broker.failPurgeOnce = true;
+    expect(await lifecycle.sweepExpired(100)).toEqual({ attempted: 1, failed: 1, purged: 0 });
+    expect(control.get(sessionId)).toMatchObject({
+      binding: { ownerId },
+      cleanupReason: "expired",
+      state: "cleanup_pending",
+    });
+
+    await expect(lifecycle.transferSessionOwner({
+      expiresAt: 200,
+      fromOwnerId: ownerId,
+      operationKey: "switch-attempt:pending-expired-source",
+      sessionId,
+      toOwnerId: anotherOwnerId,
+    })).resolves.toMatchObject({
+      epoch: 2,
+      state: "active",
+    });
+    expect(control.get(sessionId)).toMatchObject({
+      binding: { ownerId: anotherOwnerId },
+      ownerTransferOperationKey: "switch-attempt:pending-expired-source",
+    });
+    expect(broker.purgeCalls).toBe(2);
+  });
+
+  test("replays exact target custody after terminal cleanup without resurrecting it", async () => {
+    const { control, lifecycle } = await fixture();
+    await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 1_000 });
+    const input = {
+      expiresAt: 2_000,
+      fromOwnerId: ownerId,
+      operationKey: "switch-attempt:cleanup-before-state-commit",
+      sessionId,
+      toOwnerId: anotherOwnerId,
+    } as const;
+    await lifecycle.transferSessionOwner(input);
+    await lifecycle.cleanupSession({
+      ownerId: anotherOwnerId,
+      reason: "abandon",
+      sessionId,
+    });
+    await expect(lifecycle.transferSessionOwner(input)).resolves.toMatchObject({
+      epoch: 2,
+      state: "purged",
+    });
+    expect(control.get(sessionId)).toMatchObject({
+      binding: { epoch: 2, ownerId: anotherOwnerId },
+      cleanupReason: "abandon",
+      ownerTransferOperationKey: input.operationKey,
+      state: "purged",
+    });
+    await expect(lifecycle.cleanupSession({
+      ownerId: anotherOwnerId,
+      reason: "abandon",
+      sessionId,
+    })).resolves.toMatchObject({ state: "purged" });
+
+    await lifecycle.ensureSession({
+      expiresAt: 1_000,
+      ownerId: anotherOwnerId,
+      sessionId: childSessionId,
+    });
+    await lifecycle.cleanupSession({
+      ownerId: anotherOwnerId,
+      reason: "archive",
+      sessionId: childSessionId,
+    });
+    await expect(lifecycle.transferSessionOwner({
+      ...input,
+      operationKey: "switch-attempt:unrelated-archived-target",
+      sessionId: childSessionId,
+    })).rejects.toThrow("FACTS_MEMORY_OWNER_TRANSFER_REPLAY_MISMATCH");
+  });
+
+  test("recovers exact owner transfer after a lost purge response", async () => {
+    const { broker, control, lifecycle } = await fixture();
+    await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 1_000 });
+    broker.failPurgeOnce = true;
+    const input = {
+      expiresAt: 2_000,
+      fromOwnerId: ownerId,
+      operationKey: "switch-attempt:lost-purge-response",
+      sessionId,
+      toOwnerId: anotherOwnerId,
+    } as const;
+    await expect(lifecycle.transferSessionOwner(input)).rejects.toThrow("lost purge response");
+    expect(control.get(sessionId)).toMatchObject({
+      binding: { epoch: 1, ownerId },
+      cleanupReason: "provider_switch",
+      state: "cleanup_pending",
+    });
+    await expect(lifecycle.transferSessionOwner(input)).resolves.toMatchObject({
+      epoch: 2,
+      state: "active",
+    });
+    expect(broker.purgeCalls).toBe(2);
+  });
+
+  test("recovers after durable purge before owner rollover", async () => {
+    const { broker, control, lifecycle } = await fixture();
+    await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 1_000 });
+    const finalize = control.finalizePurged.bind(control);
+    let loseResponse = true;
+    control.finalizePurged = (binding, receipt) => {
+      const result = finalize(binding, receipt);
+      if (loseResponse) {
+        loseResponse = false;
+        throw new Error("crash after durable purge");
+      }
+      return result;
+    };
+    const input = {
+      expiresAt: 2_000,
+      fromOwnerId: ownerId,
+      operationKey: "switch-attempt:purged-before-rollover",
+      sessionId,
+      toOwnerId: anotherOwnerId,
+    } as const;
+    await expect(lifecycle.transferSessionOwner(input)).rejects.toThrow("crash after durable purge");
+    expect(control.get(sessionId)).toMatchObject({
+      binding: { epoch: 1, ownerId },
+      cleanupReason: "provider_switch",
+      state: "purged",
+    });
+    const targetBinding = createFactsMemoryBinding({
+      epoch: 2,
+      ownerId: anotherOwnerId,
+      sessionId,
+    });
+    expect(() => control.advanceOwnerTransfer({
+      createOperationKey: input.operationKey,
+      expiresAt: input.expiresAt,
+      fromBinding: createFactsMemoryBinding({ ownerId, sessionId }),
+      operationKey: input.operationKey,
+      toBinding: targetBinding,
+    })).toThrow("FACTS_MEMORY_OPERATION_KEY_REUSED");
+    await expect(lifecycle.transferSessionOwner(input)).resolves.toMatchObject({
+      epoch: 2,
+      state: "active",
+    });
+    expect(broker.purgeCalls).toBe(1);
+  });
+
+  test("recovers an owner rollover that committed before its response was lost", async () => {
+    const { broker, control, lifecycle } = await fixture();
+    await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 1_000 });
+    const advance = control.advanceOwnerTransfer.bind(control);
+    let loseResponse = true;
+    control.advanceOwnerTransfer = (input) => {
+      const result = advance(input);
+      if (loseResponse) {
+        loseResponse = false;
+        throw new Error("lost owner rollover response");
+      }
+      return result;
+    };
+    const input = {
+      expiresAt: 2_000,
+      fromOwnerId: ownerId,
+      operationKey: "switch-attempt:lost-rollover-response",
+      sessionId,
+      toOwnerId: anotherOwnerId,
+    } as const;
+    await expect(lifecycle.transferSessionOwner(input)).rejects.toThrow("lost owner rollover response");
+    expect(control.get(sessionId)).toMatchObject({
+      binding: { epoch: 2, ownerId: anotherOwnerId },
+      state: "reserved",
+    });
+    await expect(lifecycle.transferSessionOwner(input)).resolves.toMatchObject({
+      epoch: 2,
+      state: "active",
+    });
+    expect(broker.createCalls).toBe(2);
+    expect(broker.purgeCalls).toBe(1);
+  });
+
+  test("recovers a target create ambiguity without restoring source custody", async () => {
+    const { broker, control, lifecycle } = await fixture();
+    await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 1_000 });
+    broker.failCreateAfterCommit = true;
+    const input = {
+      expiresAt: 2_000,
+      fromOwnerId: ownerId,
+      operationKey: "switch-attempt:target-create-ambiguous",
+      sessionId,
+      toOwnerId: anotherOwnerId,
+    } as const;
+    await expect(lifecycle.transferSessionOwner(input)).rejects.toThrow("lost create response");
+    expect(control.get(sessionId)).toMatchObject({
+      binding: { epoch: 2, ownerId: anotherOwnerId },
+      state: "create_ambiguous",
+    });
+    await expect(lifecycle.transferSessionOwner(input)).resolves.toMatchObject({
+      epoch: 2,
+      state: "active",
+    });
+    expect(broker.createCalls).toBe(2);
+    expect(broker.purgeCalls).toBe(1);
+  });
+
+  test("creates fresh target custody when no control row exists and replays only its exact authority", async () => {
+    const { broker, control, lifecycle } = await fixture();
+    const aliasedSessionId = `sess_${"7".repeat(32)}`;
+    await expect(lifecycle.transferSessionOwner({
+      expiresAt: 2_000,
+      fromOwnerId: ownerId,
+      operationKey: `create:${aliasedSessionId}`,
+      sessionId: aliasedSessionId,
+      toOwnerId: anotherOwnerId,
+    })).rejects.toThrow("FACTS_MEMORY_OPERATION_KEY_REUSED");
+    expect(control.get(aliasedSessionId)).toBeNull();
+    const input = {
+      expiresAt: 2_000,
+      fromOwnerId: ownerId,
+      operationKey: "switch-attempt:no-source-row",
+      sessionId,
+      toOwnerId: anotherOwnerId,
+    } as const;
+    await expect(lifecycle.transferSessionOwner(input)).resolves.toMatchObject({
+      epoch: 1,
+      state: "active",
+    });
+    expect(control.get(sessionId)).toMatchObject({
+      binding: { epoch: 1, ownerId: anotherOwnerId },
+      ownerTransferFromId: ownerId,
+      ownerTransferOperationKey: input.operationKey,
+      ownerTransferToId: anotherOwnerId,
+    });
+    expect(broker.purgeCalls).toBe(0);
+    expect(broker.createCalls).toBe(1);
+    await expect(lifecycle.transferSessionOwner(input)).resolves.toMatchObject({ epoch: 1 });
+    await expect(lifecycle.transferSessionOwner({
+      ...input,
+      operationKey: "switch-attempt:no-source-row-forged",
+    })).rejects.toThrow("FACTS_MEMORY_OWNER_TRANSFER_REPLAY_MISMATCH");
+    await expect(lifecycle.transferSessionOwner({
+      ...input,
+      fromOwnerId: thirdOwnerId,
+    })).rejects.toThrow("FACTS_MEMORY_OWNER_TRANSFER_REPLAY_MISMATCH");
+  });
+
+  test("treats same-owner transfer as an idempotent ensure", async () => {
+    const { broker, control, lifecycle } = await fixture();
+    const first = await lifecycle.transferSessionOwner({
+      expiresAt: 1_000,
+      fromOwnerId: ownerId,
+      operationKey: "switch-attempt:same-owner",
+      sessionId,
+      toOwnerId: ownerId,
+    });
+    const replay = await lifecycle.transferSessionOwner({
+      expiresAt: 2_000,
+      fromOwnerId: ownerId,
+      operationKey: "switch-attempt:same-owner-replay",
+      sessionId,
+      toOwnerId: ownerId,
+    });
+    expect(replay).toMatchObject({ epoch: first.epoch, state: "active" });
+    expect(control.get(sessionId)).toMatchObject({
+      binding: { epoch: 1, ownerId },
+      expiresAt: 2_000,
+      ownerTransferOperationKey: null,
+    });
+    expect(broker.createCalls).toBe(1);
+    expect(broker.purgeCalls).toBe(0);
+  });
+
+  test("refuses wrong transfer authority, changed requests, and terminal cleanup", async () => {
+    const { broker, lifecycle } = await fixture();
+    await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 1_000 });
+    await expect(lifecycle.transferSessionOwner({
+      expiresAt: 2_000,
+      fromOwnerId: ownerId,
+      operationKey: `create:${sessionId}`,
+      sessionId,
+      toOwnerId: anotherOwnerId,
+    })).rejects.toThrow("FACTS_MEMORY_OPERATION_KEY_REUSED");
+    await expect(lifecycle.transferSessionOwner({
+      expiresAt: 2_000,
+      fromOwnerId: thirdOwnerId,
+      operationKey: "switch-attempt:wrong-source",
+      sessionId,
+      toOwnerId: anotherOwnerId,
+    })).rejects.toThrow("FACTS_MEMORY_AUTHORITY_MISMATCH");
+
+    broker.failPurgeOnce = true;
+    const exact = {
+      expiresAt: 2_000,
+      fromOwnerId: ownerId,
+      operationKey: "switch-attempt:frozen-request",
+      sessionId,
+      toOwnerId: anotherOwnerId,
+    } as const;
+    await expect(lifecycle.transferSessionOwner(exact)).rejects.toThrow("lost purge response");
+    await expect(lifecycle.transferSessionOwner({
+      ...exact,
+      operationKey: "switch-attempt:changed-key",
+    })).rejects.toThrow("FACTS_MEMORY_OWNER_TRANSFER_REPLAY_MISMATCH");
+    await expect(lifecycle.transferSessionOwner({
+      ...exact,
+      toOwnerId: thirdOwnerId,
+    })).rejects.toThrow("FACTS_MEMORY_OWNER_TRANSFER_REPLAY_MISMATCH");
+    await lifecycle.transferSessionOwner(exact);
+
+    const terminalSessionId = `sess_${"8".repeat(32)}`;
+    await lifecycle.ensureSession({ ownerId, sessionId: terminalSessionId, expiresAt: 1_000 });
+    await lifecycle.cleanupSession({ ownerId, reason: "archive", sessionId: terminalSessionId });
+    await expect(lifecycle.transferSessionOwner({
+      expiresAt: 2_000,
+      fromOwnerId: ownerId,
+      operationKey: "switch-attempt:terminal-source",
+      sessionId: terminalSessionId,
+      toOwnerId: anotherOwnerId,
+    })).rejects.toThrow("FACTS_MEMORY_STORE_RETIRED");
+  });
+
+  test("database triggers reject direct owner and transfer-provenance tampering", async () => {
+    const { control, lifecycle, paths } = await fixture();
+    await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 1_000 });
+    const target = createFactsMemoryBinding({
+      epoch: 2,
+      ownerId: anotherOwnerId,
+      sessionId,
+    });
+    const inspector = new Database(paths.factsMemoryControl);
+    expect(() => inspector.query(
+      "UPDATE facts_memory_lifecycles SET epoch=2,owner_id=?,binding_digest=? WHERE session_id=?",
+    ).run(anotherOwnerId, target.bindingDigest, sessionId)).toThrow("facts memory identity is immutable");
+    expect(() => inspector.query(
+      `UPDATE facts_memory_lifecycles SET owner_transfer_from_id=?,owner_transfer_to_id=?,
+       owner_transfer_operation_key=? WHERE session_id=?`,
+    ).run(
+      ownerId,
+      anotherOwnerId,
+      "switch-attempt:forged-provenance",
+      sessionId,
+    )).toThrow("facts memory owner transfer provenance is immutable");
+    const operationKey = "switch-attempt:guarded-normal-transfer";
+    expect(() => inspector.query(
+      `UPDATE facts_memory_lifecycles SET state='cleanup_pending',cleanup_reason='provider_switch',
+       cleanup_operation_key=?,owner_transfer_from_id=?,owner_transfer_to_id=?,
+       owner_transfer_operation_key=?,expires_at=expires_at+1,revision=revision+1,
+       updated_at=updated_at+1 WHERE session_id=?`,
+    ).run(
+      operationKey,
+      ownerId,
+      anotherOwnerId,
+      operationKey,
+      sessionId,
+    )).toThrow("facts memory owner transfer provenance is immutable");
+    inspector.close(false);
+    expect(control.get(sessionId)).toMatchObject({
+      binding: { epoch: 1, ownerId },
+      expiresAt: 1_000,
+      state: "active",
+    });
+    await expect(lifecycle.transferSessionOwner({
+      expiresAt: 2_000,
+      fromOwnerId: ownerId,
+      operationKey,
+      sessionId,
+      toOwnerId: anotherOwnerId,
+    })).resolves.toMatchObject({ epoch: 2, state: "active" });
   });
 
   test("forks only the exact parent checkpoint and preserves it across retry", async () => {
@@ -454,7 +1052,7 @@ describe("HRA facts-memory lifecycle", () => {
   test("reconciles durable attestation clone and post-purge cleanup independently of Oh effects", async () => {
     const { broker, control } = await fixture();
     const attestations = new FakeAttestations();
-    const lifecycle = new HraFactsMemoryLifecycle({ attestations, broker, control });
+    const lifecycle = new OompaFactsMemoryLifecycle({ attestations, broker, control });
     const parent = await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 1_000 });
     attestations.failFinalizeOnce = true;
     await expect(lifecycle.forkSession({
@@ -507,7 +1105,7 @@ describe("HRA facts-memory lifecycle", () => {
   test("resume finalizes a lost child attestation fork before releasing its parent", async () => {
     const { broker, control } = await fixture();
     const attestations = new FakeAttestations();
-    const lifecycle = new HraFactsMemoryLifecycle({ attestations, broker, control });
+    const lifecycle = new OompaFactsMemoryLifecycle({ attestations, broker, control });
     const parent = await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 1_000 });
     attestations.failFinalizeOnce = true;
     await expect(lifecycle.forkSession({
@@ -538,7 +1136,7 @@ describe("HRA facts-memory lifecycle", () => {
   test("resume finalizes a crash-left attestation reservation for an active child", async () => {
     const { broker, control } = await fixture();
     const attestations = new FakeAttestations();
-    const lifecycle = new HraFactsMemoryLifecycle({ attestations, broker, control });
+    const lifecycle = new OompaFactsMemoryLifecycle({ attestations, broker, control });
     const parent = await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 1_000 });
     const child = await lifecycle.forkSession({
       childExpiresAt: 2_000,
@@ -573,7 +1171,7 @@ describe("HRA facts-memory lifecycle", () => {
   test("treats a pre-control attestation fork reservation as a parent cleanup fence", async () => {
     const { broker, control } = await fixture();
     const attestations = new FakeAttestations();
-    const lifecycle = new HraFactsMemoryLifecycle({ attestations, broker, control });
+    const lifecycle = new OompaFactsMemoryLifecycle({ attestations, broker, control });
     const parent = await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 1_000 });
     attestations.pendingParents.add(parent.bindingDigest);
 
@@ -596,7 +1194,7 @@ describe("HRA facts-memory lifecycle", () => {
   test("sweeps a crash-left pre-control fork reservation before releasing its parent", async () => {
     const { broker, control } = await fixture();
     const attestations = new FakeAttestations();
-    const lifecycle = new HraFactsMemoryLifecycle({ attestations, broker, control });
+    const lifecycle = new OompaFactsMemoryLifecycle({ attestations, broker, control });
     const parent = await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 1_000 });
     if (parent.head === null) throw new Error("Expected an active parent checkpoint.");
     const child = createFactsMemoryBinding({ ownerId, sessionId: childSessionId });

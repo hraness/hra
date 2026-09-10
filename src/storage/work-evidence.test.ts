@@ -30,13 +30,13 @@ const git = (root: string, ...args: string[]): string => {
 };
 
 const fixture = () => {
-  const root = mkdtempSync(join(tmpdir(), "hra-work-evidence-"));
+  const root = mkdtempSync(join(tmpdir(), "oompa-work-evidence-"));
   roots.push(root);
   const artifact = Buffer.from("verified artifact\n", "utf8");
   writeFileSync(join(root, "result.txt"), artifact);
   git(root, "init", "--quiet");
-  git(root, "config", "user.name", "HRA Test");
-  git(root, "config", "user.email", "hra@example.invalid");
+  git(root, "config", "user.name", "Oompa Test");
+  git(root, "config", "user.email", "oompa@example.invalid");
   git(root, "add", "result.txt");
   git(root, "commit", "--quiet", "-m", "evidence");
   const commit = git(root, "rev-parse", "HEAD");

@@ -38,8 +38,8 @@ import {
 } from "./bounded-process";
 import type { CommandRequest, CommandRunner } from "./configure-hosted-sync";
 import {
-  HRA_CONVEX_PROJECT_ID,
-  HRA_CONVEX_TEAM_ID,
+  OOMPA_CONVEX_PROJECT_ID,
+  OOMPA_CONVEX_TEAM_ID,
   type ConvexTarget,
   type ConvexTargetVerifier,
 } from "./convex-target";
@@ -48,8 +48,8 @@ const target: ConvexTarget = {
   deploymentId: 7_654_321,
   deploymentName: "steady-otter-321",
   deploymentUrl: "https://steady-otter-321.convex.cloud",
-  projectId: HRA_CONVEX_PROJECT_ID,
-  teamId: HRA_CONVEX_TEAM_ID,
+  projectId: OOMPA_CONVEX_PROJECT_ID,
+  teamId: OOMPA_CONVEX_TEAM_ID,
 };
 
 const targetArguments = [
@@ -155,7 +155,7 @@ afterEach(async () => {
 });
 
 const makeTemporaryDirectory = async (): Promise<string> => {
-  const directory = await mkdtemp(join(tmpdir(), "hra-hosted-bootstrap-test-"));
+  const directory = await mkdtemp(join(tmpdir(), "oompa-hosted-bootstrap-test-"));
   temporaryDirectories.push(directory);
   return directory;
 };
@@ -698,7 +698,7 @@ describe("bootstrap command grammar", () => {
     ])).toThrow("usage_invalid");
     expect(() => parseBootstrapArguments([
       ...targetArguments.slice(0, 3),
-      String(HRA_CONVEX_TEAM_ID + 1),
+      String(OOMPA_CONVEX_TEAM_ID + 1),
       ...targetArguments.slice(4),
       "--invite-output",
       "/protected/new-invite",

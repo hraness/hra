@@ -1,10 +1,15 @@
 import { z } from "zod";
 
-/** Historical provider identities. Retired providers remain readable, never executable. */
-export const providerSchema = z.enum(["codex", "claude", "devin"]);
-export type Provider = z.infer<typeof providerSchema>;
+// Retained V1 documents own these exact providers, presets and model tuples.
+// Future writer formats must not extend or reinterpret these definitions.
+export const providerV1Schema = z.enum(["codex", "claude", "devin"]);
+export type ProviderV1 = z.infer<typeof providerV1Schema>;
 
-/** Providers whose existing personal-home sessions HRA can adopt. */
+/** Historical provider identities. Retired providers remain readable, never executable. */
+export const providerSchema = providerV1Schema;
+export type Provider = ProviderV1;
+
+/** Providers whose existing personal-home sessions Oompa can adopt. */
 export const adoptableProviderSchema = z.enum(["codex", "claude"]);
 export type AdoptableProvider = z.infer<typeof adoptableProviderSchema>;
 
@@ -15,8 +20,10 @@ export type SupportedProvider = z.infer<typeof supportedProviderSchema>;
 export const DEFAULT_PROVIDER = "codex" satisfies SupportedProvider;
 
 /** Historical aliases, including those found only in retired provider records. */
-export const presetSchema = z.enum(["low", "high", "ultra", "fable-max", "astra"]);
-export type Preset = z.infer<typeof presetSchema>;
+export const presetV1Schema = z.enum(["low", "high", "ultra", "fable-max", "astra"]);
+export type PresetV1 = z.infer<typeof presetV1Schema>;
+export const presetSchema = presetV1Schema;
+export type Preset = PresetV1;
 export const supportedPresetSchema = z.enum(["low", "high", "ultra", "fable-max"]);
 export type SupportedPreset = z.infer<typeof supportedPresetSchema>;
 
@@ -54,25 +61,30 @@ export const currentPresetContract = 2 as const;
 export const solCodexPresetContract = legacyPresetContract;
 export const astraPresetContract = currentPresetContract;
 export const devinPresetContract = astraPresetContract;
-export const presetContractSchema = z.union([
-  z.literal(legacyPresetContract),
-  z.literal(currentPresetContract),
+// Persisted versions are independent of the default chosen for new writes.
+// Adding a contract must retain each shipped version and its exact mapping.
+export const presetContractV1Schema = z.union([
+  z.literal(1),
+  z.literal(2),
 ]);
-export type PresetContract = z.infer<typeof presetContractSchema>;
+export type PresetContractV1 = z.infer<typeof presetContractV1Schema>;
+export const presetContractSchema = presetContractV1Schema;
+export type PresetContract = PresetContractV1;
 
-export type PresetRequirement = Readonly<{
+export type PresetRequirementV1 = Readonly<{
   model: string;
   effort: "max" | "ultra" | "provider-default";
 }>;
+export type PresetRequirement = PresetRequirementV1;
 
-const legacyPresetRequirements = {
+const presetContract1RequirementsV1 = {
   low: { model: "gpt-5.6-luna", effort: "max" },
   high: { model: "gpt-5.6-sol", effort: "max" },
   ultra: { model: "gpt-5.6-sol", effort: "ultra" },
   "fable-max": { model: "claude-fable-5-1", effort: "max" },
-} as const satisfies Partial<Record<Preset, PresetRequirement>>;
+} as const satisfies Partial<Record<PresetV1, PresetRequirementV1>>;
 
-const currentPresetRequirements = {
+const presetContract2RequirementsV1 = {
   low: { model: "gpt-5.6-luna", effort: "max" },
   high: { model: "gpt-6-astra", effort: "max" },
   ultra: { model: "gpt-6-astra", effort: "ultra" },
@@ -82,13 +94,13 @@ const currentPresetRequirements = {
   "fable-max": { model: "claude-fable-5-1", effort: "max" },
   // Retained only to decode the exact runtime tuple already stored by v39.
   astra: { model: "gpt-6-astra", effort: "provider-default" },
-} as const satisfies Record<Preset, PresetRequirement>;
+} as const satisfies Record<PresetV1, PresetRequirementV1>;
 
-const presetRequirementsByContract: Readonly<
-  Record<PresetContract, Partial<Readonly<Record<Preset, PresetRequirement>>>>
+const presetRequirementsByContractV1: Readonly<
+  Record<PresetContractV1, Partial<Readonly<Record<PresetV1, PresetRequirementV1>>>>
 > = Object.freeze({
-  [legacyPresetContract]: Object.freeze(legacyPresetRequirements),
-  [currentPresetContract]: Object.freeze(currentPresetRequirements),
+  1: Object.freeze(presetContract1RequirementsV1),
+  2: Object.freeze(presetContract2RequirementsV1),
 });
 
 type ActivePresetBinding = Readonly<{
@@ -108,23 +120,23 @@ type ActivePresetBinding = Readonly<{
 const activePresetBindings = Object.freeze({
   low: Object.freeze({
     contract: astraPresetContract,
-    requirement: currentPresetRequirements.low,
+    requirement: presetContract2RequirementsV1.low,
   }),
   high: Object.freeze({
     contract: solCodexPresetContract,
-    requirement: legacyPresetRequirements.high,
+    requirement: presetContract1RequirementsV1.high,
   }),
   ultra: Object.freeze({
     contract: solCodexPresetContract,
-    requirement: legacyPresetRequirements.ultra,
+    requirement: presetContract1RequirementsV1.ultra,
   }),
   "fable-max": Object.freeze({
     contract: astraPresetContract,
-    requirement: currentPresetRequirements["fable-max"],
+    requirement: presetContract2RequirementsV1["fable-max"],
   }),
   astra: Object.freeze({
     contract: devinPresetContract,
-    requirement: currentPresetRequirements.astra,
+    requirement: presetContract2RequirementsV1.astra,
   }),
 } as const satisfies Readonly<Record<Preset, ActivePresetBinding>>);
 
@@ -178,39 +190,50 @@ export const presetRequirements = Object.freeze({
   astra: activePresetBindings.astra.requirement,
 } as const satisfies Readonly<Record<Preset, PresetRequirement>>);
 
-type ContractRequirement<P extends Preset, C extends PresetContract> =
-  C extends typeof currentPresetContract
-    ? PresetRequirement
-    : P extends "astra" ? undefined : PresetRequirement;
-
 /** Resolve one alias under its durable, session-owned interpretation. */
-export const presetRequirementForContract = <
-  P extends Preset,
-  C extends PresetContract,
->(preset: P, contract: C): ContractRequirement<P, C> =>
-  presetRequirementsByContract[contract][preset] as ContractRequirement<P, C>;
+export const presetRequirementForContractV1 = (
+  preset: PresetV1,
+  contract: PresetContractV1,
+): PresetRequirementV1 => {
+  const requirement = presetRequirementsByContractV1[contract][preset];
+  if (requirement === undefined) {
+    throw new Error("No preset requirement exists for that contract.");
+  }
+  return requirement;
+};
+type ContractRequirement<P extends Preset, C extends PresetContract> =
+  C extends 2 ? PresetRequirement : P extends "astra" ? undefined : PresetRequirement;
+
+/** Current lookup preserves the supported-provider branch's absent-tuple result. */
+export const presetRequirementForContract = <P extends Preset, C extends PresetContract>(
+  preset: P,
+  contract: C,
+): ContractRequirement<P, C> =>
+  presetRequirementsByContractV1[contract][preset] as ContractRequirement<P, C>;
 
 /**
  * Historical runtime documents remain admissible only when they carry one of
- * the exact tuples HRA has shipped for that alias.
+ * the exact tuples Oompa has shipped for that alias.
  */
-export const isAdmittedPresetRequirement = (
-  preset: Preset,
-  requirement: PresetRequirement,
-): boolean => [legacyPresetContract, currentPresetContract].some((contract) => {
-  const admitted = presetRequirementsByContract[contract][preset];
+export const isAdmittedPresetRequirementV1 = (
+  preset: PresetV1,
+  requirement: PresetRequirementV1,
+): boolean => ([1, 2] as const).some((contract) => {
+  const admitted = presetRequirementsByContractV1[contract][preset];
   return admitted !== undefined
     && admitted.model === requirement.model
     && admitted.effort === requirement.effort;
 });
+export const isAdmittedPresetRequirement = isAdmittedPresetRequirementV1;
 
-export const presetProviders = {
+export const presetProvidersV1 = {
   low: "codex",
   high: "codex",
   ultra: "codex",
   "fable-max": "claude",
   astra: "devin",
-} as const satisfies Record<Preset, Provider>;
+} as const satisfies Record<PresetV1, ProviderV1>;
+export const presetProviders = presetProvidersV1;
 
 /** The presets a given provider owns, as a type. */
 export type ProviderPreset<P extends Provider> = {

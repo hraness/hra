@@ -93,7 +93,7 @@ const makeFixture = async (): Promise<Readonly<{
   sourcePath: string;
   x64Path: string;
 }>> => {
-  const root = await mkdtemp(join(tmpdir(), "hra-authority-artifact-"));
+  const root = await mkdtemp(join(tmpdir(), "oompa-authority-artifact-"));
   const source = Buffer.from("//! fixture authority supervisor\n", "utf8");
   const x64 = elf(62);
   const arm64 = elf(183);

@@ -11,7 +11,7 @@ export type InputProps = Omit<InputHTMLAttributes<HTMLInputElement>, "style"> & 
 }>;
 
 function rejectInlineStyle(style: unknown): void {
-  if (style !== undefined) throw new Error("HRA primitives do not accept caller inline styles.");
+  if (style !== undefined) throw new Error("Oompa primitives do not accept caller inline styles.");
 }
 
 export function Input({ className, style, xstyle, ...rest }: InputProps) {

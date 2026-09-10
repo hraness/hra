@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { hraAttentionResendApiKeyEnvironmentName } from "../convex/resendApiKey";
+import { oompaAttentionResendApiKeyEnvironmentName } from "../convex/resendApiKey";
 import { createBoundedAuthorityFetch, type AuthorityFetcher } from "./bounded-authority-fetch";
 import { parseConvexTarget, type ConvexTarget } from "./convex-target";
 
@@ -39,7 +39,7 @@ export function createAttentionKeyInstallTransport(options: Readonly<{
       body: JSON.stringify(operation === "read" ? {
         args: [{}], format: "convex_encoded_json", path: "_system/cli/queryEnvironmentVariables",
       } : {
-        changes: [{ name: hraAttentionResendApiKeyEnvironmentName, value: options.attentionKey }],
+        changes: [{ name: oompaAttentionResendApiKeyEnvironmentName, value: options.attentionKey }],
       }),
       cache: "no-store",
       headers: { Authorization: `Convex ${options.adminKey}`, "Content-Type": "application/json" },

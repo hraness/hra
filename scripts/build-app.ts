@@ -13,7 +13,7 @@ import { getDesignPaletteTheme } from "@hraness/design-kit";
 import { dlopen } from "bun:ffi";
 
 import { assertSafeDarwinInstallAcl } from "../src/install-normalizer";
-import { stageHraAppearance, type HraAppearanceAsset } from "./build-appearance.ts";
+import { stageOompaAppearance, type OompaAppearanceAsset } from "./build-appearance.ts";
 import {
   APP_SOURCE_MARKER_PATH,
   createAppSourceMarker,
@@ -30,7 +30,7 @@ export type AppGraph = Readonly<{
 }>;
 export type AppBuildProfile = "development" | "production";
 export type AppSourceEnvironmentSnapshot = Readonly<{
-  HRA_RELEASE_COMMIT: string | null;
+  OOMPA_RELEASE_COMMIT: string | null;
   VERCEL: string | null;
   VERCEL_GIT_COMMIT_SHA: string | null;
 }>;
@@ -59,6 +59,9 @@ const STYLEX_UNION_POLICY_SHA256 = "1ceced1f1bf6359413ca6425ede61e1fdae272b897f4
 const PUBLICATION_JOURNAL = "pending-publication.json";
 const ENTRY_TAG = '<script type="module" src="/src/main.tsx"></script>';
 const HTML_TAG = '<html lang="en" data-palette="catppuccin" data-theme="dark">';
+// This one authored image is already held by the shell under img-src data:.
+// Its exact SVG bytes are reviewed independently of the website runtime.
+const APP_FAVICON_SHA256 = "8b3323b41b8c95bfa39af9af23152105b87b205959834ff096aa7c5b6f83b98d";
 export const APP_CSS_PLACEHOLDER = "__HRANESS_STYLEX_CSS__";
 
 export type AppPublicationFailureBoundary =
@@ -153,7 +156,7 @@ function publicationPath(path: string): boolean {
 }
 
 /** Copy values, not mutable bundler records, and bind the entry to its facade. */
-export function snapshotAppGraph(value: unknown, absoluteEntry: string, appearance: Pick<HraAppearanceAsset, "source">): AppGraph {
+export function snapshotAppGraph(value: unknown, absoluteEntry: string, appearance: Pick<OompaAppearanceAsset, "source">): AppGraph {
   const result = record(value);
   assert.ok(Array.isArray(result.output) && result.output.length > 0 && result.output.length < MAX_FILES);
   const entries: string[] = [];
@@ -208,7 +211,18 @@ export function prepareAppShell(
   assert.equal((source.match(/<script\b/giu) ?? []).length, 1);
   assert.equal(source.split("</head>").length - 1, 1);
   assert.ok(!/<!--|<\?|<!\[CDATA\[|<(?:template|noscript|svg|math)\b/iu.test(source), "The app shell must retain its active native HTML boundary");
-  assert.ok(!/<(?:style|link|base)\b|\bstyle\s*=/iu.test(source), "Unexpected authored shell stylesheet or inline style");
+  const icons = [...source.matchAll(/<link rel="icon" type="image\/svg\+xml" href="data:image\/svg\+xml;base64,([A-Za-z0-9+/=]{1,512})">/gu)];
+  assert.equal(icons.length, 1, "The app must have exactly one canonical favicon");
+  const icon = icons[0];
+  assert.ok(icon !== undefined && icon[1] !== undefined);
+  const iconBytes = Buffer.from(icon[1], "base64");
+  assert.equal(iconBytes.toString("base64"), icon[1], "Favicon encoding must be canonical");
+  assert.equal(appSha256(iconBytes), APP_FAVICON_SHA256, "Unreviewed app favicon bytes");
+  assert.equal(source.split("<head>").length - 1, 1);
+  const head = source.indexOf("<head>");
+  assert.equal(source.slice(0, head).trimEnd(), `<!doctype html>\n${HTML_TAG}`, "Unexpected authored shell head boundary");
+  assert.ok(source.slice(head + "<head>".length).trimStart().startsWith(icon[0]), "Favicon must start the active app head");
+  assert.ok(!/<(?:style|link|base)\b|\bstyle\s*=/iu.test(source.replace(icon[0], "")), "Unexpected authored shell stylesheet or inline style");
   assert.ok(!source.includes(APP_CSS_PLACEHOLDER));
   assert.ok(compilerPublicPath(`graphs/client/${graph.entry}`) && graph.entry.endsWith(".js"));
   assert.ok(compilerPublicPath(`graphs/client/${graph.foundation}`) && graph.foundation.endsWith(".css"));
@@ -228,7 +242,7 @@ export function parseAppComplete(value: unknown): readonly AppArtifact[] {
   assert.equal(complete.schemaVersion, 2);
   assert.equal(complete.unionPolicySha256, STYLEX_UNION_POLICY_SHA256);
   assert.equal(complete.state, "complete");
-  assert.equal(complete.generationId, "hra-app");
+  assert.equal(complete.generationId, "oompa-app");
   hash(complete.compilerSha256);
   hash(complete.planSha256);
   assert.ok(Array.isArray(complete.graphs) && complete.graphs.length === 1);
@@ -270,7 +284,7 @@ export function snapshotAppSourceEnvironment(
   environment: Readonly<Record<string, string | undefined>>,
 ): AppSourceEnvironmentSnapshot {
   return parseAppSourceEnvironment({
-    HRA_RELEASE_COMMIT: environment.HRA_RELEASE_COMMIT ?? null,
+    OOMPA_RELEASE_COMMIT: environment.OOMPA_RELEASE_COMMIT ?? null,
     VERCEL: environment.VERCEL ?? null,
     VERCEL_GIT_COMMIT_SHA: environment.VERCEL_GIT_COMMIT_SHA ?? null,
   });
@@ -278,9 +292,9 @@ export function snapshotAppSourceEnvironment(
 
 function parseAppSourceEnvironment(value: unknown): AppSourceEnvironmentSnapshot {
   const environment = record(value);
-  keys(environment, ["HRA_RELEASE_COMMIT", "VERCEL", "VERCEL_GIT_COMMIT_SHA"]);
+  keys(environment, ["OOMPA_RELEASE_COMMIT", "VERCEL", "VERCEL_GIT_COMMIT_SHA"]);
   return Object.freeze({
-    HRA_RELEASE_COMMIT: environmentValue(environment.HRA_RELEASE_COMMIT, "HRA_RELEASE_COMMIT"),
+    OOMPA_RELEASE_COMMIT: environmentValue(environment.OOMPA_RELEASE_COMMIT, "OOMPA_RELEASE_COMMIT"),
     VERCEL: environmentValue(environment.VERCEL, "VERCEL"),
     VERCEL_GIT_COMMIT_SHA: environmentValue(environment.VERCEL_GIT_COMMIT_SHA, "VERCEL_GIT_COMMIT_SHA"),
   });
@@ -290,7 +304,7 @@ function markerEnvironment(
   environment: AppSourceEnvironmentSnapshot,
 ): Readonly<Record<string, string | undefined>> {
   return {
-    ...(environment.HRA_RELEASE_COMMIT === null ? {} : { HRA_RELEASE_COMMIT: environment.HRA_RELEASE_COMMIT }),
+    ...(environment.OOMPA_RELEASE_COMMIT === null ? {} : { OOMPA_RELEASE_COMMIT: environment.OOMPA_RELEASE_COMMIT }),
     ...(environment.VERCEL === null ? {} : { VERCEL: environment.VERCEL }),
     ...(environment.VERCEL_GIT_COMMIT_SHA === null ? {} : { VERCEL_GIT_COMMIT_SHA: environment.VERCEL_GIT_COMMIT_SHA }),
   };
@@ -300,7 +314,7 @@ function packageManifest(packageBytes: Uint8Array): Record<string, unknown> {
   const text = new TextDecoder("utf-8", { fatal: true }).decode(packageBytes);
   assert.equal(Buffer.from(text).byteLength, packageBytes.byteLength, "The root package manifest must be canonical UTF-8 bytes");
   const manifest = record(JSON.parse(text) as unknown);
-  assert.equal(manifest.name, "@hraness/hra", "The app source marker requires the HRA root package");
+  assert.equal(manifest.name, "@hraness/oompa", "The app source marker requires the Oompa root package");
   return manifest;
 }
 
@@ -316,7 +330,7 @@ export function createAppSourceMarkerEvidence(
   assert.ok(packageBytes.byteLength > 0 && packageBytes.byteLength <= MAX_FILE_BYTES, "The root package manifest exceeds its size bound");
   const manifest = packageManifest(packageBytes);
   const environment = parseAppSourceEnvironment({
-    HRA_RELEASE_COMMIT: environmentValue.HRA_RELEASE_COMMIT ?? null,
+    OOMPA_RELEASE_COMMIT: environmentValue.OOMPA_RELEASE_COMMIT ?? null,
     VERCEL: environmentValue.VERCEL ?? null,
     VERCEL_GIT_COMMIT_SHA: environmentValue.VERCEL_GIT_COMMIT_SHA ?? null,
   });
@@ -598,7 +612,7 @@ export function beginAppProcessCustody(
   assert.ok(/^build-[A-Za-z0-9_-]{1,128}$/u.test(run), "Invalid app process custody run");
   assert.equal(owners[1].controlDirectory, join(owners[0].controlDirectory, "dev"), "App process custody must fence the build and its dev owner");
   const source = Buffer.from(`${JSON.stringify({
-    kind: "hra-app-process-custody", run, schemaVersion: 1, token: randomBytes(32).toString("hex"),
+    kind: "oompa-app-process-custody", run, schemaVersion: 1, token: randomBytes(32).toString("hex"),
   })}\n`);
   assert.ok(source.byteLength <= 512);
   const entries: {
@@ -1191,12 +1205,12 @@ export async function stageAppBuild(options: Readonly<{
   assert.equal(STYLEX_COMPLETE_RECORD_SCHEMA_VERSION, 2);
   assert.equal(stylexUnionPolicySha256, STYLEX_UNION_POLICY_SHA256);
   const mount = options.profile === "development" ? "./" : "/";
-  const appearance = await stageHraAppearance(root, run);
+  const appearance = await stageOompaAppearance(root, run);
   const outputDirectory = join(run, "complete");
   const generation = await createStylexGeneration({
     expectedGraphs: [{ adapter: "vite", entrypoints: ["app/src/main.tsx"], id: "client", kind: "client" }],
     finalCssPath: "stylex.css",
-    generationId: "hra-app",
+    generationId: "oompa-app",
     outputDirectory,
     packageManifests: [import.meta.resolve("@hraness/ui/stylex-manifest.json"), import.meta.resolve("@hraness/design-kit/stylex-manifest.json")],
     rootDirectory: root,
@@ -1213,7 +1227,7 @@ export async function stageAppBuild(options: Readonly<{
   assert.deepEqual(await readOrdinary(join(app, "index.html")), authored, "Authored shell changed during build");
   const completed = await finalizeStylexGeneration({ generation, outputDirectory, rootDirectory: root });
   await appearance.verifyInputs();
-  assert.equal(completed, join(outputDirectory, "hra-app"));
+  assert.equal(completed, join(outputDirectory, "oompa-app"));
   const completeBytes = await readOrdinary(join(completed, COMPLETE));
   const compilerProjected = parseAppComplete(JSON.parse(completeBytes.toString("utf8")) as unknown);
   assert.deepEqual(

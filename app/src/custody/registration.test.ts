@@ -7,7 +7,7 @@ import {
   randomKeyBytes,
   type EncryptedEnvelope,
   type WrappedKeyEnvelope,
-} from "../hra/cloud";
+} from "../oompa/cloud";
 import type { KeyEnvelopeEntry } from "../data/wire";
 import {
   browserDeviceLabel,

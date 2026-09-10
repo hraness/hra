@@ -1,6 +1,6 @@
 import * as stylex from "@stylexjs/stylex";
 import { useEffect, useRef } from "react";
-import { mountHraAppearanceMenu } from "../appearance";
+import { mountOompaAppearanceMenu } from "../appearance";
 import { NativeAppearanceMenu } from "./appearance-menu";
 import { appearanceStyles } from "./appearance.stylex";
 
@@ -10,7 +10,7 @@ export function AppearanceButton() {
   useEffect(() => {
     const current = menu.current;
     if (current === null) return;
-    return mountHraAppearanceMenu(current);
+    return mountOompaAppearanceMenu(current);
   }, []);
   return <div {...stylex.props(appearanceStyles.control)}><NativeAppearanceMenu managed ref={menu} /></div>;
 }

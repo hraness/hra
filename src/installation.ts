@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { resolveCloudDeploymentEnvironment, type CloudDeploymentEnvironment } from "./domain/cloud-deployment-environment";
 
 import {
   personalProviderPaths,
@@ -9,8 +10,8 @@ import {
 } from "./storage/paths";
 import { GenerationalSecretCustody } from "./storage/secret-custody";
 
-type HraInstallationCommon = Readonly<{
-  cloudEnvironment: Readonly<{ HRA_CONVEX_URL?: string }>;
+type OompaInstallationCommon = Readonly<{
+  cloudEnvironment: CloudDeploymentEnvironment;
   codexEnvironment(codexHome: string): Promise<Readonly<Record<string, string | undefined>> | undefined>;
   credentialStorePreflight: Readonly<{
     readonly cliAuth: "file";
@@ -24,7 +25,7 @@ type HraInstallationCommon = Readonly<{
   prepareCodexHome(codexHome: string): Promise<void>;
 }>;
 
-export type HraInstallation = HraInstallationCommon & (
+export type OompaInstallation = OompaInstallationCommon & (
   | Readonly<{
       desktopSwitching: true;
       expectedHomeDirectory: null;
@@ -40,13 +41,13 @@ export type HraInstallation = HraInstallationCommon & (
 const noOpPrepareCodexHome = (): Promise<void> => Promise.resolve();
 const defaultCodexEnvironment = (): Promise<undefined> => Promise.resolve(undefined);
 
-export function createProductionInstallation(): HraInstallation {
+export function createProductionInstallation(): OompaInstallation {
   const paths = resolveStatePaths();
-  const cloudDeploymentUrl = process.env.HRA_CONVEX_URL;
+  const cloud = resolveCloudDeploymentEnvironment(process.env);
   return {
-    cloudEnvironment: cloudDeploymentUrl === undefined
-      ? {}
-      : { HRA_CONVEX_URL: cloudDeploymentUrl },
+    // Capturing a conflict must not prevent help, local diagnosis, or stop.
+    // Authority-starting consumers require agreement before their first effect.
+    cloudEnvironment: cloud.environment,
     codexEnvironment: defaultCodexEnvironment,
     credentialStorePreflight: {
       cliAuth: "file",
@@ -64,7 +65,7 @@ export function createProductionInstallation(): HraInstallation {
   };
 }
 
-export function assertInstallationHome(installation: HraInstallation): void {
+export function assertInstallationHome(installation: OompaInstallation): void {
   if (
     installation.expectedHomeDirectory !== null
     && process.env.HOME !== installation.expectedHomeDirectory

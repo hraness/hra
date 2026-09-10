@@ -148,7 +148,7 @@ export type ResolveInteractionAnswersPayload = Readonly<{
  * An attachment larger than `remoteAttachmentLimits.inlineBytes` is refused,
  * not truncated and not silently dropped. A caller that holds larger bytes
  * must attach the file from the custodian machine with
- * `hra session send --attach`; a browser cannot push it through this lane.
+ * `oompa session send --attach`; a browser cannot push it through this lane.
  */
 export const remoteAttachmentLimits = Object.freeze({
   count: 8,
@@ -679,7 +679,7 @@ export type MemorySummarySpace = Readonly<{
 }>;
 
 export type MemorySummaryPeerIdentity = Readonly<{
-  /** Device-scoped digest; never a local HRA session id. */
+  /** Device-scoped digest; never a local Oompa session id. */
   ref: string;
   label: string;
 }>;
@@ -1042,7 +1042,7 @@ function parseRegistryScheduledTasks(
       || !hasExactKeys(entry, ["cadence", "id", "kind", "label", "nextRunAt", "sessionPublicId"])
     ) return null;
     // Old daemons could publish Codex Desktop automation rows. They are
-    // private age-gate inputs, not public HRA schedules, so readers discard
+    // private age-gate inputs, not public Oompa schedules, so readers discard
     // those legacy rows without retaining any of their metadata.
     if (entry.kind === "codex_automation") continue;
     if (

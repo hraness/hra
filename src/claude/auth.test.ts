@@ -13,17 +13,18 @@ import {
   type ClaudeLoginSignalSource,
 } from "./auth";
 import { ClaudeError } from "./errors";
-import { CLAUDE_PIN, CLAUDE_PIN_EFFORT, CLAUDE_PIN_MODEL } from "./pin";
+import { CLAUDE_PIN, CLAUDE_PIN_EFFORT, CLAUDE_PIN_MODEL, CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY } from "./pin";
 import type { PinnedClaudeRuntime } from "./runtime";
 
-const CONFIG_DIR = "/var/hra/profiles/acct/claude-config";
+const CONFIG_DIR = "/var/oompa/profiles/acct/claude-config";
 const encoder = new TextEncoder();
 
 const runtime: PinnedClaudeRuntime = {
-  argv: ["/opt/hra/claude", "--print"],
+  argv: ["/opt/oompa/claude", "--print"],
   effort: CLAUDE_PIN_EFFORT,
-  executablePath: "/opt/hra/claude",
+  executablePath: "/opt/oompa/claude",
   model: CLAUDE_PIN_MODEL,
+  nativeFallback: CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY,
   version: CLAUDE_PIN,
 };
 

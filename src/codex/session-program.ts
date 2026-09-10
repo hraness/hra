@@ -8,7 +8,7 @@ export type CodexTaskFailure =
 
 export type TaskGroup = "requests" | "facts" | "writes" | "dynamic" | "server" | "responses" | "stdout" | "stderr";
 
-export class CodexConnectionWork extends Context.Tag("@hraness/hra/CodexConnectionWork")<
+export class CodexConnectionWork extends Context.Tag("@hraness/oompa/CodexConnectionWork")<
   CodexConnectionWork,
   {
     readonly groups: Readonly<Record<TaskGroup, FiberSet.FiberSet<unknown, never>>>;

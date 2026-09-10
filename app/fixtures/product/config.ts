@@ -27,7 +27,7 @@ export function productIoPlugin(root: string): Plugin {
   const authRoot = `${resolve(root, "app/src/auth")}/`;
   const appearanceStems = ["appearance", "appearance-entry"].map((name) => resolve(root, "app/src", name));
   return {
-    name: "hra-product-preview-io", enforce: "pre",
+    name: "oompa-product-preview-io", enforce: "pre",
     resolveId(source, importer) {
       if (source === "@convex-dev/auth/react") return adapter;
       if (source === "convex" || source.startsWith("convex/") || source.startsWith("@convex-dev/auth/")) {

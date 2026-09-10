@@ -50,7 +50,7 @@ const applyRequest = (operation: Readonly<Record<string, unknown>>) => ({
 });
 
 const applyControl = {
-  argv: ["hra", "work", "apply", "--input-stdin"],
+  argv: ["oompa", "work", "apply", "--input-stdin"],
   encoding: "json",
   substitution: {
     required: true,
@@ -100,7 +100,7 @@ export function workPreparedEffectMessage(effectInput: WorkPreparedEffect): stri
       control: {
         poll: {
           argv: [
-            "hra",
+            "oompa",
             "work",
             "poll",
             effect.workId,
@@ -153,7 +153,7 @@ export function workPreparedEffectMessage(effectInput: WorkPreparedEffect): stri
     control: {
       poll: {
         argv: [
-          "hra",
+          "oompa",
           "work",
           "poll",
           effect.workId,
@@ -164,7 +164,7 @@ export function workPreparedEffectMessage(effectInput: WorkPreparedEffect): stri
         attemptRevision: ATTEMPT_REVISION,
       },
       inspectDependency: {
-        argvTemplate: ["hra", "work", "task", "$DEPENDENCY_TASK_ID"],
+        argvTemplate: ["oompa", "work", "task", "$DEPENDENCY_TASK_ID"],
       },
       apply: applyControl,
       requests: {

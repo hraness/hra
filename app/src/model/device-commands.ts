@@ -7,7 +7,7 @@ import {
   type DeviceCommandResultPayload,
   type SupportedPreset,
   type NotificationHoursUpdate,
-} from "../hra/cloud";
+} from "../oompa/cloud";
 import type { MachineView } from "./settings-view";
 
 /**
@@ -255,13 +255,13 @@ export type DeviceCommandNotice = Readonly<{ tone: "error" | "pending" | "settle
 
 const refusalNotices: Readonly<Record<string, string>> = {
   ACCOUNT_LINKING_DENIED:
-    "Account linking from the browser is off on that machine. Run `hra remote allow account-linking` there first.",
+    "Account linking from the browser is off on that machine. Run `oompa remote allow account-linking` there first.",
   ACCOUNT_LOGIN_RELAY_UNAVAILABLE:
-    "That machine could not relay a login link. Run `hra account login <account>` on the machine instead.",
+    "That machine could not relay a login link. Run `oompa account login <account>` on the machine instead.",
   ACCOUNT_LOGIN_NOT_AVAILABLE:
     "A new login can start only while that account is signed out on the machine.",
   DEVICE_COMMANDS_DENIED:
-    "That machine is not accepting commands from other devices. Run `hra remote allow device-commands` there.",
+    "That machine is not accepting commands from other devices. Run `oompa remote allow device-commands` there.",
   DEVICE_COMMAND_ACCOUNT_SIGNED_OUT: "That account is signed out on the machine.",
   DEVICE_COMMAND_ACCOUNT_UNKNOWN: "That machine no longer has that account.",
   DEVICE_COMMAND_DAILY_CAP: "This device has reached its daily limit on that machine.",

@@ -27,7 +27,7 @@ import {
   parseDevicePublicKeyJson,
   parseEncryptedEnvelope,
   type EncryptedEnvelope,
-} from "../hra/cloud";
+} from "../oompa/cloud";
 import { createCancellation } from "../lib/cancellation";
 import { listDevices, presenceCurrent } from "./functions";
 import { parsePresenceResponse, type DeviceStatus } from "./wire";
@@ -171,7 +171,7 @@ const emptyDetail: DeviceDetail = { fingerprint: null, label: null };
 /**
  * The device rows with what the reader can add locally: the decrypted label
  * where the account key covers it, and the key fingerprint an operator compares
- * before running `hra device approve`.
+ * before running `oompa device approve`.
  */
 export function useDevices(): Readonly<{ devices: readonly DeviceView[]; loading: boolean }> {
   const custody = useCustody();

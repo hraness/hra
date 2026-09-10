@@ -6,9 +6,9 @@
 //
 //   bun ./scripts/check-install-pins.ts             working-tree check
 //   bun ./scripts/check-install-pins.ts --update    re-pin CLI and normalizer digests
-//   bun ./scripts/check-install-pins.ts --prepare-release v0.7.1
+//   bun ./scripts/check-install-pins.ts --prepare-release v0.8.0
 //                                                    re-pin the public runtime digest
-//   bun ./scripts/check-install-pins.ts --release-tag v0.7.1
+//   bun ./scripts/check-install-pins.ts --release-tag v0.8.0
 //                                                    working-tree check plus the public-command proof
 
 import { createHash } from "node:crypto";
@@ -16,11 +16,11 @@ import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 
-import { HRA_INSTALL_ARCHIVE_URL, HRA_INSTALL_PREFLIGHT_SOURCE_SHA256, HRA_INSTALL_PREFLIGHT_SOURCE_URL } from "../src/install-preflight";
-import { HRA_INSTALL_CLI_SHA256 } from "../src/install-normalizer";
+import { OOMPA_INSTALL_ARCHIVE_URL, OOMPA_INSTALL_PREFLIGHT_SOURCE_SHA256, OOMPA_INSTALL_PREFLIGHT_SOURCE_URL } from "../src/install-preflight";
+import { OOMPA_INSTALL_CLI_SHA256 } from "../src/install-normalizer";
 import {
-  HRA_INSTALL_CLI_SHA256 as HRA_RUNTIME_INSTALL_CLI_SHA256,
-  HRA_INSTALL_NORMALIZER_SHA256,
+  OOMPA_INSTALL_CLI_SHA256 as OOMPA_RUNTIME_INSTALL_CLI_SHA256,
+  OOMPA_INSTALL_NORMALIZER_SHA256,
 } from "../src/install-preflight-runtime";
 
 const cliPath = "src/cli.ts";
@@ -58,12 +58,12 @@ type ReleasePinUrls = Readonly<{
 export async function readInstallPins(repositoryRoot: string): Promise<InstallPinReport> {
   return {
     cli: {
-      expected: HRA_INSTALL_CLI_SHA256,
-      runtimeExpected: HRA_RUNTIME_INSTALL_CLI_SHA256,
+      expected: OOMPA_INSTALL_CLI_SHA256,
+      runtimeExpected: OOMPA_RUNTIME_INSTALL_CLI_SHA256,
       actual: await sha256File(repositoryRoot, cliPath),
     },
-    normalizer: { expected: HRA_INSTALL_NORMALIZER_SHA256, actual: await sha256File(repositoryRoot, normalizerPath) },
-    runtime: { publicCommand: HRA_INSTALL_PREFLIGHT_SOURCE_SHA256, actual: await sha256File(repositoryRoot, runtimePath) },
+    normalizer: { expected: OOMPA_INSTALL_NORMALIZER_SHA256, actual: await sha256File(repositoryRoot, normalizerPath) },
+    runtime: { publicCommand: OOMPA_INSTALL_PREFLIGHT_SOURCE_SHA256, actual: await sha256File(repositoryRoot, runtimePath) },
   };
 }
 
@@ -89,8 +89,8 @@ export function releasePinDrift(
   releaseTag: string,
   packageVersion: string,
   urls: ReleasePinUrls = {
-    archive: HRA_INSTALL_ARCHIVE_URL,
-    runtimeSource: HRA_INSTALL_PREFLIGHT_SOURCE_URL,
+    archive: OOMPA_INSTALL_ARCHIVE_URL,
+    runtimeSource: OOMPA_INSTALL_PREFLIGHT_SOURCE_URL,
   },
 ): string[] {
   const drift = workingTreePinDrift(report);
@@ -100,9 +100,9 @@ export function releasePinDrift(
   if (report.runtime.publicCommand !== report.runtime.actual) {
     drift.push(`${runtimePath} digest ${report.runtime.actual} is not the public command digest ${report.runtime.publicCommand}`);
   }
-  const expectedRuntimeUrl = `https://raw.githubusercontent.com/hraness/hra/${tag}/src/install-preflight-runtime.ts`;
+  const expectedRuntimeUrl = `https://raw.githubusercontent.com/hraness/oompa/${tag}/src/install-preflight-runtime.ts`;
   if (urls.runtimeSource !== expectedRuntimeUrl) drift.push(`public command runtime URL is not ${expectedRuntimeUrl}`);
-  const expectedArchiveUrl = `https://github.com/hraness/hra/releases/download/${tag}/hraness-hra-${packageVersion}.tgz`;
+  const expectedArchiveUrl = `https://github.com/hraness/oompa/releases/download/${tag}/hraness-oompa-${packageVersion}.tgz`;
   if (urls.archive !== expectedArchiveUrl) drift.push(`public command archive URL is not ${expectedArchiveUrl}`);
   return drift;
 }
@@ -139,26 +139,26 @@ export function assertCommittedInstallPinsForRelease(
   const report: InstallPinReport = {
     cli: {
       actual: sha256Source(sources.cli, cliPath),
-      expected: requireExportedString(sources.normalizer, "HRA_INSTALL_CLI_SHA256"),
-      runtimeExpected: requireExportedString(sources.runtime, "HRA_INSTALL_CLI_SHA256"),
+      expected: requireExportedString(sources.normalizer, "OOMPA_INSTALL_CLI_SHA256"),
+      runtimeExpected: requireExportedString(sources.runtime, "OOMPA_INSTALL_CLI_SHA256"),
     },
     normalizer: {
       actual: sha256Source(sources.normalizer, normalizerPath),
-      expected: requireExportedString(sources.runtime, "HRA_INSTALL_NORMALIZER_SHA256"),
+      expected: requireExportedString(sources.runtime, "OOMPA_INSTALL_NORMALIZER_SHA256"),
     },
     runtime: {
       actual: sha256Source(sources.runtime, runtimePath),
       publicCommand: requireExportedString(
         sources.preflight,
-        "HRA_INSTALL_PREFLIGHT_SOURCE_SHA256",
+        "OOMPA_INSTALL_PREFLIGHT_SOURCE_SHA256",
       ),
     },
   };
   const drift = releasePinDrift(report, releaseTag, manifest.version, {
-    archive: requireExportedString(sources.runtime, "HRA_INSTALL_ARCHIVE_URL"),
+    archive: requireExportedString(sources.runtime, "OOMPA_INSTALL_ARCHIVE_URL"),
     runtimeSource: requireExportedString(
       sources.preflight,
-      "HRA_INSTALL_PREFLIGHT_SOURCE_URL",
+      "OOMPA_INSTALL_PREFLIGHT_SOURCE_URL",
     ),
   });
   if (drift.length > 0) {

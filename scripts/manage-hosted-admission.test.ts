@@ -12,8 +12,8 @@ import {
   BoundedProcessRecoveryJournalError,
 } from "./bounded-process";
 import {
-  HRA_CONVEX_PROJECT_ID,
-  HRA_CONVEX_TEAM_ID,
+  OOMPA_CONVEX_PROJECT_ID,
+  OOMPA_CONVEX_TEAM_ID,
   type ConvexTarget,
   type ConvexTargetVerifier,
 } from "./convex-target";
@@ -22,8 +22,8 @@ const target: ConvexTarget = {
   deploymentId: 7_654_321,
   deploymentName: "steady-otter-321",
   deploymentUrl: "https://steady-otter-321.convex.cloud",
-  projectId: HRA_CONVEX_PROJECT_ID,
-  teamId: HRA_CONVEX_TEAM_ID,
+  projectId: OOMPA_CONVEX_PROJECT_ID,
+  teamId: OOMPA_CONVEX_TEAM_ID,
 };
 const targetArguments = [
   "--deployment", target.deploymentName,

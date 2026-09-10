@@ -9,6 +9,7 @@ import type { DaemonAuthorityReceipt } from "../src/daemon/daemon-lock";
 import type { DaemonIdentity } from "../src/daemon/daemon-startup";
 import {
   assertCompleteGitHistoryPublic,
+  assertGitHistoryPatchPublicText,
   buildGitHistoryEnvironment,
   gitHistoryCommandArguments,
   normalizeGitHistoryPatchForPublicScan,
@@ -206,7 +207,7 @@ if (child.pid === undefined) process.exit(81);
 child.stdout.once("data", (chunk) => {
   const leafPid = Number(chunk.toString("utf8").trim());
   if (!Number.isSafeInteger(leafPid) || leafPid <= 1) process.exit(82);
-  writeFileSync(process.env.HRA_HOSTILE_PID_FILE, JSON.stringify([process.pid, child.pid, leafPid]));
+  writeFileSync(process.env.OOMPA_HOSTILE_PID_FILE, JSON.stringify([process.pid, child.pid, leafPid]));
   process.stdout.write("hostile-ready\\n");
   ${overflow ? "process.stdout.write(Buffer.alloc(2 * 1024 * 1024, 0x78));" : ""}
 });
@@ -276,7 +277,7 @@ const initializeHistoryFixture = async (
   git = (...arguments_: readonly string[]) => requireHistoryFixtureGit(root, ...arguments_),
 ): Promise<string> => {
   await git("init", "--initial-branch=main");
-  await git("config", "user.name", "HRA History Fixture");
+  await git("config", "user.name", "Oompa History Fixture");
   await git("config", "user.email", "history-fixture@example.invalid");
   await writeFile(join(root, "document.txt"), body, "utf8");
   await git("add", "document.txt");
@@ -294,6 +295,115 @@ const runBoundedCanonicalHistoryPatch = async (
   ["--no-pager", ...gitHistoryCommandArguments({ commit, kind })],
   historyFixtureCommandOptions(root, timeout, "package-history-fixture-render"),
 );
+
+describe("Git history generated hunk metadata", () => {
+  const partialPackage = ["@hraness", "direc"].join("/");
+  const privatePackage = ["@unreviewed", "package"].join("/");
+  const heading = `@@ -12,4 +12,4 @@ Public package ${partialPackage}`;
+
+  test("classifies authored text without treating a truncated generated heading as a package", () => {
+    const patch = `${heading}\n unchanged\n-previous\n+current\n`;
+    expect(() => assertPublicText(patch, "raw generated heading")).toThrow("PRIVATE_SCOPE");
+    expect(() => assertGitHistoryPatchPublicText(patch, "canonical history patch")).not.toThrow();
+    for (const range of ["@@ -0,0 +1 @@", "@@ -1 +0,0 @@", "@@ -12 +12,2 @@"]) {
+      expect(() => assertGitHistoryPatchPublicText(`${range} ${partialPackage}\n+public\n`, "hunk range"))
+        .not.toThrow();
+    }
+  });
+
+  test("retains added, removed, context and malformed-header package refusals", () => {
+    for (const prefix of ["+", "-", " ", "++", "--"]) {
+      for (const body of [privatePackage, `@@ -1 +1 @@ ${privatePackage}`]) {
+        expect(() => assertGitHistoryPatchPublicText(`${heading}\n${prefix}${body}\n`, "authored history"))
+          .toThrow("PRIVATE_SCOPE");
+      }
+    }
+    for (const malformed of [
+      "@@@ -1 +1 @@@", "@@ -01 +1 @@", "@@ -1 +01 @@", "@@ -x +1 @@",
+      "@@ -1,-1 +1 @@", "@@ -1 +1 @@missing-space", "@@ -1 +1 @", "@@ -1 +1 @@\t",
+    ]) {
+      expect(() => assertGitHistoryPatchPublicText(`${malformed} ${privatePackage}\n`, "malformed heading"))
+        .toThrow("PRIVATE_SCOPE");
+    }
+    expect(() => assertGitHistoryPatchPublicText(`diff --git a/${privatePackage} b/public\n`, "path metadata"))
+      .toThrow("PRIVATE_SCOPE");
+  });
+
+  test("does not interpret embedded Unicode or carriage-return separators as Git line boundaries", () => {
+    for (const separator of ["\r", "\u2028", "\u2029"]) {
+      for (const prefix of ["+", "-", " ", ""]) {
+        expect(() => assertGitHistoryPatchPublicText(
+          `${prefix}public${separator}@@ -1 +1 @@ ${privatePackage}\n`, "embedded separator",
+        )).toThrow("PRIVATE_SCOPE");
+      }
+      expect(() => assertGitHistoryPatchPublicText(
+        `@@ -1 +1 @@ harmless${separator}${privatePackage}\n`, "noncanonical heading",
+      )).toThrow("PRIVATE_SCOPE");
+    }
+  });
+
+  test("retains sensitive checks even in generated heading metadata", () => {
+    const secret = ["github", "pat", "abcdefghijklmnopqrstuvwxyz123456"].join("_");
+    const privatePath = ["", "Users", "fixture", "private", "source.ts"].join("/");
+    for (const [value, code] of [[secret, "SECRET_SHAPE"], [privatePath, "ABSOLUTE_USER_PATH"]] as const) {
+      for (const prefix of ["@@ -1 +1 @@ ", "+", "-", " "]) {
+        expect(() => assertGitHistoryPatchPublicText(`${prefix}${value}\n`, "sensitive history"))
+          .toThrow(code);
+      }
+    }
+  });
+
+  test("preserves authored package detection for arbitrary bounded context", () => {
+    fc.assert(fc.property(fc.stringMatching(/^[a-z0-9 ]{0,40}$/u), fc.constantFrom("+", "-", " "),
+      (context, prefix) => {
+        const patch = `@@ -1,2 +1,2 @@ ${context}${partialPackage}\n${prefix}${context}${privatePackage}\n`;
+        expect(() => assertGitHistoryPatchPublicText(patch, "authored package vector")).toThrow("PRIVATE_SCOPE");
+      }), { seed: 20260909, numRuns: 40 });
+  });
+
+  test("admits real Git-truncated public headings while still scanning every historical commit", async () => {
+    const remaining = createHistoryRenderingBudget();
+    const root = resolve(await mkdtemp(join(tmpdir(), "oompa-history-hunk-heading-")));
+    const git = async (...arguments_: readonly string[]) => requireHistoryFixtureGitOutput(
+      await runHistoryFixtureGit(root, arguments_, remaining()),
+    );
+    const title = "The isolated product demos on oompa.dev incorporate MIT-licensed `@hraness/direct` v0.7.0.";
+    const before = `${title}\n\n\n\n\n before\n before\n before\n old\n`;
+    try {
+      await initializeHistoryFixture(root, before, git);
+      await writeFile(join(root, "document.txt"), before.replace(" old\n", " current\n"), "utf8");
+      await git("commit", "-am", "public heading update");
+      const commit = await git("rev-parse", "HEAD");
+      const patch = requireGitHistoryOutput("Truncated hunk heading", await runBoundedCanonicalHistoryPatch(
+        root, commit, "public_patch", remaining(),
+      ));
+      expect(patch.split("\n").filter((line) => line.startsWith("@@ ")))
+        .toEqual([`@@ -6,4 +6,4 @@ ${title.slice(0, 80)}`]);
+      expect(title.slice(0, 80)).toContain(partialPackage);
+      expect(() => assertPublicText(patch, "raw Git heading")).toThrow("PRIVATE_SCOPE");
+      expect(() => assertGitHistoryPatchPublicText(patch, "canonical Git heading")).not.toThrow();
+      await expect(assertCompleteGitHistoryPublic(root)).resolves.toBeUndefined();
+      const privateBody = `Private heading ${privatePackage}\n\n\n\n\n before\n before\n before\n old\n`;
+      await writeFile(join(root, "private.txt"), privateBody, "utf8");
+      await git("add", "private.txt");
+      await git("commit", "-m", "negative history fixture");
+      await writeFile(join(root, "private.txt"), privateBody.replace(" old\n", " current\n"), "utf8");
+      await git("commit", "-am", "unchanged private heading");
+      const privateHeadingPatch = requireGitHistoryOutput("Unchanged private heading", await runBoundedCanonicalHistoryPatch(
+        root, await git("rev-parse", "HEAD"), "public_patch", remaining(),
+      ));
+      expect(privateHeadingPatch.split("\n").filter((line) => line.includes(privatePackage)))
+        .toEqual([`@@ -6,4 +6,4 @@ Private heading ${privatePackage}`]);
+      expect(() => assertGitHistoryPatchPublicText(privateHeadingPatch, "generated private heading")).not.toThrow();
+      await expect(assertCompleteGitHistoryPublic(root)).rejects.toThrow("PRIVATE_SCOPE");
+      await writeFile(join(root, "private.txt"), "public successor\n", "utf8");
+      await git("commit", "-am", "public successor");
+      await expect(assertCompleteGitHistoryPublic(root)).rejects.toThrow("PRIVATE_SCOPE");
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  }, 30_000);
+});
 
 describe("Git hunk section scope projection", () => {
   const truncated = ["@hraness", "direc"].join("/");
@@ -361,13 +471,17 @@ describe("Git hunk section scope projection", () => {
     const scan = source.slice(source.indexOf("export const assertCompleteGitHistoryPublic ="),
       source.indexOf("const assertSessionObservationHelp ="));
     expect(scan).toContain('assertPublicSensitiveText(\n      normalizeGitHistoryPatchForPublicScan(commit, "sensitive_patch", completePatch),');
-    expect(scan.match(/stripGitHunkSectionHeadingsForScopeScan/gu)).toHaveLength(1);
-    expect(scan).toContain('assertPublicText(\n      stripGitHunkSectionHeadingsForScopeScan(\n        normalizeGitHistoryPatchForPublicScan(commit, "public_patch", authoredPatch),\n      ),');
+    expect(scan.match(/assertGitHistoryPatchPublicText/gu)).toHaveLength(1);
+    expect(scan).toContain('assertGitHistoryPatchPublicText(\n      normalizeGitHistoryPatchForPublicScan(commit, "public_patch", authoredPatch),');
+    const wrapper = source.slice(source.indexOf("export const assertGitHistoryPatchPublicText ="),
+      source.indexOf("export const assertCompleteGitHistoryPublic ="));
+    expect(wrapper.match(/stripGitHunkSectionHeadingsForScopeScan/gu)).toHaveLength(1);
+    expect(wrapper).toContain('assertPublicSensitiveText(patch, label);\n  assertPublicText(stripGitHunkSectionHeadingsForScopeScan(patch), label);');
   });
 
   test("scans complete real Git history when a public package is truncated in a generated heading", async () => {
-    const root = resolve(await mkdtemp(join(tmpdir(), "hra-history-section-")));
-    const heading = "The isolated product examples on hra.sh incorporate MIT-licensed `@hraness/direct`.";
+    const root = resolve(await mkdtemp(join(tmpdir(), "oompa-history-section-")));
+    const heading = "The isolated product demos on oompa.dev incorporate MIT-licensed `@hraness/direct`.";
     const before = `${heading}\n${"\n".repeat(8)}before\n`;
     try {
       await initializeHistoryFixture(root, before);
@@ -424,7 +538,7 @@ describe("installed package daemon ownership", () => {
 
 describe("installed package generic command ownership", () => {
   test("admits only one canonical absolute Bun dependency cache path", () => {
-    const cache = resolve(join(tmpdir(), "hra-bun-cache"));
+    const cache = resolve(join(tmpdir(), "oompa-bun-cache"));
     expect(parsePackageDependencyCache(cache)).toBe(cache);
     expect(parsePackageDependencyCache(`${cache}\n`)).toBe(cache);
     for (const value of [
@@ -460,11 +574,11 @@ describe("installed package generic command ownership", () => {
     const environment = packageDependencyCacheDiscoveryEnvironment({
       BUN_INSTALL: "/canonical-bun-root",
       BUN_INSTALL_CACHE_DIR: "/untrusted-direct-cache-override",
-      HRA_UNRELATED_FIXTURE: "preserved",
+      OOMPA_UNRELATED_FIXTURE: "preserved",
     });
     expect(environment).toEqual({
       BUN_INSTALL: "/canonical-bun-root",
-      HRA_UNRELATED_FIXTURE: "preserved",
+      OOMPA_UNRELATED_FIXTURE: "preserved",
     });
   });
 
@@ -898,7 +1012,7 @@ describe("installed package generic command ownership", () => {
     syntheticPath,
   }) => {
     const remaining = createHistoryRenderingBudget();
-    const root = resolve(await mkdtemp(join(tmpdir(), "hra-history-synthetic-")));
+    const root = resolve(await mkdtemp(join(tmpdir(), "oompa-history-synthetic-")));
     const git = async (...arguments_: readonly string[]) => requireHistoryFixtureGitOutput(
       await runHistoryFixtureGit(root, arguments_, remaining()),
     );
@@ -956,7 +1070,7 @@ describe("installed package generic command ownership", () => {
 
   test("renders both synthetic fixtures in a self-contained first-parent merge patch", async () => {
     const remaining = createHistoryRenderingBudget();
-    const root = resolve(await mkdtemp(join(tmpdir(), "hra-history-synthetic-merge-")));
+    const root = resolve(await mkdtemp(join(tmpdir(), "oompa-history-synthetic-merge-")));
     const git = async (...arguments_: readonly string[]) => requireHistoryFixtureGitOutput(
       await runHistoryFixtureGit(root, arguments_, remaining()),
     );
@@ -1049,10 +1163,10 @@ describe("installed package generic command ownership", () => {
     // Fixed phase labels identify a stall even if the outer test timeout fires.
     // Never print fixture paths, command arguments, configuration, or Git output.
     const phase = (value: "setup" | "render_baseline" | "config" | "render_hostile" | "cleanup") => {
-      console.error(`[hra-history-rendering-fixture] ${value}`);
+      console.error(`[oompa-history-rendering-fixture] ${value}`);
     };
     phase("setup");
-    const root = resolve(await mkdtemp(join(tmpdir(), "hra-history-rendering-")));
+    const root = resolve(await mkdtemp(join(tmpdir(), "oompa-history-rendering-")));
     const git = async (...arguments_: readonly string[]) => requireHistoryFixtureGitOutput(
       await runHistoryFixtureGit(root, arguments_, remaining()),
     );
@@ -1145,7 +1259,7 @@ describe("installed package generic command ownership", () => {
   });
 
   test("keeps synchronous history reads ambient-free, bounded, and nondisclosing", () => {
-    const environment = buildGitHistoryEnvironment("/private/hra-source", "/private/hra-temp");
+    const environment = buildGitHistoryEnvironment("/private/oompa-source", "/private/oompa-temp");
     expect(environment).toEqual({
       GIT_ATTR_NOSYSTEM: "1",
       GIT_CONFIG_GLOBAL: "/dev/null",
@@ -1156,14 +1270,14 @@ describe("installed package generic command ownership", () => {
       GIT_OPTIONAL_LOCKS: "0",
       GIT_PAGER: "cat",
       GIT_TERMINAL_PROMPT: "0",
-      HOME: "/private/hra-source",
+      HOME: "/private/oompa-source",
       LANG: "C",
       LC_ALL: "C",
       PATH: "/usr/bin:/bin",
-      TMPDIR: "/private/hra-temp",
+      TMPDIR: "/private/oompa-temp",
       XDG_CONFIG_HOME: "/dev/null",
     });
-    expect(() => buildGitHistoryEnvironment("relative", "/private/hra-temp"))
+    expect(() => buildGitHistoryEnvironment("relative", "/private/oompa-temp"))
       .toThrow("absolute and normalized");
 
     const safe = projectGitHistorySpawnResult({
@@ -1212,7 +1326,7 @@ describe("installed package generic command ownership", () => {
   });
 
   test("scans resolution-only merge content against the first parent", async () => {
-    const root = await mkdtemp(join(tmpdir(), "hra-history-merge-"));
+    const root = await mkdtemp(join(tmpdir(), "oompa-history-merge-"));
     try {
       await initializeHistoryFixture(root);
       const document = join(root, "document.txt");
@@ -1240,7 +1354,7 @@ describe("installed package generic command ownership", () => {
   test("scans roots, deleted content, side refs, and unreplaced objects", async () => {
     const sentinel = ["sk", "proj", "C".repeat(24)].join("-");
     for (const scenario of ["deleted-root", "side-ref", "replacement"] as const) {
-      const root = await mkdtemp(join(tmpdir(), `hra-history-${scenario}-`));
+      const root = await mkdtemp(join(tmpdir(), `oompa-history-${scenario}-`));
       try {
         const rootCommit = await initializeHistoryFixture(
           root,
@@ -1269,7 +1383,7 @@ describe("installed package generic command ownership", () => {
   }, 30_000);
 
   test("forces binary-classified historical blobs through text policy", async () => {
-    const root = await mkdtemp(join(tmpdir(), "hra-history-binary-text-"));
+    const root = await mkdtemp(join(tmpdir(), "oompa-history-binary-text-"));
     try {
       await initializeHistoryFixture(root);
       const sentinel = Buffer.from([
@@ -1295,7 +1409,7 @@ describe("installed package generic command ownership", () => {
   }, 30_000);
 
   test("keeps lockfile scope exemption narrow and refuses shallow history", async () => {
-    const root = await mkdtemp(join(tmpdir(), "hra-history-lock-policy-"));
+    const root = await mkdtemp(join(tmpdir(), "oompa-history-lock-policy-"));
     try {
       const head = await initializeHistoryFixture(root);
       const lockfile = join(root, "bun.lock");
@@ -1323,7 +1437,7 @@ describe("installed package generic command ownership", () => {
       'await run("npm", ["pack", "--ignore-scripts", "--pack-destination"',
       '["-xzpf", archive, "-C", inspectionDirectory]',
       '["add", "--backend=copyfile", "--ignore-scripts", archive]',
-      '["-e", "await import(\'@hraness/hra\')"]',
+      '["-e", "await import(\'@hraness/oompa\')"]',
       'run(executable, ["--help"]',
       'run(executable, ["--version"]',
       'run(executable, ["doctor", "--offline", "--json"]',
@@ -1356,7 +1470,7 @@ describe("installed package generic command ownership", () => {
           ["-e", hostilePtyProcessTreeSource(scenario.overflow)],
           {
             cwd: root,
-            env: { ...process.env, HRA_HOSTILE_PID_FILE: pidFile },
+            env: { ...process.env, OOMPA_HOSTILE_PID_FILE: pidFile },
             outputMaximumBytes: 64,
             timeoutMs: scenario.timeoutMs,
           },
@@ -1386,7 +1500,7 @@ describe("installed package generic command ownership", () => {
 
 describe("installed package pseudo-terminal acceptance", () => {
   test("waits for the complete authority line across every stdout split", () => {
-    const marker = "__HRA_PTY_AUTHORITY_fixture__";
+    const marker = "__OOMPA_PTY_AUTHORITY_fixture__";
     for (const ending of ["\n", "\r\n"] as const) {
       const line = `\n${marker}\t23456${ending}`;
       for (let split = 0; split < line.length; split += 1) {
@@ -1466,7 +1580,7 @@ describe("installed package pseudo-terminal acceptance", () => {
 
   test("uses each supported operating system's real script interface without interpolating macOS arguments", () => {
     expect(pseudoTerminalScriptArguments("darwin", "/tmp/wrapper path", [
-      "/tmp/hra path",
+      "/tmp/oompa path",
       "--help",
     ])).toEqual([
       "-q",
@@ -1474,26 +1588,26 @@ describe("installed package pseudo-terminal acceptance", () => {
       "/dev/null",
       "/bin/sh",
       "/tmp/wrapper path",
-      "/tmp/hra path",
+      "/tmp/oompa path",
       "--help",
     ]);
     expect(pseudoTerminalScriptArguments("linux", "/tmp/wrapper path", [
-      "/tmp/hra path",
+      "/tmp/oompa path",
       "apostrophe'value",
     ])).toEqual([
       "-q",
       "-e",
       "-c",
-      "'/bin/sh' '/tmp/wrapper path' '/tmp/hra path' 'apostrophe'\\''value'",
+      "'/bin/sh' '/tmp/wrapper path' '/tmp/oompa path' 'apostrophe'\\''value'",
       "/dev/null",
     ]);
-    expect(() => pseudoTerminalScriptArguments("win32", "wrapper", ["hra"]))
+    expect(() => pseudoTerminalScriptArguments("win32", "wrapper", ["oompa"]))
       .toThrow("unsupported on win32");
   });
 
   test("drives the actual shell terminal through account and session selection and exact slash payloads", async () => {
     if (process.platform !== "darwin" && process.platform !== "linux") return;
-    const root = await mkdtemp(join(tmpdir(), "hra-pty-test-"));
+    const root = await mkdtemp(join(tmpdir(), "oompa-pty-test-"));
     const home = join(root, "home");
     const temporaryDirectory = join(root, "tmp");
     await mkdir(home, { mode: 0o700 });
@@ -1516,18 +1630,18 @@ describe("installed package pseudo-terminal acceptance", () => {
         },
         steps: [
           { expect: PTY_BEGIN_MARKER },
-          { expect: "HRA shell. /help lists commands; /exit leaves the daemon running." },
-          { expect: "hra> ", write: "/account fixture\n" },
+          { expect: "Oompa shell. /help lists commands; /exit leaves the daemon running." },
+          { expect: "oompa> ", write: "/account fixture\n" },
           { expect: `Selected account acct_${"1".repeat(32)}.` },
-          { expect: "hra[", write: "/session fixture\n" },
+          { expect: "oompa[", write: "/session fixture\n" },
           { expect: `Selected session sess_${"2".repeat(32)}.` },
           { expect: "Live updates unavailable:" },
-          { expect: "hra[", write: "//slash-one\n" },
-          { expect: "hra[", write: "/send /slash-two\n" },
-          { expect: "hra[", write: "/watch\n" },
+          { expect: "oompa[", write: "//slash-one\n" },
+          { expect: "oompa[", write: "/send /slash-two\n" },
+          { expect: "oompa[", write: "/watch\n" },
           { expect: "WATCH_STARTED", write: "\u0003" },
-          { expect: "hra[", write: "//after-watch\n" },
-          { expect: "hra[", write: "/exit\n" },
+          { expect: "oompa[", write: "//after-watch\n" },
+          { expect: "oompa[", write: "/exit\n" },
           { expect: "Deterministic PTY shell preserved // and /send payloads across watch cancellation." },
         ],
         temporaryDirectory,
@@ -1545,7 +1659,7 @@ describe("installed package pseudo-terminal acceptance", () => {
   ] as const) {
     test(`kills the exact hostile PTY process tree after ${scenario.name} and returns within a hard bound`, async () => {
       if (process.platform !== "darwin" && process.platform !== "linux") return;
-      const root = await mkdtemp(join(tmpdir(), "hra-pty-hostile-"));
+      const root = await mkdtemp(join(tmpdir(), "oompa-pty-hostile-"));
       const temporaryDirectory = join(root, "tmp");
       const pidFile = join(root, "owned-pids.json");
       await mkdir(temporaryDirectory, { mode: 0o700 });
@@ -1557,7 +1671,7 @@ describe("installed package pseudo-terminal acceptance", () => {
           cwd: root,
           environment: {
             ...process.env,
-            HRA_HOSTILE_PID_FILE: pidFile,
+            OOMPA_HOSTILE_PID_FILE: pidFile,
           },
           steps: [
             { expect: PTY_BEGIN_MARKER },

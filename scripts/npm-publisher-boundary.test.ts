@@ -21,14 +21,14 @@ const exactIdentity = {
   GITHUB_REF: "refs/tags/v0.6.1",
   GITHUB_REF_NAME: "v0.6.1",
   GITHUB_REF_TYPE: "tag",
-  GITHUB_REPOSITORY: "hraness/hra",
+  GITHUB_REPOSITORY: "hraness/oompa",
   GITHUB_REPOSITORY_ID: "1343008607",
   GITHUB_REPOSITORY_OWNER: "hraness",
   GITHUB_REPOSITORY_OWNER_ID: "307125679",
   GITHUB_SERVER_URL: "https://github.com",
   GITHUB_SHA: "a".repeat(40),
   GITHUB_WORKFLOW: "Release",
-  GITHUB_WORKFLOW_REF: "hraness/hra/.github/workflows/release.yml@refs/tags/v0.6.1",
+  GITHUB_WORKFLOW_REF: "hraness/oompa/.github/workflows/release.yml@refs/tags/v0.6.1",
   GITHUB_WORKFLOW_SHA: "a".repeat(40),
   RUNNER_ENVIRONMENT: "github-hosted",
 } as const;
@@ -57,7 +57,7 @@ function fixedSpawn(input: Readonly<{
 }
 
 describe("npm trusted-publisher boundary", () => {
-  test("requires the exact GitHub-hosted HRA release identity", () => {
+  test("requires the exact GitHub-hosted Oompa release identity", () => {
     expect(() => assertNpmPublisherIdentity(exactIdentity, "v0.6.1", "a".repeat(40)))
       .not.toThrow();
     for (const key of Object.keys(exactIdentity)) {

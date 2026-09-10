@@ -148,19 +148,19 @@ const closedFailureReasonMessages = {
   },
   codex_interaction_deadline_expired: {
     code: "CONFLICT",
-    message: "The Codex interaction deadline expired before HRA could apply the response. Refresh pending interactions instead of replaying the expired response.",
+    message: "The Codex interaction deadline expired before Oompa could apply the response. Refresh pending interactions instead of replaying the expired response.",
   },
   codex_home_mismatch: {
     code: "UNAVAILABLE",
-    message: "The Codex home does not match this account's isolated runtime. Run `hra doctor --json` and repair the reported configuration before retrying.",
+    message: "The Codex home does not match this account's isolated runtime. Run `oompa doctor --json` and repair the reported configuration before retrying.",
   },
   codex_effect_indeterminate: {
     code: "RECOVERY_REQUIRED",
-    message: "Codex may have applied the operation, but HRA could not prove its outcome. Reconcile the recorded attempt before retrying.",
+    message: "Codex may have applied the operation, but Oompa could not prove its outcome. Reconcile the recorded attempt before retrying.",
   },
   codex_request_invalid: {
     code: "INVALID_INPUT",
-    message: "Codex rejected HRA's bounded request as invalid. Inspect the command and run `hra doctor --json` before retrying.",
+    message: "Codex rejected Oompa's bounded request as invalid. Inspect the command and run `oompa doctor --json` before retrying.",
   },
   codex_process_exited: {
     code: "UNAVAILABLE",
@@ -168,11 +168,11 @@ const closedFailureReasonMessages = {
   },
   codex_protocol_error: {
     code: "UNAVAILABLE",
-    message: "Codex returned data that violates HRA's pinned protocol. Run `hra doctor --json` and repair or update HRA before retrying.",
+    message: "Codex returned data that violates Oompa's pinned protocol. Run `oompa doctor --json` and repair or update Oompa before retrying.",
   },
   codex_protocol_limit: {
     code: "UNAVAILABLE",
-    message: "Codex data exceeded HRA's bounded protocol limits. Narrow the request where possible or update HRA before trying again.",
+    message: "Codex data exceeded Oompa's bounded protocol limits. Narrow the request where possible or update Oompa before trying again.",
   },
   codex_remote_rejected: {
     code: "UNAVAILABLE",
@@ -180,15 +180,15 @@ const closedFailureReasonMessages = {
   },
   codex_runtime_mismatch: {
     code: "UNAVAILABLE",
-    message: "HRA's pinned Codex runtime is missing or incompatible. Run `hra doctor --json` and repair or reinstall HRA before retrying.",
+    message: "Oompa's pinned Codex runtime is missing or incompatible. Run `oompa doctor --json` and repair or reinstall Oompa before retrying.",
   },
   codex_timeout: {
     code: "UNAVAILABLE",
-    message: "Codex did not complete the operation within HRA's bounded deadline. Inspect current state before deciding whether to start a fresh attempt.",
+    message: "Codex did not complete the operation within Oompa's bounded deadline. Inspect current state before deciding whether to start a fresh attempt.",
   },
   codex_capability_unsupported: {
     code: "UNAVAILABLE",
-    message: "The pinned Codex runtime does not support a capability required for this operation. Run `hra doctor --json` and update or reconfigure HRA before retrying.",
+    message: "The pinned Codex runtime does not support a capability required for this operation. Run `oompa doctor --json` and update or reconfigure Oompa before retrying.",
   },
   local_command_slots_exhausted: {
     code: "UNAVAILABLE",
@@ -647,8 +647,8 @@ export async function callLocalDaemon(input: {
     };
     const deadline = setTimeout(() => {
       settle(() => rejectPromise(connected
-        ? new LocalDaemonIndeterminateError("The HRA daemon did not respond before the deadline.")
-        : new LocalDaemonUnavailableError("The HRA daemon was unavailable before the request deadline.")));
+        ? new LocalDaemonIndeterminateError("The Oompa daemon did not respond before the deadline.")
+        : new LocalDaemonUnavailableError("The Oompa daemon was unavailable before the request deadline.")));
       destroyImmediately();
     }, input.deadlineMs ?? DEFAULT_LOCAL_REQUEST_DEADLINE_MS);
     deadline.unref();
@@ -674,7 +674,7 @@ export async function callLocalDaemon(input: {
     socket.on("data", (chunk) => {
       received = Buffer.concat([received, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)]);
       if (received.byteLength > maximumResponseBytes) {
-        settle(() => rejectPromise(new LocalDaemonIndeterminateError("The HRA daemon returned an oversized response.")));
+        settle(() => rejectPromise(new LocalDaemonIndeterminateError("The Oompa daemon returned an oversized response.")));
         socket.destroy();
         return;
       }
@@ -687,7 +687,7 @@ export async function callLocalDaemon(input: {
         }
         settle(() => resolvePromise(response));
       } catch (error: unknown) {
-        settle(() => rejectPromise(new LocalDaemonIndeterminateError("The HRA daemon returned an invalid response.", error)));
+        settle(() => rejectPromise(new LocalDaemonIndeterminateError("The Oompa daemon returned an invalid response.", error)));
       } finally {
         socket.end();
       }
@@ -703,7 +703,7 @@ export async function callLocalDaemon(input: {
     }));
     socket.once("close", () => {
       if (!settled) settle(() => rejectPromise(connected
-        ? new LocalDaemonIndeterminateError("The HRA daemon closed the connection without a response.")
+        ? new LocalDaemonIndeterminateError("The Oompa daemon closed the connection without a response.")
         : new LocalDaemonUnavailableError("The local daemon connection closed before request dispatch.")));
     });
   });

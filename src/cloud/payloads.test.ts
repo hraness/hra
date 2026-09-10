@@ -732,7 +732,7 @@ describe("memory summary payloads", () => {
     }],
     peerPolicies: [{
       mode: "coordinate",
-      projectLabel: "HRA",
+      projectLabel: "Oompa",
       session: { label: "Planner", ref: digest("a") },
       updatedAt: 1_699_999_997_000,
     }],
@@ -742,7 +742,7 @@ describe("memory summary payloads", () => {
       enrollment: "attached",
       head: { digest: digest("e"), operationSha256: digest("f"), sequence: 7 },
       lastExchangeAt: 1_699_999_999_500,
-      projectLabel: "HRA",
+      projectLabel: "Oompa",
       recentRecords: [{
         key: "release-policy",
         kind: "memory_page",

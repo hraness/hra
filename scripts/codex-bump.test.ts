@@ -36,7 +36,7 @@ const waitForMarker = async (path: string): Promise<void> => {
 
 describe("codex-bump process custody", () => {
   test("the output absence assertion refuses an existing directory", async () => {
-    const root = await mkdtemp(join(tmpdir(), "hra-codex-absence-test-"));
+    const root = await mkdtemp(join(tmpdir(), "oompa-codex-absence-test-"));
     try {
       await expect(expectAbsentPath(root)).rejects.toThrow();
       await expectAbsentPath(join(root, "absent"));
@@ -58,7 +58,7 @@ describe("codex-bump process custody", () => {
   });
 
   test.each(["timeout", "overflow", "cancel"] as const)("collects a %s schema process before removing its output", async (scenario) => {
-    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-codex-custody-test-")));
+    const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-codex-custody-test-")));
     const launcher = join(root, "codex.js"), marker = join(root, "ready.json");
     const cancellation = new AbortController();
     let outputDirectory: string | undefined;
@@ -222,7 +222,7 @@ describe("codex-bump end to end", () => {
   });
 
   test("refuses a repository without an exact dependency", async () => {
-    const root = await mkdtemp(join(tmpdir(), "hra-codex-bump-repo-"));
+    const root = await mkdtemp(join(tmpdir(), "oompa-codex-bump-repo-"));
     try {
       await writeFile(join(root, "package.json"), JSON.stringify({ dependencies: {} }), "utf8");
       const lines: string[] = [];

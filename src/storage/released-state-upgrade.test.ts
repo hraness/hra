@@ -19,8 +19,8 @@ import { Database } from "bun:sqlite";
 import { z } from "zod";
 
 import {
-  assertReleasedHraReadonlySchema,
-  RELEASED_HRA_SCHEMA_VERSION,
+  assertReleasedOompaReadonlySchema,
+  RELEASED_OOMPA_SCHEMA_VERSION,
 } from "../../scripts/fixtures/released-state/v0.5.0/released-readonly-schema-guard";
 import { resolveStatePaths } from "./paths";
 import { StateStore } from "./state-store";
@@ -217,7 +217,7 @@ test("upgrades exact released v0.5.0 state and restores the whole root for downg
     tagCommit: "846f5c99f573f97ce99f1f23ac1ea45d93e63042",
     version: "0.5.0",
   });
-  expect(manifest.state.releasedSchemaVersion).toBe(RELEASED_HRA_SCHEMA_VERSION);
+  expect(manifest.state.releasedSchemaVersion).toBe(RELEASED_OOMPA_SCHEMA_VERSION);
   expect(manifest.state.walCheckpoint).toEqual({ busy: 0, checkpointed: 0, log: 0 });
   expect(manifest.downgradeProof).toEqual({
     probedNewerSchemaVersion: 35,
@@ -228,7 +228,7 @@ test("upgrades exact released v0.5.0 state and restores the whole root for downg
   expect(sqlBytes.byteLength).toBe(manifest.state.sqlBytes);
   expect(sha256(sqlBytes)).toBe(manifest.state.sqlSha256);
 
-  const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-released-upgrade-")));
+  const temporary = await realpath(await mkdtemp(join(tmpdir(), "oompa-released-upgrade-")));
   const releasedRoot = join(temporary, "state");
   const backupRoot = join(temporary, "state.v0.5.0.backup");
   const upgradedRoot = join(temporary, "state.upgraded");
@@ -239,7 +239,7 @@ test("upgrades exact released v0.5.0 state and restores the whole root for downg
       sqlBytes.toString("utf8"),
     );
     expect(materialState(databasePath)).toEqual(manifest.state.expectedRows);
-    expect(() => assertReleasedHraReadonlySchema(databasePath)).not.toThrow();
+    expect(() => assertReleasedOompaReadonlySchema(databasePath)).not.toThrow();
 
     const beforeUpgrade = await materialTree(releasedRoot);
     await cp(releasedRoot, backupRoot, { recursive: true });
@@ -253,7 +253,7 @@ test("upgrades exact released v0.5.0 state and restores the whole root for downg
     let currentSchemaVersion = 0;
     try {
       currentSchemaVersion = (inspector.query("PRAGMA user_version").get() as { user_version: number }).user_version;
-      expect(currentSchemaVersion).toBeGreaterThan(RELEASED_HRA_SCHEMA_VERSION);
+      expect(currentSchemaVersion).toBeGreaterThan(RELEASED_OOMPA_SCHEMA_VERSION);
       expect(inspector.query("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
       expect(inspector.query("PRAGMA foreign_key_check").all()).toEqual([]);
       expect(inspector.query(
@@ -272,6 +272,34 @@ test("upgrades exact released v0.5.0 state and restores the whole root for downg
         revision: 1,
         session_id: manifest.state.expectedRows.sessions[0]?.id,
       });
+      // Migration preserves unsealed legacy input for an explicit recovery
+      // decision; it must neither silently settle it nor mint dispatch proof.
+      expect(inspector.query(
+        "SELECT * FROM queue_attachment_quarantines ORDER BY queue_id,ordinal",
+      ).all()).toEqual(manifest.state.expectedRows.queueEntries.map((entry) => ({
+        queue_id: entry.id,
+        ordinal: 1,
+        session_id: entry.session_id,
+        kind: "quarantined",
+        predecessor: null,
+        expected_session_revision: null,
+        reason: "legacy_identity_unproved",
+        recorded_at: 1_800_000_000_000,
+      })));
+      expect(inspector.query("SELECT * FROM queue_attachment_identities").all()).toEqual([]);
+      expect(inspector.query("SELECT * FROM queue_attachment_identity_anchors").all()).toEqual([]);
+      const dispatchStore = new StateStore(paths, { now: () => 1_800_000_000_000 });
+      try {
+        const beforeDispatch = inspector.serialize();
+        for (const entry of manifest.state.expectedRows.queueEntries) {
+          expect(dispatchStore.hasUnsettledQueueAttachmentQuarantineForSession(entry.session_id)).toBe(true);
+          expect(() => dispatchStore.transitionQueue(entry.id, "pending", "dispatching"))
+            .toThrow("QUEUE_ATTACHMENT_IDENTITY_UNPROVED");
+        }
+        expect(inspector.serialize()).toEqual(beforeDispatch);
+      } finally {
+        dispatchStore.close();
+      }
     } finally {
       inspector.close(false);
     }
@@ -286,19 +314,14 @@ test("upgrades exact released v0.5.0 state and restores the whole root for downg
       migrations: manifest.state.expectedRows.migrations,
     }).toEqual({
       ...manifest.state.expectedRows,
-      queueEntries: manifest.state.expectedRows.queueEntries.map((entry) => ({
-        ...entry,
-        message: "[queue message removed after settlement]",
-        state: "cancelled",
-      })),
       sessions: manifest.state.expectedRows.sessions.map((session) => ({
         ...session,
         revision: session.revision + 1,
         state: "recovery_required",
       })),
     });
-    expect(() => assertReleasedHraReadonlySchema(databasePath))
-      .toThrow(`STATE_SCHEMA_NEWER:${String(currentSchemaVersion)}:${String(RELEASED_HRA_SCHEMA_VERSION)}`);
+    expect(() => assertReleasedOompaReadonlySchema(databasePath))
+      .toThrow(`STATE_SCHEMA_NEWER:${String(currentSchemaVersion)}:${String(RELEASED_OOMPA_SCHEMA_VERSION)}`);
 
     // Rollback is deliberately a whole-root exchange. Overlaying only the old
     // database could leave current sidecars, profile data, or memory epochs in
@@ -308,9 +331,9 @@ test("upgrades exact released v0.5.0 state and restores the whole root for downg
     const restoredDatabasePath = join(releasedRoot, manifest.state.databaseRelativePath);
     expect(await materialTree(releasedRoot)).toBe(beforeUpgrade);
     expect(materialState(restoredDatabasePath)).toEqual(manifest.state.expectedRows);
-    expect(() => assertReleasedHraReadonlySchema(restoredDatabasePath)).not.toThrow();
+    expect(() => assertReleasedOompaReadonlySchema(restoredDatabasePath)).not.toThrow();
     expect(() => new StateStore(resolveStatePaths({ rootDirectory: releasedRoot }), { readonly: true }))
-      .toThrow(`STATE_SCHEMA_MIGRATION_REQUIRED:${String(RELEASED_HRA_SCHEMA_VERSION)}:${String(currentSchemaVersion)}`);
+      .toThrow(`STATE_SCHEMA_MIGRATION_REQUIRED:${String(RELEASED_OOMPA_SCHEMA_VERSION)}:${String(currentSchemaVersion)}`);
   } finally {
     await rm(temporary, { force: true, recursive: true });
   }

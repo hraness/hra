@@ -8,7 +8,7 @@ import { settingsListStyles } from "./settings-list.stylex";
 /**
  * The list and row primitives the settings screen is built from.
  *
- * They are here rather than in `components/ui` because they are HRA layout, not
+ * They are here rather than in `components/ui` because they are Oompa layout, not
  * a general interface primitive: a titled section, a labelled row with a
  * control on the right, and a segmented three-way choice. Every visual is a
  * StyleX recipe in the one same-origin stylesheet, and the one icon is inline

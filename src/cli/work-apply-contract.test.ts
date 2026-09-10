@@ -172,7 +172,7 @@ describe("agent-first work apply boundary", () => {
       version: 1,
       error: {
         code: "INTERNAL",
-        message: "HRA could not complete the request safely.",
+        message: "Oompa could not complete the request safely.",
       },
     });
     expect(target.read().stderr).not.toContain(secret);
@@ -393,7 +393,7 @@ describe("agent-first work apply boundary", () => {
     expect(Buffer.byteLength(encoded, "utf8")).toBeLessThanOrEqual(WORK_OPERATION_MAX_BYTES);
     expect(Buffer.byteLength(encoded, "utf8")).toBeLessThanOrEqual(WORK_PROTOCOL_REQUEST_MAX_BYTES);
 
-    const temporary = await mkdtemp(join(tmpdir(), "hra-work-operation-"));
+    const temporary = await mkdtemp(join(tmpdir(), "oompa-work-operation-"));
     const path = join(temporary, "operation.json");
     await writeFile(path, encoded, { encoding: "utf8", mode: 0o600 });
     const handle = await open(path, "r");
@@ -432,7 +432,7 @@ describe("agent-first work apply boundary", () => {
   });
 
   test("rejects apply input beyond the complete versioned-request ceiling", async () => {
-    const temporary = await mkdtemp(join(tmpdir(), "hra-work-operation-overflow-"));
+    const temporary = await mkdtemp(join(tmpdir(), "oompa-work-operation-overflow-"));
     const path = join(temporary, "operation.json");
     await writeFile(path, "x".repeat(WORK_PROTOCOL_REQUEST_MAX_BYTES + 1), {
       encoding: "utf8",
@@ -517,7 +517,7 @@ describe("agent-first work apply boundary", () => {
         ok: false,
         error: {
           code: "invalid_request",
-          message: "The work request document does not match the strict versioned HRA work protocol.",
+          message: "The work request document does not match the strict versioned Oompa work protocol.",
           retryable: false,
           recovery: "none",
           exitCode: 2,

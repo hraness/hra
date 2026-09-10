@@ -1,6 +1,6 @@
-# HRA Cloud efficiency plugin
+# Oompa Cloud efficiency plugin
 
-The repository marketplace distributes `hra-cloud-efficiency`, a Codex plugin for routing bounded repository work to Codex Cloud. It adds hosted compute and disk parallelism without changing HRA hosted sync, Convex authority, the local scheduler, or the public `@hraness/hra` package.
+The repository marketplace distributes `oompa-cloud-efficiency`, a Codex plugin for routing bounded repository work to Codex Cloud. It adds hosted compute and disk parallelism without changing Oompa hosted sync, Convex authority, the local scheduler, or the public `@hraness/oompa` package.
 
 The local root coordinator and integration owner stay on the caller-selected model. A Cloud worker is recorded as `cloud-default`: current Codex Cloud does not carry a desktop task's selected model or reasoning effort into the hosted task. Cloud usage draws from the same Codex plan allowance as local usage, so the route should have a clear isolation, background-progress, or resource benefit.
 
@@ -17,21 +17,21 @@ Most current plans use token-based Codex credits, while a small set of Enterpris
 Install the Hraness marketplace and both efficiency plugins on each development machine:
 
 ```sh
-codex plugin marketplace add hraness/hra --ref main --sparse .agents/plugins --sparse plugins
-codex plugin add hra-local-efficiency@hraness
-codex plugin add hra-cloud-efficiency@hraness
+codex plugin marketplace add hraness/oompa --ref main --sparse .agents/plugins --sparse plugins
+codex plugin add oompa-local-efficiency@hraness
+codex plugin add oompa-cloud-efficiency@hraness
 ```
 
-Machines that installed the older marketplace snapshot with only `plugins/hra-local-efficiency` must replace it once:
+Machines that installed the older marketplace snapshot with only `plugins/oompa-local-efficiency` must replace it once:
 
 ```sh
 codex plugin marketplace remove hraness
-codex plugin marketplace add hraness/hra --ref main --sparse .agents/plugins --sparse plugins
-codex plugin add hra-local-efficiency@hraness
-codex plugin add hra-cloud-efficiency@hraness
+codex plugin marketplace add hraness/oompa --ref main --sparse .agents/plugins --sparse plugins
+codex plugin add oompa-local-efficiency@hraness
+codex plugin add oompa-cloud-efficiency@hraness
 ```
 
-Start a new Codex task after plugin installation so Codex discovers the skill. In that task, invoke `$hra-cloud-efficiency` and apply then check the machine baseline:
+Start a new Codex task after plugin installation so Codex discovers the skill. In that task, invoke `$oompa-cloud-efficiency` and apply then check the machine baseline:
 
 ```sh
 bun run scripts/bootstrap.ts --apply
@@ -49,7 +49,7 @@ For normal upgrades, refresh the snapshot, reinstall the plugin, start a new tas
 
 ```sh
 codex plugin marketplace upgrade hraness
-codex plugin add hra-cloud-efficiency@hraness
+codex plugin add oompa-cloud-efficiency@hraness
 ```
 
 ## Route work
@@ -66,7 +66,7 @@ Run the route gate locally, then repeat it with `--online` immediately before di
 
 ```sh
 umask 077
-hra-cloud-route \
+oompa-cloud-route \
   --root /absolute/repository \
   --intent edit \
   --owner feature-owner \
@@ -83,8 +83,8 @@ Hard-local requirements are classified before Git inspection, so a valid local d
 Adopt the same marker-bounded routing policy in a repository with:
 
 ```sh
-hra-cloud-adoption --check --root /absolute/repository
-hra-cloud-adoption --apply --root /absolute/repository
+oompa-cloud-adoption --check --root /absolute/repository
+oompa-cloud-adoption --apply --root /absolute/repository
 ```
 
 ## Create environments
@@ -115,7 +115,7 @@ Build a bounded packet containing the repository, branch, exact commit, unique o
 Launch one attempt by default:
 
 ```sh
-hra-cloud-exec \
+oompa-cloud-exec \
   --environment ENVIRONMENT_ID \
   --attempts 1 \
   --route-file /absolute/private/dispatch-ready-route.json \

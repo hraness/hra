@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import fc from "fast-check";
 
-import { parseDeviceRegistryPayload, type DeviceRegistryPayload, type ProfileBindingPayload } from "../hra/cloud";
+import { parseDeviceRegistryPayload, type DeviceRegistryPayload, type ProfileBindingPayload } from "../oompa/cloud";
 import {
   accountBrowserLoginAllowed,
   accountRows,
@@ -43,7 +44,7 @@ function registry(overrides: Partial<DeviceRegistryPayload> = {}): DeviceRegistr
     defaultPreset: "ultra",
     heartbeatAt: now - minute,
     machineLabel: "studio",
-    projects: [{ label: "hra", publicId: "proj_one" }],
+    projects: [{ label: "oompa", publicId: "proj_one" }],
     proseAutorespondConfigured: true,
     scheduledTasks: [
       {
@@ -114,9 +115,63 @@ describe("isMachineOnline", () => {
       now,
     })).toBe(false);
   });
+
+  test("does not use a future heartbeat as evidence that a machine is online", () => {
+    for (const heartbeatAt of [now + 1, now + 10 * registryHeartbeatToleranceMs, Number.MAX_SAFE_INTEGER]) {
+      expect(isMachineOnline({ device: { online: false, status: "active" }, heartbeatAt, now })).toBe(false);
+    }
+  });
+
+  test("includes both boundaries of the recent heartbeat interval", () => {
+    for (const age of [0, registryHeartbeatToleranceMs]) {
+      expect(isMachineOnline({ device: { online: false, status: "active" }, heartbeatAt: now - age, now })).toBe(true);
+    }
+  });
+
+  test("requires finite clock inputs only when relying on the heartbeat fallback", () => {
+    for (const heartbeatAt of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 0, -1, now + 1]) {
+      expect(isMachineOnline({ device: { online: false, status: "active" }, heartbeatAt, now })).toBe(false);
+      expect(isMachineOnline({ device: { online: true, status: "active" }, heartbeatAt, now })).toBe(true);
+    }
+    for (const invalidNow of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      expect(isMachineOnline({ device: { online: false, status: "active" }, heartbeatAt: now, now: invalidNow })).toBe(false);
+      expect(isMachineOnline({ device: { online: true, status: "active" }, heartbeatAt: now, now: invalidNow })).toBe(true);
+    }
+  });
+
+  test("bounds fallback freshness in both time directions without changing presence or device status", () => {
+    fc.assert(fc.property(
+      fc.integer({ min: 1_000_000, max: 2_000_000_000_000 }),
+      fc.integer({ min: -2 * registryHeartbeatToleranceMs, max: 2 * registryHeartbeatToleranceMs }),
+      (clock, offset) => {
+        const heartbeatAt = clock + offset;
+        const expected = heartbeatAt >= clock - registryHeartbeatToleranceMs && heartbeatAt <= clock;
+        expect(isMachineOnline({ device: { online: false, status: "active" }, heartbeatAt, now: clock })).toBe(expected);
+        expect(isMachineOnline({ device: { online: true, status: "active" }, heartbeatAt, now: clock })).toBe(true);
+        for (const status of ["pending", "revoked"] as const) {
+          expect(isMachineOnline({ device: { online: true, status }, heartbeatAt, now: clock })).toBe(false);
+        }
+        expect(isMachineOnline({ device: null, heartbeatAt, now: clock })).toBe(false);
+      },
+    ), { seed: 68103, numRuns: 200 });
+  });
 });
 
 describe("toMachineView", () => {
+  test("preserves a future registry heartbeat without presenting it as live presence", () => {
+    const heartbeatAt = now + minute;
+    const view = toMachineView({
+      device: { online: false, status: "active" },
+      devicePublicId: "dev_one",
+      now,
+      payload: registry({ heartbeatAt }),
+      revision: 7,
+      updatedAt: now,
+    });
+    expect(view.heartbeatAt).toBe(heartbeatAt);
+    expect(view.online).toBe(false);
+  });
+
   test("decodes a registry into the row the machine card renders", () => {
     const notificationHours = {
       endMinute: 1_320,
@@ -158,14 +213,14 @@ describe("toMachineView", () => {
       ["personal", "claude", "signed_out"],
       ["build", "devin", "login_pending"],
     ]);
-    expect(view.projects.map((project) => project.label)).toEqual(["hra"]);
+    expect(view.projects.map((project) => project.label)).toEqual(["oompa"]);
   });
 
   test("renders personal-home consent as a local command in both directions", () => {
     expect(personalSessionAdoptionCommand("codex", false))
-      .toBe("hra session adoption enable <account> --provider codex");
+      .toBe("oompa session adoption enable <account> --provider codex");
     expect(personalSessionAdoptionCommand("claude", true))
-      .toBe("hra session adoption disable --provider claude");
+      .toBe("oompa session adoption disable --provider claude");
   });
 
   test("carries exact provider aggregates and never guesses an older daemon's opt-in", () => {
@@ -214,14 +269,14 @@ describe("toMachineView", () => {
       updatedAt: now,
     });
     expect(view.scheduledTasks.map((task) => [task.label, task.kindLabel])).toEqual([
-      ["morning sweep", "HRA"],
-      ["weekly review", "HRA"],
+      ["morning sweep", "Oompa"],
+      ["weekly review", "Oompa"],
     ]);
     for (const task of view.scheduledTasks) expect(task.machineLabel).toBe("studio");
   });
 
-  test("names the public HRA conversation task kind", () => {
-    expect(scheduledTaskKindLabel("hra_conversation")).toBe("HRA");
+  test("names the public Oompa conversation task kind", () => {
+    expect(scheduledTaskKindLabel("hra_conversation")).toBe("Oompa");
   });
 });
 
@@ -350,7 +405,7 @@ describe("hosted memory supervision", () => {
     }],
     peerPolicies: [{
       mode: "coordinate" as const,
-      projectLabel: "HRA",
+      projectLabel: "Oompa",
       session: { label: "Planner", ref: digest("a") },
       updatedAt: now - 3_000,
     }],
@@ -360,7 +415,7 @@ describe("hosted memory supervision", () => {
       enrollment: "attached" as const,
       head: { digest: digest(headScalar), operationSha256: digest(headScalar), sequence: 4 },
       lastExchangeAt: now - 500,
-      projectLabel: "HRA",
+      projectLabel: "Oompa",
       recentRecords: [{ key: "release-policy", kind: "memory_page" as const, updatedAt: now - 4_000 }],
       recordCount: 3,
       remoteHead: { digest: digest(headScalar), operationSha256: digest(headScalar), sequence: 4 },

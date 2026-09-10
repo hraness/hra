@@ -47,6 +47,8 @@ import {
   automaticRateLimitResetStatusSchema,
 } from "../domain/usage-metrics";
 import { sessionStateReportSchema } from "../domain/session-state";
+import { automaticUsagePolicyCommandResultSchema } from "../domain/usage-policy-command";
+import { providerAccountListResultSchema } from "../domain/provider-account-list";
 import { profileIdSchema, projectIdSchema, sessionIdSchema } from "../domain/values";
 import { publicProviderIdentifierSchema } from "../public-provider-identifier";
 import {
@@ -627,7 +629,7 @@ export class InvalidCommandResponseError extends Error {
   readonly command: LocalCommand["kind"];
 
   constructor(command: LocalCommand["kind"]) {
-    super(`The HRA daemon returned an invalid response for ${command}.`);
+    super(`The Oompa daemon returned an invalid response for ${command}.`);
     this.name = "InvalidCommandResponseError";
     this.command = command;
   }
@@ -1420,6 +1422,32 @@ const assertCommandSuccessData = (command: LocalCommand, data: unknown): void =>
 };
 
 const publicInteractionData = (command: LocalCommand, data: unknown): unknown => {
+  if (command.kind === "account.list" && command.provider !== undefined) {
+    const parsed = providerAccountListResultSchema.safeParse(data);
+    if (!parsed.success || parsed.data.provider !== command.provider) return invalidCommandResponse(command);
+    return parsed.data;
+  }
+  if (command.kind === "usage.auto.status" || command.kind === "usage.auto.set") {
+    const parsed = automaticUsagePolicyCommandResultSchema.safeParse(data);
+    if (!parsed.success) return invalidCommandResponse(command);
+    const result = parsed.data;
+    const providers = command.kind === "usage.auto.status" && command.provider !== undefined
+      ? [command.provider] : ["codex", "claude"];
+    if (result.effective.length !== providers.length
+      || result.effective.some((entry, index) => entry.provider !== providers[index])) {
+      return invalidCommandResponse(command);
+    }
+    if (command.kind === "usage.auto.set") {
+      const change = command.change;
+      if (result.configuration.automaticPolicyRevision !== command.expectedAutomaticPolicyRevision + 1
+        || (change.kind === "set_default"
+          ? result.configuration.defaultEnabled !== change.enabled
+          : result.configuration.overrides[change.provider] !== change.override)) {
+        return invalidCommandResponse(command);
+      }
+    }
+    return result;
+  }
   if (
     command.kind === "autorespond-after-hours.status"
     || command.kind === "autorespond-after-hours.enable"
@@ -1576,7 +1604,7 @@ const renderSessionList = (
   const nextCursor = opaqueCursor(root?.nextCursor);
   if (nextCursor === undefined || !accountId.success) return listing;
   const archived = command.archived ? " --archived" : "";
-  return `${listing}\n\nContinue: hra session list --account ${accountId.data}${archived} --limit ${String(command.limit)} --cursor ${nextCursor}`;
+  return `${listing}\n\nContinue: oompa session list --account ${accountId.data}${archived} --limit ${String(command.limit)} --cursor ${nextCursor}`;
 };
 
 const renderSessionTaskList = (data: unknown): string => {
@@ -1901,9 +1929,9 @@ const renderInteractionList = (
     return listing;
   }
   const invocation = command.kind === "session.interactions"
-    ? ["hra", "session", "interactions", resolvedSession.data]
+    ? ["oompa", "session", "interactions", resolvedSession.data]
     : [
-        "hra",
+        "oompa",
         "interaction",
         "list",
         ...(resolvedSession.success ? [resolvedSession.data] : []),
@@ -1948,7 +1976,7 @@ const renderInteraction = (record: PublicInteraction): string => {
       if (display.workingDirectory !== null) rows.push(`Directory: ${line(display.workingDirectory)}`);
       if (record.state === "pending") {
         rows.push(`Available decisions: ${display.availableDecisions.join(", ")}`);
-        rows.push(`Protected authority: hra interaction inspect ${record.id} --revision ${String(record.revision)}`);
+        rows.push(`Protected authority: oompa interaction inspect ${record.id} --revision ${String(record.revision)}`);
       }
       break;
     case "file_change_approval":
@@ -1972,7 +2000,7 @@ const renderInteraction = (record: PublicInteraction): string => {
             permissions: display.requested.map((permission) => permission.name),
           }))}`);
         }
-        rows.push(`Protected authority: hra interaction inspect ${record.id} --revision ${String(record.revision)}`);
+        rows.push(`Protected authority: oompa interaction inspect ${record.id} --revision ${String(record.revision)}`);
       }
       break;
     case "user_input":
@@ -2002,7 +2030,7 @@ const renderInteraction = (record: PublicInteraction): string => {
       if (display.mode === "form") {
         const fields = display.fields;
         if (fields === undefined) {
-          rows.push("This MCP request cannot be resolved safely through HRA.");
+          rows.push("This MCP request cannot be resolved safely through Oompa.");
           break;
         }
         rows.push(`Fields: ${fields.length === 0 ? "none" : String(fields.length)}`);
@@ -2061,6 +2089,13 @@ const renderSessionStatus = (data: unknown): string => {
     `Interactions: ${String(root.interactions.pendingCount)} pending, ${String(root.interactions.responseInFlightCount)} response in flight`,
     `Events: through ${String(root.eventStream.observedThroughSequence)}, retained from ${String(root.eventStream.floorSequence)}`,
   );
+  if (
+    root.advisory.execution === "terminal"
+    && providerObservation.state === "not_applicable"
+    && providerObservation.reason === "terminal"
+  ) {
+    rows.push("Next: start a new session; Oompa will not resume or replay this terminal provider thread.");
+  }
   if (root.interactions.pending.length > 0) {
     rows.push(
       "",
@@ -2078,7 +2113,7 @@ const renderSessionStatus = (data: unknown): string => {
   if (root.interactions.truncated) {
     rows.push(
       "",
-      `More pending interactions: hra session interactions ${session.id} --pending --limit 100`,
+      `More pending interactions: oompa session interactions ${session.id} --pending --limit 100`,
     );
   }
   return rows.join("\n");
@@ -2086,10 +2121,10 @@ const renderSessionStatus = (data: unknown): string => {
 
 const recoveryCommand = (intent: RecoveryIntent): string => {
   switch (intent.kind) {
-    case "inspect_account": return `hra account show ${intent.accountId}`;
-    case "inspect_session": return `hra session status ${intent.sessionId}`;
-    case "inspect_interaction": return `hra interaction inspect ${intent.interactionId} --revision ${String(intent.expectedRevision)}`;
-    case "show_interaction": return `hra interaction show ${intent.interactionId}`;
+    case "inspect_account": return `oompa account show ${intent.accountId}`;
+    case "inspect_session": return `oompa session status ${intent.sessionId}`;
+    case "inspect_interaction": return `oompa interaction inspect ${intent.interactionId} --revision ${String(intent.expectedRevision)}`;
+    case "show_interaction": return `oompa interaction show ${intent.interactionId}`;
   }
 };
 
@@ -2111,7 +2146,7 @@ const rootAttentionState = (record: RootStatusAttentionRecord): string => {
 const renderRootStatusHuman = (status: RootStatus): string => {
   const counts = status.counts;
   const rows = [
-    "HRA local status",
+    "Oompa local status",
     `Observed: ${instant(status.localObservation.observedAt)}`,
     `Coverage: local ${status.localObservation.coverage}; provider ${status.providerObservation.coverage}; cloud ${status.cloudObservation.coverage}`,
     `Accounts: ${String(counts.accounts.signedIn)} signed in, ${String(counts.accounts.signedOut)} signed out, ${String(counts.accounts.loginPending)} login pending, ${String(counts.accounts.recoveryRequired)} recovery required`,
@@ -2153,7 +2188,7 @@ export function renderRootStatus(data: unknown, json: boolean, output: Output): 
 }
 
 const pluginLifecycleNotice =
-  `Lifecycle: discovery only. Pinned Codex ${CODEX_PIN} combines install, enablement, and browser-capable OAuth, so HRA blocks that compound effect.`;
+  `Lifecycle: discovery only. Pinned Codex ${CODEX_PIN} combines install, enablement, and browser-capable OAuth, so Oompa blocks that compound effect.`;
 
 const renderPluginList = (data: unknown): string => {
   const root = object(data);
@@ -2381,6 +2416,8 @@ const automaticResetRows = (value: unknown): readonly string[] => {
         ? "same-key recovery pending"
         : refresh.state === "retry_pending"
           ? "same-key retry pending"
+          : refresh.state === "suppressed" && refresh.reason === "automatic_policy_disabled"
+            ? "suppressed (automatic management is off)"
           : `${refresh.state.replaceAll("_", " ")} (${detail})`;
     rows.push(`  automatic reset refresh: ${line(label)}`);
   }
@@ -2425,7 +2462,7 @@ const renderAccountUsageHistory = (
   if (cursor !== undefined) {
     output.push(
       "",
-      `Continue: hra account usage-history ${line(page.account.id)} --from ${instant(page.range.fromObservedAt)} --through ${instant(page.range.throughObservedAt)} --limit ${String(command.limit)} --cursor ${cursor}`,
+      `Continue: oompa account usage-history ${line(page.account.id)} --from ${instant(page.range.fromObservedAt)} --through ${instant(page.range.throughObservedAt)} --limit ${String(command.limit)} --cursor ${cursor}`,
     );
   }
   return output.join("\n");
@@ -2509,7 +2546,7 @@ const exactAccountCommand = (
   action: "login" | "login-cancel",
 ): string | null => {
   const parsed = profileIdSchema.safeParse(account.id);
-  return parsed.success ? `hra account ${action} ${parsed.data}` : null;
+  return parsed.success ? `oompa account ${action} ${parsed.data}` : null;
 };
 
 const renderAccountAdd = (data: unknown): string => {
@@ -2655,7 +2692,7 @@ const renderAccountKeyStatus = (root: Record<string, unknown>): string[] => {
       "Account key: pairing required",
       "Recovery: an existing account-key holder must pair this device.",
       "Local Codex data: unaffected.",
-      "No existing key holder: hra device key-loss --acknowledge-no-key-holders",
+      "No existing key holder: oompa device key-loss --acknowledge-no-key-holders",
     ];
   }
   return [
@@ -2663,36 +2700,36 @@ const renderAccountKeyStatus = (root: Record<string, unknown>): string[] => {
     "Local Codex data: unaffected.",
     "Existing encrypted cloud content: cannot be decrypted.",
     "Recovery: search again for an existing account-key holder, then pair the real key.",
-    "Fallback: erase and reinitialize the HRA cloud account only after that renewed holder search is exhausted. The lost account key cannot be regenerated.",
+    "Fallback: erase and reinitialize the Oompa cloud account only after that renewed holder search is exhausted. The lost account key cannot be regenerated.",
   ];
 };
 
 const renderCloudNextAction = (root: Record<string, unknown>): string | null => {
   if (root.configured !== true) {
     return typeof root.diagnostic === "string" && root.unavailability !== "disabled"
-      ? "hra doctor"
+      ? "oompa doctor"
       : null;
   }
   if (object(root.deletion) !== null) return null;
-  if (root.signedIn !== true) return "hra auth login --input-stdin";
-  if (root.automaticRegistrationPending === true) return "hra device pair";
+  if (root.signedIn !== true) return "oompa auth login --input-stdin";
+  if (root.automaticRegistrationPending === true) return "oompa device pair";
   const device = object(root.device);
   if (device?.status === "pending") {
     const deviceId = exactDevicePublicId(device.publicId);
     return deviceId === null
-      ? "hra device list"
-      : `on an active device, run hra device approve ${deviceId}`;
+      ? "oompa device list"
+      : `on an active device, run oompa device approve ${deviceId}`;
   }
   const accountKey = authoritativeAccountKeyStatus(root);
-  if (accountKey?.status === "unrecoverable") return "hra device pair";
-  if (accountKey?.status === "pairing_required") return "hra device pair";
+  if (accountKey?.status === "unrecoverable") return "oompa device pair";
+  if (accountKey?.status === "pairing_required") return "oompa device pair";
   if (Object.hasOwn(root, "accountKey") && root.accountKey !== null && accountKey === null) {
-    return "hra doctor";
+    return "oompa doctor";
   }
   if (
     device?.status === "revoked"
     || (!Object.hasOwn(root, "accountKey") && root.pairingRequired === true)
-  ) return "hra device pair";
+  ) return "oompa device pair";
   return null;
 };
 
@@ -2744,7 +2781,7 @@ const renderAccountKeyLossAcknowledgement = (data: unknown): string => {
     `Account-key loss acknowledgement: ${root.replay === true ? "already recorded locally" : "recorded locally"}.`,
     ...renderAccountKeyStatus(root),
     "No account key, device key, or ciphertext was minted, replaced, or deleted.",
-    "Next: hra device pair",
+    "Next: oompa device pair",
   ].join("\n");
 };
 
@@ -2840,7 +2877,7 @@ const unsettledProjectionRecoveryCommand = (root: Record<string, unknown>): stri
     if (!session.success || typeof entry.idempotencyKey !== "string" || !canonicalUuidV7.test(entry.idempotencyKey)) {
       continue;
     }
-    return `hra sync projection recover ${session.data} --acknowledge-gap --idempotency-key ${entry.idempotencyKey}`;
+    return `oompa sync projection recover ${session.data} --acknowledge-gap --idempotency-key ${entry.idempotencyKey}`;
   }
   return null;
 };
@@ -2849,7 +2886,7 @@ const disabledCloudRestartAction = (root: Record<string, unknown>): string | nul
   if (root.unavailability !== "disabled") return null;
   const reenable = object(root.reenable);
   if (reenable?.kind === "use_hosted_default") {
-    return "unset HRA_CONVEX_URL and restart the daemon";
+    return "unset OOMPA_CONVEX_URL and HRA_CONVEX_URL and restart the daemon";
   }
   if (
     reenable?.kind === "restore_bound_deployment"
@@ -2867,7 +2904,7 @@ const disabledCloudRestartAction = (root: Record<string, unknown>): string | nul
         && url.search === ""
         && url.hash === ""
         && url.origin === reenable.deploymentUrl
-      ) return `set HRA_CONVEX_URL to ${safeDiagnostic(reenable.deploymentUrl)} and restart the daemon`;
+      ) return `set OOMPA_CONVEX_URL to ${safeDiagnostic(reenable.deploymentUrl)}, unset HRA_CONVEX_URL, and restart the daemon`;
     } catch {
       // Keep the static recovery instruction for malformed daemon output.
     }
@@ -2877,14 +2914,14 @@ const disabledCloudRestartAction = (root: Record<string, unknown>): string | nul
 
 const renderDoctor = (data: unknown): string => {
   const root = object(data);
-  if (root === null) return "HRA checks returned an invalid local result.";
+  if (root === null) return "Oompa checks returned an invalid local result.";
   const problemsShapeValid = Array.isArray(root.problems)
     && root.problems.every((value) => typeof value === "string");
   const problems = problemsShapeValid
     ? (root.problems as string[]).slice(0, 64)
     : [];
   if (!problemsShapeValid || typeof root.healthy !== "boolean") {
-    return "HRA checks returned an invalid local result.";
+    return "Oompa checks returned an invalid local result.";
   }
   const cloud = object(root.cloud);
   const cloudRestart = cloud === null ? null : disabledCloudRestartAction(cloud);
@@ -2893,12 +2930,12 @@ const renderDoctor = (data: unknown): string => {
     : `Cloud sync: disabled (optional)\nNext: ${cloudRestart}`;
   if (root.healthy && problems.length === 0) {
     return disabledCloudBlock === null
-      ? "HRA checks passed."
-      : `HRA checks passed.\n${disabledCloudBlock}`;
+      ? "Oompa checks passed."
+      : `Oompa checks passed.\n${disabledCloudBlock}`;
   }
   const summary = problems.length === 0
-    ? "HRA checks did not pass, but no safe diagnostic was available."
-    : `HRA checks found ${String(problems.length)} problem${problems.length === 1 ? "" : "s"}:\n${problems.map((problem) => `- ${line(problem)}`).join("\n")}`;
+    ? "Oompa checks did not pass, but no safe diagnostic was available."
+    : `Oompa checks found ${String(problems.length)} problem${problems.length === 1 ? "" : "s"}:\n${problems.map((problem) => `- ${line(problem)}`).join("\n")}`;
   return disabledCloudBlock === null
     ? summary
     : `${summary}\n\n${disabledCloudBlock}`;
@@ -2952,13 +2989,13 @@ const renderSyncStatus = (data: unknown): string => {
   rows.push(...renderSyncCadence(root));
   if (typeof root.diagnostic === "string") rows.push(`Detail: ${safeDiagnostic(root.diagnostic)}`);
   const projectionNext = projectionRecoveryUnsettled
-    ? projectionRecoveryCommand ?? "hra doctor"
+    ? projectionRecoveryCommand ?? "oompa doctor"
     : projectionCache?.state === "unavailable"
-      ? "hra doctor"
+      ? "oompa doctor"
       : projectionCache?.state === "degraded" && projectionRecoverySession !== null
-        ? `hra sync projection recover ${projectionRecoverySession} --acknowledge-gap`
+        ? `oompa sync projection recover ${projectionRecoverySession} --acknowledge-gap`
         : projectionCache?.state === "degraded"
-          ? "hra sync status --json"
+          ? "oompa sync status --json"
           : null;
   const disabledRestart = disabledCloudRestartAction(root);
   if (disabledRestart !== null && projectionNext !== null) {
@@ -2969,7 +3006,7 @@ const renderSyncStatus = (data: unknown): string => {
   } else {
     const next = renderCloudNextAction(root)
       ?? projectionNext
-      ?? (state === "ready" && root.lastSync === null ? "hra sync now" : null);
+      ?? (state === "ready" && root.lastSync === null ? "oompa sync now" : null);
     if (next !== null) rows.push(`Next: ${next}`);
   }
   return rows.join("\n");
@@ -3021,7 +3058,19 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
     return;
   }
   const value = publicData as Record<string, unknown>;
-  if (command.kind === "doctor") {
+  if (command.kind === "usage.auto.status" || command.kind === "usage.auto.set") {
+    const result = automaticUsagePolicyCommandResultSchema.parse(publicData);
+    const lines = [
+      `Automatic usage policy ${command.kind === "usage.auto.set" ? "receipt" : "status"}, revision ${String(result.configuration.automaticPolicyRevision)}.`,
+      `Inherited default: ${result.configuration.defaultEnabled ? "on" : "off"}. Provider overrides take precedence.`,
+      ...result.effective.map((entry) => `${entry.provider}: ${entry.enabled ? "on" : "off"} (${entry.source === "default"
+        ? "inherits default" : `override ${result.configuration.overrides[entry.provider]}`}).`),
+    ];
+    if (command.kind === "usage.auto.set") {
+      lines.push("This is the saved receipt. Run `oompa usage auto status` for the current policy.");
+    }
+    output.writeStdout(`${lines.join("\n")}\n`);
+  } else if (command.kind === "doctor") {
     output.writeStdout(`${renderDoctor(data)}\n`);
   } else if (command.kind === "account.login") {
     const login = object(value.login);
@@ -3039,6 +3088,24 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
     } else {
       output.writeStdout("Login state is unavailable.\n");
     }
+  } else if (command.kind === "account.list" && command.provider !== undefined) {
+    const result = providerAccountListResultSchema.parse(publicData);
+    const rows = result.accounts.map((account) => ({
+      order: account.orderPosition,
+      label: account.label,
+      cachedReadiness: account.readiness,
+      observedAt: account.readinessObservedAt === null ? "unknown" : instant(account.readinessObservedAt),
+      active: account.active ? "yes" : "no",
+      id: account.id,
+      profileId: account.profileId,
+    }));
+    output.writeStdout(`${[
+      `Provider accounts: ${result.provider} (cached).`,
+      "Readiness is last observed state, not current usage or quota. No provider refresh was requested.",
+      `Order revision: ${String(result.orderRevision)}. Pointer revision: ${String(result.pointerRevision)}.`,
+      `Active provider account: ${result.activeProviderAccountId ?? "none"}.`,
+      table(rows, ["order", "label", "cachedReadiness", "observedAt", "active", "id", "profileId"]),
+    ].join("\n")}\n`);
   } else if (command.kind === "account.list" && Array.isArray(value.accounts)) {
     output.writeStdout(`${table(value.accounts as Record<string, unknown>[], ["label", "state", "providerPlan", "id"])}\n`);
   } else if (command.kind === "account.add") {
@@ -3181,18 +3248,18 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
       `Switched ${line(value.sessionId ?? object(value.session)?.id)} from ${line(from?.provider)} (${line(from?.preset)}) to ${line(to?.provider)} (${line(to?.preset)}).`,
       `Account: ${line(from?.account)} to ${line(to?.account)}.`,
       seed?.delivered === false
-        ? `Handoff summary was NOT delivered (${line(seed.failureCode)}). Send it again with \`hra session send\`.`
+        ? `Handoff summary was NOT delivered (${line(seed.failureCode)}). Send it again with \`oompa session send\`.`
         : `Handoff summary: ${line(seed?.includedRecords)} records sent, ${line(seed?.omittedRecords)} omitted.`,
-      "The new provider has HRA's record of the conversation, not the old provider's thread or cached context.",
+      "The new provider has Oompa's record of the conversation, not the old provider's thread or cached context.",
     ].join("\n").concat("\n"));
   } else if (command.kind === "session.note.get") {
     output.writeStdout(`${line(value.note)}\n`);
   } else if (command.kind === "daemon.status") {
-    output.writeStdout(value.running === true ? `HRA daemon is running (pid ${line(value.pid)}).\n` : "HRA daemon is stopped.\n");
+    output.writeStdout(value.running === true ? `Oompa daemon is running (pid ${line(value.pid)}).\n` : "Oompa daemon is stopped.\n");
   } else if (command.kind === "daemon.stop") {
-    output.writeStdout(value.released === true ? "HRA daemon stopped.\n" : "HRA daemon is already stopped.\n");
+    output.writeStdout(value.released === true ? "Oompa daemon stopped.\n" : "Oompa daemon is already stopped.\n");
   } else if (command.kind === "account.claude-login.abandon") {
-    output.writeStdout("Released the exact local Claude login fence. HRA did not stop Claude or change or delete Claude credentials; use a fresh idempotency key for another login.\n");
+    output.writeStdout("Released the exact local Claude login fence. Oompa did not stop Claude or change or delete Claude credentials; use a fresh idempotency key for another login.\n");
   } else if (command.kind === "account.login-cancel") {
     if (value.status === "signed_in") {
       output.writeStdout("The account completed sign-in before cancellation.\n");
@@ -3238,13 +3305,13 @@ const failureNextCommand = (details: unknown): string | null => {
   const value = object(details);
   if (
     Object.keys(value ?? {}).length === 1
-    && (value?.nextCommand === "hra daemon status --json"
-      || value?.nextCommand === "hra doctor --offline"
-      || value?.nextCommand === "hra init --yes"
-      || value?.nextCommand === "hra auth login --input-stdin"
-      || value?.nextCommand === "hra auth status"
-      || value?.nextCommand === "hra device pair"
-      || value?.nextCommand === "hra sync status --json")
+    && (value?.nextCommand === "oompa daemon status --json"
+      || value?.nextCommand === "oompa doctor --offline"
+      || value?.nextCommand === "oompa init --yes"
+      || value?.nextCommand === "oompa auth login --input-stdin"
+      || value?.nextCommand === "oompa auth status"
+      || value?.nextCommand === "oompa device pair"
+      || value?.nextCommand === "oompa sync status --json")
   ) {
     return value.nextCommand;
   }
@@ -3254,26 +3321,26 @@ const failureNextCommand = (details: unknown): string | null => {
     && Object.hasOwn(value, "nextCommand")
     && Object.hasOwn(value, "authorityPhase")
     && Object.hasOwn(value, "stopRequestState")
-    && value.nextCommand === "hra doctor --offline"
+    && value.nextCommand === "oompa doctor --offline"
     && (((value.authorityPhase === "preflight_receipt" || value.authorityPhase === "preflight_inspection")
       && value.stopRequestState === "not_attempted")
     || (value.authorityPhase === "stop_request" && value.stopRequestState === "attempted")
     || (value.authorityPhase === "release_confirmation"
       && (value.stopRequestState === "attempted" || value.stopRequestState === "acknowledged")))
   ) {
-    return "hra doctor --offline";
+    return "oompa doctor --offline";
   }
   if (
-    value?.nextCommand === "hra doctor"
+    value?.nextCommand === "oompa doctor"
     && value.repair === "repair_or_select_project"
     && Object.keys(value).length === 2
   ) {
-    return "hra doctor";
+    return "oompa doctor";
   }
   if (value?.accountState !== "signed_out" || typeof value.nextCommand !== "string") {
     return null;
   }
-  const prefix = "hra account login ";
+  const prefix = "oompa account login ";
   if (!value.nextCommand.startsWith(prefix)) return null;
   const claudeSuffix = " --provider claude";
   const claude = value.provider === "claude"
@@ -3295,7 +3362,7 @@ export function renderFailure(error: { code: string; message: string; details?: 
   const safeError = {
     code: error.code,
     message: error.code === "INTERNAL"
-      ? "HRA could not complete the request safely."
+      ? "Oompa could not complete the request safely."
       : safeDiagnostic(error.message),
     ...(error.code === "INTERNAL" || error.details === undefined
       ? {}
@@ -3311,12 +3378,12 @@ export function renderFailure(error: { code: string; message: string; details?: 
     if (Buffer.byteLength(line, "utf8") > WORK_STREAM_FAILURE_MAX_BYTES) {
       line = document({
         code: "INTERNAL",
-        message: "HRA could not serialize a bounded failure response safely.",
+        message: "Oompa could not serialize a bounded failure response safely.",
       });
     }
     output.writeStdout(line);
   } else {
-    output.writeStderr(`hra: ${safeError.message}\n`);
+    output.writeStderr(`oompa: ${safeError.message}\n`);
     if (safeError.details !== undefined) {
       const nextCommand = failureNextCommand(error.details);
       output.writeStderr(nextCommand === null

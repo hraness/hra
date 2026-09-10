@@ -4,7 +4,7 @@ import {
   parseDeviceCommandPayload,
   parseDeviceRegistryPayload,
   type DeviceCommandPayload,
-} from "../hra/cloud";
+} from "../oompa/cloud";
 import {
   accountLoginStartCommand,
   accountLoginStatusCommand,
@@ -401,11 +401,11 @@ describe("device command notices", () => {
 
   test("names the operator switch behind each refusal", () => {
     expect(notice("failed", "DEVICE_COMMANDS_DENIED")?.text)
-      .toContain("hra remote allow device-commands");
+      .toContain("oompa remote allow device-commands");
     expect(notice("failed", "ACCOUNT_LINKING_DENIED", "account_login_start")?.text)
-      .toContain("hra remote allow account-linking");
+      .toContain("oompa remote allow account-linking");
     expect(notice("failed", "ACCOUNT_LOGIN_RELAY_UNAVAILABLE", "account_login_start")?.text)
-      .toContain("hra account login");
+      .toContain("oompa account login");
     expect(notice("failed", "ACCOUNT_LOGIN_NOT_AVAILABLE", "account_login_start")?.text)
       .toContain("only while that account is signed out");
     expect(notice("failed", "DEVICE_COMMAND_DAILY_CAP")?.text).toContain("daily limit");

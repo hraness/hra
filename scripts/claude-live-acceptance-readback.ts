@@ -15,10 +15,11 @@ import {
   createLocalClaudeProcessLivenessProbe,
   type ClaudeProcessLivenessProbe,
 } from "../src/daemon/personal-session-discovery";
-import { HRA_SESSION_PREAMBLE } from "../src/domain/hra-preamble";
+import { OOMPA_SESSION_PREAMBLE } from "../src/domain/oompa-preamble";
 import { createFactsMemoryBinding } from "../src/domain/facts-memory";
 import { memoryPageContentDigest, memoryPageKeyDigest } from "../src/domain/memory-page";
 import { projectMemoryIdentityContractSchema } from "../src/domain/project-memory";
+import { claudeProviderAccountAuthoritySchema, type ProviderAccountAuthority } from "../src/domain/provider-accounts";
 import { reviewedRuntimeProfileSchema } from "../src/domain/runtime-profile";
 import { profileIdSchema, projectIdSchema, sessionIdSchema, type ProfileId, type ProjectId, type SessionId } from "../src/domain/values";
 import { resolveStatePaths, type StatePaths } from "../src/storage/paths";
@@ -181,6 +182,32 @@ const withoutLifecycle = (receipt: ClaudeLiveAcceptancePrivateReceipt | ClaudeLi
   return rest;
 };
 
+// These independent admission checks intentionally do not extend any V1 receipt
+// or digest preimage. The private tuple is retained across IO, never inferred
+// from the Codex/profile generation or added retrospectively to old evidence.
+// Process custody preserves its legacy profile counter separately. Compare
+// provider generations only through the independently verified custody tuple.
+const baseClaudeAuthority = (value: ProviderAccountAuthority) => claudeProviderAccountAuthoritySchema.parse({
+  provider: value.provider, providerAccountId: value.providerAccountId, profileId: value.profileId,
+  bindingGeneration: value.bindingGeneration, processGeneration: value.processGeneration,
+});
+const currentClaudeAuthority = (store: StateStore, profileId: ProfileId) => {
+  const authority = baseClaudeAuthority(store.requireProviderAccountAuthority(profileId, "claude"));
+  const account = store.assertProviderAccountAuthorityCurrent(authority);
+  return { authority, readiness: account.readiness, readinessObservedAt: account.readinessObservedAt };
+};
+const capturedClaudeAuthority = (store: StateStore, sessionId: SessionId) =>
+  baseClaudeAuthority(store.requireCapturedSessionProviderAuthority(sessionId));
+const requireOriginalMutationAuthority = (
+  store: StateStore, attemptId: Parameters<StateStore["readMutationProviderAuthorities"]>[0],
+  captured: ProviderAccountAuthority,
+) => {
+  const authorities = store.readMutationProviderAuthorities(attemptId);
+  requireThat(authorities.length === 1 && authorities[0]?.role === "primary"
+    && same(authorities[0].authority, captured));
+  return authorities;
+};
+
 /** Mirrors the production host-call idempotency preimage, independently of its result. */
 const rememberKey = (receipt: ClaudeLiveAcceptanceProvisionalPrivateReceipt): string => {
   const bytes = createHash("sha256").update([
@@ -250,7 +277,7 @@ const readArtifacts = async (paths: StatePaths, receipt: ClaudeLiveAcceptancePro
   let entries = 0;
   for await (const entry of await opendir(paths.runtime)) {
     requireThat(++entries <= 64);
-    if (entry.name.startsWith(".hra-claude-host-tools-")) directories.push(join(paths.runtime, entry.name));
+    if (entry.name.startsWith(".oompa-claude-host-tools-")) directories.push(join(paths.runtime, entry.name));
   }
   requireThat(directories.length === 1);
   const directory = directories[0] ?? refused();
@@ -282,26 +309,29 @@ const requireManagedArtifactsAbsent = async (paths: StatePaths): Promise<void> =
   await privateNode(paths.runtime, "directory");
   let entries = 0;
   for await (const entry of await opendir(paths.runtime)) {
-    requireThat(++entries <= 64 && !entry.name.startsWith(".hra-claude-host-tools-"));
+    requireThat(++entries <= 64 && !entry.name.startsWith(".oompa-claude-host-tools-"));
   }
   await absent(claudeHostToolCallbackSocketPath(paths));
 };
 
 const readCleanupRecords = (store: StateStore, input: ClaudeLiveAcceptanceCleanupInput) => {
   const profile = store.requireProfile(input.profileId);
+  const current = currentClaudeAuthority(store, input.profileId);
   requireThat(!store.profileHasClaudeProcessLaunchIntents(input.profileId)
     && !store.profileHasUnreleasedClaudeProcessAuthorities(input.profileId)
     && store.listUnsettledMutations({ authorityId: input.profileId }).length === 0);
   const sessions = store.listSessions(2, input.profileId, true);
   if (input.sessionId === undefined) {
     requireThat(sessions.length === 0
-      && (input.profileGeneration === undefined || profile.processGeneration === input.profileGeneration));
-    return { profile, session: null, authority: null, process: null };
+      && (input.profileGeneration === undefined || current.authority.processGeneration === input.profileGeneration));
+    return { records: { profile, session: null, authority: null, process: null }, providerSnapshot: { current, captured: null } };
   }
   const session = store.requireSession(input.sessionId);
   const authority = store.readSessionProviderAccountAuthority(input.sessionId);
+  const captured = capturedClaudeAuthority(store, input.sessionId);
   requireThat(sessions.length === 1 && sessions[0]?.id === input.sessionId
-    && profile.processGeneration === (input.profileGeneration ?? refused()) + 1
+    && captured.processGeneration === input.profileGeneration
+    && same(current.authority, { ...captured, processGeneration: (input.profileGeneration ?? refused()) + 1 })
     && session.profileId === input.profileId && session.provider === "claude"
     && session.providerThreadId !== undefined && authority?.provider === "claude" && authority.runtimeScope === "managed"
     && store.readSessionPersonalRuntimeBinding(input.sessionId, true) === null
@@ -309,13 +339,16 @@ const readCleanupRecords = (store: StateStore, input: ClaudeLiveAcceptanceCleanu
   const process = store.readClaudeProcessAuthority({ runtimeScope: "managed", profileId: input.profileId,
     providerThreadId: session.providerThreadId ?? refused() });
   requireThat(process !== null && process.sessionId === input.sessionId
-    && process.profileGeneration === input.profileGeneration && process.state === "released" && process.releasedAt !== null);
+    && process.providerAuthority?.processGeneration === input.profileGeneration
+    && process.state === "released" && process.releasedAt !== null
+    && same(process.providerAuthority, captured));
   if (process === null) return refused();
-  return { profile, session, authority, process };
+  return { records: { profile, session, authority, process }, providerSnapshot: { current, captured } };
 };
 
 const readStartedScope = (store: StateStore, input: ClaudeLiveAcceptanceStartedScopeInput) => {
   const profile = store.requireProfile(input.profileId);
+  const current = currentClaudeAuthority(store, input.profileId);
   const project = store.requireProject(input.projectId);
   const sessions = store.listSessions(2, input.profileId, true);
   const start = store.readMutation(input.startIdempotencyKey);
@@ -323,7 +356,7 @@ const readStartedScope = (store: StateStore, input: ClaudeLiveAcceptanceStartedS
     && store.listUnsettledMutations({ authorityId: input.profileId }).length === 0);
   if (start === null) {
     requireThat(sessions.length === 0 && !store.profileHasUnreleasedClaudeProcessAuthorities(input.profileId));
-    return { profile, project, scope: null };
+    return { profile, project, providerSnapshot: { current, captured: null, start: null }, scope: null };
   }
   const result = startReceiptSchema.parse(start.result);
   const generation = start.authorityGeneration;
@@ -340,6 +373,8 @@ const readStartedScope = (store: StateStore, input: ClaudeLiveAcceptanceStartedS
     && start.evidence.evidence.clientMessageId === null && start.evidence.evidence.messageDigest === null
     && same(start.evidence.evidence.runtimeProfile, result.effectiveRuntimeProfile));
   const session = store.requireSession(result.sessionId);
+  const captured = capturedClaudeAuthority(store, session.id);
+  const startAuthority = requireOriginalMutationAuthority(store, start.id, captured);
   const authority = store.readSessionProviderAccountAuthority(session.id);
   const runtime = store.latestSessionRuntimeProfile(session.id);
   const reviewed = result.effectiveRuntimeProfile;
@@ -357,26 +392,32 @@ const readStartedScope = (store: StateStore, input: ClaudeLiveAcceptanceStartedS
     && reviewed.processGeneration === generation && "configHome" in reviewed && reviewed.configHome === "isolated"
     && "claudeVersion" in reviewed && reviewed.claudeVersion === CLAUDE_PIN);
   const capabilities = store.requireSessionHostCapabilityBinding(session.id);
-  requireThat(capabilities.preambleVersion === HRA_SESSION_PREAMBLE.version
-    && capabilities.preambleDigest === HRA_SESSION_PREAMBLE.digest
-    && capabilities.manifestVersion === HRA_SESSION_PREAMBLE.manifestVersion
-    && capabilities.manifestDigest === HRA_SESSION_PREAMBLE.manifestDigest);
+  requireThat(capabilities.preambleVersion === OOMPA_SESSION_PREAMBLE.version
+    && capabilities.preambleDigest === OOMPA_SESSION_PREAMBLE.digest
+    && capabilities.manifestVersion === OOMPA_SESSION_PREAMBLE.manifestVersion
+    && capabilities.manifestDigest === OOMPA_SESSION_PREAMBLE.manifestDigest);
   const process = store.readClaudeProcessAuthority({ runtimeScope: "managed", profileId: input.profileId,
     providerThreadId: session.providerThreadId ?? refused() });
-  requireThat(process !== null && process.sessionId === session.id && process.profileGeneration === generation
-    && ((process.state === "bound" && process.releasedAt === null && profile.processGeneration === generation)
-      || (process.state === "released" && process.releasedAt !== null && profile.processGeneration === generation + 1)));
+  requireThat(process !== null && process.sessionId === session.id && process.providerAuthority?.processGeneration === generation
+    && captured.processGeneration === generation && same(process.providerAuthority, captured)
+    && ((process.state === "bound" && process.releasedAt === null && same(current.authority, captured))
+      || (process.state === "released" && process.releasedAt !== null
+        && same(current.authority, { ...captured, processGeneration: generation + 1 }))));
   return { profile, project, start, session, authority, runtime, capabilities, process,
+    providerSnapshot: { current, captured, start: startAuthority },
     scope: { sessionId: session.id, profileGeneration: generation } };
 };
 
 const readRecords = (store: StateStore, input: ClaudeLiveAcceptanceReadbackLiveInput, stopped: boolean) => {
   const r = input.receipt;
   const profile = store.requireProfile(r.profileId);
+  const current = currentClaudeAuthority(store, r.profileId);
+  const captured = capturedClaudeAuthority(store, r.sessionId);
   const session = store.requireSession(r.sessionId);
   const project = store.requireProject(input.projectId);
   requireThat(profile.id === r.profileId && project.id === input.projectId
-    && (stopped ? profile.processGeneration === r.profileGeneration + 1 : profile.processGeneration === r.profileGeneration)
+    && captured.processGeneration === r.profileGeneration
+    && same(current.authority, { ...captured, processGeneration: r.profileGeneration + (stopped ? 1 : 0) })
     && session.id === r.sessionId && session.profileId === r.profileId && session.projectId === input.projectId
     && session.provider === "claude" && session.providerThreadId === r.providerThreadId
     && session.preset === "fable-max" && !session.fastEnabled && session.state === "idle"
@@ -387,14 +428,16 @@ const readRecords = (store: StateStore, input: ClaudeLiveAcceptanceReadbackLiveI
   const authority = store.readSessionProviderAccountAuthority(r.sessionId);
   requireThat(authority?.provider === "claude" && authority.runtimeScope === "managed");
   const capabilities = store.requireSessionHostCapabilityBinding(r.sessionId);
-  requireThat(capabilities.preambleVersion === HRA_SESSION_PREAMBLE.version
-    && capabilities.preambleDigest === HRA_SESSION_PREAMBLE.digest
-    && capabilities.manifestVersion === HRA_SESSION_PREAMBLE.manifestVersion
-    && capabilities.manifestDigest === HRA_SESSION_PREAMBLE.manifestDigest);
+  requireThat(capabilities.preambleVersion === OOMPA_SESSION_PREAMBLE.version
+    && capabilities.preambleDigest === OOMPA_SESSION_PREAMBLE.digest
+    && capabilities.manifestVersion === OOMPA_SESSION_PREAMBLE.manifestVersion
+    && capabilities.manifestDigest === OOMPA_SESSION_PREAMBLE.manifestDigest);
   const start = store.readMutation(input.startIdempotencyKey);
   const send = store.readMutation(input.sendIdempotencyKey);
   requireThat(start !== null && send !== null);
   if (start === null || send === null) return refused();
+  const startAuthority = requireOriginalMutationAuthority(store, start.id, captured);
+  const sendAuthority = requireOriginalMutationAuthority(store, send.id, captured);
   for (const mutation of [start, send]) requireThat(mutation.state === "applied"
     && mutation.resolution === undefined && mutation.originalState === undefined
     && mutation.authorityGeneration === r.profileGeneration && mutation.evidence?.attemptId === mutation.id);
@@ -470,11 +513,13 @@ const readRecords = (store: StateStore, input: ClaudeLiveAcceptanceReadbackLiveI
     && store.readMemoryWorkingAttestationFork(submission.workingBindingDigest) === null);
   const process = store.readClaudeProcessAuthority({ runtimeScope: "managed", profileId: r.profileId,
     providerThreadId: r.providerThreadId });
-  requireThat(process?.sessionId === r.sessionId && process.profileGeneration === r.profileGeneration
+  requireThat(process?.sessionId === r.sessionId && process.providerAuthority?.processGeneration === r.profileGeneration
     && process.state === (stopped ? "released" : "bound")
     && (stopped ? process.releasedAt !== null : process.releasedAt === null));
   if (process === null) return refused();
-  return { immutable: { start, send, authority, capabilities, submission, attestation, runtime, workingHead }, process };
+  requireThat(same(process.providerAuthority, captured));
+  return { immutable: { start, send, authority, capabilities, submission, attestation, runtime, workingHead }, process,
+    providerSnapshot: { current, captured, start: startAuthority, send: sendAuthority } };
 };
 
 const checkQuery = (input: ClaudeLiveAcceptanceReadbackLiveInput, submission: ReturnType<StateStore["requireMemorySubmission"]>) => {
@@ -515,6 +560,7 @@ export function createClaudeLiveAcceptanceReadback(options: Readonly<{
   const probe = options.processProbe ?? createLocalClaudeProcessLivenessProbe();
   let phase: "new" | "busy" | "live" | "stopped" | "failed" = "new";
   let saved: Readonly<{ input: ClaudeLiveAcceptanceReadbackLiveInput; immutableDigest: string;
+    providerSnapshot: ReturnType<typeof readRecords>["providerSnapshot"];
     process: ClaudeProcessAuthorityRecord; artifacts: Awaited<ReturnType<typeof readArtifacts>>;
     evidence: ClaudeLiveAcceptanceReadbackEvidence }> | undefined;
   const check = (): void => { options.signal.throwIfAborted(); };
@@ -573,6 +619,7 @@ export function createClaudeLiveAcceptanceReadback(options: Readonly<{
         const second = await withStore((store) => readRecords(store, frozenInput, false));
         requireThat(same(first, second)
           && await probe(first.process.identity, { deadlineAt: Date.now() + 3000, signal: options.signal }) === "live"); check();
+        requireThat(same(first, await withStore((store) => readRecords(store, frozenInput, false))));
         const immutableDigest = canonicalSha256(first.immutable);
         boundary = "snapshot";
         const snapshotDigest = canonicalSha256({ immutableDigest, query, process: first.process, artifacts,
@@ -583,7 +630,8 @@ export function createClaudeLiveAcceptanceReadback(options: Readonly<{
           soleRemember: true, workingPage: true, managedClaudeSignedIn: true, processBound: true, hostBinding: true,
           pinnedProcessArgv: true, processArgvDigest: processInspection.argvDigest });
         requireThat(isBusy());
-        saved = { input: frozenInput, immutableDigest, process: first.process, artifacts, evidence };
+        saved = { input: frozenInput, immutableDigest, providerSnapshot: first.providerSnapshot,
+          process: first.process, artifacts, evidence };
         phase = "live";
         return evidence;
       } catch (error: unknown) {
@@ -609,6 +657,9 @@ export function createClaudeLiveAcceptanceReadback(options: Readonly<{
         requireThat(same(withoutLifecycle(receipt), withoutLifecycle(live.input.receipt)));
         const records = await withStore((store) => readRecords(store, live.input, true));
         requireThat(canonicalSha256(records.immutable) === live.immutableDigest
+          && same(records.providerSnapshot.captured, live.providerSnapshot.captured)
+          && same(records.providerSnapshot.start, live.providerSnapshot.start)
+          && same(records.providerSnapshot.send, live.providerSnapshot.send)
           && same(records.process.identity, live.process.identity)
           && records.process.recordedAt === live.process.recordedAt
           && records.process.revision === live.process.revision + 2);
@@ -618,6 +669,7 @@ export function createClaudeLiveAcceptanceReadback(options: Readonly<{
         const finalRecords = await withStore((store) => readRecords(store, live.input, true));
         requireThat(same(records, finalRecords)
           && await probe(live.process.identity, { deadlineAt: Date.now() + 3000, signal: options.signal }) === "not_live");
+        requireThat(same(records, await withStore((store) => readRecords(store, live.input, true))));
         check(); requireThat(isBusy()); phase = "stopped";
         return Object.freeze({ ...live.evidence, phase: "stopped" as const, processReleased: true as const,
           processNotLive: true as const, privateArtifactsAbsent: true as const, lifecycleInvalidated: true as const });
@@ -638,23 +690,24 @@ export function createClaudeLiveAcceptanceReadback(options: Readonly<{
           ...(parsed.profileGeneration === undefined ? {} : { profileGeneration: parsed.profileGeneration }),
           ...(parsed.sessionId === undefined ? {} : { sessionId: parsed.sessionId }) };
         const first = await withStore((store) => readCleanupRecords(store, scope));
-        if (first.process !== null) requireThat(await probe(first.process.identity,
+        if (first.records.process !== null) requireThat(await probe(first.records.process.identity,
           { deadlineAt: Date.now() + 3000, signal: options.signal }) === "not_live");
         await requireManagedArtifactsAbsent(paths);
         const second = await withStore((store) => readCleanupRecords(store, scope));
         requireThat(same(first, second));
-        if (first.process !== null) requireThat(await probe(first.process.identity,
+        if (first.records.process !== null) requireThat(await probe(first.records.process.identity,
           { deadlineAt: Date.now() + 3000, signal: options.signal }) === "not_live");
         await requireManagedArtifactsAbsent(paths);
+        requireThat(same(first, await withStore((store) => readCleanupRecords(store, scope))));
         check();
         requireThat(cleanupIsBusy());
         cleanupPhase = "done";
         return Object.freeze({ version: 1 as const, source: "independent_cleanup_readback" as const,
-          phase: "cleanup_stopped" as const, snapshotDigest: canonicalSha256(first),
+          phase: "cleanup_stopped" as const, snapshotDigest: canonicalSha256(first.records),
           scopeBindingDigest: canonicalSha256({ domain: "hra.claude.cleanup-readback.v1", profileId: parsed.profileId,
             profileGeneration: parsed.profileGeneration ?? null, sessionId: parsed.sessionId ?? null }),
           unreleasedProcessesAbsent: true as const, privateArtifactsAbsent: true as const,
-          retainedSessionProcess: first.process === null ? "absent" as const : "released_not_live" as const });
+          retainedSessionProcess: first.records.process === null ? "absent" as const : "released_not_live" as const });
       } catch {
         cleanupPhase = "failed";
         return refused();

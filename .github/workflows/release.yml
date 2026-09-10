@@ -135,23 +135,23 @@ jobs:
       - name: Download pinned Zig 0.16.0 for authority supervisor (Linux)
         if: runner.os == 'Linux'
         run: |
-          HRA_ZIG_DIRECTORY="$RUNNER_TEMP/hra-zig-0.16.0"
-          HRA_ZIG_ARCHIVE="$HRA_ZIG_DIRECTORY/zig-x86_64-linux-0.16.0.tar.xz"
-          HRA_ZIG_SHA256="70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
-          mkdir -p "$HRA_ZIG_DIRECTORY"
+          OOMPA_ZIG_DIRECTORY="$RUNNER_TEMP/oompa-zig-0.16.0"
+          OOMPA_ZIG_ARCHIVE="$OOMPA_ZIG_DIRECTORY/zig-x86_64-linux-0.16.0.tar.xz"
+          OOMPA_ZIG_SHA256="70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+          mkdir -p "$OOMPA_ZIG_DIRECTORY"
           curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
             --connect-timeout 10 --max-time 180 --retry 2 --retry-all-errors --retry-delay 1 \
-            --output "$HRA_ZIG_ARCHIVE" \
+            --output "$OOMPA_ZIG_ARCHIVE" \
             "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz"
-          printf '%s  %s\n' "$HRA_ZIG_SHA256" "$HRA_ZIG_ARCHIVE" | sha256sum --check --status
-          tar -xJf "$HRA_ZIG_ARCHIVE" -C "$HRA_ZIG_DIRECTORY"
-          test -x "$HRA_ZIG_DIRECTORY/zig-x86_64-linux-0.16.0/zig"
+          printf '%s  %s\n' "$OOMPA_ZIG_SHA256" "$OOMPA_ZIG_ARCHIVE" | sha256sum --check --status
+          tar -xJf "$OOMPA_ZIG_ARCHIVE" -C "$OOMPA_ZIG_DIRECTORY"
+          test -x "$OOMPA_ZIG_DIRECTORY/zig-x86_64-linux-0.16.0/zig"
 
       - name: Rebuild and verify authority-supervisor artifacts (Linux)
         if: runner.os == 'Linux'
         run: >-
           bun ./scripts/verify-authority-supervisor-build.ts
-          --zig "$RUNNER_TEMP/hra-zig-0.16.0/zig-x86_64-linux-0.16.0/zig"
+          --zig "$RUNNER_TEMP/oompa-zig-0.16.0/zig-x86_64-linux-0.16.0/zig"
 
       - name: Enable isolated user namespaces for native custody checks
         if: runner.os == 'Linux'
@@ -174,7 +174,7 @@ jobs:
       - name: Create one exact npm tarball and checksum
         run: |
           set -euo pipefail
-          release_artifacts="$RUNNER_TEMP/hra-release-artifacts"
+          release_artifacts="$RUNNER_TEMP/oompa-release-artifacts"
           mkdir "$release_artifacts"
           npm pack --ignore-scripts --pack-destination "$release_artifacts" .
           expected="$(bun -e 'import { releaseArchiveName } from "./scripts/release-package-policy"; const value = await Bun.file("package.json").json(); process.stdout.write(releaseArchiveName(value.version))')"
@@ -185,8 +185,8 @@ jobs:
         id: release_artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: hra-release-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/hra-release-artifacts/
+          name: oompa-release-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/oompa-release-artifacts/
           if-no-files-found: error
           retention-days: 7
 
@@ -250,7 +250,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.verify.outputs.artifact_id }}
           merge-multiple: true
-          path: ${{ runner.temp }}/hra-release-artifacts
+          path: ${{ runner.temp }}/oompa-release-artifacts
       - name: Enable isolated user namespaces for native custody checks
         if: runner.os == 'Linux'
         run: |
@@ -261,9 +261,9 @@ jobs:
       - name: Verify checksum and complete installed-package behavior
         run: |
           set -euo pipefail
-          artifact="$(find "$RUNNER_TEMP/hra-release-artifacts" -maxdepth 1 -type f -name '*.tgz')"
+          artifact="$(find "$RUNNER_TEMP/oompa-release-artifacts" -maxdepth 1 -type f -name '*.tgz')"
           test -n "$artifact"
-          bun run ./scripts/release-artifact-checksum.ts check "$artifact" "$RUNNER_TEMP/hra-release-artifacts/SHA256SUMS"
+          bun run ./scripts/release-artifact-checksum.ts check "$artifact" "$RUNNER_TEMP/oompa-release-artifacts/SHA256SUMS"
           bun run ./scripts/check-package.ts "$artifact"
       - name: Restore Ubuntu user-namespace restriction
         if: ${{ always() && runner.os == 'Linux' }}
@@ -340,7 +340,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.verify.outputs.artifact_id }}
           merge-multiple: true
-          path: ${{ runner.temp }}/hra-release-artifacts
+          path: ${{ runner.temp }}/oompa-release-artifacts
       - name: Revalidate remote authority and checksum
         env:
           GH_TOKEN: ${{ github.token }}
@@ -353,14 +353,14 @@ jobs:
           test "$remote_tag" = "$VERIFIED_SHA"
           git fetch --force --no-tags origin "$remote_main"
           git merge-base --is-ancestor "$VERIFIED_SHA" "$remote_main"
-          artifact="$(find "$RUNNER_TEMP/hra-release-artifacts" -maxdepth 1 -type f -name '*.tgz')"
-          bun run ./scripts/release-artifact-checksum.ts check "$artifact" "$RUNNER_TEMP/hra-release-artifacts/SHA256SUMS"
+          artifact="$(find "$RUNNER_TEMP/oompa-release-artifacts" -maxdepth 1 -type f -name '*.tgz')"
+          bun run ./scripts/release-artifact-checksum.ts check "$artifact" "$RUNNER_TEMP/oompa-release-artifacts/SHA256SUMS"
       - name: Create immutable GitHub Release from the same bytes
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          artifact="$(find "$RUNNER_TEMP/hra-release-artifacts" -maxdepth 1 -type f -name '*.tgz')"
-          bun run ./scripts/publish-github-release.ts "$VERIFIED_TAG" "$artifact" "$RUNNER_TEMP/hra-release-artifacts/SHA256SUMS"
+          artifact="$(find "$RUNNER_TEMP/oompa-release-artifacts" -maxdepth 1 -type f -name '*.tgz')"
+          bun run ./scripts/publish-github-release.ts "$VERIFIED_TAG" "$artifact" "$RUNNER_TEMP/oompa-release-artifacts/SHA256SUMS"
 
   npm_preflight:
     name: Admit optional npm mirror authority
@@ -435,7 +435,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.verify.outputs.artifact_id }}
           merge-multiple: true
-          path: ${{ runner.temp }}/hra-release-artifacts
+          path: ${{ runner.temp }}/oompa-release-artifacts
       - name: Revalidate remote authority and checksum
         env:
           GH_TOKEN: ${{ github.token }}
@@ -448,8 +448,8 @@ jobs:
           test "$remote_tag" = "$VERIFIED_SHA"
           git fetch --force --no-tags origin "$remote_main"
           git merge-base --is-ancestor "$VERIFIED_SHA" "$remote_main"
-          artifact="$(find "$RUNNER_TEMP/hra-release-artifacts" -maxdepth 1 -type f -name '*.tgz')"
-          bun run ./scripts/release-artifact-checksum.ts check "$artifact" "$RUNNER_TEMP/hra-release-artifacts/SHA256SUMS"
+          artifact="$(find "$RUNNER_TEMP/oompa-release-artifacts" -maxdepth 1 -type f -name '*.tgz')"
+          bun run ./scripts/release-artifact-checksum.ts check "$artifact" "$RUNNER_TEMP/oompa-release-artifacts/SHA256SUMS"
       - name: Require tag-only npm environment before OIDC capability
         env:
           GH_TOKEN: ${{ github.token }}
@@ -458,7 +458,7 @@ jobs:
         id: npm_preflight
         run: |
           set -euo pipefail
-          artifact="$(find "$RUNNER_TEMP/hra-release-artifacts" -maxdepth 1 -type f -name '*.tgz')"
+          artifact="$(find "$RUNNER_TEMP/oompa-release-artifacts" -maxdepth 1 -type f -name '*.tgz')"
           state="$(bun run ./scripts/check-npm-artifact-state.ts "$artifact")"
           if [[ "$state" != "absent" && "$state" != "exact" ]]; then
             echo "::error::npm registry preflight returned an invalid state"
@@ -481,9 +481,9 @@ jobs:
       VERIFIED_SHA: ${{ needs.verify.outputs.verified_sha }}
       VERIFIED_TAG: ${{ needs.verify.outputs.verified_tag }}
       VERIFIED_TAG_OBJECT: ${{ needs.verify.outputs.verified_tag_object }}
-      HRA_NPM_PREFLIGHT_RUN_ATTEMPT: ${{ needs.npm_preflight.outputs.npm_preflight_run_attempt }}
-      HRA_NPM_PREFLIGHT_RUN_ID: ${{ needs.npm_preflight.outputs.npm_preflight_run_id }}
-      HRA_NPM_PREFLIGHT_STATE: ${{ needs.npm_preflight.outputs.npm_preflight_state }}
+      OOMPA_NPM_PREFLIGHT_RUN_ATTEMPT: ${{ needs.npm_preflight.outputs.npm_preflight_run_attempt }}
+      OOMPA_NPM_PREFLIGHT_RUN_ID: ${{ needs.npm_preflight.outputs.npm_preflight_run_id }}
+      OOMPA_NPM_PREFLIGHT_STATE: ${{ needs.npm_preflight.outputs.npm_preflight_state }}
     steps:
       - name: Check out verified source with complete history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -542,7 +542,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.verify.outputs.artifact_id }}
           merge-multiple: true
-          path: ${{ runner.temp }}/hra-release-artifacts
+          path: ${{ runner.temp }}/oompa-release-artifacts
       - name: Revalidate remote authority and checksum
         env:
           GH_TOKEN: ${{ github.token }}
@@ -555,18 +555,18 @@ jobs:
           test "$remote_tag" = "$VERIFIED_SHA"
           git fetch --force --no-tags origin "$remote_main"
           git merge-base --is-ancestor "$VERIFIED_SHA" "$remote_main"
-          artifact="$(find "$RUNNER_TEMP/hra-release-artifacts" -maxdepth 1 -type f -name '*.tgz')"
-          bun run ./scripts/release-artifact-checksum.ts check "$artifact" "$RUNNER_TEMP/hra-release-artifacts/SHA256SUMS"
+          artifact="$(find "$RUNNER_TEMP/oompa-release-artifacts" -maxdepth 1 -type f -name '*.tgz')"
+          bun run ./scripts/release-artifact-checksum.ts check "$artifact" "$RUNNER_TEMP/oompa-release-artifacts/SHA256SUMS"
       - name: Prove npm trusted-publisher exchange without publication
         if: needs.npm_preflight.outputs.npm_preflight_state == 'absent'
         run: |
-          artifact="$(find "$RUNNER_TEMP/hra-release-artifacts" -maxdepth 1 -type f -name '*.tgz')"
+          artifact="$(find "$RUNNER_TEMP/oompa-release-artifacts" -maxdepth 1 -type f -name '*.tgz')"
           bun run ./scripts/check-npm-trusted-publisher-oidc.ts "$artifact"
       - name: Publish exact tarball through npm trusted publishing
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          artifact="$(find "$RUNNER_TEMP/hra-release-artifacts" -maxdepth 1 -type f -name '*.tgz')"
+          artifact="$(find "$RUNNER_TEMP/oompa-release-artifacts" -maxdepth 1 -type f -name '*.tgz')"
           bun run ./scripts/publish-npm-release.ts "$artifact"
       - name: Admit exact public npm and GitHub state
         env:

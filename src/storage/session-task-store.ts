@@ -25,7 +25,6 @@ import {
   type SessionTaskSummary,
 } from "../domain/session-tasks";
 import {
-  createQueueId,
   createSessionTaskId,
   MESSAGE_MAX_BYTES,
   positiveRevisionSchema,
@@ -38,7 +37,10 @@ import {
   type SessionId,
   type SessionTaskId,
 } from "../domain/values";
+import type { QueueState } from "../domain/transitions";
 import { resolveUsableCanonicalProjectDirectory } from "./project-directory";
+import { SESSION_SWITCH_BLOCKING_PREDICATE, SESSION_SWITCH_FENCE_SOURCE } from "./session-switch-fence";
+import { normalizeSchemaSql } from "./schema-cohort";
 
 const maximumSafeInteger = 9_007_199_254_740_991;
 const SESSION_TASK_RECEIPT_RESULT_MAX_BYTES = MESSAGE_MAX_BYTES * 6 + 16_384;
@@ -293,9 +295,6 @@ const foreignKeyRowSchema = z.object({
   match: z.string(),
 }).strict();
 
-const normalizedSchemaSql = (value: string): string =>
-  value.replaceAll(/\s+/gu, " ").trim();
-
 const sessionTaskSchemaSignature = (database: Database): string => {
   const objects = database.query(
     `SELECT name,type,sql FROM sqlite_schema
@@ -303,7 +302,7 @@ const sessionTaskSchemaSignature = (database: Database): string => {
      ORDER BY name`,
   ).all(...requiredSchemaObjects).map((row) => {
     const parsed = schemaObjectRowSchema.parse(row);
-    return { ...parsed, sql: normalizedSchemaSql(parsed.sql) };
+    return { ...parsed, sql: normalizeSchemaSql(parsed.sql) };
   });
   const tables = database.query("PRAGMA table_list").all().map((row) =>
     z.object({
@@ -422,14 +421,25 @@ type ReceiptRow = z.infer<typeof receiptRowSchema>;
 // extend the explicit final branch; an unknown provider never inherits Codex.
 const currentSessionTaskAuthorityJoins = `
 JOIN profiles a ON a.id=s.profile_id
+JOIN session_provider_authorities captured
+  ON captured.session_id=s.id AND captured.profile_id=s.profile_id AND captured.provider=s.provider_v39
+JOIN provider_accounts exact_account
+  ON exact_account.id=captured.provider_account_id AND exact_account.profile_id=captured.profile_id
+    AND exact_account.provider=captured.provider AND exact_account.binding_generation=captured.binding_generation
+    AND exact_account.process_generation=captured.process_generation
 LEFT JOIN session_provider_account_authorities pa
   ON pa.session_id=s.id AND pa.provider=s.provider_v39`;
 
 const currentSessionTaskAuthorityPredicate = `
+AND a.state!='removed'
+AND (exact_account.readiness='signed_in' OR (
+  captured.provider IN ('claude','devin') AND exact_account.readiness='unverified'
+  AND captured.routing_provenance='explicit'
+))
 AND NOT EXISTS(
   SELECT 1 FROM provider_runtime_account_revocations r
   WHERE r.profile_id=s.profile_id
-    AND r.profile_generation=a.process_generation
+    AND (r.provider='claude' OR r.profile_generation=captured.process_generation)
     AND r.provider=s.provider_v39
     AND r.runtime_scope=pa.runtime_scope
     AND (r.state='releasing' OR r.current_account_key IS NULL
@@ -453,7 +463,7 @@ AND (
   ))
 )
 AND (
-  (s.provider_v39='claude' AND a.state IN ('signed_in','signed_out'))
+  (s.provider_v39='claude' AND a.state!='removed')
   OR (s.provider_v39='codex' AND a.state='signed_in'
     AND a.provider_email IS NOT NULL
     AND a.codex_account_key=pa.account_key
@@ -464,7 +474,7 @@ AND (
         AND legacy.account_key IS NOT NULL
         AND legacy.account_key=lower(trim(a.provider_email))
     ))
-  OR (s.provider_v39='devin' AND a.state IN ('signed_in','signed_out'))
+  OR (s.provider_v39='devin' AND a.state!='removed')
 )`;
 
 const dueCandidateRowSchema = taskRowSchema.extend({
@@ -496,6 +506,25 @@ export type SessionTaskQueueRecord = Readonly<{
   updatedAt: number;
 }>;
 
+/** The owning StateStore's synchronous, sealed queue admission on this database. */
+export type SessionTaskEnqueue = (sessionId: SessionId, message: string) => Readonly<{
+  id: QueueId;
+  sessionId: SessionId;
+  message: string;
+  state: QueueState;
+  createdAt: number;
+  updatedAt: number;
+}>;
+
+const pendingQueueSchema = z.object({
+  id: queueIdSchema,
+  sessionId: sessionIdSchema,
+  message: z.string().min(1).max(MESSAGE_MAX_BYTES),
+  state: z.literal("pending"),
+  createdAt: safeTimestampSchema,
+  updatedAt: safeTimestampSchema,
+}).strict();
+
 export type SessionTaskMaterialization = Readonly<{
   task: SessionTaskRecord;
   occurrence: SessionTaskOccurrence;
@@ -512,6 +541,8 @@ export type SessionTaskExecutionAuthority = Readonly<{
 
 export type SessionTaskStoreErrorCode =
   | "DAEMON_AUTHORITY_CHANGED"
+  | "ENQUEUE_INVALID"
+  | "ENQUEUE_UNAVAILABLE"
   | "IDEMPOTENCY_CONFLICT"
   | "IDEMPOTENCY_REPLAY_SUPERSEDED"
   | "NO_CHANGES"
@@ -627,18 +658,21 @@ export class SessionTaskStore {
   readonly #database: Database;
   readonly #now: () => number;
   readonly #resolveProjectDirectory: (root: string) => Promise<string | null>;
+  readonly #enqueue: SessionTaskEnqueue | undefined;
   readonly #isExecutionAuthorityLive: (authority: SessionTaskExecutionAuthority) => boolean;
   #dueScanCursor: Readonly<{ nextDueAt: number; taskId: SessionTaskId }> | null = null;
 
   constructor(database: Database, options: Readonly<{
     now?: () => number;
     resolveProjectDirectory?: (root: string) => Promise<string | null>;
+    enqueue?: SessionTaskEnqueue;
     isExecutionAuthorityLive?: (authority: SessionTaskExecutionAuthority) => boolean;
   }> = {}) {
     this.#database = database;
     this.#now = options.now ?? Date.now;
     this.#resolveProjectDirectory = options.resolveProjectDirectory
       ?? resolveUsableCanonicalProjectDirectory;
+    this.#enqueue = options.enqueue;
     // Codex owns a durable reconnect path outside this store. Every other
     // provider needs a positive, process-local proof from the runtime layer;
     // a persisted thread id alone is never execution authority.
@@ -1238,6 +1272,11 @@ export class SessionTaskStore {
          AND s.state NOT IN ('terminal','recovery_required')
          ${currentSessionTaskAuthorityPredicate}
          AND NOT EXISTS(
+           SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+           WHERE switch.session_id=t.session_id
+             AND ${SESSION_SWITCH_BLOCKING_PREDICATE}
+         )
+         AND NOT EXISTS(
            SELECT 1
            FROM session_task_occurrences o
            JOIN queue_entries q ON q.id=o.queue_id
@@ -1276,13 +1315,15 @@ export class SessionTaskStore {
     daemonGeneration?: number;
   }>): Promise<readonly SessionTaskMaterialization[]> {
     const { now, daemonGeneration } = materializeInputSchema.parse(input);
+    const enqueue = this.#enqueue;
+    if (enqueue === undefined) throw new SessionTaskStoreError("ENQUEUE_UNAVAILABLE");
     const scanLimit = SESSION_TASK_LIMIT * 4;
     const cursor = this.#dueScanCursor;
     const candidates = this.#database.query(
       `SELECT
          t.id,t.session_id,t.name,t.prompt,t.schedule_kind,t.interval_minutes,t.status,
          t.revision,t.next_due_at,t.created_at,t.updated_at,t.deleted_at,
-         p.root_path AS project_root,a.id AS profile_id,a.process_generation,
+         p.root_path AS project_root,a.id AS profile_id,exact_account.process_generation,
          s.provider_v39 AS provider,s.provider_thread_id
        FROM session_tasks t
        JOIN sessions s ON s.id=t.session_id
@@ -1295,6 +1336,11 @@ export class SessionTaskStore {
          AND s.provider_v39 IN ('codex','claude')
          AND s.state NOT IN ('terminal','recovery_required')
          ${currentSessionTaskAuthorityPredicate}
+         AND NOT EXISTS(
+           SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+           WHERE switch.session_id=t.session_id
+             AND ${SESSION_SWITCH_BLOCKING_PREDICATE}
+         )
          AND (
            ? IS NULL
            OR t.next_due_at>?
@@ -1369,7 +1415,7 @@ export class SessionTaskStore {
              t.id,t.session_id,t.name,t.prompt,t.schedule_kind,t.interval_minutes,t.status,
              t.revision,t.next_due_at,t.created_at,t.updated_at,t.deleted_at,
              p.root_path AS project_root,a.state AS profile_state,s.state AS session_state,
-             a.id AS profile_id,a.process_generation,s.provider_v39 AS provider,
+             a.id AS profile_id,exact_account.process_generation,s.provider_v39 AS provider,
              s.provider_thread_id
            FROM session_tasks t
            JOIN sessions s ON s.id=t.session_id
@@ -1384,6 +1430,11 @@ export class SessionTaskStore {
              AND s.provider_v39 IN ('codex','claude')
              AND s.state NOT IN ('terminal','recovery_required')
              ${currentSessionTaskAuthorityPredicate}
+             AND NOT EXISTS(
+               SELECT 1 FROM ${SESSION_SWITCH_FENCE_SOURCE} switch
+               WHERE switch.session_id=t.session_id
+                 AND ${SESSION_SWITCH_BLOCKING_PREDICATE}
+             )
              AND NOT EXISTS(
                SELECT 1
                FROM session_task_occurrences o
@@ -1412,29 +1463,20 @@ export class SessionTaskStore {
           now,
           authoritative.interval_minutes,
         );
-        const sequenceRow = this.#database.query(
-          `UPDATE queue_sequence_authority
-           SET next_sequence=next_sequence+1
-           WHERE singleton=1 AND next_sequence<9007199254740991
-           RETURNING next_sequence-1 AS enqueue_sequence`,
-        ).get();
-        if (sequenceRow === null) throw new Error("QUEUE_SEQUENCE_EXHAUSTED");
-        const enqueueSequence = z.object({
-          enqueue_sequence: z.number().int().positive().safe(),
-        }).strict().parse(sequenceRow).enqueue_sequence;
-        const queueId = createQueueId();
-        this.#database.query(
-          `INSERT INTO queue_entries(
-             id,session_id,message,state,enqueue_sequence,created_at,updated_at
-           ) VALUES (?,?,?,'pending',?,?,?)`,
-        ).run(
-          queueId,
-          authoritative.session_id,
-          authoritative.prompt,
-          enqueueSequence,
-          now,
-          now,
-        );
+        // Queue sequence, mutation ownership, provider authority and empty
+        // attachment identity belong to StateStore, in this same transaction.
+        const enqueued = pendingQueueSchema.safeParse(enqueue(authoritative.session_id, authoritative.prompt));
+        if (!enqueued.success) throw new SessionTaskStoreError("ENQUEUE_INVALID");
+        const queue = enqueued.data;
+        const durable = pendingQueueSchema.safeParse(this.#database.query(
+          `SELECT id,session_id AS sessionId,message,state,created_at AS createdAt,updated_at AS updatedAt
+           FROM queue_entries WHERE id=?`,
+        ).get(queue.id));
+        if (queue.sessionId !== authoritative.session_id || queue.message !== authoritative.prompt
+          || !durable.success || JSON.stringify(durable.data) !== JSON.stringify(queue)) {
+          throw new SessionTaskStoreError("ENQUEUE_INVALID");
+        }
+        const queueId = queue.id;
         this.#database.query(
           `INSERT INTO session_task_occurrences(
              task_id,session_id,task_revision,scheduled_for,coalesced_intervals,queue_id,created_at
@@ -1446,7 +1488,7 @@ export class SessionTaskStore {
           scheduledFor,
           coalescedIntervals,
           queueId,
-          now,
+          queue.createdAt,
         );
         const advanced = this.#database.query(
           `UPDATE session_tasks
@@ -1470,16 +1512,9 @@ export class SessionTaskStore {
             scheduledFor,
             coalescedIntervals,
             queueId,
-            createdAt: now,
+            createdAt: queue.createdAt,
           }),
-          queue: {
-            id: queueId,
-            sessionId: authoritative.session_id,
-            message: authoritative.prompt,
-            state: "pending",
-            createdAt: now,
-            updatedAt: now,
-          },
+          queue,
         };
       });
       try {

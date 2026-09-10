@@ -35,7 +35,7 @@ const refuse = (): never => readProductPreviewHarness().refuse();
 const refuseAsync = async (): Promise<never> => refuse();
 
 /** Keep the real menu disabled and inert: no preference read, write or listener. */
-export const mountHraAppearanceMenu: typeof Appearance.mountHraAppearanceMenu = () => {
+export const mountOompaAppearanceMenu: typeof Appearance.mountOompaAppearanceMenu = () => {
   readProductPreviewHarness();
   return noop;
 };

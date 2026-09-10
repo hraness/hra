@@ -1,6 +1,6 @@
 # Attachments
 
-Any chat message HRA sends to a provider may carry file and image attachments. This document is the whole contract: the record shape, the accepted types, where the bytes live, what each provider receives, the CLI surface, the hosted wire, the projection, and the exact rules a browser client must follow.
+Any chat message Oompa sends to a provider may carry file and image attachments. This document is the whole contract: the record shape, the accepted types, where the bytes live, what each provider receives, the CLI surface, the hosted wire, the projection, and the exact rules a browser client must follow.
 
 ## The record
 
@@ -72,9 +72,33 @@ message_attachments(session_id, source_id, position PK, digest, name, media_type
 
 `attachments.media_type` is the **canonical** type, so one digest has exactly one row even when two messages declare the same bytes as `text/markdown` and `text/csv`. `message_attachments.media_type` is the **declared** type. `source_id` is the client message id the turn was dispatched under: an `attempt_…` id for a send or a steer, a `queue_…` id for a queued message. Two triggers keep `reference_count` exact, and link rows are immutable.
 
-Per session, the newest `MESSAGE_ATTACHMENT_SOURCE_PER_SESSION_CAP` (200) settled manifest sources are retained, oldest pruned first. A provider-bound source whose neutral transcript is still pending finalization is never pruned; the table may therefore exceed 200 sources temporarily until those effects settle. A settled attachment-bearing queue replay compares the request with this manifest. If its manifest has aged out, HRA fails the replay closed instead of guessing that the attachments still match. The manifest holds no bytes.
+Each nonempty manifest admission prunes settled historical sources toward `MESSAGE_ATTACHMENT_SOURCE_PER_SESSION_CAP` (200) per session, oldest first. Pending, dispatching and unresolved ambiguous queues, custody-owned inputs, and provider-bound sources awaiting neutral transcript finalization retain their manifests separately from that display target. Settling those effects can temporarily leave more historical sources until a later manifest admission prunes them. At most 200 unresolved attached queue sources may be admitted per session; a full allowance refuses another attached enqueue atomically, without consuming its request key. It does not add a limit to attachment-free queues. A sealed queue replay proves the original request against its immutable message and manifest digests, even if its settled display manifest has aged out. Dispatch still requires the exact retained manifest and verified blob bytes. The manifest holds no bytes.
 
-Custody maintenance runs after any message that actually carried attachments. It drops accounting rows nothing references any more and removes their blobs, then removes blob files local custody does not account for at all. Blobs younger than `ATTACHMENT_BLOB_SWEEP_GRACE_MS` (one hour) are never touched, so a command still in flight is safe.
+Custody maintenance runs after a new message that actually carried attachments. It examines at most 64 unreferenced accounting rows and 256 directory entries per pass. These lists are hints: each deletion rechecks the current daemon, retained input, actual message references and canonical accounting while holding SQLite's writer through a synchronous unlink. It does not load the complete accounting history. The `ATTACHMENT_BLOB_SWEEP_GRACE_MS` age check (one hour) applies only to unaccounted files; it is not a reservation for an old blob reused by an in-flight command.
+
+### Input custody and retries
+
+Schema version 48 reserves the exact ordered attachment input before the daemon first reads its blobs. Send, steer and queue re-prove the bytes while that reservation is held. If deletion won before reservation, the command refuses missing bytes before a provider effect. Each invocation has its own reservation, including concurrent retries of one key; releasing one cannot release another.
+
+Send and steer atomically attach their first reservation to the original mutation. The complete manifest, native write-ahead evidence and effect transition then commit together. A failed pre-effect review or manifest admission leaves the request prepared with its retained input. An exact retry uses that original custody; it cannot alter the text or attachment list. Actual terminal evidence releases custody, while an ambiguous provider outcome remains retained for recovery. Cleanup errors never replace the original command result or expose attachment details in diagnostics.
+
+Provider deletion or transport loss can leave the local session terminal while its unknown send or steer outcome still retains input custody. Explicit `oompa session abandon` can acknowledge that retained outcome locally. It records separate immutable evidence bound to the original request, effect, custody and abandonment resolution, then releases only the proved retention. It does not change the recorded provider outcome, replay input or delete provider state. Repeating the acknowledgment is inert; missing or inconsistent original evidence is refused as `RECOVERY_REQUIRED`. This cleanup path does not infer authority for unproved historical input or original-send custody.
+
+A completed send or steer checks its exact historical input and restores its receipt before live provider checks or blob reads. It needs no new custody slot, even when the allowance is full or the original bytes have been pruned. This read-only replay does not dispatch again, append a duplicate transcript message or schedule queue work. If another writer completes after the first lookup, transactional admission restores that receipt and skips those post-send actions too. An uncertain earlier effect remains recovery-required; a prepared retry still passes the closed input-admission checks.
+
+At most 64 attached input sets may be retained across all daemon boots. Each still obeys the eight-file and ten-MiB message bounds. A full allowance refuses another attached admission before an effect; text-only input uses positive empty-input evidence without consuming a slot. Successfully queued input transfers into its protected queue manifest instead of continuing to consume an input slot.
+
+Restart retires only invocation reservations that never became mutation-owned. Retained unresolved input has no expiry timer. Historical send or steer rows whose attachment identity cannot be proved conservatively prevent blob cleanup; a retry cannot manufacture an empty manifest or reconstruct their original input from retained display references. Their existing terminal receipts and recovery rules remain authoritative.
+
+### Queue identity and recovery
+
+Schema version 47 seals each new queue request, including an explicitly empty attachment list, under its existing mutation key. The queue, provider authority, accounting, complete ordered manifest and immutable identity commit in one transaction. The identity and its independent anchor retain only identifiers, digests, lengths and counts, not a second message body or attachment bytes. Existing terminal queue-body scrubbing is unchanged.
+
+The same key cannot add, remove, reorder or rename attachments, or change their type, length or digest. An already-known exact historical replay uses the original authority and receipt before current provider or file checks. A concurrent replay discovered at transactional admission may already have read the files; neither replay rewrites a manifest, sweeps files or schedules a provider turn. Dispatch verifies the sealed manifest and accounting before provider preparation and again at its final admission boundary. Missing identity is never interpreted as an empty attachment list.
+
+Older queue requests did not bind attachment identity. Neither an absent nor a retained old manifest proves the original list, because the old writer could append references during a retry. Historical receipt lookup preserves the original message semantics and reports `attachmentVerification: legacy_unverified`; an attached retry cannot supply the missing proof or rewrite custody.
+
+An unproved legacy FIFO head blocks later dispatch and places the session in recovery while preserving queued text. `oompa session recover` cannot infer missing attachments or send the message. Explicit `oompa session abandon` ends the local session, cancels its pending queue and applies normal body scrubbing without replaying or deleting provider state. It is not a command to discard only one queue entry.
 
 ## Providers
 
@@ -88,12 +112,12 @@ The pinned Codex 0.153.2 app-server accepts these `UserInput` variants on `turn/
 text | image | localImage | audio | localAudio | skill | mention
 ```
 
-Images are supported. HRA emits `localImage`, naming the mode-0600 blob in the local content-addressed store, which is why a blob's file name carries an image extension.
+Images are supported. Oompa emits `localImage`, naming the mode-0600 blob in the local content-addressed store, which is why a blob's file name carries an image extension.
 
 There is **no file or document input item**. A text-ish attachment therefore has no content item of its own and is folded into the text item instead.
 
 ```jsonc
-// hra session send s --attach diagram.png --attach notes.md "what changed?"
+// oompa session send s --attach diagram.png --attach notes.md "what changed?"
 "input": [
   { "type": "text", "text": "what changed?\n\nAttached file: notes.md (text/markdown, 7 bytes)\n```\n# hello\n```" },
   { "type": "localImage", "path": "/…/attachments/<digest>.png" }
@@ -125,10 +149,10 @@ Sending and steering are the same wire shape, so an attachment can ride on a ste
 ## The CLI
 
 ```
-hra session send|queue|steer <session> [--attach <path>]... <message>
+oompa session send|queue|steer <session> [--attach <path>]... <message>
 ```
 
-`--attach` is repeatable, accepts at most eight paths, and may appear anywhere before the message. A message word after the literal `--` delimiter is never read as an option, so `hra session send s -- --attach is a word` sends that text.
+`--attach` is repeatable, accepts at most eight paths, and may appear anywhere before the message. A message word after the literal `--` delimiter is never read as an option, so `oompa session send s -- --attach is a word` sends that text.
 
 The CLI is the only place a filesystem path is resolved for an attachment. `ingestAttachments` refuses the file by extension, opens it `O_NOFOLLOW` (so a symbolic link is refused), bounds it, sniffs it, writes it into the store, and reissues the command carrying digest references. **No path ever crosses the local socket**, which is why no remote command can name one.
 
@@ -136,7 +160,7 @@ The daemon does not trust any of that. It re-reads each blob, re-proves its dige
 
 Failure codes the daemon can produce for a reference: `ATTACHMENT_MISSING`, `ATTACHMENT_LENGTH_MISMATCH`, and `ATTACHMENT_<refusal reason>`.
 
-Rendering never shows bytes. `hra session show` prints, under each user message:
+Rendering never shows bytes. `oompa session show` prints, under each user message:
 
 ```
 You  turn_01
@@ -181,7 +205,7 @@ These exist because the whole command is one encrypted Convex document. Convex c
 
 Refusals are codes, not truncation. Parsing returns `null` for anything over a bound, which rejects the command. Materialization on the custodian returns `ATTACHMENT_MISSING`, `ATTACHMENT_LENGTH_MISMATCH`, `ATTACHMENT_DIGEST_MISMATCH`, or `ATTACHMENT_<refusal reason>`.
 
-**What a client should do with something larger than 64 KiB.** Refuse it locally with the same bound and tell the person to attach the file from the machine running the session, with `hra session send --attach`. There is no hosted upload lane: pushing multi-megabyte bytes through an encrypted command document would breach the Convex document cap and the per-user quota, and HRA deliberately has no blob endpoint. A client may also send a `data`-less reference for a digest the custodian already holds - that is the one way a large file can be reattached remotely.
+**What a client should do with something larger than 64 KiB.** Refuse it locally with the same bound and tell the person to attach the file from the machine running the session, with `oompa session send --attach`. There is no hosted upload lane: pushing multi-megabyte bytes through an encrypted command document would breach the Convex document cap and the per-user quota, and Oompa deliberately has no blob endpoint. A client may also send a `data`-less reference for a digest the custodian already holds - that is the one way a large file can be reattached remotely.
 
 ## Projection
 
@@ -205,9 +229,9 @@ A manifest is parsed as strictly as an interaction detail: the name must be boun
 1. **Build a `RemoteMessagePayload` with `version: 2`.** Send `{kind, message}` with no `version` and no `attachments` when there is nothing attached; anything else changes the byte shape of an ordinary message.
 2. **Compute the digest yourself** - lower-case hex SHA-256 of the exact bytes - and send it. The custodian re-derives it and refuses a mismatch, so a wrong digest is a hard failure, not a warning.
 3. **Derive the declared media type from the file name**, using the same reviewed extension list. Do not trust a browser `File.type`: a browser reports `application/octet-stream` for many text files and will happily report `image/png` for anything named `.png`.
-4. **Enforce the client bounds before sending**: 8 attachments, 64 KiB inline per attachment, 96 KiB inline per message. Over any of them, refuse in the UI and say the file must be attached from the machine running the session with `hra session send --attach <path>`.
+4. **Enforce the client bounds before sending**: 8 attachments, 64 KiB inline per attachment, 96 KiB inline per message. Over any of them, refuse in the UI and say the file must be attached from the machine running the session with `oompa session send --attach <path>`.
 5. **Do not send `data` for a digest the custodian already holds.** Omit it and send the reference alone; if the custodian no longer holds it, the command fails with `ATTACHMENT_MISSING` and the client should resend with `data`.
-6. **Paste support is a client concern.** Read the `image/*` item off the clipboard, name it something with a reviewed extension (`pasted-image.png`), and treat it exactly like a chosen file. HRA accepts no unnamed attachment.
+6. **Paste support is a client concern.** Read the `image/*` item off the clipboard, name it something with a reviewed extension (`pasted-image.png`), and treat it exactly like a chosen file. Oompa accepts no unnamed attachment.
 7. **Render a manifest, never bytes.** The `attachments` array on a `user_message` event carries name, media type, size, and digest. The digest identifies the bytes; it does not fetch them. There is no endpoint that returns attachment bytes to a browser, and the app must not present one.
 8. **Refuse an unreviewed type in the picker.** Accept only the extensions the reviewed list maps, so a person learns the file is unsupported before a round trip.
 
@@ -217,6 +241,7 @@ A manifest is parsed as strictly as an interaction detail: the name must be boun
 - `src/domain/attachment-schemas.ts` - the zod schemas that parse a reference
 - `src/storage/attachment-store.ts` - the content-addressed blob store and `attachmentDigest`
 - `src/storage/state-store.ts` - schema version 34, `attachments`, `message_attachments`, and their custody methods
+- `src/storage/queue-attachment-identity.ts` - schema version 47 queue identity, manifest integrity, retention guards and recovery evidence
 - `src/daemon/attachment-ingest.ts` - path to custody
 - `src/daemon/attachments.ts` - references back to bytes for the providers
 - `src/daemon/service.ts` - send, queue, steer, queue dispatch, projection enrichment, custody sweep

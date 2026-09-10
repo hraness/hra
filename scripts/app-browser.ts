@@ -216,11 +216,11 @@ export function siteProductionCsp(value: unknown): Readonly<{ siteCsp: string; p
   }
   assert.deepEqual(previewCsp.split(";").map((part) => part.trim()).filter((part) => part.startsWith("script-src")), ["script-src 'none'"]);
   assert.deepEqual(siteCsp.split(";").map((part) => part.trim()).filter((part) => part.startsWith("frame-src")), ["frame-src 'self' https://challenges.cloudflare.com"]);
-  const productCsp = productionCsp(value, "/examples/app/:path*");
+  const productCsp = productionCsp(value, "/examples/app/:path(.*)");
   assert.equal(productCsp, `${productPreviewCsp}; frame-ancestors 'self'`, "Product example CSP drifted");
   const rows = record(value).headers;
   assert.ok(Array.isArray(rows));
-  const headers = record(rows.map(record).find((row) => row.source === "/examples/app/:path*")).headers;
+  const headers = record(rows.map(record).find((row) => row.source === "/examples/app/:path(.*)")).headers;
   assert.ok(Array.isArray(headers));
   assert.deepEqual(headers.map(record).map(({ key, value }) => [key, value]).sort(), [
     ["Content-Security-Policy", productCsp], ["Access-Control-Allow-Origin", "*"],
@@ -409,9 +409,9 @@ export function siteStylesheetPaths(documents: ReadonlyMap<string, Buffer>): rea
     assert.equal(document.documentElement.getAttribute("data-palette"), "catppuccin", "Static default palette changed");
     assert.equal(document.documentElement.getAttribute("data-theme"), "dark", "Static default theme changed");
     const appearance = [...document.querySelectorAll('script[src="/appearance.js"]')];
-    const menus = [...document.querySelectorAll("details[data-hra-appearance]")];
+    const menus = [...document.querySelectorAll("details[data-oompa-appearance]")];
     if (path === "preview/index.html") {
-      assert.equal(document.querySelectorAll("script,details[data-hra-appearance]").length, 0, "Inert preview acquired appearance controls");
+      assert.equal(document.querySelectorAll("script,details[data-oompa-appearance]").length, 0, "Inert preview acquired appearance controls");
     } else {
       assert.equal(appearance.length, 1, "Static page must load one bound appearance bootstrap");
       const bootstrap = appearance[0];
@@ -644,21 +644,21 @@ async function verifyProductScene(iframe: Locator, view: ProductView): Promise<u
     }, undefined, { polling: "raf", timeout: 15_000 });
     await ready.dispose();
     const observation = await frame.evaluate((selected) => {
-      const state = window as typeof window & { __direct?: DirectBrowserBridge; __hraBrowserViolations?: string[] };
+      const state = window as typeof window & { __direct?: DirectBrowserBridge; __oompaBrowserViolations?: string[] };
       const bridge = state.__direct;
       if (bridge === undefined) throw new Error("Missing genuine Direct browser bridge");
       let parentAccessible = false;
       try { void window.parent.document; parentAccessible = true; } catch { /* Opaque origin must refuse parent access. */ }
       return { origin: globalThis.origin, parentAccessible, ready: document.documentElement.dataset.previewReady,
         failed: document.documentElement.dataset.previewFailed, inert: document.querySelector(`[data-product-preview="${selected}"]`)?.hasAttribute("inert"),
-        now: Date.now(), violations: state.__hraBrowserViolations, inline: document.querySelectorAll("style,[style]").length,
+        now: Date.now(), violations: state.__oompaBrowserViolations, inline: document.querySelectorAll("style,[style]").length,
         bridgeSchema: bridge.schema, manifest: bridge.manifest, snapshot: bridge.snapshot(),
         stylesheets: [...document.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"]')].map((link) => link.sheet !== null && !link.disabled),
         appearance: { palette: document.documentElement.dataset.palette, theme: document.documentElement.dataset.theme,
-          menus: document.querySelectorAll("details[data-hra-appearance]").length,
-          ready: document.querySelector('details[data-hra-appearance][data-ready="true"]') !== null,
-          controls: document.querySelectorAll("details[data-hra-appearance] select").length,
-          controlsDisabled: [...document.querySelectorAll<HTMLSelectElement>("details[data-hra-appearance] select")].every((select) => select.disabled) },
+          menus: document.querySelectorAll("details[data-oompa-appearance]").length,
+          ready: document.querySelector('details[data-oompa-appearance][data-ready="true"]') !== null,
+          controls: document.querySelectorAll("details[data-oompa-appearance] select").length,
+          controlsDisabled: [...document.querySelectorAll<HTMLSelectElement>("details[data-oompa-appearance] select")].every((select) => select.disabled) },
       };
     }, view);
     assertProductPreviewObservation(observation, view);
@@ -809,12 +809,12 @@ async function defaultPalette(page: Page, forced: boolean): Promise<void> {
 
 /** One real guide exercises the shared control; restore before any later route. */
 async function verifyGuideAppearance(page: Page): Promise<void> {
-  const menu = page.locator("details[data-hra-appearance]");
+  const menu = page.locator("details[data-oompa-appearance]");
   assert.equal(await menu.count(), 1);
   const summary = menu.locator("summary");
   await summary.focus();
   await page.keyboard.press("Enter");
-  const mode = menu.locator("select[data-hra-mode]");
+  const mode = menu.locator("select[data-oompa-mode]");
   await mode.selectOption("light");
   await page.waitForFunction(() => document.documentElement.dataset.palette === "catppuccin" && document.documentElement.dataset.theme === "light"
     && getComputedStyle(document.documentElement).colorScheme === "light");
@@ -881,8 +881,8 @@ async function styled(locator: Locator, placement: ButtonPlacement): Promise<voi
 async function cleanDocument(page: Page): Promise<void> {
   assert.equal(await page.locator("[style],style").count(), 0, "Inline presentation escaped the CSP contract");
   const issues = await page.evaluate(() => {
-    const state = window as typeof window & { __hraBrowserViolations?: string[] };
-    return state.__hraBrowserViolations ?? [];
+    const state = window as typeof window & { __oompaBrowserViolations?: string[] };
+    return state.__oompaBrowserViolations ?? [];
   });
   assert.deepEqual(issues, [], "CSP or inline-style mutation occurred");
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), "Horizontal viewport overflow");
@@ -1426,9 +1426,9 @@ async function isolate(context: BrowserContext, origins: ReadonlySet<string>): P
   });
   await context.routeWebSocket("**/*", async (socket) => { note(blocked, "websocket"); await socket.close({ code: 1000, reason: "Offline browser acceptance" }); });
   await context.addInitScript(() => {
-    const state = window as typeof window & { __hraBrowserViolations?: string[] };
+    const state = window as typeof window & { __oompaBrowserViolations?: string[] };
     const violations: string[] = [];
-    state.__hraBrowserViolations = violations;
+    state.__oompaBrowserViolations = violations;
     const note = (value: string) => { if (violations.length < 128) violations.push(value.slice(0, 500)); };
     document.addEventListener("securitypolicyviolation", (event) => { note(`${event.violatedDirective}:${event.blockedURI}`); });
     new MutationObserver((mutations) => {
@@ -1489,7 +1489,7 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
   if (signal.aborted) onSignal();
   let failure: unknown;
   try {
-    const fixtureFiles = new Map([...(await inventory(join(run, "fixture/hra-app")))].filter(([path]) => path !== "stylex-complete.json"));
+    const fixtureFiles = new Map([...(await inventory(join(run, "fixture/oompa-app")))].filter(([path]) => path !== "stylex-complete.json"));
     assert.deepEqual(artifacts(fixtureFiles), browserPublicArtifacts(handoff.prepared.fixture).filter(({ path }) => path !== "stylex-complete.json"));
     fixtureArtifacts = artifacts(fixtureFiles);
     assert.ok(!isCancelled(), "Browser acceptance cancelled");
@@ -1576,7 +1576,7 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
         mark("production-anonymous:navigation");
         await page.goto(app.origin);
         mark("production-anonymous:assertions");
-        await page.getByRole("heading", { name: "Sign in to HRA" }).waitFor();
+        await page.getByRole("heading", { name: "Sign in to Oompa" }).waitFor();
         assert.deepEqual(await page.evaluate(() => ({
           coarse: matchMedia("(pointer: coarse)").matches,
           reduced: matchMedia("(prefers-reduced-motion: reduce)").matches,

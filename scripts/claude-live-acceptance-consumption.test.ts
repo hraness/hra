@@ -19,6 +19,8 @@ const cursor = (sequence: number) =>
 function fixture() {
   const sessionId = createSessionId();
   const profileId = createProfileId();
+  const providerAuthority = { profileId, provider: "claude" as const,
+    providerAccountId: `pact_${randomUUID().replaceAll("-", "")}`, bindingGeneration: 1, processGeneration: 3 };
   const connectionId = randomUUID();
   const epoch = randomUUID();
   const turnId = alias("synthetic-turn");
@@ -69,7 +71,7 @@ function fixture() {
     receiptSha256, sessionId, signal: controller.signal, submissionId,
     readPage: async () => page(events),
   };
-  return { input, events, event, page, echo, controller, turnId };
+  return { input, events, event, page, echo, controller, turnId, providerAuthority };
 }
 
 const refused = async (input: ClaudeLiveAcceptanceConsumptionInput): Promise<void> => {
@@ -122,11 +124,13 @@ describe("bounded Claude public-event consumption", () => {
     });
     const projected: SessionEventWrite[] = rawBodies.flatMap((body) => redactor.accept({
       sessionId: f.input.sessionId, accountId: f.input.profileId,
+      providerAuthority: f.providerAuthority,
       providerGeneration: f.input.profileGeneration, providerConnectionId: f.input.connectionId, body,
     }));
-    const events = projected.map((entry, index) => ({
-      ...f.event(entry.body, index + 1), ...entry,
-    }));
+    const events = projected.map(({ providerAuthority, ...entry }, index) => {
+      expect(providerAuthority).toEqual(f.providerAuthority);
+      return { ...f.event(entry.body, index + 1), ...entry };
+    });
     expect(redactor.activeStreamCount).toBe(0);
     expect(events.filter(({ body }) => body.type === "assistant_delta")
       .map(({ body }) => body.type === "assistant_delta" ? body.text : "").join("")).toBe(f.echo);

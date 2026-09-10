@@ -128,7 +128,7 @@ describe("Devin account settings", () => {
 
     expect(markup).toContain("Devin support is retired");
     expect(markup).toContain("read-only");
-    expect(markup).not.toContain("hra account login acct_devin000001");
+    expect(markup).not.toContain("oompa account login acct_devin000001");
     expect(markup).not.toContain("--manual-token-flow");
     expect(markup).not.toContain("Link here");
     expect(markup).not.toContain("Check status");

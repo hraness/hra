@@ -21,12 +21,12 @@ import { Readable } from "node:stream";
 import { createGzip, gzipSync } from "node:zlib";
 
 import {
-  assertHraInstallManifest,
+  assertOompaInstallManifest,
   assertSupportedBunInstallerVersion,
-  HRA_INSTALL_BUN_VERSION,
-  HRA_INSTALL_CLI_SHA256,
-  normalizeHraBunInstall,
-  parseAuthenticatedHraPackageArchive,
+  OOMPA_INSTALL_BUN_VERSION,
+  OOMPA_INSTALL_CLI_SHA256,
+  normalizeOompaBunInstall,
+  parseAuthenticatedOompaPackageArchive,
 } from "./install-normalizer";
 
 const temporaryDirectories: string[] = [];
@@ -41,10 +41,10 @@ afterEach(async () => {
 const manifest = (scripts: Record<string, string> = {
   build: "bun ./build.ts",
 }): Record<string, unknown> => ({
-  bin: { hra: "./src/cli.ts" },
-  name: "@hraness/hra",
+  bin: { oompa: "./src/cli.ts" },
+  name: "@hraness/oompa",
   scripts,
-  version: "0.7.1",
+  version: "0.8.0",
 });
 
 type UstarFixtureEntry = Readonly<{
@@ -124,7 +124,7 @@ const gzipZeroFixture = async (byteLength: number): Promise<Buffer> => {
   return Buffer.concat(compressed);
 };
 
-describe("authenticated HRA package archive parser", () => {
+describe("authenticated Oompa package archive parser", () => {
   test("streams an exact minimal ustar package into bounded file identities", async () => {
     const entries = [
       { body: "{}\n", path: "package/package.json" },
@@ -132,7 +132,7 @@ describe("authenticated HRA package archive parser", () => {
       { body: "export {};\n", path: "package/src/install-normalizer.ts" },
     ] as const;
 
-    const parsed = await parseAuthenticatedHraPackageArchive(gzipUstarFixture(entries));
+    const parsed = await parseAuthenticatedOompaPackageArchive(gzipUstarFixture(entries));
 
     expect([...parsed.directories].sort()).toEqual(["", "src"]);
     expect([...parsed.files.keys()].sort()).toEqual([
@@ -157,7 +157,7 @@ describe("authenticated HRA package archive parser", () => {
     }]);
     expect(archive.byteLength).toBeLessThan(1_024);
 
-    await expect(parseAuthenticatedHraPackageArchive(archive)).rejects.toThrow(
+    await expect(parseAuthenticatedOompaPackageArchive(archive)).rejects.toThrow(
       "contains an oversized package file",
     );
   });
@@ -167,7 +167,7 @@ describe("authenticated HRA package archive parser", () => {
       path: `package/${Array.from({ length: 17 }, () => "d").join("/")}`,
     }]);
 
-    await expect(parseAuthenticatedHraPackageArchive(archive)).rejects.toThrow(
+    await expect(parseAuthenticatedOompaPackageArchive(archive)).rejects.toThrow(
       "contains an ambiguous package path",
     );
   });
@@ -178,7 +178,7 @@ describe("authenticated HRA package archive parser", () => {
       type: 0x32,
     }]);
 
-    await expect(parseAuthenticatedHraPackageArchive(archive)).rejects.toThrow(
+    await expect(parseAuthenticatedOompaPackageArchive(archive)).rejects.toThrow(
       "contains a non-regular package entry",
     );
   });
@@ -189,7 +189,7 @@ describe("authenticated HRA package archive parser", () => {
     })));
     expect(archive.byteLength).toBeLessThan(8 * 1_024);
 
-    await expect(parseAuthenticatedHraPackageArchive(archive)).rejects.toThrow(
+    await expect(parseAuthenticatedOompaPackageArchive(archive)).rejects.toThrow(
       "exceeds its package-file-count bound",
     );
   });
@@ -198,13 +198,13 @@ describe("authenticated HRA package archive parser", () => {
     const archive = await gzipZeroFixture(81 * 1_024 * 1_024);
     expect(archive.byteLength).toBeLessThan(128 * 1_024);
 
-    await expect(parseAuthenticatedHraPackageArchive(archive)).rejects.toThrow(
+    await expect(parseAuthenticatedOompaPackageArchive(archive)).rejects.toThrow(
       "exceeds its expanded tar-byte bound",
     );
   });
 
   test("settles a truncated gzip decoder after its error", async () => {
-    await expect(parseAuthenticatedHraPackageArchive(Buffer.from([0x1f, 0x8b, 0x08, 0x00]))).rejects.toThrow(
+    await expect(parseAuthenticatedOompaPackageArchive(Buffer.from([0x1f, 0x8b, 0x08, 0x00]))).rejects.toThrow(
       "could not be parsed as a bounded package tarball",
     );
   });
@@ -219,14 +219,14 @@ type InstallFixture = Readonly<{
 }>;
 
 const installFixture = async (): Promise<InstallFixture> => {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-install-normalizer-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-install-normalizer-")));
   temporaryDirectories.push(root);
-  const packageRoot = join(root, "node_modules", "@hraness", "hra");
+  const packageRoot = join(root, "node_modules", "@hraness", "oompa");
   const sourceDirectory = join(packageRoot, "src");
   const binDirectory = join(root, "node_modules", ".bin");
   const cliPath = join(sourceDirectory, "cli.ts");
   const normalizerPath = join(sourceDirectory, "install-normalizer.ts");
-  const binLink = join(binDirectory, "hra");
+  const binLink = join(binDirectory, "oompa");
   await mkdir(sourceDirectory, { recursive: true, mode: 0o755 });
   await mkdir(binDirectory, { mode: 0o755 });
   await writeFile(join(packageRoot, "package.json"), `${JSON.stringify(manifest(), null, 2)}\n`, {
@@ -235,7 +235,7 @@ const installFixture = async (): Promise<InstallFixture> => {
   await writeFile(normalizerPath, "// reviewed fixture normalizer\n", { mode: 0o644 });
   await writeFile(cliPath, await readFile(join(repositoryRoot, "src", "cli.ts")), { mode: 0o755 });
   await chmod(cliPath, 0o777);
-  await symlink("../@hraness/hra/src/cli.ts", binLink);
+  await symlink("../@hraness/oompa/src/cli.ts", binLink);
   return { binLink, cliPath, normalizerPath, packageRoot, root };
 };
 
@@ -260,22 +260,24 @@ const run = async (
 describe("lifecycle-free Bun install normalizer", () => {
   test("binds the reviewed CLI bytes to a checked digest", async () => {
     const bytes = await readFile(join(repositoryRoot, "src", "cli.ts"));
-    expect(createHash("sha256").update(bytes).digest("hex")).toBe(HRA_INSTALL_CLI_SHA256);
+    expect(createHash("sha256").update(bytes).digest("hex")).toBe(OOMPA_INSTALL_CLI_SHA256);
   });
 
   test("binds normalization to the only proven Bun installer runtime", () => {
-    expect(Bun.version).toBe(HRA_INSTALL_BUN_VERSION);
-    expect(() => assertSupportedBunInstallerVersion(HRA_INSTALL_BUN_VERSION)).not.toThrow();
+    expect(Bun.version).toBe(OOMPA_INSTALL_BUN_VERSION);
+    expect(() => assertSupportedBunInstallerVersion(OOMPA_INSTALL_BUN_VERSION)).not.toThrow();
     expect(() => assertSupportedBunInstallerVersion("1.3.15")).toThrow("exact supported Bun installer version");
     expect(() => assertSupportedBunInstallerVersion(undefined)).toThrow("exact supported Bun installer version");
   });
 
   test("requires an exact zero-lifecycle package manifest", () => {
-    expect(() => assertHraInstallManifest(manifest())).not.toThrow();
-    expect(() => assertHraInstallManifest({ ...manifest(), version: "0.7.0" }))
-      .toThrow("package identity");
+    expect(() => assertOompaInstallManifest(manifest())).not.toThrow();
+    for (const version of ["0.7.0", "0.7.1"]) {
+      expect(() => assertOompaInstallManifest({ ...manifest(), version }))
+        .toThrow("package identity");
+    }
     for (const name of ["preinstall", "postinstall", "prepublishOnly", "prepare", "prepack"]) {
-      expect(() => assertHraInstallManifest(manifest({
+      expect(() => assertOompaInstallManifest(manifest({
         build: "bun ./build.ts",
         [name]: "bun ./unreviewed.ts",
       }))).toThrow("zero-lifecycle contract");
@@ -289,7 +291,7 @@ describe("lifecycle-free Bun install normalizer", () => {
     const uid = process.getuid?.();
     if (uid === undefined) throw new Error("The install normalizer test requires a current-user identity.");
 
-    await normalizeHraBunInstall({
+    await normalizeOompaBunInstall({
       normalizerPath: fixture.normalizerPath,
       packageRoot: fixture.packageRoot,
     });
@@ -312,7 +314,7 @@ describe("lifecycle-free Bun install normalizer", () => {
     await chmod(join(fixture.packageRoot, "package.json"), 0o600);
     await chmod(fixture.normalizerPath, 0o600);
 
-    await normalizeHraBunInstall({
+    await normalizeOompaBunInstall({
       normalizerPath: fixture.normalizerPath,
       packageRoot: fixture.packageRoot,
     });
@@ -328,7 +330,7 @@ describe("lifecycle-free Bun install normalizer", () => {
     await writeFile(mismatched.cliPath, mismatchedBytes, { mode: 0o777 });
     await chmod(mismatched.cliPath, 0o777);
     const mismatchedInode = (await lstat(mismatched.cliPath)).ino;
-    await expect(normalizeHraBunInstall({
+    await expect(normalizeOompaBunInstall({
       normalizerPath: mismatched.normalizerPath,
       packageRoot: mismatched.packageRoot,
     })).rejects.toThrow("does not match the reviewed package digest");
@@ -345,7 +347,7 @@ describe("lifecycle-free Bun install normalizer", () => {
       }), null, 2)}\n`,
       { mode: 0o644 },
     );
-    await expect(normalizeHraBunInstall({
+    await expect(normalizeOompaBunInstall({
       normalizerPath: lifecycle.normalizerPath,
       packageRoot: lifecycle.packageRoot,
     })).rejects.toThrow("zero-lifecycle contract");
@@ -357,7 +359,7 @@ describe("lifecycle-free Bun install normalizer", () => {
     const wrongTarget = join(wrongBin.root, "wrong-cli.ts");
     await writeFile(wrongTarget, "wrong\n", { mode: 0o755 });
     await symlink(wrongTarget, wrongBin.binLink);
-    await expect(normalizeHraBunInstall({
+    await expect(normalizeOompaBunInstall({
       normalizerPath: wrongBin.normalizerPath,
       packageRoot: wrongBin.packageRoot,
     })).rejects.toThrow("does not resolve to its exact package entry point");
@@ -366,7 +368,7 @@ describe("lifecycle-free Bun install normalizer", () => {
 
     const hardlinked = await installFixture();
     await link(hardlinked.cliPath, join(hardlinked.root, "second-link"));
-    await expect(normalizeHraBunInstall({
+    await expect(normalizeOompaBunInstall({
       normalizerPath: hardlinked.normalizerPath,
       packageRoot: hardlinked.packageRoot,
     })).rejects.toThrow("single-link 0755 or 0777 regular file");
@@ -377,7 +379,7 @@ describe("lifecycle-free Bun install normalizer", () => {
   test("refuses writable and symlinked mutation parents and quarantines after core custody", async () => {
     const writablePackageParent = await installFixture();
     await chmod(join(writablePackageParent.root, "node_modules"), 0o775);
-    await expect(normalizeHraBunInstall({
+    await expect(normalizeOompaBunInstall({
       normalizerPath: writablePackageParent.normalizerPath,
       packageRoot: writablePackageParent.packageRoot,
     })).rejects.toThrow("group/world-writable directory component");
@@ -385,7 +387,7 @@ describe("lifecycle-free Bun install normalizer", () => {
 
     const writableBinParent = await installFixture();
     await chmod(dirname(writableBinParent.binLink), 0o777);
-    await expect(normalizeHraBunInstall({
+    await expect(normalizeOompaBunInstall({
       normalizerPath: writableBinParent.normalizerPath,
       packageRoot: writableBinParent.packageRoot,
     })).rejects.toThrow("group/world-writable directory component");
@@ -394,7 +396,7 @@ describe("lifecycle-free Bun install normalizer", () => {
     const symlinkedRoot = await installFixture();
     const packageAlias = join(symlinkedRoot.root, "hra-package-alias");
     await symlink(symlinkedRoot.packageRoot, packageAlias, "dir");
-    await expect(normalizeHraBunInstall({
+    await expect(normalizeOompaBunInstall({
       normalizerPath: join(packageAlias, "src", "install-normalizer.ts"),
       packageRoot: packageAlias,
     })).rejects.toThrow("refuses symlinked package or normalizer paths");
@@ -406,7 +408,7 @@ describe("lifecycle-free Bun install normalizer", () => {
     test(`disables the freshly published CLI and removes its command link when ${hook} fails`, async () => {
       const fixture = await installFixture();
       const before = await lstat(fixture.cliPath);
-      await expect(normalizeHraBunInstall({
+      await expect(normalizeOompaBunInstall({
         normalizerPath: fixture.normalizerPath,
         packageRoot: fixture.packageRoot,
         testHooks: {
@@ -425,7 +427,7 @@ describe("lifecycle-free Bun install normalizer", () => {
     const replacedSource = await installFixture();
     const sourceDirectory = join(replacedSource.packageRoot, "src");
     const heldSourceDirectory = join(replacedSource.packageRoot, "src-held");
-    await expect(normalizeHraBunInstall({
+    await expect(normalizeOompaBunInstall({
       normalizerPath: replacedSource.normalizerPath,
       packageRoot: replacedSource.packageRoot,
       testHooks: {
@@ -441,25 +443,25 @@ describe("lifecycle-free Bun install normalizer", () => {
     const replacedBin = await installFixture();
     const binDirectory = dirname(replacedBin.binLink);
     const heldBinDirectory = join(replacedBin.root, "node_modules", ".bin-held");
-    await expect(normalizeHraBunInstall({
+    await expect(normalizeOompaBunInstall({
       normalizerPath: replacedBin.normalizerPath,
       packageRoot: replacedBin.packageRoot,
       testHooks: {
         beforePublishRename: async () => {
           await rename(binDirectory, heldBinDirectory);
           await mkdir(binDirectory, { mode: 0o755 });
-          await symlink("../@hraness/hra/src/cli.ts", join(binDirectory, "hra"));
+          await symlink("../@hraness/oompa/src/cli.ts", join(binDirectory, "oompa"));
         },
       },
     })).rejects.toThrow("directory path no longer names its held custody descriptor");
     expect((await lstat(replacedBin.cliPath)).mode & 0o777).toBe(0o600);
-    expect((await lstat(join(heldBinDirectory, "hra"))).isSymbolicLink()).toBe(true);
+    expect((await lstat(join(heldBinDirectory, "oompa"))).isSymbolicLink()).toBe(true);
   });
 
   test("normalizes fresh and repeated global installs without executing or changing existing trust", async () => {
-    const root = await realpath(await mkdtemp(join(tmpdir(), "hra lifecycle-free global ")));
+    const root = await realpath(await mkdtemp(join(tmpdir(), "oompa lifecycle-free global ")));
     temporaryDirectories.push(root);
-    const packageSource = join(root, "hra-source");
+    const packageSource = join(root, "oompa-source");
     const hostileSource = join(root, "hostile-source");
     const archiveDirectory = join(root, "archive");
     const consumerHome = join(root, "home");
@@ -536,26 +538,26 @@ describe("lifecycle-free Bun install normalizer", () => {
     globalManifest.trustedDependencies = ["existing-trusted-fixture"];
     await writeFile(globalManifestPath, `${JSON.stringify(globalManifest, null, 2)}\n`, { mode: 0o644 });
 
-    const hraPack = await run(
+    const oompaPack = await run(
       [process.execPath, "pm", "pack", "--ignore-scripts", "--destination", archiveDirectory],
       { cwd: packageSource, environment },
     );
-    expect(hraPack.exitCode).toBe(0);
-    const hraArchive = join(archiveDirectory, "hraness-hra-0.7.1.tgz");
+    expect(oompaPack.exitCode).toBe(0);
+    const oompaArchive = join(archiveDirectory, "hraness-oompa-0.8.0.tgz");
     let installedCli: string | undefined;
     const installAndNormalize = async (): Promise<void> => {
       const installation = await run(
-        [process.execPath, join(repositoryRoot, "src", "install-preflight.ts"), hraArchive],
+        [process.execPath, join(repositoryRoot, "src", "install-preflight.ts"), oompaArchive],
         { cwd: root, environment },
       );
       expect(installation.exitCode).toBe(0);
       expect(installation.stdout).toBe("hra-install-safe\n");
-      const currentCli = await realpath(join(globalInstall, "bin", "hra"));
+      const currentCli = await realpath(join(globalInstall, "bin", "oompa"));
       installedCli ??= currentCli;
       expect(currentCli).toBe(installedCli);
-      expect(currentCli).toContain(`${join(globalInstall, "install", "hra", "versions")}/`);
+      expect(currentCli).toContain(`${join(globalInstall, "install", "oompa", "versions")}/`);
       expect((await lstat(currentCli)).mode & 0o777).toBe(0o755);
-      expect(await Bun.file(join(globalInstall, "install", "global", "node_modules", "@hraness", "hra")).exists()).toBeFalse();
+      expect(await Bun.file(join(globalInstall, "install", "global", "node_modules", "@hraness", "oompa")).exists()).toBeFalse();
       expect(await access(hostileSentinel).then(() => "present", () => "absent")).toBe("absent");
       const trustAfter = JSON.parse(await readFile(globalManifestPath, "utf8")) as Record<string, unknown>;
       expect(trustAfter.trustedDependencies).toEqual(["existing-trusted-fixture"]);
@@ -565,7 +567,7 @@ describe("lifecycle-free Bun install normalizer", () => {
   });
 
   test("makes lifecycle-disabled copyfile installation fail closed when the reviewed CLI digest is wrong", async () => {
-    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-normalizer-refusal-")));
+    const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-normalizer-refusal-")));
     temporaryDirectories.push(root);
     const packageSource = join(root, "package-source");
     const archiveDirectory = join(root, "archive");
@@ -606,7 +608,7 @@ describe("lifecycle-free Bun install normalizer", () => {
       { cwd: packageSource },
     );
     expect(packed.exitCode).toBe(0);
-    const archive = join(archiveDirectory, "hraness-hra-0.7.1.tgz");
+    const archive = join(archiveDirectory, "hraness-oompa-0.8.0.tgz");
     const environment = {
       ...process.env,
       BUN_INSTALL: globalInstall,
@@ -627,10 +629,10 @@ describe("lifecycle-free Bun install normalizer", () => {
       },
     );
     expect(installed.exitCode).not.toBe(0);
-    expect(installed.stderr).not.toContain(HRA_INSTALL_CLI_SHA256);
-    expect(await Bun.file(join(globalInstall, "bin", "hra")).exists()).toBeFalse();
-    expect(await Bun.file(join(globalInstall, "install", "global", "node_modules", "@hraness", "hra")).exists()).toBeFalse();
-    const authorityEntries = await readdir(join(globalInstall, "install", "hra"));
+    expect(installed.stderr).not.toContain(OOMPA_INSTALL_CLI_SHA256);
+    expect(await Bun.file(join(globalInstall, "bin", "oompa")).exists()).toBeFalse();
+    expect(await Bun.file(join(globalInstall, "install", "global", "node_modules", "@hraness", "oompa")).exists()).toBeFalse();
+    const authorityEntries = await readdir(join(globalInstall, "install", "oompa"));
     expect(authorityEntries.some((entry) => entry.startsWith(".staging-"))).toBeTrue();
   });
 });

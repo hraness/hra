@@ -1,0 +1,362 @@
+// Coordinator-reviewed execution only. No source is imported before its full
+// manifest and exact dependencies are checked. Stage11..16 outputs are copies
+// of UNCOMMITTED archived10->17 migration stages, NOT released writer images.
+// Only archived public APIs write logical input. The observer neither changes
+// SQL nor injects, deletes, normalizes, or reinserts any captured database cell.
+import { createHash } from "node:crypto";
+import { lstatSync, readdirSync, readFileSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join, relative } from "node:path";
+import { Database } from "bun:sqlite";
+import { z } from "zod";
+
+const sha256 = (value: string | Uint8Array) => createHash("sha256").update(value).digest("hex");
+const readBounded = (path: string, bytes = 8 * 1024 * 1024) => {
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.size > bytes) throw new Error("CAPTURE_FILE_LIMIT");
+  return readFileSync(path);
+};
+const hostPrefixes = [["", "Users", ""], ["", "home", ""], ["", "private", ""],
+  ["", "tmp", ""], ["", "var", "folders", ""]].map((parts) => parts.join("/"));
+hostPrefixes.push(["", "Users", ""].join("\\"));
+const assertPrivatePathFree = (bytes: Uint8Array) => {
+  const value = Buffer.from(bytes);
+  for (const prefix of hostPrefixes) for (const needle of [
+    Buffer.from(prefix, "utf8"), Buffer.from(prefix, "utf16le"), Buffer.from(prefix, "utf16le").swap16(),
+  ]) {
+    if (value.includes(needle)) throw new Error("CAPTURE_HOST_PATH");
+  }
+};
+const recipe = readBounded(import.meta.filename, 64 * 1024);
+assertPrivatePathFree(recipe);
+if (Bun.version !== "1.3.14" || (lstatSync(import.meta.dir).mode & 0o777) !== 0o700) {
+  throw new Error("CAPTURE_RUNTIME_OR_DIRECTORY_MISMATCH");
+}
+const dependencies = { "@openai/codex": "0.149.0", convex: "1.45.0", zod: "4.4.3" } as const;
+const dependencyManifestHashes: Readonly<Record<string, string>> = {
+  "@openai/codex": "0580493a92b83d962b8fdc8585a66c963431c6ddb54fabe4b3797970095f000d",
+  convex: "aa9f5baee26b69a88d6b61180e540cce1f52baa31094e7124c8c0393e4b3211e",
+  zod: "c630bd10b52dcf71c112a2bf78dbf2734b9db58d62de663b8d86c2ec2c8cda2e",
+};
+const sources = {
+  canonical10: {
+    commit: "42d91955132816626ce35ae8afc4bc330ba38170", tree: "b6c160d105787df4014b149503fbda82ec8835df",
+    sourceFileCount: 119, manifest: "37971033b9487826b2d3bb379f8c63593c419b0a9a69473fea9bf372b8ef3406",
+    pins: {
+      "src/storage/state-store.ts": "6cdee2a6cc9f45f47388169611788f997bce0fe640fa61b9c124785f36d5960e",
+      "package.json": "4ea731562dba841f3c28b0d899d2b91e14353d4b2fc867a70d8e8ccf5670c00d",
+      "bun.lock": "650f295c061c3573d0fb4b5542f12977d8e4b5ab8b65d1e019b290f4a205011d",
+    },
+  },
+  canonical17: {
+    commit: "c018e91fcdeab9fe66078c96ca25c34d198a6189", tree: "4b7a6d24d8be24c889b735ee9146555dc139e293",
+    sourceFileCount: 119, manifest: "407df7c80c5b3503670a4d3b75a90619f0f32d70133b6cd01338dce124d32937",
+    pins: {
+      "src/storage/state-store.ts": "31d462821d1c7830a38e917c989c0b44ba03b8f3c1812788d8eb554d24c09cd0",
+      "package.json": "1ace2e19fb0f9e63e37668baea728c1063b4e7fc89865461a3e59088e9f17ad4",
+      "bun.lock": "650f295c061c3573d0fb4b5542f12977d8e4b5ab8b65d1e019b290f4a205011d",
+    },
+  },
+} as const;
+const verifySources = () => {
+  for (const [name, source] of Object.entries(sources)) {
+    const root = join(import.meta.dir, name);
+    for (const [path, expected] of Object.entries(source.pins)) {
+      if (sha256(readBounded(join(root, path))) !== expected) throw new Error("CAPTURE_SOURCE_MISMATCH");
+    }
+    const files: { path: string; sha256: string }[] = [];
+    const visit = (directory: string) => {
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        if (!/^[A-Za-z0-9_.-]+$/u.test(entry.name)) throw new Error("CAPTURE_SOURCE_ENTRY_INVALID");
+        const path = join(directory, entry.name);
+        if (entry.isDirectory()) visit(path);
+        else if (entry.isFile()) files.push({ path: relative(root, path), sha256: sha256(readBounded(path)) });
+        else throw new Error("CAPTURE_SOURCE_ENTRY_INVALID");
+      }
+    };
+    visit(join(root, "src"));
+    files.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+    if (files.length !== source.sourceFileCount || sha256(JSON.stringify(files)) !== source.manifest) {
+      throw new Error("CAPTURE_SOURCE_MANIFEST_MISMATCH");
+    }
+    const declared = z.object({ dependencies: z.record(z.string(), z.string()) }).passthrough()
+      .parse(JSON.parse(readBounded(join(root, "package.json")).toString("utf8")));
+    if (JSON.stringify(declared.dependencies) !== JSON.stringify(dependencies)) throw new Error("CAPTURE_DEPENDENCIES_MISMATCH");
+    for (const [dependency, version] of Object.entries(dependencies)) {
+      const manifest = readBounded(join(root, "node_modules", dependency, "package.json"), 256 * 1024);
+      if (sha256(manifest) !== dependencyManifestHashes[dependency]) throw new Error("CAPTURE_DEPENDENCY_MANIFEST_MISMATCH");
+      z.object({ name: z.literal(dependency), version: z.literal(version) }).passthrough()
+        .parse(JSON.parse(manifest.toString("utf8")));
+    }
+  }
+};
+verifySources();
+const stageVersions = [11, 12, 13, 14, 15, 16] as const;
+const markers = stageVersions.map((version) => `PRAGMA user_version = ${version}`);
+const migrationSource = readBounded(join(import.meta.dir, "canonical17/src/storage/state-store.ts")).toString("utf8");
+for (const marker of markers) {
+  if (migrationSource.split(`database.exec("${marker}");`).length !== 2) throw new Error("CAPTURE_MARKER_SOURCE_MISMATCH");
+}
+if (!migrationSource.includes('database.exec("PRAGMA secure_delete = ON")')) throw new Error("CAPTURE_SECURE_DELETE_SOURCE_MISMATCH");
+
+const { StateStore: Store10 } = await import("./canonical10/src/storage/state-store");
+const { StateStore: Store17 } = await import("./canonical17/src/storage/state-store");
+const { initializeStatePaths, resolveStatePaths } = await import("./canonical10/src/storage/paths");
+const capture = join(import.meta.dir, "capture");
+await mkdir(capture, { mode: 0o700 });
+const paths10 = resolveStatePaths({ homeDirectory: join(capture, "home10"), platform: "darwin" });
+await initializeStatePaths(paths10);
+const fixedTime = 10_001;
+const migrationTime = 17_001;
+const store10 = new Store10(paths10, { now: () => fixedTime });
+const bootId = `boot_${"1".repeat(32)}`;
+const daemonGeneration = store10.nextDaemonGeneration(bootId);
+const created = store10.createProfile("Canonical10 stage source");
+const profile = store10.nextProfileGeneration(created.id);
+const reservedUsageRevision = store10.allocateNextUsageRevision(profile.id);
+if (reservedUsageRevision !== 1) throw new Error("CAPTURE_UNUSED_USAGE_RESERVATION_INVALID");
+const session = store10.upsertProviderSession({
+  profileId: profile.id, providerThreadId: "canonical10-synthetic-thread",
+  title: "Canonical10 stage queue", state: "idle", providerUpdatedAt: fixedTime,
+});
+const queue = ["first", "third", "fourth"].map((message) => store10.enqueue(session.id, message));
+// These are three real old queue inserts, not a fabricated deleted-row hole.
+const mcpSentinel = "CANONICAL10_MCP_URL_SYNTHETIC_SENTINEL";
+const permissionSentinel = "CANONICAL10_PERMISSION_SYNTHETIC_SENTINEL";
+const staleNoteSentinel = "CANONICAL10_OLD_NOTE_SYNTHETIC_SENTINEL";
+const connectionId = "10000000-0000-4000-8000-000000000010";
+const authority = (request: number, method: string) => ({
+  profileId: profile.id, processGeneration: profile.processGeneration, connectionId,
+  requestId: { type: "number" as const, value: request }, method,
+  requestDigest: sha256(`canonical10 synthetic request ${request}`),
+  threadId: session.providerThreadId ?? null, turnId: null, itemId: null, approvalId: null,
+});
+const mcp = store10.admitInteraction({
+  publicId: "10000000-0000-4000-8000-000000000011", sessionId: session.id,
+  authority: authority(1, "item/mcpToolCall/requestElicitation"), kind: "mcp_elicitation", blocking: false,
+  display: { kind: "mcp_elicitation", summary: "Synthetic old URL", serverName: "fixture",
+    mode: "url", url: `https://example.invalid/${mcpSentinel}${"x".repeat(1536)}`, mayContainSecrets: true },
+});
+const permission = store10.admitInteraction({
+  publicId: "10000000-0000-4000-8000-000000000012", sessionId: session.id,
+  authority: authority(2, "item/permissions/requestApproval"), kind: "permission_approval", blocking: true,
+  display: { kind: "permission_approval", summary: "Synthetic old permission", reason: null,
+    requested: [{ name: "filesystem", value: `${permissionSentinel}${"p".repeat(1536)}` }], allowsSessionScope: true },
+});
+const approval = store10.admitInteraction({
+  publicId: "10000000-0000-4000-8000-000000000013", sessionId: session.id,
+  authority: authority(3, "item/commandExecution/requestApproval"), kind: "command_approval", blocking: true,
+  display: { kind: "command_approval", summary: "Synthetic approval", reason: null,
+    commandClass: "fixture", workingDirectory: null, allowsSessionApproval: true },
+});
+// Genuine old pending-login receipt without a loginId, created through the
+// original prepare/begin/applied API. No current provider-authority claim.
+const loginProfile = store10.createProfile("Canonical10 pending login");
+if (store10.allocateNextUsageRevision(loginProfile.id) !== 1) throw new Error("CAPTURE_LOGIN_USAGE_RESERVATION_INVALID");
+const loginKey = "10000000-0000-4000-8000-000000000017";
+const login = store10.prepareMutation({ kind: "account.login", authorityId: loginProfile.id,
+  authorityGeneration: 1, request: { method: "device_code" }, idempotencyKey: loginKey });
+store10.beginAccountMutationEffect({ attemptId: login.id, profileId: loginProfile.id,
+  profileGeneration: 1, evidence: { kind: "account.login", method: "device_code" } });
+if (!store10.transitionMutation(login.id, "effect_started", "applied", { status: "pending" })) throw new Error("CAPTURE_LOGIN_TRANSITION_REFUSED");
+const pendingLogin = store10.readMutation(loginKey);
+const pendingProfile = store10.requireProfile(loginProfile.id);
+
+// Public note set/clear creates independently attributable old free-page
+// material. It is NOT claimed to be erased MCP history. Eight bounded notes
+// leave enough old content to observe without altering secure_delete or pages.
+const noteText = `${staleNoteSentinel}:`.repeat(350);
+if (Buffer.byteLength(noteText) > 16_384) throw new Error("CAPTURE_NOTE_INPUT_LIMIT");
+const noteSessions = Array.from({ length: 8 }, (_, index) => {
+  const empty = store10.createSession({ profileId: profile.id, title: `Canonical10 stale-note ${index}`,
+    preset: "high", fastEnabled: false });
+  return store10.updateSessionMetadata({ sessionId: empty.id, expectedRevision: empty.revision, note: noteText });
+});
+const clearedNoteSessions = noteSessions.map((entry) => store10.updateSessionMetadata({
+  sessionId: entry.id, expectedRevision: entry.revision, note: "",
+}));
+store10.close();
+
+const identifier = (name: string) => {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(name)) throw new Error("CAPTURE_IDENTIFIER_INVALID");
+  return `"${name}"`;
+};
+const schemaRow = z.object({ type: z.string(), name: z.string(), tbl_name: z.string(), sql: z.string().nullable() }).strict();
+const snapshot = (database: Database) => {
+  const schema = z.array(schemaRow).max(2048).parse(database.query(
+    "SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name LIMIT 2049").all());
+  const tables = schema.filter((entry) => entry.type === "table").map((entry) => entry.name).sort();
+  if (tables.length > 256) throw new Error("CAPTURE_TABLE_LIMIT");
+  const rows: Record<string, unknown[]> = {};
+  const logicalText: string[] = [];
+  for (const table of tables) {
+    const columns = z.array(z.object({ name: z.string() }).passthrough()).max(128)
+      .parse(database.query(`PRAGMA table_xinfo(${identifier(table)})`).all());
+    const projection = columns.map(({ name }) => {
+      const quoted = identifier(name);
+      return `json_array(typeof(${quoted}),CASE WHEN typeof(${quoted}) IN ('text','blob') THEN hex(${quoted}) ELSE ${quoted} END) AS ${quoted}`;
+    }).join(",");
+    const selected = database.query(`SELECT ${projection} FROM ${identifier(table)} LIMIT 4097`).all();
+    if (selected.length > 4096) throw new Error("CAPTURE_ROW_LIMIT");
+    rows[table] = selected.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+    logicalText.push(JSON.stringify(selected));
+  }
+  const result = { version: database.query("PRAGMA user_version").get(),
+    ledger: database.query("SELECT * FROM migrations ORDER BY version").all(),
+    foreignKeys: database.query("PRAGMA foreign_key_check").all(), schema, rows };
+  if (Buffer.byteLength(JSON.stringify(result)) > 8 * 1024 * 1024) throw new Error("CAPTURE_SNAPSHOT_LIMIT");
+  if (result.foreignKeys.length !== 0) throw new Error("CAPTURE_FOREIGN_KEYS_INVALID");
+  return { result, logicalHex: logicalText.join("") };
+};
+const inspect = (path: string) => {
+  const database = new Database(path, { create: false, strict: true });
+  try {
+    database.exec("PRAGMA query_only=ON");
+    const result = database.transaction(() => snapshot(database)).deferred();
+    z.object({ count: z.literal(0) }).strict().parse(database.query("SELECT total_changes() AS count").get());
+    if (database.inTransaction) throw new Error("CAPTURE_INSPECTOR_TRANSACTION_LEAK");
+    return result;
+  } finally { database.close(false); }
+};
+const checkpoint = (path: string) => {
+  const database = new Database(path, { create: false, strict: true });
+  try {
+    z.object({ busy: z.literal(0), log: z.literal(0), checkpointed: z.literal(0) }).strict()
+      .parse(database.query("PRAGMA wal_checkpoint(TRUNCATE)").get());
+  } finally { database.close(false); }
+};
+const assertLogicalSentinel = (logicalHex: string, sentinel: string, present: boolean) => {
+  if (logicalHex.includes(Buffer.from(sentinel).toString("hex").toUpperCase()) !== present) {
+    throw new Error("CAPTURE_LOGICAL_SENTINEL_MISMATCH");
+  }
+};
+checkpoint(paths10.database);
+const original = inspect(paths10.database);
+const initialBytes = readBounded(paths10.database);
+assertPrivatePathFree(initialBytes);
+if (JSON.stringify(original.result.version) !== '{"user_version":10}') throw new Error("CAPTURE_BASE_VERSION_INVALID");
+assertLogicalSentinel(original.logicalHex, mcpSentinel, true);
+assertLogicalSentinel(original.logicalHex, permissionSentinel, true);
+assertLogicalSentinel(original.logicalHex, staleNoteSentinel, false);
+if (!initialBytes.includes(Buffer.from(staleNoteSentinel))) throw new Error("CAPTURE_REAL_OLD_NOTE_BYTES_ABSENT");
+for (const readonly of [false, true]) {
+  const bytesBefore = readBounded(paths10.database);
+  const reopened = new Store10(paths10, { readonly, now: () => fixedTime + 1 });
+  try {
+    if (JSON.stringify(reopened.readMutation(loginKey)) !== JSON.stringify(pendingLogin)) throw new Error("CAPTURE_BASE_LOGIN_CHANGED");
+  } finally { reopened.close(); }
+  if (JSON.stringify(inspect(paths10.database)) !== JSON.stringify(original)) throw new Error("CAPTURE_BASE_REOPEN_CHANGED");
+  checkpoint(paths10.database);
+  if (readonly && sha256(readBounded(paths10.database)) !== sha256(bytesBefore)) throw new Error("CAPTURE_BASE_READONLY_BYTES_CHANGED");
+}
+const baseBytes = readBounded(paths10.database);
+assertPrivatePathFree(baseBytes);
+if (!baseBytes.includes(Buffer.from(staleNoteSentinel))) throw new Error("CAPTURE_REOPENED_OLD_NOTE_BYTES_ABSENT");
+const paths17 = resolveStatePaths({ homeDirectory: join(capture, "home17"), platform: "darwin" });
+await initializeStatePaths(paths17);
+await writeFile(paths17.database, baseBytes, { mode: 0o600, flag: "wx" });
+
+type ExecMethod = (this: Database, ...args: Parameters<Database["exec"]>) => ReturnType<Database["exec"]>;
+const execDescriptor: (Omit<PropertyDescriptor, "value"> & { value?: ExecMethod }) | undefined = Object.getOwnPropertyDescriptor(Database.prototype, "exec");
+if (execDescriptor?.value === undefined || execDescriptor.configurable !== true) throw new Error("CAPTURE_EXEC_DESCRIPTOR_INVALID");
+const captured: { version: number; marker: string; bytes: Buffer; sha256: string; snapshot: ReturnType<typeof snapshot> }[] = [];
+Object.defineProperty(Database.prototype, "exec", { ...execDescriptor,
+  value: function(this: Database, ...args: Parameters<Database["exec"]>) {
+    if (execDescriptor.value === undefined) throw new Error("CAPTURE_EXEC_DESCRIPTOR_LOST");
+    const result = execDescriptor.value.call(this, ...args);
+    const markerIndex = markers.indexOf(args[0]);
+    if (markerIndex !== -1) {
+      const version = stageVersions[markerIndex];
+      if (this.filename !== paths17.database || !this.inTransaction || version === undefined
+        || captured.length !== markerIndex) throw new Error("CAPTURE_STAGE_ORDER_OR_TRANSACTION_INVALID");
+      const changesBefore = this.query("SELECT total_changes() AS count").get();
+      const observed = snapshot(this);
+      if (JSON.stringify(observed.result.version) !== JSON.stringify({ user_version: version })) throw new Error("CAPTURE_STAGE_VERSION_INVALID");
+      const bytes = Buffer.from(this.serialize());
+      if (bytes.length > 8 * 1024 * 1024) throw new Error("CAPTURE_STAGE_BYTES_LIMIT");
+      if (JSON.stringify(this.query("SELECT total_changes() AS count").get()) !== JSON.stringify(changesBefore)
+        || !this.inTransaction) throw new Error("CAPTURE_OBSERVER_CHANGED_TRANSACTION");
+      captured.push({ version, marker: args[0], bytes, sha256: sha256(bytes), snapshot: observed });
+    }
+    return result;
+  },
+});
+try {
+  const migrated = new Store17(paths17, { now: () => migrationTime });
+  try {
+    if (migrated.requireProfile(loginProfile.id).state !== "signed_out") throw new Error("CAPTURE_FINAL_LOGIN_NOT_RECONCILED");
+  } finally { migrated.close(); }
+} finally { Object.defineProperty(Database.prototype, "exec", execDescriptor); }
+if (Object.getOwnPropertyDescriptor(Database.prototype, "exec")?.value !== execDescriptor.value || captured.length !== 6) {
+  throw new Error("CAPTURE_OBSERVER_RESTORE_OR_COVERAGE_INVALID");
+}
+checkpoint(paths17.database);
+const final = inspect(paths17.database);
+if (JSON.stringify(final.result.version) !== '{"user_version":17}') throw new Error("CAPTURE_FINAL_VERSION_INVALID");
+for (const readonly of [false, true]) {
+  const bytesBefore = readBounded(paths17.database);
+  const reopened = new Store17(paths17, { readonly, now: () => migrationTime + 1 });
+  reopened.close();
+  if (JSON.stringify(inspect(paths17.database)) !== JSON.stringify(final)) throw new Error("CAPTURE_FINAL_REOPEN_CHANGED");
+  checkpoint(paths17.database);
+  if (readonly && sha256(readBounded(paths17.database)) !== sha256(bytesBefore)) throw new Error("CAPTURE_FINAL_READONLY_BYTES_CHANGED");
+}
+const finalBytes = readBounded(paths17.database);
+for (const sentinel of [mcpSentinel, permissionSentinel, staleNoteSentinel]) {
+  if (finalBytes.includes(Buffer.from(sentinel))) throw new Error("CAPTURE_FINAL_PHYSICAL_SCRUB_INCOMPLETE");
+}
+const stageMetadata = [];
+// These validation copies are not published fixture outputs. A refused capture
+// keeps them for diagnosis, without a fixture.json admitting any partial result.
+const candidateReadbacks = join(capture, "candidate-readbacks");
+await mkdir(candidateReadbacks, { mode: 0o700 });
+for (const stage of captured) {
+  if (sha256(stage.bytes) !== stage.sha256) throw new Error("CAPTURE_STAGE_BUFFER_CHANGED_AFTER_MIGRATION");
+  assertPrivatePathFree(stage.bytes);
+  assertLogicalSentinel(stage.snapshot.logicalHex, mcpSentinel, false);
+  assertLogicalSentinel(stage.snapshot.logicalHex, permissionSentinel, stage.version < 15);
+  assertLogicalSentinel(stage.snapshot.logicalHex, staleNoteSentinel, false);
+  // Mandatory real physical premise, with no fallback to the engine-only test.
+  if (stage.version <= 13 && !stage.bytes.includes(Buffer.from(staleNoteSentinel))) {
+    throw new Error(`CAPTURE_STAGE_REAL_OLD_NOTE_BYTES_ABSENT:${stage.version}`);
+  }
+  const expectedLedger = Array.from({ length: stage.version }, (_, index) => ({
+    version: index + 1, applied_at: index < 10 ? fixedTime : migrationTime,
+  }));
+  if (JSON.stringify(stage.snapshot.result.ledger) !== JSON.stringify(expectedLedger)) throw new Error("CAPTURE_STAGE_LEDGER_INVALID");
+  if (stage.snapshot.result.schema.some((entry) => entry.name === "provider_login_authorities")) throw new Error("CAPTURE_POST_TARGET_OBJECT_PRESENT");
+  const output = join(candidateReadbacks, `stage${stage.version}.sqlite`);
+  await writeFile(output, stage.bytes, { mode: 0o600, flag: "wx" });
+  const readback = inspect(output);
+  if (JSON.stringify(readback) !== JSON.stringify(stage.snapshot)
+    || sha256(readBounded(output)) !== stage.sha256) throw new Error("CAPTURE_SERIALIZED_STAGE_READBACK_CHANGED");
+  stageMetadata.push({ version: stage.version, marker: stage.marker, databaseSha256: stage.sha256,
+    databaseBytes: stage.bytes.length, snapshot: stage.snapshot.result,
+    provenance: { kind: "uncommitted_archived_migration_stage", releasedWriterImage: false,
+      observedBeforeOuterCommit: true, rawByteCopyWithoutNormalization: true,
+      standaloneReadbackTransactionClosed: true, oldNoteSentinelPresent: stage.bytes.includes(Buffer.from(staleNoteSentinel)),
+      oldNoteSentinelIsNotMcpErasureProvenance: true, futureV13ScrubTableMayAlreadyExist: true } });
+}
+verifySources();
+if (sha256(readBounded(import.meta.filename, 64 * 1024)) !== sha256(recipe)) throw new Error("CAPTURE_RECIPE_CHANGED");
+if (sha256(readBounded(paths10.database)) !== sha256(baseBytes)) throw new Error("CAPTURE_SOURCE10_IMAGE_CHANGED");
+assertPrivatePathFree(finalBytes);
+const metadata = { sources, dependencies, dependencyManifestHashes, generatorSha256: sha256(recipe), bunVersion: Bun.version,
+  fixedTime, migrationTime, baseDatabaseSha256: sha256(baseBytes), finalDatabaseSha256: sha256(finalBytes),
+  retained: { bootId, daemonGeneration, profile, session, queue, mcp, permission, approval, reservedUsageRevision,
+    pendingProfile, pendingLogin, loginKey, clearedNoteSessions, mcpSentinel, permissionSentinel, staleNoteSentinel },
+  original: original.result, final: final.result, stages: stageMetadata,
+  provenance: { syntheticStorageOnly: true, providerEffects: 0, sourceSqlChanged: false,
+    observerRowOrSchemaWrites: false, secureDeleteUnchanged: true, queueDeletedRowHoleClaim: false } };
+const metadataBytes = Buffer.from(`${JSON.stringify(metadata, null, 2)}\n`);
+if (metadataBytes.length > 64 * 1024 * 1024) throw new Error("CAPTURE_METADATA_LIMIT");
+assertPrivatePathFree(metadataBytes);
+for (const stage of captured) {
+  await writeFile(join(capture, `uncommitted-archived-migration-stage${stage.version}.sqlite`),
+    stage.bytes, { mode: 0o600, flag: "wx" });
+}
+await writeFile(join(capture, "canonical10.sqlite"), baseBytes, { mode: 0o600, flag: "wx" });
+await writeFile(join(capture, "canonical17.sqlite"), finalBytes, { mode: 0o600, flag: "wx" });
+await writeFile(join(capture, "fixture.json"), metadataBytes, { mode: 0o600, flag: "wx" });
+console.log(JSON.stringify({ generatorSha256: metadata.generatorSha256, baseDatabaseSha256: metadata.baseDatabaseSha256,
+  finalDatabaseSha256: metadata.finalDatabaseSha256, stages: stageMetadata.map(({ version, databaseSha256, databaseBytes }) => ({ version, databaseSha256, databaseBytes })) }));

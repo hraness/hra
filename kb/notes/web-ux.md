@@ -1,21 +1,21 @@
 ---
 title: Web surface UX contract
-description: The keyboard-first, TUI-style interaction contract for the HRA browser surface, an enrolled device that renders the compact projection and submits remote commands.
+description: The keyboard-first, TUI-style interaction contract for the Oompa browser surface, an enrolled device that renders the compact projection and submits remote commands.
 type: note
 status: proposed
-area: hra
+area: oompa
 tags:
   - web
   - ux
   - keyboard
   - accessibility
 relations:
-  related-to: [ plans/hra-v2 ]
+  related-to: [ plans/oompa-v2 ]
 ---
 
 # Web surface UX contract
 
-This note is the build contract for the HRA web app proposed in [HRA v2](../plans/hra-v2.md). The browser is an enrolled device: it holds its own wrapping key, decrypts the compact projection client-side, and submits durable remote commands to the session's execution custodian. It is never the execution device and never implies that it can start, resume, approve file changes, or take over a session.
+This note is the build contract for the Oompa web app proposed in [Oompa v2](../plans/oompa-v2.md). The browser is an enrolled device: it holds its own wrapping key, decrypts the compact projection client-side, and submits durable remote commands to the session's execution custodian. It is never the execution device and never implies that it can start, resume, approve file changes, or take over a session.
 
 Principles: one fixed monospace grid; every action has a key; the mouse is optional; nothing decorative; state is shown as a glyph and a word, never only a color; one status line at the bottom carries identity, device, lease, sync, and mode.
 
@@ -36,7 +36,7 @@ Principles: one fixed monospace grid; every action has a key; the mouse is optio
 | `i` | compose (send); `q` queue; `s` steer; all open INSERT with the kind shown |
 | `x` | stop: two-step (`x` then `Enter`), shows target session + custodian |
 | `p` | preset picker low/high/ultra; `f` toggle fast |
-| `y` | yank public id; `Y` yank the exact equivalent `hra remote ...` command |
+| `y` | yank public id; `Y` yank the exact equivalent `oompa remote ...` command |
 | `r` | reveal interaction summary; `o` open turn summary (files/git) |
 | `/` | filter current list (regex, `!` negates, as k9s) |
 | `:` `Cmd/Ctrl+K` | palette: actions + sessions + accounts + devices, fuzzy, shortcuts shown inline |
@@ -57,7 +57,7 @@ INSERT: `Enter` sends, `Shift+Enter` newline, `Esc` cancels back to NORMAL, `Ctr
 3. **k9s** - `:` command mode with aliases (`:pod ns`), `/` regex filter with `!` negation, header hotkey legend, bottom breadcrumb, `?` lists hotkeys. Copy: `:` resource jumps (`:s <prefix>`, `:a <label>`), filter grammar, crumbs at the bottom. [k9scli.io/topics/hotkeys](https://k9scli.io/topics/hotkeys/), [github.com/derailed/k9s README](https://github.com/derailed/k9s/blob/master/README.md)
 4. **lazygit** - numbered panels (1-5) with the number printed in the corner, `?` help that changes with the focused panel, footer showing the current keys. Copy exactly: pane numbers rendered in the pane title, context-sensitive `?`, footer key hints. [freecodecamp lazygit](https://www.freecodecamp.org/news/how-to-use-lazygit-to-improve-your-git-workflow/), [lazygit discussion 4989](https://github.com/jesseduffield/lazygit/discussions/4989)
 5. **Warp** - each command + output is a selectable block navigable with `Ctrl+↑/↓`, copyable per block, palette for the long tail. Copy: each turn (user message + assistant message + turn summary) is one selectable block in the stream; `y` on a block yanks the block's public id; decrypted text never enters the clipboard. [docs.warp.dev blocks](https://docs.warp.dev/terminal/blocks/block-basics/), [docs.warp.dev command palette](https://docs.warp.dev/terminal/command-palette/)
-6. **Textual / textual-web** - proof that a TUI vocabulary renders well in a browser; the app runs on the machine and the browser is a view. Contrast for HRA: our browser is an *enrolled device with its own key*, not a remote frame, because the custodian may be offline and the projection is E2E encrypted. [textual.textualize.io blog](https://textual.textualize.io/blog/2024/09/08/towards-textual-web-applications/), [github.com/Textualize/textual-web](https://github.com/textualize/textual-web)
+6. **Textual / textual-web** - proof that a TUI vocabulary renders well in a browser; the app runs on the machine and the browser is a view. Contrast for Oompa: our browser is an *enrolled device with its own key*, not a remote frame, because the custodian may be offline and the projection is E2E encrypted. [textual.textualize.io blog](https://textual.textualize.io/blog/2024/09/08/towards-textual-web-applications/), [github.com/Textualize/textual-web](https://github.com/textualize/textual-web)
 7. **Attio** - `?` anywhere opens the shortcut sheet; 30+ "quick actions" surfaced inside search. Copy: `?` and palette share one registry so the two never drift. [attio.com navigating your workspace](https://attio.com/help/reference/productivity-collaborating/navigating-your-workspace)
 8. Command-bar patterns in general (fuzzy match, chained selections as in Tana, inline shortcuts as in Todoist): [maggieappleton.com/command-bar](https://maggieappleton.com/command-bar)
 
@@ -108,9 +108,9 @@ Screen 3 - Accounts and usage (`g a`):
 │● alt    pro    b***@y.io   1 sess   ││ 5h primary      ▓▓▓▓▓▓░░░░ 62%   2h14m   300m           ││● mbp       online       │
 │○ spare  free   —           0 sess   ││ weekly          ▓▓▓░░░░░░░ 31%   4d3h    10080m         ││● brw_3f1a  this browser │
 │                                      ││ daily tokens (30d)  ▁▂▃▅▇▆▃▂▁▂▄▆█▇▅▃▂▁▁▂▃▄▅▆▇▆▅▃▂▁      ││◌ brw_88e0  pending      │
-│                                      ││ lifetime 41.2M · peak 3.1M · streak 12d (best 19d)       ││   approve: hra device   │
+│                                      ││ lifetime 41.2M · peak 3.1M · streak 12d (best 19d)       ││   approve: oompa device   │
 │                                      ││ longest turn 214s                                        ││   approve brw_88e0      │
-│ a add · l login (local only) ────────││ refresh: run `hra account usage --refresh` on mac-mini   ││ r revoke (type id)      │
+│ a add · l login (local only) ────────││ refresh: run `oompa account usage --refresh` on mac-mini   ││ r revoke (type id)      │
 └──────────────────────────────────────┘└──────────────────────────────────────────────────────────┘└─────────────────────────┘
  NORMAL │ g s sessions · g u usage · g d devices │ key v1 ready │ sync 5s │ ? help
 ```
@@ -138,7 +138,7 @@ Screen 4 - Palette (`:`) and help (`?`) overlays on top of screen 1:
 ## Accessibility
 
 - Lists are React Aria `ListBox` from `@hraness/ui` (roving tabindex, `aria-activedescendant`, type-ahead); `j/k` are added as aliases of arrow keys, never replacements.
-- The stream is `role="log"` with `aria-live="polite"` and coalesced announcements (one per turn completion, not per delta), matching the CLI's "coalesces small deltas" rule (`kb/plans/hra-v1.md:90`). Command state changes announce once at terminal state.
+- The stream is `role="log"` with `aria-live="polite"` and coalesced announcements (one per turn completion, not per delta), matching the CLI's "coalesces small deltas" rule (`kb/plans/oompa-v1.md:90`). Command state changes announce once at terminal state.
 - Mode changes (`NORMAL`/`INSERT`/...) are announced via a visually-hidden `aria-live="assertive"` region, one word.
 - Focus ring is always visible (no `outline: none`); the focused pane has a distinct border token; `SkipLink` from `@hraness/ui` jumps to each pane. Focus is trapped in palette/help dialogs (React Aria `Dialog`), returned to the prior element on close.
 - Every single-key action has a palette entry and a visible `KeyHint` in the pane footer, so shortcuts are discoverable without memorization and available through the palette for switch-access users.

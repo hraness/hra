@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import {
-  defaultHraOtpReplyTo,
-  hraOtpReplyToEnvironmentName,
+  defaultOompaOtpReplyTo,
+  oompaOtpReplyToEnvironmentName,
 } from "../convex/otpEmailConfig";
 import {
   BoundedProcessCleanupUnprovenError,
@@ -20,8 +20,8 @@ import {
 } from "./configure-hosted-sync";
 import {
   ConvexTargetError,
-  HRA_CONVEX_PROJECT_ID,
-  HRA_CONVEX_TEAM_ID,
+  OOMPA_CONVEX_PROJECT_ID,
+  OOMPA_CONVEX_TEAM_ID,
   type ConvexTarget,
   type ConvexTargetVerifier,
 } from "./convex-target";
@@ -51,8 +51,8 @@ const target: ConvexTarget = {
   deploymentId: 7_654_321,
   deploymentName: "steady-otter-321",
   deploymentUrl: "https://steady-otter-321.convex.cloud",
-  projectId: HRA_CONVEX_PROJECT_ID,
-  teamId: HRA_CONVEX_TEAM_ID,
+  projectId: OOMPA_CONVEX_PROJECT_ID,
+  teamId: OOMPA_CONVEX_TEAM_ID,
 };
 const targetArguments = [
   "--deployment", target.deploymentName,
@@ -135,8 +135,8 @@ type HarnessOptions = Readonly<{
 }>;
 
 const makeHarness = async (options: HarnessOptions = {}) => {
-  const deployDirectory = await makeProtectedDirectory("hra-reply-deploy-");
-  const outputDirectory = await makeProtectedDirectory("hra-reply-output-");
+  const deployDirectory = await makeProtectedDirectory("oompa-reply-deploy-");
+  const outputDirectory = await makeProtectedDirectory("oompa-reply-output-");
   const deployEvidencePath = join(deployDirectory, "candidate.json");
   const evidencePath = join(outputDirectory, "migration.json");
   const candidate = options.candidate ?? candidateEvidence();
@@ -181,8 +181,8 @@ const makeHarness = async (options: HarnessOptions = {}) => {
     if (request.phase === "hosted-reply-to-set") {
       setCalls += 1;
       if (options.setMutates !== false) {
-        names.add(hraOtpReplyToEnvironmentName);
-        value = defaultHraOtpReplyTo;
+        names.add(oompaOtpReplyToEnvironmentName);
+        value = defaultOompaOtpReplyTo;
       }
       if (options.removeNameAfterSet !== undefined) {
         names.delete(options.removeNameAfterSet);
@@ -216,9 +216,9 @@ const makeHarness = async (options: HarnessOptions = {}) => {
     deployEvidencePath,
     environment: {
       HOME: "/safe/operator",
-      HRA_AUTH_EMAIL_REPLY_TO: defaultHraOtpReplyTo,
-      HRA_FAILURE_SENTINEL: "environment-failure-sentinel",
-      PATH: `/safe/bin:${defaultHraOtpReplyTo}`,
+      OOMPA_AUTH_EMAIL_REPLY_TO: defaultOompaOtpReplyTo,
+      OOMPA_FAILURE_SENTINEL: "environment-failure-sentinel",
+      PATH: `/safe/bin:${defaultOompaOtpReplyTo}`,
     },
     evidencePath,
     readAttestation,
@@ -244,8 +244,8 @@ const makeHarness = async (options: HarnessOptions = {}) => {
     run,
     setRemoteReplyTo(nextValue: string | undefined) {
       value = nextValue;
-      if (nextValue === undefined) names.delete(hraOtpReplyToEnvironmentName);
-      else names.add(hraOtpReplyToEnvironmentName);
+      if (nextValue === undefined) names.delete(oompaOtpReplyToEnvironmentName);
+      else names.add(oompaOtpReplyToEnvironmentName);
     },
     get setCalls() { return setCalls; },
     setVerifyHook(hook: ((phase: string, count: number) => void) | undefined) {
@@ -387,14 +387,14 @@ describe("hosted Reply-To migration operator", () => {
       "SITE_URL",
       "JWT_PRIVATE_KEY",
       "JWKS",
-      "HRA_AUTH_HMAC_SECRET",
-      "HRA_RESEND_API_KEY",
+      "OOMPA_AUTH_HMAC_SECRET",
+      "OOMPA_RESEND_API_KEY",
     ]);
-    expect(HOSTED_REPLY_TO_LEGACY_PREREQUISITE).toBe("HRA_AUTH_EMAIL_FROM");
+    expect(HOSTED_REPLY_TO_LEGACY_PREREQUISITE).toBe("OOMPA_AUTH_EMAIL_FROM");
     expect([...HOSTED_ENVIRONMENT_NAMES]).toEqual([
       ...HOSTED_REPLY_TO_MIGRATION_PREREQUISITES,
-      hraOtpReplyToEnvironmentName,
-      "HRA_ATTENTION_RESEND_API_KEY",
+      oompaOtpReplyToEnvironmentName,
+      "OOMPA_ATTENTION_RESEND_API_KEY",
     ]);
   });
 
@@ -403,9 +403,9 @@ describe("hosted Reply-To migration operator", () => {
       names: [
         ...HOSTED_REPLY_TO_MIGRATION_PREREQUISITES,
         HOSTED_REPLY_TO_LEGACY_PREREQUISITE,
-        hraOtpReplyToEnvironmentName,
+        oompaOtpReplyToEnvironmentName,
       ],
-      value: defaultHraOtpReplyTo,
+      value: defaultOompaOtpReplyTo,
     });
     await expect(harness.run()).rejects.toThrow("reply_to_already_configured");
     expect(harness.setCalls).toBe(0);
@@ -414,7 +414,7 @@ describe("hosted Reply-To migration operator", () => {
   });
 
   test("reconciles an exact value under a matching intent with zero writes and refuses conflict", async () => {
-    for (const remoteValue of [defaultHraOtpReplyTo, "other@example.com"]) {
+    for (const remoteValue of [defaultOompaOtpReplyTo, "other@example.com"]) {
       const harness = await makeHarness();
       const intent = hostedReplyToMigrationIntentSchema.parse(withSelfDigest({
         candidateDeployDigest: harness.candidate.selfDigest,
@@ -431,7 +431,7 @@ describe("hosted Reply-To migration operator", () => {
         hostedReplyToMigrationIntentSchema,
       );
       harness.setRemoteReplyTo(remoteValue);
-      if (remoteValue === defaultHraOtpReplyTo) {
+      if (remoteValue === defaultOompaOtpReplyTo) {
         expect((await harness.run()).replayed).toBe(true);
         expect((await stat(harness.evidencePath)).mode & 0o777).toBe(0o600);
       } else {
@@ -458,7 +458,7 @@ describe("hosted Reply-To migration operator", () => {
       intent,
       hostedReplyToMigrationIntentSchema,
     );
-    missingLegacy.setRemoteReplyTo(defaultHraOtpReplyTo);
+    missingLegacy.setRemoteReplyTo(defaultOompaOtpReplyTo);
     await expect(missingLegacy.run()).rejects.toThrow("migration_recovery_incomplete");
     expect(missingLegacy.setCalls).toBe(0);
   });
@@ -487,9 +487,9 @@ describe("hosted Reply-To migration operator", () => {
     const getFailures: readonly CommandResult[] = [
       { exitCode: 0, stderr: "Environment variable not found", stdout: "" },
       { exitCode: 0, stderr: "", stdout: "other@example.com\n" },
-      { exitCode: 0, stderr: "", stdout: `${defaultHraOtpReplyTo}\nextra\n` },
-      { exitCode: 0, stderr: "warning", stdout: `${defaultHraOtpReplyTo}\n` },
-      { exitCode: 1, stderr: "provider-get-failure", stdout: `${defaultHraOtpReplyTo}\n` },
+      { exitCode: 0, stderr: "", stdout: `${defaultOompaOtpReplyTo}\nextra\n` },
+      { exitCode: 0, stderr: "warning", stdout: `${defaultOompaOtpReplyTo}\n` },
+      { exitCode: 1, stderr: "provider-get-failure", stdout: `${defaultOompaOtpReplyTo}\n` },
     ];
     for (const getResult of getFailures) {
       const harness = await makeHarness({ getResults: [getResult] });
@@ -615,8 +615,8 @@ describe("hosted Reply-To migration operator", () => {
     const harness = await makeHarness({ setExitCode: 1 });
     await harness.run();
     expect(harness.requests.every((request) => (
-      !JSON.stringify(request.arguments).includes(defaultHraOtpReplyTo)
-      && !JSON.stringify(request.environment).includes(defaultHraOtpReplyTo)
+      !JSON.stringify(request.arguments).includes(defaultOompaOtpReplyTo)
+      && !JSON.stringify(request.environment).includes(defaultOompaOtpReplyTo)
       && !JSON.stringify(request.environment).includes("environment-failure-sentinel")
     ))).toBe(true);
     const stdout: string[] = [];
@@ -625,8 +625,8 @@ describe("hosted Reply-To migration operator", () => {
       arguments: executeArguments(harness.deployEvidencePath, harness.evidencePath),
       environment: {
         HOME: "/safe/operator",
-        HRA_FAILURE_SENTINEL: "environment-failure-sentinel",
-        PATH: `/safe/bin:${defaultHraOtpReplyTo}`,
+        OOMPA_FAILURE_SENTINEL: "environment-failure-sentinel",
+        PATH: `/safe/bin:${defaultOompaOtpReplyTo}`,
       },
       readAttestation: async () => candidateAttestation,
       repositoryRoot: "/repo",
@@ -652,9 +652,9 @@ describe("hosted Reply-To migration operator", () => {
     const publicSurface = JSON.stringify({ stderr, stdout });
     expect(publicSurface).not.toContain("provider-read");
     expect(publicSurface).not.toContain("environment-failure");
-    expect(publicSurface).not.toContain(defaultHraOtpReplyTo);
+    expect(publicSurface).not.toContain(defaultOompaOtpReplyTo);
     expect(serializeHostedReplyToMigration()).toBe(
-      `${hraOtpReplyToEnvironmentName}='${defaultHraOtpReplyTo}'\n`,
+      `${oompaOtpReplyToEnvironmentName}='${defaultOompaOtpReplyTo}'\n`,
     );
   });
 

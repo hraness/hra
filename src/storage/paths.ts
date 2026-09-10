@@ -19,7 +19,7 @@ export type StatePaths = {
 };
 
 /**
- * The provider homes owned by the current OS user rather than by an HRA
+ * The provider homes owned by the current OS user rather than by an Oompa
  * profile. Merely resolving these paths grants no read or write authority;
  * the session-adoption policy and the provider-specific custody check do that.
  */
@@ -111,7 +111,7 @@ export function profilePaths(paths: StatePaths, profileId: ProfileId): {
     root,
     codexHome: join(root, "codex-home"),
     // The isolated `CLAUDE_CONFIG_DIR` is the entire Claude Code
-    // authentication boundary for this account. HRA never reads inside it.
+    // authentication boundary for this account. Oompa never reads inside it.
     claudeConfigDir: join(root, "claude-config"),
     desktopUserData: join(root, "desktop-user-data"),
   };

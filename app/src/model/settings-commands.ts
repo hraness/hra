@@ -18,7 +18,7 @@ import {
   activeRemotePresetSelection,
   type RemoteCommandPayload,
   type SupportedPreset,
-} from "../hra/cloud";
+} from "../oompa/cloud";
 
 export type ApprovalMode = "auto:all" | "auto:workspace" | "manual";
 export type PresetChoice = "low" | "high" | "ultra" | "fable-max" | "astra";

@@ -15,7 +15,7 @@ import type {
   CompactMessageActorKind,
   CompactSessionEvent,
   GitAction,
-} from "../hra/cloud";
+} from "../oompa/cloud";
 import { parseAttachmentManifest, type AttachmentManifestEntry } from "./attachments";
 
 export type TranscriptMessageActor = CompactMessageActor | CompactMessageActorKind;

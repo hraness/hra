@@ -1,0 +1,233 @@
+// Coordinator-reviewed execution only. Four authentic archived public-writer
+// images; no schema restamping, raw logical writes, or migration observers.
+// Project roots '/' and '/usr' are read-only canonical-directory witnesses:
+// no project file is created, read, executed, or granted provider authority.
+import { createHash } from "node:crypto";
+import { lstatSync, readdirSync, readFileSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join, relative } from "node:path";
+import { Database } from "bun:sqlite";
+import { z } from "zod";
+
+const sha256 = (value: string | Uint8Array) => createHash("sha256").update(value).digest("hex");
+const readBounded = (path: string, maximum = 8 * 1024 * 1024) => {
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.size > maximum) throw new Error("CAPTURE_FILE_LIMIT");
+  return readFileSync(path);
+};
+const hostPrefixes = [["", "Users", ""], ["", "home", ""], ["", "private", ""],
+  ["", "tmp", ""], ["", "var", "folders", ""]].map((parts) => parts.join("/"));
+hostPrefixes.push(["", "Users", ""].join("\\"));
+const assertPrivatePathFree = (input: Uint8Array) => {
+  const bytes = Buffer.from(input);
+  for (const prefix of hostPrefixes) for (const needle of [Buffer.from(prefix),
+    Buffer.from(prefix, "utf16le"), Buffer.from(prefix, "utf16le").swap16()]) {
+    if (bytes.includes(needle)) throw new Error("CAPTURE_HOST_PATH");
+  }
+};
+const recipe = readBounded(import.meta.filename, 64 * 1024);
+assertPrivatePathFree(recipe);
+if (Bun.version !== "1.3.14" || (lstatSync(import.meta.dir).mode & 0o777) !== 0o700) {
+  throw new Error("CAPTURE_RUNTIME_OR_DIRECTORY_MISMATCH");
+}
+const dependencies = { "@openai/codex": "0.149.0", convex: "1.45.0", zod: "4.4.3" } as const;
+const dependencyManifestHashes: Readonly<Record<string, string>> = {
+  "@openai/codex": "0580493a92b83d962b8fdc8585a66c963431c6ddb54fabe4b3797970095f000d",
+  convex: "aa9f5baee26b69a88d6b61180e540cce1f52baa31094e7124c8c0393e4b3211e",
+  zod: "c630bd10b52dcf71c112a2bf78dbf2734b9db58d62de663b8d86c2ec2c8cda2e",
+};
+const sources = {
+  canonical17: {
+    commit: "c018e91fcdeab9fe66078c96ca25c34d198a6189", tree: "4b7a6d24d8be24c889b735ee9146555dc139e293",
+    sourceFileCount: 119, manifest: "407df7c80c5b3503670a4d3b75a90619f0f32d70133b6cd01338dce124d32937",
+    pins: { "src/storage/state-store.ts": "31d462821d1c7830a38e917c989c0b44ba03b8f3c1812788d8eb554d24c09cd0",
+      "package.json": "1ace2e19fb0f9e63e37668baea728c1063b4e7fc89865461a3e59088e9f17ad4",
+      "bun.lock": "650f295c061c3573d0fb4b5542f12977d8e4b5ab8b65d1e019b290f4a205011d",
+      ".bun-version": "56b0485099b6c5427d3b68c042fd05b632d5e52e924c5064473389812227164c" },
+  },
+  canonical25: {
+    commit: "5ac4359abb7b23887abeb7bfc11e32b3efcc7180", tree: "f811c3d03e8738e92224225c285a4acd6921d275",
+    sourceFileCount: 146, manifest: "2da9b24b18ed4ed29fec7ed916c0d2fef1bc4283f1ffde3947aa3c752fb2adf3",
+    pins: { "src/storage/state-store.ts": "f92aead85ce5a052ee595ac2b92ea538594beaffcc300cd70fcead6b235ef653",
+      "package.json": "3f256386d6b2b6bcfbd30c1753dc72b4489ddc2c144b71bea02c1bb0a58270d7",
+      "bun.lock": "71b613bb93f0ddf11b6e3affdb3033cb23c1be9e9d977c207df6cd31d477e8fa",
+      ".bun-version": "56b0485099b6c5427d3b68c042fd05b632d5e52e924c5064473389812227164c" },
+  },
+} as const;
+const verifySources = () => {
+  for (const [name, source] of Object.entries(sources)) {
+    const root = join(import.meta.dir, name);
+    for (const [path, expected] of Object.entries(source.pins)) {
+      if (sha256(readBounded(join(root, path))) !== expected) throw new Error("CAPTURE_SOURCE_MISMATCH");
+    }
+    const files: { path: string; sha256: string }[] = [];
+    const visit = (directory: string) => {
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        if (!/^[A-Za-z0-9_.-]+$/u.test(entry.name)) throw new Error("CAPTURE_SOURCE_ENTRY_INVALID");
+        const path = join(directory, entry.name);
+        if (entry.isDirectory()) visit(path);
+        else if (entry.isFile()) files.push({ path: relative(root, path), sha256: sha256(readBounded(path)) });
+        else throw new Error("CAPTURE_SOURCE_ENTRY_INVALID");
+      }
+    };
+    visit(join(root, "src"));
+    files.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+    if (files.length !== source.sourceFileCount || sha256(JSON.stringify(files)) !== source.manifest) throw new Error("CAPTURE_SOURCE_MANIFEST_MISMATCH");
+    const declared = z.object({ dependencies: z.record(z.string(), z.string()) }).passthrough()
+      .parse(JSON.parse(readBounded(join(root, "package.json")).toString("utf8")));
+    if (JSON.stringify(declared.dependencies) !== JSON.stringify(dependencies)) throw new Error("CAPTURE_DEPENDENCIES_MISMATCH");
+    for (const [dependency, version] of Object.entries(dependencies)) {
+      const manifest = readBounded(join(root, "node_modules", dependency, "package.json"), 256 * 1024);
+      if (sha256(manifest) !== dependencyManifestHashes[dependency]) throw new Error("CAPTURE_DEPENDENCY_MANIFEST_MISMATCH");
+      z.object({ name: z.literal(dependency), version: z.literal(version) }).passthrough().parse(JSON.parse(manifest.toString("utf8")));
+    }
+  }
+};
+verifySources();
+const { StateStore: Store17 } = await import("./canonical17/src/storage/state-store");
+const { StateStore: Store25 } = await import("./canonical25/src/storage/state-store");
+const paths17 = await import("./canonical17/src/storage/paths");
+const paths25 = await import("./canonical25/src/storage/paths");
+const output = join(import.meta.dir, "capture");
+await mkdir(output, { mode: 0o700 });
+const fixedTime = 17_001;
+const metadata: Record<string, unknown> = {};
+const quote = (value: string) => {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(value)) throw new Error("CAPTURE_SQL_IDENTIFIER_INVALID");
+  return `"${value}"`;
+};
+const snapshot = (db: Database) => {
+  const schema = z.object({ type: z.string(), name: z.string(), tbl_name: z.string(), sql: z.string().nullable() }).strict().array().max(2048)
+    .parse(db.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name LIMIT 2049").all());
+  const tables = schema.filter((row) => row.type === "table");
+  if (tables.length > 256) throw new Error("CAPTURE_TABLE_LIMIT");
+  const rows = Object.fromEntries(tables.map(({ name }) => {
+    const entries = db.query(`SELECT * FROM ${quote(name)} LIMIT 4097`).all();
+    if (entries.length > 4096) throw new Error("CAPTURE_ROW_LIMIT");
+    entries.sort((a, b) => JSON.stringify(a) < JSON.stringify(b) ? -1 : JSON.stringify(a) > JSON.stringify(b) ? 1 : 0);
+    return [name, entries];
+  }));
+  const value = { version: db.query("PRAGMA user_version").get(),
+    ledger: db.query("SELECT * FROM migrations ORDER BY version").all(),
+    foreignKeys: db.query("PRAGMA foreign_key_check").all(), schema, rows };
+  if (value.foreignKeys.length !== 0 || Buffer.byteLength(JSON.stringify(value)) > 8 * 1024 * 1024) throw new Error("CAPTURE_SNAPSHOT_INVALID");
+  return value;
+};
+const inspect = (path: string) => {
+  const db = new Database(path, { create: false, strict: true });
+  try {
+    db.exec("PRAGMA query_only=ON");
+    const result = db.transaction(() => snapshot(db)).deferred();
+    z.object({ n: z.literal(0) }).strict().parse(db.query("SELECT total_changes() AS n").get());
+    return result;
+  } finally { db.close(false); }
+};
+const checkpoint = (path: string) => {
+  const db = new Database(path, { create: false, strict: true });
+  try { z.object({ busy: z.literal(0), log: z.literal(0), checkpointed: z.literal(0) }).strict()
+    .parse(db.query("PRAGMA wal_checkpoint(TRUNCATE)").get()); } finally { db.close(false); }
+};
+const preserve = async (name: string, databasePath: string, version: 17 | 25, retained: unknown, reopen: (readonly: boolean) => void) => {
+  checkpoint(databasePath);
+  const original = inspect(databasePath);
+  if (JSON.stringify(original.version) !== JSON.stringify({ user_version: version })) throw new Error("CAPTURE_VERSION_INVALID");
+  if (JSON.stringify(original.ledger) !== JSON.stringify(Array.from({ length: version }, (_, index) => ({ version: index + 1, applied_at: fixedTime })))) {
+    throw new Error("CAPTURE_LEDGER_INVALID");
+  }
+  for (const readonly of [false, true]) {
+    const before = readBounded(databasePath);
+    reopen(readonly);
+    if (JSON.stringify(inspect(databasePath)) !== JSON.stringify(original)) throw new Error("CAPTURE_REOPEN_CHANGED");
+    checkpoint(databasePath);
+    // Old writable constructors can re-execute exact idempotent DDL. Require
+    // logical/schema equality there, and exact file bytes for read-only reopen.
+    if (readonly && sha256(readBounded(databasePath)) !== sha256(before)) throw new Error("CAPTURE_READONLY_BYTES_CHANGED");
+  }
+  const bytes = readBounded(databasePath);
+  assertPrivatePathFree(bytes);
+  const compressed = Bun.gzipSync(bytes);
+  const entry = { schemaVersion: version, source: version === 17 ? "canonical17" : "canonical25", retained,
+    databaseSha256: sha256(bytes), databaseBytes: bytes.length, compressedSha256: sha256(compressed),
+    snapshot: original, provenance: { kind: "archived_public_writer", syntheticStorageOnly: true,
+      providerEffects: 0, rawLogicalWrites: false, versionRestamped: false, migrationStageImage: false } };
+  assertPrivatePathFree(Buffer.from(JSON.stringify(entry)));
+  metadata[name] = entry;
+  await writeFile(join(output, `${name}.sqlite.gz`), compressed, { mode: 0o600, flag: "wx" });
+};
+
+for (const kind of ["account", "project"] as const) {
+  const paths = paths17.resolveStatePaths({ homeDirectory: join(output, `home17-${kind}`), platform: "darwin" });
+  await paths17.initializeStatePaths(paths);
+  const store = new Store17(paths, { now: () => fixedTime });
+  let retained: unknown;
+  try {
+    if (kind === "account") {
+      const profiles = [store.createProfile("Équipe"), store.createProfile("équipe")];
+      for (const profile of profiles) if (store.allocateNextUsageRevision(profile.id) !== 1) throw new Error("CAPTURE_USAGE_RESERVATION_INVALID");
+      if (new Set(profiles.map((row) => row.label.normalize("NFKC").toLowerCase())).size !== 1) throw new Error("CAPTURE_ACCOUNT_COLLISION_ABSENT");
+      retained = { profiles };
+    } else {
+      const projects = [await store.createProject("Café", "/"), await store.createProject("Cafe\u0301", "/usr")];
+      if (new Set(projects.map((row) => row.label.normalize("NFKC").toLowerCase())).size !== 1) throw new Error("CAPTURE_PROJECT_COLLISION_ABSENT");
+      retained = { projects, projectDirectoriesInspectedOnly: true };
+    }
+  } finally { store.close(); }
+  await preserve(`canonical17-${kind}-collision`, paths.database, 17, retained,
+    (readonly) => { const opened = new Store17(paths, { readonly, now: () => fixedTime + 1 }); opened.close(); });
+}
+
+{
+  const paths = paths17.resolveStatePaths({ homeDirectory: join(output, "home17-approvals"), platform: "darwin" });
+  await paths17.initializeStatePaths(paths);
+  const store = new Store17(paths, { now: () => fixedTime });
+  let retained: unknown;
+  try {
+    const created = store.createProfile("Canonical17 approval controls");
+    const profile = store.nextProfileGeneration(created.id);
+    if (store.allocateNextUsageRevision(profile.id) !== 1) throw new Error("CAPTURE_USAGE_RESERVATION_INVALID");
+    const session = store.upsertProviderSession({ profileId: profile.id, providerThreadId: "canonical17-synthetic-approval-thread",
+      title: "Canonical17 approval controls", state: "idle", providerUpdatedAt: fixedTime });
+    const authority = (number: number, method: string) => ({ profileId: profile.id, processGeneration: profile.processGeneration,
+      connectionId: "17000000-0000-4000-8000-000000000025", requestId: { type: "number" as const, value: number }, method,
+      requestDigest: sha256(`canonical17 synthetic approval ${number}`), threadId: session.providerThreadId ?? null,
+      turnId: null, itemId: null, approvalId: null });
+    const command = store.admitInteraction({ publicId: "17000000-0000-4000-8000-000000000026", sessionId: session.id,
+      authority: authority(1, "item/commandExecution/requestApproval"), kind: "command_approval", blocking: true,
+      display: { kind: "command_approval", summary: "Synthetic command approval", reason: null,
+        commandClass: "fixture", workingDirectory: null, allowsSessionApproval: true } });
+    const fileChange = store.admitInteraction({ publicId: "17000000-0000-4000-8000-000000000027", sessionId: session.id,
+      authority: authority(2, "item/fileChange/requestApproval"), kind: "file_change_approval", blocking: true,
+      display: { kind: "file_change_approval", summary: "Synthetic file approval", reason: null,
+        grantRoot: null, allowsSessionApproval: false } });
+    retained = { profile, session, command, fileChange };
+  } finally { store.close(); }
+  await preserve("canonical17-approval-controls", paths.database, 17, retained,
+    (readonly) => { const opened = new Store17(paths, { readonly, now: () => fixedTime + 1 }); opened.close(); });
+}
+
+{
+  const paths = paths25.resolveStatePaths({ homeDirectory: join(output, "home25-preset"), platform: "darwin" });
+  await paths25.initializeStatePaths(paths);
+  const store = new Store25(paths, { now: () => fixedTime });
+  let retained: unknown;
+  try {
+    const profile = store.createProfile("Canonical25 preset control");
+    if (store.allocateNextUsageRevision(profile.id) !== 1) throw new Error("CAPTURE_USAGE_RESERVATION_INVALID");
+    const session = store.createSession({ profileId: profile.id, title: "Canonical25 high preset", preset: "high", fastEnabled: false });
+    retained = { profile, session, originalPresetRequirement: { model: "gpt-5.6-sol", effort: "max" } };
+  } finally { store.close(); }
+  const original = inspect(paths.database);
+  if (original.schema.some((row) => row.name === "works")
+    || original.schema.find((row) => row.name === "sessions")?.sql?.includes("preset_contract")) throw new Error("CAPTURE_PRESET_ALREADY_PRESENT");
+  await preserve("canonical25-preset", paths.database, 25, retained,
+    (readonly) => { const opened = new Store25(paths, { readonly, now: () => fixedTime + 1 }); opened.close(); });
+}
+verifySources();
+if (sha256(readBounded(import.meta.filename, 64 * 1024)) !== sha256(recipe)) throw new Error("CAPTURE_RECIPE_CHANGED");
+const result = { generatorSha256: sha256(recipe), bunVersion: Bun.version, sources, dependencies,
+  dependencyManifestHashes, fixedTime, captures: metadata };
+const bytes = Buffer.from(`${JSON.stringify(result, null, 2)}\n`);
+if (bytes.length > 32 * 1024 * 1024) throw new Error("CAPTURE_METADATA_LIMIT");
+assertPrivatePathFree(bytes);
+await writeFile(join(output, "fixture.json"), bytes, { mode: 0o600, flag: "wx" });
+console.log(JSON.stringify({ generatorSha256: result.generatorSha256, captures: Object.keys(metadata) }));

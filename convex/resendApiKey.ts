@@ -1,14 +1,16 @@
-export const hraResendApiKeyEnvironmentName = "HRA_RESEND_API_KEY" as const;
-export const hraAttentionResendApiKeyEnvironmentName = "HRA_ATTENTION_RESEND_API_KEY" as const;
+import { readAliasedEnvironment } from "./environmentAliases";
+
+export const oompaResendApiKeyEnvironmentName = "OOMPA_RESEND_API_KEY" as const;
+export const oompaAttentionResendApiKeyEnvironmentName = "OOMPA_ATTENTION_RESEND_API_KEY" as const;
 
 /**
  * Preserve the sign-in credential contract independently of attention email.
  * Keep errors generic so malformed secrets never reach logs or callers.
  */
-export function requireHraResendApiKey(
+export function requireOompaResendApiKey(
   environment: Readonly<Record<string, string | undefined>> = process.env,
 ): string {
-  const value = environment[hraResendApiKeyEnvironmentName];
+  const value = readAliasedEnvironment(environment, oompaResendApiKeyEnvironmentName);
   if (
     value === undefined
     || !value.startsWith("re_")
@@ -19,11 +21,11 @@ export function requireHraResendApiKey(
   return value;
 }
 
-export function requireHraAttentionResendApiKey(
+export function requireOompaAttentionResendApiKey(
   environment: Readonly<Record<string, string | undefined>> = process.env,
 ): string {
-  const value = environment[hraAttentionResendApiKeyEnvironmentName];
-  const authenticationKey = environment[hraResendApiKeyEnvironmentName];
+  const value = readAliasedEnvironment(environment, oompaAttentionResendApiKeyEnvironmentName);
+  const authenticationKey = readAliasedEnvironment(environment, oompaResendApiKeyEnvironmentName);
   if (
     !isStrictResendApiKey(value)
     || !isStrictResendApiKey(authenticationKey)

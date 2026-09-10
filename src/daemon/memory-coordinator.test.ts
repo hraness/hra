@@ -16,12 +16,12 @@ import {
 import { OH_CANONICAL_STORE_PROFILE_V1, type OhHeadV1 } from "@hraness/oh/store";
 
 import type {
-  HraMemoryRememberInput,
+  OompaMemoryRememberInput,
 } from "../domain/host-tools";
 import {
   createPortableProjectMemoryCanonicalIdentity,
   deriveProjectMemoryCanonicalIdentity,
-  HRA_CANONICAL_MEMORY_OPERATION_MAX_BYTES,
+  OOMPA_CANONICAL_MEMORY_OPERATION_MAX_BYTES,
   legacyProjectMemorySpaceId,
   PROJECT_MEMORY_EMPTY_HEAD,
 } from "../domain/project-memory";
@@ -38,14 +38,14 @@ import {
 } from "../storage/paths";
 import { StateStore, type ProjectRecord, type SessionRecord } from "../storage/state-store";
 import {
-  HraFactsMemoryLifecycle,
-  type HraFactsMemoryLifecyclePort,
+  OompaFactsMemoryLifecycle,
+  type OompaFactsMemoryLifecyclePort,
 } from "./facts-memory-lifecycle";
 import {
-  HraMemoryRefusalError,
-  HraOhMemoryCoordinator,
+  OompaMemoryRefusalError,
+  OompaOhMemoryCoordinator,
 } from "./memory-coordinator";
-import type { HraCanonicalMemorySyncPort } from "./canonical-memory-sync";
+import type { OompaCanonicalMemorySyncPort } from "./canonical-memory-sync";
 
 type Clock = {
   monotonic: number;
@@ -54,16 +54,18 @@ type Clock = {
 
 type Runtime = Readonly<{
   control: FactsMemoryControlStore;
-  coordinator: HraOhMemoryCoordinator;
+  coordinator: OompaOhMemoryCoordinator;
   engine: OhSqliteFactsMemoryEngine;
-  lifecycle: HraFactsMemoryLifecycle;
+  lifecycle: OompaFactsMemoryLifecycle;
   store: StateStore;
 }>;
 
 const roots: string[] = [];
 const runtimes: Runtime[] = [];
+const ownedCaseJoins: Promise<void>[] = [];
 
 afterEach(async () => {
+  for (const joined of ownedCaseJoins.splice(0)) await joined;
   for (const runtime of runtimes.splice(0).reverse()) {
     await runtime.coordinator.close().catch(() => undefined);
     try {
@@ -82,20 +84,24 @@ afterEach(async () => {
   }));
 });
 
-class FailPostCommitSettlementOnce implements HraFactsMemoryLifecyclePort {
+class FailPostCommitSettlementOnce implements OompaFactsMemoryLifecyclePort {
   #failEnsureAfterResume = false;
   #failResume = true;
 
-  constructor(readonly delegate: HraFactsMemoryLifecyclePort) {}
+  constructor(readonly delegate: OompaFactsMemoryLifecyclePort) {}
+
+  transferSessionOwner(input: Parameters<OompaFactsMemoryLifecyclePort["transferSessionOwner"]>[0]) {
+    return this.delegate.transferSessionOwner(input);
+  }
 
   cleanupSession(
-    input: Parameters<HraFactsMemoryLifecyclePort["cleanupSession"]>[0],
+    input: Parameters<OompaFactsMemoryLifecyclePort["cleanupSession"]>[0],
   ) {
     return this.delegate.cleanupSession(input);
   }
 
   ensureSession(
-    input: Parameters<HraFactsMemoryLifecyclePort["ensureSession"]>[0],
+    input: Parameters<OompaFactsMemoryLifecyclePort["ensureSession"]>[0],
   ) {
     if (this.#failEnsureAfterResume) {
       this.#failEnsureAfterResume = false;
@@ -105,19 +111,19 @@ class FailPostCommitSettlementOnce implements HraFactsMemoryLifecyclePort {
   }
 
   forkSession(
-    input: Parameters<HraFactsMemoryLifecyclePort["forkSession"]>[0],
+    input: Parameters<OompaFactsMemoryLifecyclePort["forkSession"]>[0],
   ) {
     return this.delegate.forkSession(input);
   }
 
   readSession(
-    sessionId: Parameters<HraFactsMemoryLifecyclePort["readSession"]>[0],
+    sessionId: Parameters<OompaFactsMemoryLifecyclePort["readSession"]>[0],
   ) {
     return this.delegate.readSession(sessionId);
   }
 
   resumeSession(
-    input: Parameters<HraFactsMemoryLifecyclePort["resumeSession"]>[0],
+    input: Parameters<OompaFactsMemoryLifecyclePort["resumeSession"]>[0],
   ) {
     if (this.#failResume) {
       this.#failResume = false;
@@ -128,13 +134,13 @@ class FailPostCommitSettlementOnce implements HraFactsMemoryLifecyclePort {
   }
 
   sweepExpired(
-    ...input: Parameters<HraFactsMemoryLifecyclePort["sweepExpired"]>
+    ...input: Parameters<OompaFactsMemoryLifecyclePort["sweepExpired"]>
   ) {
     return this.delegate.sweepExpired(...input);
   }
 }
 
-class GateFirstEnsure implements HraFactsMemoryLifecyclePort {
+class GateFirstEnsure implements OompaFactsMemoryLifecyclePort {
   readonly entered: Promise<void>;
   #enter!: () => void;
   #release!: () => void;
@@ -143,7 +149,7 @@ class GateFirstEnsure implements HraFactsMemoryLifecyclePort {
   #waiting = true;
 
   constructor(
-    readonly delegate: HraFactsMemoryLifecyclePort,
+    readonly delegate: OompaFactsMemoryLifecyclePort,
     blockOnCall = 1,
     readonly afterEnsure = false,
   ) {
@@ -156,14 +162,18 @@ class GateFirstEnsure implements HraFactsMemoryLifecyclePort {
     this.#release();
   }
 
+  transferSessionOwner(input: Parameters<OompaFactsMemoryLifecyclePort["transferSessionOwner"]>[0]) {
+    return this.delegate.transferSessionOwner(input);
+  }
+
   cleanupSession(
-    input: Parameters<HraFactsMemoryLifecyclePort["cleanupSession"]>[0],
+    input: Parameters<OompaFactsMemoryLifecyclePort["cleanupSession"]>[0],
   ) {
     return this.delegate.cleanupSession(input);
   }
 
   async ensureSession(
-    input: Parameters<HraFactsMemoryLifecyclePort["ensureSession"]>[0],
+    input: Parameters<OompaFactsMemoryLifecyclePort["ensureSession"]>[0],
   ) {
     if (this.#remaining > 1) {
       this.#remaining -= 1;
@@ -183,47 +193,51 @@ class GateFirstEnsure implements HraFactsMemoryLifecyclePort {
   }
 
   forkSession(
-    input: Parameters<HraFactsMemoryLifecyclePort["forkSession"]>[0],
+    input: Parameters<OompaFactsMemoryLifecyclePort["forkSession"]>[0],
   ) {
     return this.delegate.forkSession(input);
   }
 
   readSession(
-    sessionId: Parameters<HraFactsMemoryLifecyclePort["readSession"]>[0],
+    sessionId: Parameters<OompaFactsMemoryLifecyclePort["readSession"]>[0],
   ) {
     return this.delegate.readSession(sessionId);
   }
 
   resumeSession(
-    input: Parameters<HraFactsMemoryLifecyclePort["resumeSession"]>[0],
+    input: Parameters<OompaFactsMemoryLifecyclePort["resumeSession"]>[0],
   ) {
     return this.delegate.resumeSession(input);
   }
 
   sweepExpired(
-    ...input: Parameters<HraFactsMemoryLifecyclePort["sweepExpired"]>
+    ...input: Parameters<OompaFactsMemoryLifecyclePort["sweepExpired"]>
   ) {
     return this.delegate.sweepExpired(...input);
   }
 }
 
-class FailArmedEnsureOnce implements HraFactsMemoryLifecyclePort {
+class FailArmedEnsureOnce implements OompaFactsMemoryLifecyclePort {
   #armed = false;
 
-  constructor(readonly delegate: HraFactsMemoryLifecyclePort) {}
+  constructor(readonly delegate: OompaFactsMemoryLifecyclePort) {}
+
+  transferSessionOwner(input: Parameters<OompaFactsMemoryLifecyclePort["transferSessionOwner"]>[0]) {
+    return this.delegate.transferSessionOwner(input);
+  }
 
   arm(): void {
     this.#armed = true;
   }
 
   cleanupSession(
-    input: Parameters<HraFactsMemoryLifecyclePort["cleanupSession"]>[0],
+    input: Parameters<OompaFactsMemoryLifecyclePort["cleanupSession"]>[0],
   ) {
     return this.delegate.cleanupSession(input);
   }
 
   ensureSession(
-    input: Parameters<HraFactsMemoryLifecyclePort["ensureSession"]>[0],
+    input: Parameters<OompaFactsMemoryLifecyclePort["ensureSession"]>[0],
   ) {
     if (this.#armed) {
       this.#armed = false;
@@ -233,25 +247,25 @@ class FailArmedEnsureOnce implements HraFactsMemoryLifecyclePort {
   }
 
   forkSession(
-    input: Parameters<HraFactsMemoryLifecyclePort["forkSession"]>[0],
+    input: Parameters<OompaFactsMemoryLifecyclePort["forkSession"]>[0],
   ) {
     return this.delegate.forkSession(input);
   }
 
   readSession(
-    sessionId: Parameters<HraFactsMemoryLifecyclePort["readSession"]>[0],
+    sessionId: Parameters<OompaFactsMemoryLifecyclePort["readSession"]>[0],
   ) {
     return this.delegate.readSession(sessionId);
   }
 
   resumeSession(
-    input: Parameters<HraFactsMemoryLifecyclePort["resumeSession"]>[0],
+    input: Parameters<OompaFactsMemoryLifecyclePort["resumeSession"]>[0],
   ) {
     return this.delegate.resumeSession(input);
   }
 
   sweepExpired(
-    ...input: Parameters<HraFactsMemoryLifecyclePort["sweepExpired"]>
+    ...input: Parameters<OompaFactsMemoryLifecyclePort["sweepExpired"]>
   ) {
     return this.delegate.sweepExpired(...input);
   }
@@ -261,9 +275,9 @@ const makeRuntime = (
   paths: StatePaths,
   clock: Clock,
   wrapLifecycle?: (
-    lifecycle: HraFactsMemoryLifecycle,
-  ) => HraFactsMemoryLifecyclePort,
-  sync?: HraCanonicalMemorySyncPort,
+    lifecycle: OompaFactsMemoryLifecycle,
+  ) => OompaFactsMemoryLifecyclePort,
+  sync?: OompaCanonicalMemorySyncPort,
 ): Runtime => {
   const now = () => clock.wall++;
   const store = new StateStore(paths, { now });
@@ -274,12 +288,12 @@ const makeRuntime = (
     now,
     root: paths.factsMemorySessions,
   });
-  const lifecycle = new HraFactsMemoryLifecycle({
+  const lifecycle = new OompaFactsMemoryLifecycle({
     attestations: store,
     broker,
     control,
   });
-  const coordinator = new HraOhMemoryCoordinator({
+  const coordinator = new OompaOhMemoryCoordinator({
     continuationKey: new Uint8Array(32).fill(17),
     engine,
     factsMemory: wrapLifecycle?.(lifecycle) ?? lifecycle,
@@ -318,9 +332,9 @@ const failNextAdoptedShareSettlement = (
 };
 
 const createFixture = async (wrapLifecycle?: (
-  lifecycle: HraFactsMemoryLifecycle,
-) => HraFactsMemoryLifecyclePort, sync?: HraCanonicalMemorySyncPort) => {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-memory-coordinator-")));
+  lifecycle: OompaFactsMemoryLifecycle,
+) => OompaFactsMemoryLifecyclePort, sync?: OompaCanonicalMemorySyncPort) => {
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-memory-coordinator-")));
   roots.push(home);
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
@@ -364,12 +378,26 @@ const createFixture = async (wrapLifecycle?: (
   };
 };
 
+function ownedMemoryCoordinatorCase(
+  runCase: (value: Awaited<ReturnType<typeof createFixture>>) => Promise<void>,
+): Promise<void> {
+  // Register ownership before setup starts. Every request in these cases is
+  // awaited, so joining the raw case also joins work after a test deadline.
+  const setup = Promise.resolve().then(() => createFixture());
+  const caseTask = setup.then(runCase);
+  ownedCaseJoins.push(Promise.allSettled([setup, caseTask]).then(() => undefined));
+  // Observation prevents a timeout from leaving an unhandled rejection; the
+  // unmodified promise still reports the original failure to the test runner.
+  void caseTask.catch(() => undefined);
+  return caseTask;
+}
+
 const operationInput = (index: number, label: string) => ({
   idempotencyKey: `10000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`,
   requestDigest: canonicalSha256({ index, label, v: 1 }),
 });
 
-const page = (overrides: Partial<HraMemoryRememberInput> = {}): HraMemoryRememberInput => ({
+const page = (overrides: Partial<OompaMemoryRememberInput> = {}): OompaMemoryRememberInput => ({
   body: "The project owner serializes canonical memory updates and fails closed on conflicts.",
   key: "architecture/canonical-owner",
   language: "en",
@@ -380,22 +408,22 @@ const page = (overrides: Partial<HraMemoryRememberInput> = {}): HraMemoryRemembe
 
 const expectRefusal = async (
   operation: Promise<unknown>,
-  code: HraMemoryRefusalError["code"],
+  code: OompaMemoryRefusalError["code"],
 ) => {
   try {
     await operation;
     throw new Error("Expected memory operation to be refused.");
   } catch (error: unknown) {
-    expect(error).toBeInstanceOf(HraMemoryRefusalError);
-    expect((error as HraMemoryRefusalError).code).toBe(code);
+    expect(error).toBeInstanceOf(OompaMemoryRefusalError);
+    expect((error as OompaMemoryRefusalError).code).toBe(code);
   }
 };
 
-describe("HRA Oh memory coordinator integration", () => {
+describe("Oompa Oh memory coordinator integration", () => {
   test("keeps working memory usable when hosted recovery cannot reach cloud at boot", async () => {
     let foregroundRecoverCalls = 0;
     let backgroundStarts = 0;
-    const sync: HraCanonicalMemorySyncPort = {
+    const sync: OompaCanonicalMemorySyncPort = {
       attachHostedSpace: async () => { throw new Error("UNUSED_ATTACH"); },
       close: async () => undefined,
       createHostedSpace: async () => { throw new Error("UNUSED_CREATE"); },
@@ -603,7 +631,7 @@ describe("HRA Oh memory coordinator integration", () => {
     const value = await createFixture();
     const actor = value.session(value.firstProject, "Bounded canonical share");
     const memory = page({
-      body: "x".repeat(HRA_CANONICAL_MEMORY_OPERATION_MAX_BYTES + 1),
+      body: "x".repeat(OOMPA_CANONICAL_MEMORY_OPERATION_MAX_BYTES + 1),
       key: "architecture/oversized-canonical-share",
       summary: "This working page cannot fit one hosted canonical operation.",
       title: "Oversized canonical share",
@@ -876,7 +904,7 @@ describe("HRA Oh memory coordinator integration", () => {
   });
 
   test("requires a fresh converged hosted head for each canonical share", async () => {
-    const sync: HraCanonicalMemorySyncPort = {
+    const sync: OompaCanonicalMemorySyncPort = {
       attachHostedSpace: async () => { throw new Error("UNUSED_ATTACH"); },
       close: async () => undefined,
       createHostedSpace: async () => { throw new Error("UNUSED_CREATE"); },
@@ -1074,7 +1102,7 @@ describe("HRA Oh memory coordinator integration", () => {
   test("replays a terminal share without sync or Oh access while hosted custody is frozen", async () => {
     let syncCalls = 0;
     let syncUnavailable = false;
-    const sync: HraCanonicalMemorySyncPort = {
+    const sync: OompaCanonicalMemorySyncPort = {
       attachHostedSpace: async () => { throw new Error("UNUSED_ATTACH"); },
       close: async () => undefined,
       createHostedSpace: async () => { throw new Error("UNUSED_CREATE"); },
@@ -1179,7 +1207,7 @@ describe("HRA Oh memory coordinator integration", () => {
     let releaseSync!: () => void;
     const syncGate = new Promise<void>((resolve) => { releaseSync = resolve; });
     const synchronizedProjects: string[] = [];
-    const sync: HraCanonicalMemorySyncPort = {
+    const sync: OompaCanonicalMemorySyncPort = {
       attachHostedSpace: async () => { throw new Error("UNUSED_ATTACH"); },
       close: async () => undefined,
       createHostedSpace: async () => { throw new Error("UNUSED_CREATE"); },
@@ -1385,7 +1413,7 @@ describe("HRA Oh memory coordinator integration", () => {
     });
   });
 
-  test("recovers exactly after Oh committed remember but HRA settlement lost its response", async () => {
+  test("recovers exactly after Oh committed remember but Oompa settlement lost its response", async () => {
     const value = await createFixture();
     const actor = value.session(value.firstProject, "Crash recovery");
 
@@ -1696,9 +1724,9 @@ describe("HRA Oh memory coordinator integration", () => {
     });
   });
 
-  test("adopts every exact empty crash-left legacy stage before creating a portable identity", async () => {
-    for (const stage of ["zero-byte", "migrated", "space-created", "bound"] as const) {
-      const value = await createFixture();
+  test.each(["zero-byte", "migrated", "space-created", "bound"] as const)(
+    "adopts every exact empty crash-left legacy stage before creating a portable identity: %s",
+    (stage) => ownedMemoryCoordinatorCase(async (value) => {
       const actor = value.session(value.firstProject, `Legacy ${stage} recovery`);
       const projectDigest = canonicalSha256({ projectId: value.firstProject.id, v: 1 });
       const canonicalDirectory = join(value.paths.projectMemory, projectDigest);
@@ -1755,12 +1783,12 @@ describe("HRA Oh memory coordinator integration", () => {
         },
       });
       expect((status.canonical as Record<string, unknown>).spaceId).toBeUndefined();
-    }
-  });
+    }),
+  );
 
-  test("resumes every exact empty stage after a portable authority reservation", async () => {
-    for (const stage of ["absent", "zero-byte", "migrated", "space-created", "bound"] as const) {
-      const value = await createFixture();
+  test.each(["absent", "zero-byte", "migrated", "space-created", "bound"] as const)(
+    "resumes every exact empty stage after a portable authority reservation: %s",
+    (stage) => ownedMemoryCoordinatorCase(async (value) => {
       const actor = value.session(value.firstProject, `Portable ${stage} recovery`);
       const identity = createPortableProjectMemoryCanonicalIdentity(value.firstProject.id);
       const reserved = value.runtime.store.reserveProjectMemoryAuthority({
@@ -1810,8 +1838,8 @@ describe("HRA Oh memory coordinator integration", () => {
         physicalState: "initialized",
         revision: 2,
       });
-    }
-  });
+    }),
+  );
 
   test("durably rejects a nonempty store left behind after portable reservation", async () => {
     const value = await createFixture();

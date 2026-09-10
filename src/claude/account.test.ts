@@ -9,7 +9,7 @@ import {
   readClaudeAccountProjection,
   spawnClaudeAuthStatusProbe,
 } from "./account";
-import { CLAUDE_PIN, CLAUDE_PIN_EFFORT, CLAUDE_PIN_MODEL } from "./pin";
+import { CLAUDE_PIN, CLAUDE_PIN_EFFORT, CLAUDE_PIN_MODEL, CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY } from "./pin";
 import type { PinnedClaudeRuntime } from "./runtime";
 
 const runtime: PinnedClaudeRuntime = Object.freeze({
@@ -17,6 +17,7 @@ const runtime: PinnedClaudeRuntime = Object.freeze({
   effort: CLAUDE_PIN_EFFORT,
   executablePath: "/synthetic/bin/claude",
   model: CLAUDE_PIN_MODEL,
+  nativeFallback: CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY,
   version: CLAUDE_PIN,
 });
 
@@ -71,7 +72,7 @@ async function rejectBeforeFifoWriter(pending: Promise<unknown>, fifo: string): 
 
 describe("Claude account projection", () => {
   test("the production status probe accepts coherent signed-out exit 1 and rejects contradictory exit 0", async () => {
-    const root = await mkdtemp(join(tmpdir(), "hra-claude-account-status-"));
+    const root = await mkdtemp(join(tmpdir(), "oompa-claude-account-status-"));
     const configDir = join(root, "config");
     const executablePath = join(root, "status-fixture");
     try {
@@ -202,7 +203,7 @@ describe("Claude account projection", () => {
   });
 
   test("rejects a metadata document that fails its custody mode check", async () => {
-    const root = await mkdtemp(join(tmpdir(), "hra-claude-account-"));
+    const root = await mkdtemp(join(tmpdir(), "oompa-claude-account-"));
     const configDir = join(root, "config");
     const accountPath = claudeAccountDocumentPath(configDir, "isolated");
     try {
@@ -230,7 +231,7 @@ describe("Claude account projection", () => {
 
   test("refuses a swapped account FIFO without waiting for a writer", async () => {
     if (!fifoTestsSupported()) return;
-    const root = await mkdtemp(join(tmpdir(), "hra-claude-account-fifo-"));
+    const root = await mkdtemp(join(tmpdir(), "oompa-claude-account-fifo-"));
     const configDir = join(root, "config");
     const accountPath = claudeAccountDocumentPath(configDir, "isolated");
     try {

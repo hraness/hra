@@ -5,6 +5,7 @@ import {
   replaceCodexDesktopHeartbeatEnvelope,
 } from "../domain/codex-heartbeat-envelope";
 import type { InteractionDisplay } from "../domain/interactions";
+import type { ProviderAccountAuthority } from "../domain/provider-accounts";
 import type { SessionEvent, SessionEventBody } from "../domain/session-events";
 import {
   createEphemeralPublicProviderIdentifierProjector,
@@ -26,7 +27,10 @@ export type SessionEventWrite = Readonly<
     | "providerConnectionId"
     | "providerGeneration"
     | "sessionId"
-  > & { body: SessionEventBody }
+  > & {
+    body: SessionEventBody;
+    providerAuthority: ProviderAccountAuthority;
+  }
 >;
 
 type StagedNode = {
@@ -47,6 +51,7 @@ type ActiveStream = {
 type ActiveItem = Readonly<{
   accountId: SessionEventWrite["accountId"];
   itemId: string;
+  providerAuthority: ProviderAccountAuthority;
   providerConnectionId: SessionEventWrite["providerConnectionId"];
   providerGeneration: number;
   sessionId: SessionEventWrite["sessionId"];
@@ -348,6 +353,10 @@ const streamKey = (write: SessionEventWrite): string => {
   ) throw new Error("SESSION_EVENT_STREAM_KEY_REQUIRES_DELTA");
   return JSON.stringify([
     write.accountId,
+    write.providerAuthority.provider,
+    write.providerAuthority.providerAccountId,
+    write.providerAuthority.bindingGeneration,
+    write.providerAuthority.processGeneration,
     write.providerGeneration,
     write.providerConnectionId,
     write.sessionId,
@@ -366,6 +375,10 @@ const itemKey = (
   itemId: string,
 ): string => JSON.stringify([
   write.accountId,
+  write.providerAuthority.provider,
+  write.providerAuthority.providerAccountId,
+  write.providerAuthority.bindingGeneration,
+  write.providerAuthority.processGeneration,
   write.providerGeneration,
   write.providerConnectionId,
   write.sessionId,
@@ -384,13 +397,28 @@ const bodyFrom = (
   text: sanitizeProviderProse(text),
 });
 
-const sameSession = (left: SessionEventWrite, right: ActiveStream): boolean =>
-  left.accountId === right.context.accountId
-  && left.sessionId === right.context.sessionId;
+const sameProviderAuthority = (
+  left: ProviderAccountAuthority,
+  right: ProviderAccountAuthority,
+): boolean => left.profileId === right.profileId
+  && left.provider === right.provider
+  && left.providerAccountId === right.providerAccountId
+  && left.bindingGeneration === right.bindingGeneration
+  && left.processGeneration === right.processGeneration;
+
+const sameProviderCustody = (
+  left: Omit<SessionEventWrite, "body">,
+  right: ActiveStream,
+): boolean => left.accountId === right.context.accountId
+  && left.sessionId === right.context.sessionId
+  && sameProviderAuthority(
+    left.providerAuthority,
+    right.context.providerAuthority,
+  )
+  && left.providerGeneration === right.context.providerGeneration;
 
 const sameAuthority = (left: SessionEventWrite, right: ActiveStream): boolean =>
-  sameSession(left, right)
-  && left.providerGeneration === right.context.providerGeneration
+  sameProviderCustody(left, right)
   && (
     left.providerConnectionId === null
     || left.providerConnectionId === right.context.providerConnectionId
@@ -405,7 +433,7 @@ export class SessionEventStreamRedactor {
   readonly #streams = new Map<string, ActiveStream>();
   readonly #queues = new Map<string, StagedNode[]>();
   readonly #activeItems = new Map<string, ActiveItem>();
-  readonly #quarantinedSessions = new Set<string>();
+  readonly #quarantinedAuthorities = new Set<string>();
   readonly #maximumActiveStreams: number;
   readonly #maximumActiveStreamsPerSession: number;
   readonly #maximumStagedCodeUnits: number;
@@ -449,11 +477,13 @@ export class SessionEventStreamRedactor {
   }
 
   accept(write: SessionEventWrite): readonly SessionEventWrite[] {
+    this.#assertWriteAuthority(write);
+    const custodyKey = this.#custodyKey(write);
     const body = write.body;
     if (body.type === "assistant_delta" || body.type === "reasoning_summary_delta") {
       if (body.text.length === 0) return [];
       if (
-        this.#quarantinedSessions.has(write.sessionId)
+        this.#quarantinedAuthorities.has(custodyKey)
         || !this.#activeItems.has(itemKey(write, body.turnId, body.itemId))
       ) {
         const released = this.#ensureCapacity(write, 0, false);
@@ -466,12 +496,12 @@ export class SessionEventStreamRedactor {
           ),
           write,
         });
-        return [...released, ...this.#drainSession(write.sessionId)];
+        return [...released, ...this.#drainAuthority(write)];
       }
       const key = streamKey(write);
       const isNewStream = !this.#streams.has(key);
       const released = this.#ensureCapacity(write, body.text.length, isNewStream);
-      if (this.#quarantinedSessions.has(write.sessionId)) {
+      if (this.#quarantinedAuthorities.has(custodyKey)) {
         this.#enqueue({
           rawText: "",
           readyBody: bodyFrom(
@@ -481,7 +511,7 @@ export class SessionEventStreamRedactor {
           ),
           write,
         });
-        return [...released, ...this.#drainSession(write.sessionId)];
+        return [...released, ...this.#drainAuthority(write)];
       }
       let stream = this.#streams.get(key);
       if (stream === undefined) {
@@ -489,6 +519,7 @@ export class SessionEventStreamRedactor {
         stream = {
           context: {
             accountId: write.accountId,
+            providerAuthority: write.providerAuthority,
             providerConnectionId: write.providerConnectionId,
             providerGeneration: write.providerGeneration,
             sessionId: write.sessionId,
@@ -507,7 +538,7 @@ export class SessionEventStreamRedactor {
       stream.pending.push(node);
       this.#enqueue(node);
       this.#applyStreamInput(stream, body.text);
-      return [...released, ...this.#drainSession(write.sessionId)];
+      return [...released, ...this.#drainAuthority(write)];
     }
 
     const released = this.#ensureCapacity(write, 0, false);
@@ -521,24 +552,26 @@ export class SessionEventStreamRedactor {
       ),
       write,
     });
-    return [...released, ...this.#drainSession(write.sessionId)];
+    return [...released, ...this.#drainAuthority(write)];
   }
 
   interruptAll(): readonly SessionEventWrite[] {
     this.#finish(() => true, true);
     this.#activeItems.clear();
-    this.#quarantinedSessions.clear();
+    this.#quarantinedAuthorities.clear();
     return this.#drainAll();
   }
 
   interruptSession(write: Omit<SessionEventWrite, "body">): readonly SessionEventWrite[] {
-    this.#finish((stream) =>
-      stream.context.accountId === write.accountId
-      && stream.context.sessionId === write.sessionId, true);
+    this.#assertWriteAuthority(write);
+    this.#finish((stream) => sameProviderCustody(write, stream), true);
     this.#clearActiveItems((item) =>
-      item.accountId === write.accountId && item.sessionId === write.sessionId);
-    this.#quarantinedSessions.delete(write.sessionId);
-    return this.#drainSession(write.sessionId);
+      item.accountId === write.accountId
+      && item.sessionId === write.sessionId
+      && sameProviderAuthority(item.providerAuthority, write.providerAuthority)
+      && item.providerGeneration === write.providerGeneration);
+    this.#quarantinedAuthorities.delete(this.#custodyKey(write));
+    return this.#drainAuthority(write);
   }
 
   /**
@@ -547,10 +580,9 @@ export class SessionEventStreamRedactor {
    * custody so later provider deltas for the same item remain admissible.
    */
   flushSession(write: Omit<SessionEventWrite, "body">): readonly SessionEventWrite[] {
-    this.#finish((stream) =>
-      stream.context.accountId === write.accountId
-      && stream.context.sessionId === write.sessionId, false);
-    return this.#drainSession(write.sessionId);
+    this.#assertWriteAuthority(write);
+    this.#finish((stream) => sameProviderCustody(write, stream), false);
+    return this.#drainAuthority(write);
   }
 
   get activeStreamCount(): number {
@@ -576,15 +608,16 @@ export class SessionEventStreamRedactor {
       )
     ) {
       this.#quarantineSession(write);
-      return this.#drainSession(write.sessionId);
+      return this.#drainAuthority(write);
     }
     return [];
   }
 
   #enqueue(node: StagedNode): void {
-    const queue = this.#queues.get(node.write.sessionId) ?? [];
-    if (!this.#queues.has(node.write.sessionId)) {
-      this.#queues.set(node.write.sessionId, queue);
+    const key = this.#custodyKey(node.write);
+    const queue = this.#queues.get(key) ?? [];
+    if (!this.#queues.has(key)) {
+      this.#queues.set(key, queue);
     }
     queue.push(node);
     this.#stagedNodes += 1;
@@ -601,6 +634,7 @@ export class SessionEventStreamRedactor {
       this.#clearActiveItems((item) =>
         item.accountId === write.accountId
         && item.sessionId === write.sessionId
+        && sameProviderAuthority(item.providerAuthority, write.providerAuthority)
         && item.providerGeneration === write.providerGeneration
         && (
           write.providerConnectionId === null
@@ -608,7 +642,7 @@ export class SessionEventStreamRedactor {
         )
         && item.turnId === body.turnId
         && item.itemId === body.itemId);
-      this.#quarantinedSessions.delete(write.sessionId);
+      this.#quarantinedAuthorities.delete(this.#custodyKey(write));
       return;
     }
     if (body.type === "turn_completed") {
@@ -618,8 +652,14 @@ export class SessionEventStreamRedactor {
       this.#clearActiveItems((item) =>
         item.accountId === write.accountId
         && item.sessionId === write.sessionId
+        && sameProviderAuthority(item.providerAuthority, write.providerAuthority)
+        && item.providerGeneration === write.providerGeneration
+        && (
+          write.providerConnectionId === null
+          || item.providerConnectionId === write.providerConnectionId
+        )
         && item.turnId === body.turnId);
-      this.#quarantinedSessions.delete(write.sessionId);
+      this.#quarantinedAuthorities.delete(this.#custodyKey(write));
       return;
     }
     if (body.type === "item_started") {
@@ -630,10 +670,18 @@ export class SessionEventStreamRedactor {
       this.#clearActiveItems((item) =>
         item.accountId === write.accountId
         && item.sessionId === write.sessionId
+        && sameProviderAuthority(item.providerAuthority, write.providerAuthority)
+        && item.providerGeneration === write.providerGeneration
+        && (
+          write.providerConnectionId === null
+          || item.providerConnectionId === write.providerConnectionId
+        )
         && item.turnId === body.turnId
         && item.itemId === body.itemId);
       const sessionItems = Array.from(this.#activeItems.values()).filter((item) =>
-        item.accountId === write.accountId && item.sessionId === write.sessionId).length;
+        item.accountId === write.accountId
+        && item.sessionId === write.sessionId
+        && sameProviderAuthority(item.providerAuthority, write.providerAuthority)).length;
       if (
         this.#activeItems.size >= this.#maximumActiveStreams
         || sessionItems >= this.#maximumActiveStreamsPerSession
@@ -643,20 +691,24 @@ export class SessionEventStreamRedactor {
       }
       this.#activeItems.set(itemKey(write, body.turnId, body.itemId), {
         accountId: write.accountId,
+        providerAuthority: write.providerAuthority,
         providerConnectionId: write.providerConnectionId,
         providerGeneration: write.providerGeneration,
         sessionId: write.sessionId,
         turnId: body.turnId,
         itemId: body.itemId,
       });
-      this.#quarantinedSessions.delete(write.sessionId);
+      this.#quarantinedAuthorities.delete(this.#custodyKey(write));
       return;
     }
     if (body.type === "turn_started") {
-      this.#finish((stream) => sameSession(write, stream), true);
+      this.#finish((stream) => sameProviderCustody(write, stream), true);
       this.#clearActiveItems((item) =>
-        item.accountId === write.accountId && item.sessionId === write.sessionId);
-      this.#quarantinedSessions.delete(write.sessionId);
+        item.accountId === write.accountId
+        && item.sessionId === write.sessionId
+        && sameProviderAuthority(item.providerAuthority, write.providerAuthority)
+        && item.providerGeneration === write.providerGeneration);
+      this.#quarantinedAuthorities.delete(this.#custodyKey(write));
       return;
     }
     if (
@@ -664,10 +716,13 @@ export class SessionEventStreamRedactor {
       || body.type === "connection"
       || (body.type === "session_status" && body.status !== "active")
     ) {
-      this.#finish((stream) => sameSession(write, stream), true);
+      this.#finish((stream) => sameProviderCustody(write, stream), true);
       this.#clearActiveItems((item) =>
-        item.accountId === write.accountId && item.sessionId === write.sessionId);
-      this.#quarantinedSessions.delete(write.sessionId);
+        item.accountId === write.accountId
+        && item.sessionId === write.sessionId
+        && sameProviderAuthority(item.providerAuthority, write.providerAuthority)
+        && item.providerGeneration === write.providerGeneration);
+      this.#quarantinedAuthorities.delete(this.#custodyKey(write));
     }
   }
 
@@ -678,10 +733,13 @@ export class SessionEventStreamRedactor {
   }
 
   #quarantineSession(write: SessionEventWrite): void {
-    this.#quarantinedSessions.add(write.sessionId);
-    this.#finish((stream) => sameSession(write, stream), true);
+    this.#quarantinedAuthorities.add(this.#custodyKey(write));
+    this.#finish((stream) => sameProviderCustody(write, stream), true);
     this.#clearActiveItems((item) =>
-      item.accountId === write.accountId && item.sessionId === write.sessionId);
+      item.accountId === write.accountId
+      && item.sessionId === write.sessionId
+      && sameProviderAuthority(item.providerAuthority, write.providerAuthority)
+      && item.providerGeneration === write.providerGeneration);
   }
 
   #finish(
@@ -818,7 +876,7 @@ export class SessionEventStreamRedactor {
     if (prefixLength <= 0 || prefixLength >= node.rawText.length) {
       throw new Error("SESSION_EVENT_STAGE_SPLIT_INVALID");
     }
-    const queue = this.#queues.get(node.write.sessionId);
+    const queue = this.#queues.get(this.#custodyKey(node.write));
     const queueIndex = queue?.indexOf(node) ?? -1;
     if (queue === undefined || queueIndex < 0) {
       throw new Error("SESSION_EVENT_STAGE_NODE_MISSING");
@@ -908,8 +966,9 @@ export class SessionEventStreamRedactor {
     node.readyBody = body;
   }
 
-  #drainSession(sessionId: string): readonly SessionEventWrite[] {
-    const queue = this.#queues.get(sessionId);
+  #drainAuthority(write: Omit<SessionEventWrite, "body">): readonly SessionEventWrite[] {
+    const key = this.#custodyKey(write);
+    const queue = this.#queues.get(key);
     if (queue === undefined) return [];
     const writes: SessionEventWrite[] = [];
     while (queue.length > 0) {
@@ -921,15 +980,34 @@ export class SessionEventStreamRedactor {
         writes.push({ ...node.write, body: node.readyBody });
       }
     }
-    if (queue.length === 0) this.#queues.delete(sessionId);
+    if (queue.length === 0) this.#queues.delete(key);
     return writes;
   }
 
   #drainAll(): readonly SessionEventWrite[] {
     const writes: SessionEventWrite[] = [];
-    for (const sessionId of [...this.#queues.keys()]) {
-      writes.push(...this.#drainSession(sessionId));
+    for (const queue of this.#queues.values()) {
+      const write = queue[0]?.write;
+      if (write !== undefined) writes.push(...this.#drainAuthority(write));
     }
     return writes;
+  }
+
+  #assertWriteAuthority(write: Omit<SessionEventWrite, "body">): void {
+    if (
+      write.accountId !== write.providerAuthority.profileId
+      || write.providerGeneration !== write.providerAuthority.processGeneration
+    ) throw new Error("SESSION_EVENT_PROVIDER_AUTHORITY_MISMATCH");
+  }
+
+  #custodyKey(write: Omit<SessionEventWrite, "body">): string {
+    return JSON.stringify([
+      write.sessionId,
+      write.providerAuthority.profileId,
+      write.providerAuthority.provider,
+      write.providerAuthority.providerAccountId,
+      write.providerAuthority.bindingGeneration,
+      write.providerAuthority.processGeneration,
+    ]);
   }
 }

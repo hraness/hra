@@ -41,11 +41,11 @@ import {
   type FactsMemoryBinding,
   type FactsMemoryCheckpoint,
 } from "../domain/facts-memory";
-import { HraFactsMemoryLifecycle } from "../daemon/facts-memory-lifecycle";
+import { OompaFactsMemoryLifecycle } from "../daemon/facts-memory-lifecycle";
 import { FactsMemoryControlStore } from "./facts-memory-control";
 import { LocalFactsMemoryBroker } from "./local-facts-memory-broker";
 import {
-  HRA_OH_FACTS_MEMORY_LIMITS_V1,
+  OOMPA_OH_FACTS_MEMORY_LIMITS_V1,
   inspectOhCanonicalDatabaseForRecovery,
   OhCanonicalDatabaseInspectionError,
   OhSqliteFactsMemoryEngine,
@@ -87,10 +87,10 @@ const openOhAuthority = (binding: FactsMemoryBinding, directory: string) =>
   createOhSqliteStoreAuthorityV1({
     path: join(directory, "oh.sqlite"),
     profile: OH_WORKING_STORE_PROFILE_V1,
-    realmId: `hra:${binding.bindingDigest}`,
+    realmId: `oompa:${binding.bindingDigest}`,
     spaceId: binding.epoch === 1
-      ? `hra:${binding.sessionId}`
-      : `hra:${binding.sessionId}:epoch:${String(binding.epoch)}`,
+      ? `oompa:${binding.sessionId}`
+      : `oompa:${binding.sessionId}:epoch:${String(binding.epoch)}`,
   });
 
 const sqliteLogicalBytes = async (directory: string): Promise<number> => {
@@ -685,7 +685,7 @@ describe("released Oh SQLite facts-memory adapter", () => {
     await oversized.store.close();
     await truncate(
       join(oversizedDirectory, "oh.sqlite"),
-      HRA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes + 1,
+      OOMPA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes + 1,
     );
     let oversizedCallbackCalled = false;
     await expect(engine.withCanonicalReplication({
@@ -1420,7 +1420,7 @@ describe("released Oh SQLite facts-memory adapter", () => {
     const { broker, root } = await fixture();
     const control = new FactsMemoryControlStore(join(root, "control.sqlite"), { now: () => 90 });
     controls.push(control);
-    const lifecycle = new HraFactsMemoryLifecycle({ broker, control });
+    const lifecycle = new OompaFactsMemoryLifecycle({ broker, control });
     const parent = createFactsMemoryBinding({ ownerId, sessionId: parentSessionId });
     const child = createFactsMemoryBinding({ ownerId, sessionId: childSessionId });
     await lifecycle.ensureSession({ ownerId, sessionId: parent.sessionId, expiresAt: 1_000 });
@@ -1537,7 +1537,7 @@ describe("released Oh SQLite facts-memory adapter", () => {
     const { broker, root } = await fixture();
     const control = new FactsMemoryControlStore(join(root, "control.sqlite"), { now: () => 90 });
     controls.push(control);
-    const lifecycle = new HraFactsMemoryLifecycle({ broker, control });
+    const lifecycle = new OompaFactsMemoryLifecycle({ broker, control });
     const first = await lifecycle.ensureSession({ ownerId, sessionId: parentSessionId, expiresAt: 100 });
     expect(await lifecycle.sweepExpired(100)).toMatchObject({ purged: 1 });
     const second = await lifecycle.ensureSession({ ownerId, sessionId: parentSessionId, expiresAt: 1_000 });
@@ -1592,14 +1592,14 @@ describe("released Oh SQLite facts-memory adapter", () => {
       sessionId: `sess_${"3".repeat(32)}`,
     });
     await broker.create({ binding: parent, operationKey: `create:${parent.sessionId}` });
-    expect(HRA_OH_FACTS_MEMORY_LIMITS_V1.forkSnapshotBytes)
+    expect(OOMPA_OH_FACTS_MEMORY_LIMITS_V1.forkSnapshotBytes)
       .toBe(OH_MEMORY_LIMITS_V1.snapshotBytesPerLane);
     const records = Array.from({ length: 65 }, (_, index) =>
       memoryPageRecord(index, "word ".repeat(102_000)));
     const encodedAtLimit = Buffer.byteLength(JSON.stringify(records), "utf8");
-    expect(encodedAtLimit).toBeLessThanOrEqual(HRA_OH_FACTS_MEMORY_LIMITS_V1.forkSnapshotBytes);
+    expect(encodedAtLimit).toBeLessThanOrEqual(OOMPA_OH_FACTS_MEMORY_LIMITS_V1.forkSnapshotBytes);
     expect(encodedAtLimit)
-      .toBeGreaterThan(HRA_OH_FACTS_MEMORY_LIMITS_V1.forkSnapshotBytes - 512 * 1024);
+      .toBeGreaterThan(OOMPA_OH_FACTS_MEMORY_LIMITS_V1.forkSnapshotBytes - 512 * 1024);
     const parentDirectory = join(root, parent.sessionId);
     const parentAuthority = openOhAuthority(parent, parentDirectory);
     await parentAuthority.store.commit({
@@ -1610,7 +1610,7 @@ describe("released Oh SQLite facts-memory adapter", () => {
     });
     await parentAuthority.store.close();
     expect(await sqliteLogicalBytes(parentDirectory))
-      .toBeLessThan(HRA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes);
+      .toBeLessThan(OOMPA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes);
 
     await expect(broker.fork({
       binding: child,
@@ -1632,7 +1632,7 @@ describe("released Oh SQLite facts-memory adapter", () => {
     const oversizedSnapshot = await advancedParent.store.snapshot({ maximumRecords: 8_192 });
     await advancedParent.store.close();
     expect(Buffer.byteLength(JSON.stringify(oversizedSnapshot.records), "utf8"))
-      .toBeGreaterThan(HRA_OH_FACTS_MEMORY_LIMITS_V1.forkSnapshotBytes);
+      .toBeGreaterThan(OOMPA_OH_FACTS_MEMORY_LIMITS_V1.forkSnapshotBytes);
     await expect(broker.fork({
       binding: oversizedChild,
       operationKey: `fork:${oversizedChild.sessionId}`,
@@ -1656,10 +1656,10 @@ describe("released Oh SQLite facts-memory adapter", () => {
     const churnDirectory = join(root, churn.sessionId);
     await truncate(
       join(churnDirectory, "oh.sqlite"),
-      HRA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes + 1,
+      OOMPA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes + 1,
     );
     expect(await sqliteLogicalBytes(churnDirectory))
-      .toBeGreaterThan(HRA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes);
+      .toBeGreaterThan(OOMPA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes);
     await expect(broker.inspect(churn)).rejects.toThrow("FACTS_MEMORY_OH_DATABASE_TOO_LARGE");
     await expect(broker.purge({
       binding: churn,
@@ -1697,7 +1697,7 @@ describe("released Oh SQLite facts-memory adapter", () => {
       const pageSize = database.query<{ page_size: number }, []>("PRAGMA page_size").get()?.page_size;
       if (pageSize === undefined) throw new Error("Expected SQLite page size.");
       const maximumPages = Math.floor(
-        (HRA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes - 32) / (2 * pageSize + 24),
+        (OOMPA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes - 32) / (2 * pageSize + 24),
       );
       const insert = database.query("INSERT INTO hra_capacity_padding(id, payload) VALUES (?, zeroblob(?))");
       let id = 0;
@@ -1721,7 +1721,7 @@ describe("released Oh SQLite facts-memory adapter", () => {
       database.close();
     }
     expect(await sqliteLogicalBytes(canonicalDirectory))
-      .toBeLessThan(HRA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes);
+      .toBeLessThan(OOMPA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes);
 
     const record = memoryPageRecord(9_999, "word ".repeat(104_000));
     const stores = {
@@ -1757,7 +1757,7 @@ describe("released Oh SQLite facts-memory adapter", () => {
     expect(reopened.canonicalHead).toMatchObject({ operationSha256: null, sequence: 0 });
     expect(reopened.workingHead).toMatchObject({ operationSha256: null, sequence: 0 });
     expect(await sqliteLogicalBytes(canonicalDirectory))
-      .toBeLessThan(HRA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes);
+      .toBeLessThan(OOMPA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes);
   }, 60_000);
 
   test("authorizes oversized legacy cleanup only from exact historical sidecar preimages", async () => {
@@ -1803,10 +1803,10 @@ describe("released Oh SQLite facts-memory adapter", () => {
 
     await truncate(
       join(childDirectory, "oh.sqlite"),
-      HRA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes + 1,
+      OOMPA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes + 1,
     );
     expect(await sqliteLogicalBytes(childDirectory))
-      .toBeGreaterThan(HRA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes);
+      .toBeGreaterThan(OOMPA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes);
 
     const writeMetadata = async (metadata: LegacyMetadataFixture): Promise<void> => {
       await writeFile(metadataPath, JSON.stringify(metadata), { mode: 0o600 });

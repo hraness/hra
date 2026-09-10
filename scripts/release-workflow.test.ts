@@ -4,8 +4,8 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  buildHraGlobalInstallCommand,
-  HRA_INSTALL_ARCHIVE_URL,
+  buildOompaGlobalInstallCommand,
+  OOMPA_INSTALL_ARCHIVE_URL,
 } from "../src/install-preflight";
 import { publicContent } from "../site/content";
 import { docsPathForSection, renderDocsMarkdown } from "../site/docs-content";
@@ -78,7 +78,7 @@ const sourceShardArguments = ["--shard=1/3", "--shard=2/3", "--shard=3/3"] as co
 const shardFixtureNames = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"] as const;
 
 async function withShardFixture(run: (directory: string) => void): Promise<void> {
-  const directory = await mkdtemp(join(tmpdir(), "hra-ci-shard-contract-"));
+  const directory = await mkdtemp(join(tmpdir(), "oompa-ci-shard-contract-"));
   try {
     await mkdir(join(directory, "fixtures"));
     for (const name of shardFixtureNames) {
@@ -236,7 +236,7 @@ describe("release workflow", () => {
     expect(npmPublisher).toContain('metadata(versionUrl, "version")');
     expect(npmPublisher).toContain('metadata(latestUrl, "latest")');
     expect(npmPublisher).toContain("lookupCompleteRelease()");
-    expect(npmPublisher).not.toContain("HRA_APPROVE_NPM_PUBLICATION");
+    expect(npmPublisher).not.toContain("OOMPA_APPROVE_NPM_PUBLICATION");
     expect(npmBoundary).toContain("maximumPublisherOutputBytes");
     expect(npmBoundary).toContain("Successfully retrieved and set token");
     expect(npmBoundary).toContain("GITHUB_REPOSITORY_OWNER_ID");
@@ -299,7 +299,7 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("Current V2 claims from `.11` onward");
     expect(releaseRecord).toContain("Environment claim OID\n`.23` must be exactly `npm-release`");
     expect(releaseRecord).toContain("Repository-subject OID `.24` remains mandatory");
-    expect(releaseRecord).toContain("repository path `hraness/hra`, numeric owner ID `307125679`");
+    expect(releaseRecord).toContain("repository path `hraness/oompa`, numeric owner ID `307125679`");
     expect(releaseRecord).toContain("numeric repository ID\n`1343008607`, and environment `npm-release`");
     expect(releaseRecord).toContain("tag ref `refs/tags/v0.7.0`");
     expect(releaseRecord).toContain("certificate URI and OIDs `.6`, `.14`, and `.18`");
@@ -449,7 +449,7 @@ describe("release workflow", () => {
       "CI check",
     ).run);
     expect(zigDownload).toContain(
-      'HRA_ZIG_SHA256="70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"',
+      'OOMPA_ZIG_SHA256="70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"',
     );
     expect(zigDownload).toContain(
       '"https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz"',
@@ -460,7 +460,7 @@ describe("release workflow", () => {
       "Rebuild and verify authority-supervisor artifacts (Linux)",
       "CI check",
     ).run)).toBe(
-      'bun ./scripts/verify-authority-supervisor-build.ts --zig "$RUNNER_TEMP/hra-zig-0.16.0/zig-x86_64-linux-0.16.0/zig"',
+      'bun ./scripts/verify-authority-supervisor-build.ts --zig "$RUNNER_TEMP/oompa-zig-0.16.0/zig-x86_64-linux-0.16.0/zig"',
     );
     const enableNamespaces = String(exactlyOneStep(
       ciSteps,
@@ -544,11 +544,11 @@ describe("release workflow", () => {
       GITHUB_REF: "refs/tags/v0.7.1",
       GITHUB_REF_NAME: "v0.7.1",
       GITHUB_REF_TYPE: "tag",
-      GITHUB_REPOSITORY: "hraness/hra",
+      GITHUB_REPOSITORY: "hraness/oompa",
       GITHUB_REPOSITORY_ID: "1343008607",
       GITHUB_RUN_ATTEMPT: "2",
       GITHUB_RUN_ID: "123",
-      GITHUB_WORKFLOW_REF: "hraness/hra/.github/workflows/release.yml@refs/tags/v0.7.1",
+      GITHUB_WORKFLOW_REF: "hraness/oompa/.github/workflows/release.yml@refs/tags/v0.7.1",
     };
     const run = githubReleaseRun("v0.7.1", source);
     const input = {
@@ -577,7 +577,7 @@ describe("release workflow", () => {
       .not.toThrow();
   });
 
-  test("binds the admitted installer to its own evidence without claiming runtime rollout", async () => {
+  test("binds the candidate installer without claiming artifact admission or runtime rollout", async () => {
     const [releaseNotes, readme, thirdPartyNotices, changelog, security] = await Promise.all([
       readFile(join(import.meta.dir, "..", "docs", "beta-release-notes.md"), "utf8"),
       readFile(join(import.meta.dir, "..", "README.md"), "utf8"),
@@ -585,8 +585,9 @@ describe("release workflow", () => {
       readFile(join(import.meta.dir, "..", "CHANGELOG.md"), "utf8"),
       readFile(join(import.meta.dir, "..", "SECURITY.md"), "utf8"),
     ]);
-    const installCommand = buildHraGlobalInstallCommand(HRA_INSTALL_ARCHIVE_URL);
+    const installCommand = buildOompaGlobalInstallCommand(OOMPA_INSTALL_ARCHIVE_URL);
     const availability = renderDocsMarkdown("/docs/status/");
+    const gettingStarted = renderDocsMarkdown("/docs/start/");
 
     expect(releaseNotes).toContain(installCommand);
     expect(releaseNotes).toContain("## Admitted v0.6.2 predecessor");
@@ -601,33 +602,61 @@ describe("release workflow", () => {
     expect(changelog).not.toContain("## v0.6.3 candidate (unreleased)");
     expect(changelog).toContain("docs/beta-release.md#immutable-v063-successful-release-record");
     expect(readme).toContain(installCommand);
-    expect(readme).toContain("Install and verify the admitted v0.7.1 CLI artifact. This does not start the daemon:");
+    expect(readme).toContain("Local CLI v0.8.0 is a release candidate");
+    expect(readme).not.toContain("Local CLI v0.8.0 is the fully admitted public artifact");
+    expect(readme).not.toContain("Install and verify the admitted v0.8.0 CLI artifact");
+    expect(readme).toContain("Only after immutable GitHub release admission, install and verify the v0.8.0 candidate CLI artifact. This does not start the daemon:");
+    expect(readme).toContain("The v0.8.0 candidate is not yet admitted");
+    expect(readme).toContain("https://github.com/hraness/oompa/tree/v0.7.1#get-started");
+    expect(releaseNotes).toContain("## Admitted v0.7.0 predecessor");
+    expect(releaseNotes).toContain("## Admitted v0.7.1 predecessor");
+    for (const surface of [readme, releaseNotes, availability, gettingStarted]) {
+      expect(surface).toContain("This release candidate is not yet admitted");
+      expect(surface).toContain("https://github.com/hraness/oompa/blob/v0.7.1/docs/beta-release-notes.md#install");
+      expect(surface).toContain("install command");
+      expect(surface).toContain("unavailable until");
+      const noticePosition = surface.indexOf("This release candidate is not yet admitted");
+      const installPosition = surface.indexOf(installCommand);
+      expect(noticePosition).toBeGreaterThanOrEqual(0);
+      expect(installPosition).toBeGreaterThanOrEqual(0);
+      expect(noticePosition).toBeLessThan(installPosition);
+    }
+    for (const guide of [availability, gettingStarted]) {
+      expect(guide).not.toContain("v0.8.0 is released");
+      expect(guide).not.toContain("The v0.8.0 CLI passed immutable GitHub and npm artifact admission");
+      expect(guide).not.toContain("You can install and check v0.8.0 now");
+    }
     expect(readme).not.toContain("The v0.7.1 candidate is not yet admitted");
-    expect(readme).toContain("https://github.com/hraness/hra/actions/runs/34367591503");
-    expect(readme).toContain("[Availability](https://hra.sh/docs/status/)");
-    expect(readme).toContain("[ordered update runbook](https://hra.sh/docs/status/#install-and-update)");
+    expect(readme).toContain("[Availability](https://oompa.dev/docs/status/)");
+    expect(readme).toContain("[ordered update runbook](https://oompa.dev/docs/status/#install-and-update)");
     expect(readme).not.toContain("Local CLI v0.7.0 is a release candidate");
     const homepageAvailability = publicContent.questions.find(({ question }) => question === "Can I start using it now?");
     expect(homepageAvailability).toBeDefined();
     expect(homepageAvailability?.answer).toContainEqual({ kind: "link", label: "Check the setup status", href: "/docs/status/" });
-    expect(homepageAvailability?.answer.filter((part) => part.kind === "text").map((part) => part.value).join(""))
-      .toContain("Starting or upgrading a daemon and enabling hosted commands are paused until the capacity checks pass.");
+    expect(homepageAvailability?.answer).toContainEqual({ kind: "link", label: "admitted release's immutable installation notes", href: "https://github.com/hraness/oompa/blob/v0.7.1/docs/beta-release-notes.md#install" });
+    const homepageAvailabilityText = homepageAvailability?.answer.filter((part) => part.kind === "text").map((part) => part.value).join("");
+    expect(homepageAvailabilityText).toContain("The admitted v0.7.1 CLI has its own");
+    expect(homepageAvailabilityText).toContain("The v0.8.0 candidate is not yet admitted.");
+    expect(homepageAvailabilityText).toContain("Starting or upgrading a daemon and enabling hosted commands are paused until the capacity checks pass.");
+    expect(homepageAvailabilityText).toContain("before initialization or daemon startup.");
     // The concise entry points link to the canonical availability guide. The
     // release-bound recovery restrictions must survive that relocation intact.
     expect(docsPathForSection("install-and-update")).toBe("/docs/status/#install-and-update");
     expect(availability).toContain(installCommand);
     expect(availability).toContain("The v0.7.1 CLI passed immutable GitHub and npm artifact admission.");
     expect(availability).not.toContain("The v0.7.1 candidate is not yet admitted");
+    expect(availability).toContain("The v0.8.0 candidate is not yet admitted");
+    expect(availability).not.toContain("v0.8.0 is released");
     expect(availability).toContain("their availability does not authorize starting the current daemon or sending new hosted commands");
     for (const document of [readme, availability]) {
       expect(document).toContain("Current daemon and hosted command-writer rollout remains blocked on capacity.");
-      expect(document).toContain("Do not initialize, start, or autostart a current daemon until");
+      expect(document).toContain("Do not initialize, start, or autostart either the admitted v0.7.1 daemon or the v0.8.0 candidate");
       expect(document).toContain("protected two-pass zero-debt capacity evidence and its exact .activated readback receipt");
       expect(document).toContain("Artifact availability and the live sync service do not clear this gate.");
       expect(document).toContain("daemon and target marker-2 proofs before globally enabling hosted writers");
     }
     expect(availability).toContain("next invocation of that exact release's installer");
-    expect(availability).toContain("`$BUN_INSTALL/install/hra/install-intent.json`");
+    expect(availability).toContain("`$BUN_INSTALL/install/oompa/install-intent.json`");
     expect(availability).toContain("the exact immutable install command from the originating release's trusted README or release notes");
     expect(availability).toContain("If that installer refuses the intent, stop installation and use bounded read-only diagnosis");
     expect(availability).toContain("while preserving the intent and its directories");
@@ -648,18 +677,23 @@ describe("release workflow", () => {
     expect(releaseNotes).not.toContain("Cloud enrollment is invitation-only");
     expect(releaseNotes).not.toContain("artifact-identity SPDX");
     expect(releaseNotes).not.toContain("runtime SPDX inventory");
-    expect(releaseNotes).toContain("# HRA v0.7.1 local CLI beta\n");
+    expect(releaseNotes).toContain("# Oompa v0.8.0 local CLI candidate\n");
     expect(thirdPartyNotices).toContain("exact tarball plus `SHA256SUMS`");
-    expect(thirdPartyNotices).not.toContain("This candidate is not yet admitted");
-    expect(thirdPartyNotices).toContain("The admitted `v0.7.1` release records its build graph");
+    expect(thirdPartyNotices).toContain("The admitted `v0.7.1` predecessor records its own build graph");
+    expect(thirdPartyNotices).toContain("This candidate is not yet admitted");
+    expect(thirdPartyNotices).not.toContain("The admitted `v0.8.0` release records its build graph");
     expect(thirdPartyNotices).toContain("bound the immutable source tag");
     expect(thirdPartyNotices).toContain("`@hraness/site-footer` v0.6.1");
     expect(thirdPartyNotices).toContain("`@hraness/design-kit` v0.6.2");
     expect(thirdPartyNotices).toContain("`@hraness/ui` v0.5.6");
+    expect(thirdPartyNotices).toContain("`@hraness/direct` v0.7.0");
+    expect(thirdPartyNotices).toContain("not a runtime dependency of the Oompa CLI or the authenticated app");
     expect(thirdPartyNotices).toContain("shared semantic themes and appearance controls");
     expect(thirdPartyNotices).not.toContain("`@hraness/design-kit` v0.3.0");
     expect(thirdPartyNotices).not.toContain("SPDX");
     expect(changelog).toContain("## v0.7.0\n");
+    expect(changelog).toContain("## v0.8.0 candidate (unreleased)\n");
+    expect(changelog).not.toContain("## v0.8.0\n");
     expect(changelog).toContain("## v0.7.1\n");
     expect(changelog).toContain("Forward repair for the incomplete `v0.6.0` admission");
     expect(security).toContain("| `v0.7.1` | Fully admitted beta. Supported and receives security fixes. Hosted command-writer rollout remains capacity-gated. |");
@@ -667,6 +701,7 @@ describe("release workflow", () => {
     expect(security).toContain("| `v0.6.3` | Superseded by `v0.7.0`. Unsupported. Do not bypass the update runbook to migrate. |");
     expect(security).toContain("| `v0.6.2` | Superseded by `v0.6.3`. Unsupported. Do not bypass the update runbook to migrate. |");
     expect(security).toContain("Only the latest fully admitted beta receives security fixes");
+    expect(security).toContain("| `v0.8.0` candidate | Not admitted or supported as a public release.");
     expect(security).toContain("| `v0.6.0` | Immutable partial publication. The workflow did not complete final admission; unsupported. |");
     expect(security).toContain("| `v0.5.0` | Superseded by `v0.6.1`. Unsupported. Do not bypass the update runbook to migrate. |");
     expect(releaseNotes).toContain("Current daemon startup and command-writer rollout remain blocked by `authority_reduction_hard_quota`");
@@ -675,10 +710,10 @@ describe("release workflow", () => {
     expect(installSection).toBeDefined();
     const installCommandBlocks = [...(installSection ?? "").matchAll(/```(?:sh|shell)\n([\s\S]*?)```/gu)];
     expect(installCommandBlocks).toHaveLength(1);
-    const directHraCommands = installCommandBlocks.flatMap((match) =>
-      (match[1] ?? "").split("\n").map((line) => line.trim()).filter((line) => /\bhra\s/u.test(line)),
+    const directOompaCommands = installCommandBlocks.flatMap((match) =>
+      (match[1] ?? "").split("\n").map((line) => line.trim()).filter((line) => /\boompa\s/u.test(line)),
     );
-    expect(directHraCommands).toEqual(["hra --version", "hra doctor --offline"]);
+    expect(directOompaCommands).toEqual(["oompa --version", "oompa doctor --offline"]);
     expect(releaseNotes.indexOf("Current daemon startup and command-writer rollout remain blocked"))
       .toBeLessThan(releaseNotes.indexOf("```sh"));
   });
@@ -710,12 +745,12 @@ describe("release workflow", () => {
     expect(releaseRecord).not.toContain("Publication is safe independently because");
 
     for (const qualification of [hostedQualification, claudeQualification]) {
-      expect(qualification).toContain("not a prerequisite for tagging or publishing HRA artifacts");
+      expect(qualification).toContain("not a prerequisite for tagging or publishing Oompa artifacts");
       expect(qualification).toContain("beta-release.md");
       expect(qualification).toContain("Use an authorized Linux host");
     }
     expect(hostedQualification).toContain("version-two memory evidence");
-    expect(hostedQualification).toContain("HRA never falls back to local custody");
+    expect(hostedQualification).toContain("Oompa never falls back to local custody");
     expect(claudeQualification).toContain("deterministic tests do not substitute for an authenticated live run");
     expect(claudeQualification).toContain("Write passing evidence only after cleanup succeeds");
     expect(claudeQualification).not.toContain("A release still needs the fresh exact-tree aggregate and this authorized Linux proof");
@@ -857,7 +892,7 @@ describe("release workflow", () => {
     expect(routing).toContain("The v0.7.1 artifact is fully admitted");
     expect(routing).toContain("Operational rollout remains pending");
     expect(releaseNotes).toContain("../README.md#get-started");
-    expect(releaseNotes).toContain("https://hra.sh/docs/status/#install-and-update");
+    expect(releaseNotes).toContain("https://oompa.dev/docs/status/#install-and-update");
     expect(releaseNotes).not.toContain("../README.md#update-runbook");
     const recovery = releaseRecord.split("## Recover delayed public visibility\n")[1]?.split("\n## ")[0];
     for (const boundary of [
@@ -865,7 +900,7 @@ describe("release workflow", () => {
       "Reconcile public state read-only before a retry",
       "Missing, mismatched or ambiguous evidence remains a hold",
       "existing strict branch/comparison helpers and final-ref readback",
-      "gh run rerun <run-id> --repo hraness/hra",
+      "gh run rerun <run-id> --repo hraness/oompa",
       "not a new run or a failed-job-only rerun",
       "A rerun is not inherently read-only", "resulting step evidence proves it",
       "Require all release jobs and final public admission to pass",
@@ -920,17 +955,18 @@ describe("release workflow", () => {
     expect(scripts["release:candidate"]).toBeUndefined();
     expect(scripts["release:publish"]).toBeUndefined();
     expect(scripts["release:canonical-alias"]).toBeUndefined();
-    expect(domainRecord).toContain("HRA v0 status: retired on 2026-08-27.");
+    expect(domainRecord).toContain("Oompa v0 status: retired on 2026-08-27.");
     expect(domainRecord).toContain("current-project-only");
-    expect(domainRecord).toContain("HRA v0 is never a fallback");
+    expect(domainRecord).toContain("Oompa v0 is never a fallback");
     expect(domainRecord).toContain("--confirm-exact");
     expect(domainRecord).toContain("canonical-alias-release");
     expect(domainRecord).toContain("unresolved_prior_intent");
     expect(domainRecord).toContain("reasserts only the plan's exact source");
     expect(domainRecord).toContain("unresolved_current_intent");
-    expect(releaseRecord.split("\n")[2]).toContain("Status: `v0.7.1` is the fully admitted public CLI beta");
+    expect(releaseRecord.split("\n")[2]).toContain("Status: `v0.8.0` is an unreleased provider-usage foundation candidate");
+    expect(releaseRecord.split("\n")[2]).toContain("`v0.7.1` remains the fully admitted public CLI beta");
     expect(releaseRecord).toContain("Artifact admission does not clear the blocked hosted command-writer rollout or authorize daemon upgrades");
-    expect(releaseRecord).toContain("At retirement, `hraness/hra` had no `v0.1.0` tag");
+    expect(releaseRecord).toContain("At retirement, `hraness/oompa` had no `v0.1.0` tag");
     expect(releaseRecord).toContain("## Immutable v0.1.0 failure record");
     expect(releaseRecord).toContain("Release workflow run `33363290345`, attempt 1");
     expect(releaseRecord).toContain("job `99398751969`");
@@ -1049,13 +1085,15 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("Stable `@hraness/hra@0.7.1` is the current admitted artifact");
     expect(releaseRecord).toContain("The canonical README and website use a two-phase local-release surface");
     expect(releaseRecord).toContain("The `v0.7.1` local CLI artifacts are admitted");
-    expect(releaseRecord).toContain("without changing the pre-admission wording captured in the release's immutable README and package metadata");
-    expect(releaseRecord).toContain("The current command names the admitted `v0.7.1` artifact and verifies its exact immutable bytes before installation");
-    expect(releaseRecord).toContain("https://github.com/hraness/hra/tree/v0.7.0#install-and-update");
+    expect(releaseRecord).toContain("preserves that predecessor's admission record and the pre-admission wording captured in its immutable README and package metadata");
+    expect(releaseRecord).toContain("Their immutable installation notes name the exact admitted GitHub Release and verified archive");
+    expect(releaseRecord).toContain("v0.8.0 candidate command, explicitly unavailable until its own exact artifact admission");
+    expect(releaseRecord).toContain("links to the v0.7.1 notes for the existing artifact");
+    expect(releaseRecord).toContain("https://github.com/hraness/hra/tree/v0.7.1#get-started");
     expect(releaseRecord).toContain("https://github.com/hraness/hra/blob/v0.6.1/docs/beta-release-notes.md#install");
     expect(releaseRecord).toContain("Hosted sync went live separately on 2026-09-03");
     expect(releaseRecord).toContain("Preserve old local state-protocol receipts, mutation intents, and evidence files");
-    expect(releaseRecord).toContain("The singleton `$BUN_INSTALL/install/hra/install-intent.json` is different");
+    expect(releaseRecord).toContain("The singleton `$BUN_INSTALL/install/oompa/install-intent.json` is different");
     expect(releaseRecord).toContain("settle it only with the exact immutable installer from its originating release");
     expect(releaseRecord).toContain("never treat that local recovery as authorization to retry or mutate the historical release workflow");
     expect(releaseRecord).toContain("## Immutable v0.5.0 successful release record");
@@ -1147,8 +1185,8 @@ describe("release workflow", () => {
     expect(workflow).toContain("check-public-release.ts");
     expect(workflow).toContain("os: [ubuntu-24.04, macos-15]");
     expect(workflow).toContain("npm_preflight_run_attempt");
-    expect(workflow).toContain("HRA_NPM_PREFLIGHT_RUN_ATTEMPT");
-    expect(workflow).not.toContain("HRA_APPROVE_NPM_PUBLICATION");
+    expect(workflow).toContain("OOMPA_NPM_PREFLIGHT_RUN_ATTEMPT");
+    expect(workflow).not.toContain("OOMPA_APPROVE_NPM_PUBLICATION");
     expect(workflow).not.toContain("release-candidate.ts");
     expect(workflow).not.toContain("publish-beta-release.ts");
     for (const retired of [
@@ -1157,8 +1195,8 @@ describe("release workflow", () => {
       "release-candidate.ts",
       "release-candidate.test.ts",
     ]) expect(await Bun.file(join(import.meta.dir, retired)).exists()).toBeFalse();
-    expect(workflow).not.toContain("hra-weld.vercel.app");
-    expect(workflow).not.toContain("try-hra.vercel.app");
+    expect(workflow).not.toContain("oompa-weld.vercel.app");
+    expect(workflow).not.toContain("hra.vercel.app");
     expect(workflow).not.toContain("convex");
   });
 
@@ -1174,7 +1212,7 @@ describe("release workflow", () => {
     expect(Object.keys(jobs).sort()).toEqual(["browser", "check", "required"]);
     expect(check.name).toBe("Check (${{ matrix.os }}, ${{ matrix.gate }})");
     expect(check["runs-on"]).toBe("${{ matrix.os }}");
-    expect(check["timeout-minutes"]).toBe(20);
+    expect(check["timeout-minutes"]).toBe("${{ matrix.gate == 'remainder' && 20 || 75 }}");
     expect(check.if).toBeUndefined();
     expect(check["continue-on-error"]).toBeUndefined();
     expect(check.strategy).toEqual({
@@ -1287,6 +1325,44 @@ describe("release workflow", () => {
       BROWSER_RESULT: "${{ needs.browser.result }}",
     });
     expect(requiredStep.run).toBe('test "$CHECK_RESULT" = "success" && test "$BROWSER_RESULT" = "success"');
+  });
+
+  test("keeps scoped Ubuntu Chromium setup mandatory before the unchanged compiled browser gate", async () => {
+    const workflow = asRecord(Bun.YAML.parse(await readFile(
+      join(import.meta.dir, "..", ".github", "workflows", "ci.yml"), "utf8",
+    )), "CI workflow");
+    const browser = asRecord(asRecord(workflow.jobs, "CI jobs").browser, "CI browser job");
+    expect(browser["runs-on"]).toBe("ubuntu-24.04");
+    expect(browser["timeout-minutes"]).toBe(20);
+    expect(browser.if).toBeUndefined();
+    expect(browser["continue-on-error"]).toBeUndefined();
+    if (!Array.isArray(browser.steps)) throw new TypeError("CI browser steps must be an array");
+    const steps = browser.steps.map((step, index) => asRecord(step, `CI browser step ${index}`));
+    expect(steps.map((step) => step.name)).toEqual([
+      "Check out exact source", "Install Bun", "Install frozen dependencies", "Install the browser driver runtime",
+      "Install package-pinned Chromium", "Verify compiled browser surfaces", "Retain browser acceptance receipts",
+    ]);
+    for (const step of steps) {
+      expect(step["continue-on-error"]).toBeUndefined();
+      expect(step.if).toBe(step.name === "Retain browser acceptance receipts" ? "${{ always() }}" : undefined);
+    }
+    const runtime = asRecord(steps.find((step) => step.name === "Install the browser driver runtime"), "browser runtime step");
+    expect(runtime.uses).toBe(reviewedActions.setupNode);
+    expect(runtime.with).toEqual({ "node-version": "24.18.1", "package-manager-cache": false });
+    const install = asRecord(steps.find((step) => step.name === "Install package-pinned Chromium"), "browser install step");
+    expect(install.run).toBe("node ./scripts/install-ci-chromium-deps.ts");
+    expect(install.env).toBeUndefined();
+    const verify = asRecord(steps.find((step) => step.name === "Verify compiled browser surfaces"), "browser gate step");
+    expect(String(verify.run).trim()).toBe([
+      "set -euo pipefail",
+      'BUN_EXECUTABLE_PATH="$(command -v bun)"',
+      'CHROMIUM_EXECUTABLE_PATH="$(node --input-type=module -e \'import { chromium } from "playwright-core"; console.log(chromium.executablePath())\')"',
+      "export BUN_EXECUTABLE_PATH CHROMIUM_EXECUTABLE_PATH",
+      'test -x "$BUN_EXECUTABLE_PATH"',
+      'test -x "$CHROMIUM_EXECUTABLE_PATH"',
+      "bun run check:browser",
+    ].join("\n"));
+    expect(verify.env).toBeUndefined();
   });
 
   test("admits only a tagged commit whose CI run concluded success before packaging", async () => {
@@ -1427,8 +1503,8 @@ describe("release workflow", () => {
     expect(upload?.id).toBe("release_artifact");
     expect(upload?.uses).toBe(reviewedActions.uploadArtifact);
     const uploadInputs = asRecord(upload?.with, "release artifact upload inputs");
-    expect(uploadInputs.name).toBe("hra-release-${{ github.run_attempt }}");
-    expect(uploadInputs.path).toBe("${{ runner.temp }}/hra-release-artifacts/");
+    expect(uploadInputs.name).toBe("oompa-release-${{ github.run_attempt }}");
+    expect(uploadInputs.path).toBe("${{ runner.temp }}/oompa-release-artifacts/");
 
     for (const jobName of ["exact_artifact", "publish", "npm_preflight", "npm_mirror"] as const) {
       const job = asRecord(jobs[jobName], `${jobName} job`);
@@ -1451,7 +1527,7 @@ describe("release workflow", () => {
       expect(inputs).toEqual({
         "artifact-ids": "${{ needs.verify.outputs.artifact_id }}",
         "merge-multiple": true,
-        path: "${{ runner.temp }}/hra-release-artifacts",
+        path: "${{ runner.temp }}/oompa-release-artifacts",
       });
       expect(inputs.name).toBeUndefined();
     }
@@ -1479,8 +1555,8 @@ describe("release workflow", () => {
       if (typeof run !== "string") throw new TypeError(`${jobName} ${stepName} must have a run command`);
       return run;
     };
-    const exactShellRoot = "$RUNNER_TEMP/hra-release-artifacts";
-    const exactActionRoot = "${{ runner.temp }}/hra-release-artifacts";
+    const exactShellRoot = "$RUNNER_TEMP/oompa-release-artifacts";
+    const exactActionRoot = "${{ runner.temp }}/oompa-release-artifacts";
     const assertOutsideCheckout = (command: string): void => {
       expect(command).not.toContain("$GITHUB_WORKSPACE");
       expect(command).not.toContain("${{ github.workspace }}");

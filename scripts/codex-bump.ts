@@ -221,7 +221,7 @@ export async function generateCodexSchemas(input: Readonly<{
     throw new CodexBumpRefusedError("Executable paths must be absolute.");
   }
   assertCodexBumpActive(input.signal);
-  const outputDirectory = await realpath(await mkdtemp(join(tmpdir(), "hra-codex-bump-")));
+  const outputDirectory = await realpath(await mkdtemp(join(tmpdir(), "oompa-codex-bump-")));
   let cleanupProven = true;
   try {
     assertCodexBumpActive(input.signal);

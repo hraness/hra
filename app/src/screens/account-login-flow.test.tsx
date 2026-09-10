@@ -3,7 +3,7 @@ import { parseHTML } from "linkedom";
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 
-import type { DeviceCommandResultPayload } from "../hra/cloud";
+import type { DeviceCommandResultPayload } from "../oompa/cloud";
 import type { AccountRowView } from "../model/settings-view";
 
 const loginCommandId = "018bcfe5-6800-7000-8000-000000000001";
@@ -208,7 +208,7 @@ describe("mounted account login handoff lifecycle", () => {
     await act(async () => { await new Promise((resolve) => { setTimeout(resolve, 0); }); });
     expect(container.textContent).not.toContain("ABCD-EFGH");
     expect(container.textContent).toContain("handoff expired");
-    expect(container.textContent).toContain("hra account login-cancel acct_primary0001");
+    expect(container.textContent).toContain("oompa account login-cancel acct_primary0001");
     expect(container.textContent).not.toContain("Start a new login.");
   });
 });

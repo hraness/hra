@@ -1,11 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 
 import {
-  HRA_HOST_TOOL_MANIFEST,
-  HRA_HOST_TOOL_MANIFEST_VERSION,
-  HRA_HOST_TOOL_PUBLIC_RESULT_MAX_BYTES,
-  parseHraHostToolRequest,
-  type HraHostToolRequest,
+  OOMPA_HOST_TOOL_MANIFEST,
+  OOMPA_HOST_TOOL_MANIFEST_VERSION,
+  OOMPA_HOST_TOOL_PUBLIC_RESULT_MAX_BYTES,
+  parseOompaHostToolRequest,
+  type OompaHostToolRequest,
 } from "../domain/host-tools.ts";
 import { ClaudeError } from "./errors.ts";
 import { CLAUDE_PIN, CLAUDE_PIN_MCP_PROTOCOL_VERSION } from "./pin.ts";
@@ -22,7 +22,7 @@ export type ClaudeMcpResponse = Readonly<{
 export type ClaudeHostToolInvocation = Readonly<{
   callId: string;
   requestDigest: string;
-  request: HraHostToolRequest;
+  request: OompaHostToolRequest;
 }>;
 
 export type ClaudeHostToolInvocationReceipt = Readonly<{
@@ -119,7 +119,7 @@ const canonicalJson = (value: unknown): string => {
 
 export const digestClaudeHostToolInvocation = (
   callId: string,
-  request: HraHostToolRequest,
+  request: OompaHostToolRequest,
 ): string => createHash("sha256")
   .update("hra:claude-host-tool-call:v1\0", "utf8")
   .update(canonicalJson({ callId, input: request.input, tool: request.tool }), "utf8")
@@ -176,14 +176,14 @@ const validateInitialize = (paramsValue: unknown): void => {
   }
 };
 
-const parseHostToolCall = (paramsValue: unknown): HraHostToolRequest => {
+const parseHostToolCall = (paramsValue: unknown): OompaHostToolRequest => {
   const params = record(paramsValue, "MCP tools/call params");
   exactKeys(params, new Set(["name", "arguments"]), ["name"], "MCP tools/call params");
   const name = boundedString(params.name, "MCP tool name", 128);
   try {
-    return parseHraHostToolRequest(name, params.arguments ?? {});
+    return parseOompaHostToolRequest(name, params.arguments ?? {});
   } catch {
-    throw new McpProtocolFault(-32_602, "MCP tool arguments do not match an advertised HRA tool");
+    throw new McpProtocolFault(-32_602, "MCP tool arguments do not match an advertised Oompa tool");
   }
 };
 
@@ -199,10 +199,10 @@ const normalizeOutcome = (
   if (
     typeof outcome.ok !== "boolean"
     || typeof outcome.text !== "string"
-    || new TextEncoder().encode(outcome.text).byteLength > HRA_HOST_TOOL_PUBLIC_RESULT_MAX_BYTES
+    || new TextEncoder().encode(outcome.text).byteLength > OOMPA_HOST_TOOL_PUBLIC_RESULT_MAX_BYTES
     || outcome.text.includes("\0")
     || /\p{Cs}/u.test(outcome.text)
-  ) return { ok: false, text: "HRA refused an invalid host-tool result." };
+  ) return { ok: false, text: "Oompa refused an invalid host-tool result." };
   return outcome;
 };
 
@@ -221,7 +221,7 @@ type LedgerEntry = Readonly<{
 
 /**
  * The exact, closed MCP server surface admitted for Claude Code 2.1.260.
- * It exposes only the shared eight-tool HRA manifest. Provider identity is
+ * It exposes only the shared eight-tool Oompa manifest. Provider identity is
  * supplied later by the private binding transport, never by model arguments.
  */
 export class ClaudeHostToolMcpServer {
@@ -279,7 +279,7 @@ export class ClaudeHostToolMcpServer {
       return await this.#request(rawId, method, message.params);
     } catch (error: unknown) {
       if (error instanceof McpProtocolFault) return mcpError(rawId, error.code, error.message);
-      return mcpError(rawId, -32_603, "HRA could not process this MCP request");
+      return mcpError(rawId, -32_603, "Oompa could not process this MCP request");
     }
   }
 
@@ -352,7 +352,7 @@ export class ClaudeHostToolMcpServer {
     }).catch((error: unknown) => {
       lifecycle.reclaimable = true;
       if (error instanceof McpProtocolFault) return mcpError(id, error.code, error.message);
-      return mcpError(id, -32_603, "HRA could not process this MCP request");
+      return mcpError(id, -32_603, "Oompa could not process this MCP request");
     });
     this.#ledger.set(key, { dispatchTask, lifecycle, requestDigest: digest });
     return await dispatchTask;
@@ -375,9 +375,9 @@ export class ClaudeHostToolMcpServer {
         capabilities: { tools: { listChanged: false } },
         protocolVersion: CLAUDE_PIN_MCP_PROTOCOL_VERSION,
         serverInfo: {
-          name: "hra",
-          title: "HRA session host tools",
-          version: String(HRA_HOST_TOOL_MANIFEST_VERSION),
+          name: "oompa",
+          title: "Oompa session host tools",
+          version: String(OOMPA_HOST_TOOL_MANIFEST_VERSION),
         },
       });
     }
@@ -393,7 +393,7 @@ export class ClaudeHostToolMcpServer {
       parseEmptyParams(params, "MCP tools/list params");
       release();
       return mcpResult(id, {
-        tools: HRA_HOST_TOOL_MANIFEST.tools.map((tool) => ({
+        tools: OOMPA_HOST_TOOL_MANIFEST.tools.map((tool) => ({
           description: tool.description,
           inputSchema: tool.inputSchema,
           name: tool.name,
@@ -412,7 +412,7 @@ export class ClaudeHostToolMcpServer {
     release: () => void,
   ): Promise<ClaudeMcpDispatch> {
     const request = parseHostToolCall(params);
-    const callId = boundedString(this.#newCallId(), "HRA host-tool call id");
+    const callId = boundedString(this.#newCallId(), "Oompa host-tool call id");
     const call: ClaudeHostToolInvocation = {
       callId,
       request,
@@ -422,7 +422,7 @@ export class ClaudeHostToolMcpServer {
     try {
       outcome = normalizeOutcome(await this.#handler.invoke(call));
     } catch {
-      outcome = { ok: false, text: "HRA could not complete this host-tool request." };
+      outcome = { ok: false, text: "Oompa could not complete this host-tool request." };
     }
     let notified = false;
     const receipt: ClaudeHostToolInvocationReceipt = {

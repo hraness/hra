@@ -23,7 +23,7 @@ import {
   type MemorySummarySpace,
   type NotificationHoursPolicy,
   type ProfileBindingPayload,
-} from "../hra/cloud";
+} from "../oompa/cloud";
 import type { ApprovalMode, PresetChoice } from "./settings-commands";
 
 /**
@@ -46,8 +46,8 @@ export function personalSessionAdoptionCommand(
   enabled: boolean,
 ): string {
   return enabled
-    ? `hra session adoption disable --provider ${provider}`
-    : `hra session adoption enable <account> --provider ${provider}`;
+    ? `oompa session adoption disable --provider ${provider}`
+    : `oompa session adoption enable <account> --provider ${provider}`;
 }
 
 export type MachineDeviceState = Readonly<{
@@ -68,22 +68,24 @@ export type MachineOnlineInput = Readonly<{
 /**
  * A machine is online when the hosted presence table still holds its device
  * connection, and otherwise when its registry heartbeat is recent enough that
- * presence has simply not caught up. A revoked or missing device row is always
- * offline, whatever the last published heartbeat said.
+ * presence has simply not caught up. A future heartbeat does not establish
+ * freshness. A revoked or missing device row is always offline, whatever the
+ * last published heartbeat said.
  */
 export function isMachineOnline(input: MachineOnlineInput): boolean {
   const { device, heartbeatAt, now } = input;
   if (device === null || device.status !== "active") return false;
   if (device.online) return true;
   if (!Number.isFinite(heartbeatAt) || heartbeatAt <= 0 || !Number.isFinite(now)) return false;
-  return now - heartbeatAt <= registryHeartbeatToleranceMs;
+  const age = now - heartbeatAt;
+  return age >= 0 && age <= registryHeartbeatToleranceMs;
 }
 
-export type ScheduledTaskKindLabel = "HRA";
+export type ScheduledTaskKindLabel = "Oompa";
 
 const scheduledTaskKindLabels: Readonly<
   Record<DeviceRegistryScheduledTask["kind"], ScheduledTaskKindLabel>
-> = { hra_conversation: "HRA" };
+> = { hra_conversation: "Oompa" };
 
 export function scheduledTaskKindLabel(
   kind: DeviceRegistryScheduledTask["kind"],
@@ -532,7 +534,7 @@ export function archivedSessionRows(
 }
 
 export type AccountRowView = Readonly<{
-  /** The machine's local opt-in: `hra remote allow account-linking`. */
+  /** The machine's local opt-in: `oompa remote allow account-linking`. */
   accountLinkingAllowed: boolean;
   /** The machine-wide device-command kill switch. */
   deviceCommandsAllowed: boolean;

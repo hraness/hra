@@ -17,7 +17,7 @@ import {
   type DeviceCommandPayload,
   type DeviceCommandResultPayload,
   type EncryptedEnvelope,
-} from "../hra/cloud";
+} from "../oompa/cloud";
 import {
   acknowledgeObservedCommandReceipt,
   parseDeviceCommandEnqueueReceipt,

@@ -4,12 +4,12 @@ import { parseAuthCredentials } from "../src/cloud/authCredentials";
 import { digestAuthEmail, digestAuthOtp, timingSafeEqualAuthDigest } from "./authEmail";
 
 afterEach(() => {
-  delete process.env.HRA_AUTH_HMAC_SECRET;
+  delete process.env.OOMPA_AUTH_HMAC_SECRET;
 });
 
 describe("purpose-separated auth digests", () => {
   test("stores neither canonical email nor low-entropy code", async () => {
-    process.env.HRA_AUTH_HMAC_SECRET = ["test", "secret", "at", "least", "thirty", "two", "characters"].join("-");
+    process.env.OOMPA_AUTH_HMAC_SECRET = ["test", "secret", "at", "least", "thirty", "two", "characters"].join("-");
     const parsed = parseAuthCredentials({ email: "reader@example.com", code: "01234567" });
     if (parsed.kind !== "verify_code") throw new Error("invalid auth fixture");
     const emailDigest = await digestAuthEmail(parsed.email);
@@ -52,7 +52,7 @@ describe("constant-time OTP digest comparison", () => {
   });
 
   test("agrees with strict equality for every well-formed pair", async () => {
-    process.env.HRA_AUTH_HMAC_SECRET = ["test", "secret", "at", "least", "thirty", "two", "characters"].join("-");
+    process.env.OOMPA_AUTH_HMAC_SECRET = ["test", "secret", "at", "least", "thirty", "two", "characters"].join("-");
     const parsed = parseAuthCredentials({ email: "reader@example.com", code: "01234567" });
     if (parsed.kind !== "verify_code") throw new Error("invalid auth fixture");
     const stored = await digestAuthOtp(parsed.email, parsed.code);

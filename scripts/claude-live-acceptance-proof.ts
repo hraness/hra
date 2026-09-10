@@ -7,12 +7,13 @@ import type {
   ClaudeHostToolResponseWritten,
 } from "../src/claude/index";
 import { digestClaudeHostToolInvocation } from "../src/claude/index";
-import type { HraHostToolCall } from "../src/codex/protocol";
+import type { OompaHostToolCall } from "../src/codex/protocol";
 import type { LiveAcceptanceClaudeProofPort } from "../src/cli";
 import type { ProfileAuthority } from "../src/daemon/ports";
-import { parseHraHostToolRequest, type HraMemoryRememberInput } from "../src/domain/host-tools";
+import { parseOompaHostToolRequest, type OompaMemoryRememberInput } from "../src/domain/host-tools";
+import { claudeProviderAccountAuthoritySchema } from "../src/domain/provider-accounts";
 import { profileIdSchema, sessionIdSchema, type ProfileId, type SessionId } from "../src/domain/values";
-import { HRA_VERSION } from "../src/version";
+import { OOMPA_VERSION } from "../src/version";
 import {
   liveAcceptanceCandidateSchema,
   type LiveAcceptanceCandidate,
@@ -61,7 +62,7 @@ const freshSessionScopeSchema = z.object({
 
 export type ClaudeLiveAcceptanceFreshSessionScope = Readonly<{
   daemonGeneration: number;
-  memory: HraMemoryRememberInput;
+  memory: OompaMemoryRememberInput;
   profileGeneration: number;
   profileId: ProfileId;
   providerThreadId: string;
@@ -83,7 +84,7 @@ type ClaudeLiveAcceptancePrivateReceiptBase = Readonly<{
   candidateBindingDigest: string;
   connectionId: string;
   daemonGeneration: number;
-  memory: HraMemoryRememberInput;
+  memory: OompaMemoryRememberInput;
   profileGeneration: number;
   profileId: ProfileId;
   providerThreadId: string;
@@ -143,7 +144,7 @@ const sha256 = (value: string): string => createHash("sha256")
   .update(value, "utf8")
   .digest("hex");
 
-const freezeMemory = (input: HraMemoryRememberInput): HraMemoryRememberInput => Object.freeze({
+const freezeMemory = (input: OompaMemoryRememberInput): OompaMemoryRememberInput => Object.freeze({
   body: input.body,
   key: input.key,
   ...(input.language === undefined ? {} : { language: input.language }),
@@ -160,8 +161,8 @@ const freezeRememberResult = (
   workingHead: Object.freeze({ ...input.workingHead }),
 });
 
-const parseRememberInput = (value: unknown): HraMemoryRememberInput => {
-  const request = parseHraHostToolRequest("memory_remember", value);
+const parseRememberInput = (value: unknown): OompaMemoryRememberInput => {
+  const request = parseOompaHostToolRequest("memory_remember", value);
   if (request.tool !== "memory_remember") throw new Error("unreachable");
   return freezeMemory(request.input);
 };
@@ -240,7 +241,7 @@ const parsePrivateReceiptBase = (value: unknown): ClaudeLiveAcceptancePrivateRec
     result: freezeRememberResult(parsed.result),
   };
   if (
-    receipt.candidate.packageVersion !== HRA_VERSION
+    receipt.candidate.packageVersion !== OOMPA_VERSION
     || proofBindingDigest(receipt) !== receipt.candidateBindingDigest
     || digestClaudeHostToolInvocation(receipt.callId, {
       input: receipt.memory,
@@ -295,7 +296,7 @@ export class ClaudeLiveAcceptanceProofCollector implements LiveAcceptanceClaudeP
   }>) {
     const candidate = liveAcceptanceCandidateSchema.safeParse(input.candidate);
     const runId = z.string().uuid().safeParse(input.runId);
-    if (!candidate.success || candidate.data.packageVersion !== HRA_VERSION || !runId.success) {
+    if (!candidate.success || candidate.data.packageVersion !== OOMPA_VERSION || !runId.success) {
       throw new ClaudeLiveAcceptanceProofError("candidate_invalid");
     }
     this.#candidate = Object.freeze({ ...candidate.data });
@@ -346,7 +347,7 @@ export class ClaudeLiveAcceptanceProofCollector implements LiveAcceptanceClaudeP
 
   async handleManagedHostToolCall(input: Readonly<{
     authority: ProfileAuthority;
-    call: HraHostToolCall;
+    call: OompaHostToolCall;
     dispatch: () => Promise<ClaudeHostToolPublicResult>;
   }>): Promise<ClaudeHostToolPublicResult> {
     this.#requireOpen();
@@ -360,8 +361,11 @@ export class ClaudeLiveAcceptanceProofCollector implements LiveAcceptanceClaudeP
       );
     }
     const scope = this.#requireScope();
-    const call = input.call;
-    let memory: HraMemoryRememberInput;
+    // Own the fields retained after dispatch. The V1 receipt remains unchanged;
+    // full provider identity is an admission check, not a new receipt preimage.
+    const call = { ...input.call, authority: { ...input.call.authority }, requestId: { ...input.call.requestId } };
+    const authority = { ...input.authority };
+    let memory: OompaMemoryRememberInput;
     try {
       memory = call.tool === "memory_remember" ? parseRememberInput(call.input) : this.#fail("call_mismatch");
     } catch (error: unknown) {
@@ -369,8 +373,12 @@ export class ClaudeLiveAcceptanceProofCollector implements LiveAcceptanceClaudeP
       this.#fail("call_mismatch");
     }
     if (
-      input.authority.id !== scope.profileId
-      || input.authority.generation !== scope.profileGeneration
+      authority.id !== scope.profileId
+      || authority.generation !== scope.profileGeneration
+      || authority.provider !== "claude"
+      || !claudeProviderAccountAuthoritySchema.safeParse(call.authority).success
+      || call.authority.providerAccountId !== authority.providerAccountId
+      || call.authority.bindingGeneration !== authority.bindingGeneration
       || call.authority.profileId !== scope.profileId
       || call.authority.processGeneration !== scope.profileGeneration
       || call.threadId !== scope.providerThreadId
@@ -427,7 +435,7 @@ export class ClaudeLiveAcceptanceProofCollector implements LiveAcceptanceClaudeP
     const scope = this.#requireScope();
     const call = this.#call;
     if (call === null) this.#fail("response_written_mismatch");
-    let memory: HraMemoryRememberInput;
+    let memory: OompaMemoryRememberInput;
     try {
       memory = receipt.request.tool === "memory_remember"
         ? parseRememberInput(receipt.request.input)

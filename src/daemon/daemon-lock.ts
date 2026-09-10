@@ -254,8 +254,8 @@ export class DaemonAuthorityBusyError extends Error {
 
   constructor(receipt: DaemonAuthorityReceipt | null) {
     super(receipt === null
-      ? "A HRA process already owns the local daemon authority."
-      : `A HRA process already owns the local daemon authority (pid ${receipt.pid}, ${receipt.state}).`);
+      ? "A Oompa process already owns the local daemon authority."
+      : `A Oompa process already owns the local daemon authority (pid ${receipt.pid}, ${receipt.state}).`);
     this.name = "DaemonAuthorityBusyError";
   }
 }

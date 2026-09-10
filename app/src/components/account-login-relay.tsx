@@ -29,7 +29,7 @@ export function AccountLoginRelay({
           Open Codex sign-in
         </a>
       </p>
-      <p {...stylex.props(accountLoginRelayStyles.paragraph)}>Keep this HRA tab open until sign-in finishes. This code cannot be retrieved again.</p>
+      <p {...stylex.props(accountLoginRelayStyles.paragraph)}>Keep this Oompa tab open until sign-in finishes. This code cannot be retrieved again.</p>
     </div>
   );
 }

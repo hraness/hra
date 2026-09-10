@@ -4,37 +4,39 @@ import fc from "fast-check";
 import type { CanonicalAuthEmail } from "../src/cloud/authCredentials";
 import type { InteractionKind } from "../src/domain/interactions";
 import {
-  buildHraAttentionEmailBody,
-  buildHraAttentionEmailPayload,
-  classifyHraAttentionEmailResponse,
-  createHraAttentionEmailSender,
-  hraAttentionEmailBodyVersion,
-  hraAttentionEmailDeliveryTimeoutMs,
-  hraAttentionEmailEndpoint,
-  hraAttentionEmailFrom,
-  hraAttentionEmailMaximumBodyBytes,
-  hraAttentionEmailMaximumItems,
-  hraAttentionEmailSubject,
-  hraAttentionEmailUserAgent,
-  parseHraAttentionEmailBody,
-  sendHraAttentionEmail,
-  type HraAttentionEmailBody,
-  type HraAttentionEmailFetch,
-  type HraAttentionEmailItem,
+  attentionEmailFromV1,
+  attentionEmailSubjectV1,
+  buildOompaAttentionEmailBody,
+  buildOompaAttentionEmailPayload,
+  classifyOompaAttentionEmailResponse,
+  createOompaAttentionEmailSender,
+  oompaAttentionEmailBodyVersion,
+  oompaAttentionEmailDeliveryTimeoutMs,
+  oompaAttentionEmailEndpoint,
+  oompaAttentionEmailFrom,
+  oompaAttentionEmailMaximumBodyBytes,
+  oompaAttentionEmailMaximumItems,
+  oompaAttentionEmailSubject,
+  oompaAttentionEmailUserAgent,
+  parseOompaAttentionEmailBody,
+  sendOompaAttentionEmail,
+  type OompaAttentionEmailBody,
+  type OompaAttentionEmailFetch,
+  type OompaAttentionEmailItem,
 } from "./attentionEmail";
 import {
-  hraAttentionResendApiKeyEnvironmentName,
-  hraResendApiKeyEnvironmentName,
+  oompaAttentionResendApiKeyEnvironmentName,
+  oompaResendApiKeyEnvironmentName,
   isStrictResendApiKey,
-  requireHraAttentionResendApiKey,
+  requireOompaAttentionResendApiKey,
 } from "./resendApiKey";
 
 const recipient = "reader@example.com" as CanonicalAuthEmail;
 const apiKey = "re_fixture_key";
 const authApiKey = "re_auth_test";
 const emailEnvironment = {
-  [hraAttentionResendApiKeyEnvironmentName]: apiKey,
-  [hraResendApiKeyEnvironmentName]: authApiKey,
+  [oompaAttentionResendApiKeyEnvironmentName]: apiKey,
+  [oompaResendApiKeyEnvironmentName]: authApiKey,
 };
 const idempotencyKey = "attention/018bcfe5-6800-7000-8000-000000000001";
 const sessionPublicId = "session_0123456789abcdef";
@@ -49,7 +51,7 @@ const interactionKinds: readonly InteractionKind[] = [
   "mcp_elicitation",
 ];
 
-const items = interactionKinds.map((interactionKind, index): HraAttentionEmailItem => ({
+const items = interactionKinds.map((interactionKind, index): OompaAttentionEmailItem => ({
   interactionKind,
   sessionPublicId: `${sessionPublicId}_${String(index)}`,
 }));
@@ -60,27 +62,27 @@ const errorBody = (statusCode: number, name: string): Readonly<{
   statusCode: number;
 }> => ({ message: "The provider refused the request.", name, statusCode });
 
-describe("HRA attention email body and payload", () => {
+describe("Oompa attention email body and payload", () => {
   test("freezes a versioned metadata-only body and pins its delivery payload", () => {
-    const body = buildHraAttentionEmailBody(items);
-    const payload = buildHraAttentionEmailPayload({ body, recipient });
+    const body = buildOompaAttentionEmailBody(items);
+    const payload = buildOompaAttentionEmailPayload({ body, recipient });
     expect(Object.isFrozen(body)).toBe(true);
     expect(body).toEqual({
       text: [
-        "HRA needs your attention",
+        "Oompa needs your attention",
         "",
-        "Open HRA to review:",
-        `- Command approval: https://app.hra.sh/#/session/${sessionPublicId}_0`,
-        `- File change approval: https://app.hra.sh/#/session/${sessionPublicId}_1`,
-        `- Permission approval: https://app.hra.sh/#/session/${sessionPublicId}_2`,
-        `- User input: https://app.hra.sh/#/session/${sessionPublicId}_3`,
-        `- MCP elicitation: https://app.hra.sh/#/session/${sessionPublicId}_4`,
+        "Open Oompa to review:",
+        `- Command approval: https://app.oompa.dev/#/session/${sessionPublicId}_0`,
+        `- File change approval: https://app.oompa.dev/#/session/${sessionPublicId}_1`,
+        `- Permission approval: https://app.oompa.dev/#/session/${sessionPublicId}_2`,
+        `- User input: https://app.oompa.dev/#/session/${sessionPublicId}_3`,
+        `- MCP elicitation: https://app.oompa.dev/#/session/${sessionPublicId}_4`,
       ].join("\n"),
-      version: hraAttentionEmailBodyVersion,
+      version: oompaAttentionEmailBodyVersion,
     });
     expect(payload).toEqual({
-      from: hraAttentionEmailFrom,
-      subject: hraAttentionEmailSubject,
+      from: oompaAttentionEmailFrom,
+      subject: oompaAttentionEmailSubject,
       text: body.text,
       to: [recipient],
     });
@@ -88,7 +90,7 @@ describe("HRA attention email body and payload", () => {
     expect("reply_to" in payload).toBe(false);
     expect("html" in payload).toBe(false);
     expect(new TextEncoder().encode(payload.text).byteLength)
-      .toBeLessThanOrEqual(hraAttentionEmailMaximumBodyBytes);
+      .toBeLessThanOrEqual(oompaAttentionEmailMaximumBodyBytes);
   });
 
   test("rejects non-opaque destinations, extra content fields, and invalid recipients", () => {
@@ -99,35 +101,35 @@ describe("HRA attention email body and payload", () => {
       "session_0123456789abcdef?next=attacker",
       "session_0123456789abcdef%2fattacker",
     ]) {
-      expect(() => buildHraAttentionEmailBody([
+      expect(() => buildOompaAttentionEmailBody([
         { interactionKind: "user_input", sessionPublicId: invalid },
       ])).toThrow("Attention email delivery is unavailable.");
     }
 
-    expect(() => buildHraAttentionEmailBody([{
+    expect(() => buildOompaAttentionEmailBody([{
         interactionKind: "user_input",
         prompt: "not allowed",
         sessionPublicId,
-      } as HraAttentionEmailItem]))
+      } as OompaAttentionEmailItem]))
       .toThrow("Attention email delivery is unavailable.");
-    expect(() => buildHraAttentionEmailPayload({
-      body: buildHraAttentionEmailBody([{ interactionKind: "user_input", sessionPublicId }]),
+    expect(() => buildOompaAttentionEmailPayload({
+      body: buildOompaAttentionEmailBody([{ interactionKind: "user_input", sessionPublicId }]),
       recipient: "Reader@example.com" as CanonicalAuthEmail,
     })).toThrow("Attention email delivery is unavailable.");
   });
 
   test("requires one through eight items", () => {
-    expect(() => buildHraAttentionEmailBody([]))
+    expect(() => buildOompaAttentionEmailBody([]))
       .toThrow("Attention email delivery is unavailable.");
-    expect(() => buildHraAttentionEmailBody(
-      Array.from({ length: hraAttentionEmailMaximumItems + 1 }, () => ({
+    expect(() => buildOompaAttentionEmailBody(
+      Array.from({ length: oompaAttentionEmailMaximumItems + 1 }, () => ({
         interactionKind: "user_input" as const,
         sessionPublicId,
       })),
     )).toThrow("Attention email delivery is unavailable.");
   });
 
-  test("strictly restores a literal stored v1 body without rebuilding it", () => {
+  test("strictly restores a literal stored v1 body with its HRA-era sender", () => {
     const stored = {
       text: [
         "HRA needs your attention",
@@ -137,23 +139,57 @@ describe("HRA attention email body and payload", () => {
       ].join("\n"),
       version: 1 as const,
     };
-    const restored = parseHraAttentionEmailBody(JSON.parse(JSON.stringify(stored)));
+    const restored = parseOompaAttentionEmailBody(JSON.parse(JSON.stringify(stored)));
+    expect(restored).toEqual(stored);
+    expect(Object.isFrozen(restored)).toBe(true);
+    expect(buildOompaAttentionEmailBody([{ interactionKind: "user_input", sessionPublicId }], 1))
+      .toEqual(stored);
+    expect(buildOompaAttentionEmailPayload({ body: stored, recipient })).toEqual({
+      from: attentionEmailFromV1,
+      subject: attentionEmailSubjectV1,
+      text: stored.text,
+      to: [recipient],
+    });
+
+    for (const invalid of [
+      { ...stored, extra: true },
+      { ...stored, version: 2 },
+      { ...stored, version: 3 },
+      { ...stored, text: `${stored.text}\n` },
+      { ...stored, text: stored.text.replace("app.hra.sh", "app.oompa.dev") },
+      { ...stored, text: stored.text.replace("app.hra.sh", "attacker.example") },
+      { ...stored, text: stored.text.replace(sessionPublicId, "short") },
+    ]) expect(parseOompaAttentionEmailBody(invalid)).toBeNull();
+  });
+
+  test("strictly restores a literal stored v2 body without rebuilding it", () => {
+    const stored = {
+      text: [
+        "Oompa needs your attention",
+        "",
+        "Open Oompa to review:",
+        `- User input: https://app.oompa.dev/#/session/${sessionPublicId}`,
+      ].join("\n"),
+      version: 2 as const,
+    };
+    const restored = parseOompaAttentionEmailBody(JSON.parse(JSON.stringify(stored)));
     expect(restored).toEqual(stored);
     expect(Object.isFrozen(restored)).toBe(true);
 
     for (const invalid of [
       { ...stored, extra: true },
-      { ...stored, version: 2 },
+      { ...stored, version: 1 },
       { ...stored, text: `${stored.text}\n` },
-      { ...stored, text: stored.text.replace("app.hra.sh", "attacker.example") },
+      { ...stored, text: stored.text.replace("app.oompa.dev", "app.hra.sh") },
+      { ...stored, text: stored.text.replace("app.oompa.dev", "attacker.example") },
       { ...stored, text: stored.text.replace(sessionPublicId, "short") },
-    ]) expect(parseHraAttentionEmailBody(invalid)).toBeNull();
+    ]) expect(parseOompaAttentionEmailBody(invalid)).toBeNull();
   });
 });
 
-describe("HRA attention email response classification", () => {
+describe("Oompa attention email response classification", () => {
   test("accepts only an exact 2xx body with one bounded opaque provider id", () => {
-    expect(classifyHraAttentionEmailResponse({
+    expect(classifyOompaAttentionEmailResponse({
       body: { id: providerMessageId },
       status: 201,
     })).toEqual({ kind: "accepted", providerMessageId });
@@ -165,24 +201,24 @@ describe("HRA attention email response classification", () => {
       { id: "x".repeat(257) },
       { id: providerMessageId, extra: true },
     ]) {
-      expect(classifyHraAttentionEmailResponse({ body, status: 200 }))
+      expect(classifyOompaAttentionEmailResponse({ body, status: 200 }))
         .toEqual({ kind: "retryable", reason: "malformed_success" });
     }
   });
 
   test("keeps network-shaped HTTP outcomes retryable", () => {
     for (const status of [408, 429, 500, 503, 599]) {
-      expect(classifyHraAttentionEmailResponse({ body: null, status }))
+      expect(classifyOompaAttentionEmailResponse({ body: null, status }))
         .toEqual({ kind: "retryable", reason: "transient_http" });
     }
-    expect(classifyHraAttentionEmailResponse({
+    expect(classifyOompaAttentionEmailResponse({
       body: errorBody(409, "concurrent_idempotent_requests"),
       status: 409,
     })).toEqual({ kind: "retryable", reason: "concurrent_idempotency" });
   });
 
   test("marks an exact changed-body idempotency conflict ambiguous and safety-faulted", () => {
-    expect(classifyHraAttentionEmailResponse({
+    expect(classifyOompaAttentionEmailResponse({
       body: errorBody(409, "invalid_idempotent_request"),
       status: 409,
     })).toEqual({
@@ -211,7 +247,7 @@ describe("HRA attention email response classification", () => {
       [422, "missing_required_field"],
     ] as const;
     for (const [status, name] of pairs) {
-      expect(classifyHraAttentionEmailResponse({ body: errorBody(status, name), status }))
+      expect(classifyOompaAttentionEmailResponse({ body: errorBody(status, name), status }))
         .toEqual({ kind: "refused", providerErrorType: name, status });
     }
   });
@@ -231,7 +267,7 @@ describe("HRA attention email response classification", () => {
       [errorBody(422, "missing_required_parameter"), 422],
       [null, 302],
     ] as const) {
-      expect(classifyHraAttentionEmailResponse({ body, status }))
+      expect(classifyOompaAttentionEmailResponse({ body, status }))
         .toEqual({ kind: "retryable", reason: "unknown_or_incoherent_response" });
     }
 
@@ -243,7 +279,7 @@ describe("HRA attention email response classification", () => {
         return providerMessageId;
       },
     });
-    expect(classifyHraAttentionEmailResponse({ body: accessor, status: 200 }))
+    expect(classifyOompaAttentionEmailResponse({ body: accessor, status: 200 }))
       .toEqual({ kind: "retryable", reason: "malformed_success" });
     expect(reads).toBe(0);
   });
@@ -253,7 +289,7 @@ describe("HRA attention email response classification", () => {
       fc.jsonValue(),
       fc.integer({ max: 700, min: 0 }),
       (body, status) => {
-        const result = classifyHraAttentionEmailResponse({ body, status });
+        const result = classifyOompaAttentionEmailResponse({ body, status });
         expect(["accepted", "ambiguous", "refused", "retryable"])
           .toContain(result.kind);
       },
@@ -261,11 +297,11 @@ describe("HRA attention email response classification", () => {
   });
 });
 
-describe("HRA attention email transport", () => {
+describe("Oompa attention email transport", () => {
   test("uses the pinned endpoint, immutable payload, and exact idempotency key", async () => {
     let observedResource: string | undefined;
     let observedInit: RequestInit | undefined;
-    const fetch: HraAttentionEmailFetch = async (resource, init) => {
+    const fetch: OompaAttentionEmailFetch = async (resource, init) => {
       observedResource = resource;
       observedInit = init;
       return new Response(JSON.stringify({ id: providerMessageId }), {
@@ -274,8 +310,8 @@ describe("HRA attention email transport", () => {
       });
     };
 
-    await expect(sendHraAttentionEmail({
-      body: buildHraAttentionEmailBody([{ interactionKind: "user_input", sessionPublicId }]),
+    await expect(sendOompaAttentionEmail({
+      body: buildOompaAttentionEmailBody([{ interactionKind: "user_input", sessionPublicId }]),
       idempotencyKey,
       recipient,
     }, {
@@ -283,7 +319,7 @@ describe("HRA attention email transport", () => {
       fetch,
     })).resolves.toEqual({ kind: "accepted", providerMessageId });
 
-    expect(observedResource).toBe(hraAttentionEmailEndpoint);
+    expect(observedResource).toBe(oompaAttentionEmailEndpoint);
     expect(observedInit?.method).toBe("POST");
     expect(observedInit?.redirect).toBe("error");
     expect(observedInit?.headers).toEqual({
@@ -291,21 +327,21 @@ describe("HRA attention email transport", () => {
       Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
       "Idempotency-Key": idempotencyKey,
-      "User-Agent": hraAttentionEmailUserAgent,
+      "User-Agent": oompaAttentionEmailUserAgent,
     });
     expect((observedInit?.signal as AbortSignal | undefined)?.aborted).toBe(false);
     const body = JSON.parse(observedInit?.body as string) as Record<string, unknown>;
     expect(Object.keys(body).sort()).toEqual(["from", "subject", "text", "to"]);
-    expect(body.from).toBe(hraAttentionEmailFrom);
-    expect(body.subject).toBe(hraAttentionEmailSubject);
+    expect(body.from).toBe(oompaAttentionEmailFrom);
+    expect(body.subject).toBe(oompaAttentionEmailSubject);
     expect(body).not.toHaveProperty("reply_to");
   });
 
   test("sends a restored v1 body byte-identically across same-key retries", async () => {
-    const storedJson = JSON.stringify(buildHraAttentionEmailBody([
+    const storedJson = JSON.stringify(buildOompaAttentionEmailBody([
       { interactionKind: "permission_approval", sessionPublicId },
     ]));
-    const body: HraAttentionEmailBody | null = parseHraAttentionEmailBody(
+    const body: OompaAttentionEmailBody | null = parseOompaAttentionEmailBody(
       JSON.parse(storedJson),
     );
     if (body === null) throw new Error("invalid stored-body fixture");
@@ -313,7 +349,7 @@ describe("HRA attention email transport", () => {
     const requestBodies: string[] = [];
     const requestKeys: string[] = [];
     let attempt = 0;
-    const fetch: HraAttentionEmailFetch = async (_resource, init) => {
+    const fetch: OompaAttentionEmailFetch = async (_resource, init) => {
       requestBodies.push(init.body as string);
       requestKeys.push((init.headers as Record<string, string>)["Idempotency-Key"] ?? "");
       attempt += 1;
@@ -333,9 +369,9 @@ describe("HRA attention email transport", () => {
       fetch,
     };
 
-    await expect(sendHraAttentionEmail(input, options))
+    await expect(sendOompaAttentionEmail(input, options))
       .resolves.toEqual({ kind: "retryable", reason: "concurrent_idempotency" });
-    await expect(sendHraAttentionEmail(input, options))
+    await expect(sendOompaAttentionEmail(input, options))
       .resolves.toEqual({ kind: "accepted", providerMessageId });
     expect(requestBodies).toHaveLength(2);
     expect(requestBodies[1]).toBe(requestBodies[0]);
@@ -345,7 +381,7 @@ describe("HRA attention email transport", () => {
 
   test("keeps network failure and malformed or oversized success retryable", async () => {
     const common = {
-      body: buildHraAttentionEmailBody([{
+      body: buildOompaAttentionEmailBody([{
         interactionKind: "user_input" as const,
         sessionPublicId,
       }]),
@@ -353,15 +389,15 @@ describe("HRA attention email transport", () => {
       recipient,
     };
     const environment = emailEnvironment;
-    await expect(sendHraAttentionEmail(common, {
+    await expect(sendOompaAttentionEmail(common, {
       environment,
       fetch: async () => { throw new Error("network detail must not escape"); },
     })).resolves.toEqual({ kind: "retryable", reason: "network" });
-    await expect(sendHraAttentionEmail(common, {
+    await expect(sendOompaAttentionEmail(common, {
       environment,
       fetch: async () => new Response("not json", { headers: jsonHeaders, status: 200 }),
     })).resolves.toEqual({ kind: "retryable", reason: "malformed_success" });
-    await expect(sendHraAttentionEmail(common, {
+    await expect(sendOompaAttentionEmail(common, {
       environment,
       fetch: async () => new Response(JSON.stringify({ id: "x".repeat(5_000) }), {
         headers: jsonHeaders,
@@ -374,8 +410,8 @@ describe("HRA attention email transport", () => {
     jest.useFakeTimers();
     let observedSignal: AbortSignal | undefined;
     try {
-      const pending = sendHraAttentionEmail({
-        body: buildHraAttentionEmailBody([{ interactionKind: "user_input", sessionPublicId }]),
+      const pending = sendOompaAttentionEmail({
+        body: buildOompaAttentionEmailBody([{ interactionKind: "user_input", sessionPublicId }]),
         idempotencyKey,
         recipient,
       }, {
@@ -386,7 +422,7 @@ describe("HRA attention email transport", () => {
         },
       });
       await Promise.resolve();
-      jest.advanceTimersByTime(hraAttentionEmailDeliveryTimeoutMs);
+      jest.advanceTimersByTime(oompaAttentionEmailDeliveryTimeoutMs);
       await expect(pending).resolves.toEqual({ kind: "retryable", reason: "timeout" });
       expect(observedSignal?.aborted).toBe(true);
     } finally {
@@ -395,7 +431,7 @@ describe("HRA attention email transport", () => {
   });
 
   test("requires a strict dedicated key and refuses auth fallback or equality before fetch", async () => {
-    expect(requireHraAttentionResendApiKey(emailEnvironment)).toBe(apiKey);
+    expect(requireOompaAttentionResendApiKey(emailEnvironment)).toBe(apiKey);
     let calls = 0;
     for (const invalid of [
       undefined,
@@ -411,15 +447,15 @@ describe("HRA attention email transport", () => {
       authApiKey,
     ]) {
       const environment = {
-        [hraAttentionResendApiKeyEnvironmentName]: invalid,
-        [hraResendApiKeyEnvironmentName]: authApiKey,
+        [oompaAttentionResendApiKeyEnvironmentName]: invalid,
+        [oompaResendApiKeyEnvironmentName]: authApiKey,
       };
-      expect(() => requireHraAttentionResendApiKey(environment))
+      expect(() => requireOompaAttentionResendApiKey(environment))
         .toThrow("Attention email delivery is unavailable.");
-      expect(() => createHraAttentionEmailSender({ environment }))
+      expect(() => createOompaAttentionEmailSender({ environment }))
         .toThrow("Attention email delivery is unavailable.");
-      await expect(sendHraAttentionEmail({
-        body: buildHraAttentionEmailBody([{ interactionKind: "user_input", sessionPublicId }]),
+      await expect(sendOompaAttentionEmail({
+        body: buildOompaAttentionEmailBody([{ interactionKind: "user_input", sessionPublicId }]),
         idempotencyKey,
         recipient,
       }, {
@@ -432,8 +468,8 @@ describe("HRA attention email transport", () => {
     }
     expect(calls).toBe(0);
 
-    await expect(sendHraAttentionEmail({
-      body: buildHraAttentionEmailBody([{ interactionKind: "user_input", sessionPublicId }]),
+    await expect(sendOompaAttentionEmail({
+      body: buildOompaAttentionEmailBody([{ interactionKind: "user_input", sessionPublicId }]),
       idempotencyKey: "bad key",
       recipient,
     }, {
@@ -449,7 +485,7 @@ describe("HRA attention email transport", () => {
   test("keeps a prepared sender bound to its validated credential snapshot", async () => {
     const environment = { ...emailEnvironment };
     const authorizations: (string | null)[] = [];
-    const sender = createHraAttentionEmailSender({
+    const sender = createOompaAttentionEmailSender({
       environment,
       fetch: async (_resource, init) => {
         authorizations.push(new Headers(init.headers).get("Authorization"));
@@ -459,9 +495,9 @@ describe("HRA attention email transport", () => {
         });
       },
     });
-    environment[hraAttentionResendApiKeyEnvironmentName] = authApiKey;
+    environment[oompaAttentionResendApiKeyEnvironmentName] = authApiKey;
     await expect(sender({
-      body: buildHraAttentionEmailBody([{ interactionKind: "user_input", sessionPublicId }]),
+      body: buildOompaAttentionEmailBody([{ interactionKind: "user_input", sessionPublicId }]),
       idempotencyKey,
       recipient,
     })).resolves.toEqual({ kind: "accepted", providerMessageId });
@@ -477,27 +513,27 @@ describe("HRA attention email transport", () => {
         && value !== authApiKey;
       expect(isStrictResendApiKey(value)).toBe(valid || value === authApiKey);
       const environment = {
-        [hraAttentionResendApiKeyEnvironmentName]: value,
-        [hraResendApiKeyEnvironmentName]: authApiKey,
+        [oompaAttentionResendApiKeyEnvironmentName]: value,
+        [oompaResendApiKeyEnvironmentName]: authApiKey,
       };
-      if (valid) expect(requireHraAttentionResendApiKey(environment)).toBe(value);
-      else expect(() => requireHraAttentionResendApiKey(environment))
+      if (valid) expect(requireOompaAttentionResendApiKey(environment)).toBe(value);
+      else expect(() => requireOompaAttentionResendApiKey(environment))
         .toThrow("Attention email delivery is unavailable.");
     }));
     for (const length of [8, 512]) {
       const value = `re_${"a".repeat(length - 3)}`;
-      expect(requireHraAttentionResendApiKey({
-        [hraAttentionResendApiKeyEnvironmentName]: value,
-        [hraResendApiKeyEnvironmentName]: authApiKey,
+      expect(requireOompaAttentionResendApiKey({
+        [oompaAttentionResendApiKeyEnvironmentName]: value,
+        [oompaResendApiKeyEnvironmentName]: authApiKey,
       })).toBe(value);
     }
   });
 
   test("requires a valid authentication counterpart without falling back to it", () => {
     for (const invalid of [undefined, "re_x", "re_bad'quote", "re_has space", apiKey]) {
-      expect(() => requireHraAttentionResendApiKey({
-        [hraAttentionResendApiKeyEnvironmentName]: apiKey,
-        [hraResendApiKeyEnvironmentName]: invalid,
+      expect(() => requireOompaAttentionResendApiKey({
+        [oompaAttentionResendApiKeyEnvironmentName]: apiKey,
+        [oompaResendApiKeyEnvironmentName]: invalid,
       })).toThrow("Attention email delivery is unavailable.");
     }
   });

@@ -4,6 +4,7 @@ import {
   interactionRecordSchema,
   protectedInteractionDetailDocumentSchema,
   mcpFormFieldSchema,
+  legacyProviderInteractionAuthoritySchema,
   providerInteractionAuthoritySchema,
   providerRequestIdSchema,
   publicInteractionSchema,
@@ -12,8 +13,37 @@ import { projectPublicProviderIdentifier } from "../public-provider-identifier";
 import { createProfileId, createSessionId } from "./values";
 
 const providerIdentifierKey = Buffer.alloc(32, 0x41);
+const codexProviderAuthority = {
+  provider: "codex" as const,
+  providerAccountId: "acct_00000000000000000000000000000000",
+  bindingGeneration: 1,
+};
 
 describe("provider interactions", () => {
+  test("Devin live and legacy interactions require their own exact opaque account identity", () => {
+    const authority = {
+      provider: "devin" as const,
+      providerAccountId: `dact_${"3".repeat(32)}`,
+      bindingGeneration: 2,
+      profileId: createProfileId(),
+      processGeneration: 4,
+      connectionId: crypto.randomUUID(),
+      requestId: { type: "string" as const, value: "devin-1" },
+      method: "session/request_permission",
+      requestDigest: "a".repeat(64),
+      threadId: "devin-thread-1",
+      turnId: null,
+      itemId: null,
+      approvalId: null,
+    };
+    for (const schema of [providerInteractionAuthoritySchema, legacyProviderInteractionAuthoritySchema]) {
+      expect(schema.parse(authority)).toEqual(authority);
+      for (const prefix of ["acct", "pact"]) {
+        expect(schema.safeParse({ ...authority, providerAccountId: `${prefix}_${"3".repeat(32)}` }).success).toBe(false);
+      }
+    }
+  });
+
   test("binds complete protected authority to one live public revision and kind", () => {
     const document = {
       type: "hra_protected_interaction_detail" as const,
@@ -58,6 +88,7 @@ describe("provider interactions", () => {
 
   test("allows nullable MCP context while keeping method, digest, connection, and generation exact", () => {
     const authority = providerInteractionAuthoritySchema.parse({
+      ...codexProviderAuthority,
       profileId: createProfileId(),
       processGeneration: 4,
       connectionId: crypto.randomUUID(),
@@ -72,12 +103,34 @@ describe("provider interactions", () => {
     expect(authority.turnId).toBeNull();
   });
 
+  test("keeps providerless interaction authority at the decode-only legacy boundary", () => {
+    const providerless = {
+      profileId: createProfileId(),
+      processGeneration: 4,
+      connectionId: crypto.randomUUID(),
+      requestId: { type: "string" as const, value: "legacy-1" },
+      method: "item/tool/requestUserInput",
+      requestDigest: "d".repeat(64),
+      threadId: "thread-1",
+      turnId: "turn-1",
+      itemId: "item-1",
+      approvalId: null,
+    };
+    expect(legacyProviderInteractionAuthoritySchema.parse(providerless)).toEqual(providerless);
+    expect(() => providerInteractionAuthoritySchema.parse(providerless)).toThrow();
+    expect(() => legacyProviderInteractionAuthoritySchema.parse({
+      ...providerless,
+      provider: "codex",
+    })).toThrow();
+  });
+
   test("durable records contain sanitized display and response digest, not response secrets", () => {
     const value = {
       version: 1 as const,
       publicId: crypto.randomUUID(),
       sessionId: createSessionId(),
       authority: {
+        ...codexProviderAuthority,
         profileId: createProfileId(),
         processGeneration: 1,
         connectionId: crypto.randomUUID(),

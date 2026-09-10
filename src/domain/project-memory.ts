@@ -11,7 +11,7 @@ import { z } from "zod";
 
 import { projectIdSchema, type ProjectId } from "./values";
 
-export { HRA_CANONICAL_MEMORY_OPERATION_MAX_BYTES } from "./canonical-memory-sync";
+export { OOMPA_CANONICAL_MEMORY_OPERATION_MAX_BYTES } from "./canonical-memory-sync";
 
 export const PROJECT_MEMORY_DESTINATION_PURPOSE = "hra.project.canonical";
 export const projectMemoryIdentityContractSchema = z.union([

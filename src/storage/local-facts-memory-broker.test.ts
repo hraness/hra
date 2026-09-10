@@ -100,7 +100,7 @@ afterEach(async () => {
 });
 
 const fixture = async () => {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-local-memory-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-local-memory-")));
   roots.push(root);
   await ensurePrivateDirectory(root);
   const engine = new FakeLocalOhEngine();
@@ -176,7 +176,7 @@ describe("local Oh facts-memory custody", () => {
 
   test("rejects target and root symlinks instead of following them", async () => {
     const { broker, root } = await fixture();
-    const outside = await realpath(await mkdtemp(join(tmpdir(), "hra-memory-outside-")));
+    const outside = await realpath(await mkdtemp(join(tmpdir(), "oompa-memory-outside-")));
     roots.push(outside);
     await symlink(outside, join(root, sessionId));
     const binding = createFactsMemoryBinding({ ownerId, sessionId });

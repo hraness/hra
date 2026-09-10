@@ -47,7 +47,7 @@ const changeHex = (value: string): string =>
   `${value[0] === "0" ? "1" : "0"}${value.slice(1)}`;
 
 const makeRoot = async (): Promise<string> => {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-bounded-process-test-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-bounded-process-test-")));
   await chmod(root, 0o700);
   roots.push(root);
   return root;

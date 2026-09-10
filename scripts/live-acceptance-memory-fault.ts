@@ -18,7 +18,7 @@ import {
   projectMemoryHeadRefSchema,
   type ProjectMemoryHeadRef,
 } from "../src/storage/state-store";
-import { HRA_VERSION } from "../src/version";
+import { OOMPA_VERSION } from "../src/version";
 import {
   liveAcceptanceCandidateSchema,
   type LiveAcceptanceCandidate,
@@ -327,7 +327,7 @@ export class LiveAcceptanceMemoryFaultController {
     if (
       candidate !== null
       && (
-        candidate.packageVersion !== HRA_VERSION
+        candidate.packageVersion !== OOMPA_VERSION
         || cloudTargetDigest === null
         || candidate.cloudTargetDigest !== cloudTargetDigest
       )

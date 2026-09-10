@@ -54,7 +54,7 @@ import {
 
 type Args = Readonly<Record<string, Value>>;
 type CommandType = "device" | "session";
-const hmacEnvironmentName = "HRA_AUTH_HMAC_SECRET";
+const hmacEnvironmentName = "OOMPA_AUTH_HMAC_SECRET";
 const priorHmacSecret = process.env[hmacEnvironmentName];
 
 beforeAll(() => {
@@ -62,7 +62,7 @@ beforeAll(() => {
 });
 
 afterAll(() => {
-  if (priorHmacSecret === undefined) delete process.env.HRA_AUTH_HMAC_SECRET;
+  if (priorHmacSecret === undefined) delete process.env.OOMPA_AUTH_HMAC_SECRET;
   else process.env[hmacEnvironmentName] = priorHmacSecret;
 });
 type AuditResult = Readonly<{
@@ -1003,7 +1003,7 @@ describe("command lifecycle physical quota reservations", () => {
     })).toMatchObject({ ready: 1, scanned: 1 });
   });
 
-  test("requires exact HRA identity topology before certifying or backfilling capacity", async () => {
+  test("requires exact Oompa identity topology before certifying or backfilling capacity", async () => {
     const corruptions = [
       "missing_account",
       "noncanonical_user_email",

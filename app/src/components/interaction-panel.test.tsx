@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import type { CompactRemoteInteractionQuestion } from "../hra/cloud";
+import type { CompactRemoteInteractionQuestion } from "../oompa/cloud";
 import {
   buildInteractionAnswers,
   interactionAnswersAreComplete,

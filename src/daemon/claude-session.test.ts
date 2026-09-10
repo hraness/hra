@@ -9,7 +9,12 @@ import {
   type ClaudeProcessIdentity,
   type PinnedClaudeRuntime,
 } from "../claude/index";
-import { CLAUDE_PIN, CLAUDE_PIN_EFFORT, CLAUDE_PIN_MODEL } from "../claude/pin";
+import {
+  CLAUDE_PIN,
+  CLAUDE_PIN_EFFORT,
+  CLAUDE_PIN_MODEL,
+  CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY,
+} from "../claude/pin";
 import { LiveBatcher } from "../cloud/live-uploader";
 import type { SessionEvent } from "../domain/session-events";
 import { initializeStatePaths, resolveStatePaths } from "../storage/paths";
@@ -23,9 +28,10 @@ import {
   type CodexRuntimePort,
   type CompactProjectionRecoveryBlocker,
 } from "./ports";
-import { HraService } from "./service";
+import { OompaService } from "./service";
 
 const signal = new AbortController().signal;
+const PROVIDER_USAGE_PERSISTENCE_QUEUE_LIMIT = 1_024;
 
 /**
  * The exact `system/init`, `assistant`, `control_request`, `rate_limit_event`,
@@ -110,61 +116,98 @@ const subagentStartedLine = {
   type: "system",
 };
 
+const rateLimitLine = (uuid: string, utilization = 0.5) => ({
+  rate_limit_info: {
+    isUsingOverage: false,
+    overageDisabledReason: "org_level_disabled",
+    overageStatus: "rejected",
+    rateLimitType: "five_hour",
+    resetsAt: 1_788_499_800,
+    status: "allowed",
+    unifiedWindows: {
+      five_hour: { resetsAt: 1_788_499_800, utilization },
+    },
+  },
+  session_id: FIXTURE_SESSION_ID,
+  type: "rate_limit_event",
+  uuid,
+});
+
 const resultLine = (resultText: string) => ({
   duration_ms: 2_374,
   is_error: false,
+  modelUsage: {
+    [CLAUDE_PIN_MODEL]: {
+      cacheCreationInputTokens: 0,
+      cacheReadInputTokens: 10_123,
+      canonicalModel: CLAUDE_PIN_MODEL,
+      contextWindow: 1_000_000,
+      costUSD: 0.2,
+      inputTokens: 2,
+      maxOutputTokens: 64_000,
+      outputTokens: 4,
+      thinkingTokens: 0,
+    },
+  },
   num_turns: 1,
   result: resultText,
   session_id: FIXTURE_SESSION_ID,
   stop_reason: "end_turn",
   subtype: "success",
   terminal_reason: "completed",
+  total_cost_usd: 0.2,
   type: "result",
   usage: {
     cache_read_input_tokens: 10_123,
     input_tokens: 2,
     output_tokens: 4,
   },
+  uuid: "48c87f50-1645-4f71-a091-4949d337eb87",
 });
 
 const pinnedRuntime: PinnedClaudeRuntime = {
-  argv: ["/opt/hra/bin/claude", "--print"],
+  argv: ["/opt/oompa/bin/claude", "--print"],
   effort: CLAUDE_PIN_EFFORT,
-  executablePath: "/opt/hra/bin/claude",
+  executablePath: "/opt/oompa/bin/claude",
   model: CLAUDE_PIN_MODEL,
+  nativeFallback: CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY,
   version: CLAUDE_PIN,
 };
 
 class FakeClaudeProcess implements ClaudeProcess {
-  readonly identity: Promise<ClaudeProcessIdentity> = Promise.resolve(Object.freeze({
-    pid: 8_123,
-    pidDomain: "darwin",
-    procStart: "Fri Sep  4 12:00:00 2026",
-  }));
+  readonly identity: Promise<ClaudeProcessIdentity>;
   readonly written: string[] = [];
   readonly exited: Promise<number>;
   readonly stdout: AsyncIterable<Uint8Array>;
   readonly stderr: AsyncIterable<Uint8Array> = {
     async *[Symbol.asyncIterator]() { /* silent */ },
   };
+  beforeWriteReturn: ((line: string) => Promise<void> | void) | undefined;
+  afterStdoutChunkRead: (() => void) | undefined;
   terminated = false;
   onTerminate: (() => void) | undefined;
   #push: ((chunk: Uint8Array) => void) | undefined;
   #finish: (() => void) | undefined;
   #resolveExit: ((code: number) => void) | undefined;
 
-  constructor() {
+  constructor(readonly providerThreadId: string, pid: number) {
+    this.identity = Promise.resolve(Object.freeze({
+      pid,
+      pidDomain: "darwin",
+      procStart: "Fri Sep  4 12:00:00 2026",
+    }));
     this.exited = new Promise((resolve) => { this.#resolveExit = resolve; });
     const queue: Uint8Array[] = [];
     let waiter: (() => void) | undefined;
     let done = false;
     this.#push = (chunk) => { queue.push(chunk); waiter?.(); waiter = undefined; };
     this.#finish = () => { done = true; waiter?.(); waiter = undefined; };
+    const chunkRead = (): void => { this.afterStdoutChunkRead?.(); };
     this.stdout = {
       async *[Symbol.asyncIterator]() {
         for (;;) {
           const chunk = queue.shift();
-          if (chunk !== undefined) { yield chunk; continue; }
+          if (chunk !== undefined) { yield chunk; chunkRead(); continue; }
           if (done) return;
           await new Promise<void>((resolve) => { waiter = resolve; });
         }
@@ -172,14 +215,19 @@ class FakeClaudeProcess implements ClaudeProcess {
     };
   }
 
-  emit(...lines: readonly unknown[]): void {
+  emit(...lines: readonly Readonly<Record<string, unknown>>[]): void {
     this.#push?.(new TextEncoder().encode(
-      lines.map((line) => `${JSON.stringify(line)}\n`).join(""),
+      // Captured wire templates use one redacted session ID. Render that
+      // placeholder for this exact launched process, never another live thread.
+      lines.map((line) => `${JSON.stringify(line.session_id === FIXTURE_SESSION_ID
+        ? { ...line, session_id: this.providerThreadId } : line)}\n`).join(""),
     ));
   }
 
   async write(bytes: Uint8Array): Promise<void> {
-    this.written.push(new TextDecoder().decode(bytes));
+    const line = new TextDecoder().decode(bytes);
+    this.written.push(line);
+    await this.beforeWriteReturn?.(line);
   }
 
   terminate(): void {
@@ -232,9 +280,12 @@ class SignInOnlyCodex implements CodexRuntimePort {
 }
 
 class OfflineCloud extends UnavailableCloudControl {
-  constructor() {
+  constructor(beforeProjectionRecoveryCheck?: () => Promise<void>) {
     super({
-      isCompactProjectionRecoveryUnsettled: async () => false,
+      isCompactProjectionRecoveryUnsettled: async () => {
+        await beforeProjectionRecoveryCheck?.();
+        return false;
+      },
       isCompactProjectionRecoveryUnsettledForProfile: async () => false,
       supersedeCompactProjectionRecoveryForProviderDeletion: async () => ({ superseded: false }),
       supersedeTerminalCompactProjectionRecoveries: async () => ({ superseded: 0 }),
@@ -244,7 +295,7 @@ class OfflineCloud extends UnavailableCloudControl {
 
 const stores: StateStore[] = [];
 const roots: string[] = [];
-const services: HraService[] = [];
+const services: OompaService[] = [];
 const hostToolAuthorities: ClaudeHostToolBindingAuthority[] = [];
 
 afterEach(async () => {
@@ -255,7 +306,8 @@ afterEach(async () => {
 });
 
 type ClaudeFixture = Readonly<{
-  service: HraService;
+  service: OompaService;
+  runtime: PinnedClaudeRuntimeManager;
   store: StateStore;
   cloud: CloudControlPort;
   documents: string;
@@ -265,22 +317,32 @@ type ClaudeFixture = Readonly<{
 
 async function claudeFixture(
   options: Readonly<{
+    beforeProjectionRecoveryCheck?: () => Promise<void>;
+    daemonAuthority?: ConstructorParameters<typeof OompaService>[0]["daemonAuthority"];
+    immediatelyEndProcess?: boolean;
+    now?: () => number;
+    onFactObserved?: (fact: Readonly<{ type: string }>) => void;
     claudeSignedIn?: boolean;
     resolveRuntime?: () => Promise<PinnedClaudeRuntime>;
   }> = {},
 ): Promise<ClaudeFixture> {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-claude-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-claude-")));
   roots.push(home);
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   const documents = join(home, "Documents");
   await mkdir(documents, { recursive: true });
   await initializeStatePaths(paths);
-  const store = new StateStore(paths);
+  const store = new StateStore(
+    paths,
+    options.now === undefined ? {} : { now: options.now },
+  );
   stores.push(store);
+  const daemonBootId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
+  const daemonGeneration = store.nextDaemonGeneration(daemonBootId);
   // These tests drive every approval by hand.
   store.setDefaultApprovalMode("manual");
   const processes: FakeClaudeProcess[] = [];
-  const reference: { current?: HraService } = {};
+  const reference: { current?: OompaService } = {};
   const hostToolAuthority = new ClaudeHostToolBindingAuthority();
   hostToolAuthorities.push(hostToolAuthority);
   const claude = new PinnedClaudeRuntimeManager({
@@ -289,7 +351,16 @@ async function claudeFixture(
     isCurrent: (authority) => {
       try {
         const profile = store.requireProfile(authority.id);
-        return profile.processGeneration === authority.generation && profile.state !== "removed";
+        const provider = store.requireProviderAccountAuthority(
+          authority.id,
+          authority.provider,
+        );
+        return profile.state !== "removed"
+          && provider.profileId === authority.id
+          && provider.provider === authority.provider
+          && provider.providerAccountId === authority.providerAccountId
+          && provider.bindingGeneration === authority.bindingGeneration
+          && provider.processGeneration === authority.generation;
       } catch {
         return false;
       }
@@ -297,6 +368,7 @@ async function claudeFixture(
     observer: {
       fact: async (authority, fact) => {
         await reference.current?.observeClaudeFact(authority, fact);
+        options.onFactObserved?.(fact);
       },
     },
     hostTools: {
@@ -305,11 +377,14 @@ async function claudeFixture(
       privateRoot: paths.runtime,
     },
     processFactory: (launch) => {
-      const process = new FakeClaudeProcess();
-      processes.push(process);
       const providerThreadId = launch.argv.at(-1);
       if (providerThreadId === undefined) throw new Error("Expected a session-bound Claude argv.");
-      queueMicrotask(() => { process.emit({ ...initLine, session_id: providerThreadId }); });
+      const process = new FakeClaudeProcess(providerThreadId, 8_123 + processes.length);
+      processes.push(process);
+      if (options.immediatelyEndProcess === true) process.terminate();
+      else {
+        queueMicrotask(() => { process.emit({ ...initLine, session_id: providerThreadId }); });
+      }
       return process;
     },
     readAuthStatus: async () => options.claudeSignedIn === false
@@ -321,21 +396,35 @@ async function claudeFixture(
           signedIn: true,
         },
     resolveRuntime: options.resolveRuntime ?? (async () => pinnedRuntime),
+    ...(options.now === undefined ? {} : { now: options.now }),
   });
-  const cloud = new OfflineCloud();
-  const service = new HraService({
+  const cloud = new OfflineCloud(options.beforeProjectionRecoveryCheck);
+  const service = new OompaService({
     claude,
+    claudeProcessLiveness: async (identity) => {
+      for (const process of processes) {
+        const actual = await process.identity;
+        if (actual.pid === identity.pid && actual.pidDomain === identity.pidDomain
+          && actual.procStart === identity.procStart) {
+          return process.terminated ? "not_live" : "live";
+        }
+      }
+      return "unknown";
+    },
     cloud,
     codex: new SignInOnlyCodex(),
-    daemonAuthority: { assertCurrent: async () => {}, close: () => {} },
+    daemonAuthority: options.daemonAuthority ?? { assertCurrent: async () => {}, close: () => {} },
+    daemonGeneration,
+    daemonBootId,
     paths,
     platform: "linux",
     requestStop: () => undefined,
     store,
+    ...(options.now === undefined ? {} : { now: options.now }),
   });
   reference.current = service;
   services.push(service);
-  return { cloud, documents, paths, processes, service, store };
+  return { cloud, documents, paths, processes, runtime: claude, service, store };
 }
 
 async function authenticatedClaudeAccount(
@@ -360,7 +449,7 @@ const settle = async (): Promise<void> => {
 
 const eventBodies = async (
   value: ClaudeFixture,
-  sessionId: `sess_${string}`,
+  sessionId: string,
 ): Promise<readonly Record<string, unknown>[]> => {
   const page = await value.service.execute(
     { kind: "session.events", limit: 200, session: sessionId, waitMs: 0 },
@@ -370,7 +459,7 @@ const eventBodies = async (
 };
 
 describe("Claude sessions on the local authority", () => {
-  test("does not rotate a profile underneath an unsettled Claude login launch", async () => {
+  test("keeps an unsettled Claude login bound while sibling Codex authority advances", async () => {
     const value = await claudeFixture({ claudeSignedIn: false });
     const account = await authenticatedClaudeAccount(value, "Claude login generation fence");
     const loginKey = crypto.randomUUID();
@@ -380,30 +469,37 @@ describe("Claude sessions on the local authority", () => {
       kind: "account.claude-login.prepare",
     }, { signal }) as { login: { attemptId: string; providerGeneration: number } };
     const before = value.store.requireProfileById(account);
+    const claudeBefore = value.store.requireProviderAccountAuthority(account, "claude");
 
     await expect(value.service.execute({
       account,
       deviceCode: true,
       idempotencyKey: crypto.randomUUID(),
       kind: "account.login",
-    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
-    expect(value.store.requireProfileById(account).processGeneration).toBe(before.processGeneration);
+    }, { signal })).resolves.toMatchObject({ account: { state: "signed_in" } });
+    expect(value.store.requireProfileById(account).processGeneration).toBe(before.processGeneration + 1);
+    expect(value.store.requireProviderAccountAuthority(account, "claude")).toEqual(claudeBefore);
     expect(value.store.readMutation(loginKey)).toMatchObject({
       id: prepared.login.attemptId,
       state: "effect_started",
     });
 
+    const codex = value.store.requireProviderAccountAuthority(account, "codex");
     await value.service.observeCodexFact({
+      bindingGeneration: codex.bindingGeneration,
       codexHome: "unused-codex-home",
       desktopUserData: "unused-desktop-home",
-      generation: before.processGeneration,
-      id: before.id,
+      generation: codex.processGeneration,
+      id: codex.profileId,
+      provider: "codex",
+      providerAccountId: codex.providerAccountId,
     }, {
       connectionId: "21000000-0000-4000-8000-000000000002",
       reason: "eof",
       type: "providerDisconnected",
     });
-    expect(value.store.requireProfileById(account).processGeneration).toBe(before.processGeneration);
+    expect(value.store.requireProfileById(account).processGeneration).toBe(before.processGeneration + 2);
+    expect(value.store.requireProviderAccountAuthority(account, "claude")).toEqual(claudeBefore);
     expect(value.store.readMutation(loginKey)).toMatchObject({ state: "effect_started" });
   });
 
@@ -422,7 +518,11 @@ describe("Claude sessions on the local authority", () => {
     await settle();
 
     const before = value.store.requireProfileById(account);
+    const claudeBefore = value.store.requireProviderAccountAuthority(account, "claude");
+    const capturedBefore = value.store.requireSessionProviderAuthority(started.session.id);
+    expect(claudeBefore.processGeneration).not.toBe(before.processGeneration);
     expect(before.state).toBe("signed_out");
+    const beforeLoginBodies = await eventBodies(value, started.session.id);
     await value.service.execute({
       account,
       deviceCode: false,
@@ -436,12 +536,16 @@ describe("Claude sessions on the local authority", () => {
       state: "signed_in",
     });
     expect(value.processes).toEqual([process]);
-    expect(process.terminated).toBe(true);
+    expect(process.terminated).toBe(false);
+    expect(value.store.requireProviderAccountAuthority(account, "claude")).toEqual(claudeBefore);
+    expect(value.store.requireSessionProviderAuthority(started.session.id)).toEqual(capturedBefore);
     const afterLoginBodies = await eventBodies(value, started.session.id);
-    expect(afterLoginBodies.some((body) =>
-      body.type === "gap" && body.reason === "provider_restart")).toBe(true);
-    expect(afterLoginBodies.some((body) =>
-      body.type === "connection" && body.state === "resubscribed")).toBe(true);
+    expect(afterLoginBodies.filter((body) =>
+      (body.type === "gap" && body.reason === "provider_restart")
+      || (body.type === "connection" && body.state === "resubscribed")))
+      .toEqual(beforeLoginBodies.filter((body) =>
+        (body.type === "gap" && body.reason === "provider_restart")
+        || (body.type === "connection" && body.state === "resubscribed")));
 
     await value.service.execute({
       idempotencyKey: crypto.randomUUID(),
@@ -454,16 +558,15 @@ describe("Claude sessions on the local authority", () => {
       kind: "session.stop",
       session: started.session.id,
     }, { signal }) as { stopped: boolean };
-    const resumedProcess = value.processes[1];
-    if (resumedProcess === undefined) throw new Error("Expected Claude to resume the session.");
     expect(stopped.stopped).toBe(true);
-    expect(resumedProcess.written.join("\n")).toContain("Keep working after the Codex login");
-    expect(resumedProcess.written.some((line) => line.includes("interrupt"))).toBe(true);
-    expect(process.terminated).toBe(true);
-    expect(resumedProcess.terminated).toBe(false);
+    expect(value.processes).toEqual([process]);
+    expect(process.written.join("\n")).toContain("Keep working after the Codex login");
+    expect(process.written.some((line) => line.includes("interrupt"))).toBe(true);
+    expect(process.terminated).toBe(false);
+    expect(value.store.requireSessionProviderAuthority(started.session.id)).toEqual(capturedBefore);
   });
 
-  test("refuses a Codex login before rotating an in-flight Claude authority", async () => {
+  test("keeps in-flight Claude authority unchanged across sibling Codex login", async () => {
     const value = await claudeFixture();
     const account = await authenticatedClaudeAccount(value, "Claude blocks Codex login");
     const started = await value.service.execute({
@@ -484,18 +587,18 @@ describe("Claude sessions on the local authority", () => {
     }, { signal });
     const before = value.store.requireProfileById(account);
 
-    const refusal = await value.service.execute({
+    const claudeBefore = value.store.requireProviderAccountAuthority(account, "claude");
+    await value.service.execute({
       account,
       deviceCode: false,
       idempotencyKey: crypto.randomUUID(),
       kind: "account.login",
-    }, { signal }).catch((error: unknown) => error);
-    expect(refusal).toBeInstanceOf(Error);
-    expect(refusal).toMatchObject({ code: "CONFLICT" });
+    }, { signal });
     expect(value.store.requireProfileById(account)).toMatchObject({
-      processGeneration: before.processGeneration,
-      state: before.state,
+      processGeneration: before.processGeneration + 1,
+      state: "signed_in",
     });
+    expect(value.store.requireProviderAccountAuthority(account, "claude")).toEqual(claudeBefore);
     expect(process.terminated).toBe(false);
     expect(await eventBodies(value, started.session.id)).not.toContainEqual(
       expect.objectContaining({ type: "gap", reason: "provider_disconnect" }),
@@ -510,15 +613,8 @@ describe("Claude sessions on the local authority", () => {
     expect(process.written.some((line) => line.includes("interrupt"))).toBe(true);
     process.emit(resultLine("Stopped cleanly"));
     await settle();
-    await expect(value.service.execute({
-      account,
-      deviceCode: false,
-      idempotencyKey: crypto.randomUUID(),
-      kind: "account.login",
-    }, { signal })).resolves.toMatchObject({
-      account: { processGeneration: before.processGeneration + 1 },
-    });
-    expect(process.terminated).toBe(true);
+    expect(value.store.requireProviderAccountAuthority(account, "claude")).toEqual(claudeBefore);
+    expect(process.terminated).toBe(false);
   });
 
   test("keeps an idle Claude session usable when the sibling Codex runtime disconnects", async () => {
@@ -535,11 +631,18 @@ describe("Claude sessions on the local authority", () => {
     if (process === undefined) throw new Error("Expected one pinned Claude process.");
     await settle();
     const before = value.store.requireProfileById(account);
+    const claudeBefore = value.store.requireProviderAccountAuthority(account, "claude");
+    const capturedBefore = value.store.requireSessionProviderAuthority(started.session.id);
+
+    const codex = value.store.requireProviderAccountAuthority(account, "codex");
     await value.service.observeCodexFact({
+      bindingGeneration: codex.bindingGeneration,
       codexHome: "unused-codex-home",
       desktopUserData: "unused-desktop-home",
-      generation: before.processGeneration,
-      id: before.id,
+      generation: codex.processGeneration,
+      id: codex.profileId,
+      provider: "codex",
+      providerAccountId: codex.providerAccountId,
     }, {
       connectionId: "21000000-0000-4000-8000-000000000001",
       reason: "eof",
@@ -547,7 +650,9 @@ describe("Claude sessions on the local authority", () => {
     });
 
     expect(value.store.requireProfileById(account).processGeneration)
-      .toBe(before.processGeneration);
+      .toBe(before.processGeneration + 1);
+    expect(value.store.requireProviderAccountAuthority(account, "claude")).toEqual(claudeBefore);
+    expect(value.store.requireSessionProviderAuthority(started.session.id)).toEqual(capturedBefore);
     expect(process.terminated).toBe(false);
     await value.service.execute({
       idempotencyKey: crypto.randomUUID(),
@@ -576,7 +681,7 @@ describe("Claude sessions on the local authority", () => {
       provider: "claude",
     }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const session = value.store.requireSession(started.session.id);
-    const profile = value.store.requireProfileById(session.profileId);
+    const providerAuthority = value.store.requireProviderAccountAuthority(session.profileId, "claude");
     if (session.providerThreadId === undefined) throw new Error("Expected a bound Claude session.");
 
     await expect(value.service.execute({
@@ -594,8 +699,11 @@ describe("Claude sessions on the local authority", () => {
       kind: "session.fast",
       session: session.id,
     }, {
-      processGeneration: profile.processGeneration,
-      profileId: profile.id,
+      bindingGeneration: providerAuthority.bindingGeneration,
+      processGeneration: providerAuthority.processGeneration,
+      profileId: providerAuthority.profileId,
+      provider: "claude",
+      providerAccountId: providerAuthority.providerAccountId,
       providerThreadId: session.providerThreadId,
       sessionId: session.id,
     }, { signal })).rejects.toMatchObject({
@@ -641,6 +749,7 @@ describe("Claude sessions on the local authority", () => {
       claudeVersion: CLAUDE_PIN,
       inputFormat: "stream-json",
       model: CLAUDE_PIN_MODEL,
+      nativeFallback: CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY,
       outputFormat: "stream-json",
       permissionMode: "default",
       preset: "fable-max",
@@ -715,8 +824,41 @@ describe("Claude sessions on the local authority", () => {
     expect(process.written.join("")).toContain("Only the first line, please");
 
     process.emit(assistantLine("HTTP/2 200", "msg_2"));
+    process.emit(rateLimitLine("bee4e95a-9a7d-4f23-a5d2-a50045b22dec"));
     process.emit(resultLine("HTTP/2 200"));
     await settle();
+    await value.service.settled();
+
+    const providerAuthority = value.store.requireProviderAccountAuthority(account, "claude");
+    const usage = value.store.latestProviderUsage(providerAuthority.providerAccountId);
+    expect(usage).toMatchObject({
+      authority: providerAuthority,
+      authorityMode: "mutation_authoritative",
+      quota: {
+        observationRevision: 1,
+        source: "claude_rate_limit_event",
+        turn: { sessionId, turnId: sent.turnId },
+        quota: {
+          format: "claude_v1",
+          status: { state: "known", value: "allowed" },
+          windows: [{
+            id: "five_hour",
+            resetsAtMs: 1_788_499_800_000,
+            scope: "account",
+            usedPercent: 50,
+          }],
+        },
+      },
+      accounting: {
+        observationRevision: 1,
+        source: "claude_result",
+        turn: { sessionId, turnId: sent.turnId },
+        accounting: {
+          format: "claude_v1",
+          totalCostUsd: 0.2,
+        },
+      },
+    });
 
     const bodies = await eventBodies(value, sessionId);
     const types = bodies.map((body) => body.type);
@@ -829,6 +971,993 @@ describe("Claude sessions on the local authority", () => {
       .toMatchObject({ state: "resolved" });
   });
 
+  test("returns the usage callback before attempting deferred persistence", async () => {
+    let observed!: () => void;
+    const callbackReturned = new Promise<void>((resolve) => { observed = resolve; });
+    const value = await claudeFixture({
+      now: () => 10_000,
+      onFactObserved: (fact) => {
+        if (fact.type === "rateLimitObserved") observed();
+      },
+    });
+    const account = await authenticatedClaudeAccount(value, "Claude deferred usage");
+    const started = await value.service.execute({
+      account,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const process = value.processes[0];
+    if (process === undefined) throw new Error("Expected one pinned Claude process.");
+    process.emit(initLine);
+    await settle();
+    const sent = await value.service.execute({
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.send",
+      message: "Observe quota",
+      session: started.session.id,
+    }, { signal }) as { turnId: string };
+
+    let writes = 0;
+    const record = value.store.recordProviderUsageObservation.bind(value.store);
+    value.store.recordProviderUsageObservation = (observation) => {
+      writes += 1;
+      return record(observation);
+    };
+    process.emit(rateLimitLine("00000000-0000-4000-8000-000000000010"));
+    await callbackReturned;
+    expect(writes).toBe(0);
+    await value.service.settled();
+    expect(writes).toBe(1);
+    const authority = value.store.requireProviderAccountAuthority(account, "claude");
+    expect(value.store.latestProviderUsage(authority.providerAccountId)).toMatchObject({
+      quota: {
+        observedAt: 10_000,
+        receivedAt: 10_000,
+        turn: { sessionId: started.session.id, turnId: sent.turnId },
+      },
+    });
+  });
+
+  test("retries direct-turn usage only after that exact turn binding commits", async () => {
+    const value = await claudeFixture({ now: () => 10_000 });
+    const account = await authenticatedClaudeAccount(value, "Claude direct usage race");
+    const started = await value.service.execute({
+      account,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const process = value.processes[0];
+    if (process === undefined) throw new Error("Expected one pinned Claude process.");
+    process.emit(initLine);
+    await settle();
+
+    let attempts = 0;
+    let signalFirstAttempt!: () => void;
+    const firstAttempt = new Promise<void>((resolve) => {
+      signalFirstAttempt = resolve;
+    });
+    const record = value.store.recordProviderUsageObservation.bind(value.store);
+    value.store.recordProviderUsageObservation = (observation) => {
+      attempts += 1;
+      if (attempts === 1) signalFirstAttempt();
+      return record(observation);
+    };
+    process.beforeWriteReturn = async () => {
+      process.beforeWriteReturn = undefined;
+      process.emit(rateLimitLine("00000000-0000-4000-8000-000000000030"));
+      await firstAttempt;
+    };
+
+    const sending = value.service.execute({
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.send",
+      message: "Race the direct turn binding",
+      session: started.session.id,
+    }, { signal }) as Promise<{ turnId: string }>;
+    await firstAttempt;
+    expect(attempts).toBe(1);
+    const sent = await sending;
+    await value.service.settled();
+
+    expect(attempts).toBe(2);
+    const authority = value.store.requireProviderAccountAuthority(account, "claude");
+    expect(value.store.latestProviderUsage(authority.providerAccountId)).toMatchObject({
+      authority,
+      quota: {
+        turn: { sessionId: started.session.id, turnId: sent.turnId },
+      },
+    });
+    expect(value.service.backgroundDiagnostics().byCode).not.toContainEqual(
+      expect.objectContaining({ code: "provider_usage_persistence_failed" }),
+    );
+  });
+
+  test("retries queued-turn usage only after that exact turn binding commits", async () => {
+    const value = await claudeFixture({ now: () => 10_000 });
+    const account = await authenticatedClaudeAccount(value, "Claude queued usage race");
+    const started = await value.service.execute({
+      account,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const process = value.processes[0];
+    if (process === undefined) throw new Error("Expected one pinned Claude process.");
+    process.emit(initLine);
+    await settle();
+
+    let attempts = 0;
+    let signalFirstAttempt!: () => void;
+    const firstAttempt = new Promise<void>((resolve) => {
+      signalFirstAttempt = resolve;
+    });
+    const record = value.store.recordProviderUsageObservation.bind(value.store);
+    value.store.recordProviderUsageObservation = (observation) => {
+      attempts += 1;
+      if (attempts === 1) signalFirstAttempt();
+      return record(observation);
+    };
+    process.beforeWriteReturn = async () => {
+      process.beforeWriteReturn = undefined;
+      process.emit(rateLimitLine("00000000-0000-4000-8000-000000000031"));
+      await firstAttempt;
+    };
+
+    const result = await value.service.execute({
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.queue",
+      message: "Race the queued turn binding",
+      session: started.session.id,
+    }, { signal }) as { queued: { id: `queue_${string}` } };
+    await firstAttempt;
+    expect(attempts).toBe(1);
+    await value.service.settled();
+
+    expect(attempts).toBe(2);
+    expect(value.store.requireQueue(result.queued.id)).toMatchObject({ state: "applied" });
+    const authority = value.store.requireProviderAccountAuthority(account, "claude");
+    const quota = value.store.providerUsageObservations({
+      component: "quota",
+      providerAccountId: authority.providerAccountId,
+    })[0];
+    expect(quota).toMatchObject({
+      authority,
+      turn: { sessionId: started.session.id },
+    });
+    if (quota?.turn === null || quota?.turn === undefined) {
+      throw new Error("Expected queued usage to retain exact turn provenance.");
+    }
+    expect(value.store.runtimeProfileForTurn(started.session.id, quota.turn.turnId)).not.toBeNull();
+    expect(value.service.backgroundDiagnostics().byCode).not.toContainEqual(
+      expect.objectContaining({ code: "provider_usage_persistence_failed" }),
+    );
+  });
+
+  test("settles a pre-bind usage writer when close races a failed provider start", async () => {
+    const value = await claudeFixture({ now: () => 10_000 });
+    const account = await authenticatedClaudeAccount(value, "Claude failed usage race");
+    const started = await value.service.execute({
+      account,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const process = value.processes[0];
+    if (process === undefined) throw new Error("Expected one pinned Claude process.");
+    process.emit(initLine);
+    await settle();
+
+    let attempts = 0;
+    let signalFirstAttempt!: () => void;
+    const firstAttempt = new Promise<void>((resolve) => {
+      signalFirstAttempt = resolve;
+    });
+    let releaseProviderWrite!: () => void;
+    const providerWriteGate = new Promise<void>((resolve) => {
+      releaseProviderWrite = resolve;
+    });
+    const record = value.store.recordProviderUsageObservation.bind(value.store);
+    value.store.recordProviderUsageObservation = (observation) => {
+      attempts += 1;
+      if (attempts === 1) signalFirstAttempt();
+      return record(observation);
+    };
+    process.beforeWriteReturn = async () => {
+      process.beforeWriteReturn = undefined;
+      process.emit(rateLimitLine("00000000-0000-4000-8000-000000000033"));
+      await firstAttempt;
+      await providerWriteGate;
+      throw new Error("test-only provider write failure");
+    };
+
+    const sending = value.service.execute({
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.send",
+      message: "Fail before binding the turn",
+      session: started.session.id,
+    }, { signal });
+    await firstAttempt;
+    expect(attempts).toBe(1);
+    const closing = value.service.close();
+    releaseProviderWrite();
+    const [sendOutcome, closeOutcome] = await Promise.allSettled([sending, closing]);
+
+    expect(sendOutcome.status).toBe("rejected");
+    expect(closeOutcome.status).toBe("fulfilled");
+    expect(attempts).toBe(1);
+    const authority = value.store.requireProviderAccountAuthority(account, "claude");
+    expect(value.store.latestProviderUsage(authority.providerAccountId)).toBeNull();
+    expect(value.service.backgroundDiagnostics().last).toMatchObject({
+      cause: "error",
+      code: "provider_usage_persistence_failed",
+      count: 1,
+    });
+  });
+
+  test("persists admitted historical usage after the account process generation advances", async () => {
+    let signalCallbackReturned!: () => void;
+    const callbackReturned = new Promise<void>((resolve) => {
+      signalCallbackReturned = resolve;
+    });
+    const value = await claudeFixture({
+      now: () => 10_000,
+      onFactObserved: (fact) => {
+        if (fact.type === "rateLimitObserved") signalCallbackReturned();
+      },
+    });
+    const account = await authenticatedClaudeAccount(value, "Claude historical usage");
+    const started = await value.service.execute({
+      account,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const process = value.processes[0];
+    if (process === undefined) throw new Error("Expected one pinned Claude process.");
+    process.emit(initLine);
+    await settle();
+    const sent = await value.service.execute({
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.send",
+      message: "Bind historical usage",
+      session: started.session.id,
+    }, { signal }) as { turnId: string };
+    const frozenAuthority = value.store.requireProviderAccountAuthority(account, "claude");
+
+    let writes = 0;
+    const record = value.store.recordProviderUsageObservation.bind(value.store);
+    value.store.recordProviderUsageObservation = (observation) => {
+      writes += 1;
+      return record(observation);
+    };
+    process.emit(rateLimitLine("00000000-0000-4000-8000-000000000032"));
+    await callbackReturned;
+    expect(writes).toBe(0);
+    value.store.advanceProviderAccountProcessGeneration({
+      expectedProcessGeneration: frozenAuthority.processGeneration,
+      profileId: account,
+      provider: "claude",
+    });
+    await value.service.settled();
+
+    expect(writes).toBe(1);
+    const stored = value.store.providerUsageObservations({
+      component: "quota",
+      providerAccountId: frozenAuthority.providerAccountId,
+    })[0];
+    expect(stored).toMatchObject({
+      authority: frozenAuthority,
+      turn: { sessionId: started.session.id, turnId: sent.turnId },
+    });
+    expect(value.store.requireProviderAccountAuthority(account, "claude")).toMatchObject({
+      bindingGeneration: frozenAuthority.bindingGeneration,
+      processGeneration: frozenAuthority.processGeneration + 1,
+    });
+  });
+
+  test("reduces a result timeline before scheduling deferred accounting persistence", async () => {
+    let signalCallbackReturned!: () => void;
+    const callbackReturned = new Promise<void>((resolve) => {
+      signalCallbackReturned = resolve;
+    });
+    let writes = 0;
+    const persistenceSnapshots: Array<Readonly<{ state: string; completed: boolean }>> = [];
+    const order: string[] = [];
+    const value = await claudeFixture({
+      onFactObserved: (fact) => {
+        if (fact.type !== "usageAccountingObserved") return;
+        order.push("callback");
+        signalCallbackReturned();
+      },
+    });
+    const account = await authenticatedClaudeAccount(value, "Claude result ordering");
+    const started = await value.service.execute({
+      account,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const process = value.processes[0];
+    if (process === undefined) throw new Error("Expected one pinned Claude process.");
+    process.emit(initLine);
+    await settle();
+    await value.service.execute({
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.send",
+      message: "Observe terminal accounting",
+      session: started.session.id,
+    }, { signal });
+
+    const record = value.store.recordProviderUsageObservation.bind(value.store);
+    value.store.recordProviderUsageObservation = (observation) => {
+      writes += 1;
+      order.push("persist");
+      persistenceSnapshots.push({
+        state: value.store.requireSession(started.session.id).state,
+        completed: value.store.listSessionEvents({
+          sessionId: started.session.id, afterSequence: null, limit: 200,
+        }).events.some((event) => event.body.type === "turn_completed"),
+      });
+      return record(observation);
+    };
+    process.emit(resultLine("done"));
+    await callbackReturned;
+    // Callback return is not a timeline commit when a native effect owns the
+    // session tail. Persistence, however, must wait for that exact ordered work.
+    expect(writes).toBe(0);
+    await value.service.settled();
+    expect(writes).toBe(1);
+    expect(order).toEqual(["callback", "persist"]);
+    expect(persistenceSnapshots).toEqual([{ state: "idle", completed: true }]);
+  });
+
+  test.each(["current", "retired_provider", "lost_daemon", "closing"] as const)(
+    "orders terminal accounting behind deferred facts without blocking native turn admission: %s",
+    async (disposition) => {
+    let signalAccountingReturned!: () => void;
+    const accountingReturned = new Promise<void>((resolve) => { signalAccountingReturned = resolve; });
+    let signalTimelineBlocked!: () => void;
+    const timelineBlocked = new Promise<void>((resolve) => { signalTimelineBlocked = resolve; });
+    let releaseTimeline!: () => void;
+    const timelineRelease = new Promise<void>((resolve) => { releaseTimeline = resolve; });
+    let blockNextTimeline = false;
+    let daemonLost = false;
+    const value = await claudeFixture({
+      daemonAuthority: {
+        assertCurrent: async () => {
+          if (daemonLost) throw new Error("test-only daemon fence lost");
+        },
+        close: () => { daemonLost = true; },
+      },
+      beforeProjectionRecoveryCheck: async () => {
+        if (!blockNextTimeline) return;
+        blockNextTimeline = false;
+        signalTimelineBlocked();
+        await timelineRelease;
+      },
+      onFactObserved: (fact) => {
+        if (fact.type === "usageAccountingObserved") signalAccountingReturned();
+      },
+    });
+    const account = await authenticatedClaudeAccount(value, "Claude locked accounting");
+    const started = await value.service.execute({
+      account, fast: false, kind: "session.start", preset: "fable-max", provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const process = value.processes[0];
+    if (process === undefined) throw new Error("Expected one pinned Claude process.");
+    await settle();
+    await value.service.settled();
+    const frozenAuthority = value.store.requireProviderAccountAuthority(account, "claude");
+    const sent = await value.service.execute({
+      idempotencyKey: crypto.randomUUID(), kind: "session.send",
+      message: "Start before the result-producing steer", session: started.session.id,
+    }, { signal }) as { turnId: string };
+    await value.service.settled();
+    const snapshots: Array<Readonly<{ state: string; completed: boolean }>> = [];
+    const record = value.store.recordProviderUsageObservation.bind(value.store);
+    value.store.recordProviderUsageObservation = (observation) => {
+      snapshots.push({
+        state: value.store.requireSession(started.session.id).state,
+        completed: value.store.listSessionEvents({
+          sessionId: started.session.id, afterSequence: null, limit: 200,
+        }).events.some((event) => event.body.type === "turn_completed"),
+      });
+      return record(observation);
+    };
+    process.beforeWriteReturn = async () => {
+      process.beforeWriteReturn = undefined;
+      blockNextTimeline = true;
+      process.emit(resultLine("done while native admission owns the session lock"));
+      // The native write deliberately awaits the reader. A callback that waits
+      // for the mutation's own session tail would deadlock this real seam.
+      await accountingReturned;
+    };
+    let closing: Promise<void> | undefined;
+    try {
+      await value.service.execute({
+        idempotencyKey: crypto.randomUUID(), kind: "session.steer",
+        message: "Complete before the native steer returns", session: started.session.id,
+      }, { signal });
+      await timelineBlocked;
+      // Cross the already scheduled zero-delay writer turn while a real
+      // timeline reducer is held. This is an event-loop barrier, not a race delay.
+      await new Promise<void>((resolve) => { setTimeout(resolve, 0); });
+      expect(snapshots).toEqual([]);
+      expect(value.store.requireSession(started.session.id).state).toBe("active");
+      if (disposition === "retired_provider") {
+        value.store.advanceProviderAccountProcessGeneration({
+          profileId: account, provider: "claude",
+          expectedProcessGeneration: frozenAuthority.processGeneration,
+        });
+      } else if (disposition === "lost_daemon") {
+        daemonLost = true;
+      } else if (disposition === "closing") {
+        closing = value.service.close();
+      }
+    } finally {
+      releaseTimeline();
+    }
+    await value.service.settled();
+    await closing;
+    if (disposition === "lost_daemon" || disposition === "closing") {
+      expect(snapshots).toEqual([]);
+      expect(value.service.backgroundDiagnostics().byCode.find((diagnostic) =>
+        diagnostic.code === "provider_usage_persistence_failed"))
+        .toMatchObject({ code: "provider_usage_persistence_failed", count: 1 });
+      expect(value.store.providerUsageObservations({
+        component: "accounting", providerAccountId: frozenAuthority.providerAccountId,
+      })).toEqual([]);
+    } else {
+      expect(snapshots).toEqual([disposition === "current"
+        ? { state: "idle", completed: true }
+        : { state: "active", completed: false }]);
+      expect(value.store.providerUsageObservations({
+        component: "accounting", providerAccountId: frozenAuthority.providerAccountId,
+      })).toMatchObject([{
+        authority: frozenAuthority, turn: { sessionId: started.session.id, turnId: sent.turnId },
+      }]);
+    }
+  });
+
+  test("retains an immediate Claude result without restoring a completed turn to active", async () => {
+    const value = await claudeFixture();
+    const account = await authenticatedClaudeAccount(value, "Claude immediate result");
+    const started = await value.service.execute({
+      account, fast: false, kind: "session.start", preset: "fable-max", provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const process = value.processes[0];
+    if (process === undefined) throw new Error("Expected one pinned Claude process.");
+    await settle();
+    await value.service.settled();
+    process.beforeWriteReturn = async () => {
+      process.beforeWriteReturn = undefined;
+      const resultRead = new Promise<void>((resolve) => {
+        process.afterStdoutChunkRead = () => {
+          process.afterStdoutChunkRead = undefined;
+          resolve();
+        };
+      });
+      process.emit(resultLine("Immediate completion"));
+      // Prove the actual stream consumed the result before the initial native
+      // write resolves; do not wait for a daemon callback or a timing delay.
+      await resultRead;
+    };
+    const key = crypto.randomUUID();
+    const sent = await value.service.execute({
+      idempotencyKey: key, kind: "session.send", message: "Complete immediately",
+      session: started.session.id,
+    }, { signal }) as { turnId: string };
+    await value.service.settled();
+    expect(value.store.requireSession(started.session.id)).toMatchObject({ state: "idle" });
+    expect(value.store.requireSession(started.session.id).activeTurnId).toBeUndefined();
+    const facts = await eventBodies(value, started.session.id);
+    const userIndex = facts.findIndex((fact) => fact.type === "user_message");
+    const startedIndex = facts.findIndex((fact) => fact.type === "turn_started");
+    const completedIndex = facts.findIndex((fact) => fact.type === "turn_completed");
+    expect(userIndex).toBeGreaterThanOrEqual(0);
+    expect(startedIndex).toBeGreaterThan(userIndex);
+    expect(startedIndex).toBeGreaterThanOrEqual(0);
+    expect(completedIndex).toBeGreaterThan(startedIndex);
+    expect(facts.filter((fact) => fact.type === "turn_started")).toHaveLength(1);
+    expect(facts.filter((fact) => fact.type === "turn_completed")).toHaveLength(1);
+    expect(value.store.readMutation(key)).toMatchObject({ state: "applied", result: { turnId: sent.turnId } });
+    const shown = await value.service.execute({
+      kind: "session.show", session: started.session.id, detail: false,
+    }, { signal });
+    expect(shown).toMatchObject({ session: { state: "idle" } });
+    expect(value.processes).toHaveLength(1);
+  });
+
+  test("retains an observed Claude result after write rejection without inventing success or replay", async () => {
+    const value = await claudeFixture();
+    const account = await authenticatedClaudeAccount(value, "Claude rejected early result");
+    const started = await value.service.execute({
+      account, fast: false, kind: "session.start", preset: "fable-max", provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const process = value.processes[0];
+    if (process === undefined) throw new Error("Expected one pinned Claude process.");
+    await settle();
+    await value.service.settled();
+    process.beforeWriteReturn = async () => {
+      process.beforeWriteReturn = undefined;
+      const resultRead = new Promise<void>((resolve) => {
+        process.afterStdoutChunkRead = () => {
+          process.afterStdoutChunkRead = undefined;
+          resolve();
+        };
+      });
+      process.emit(resultLine("Observed completion despite failed write settlement"));
+      await resultRead;
+      throw new Error("test-only write rejection after an actual result");
+    };
+    const key = crypto.randomUUID();
+    const command = {
+      idempotencyKey: key, kind: "session.send" as const,
+      message: "Do not replay a rejected write", session: started.session.id,
+    };
+    await expect(value.service.execute(command, { signal })).rejects.toThrow();
+    await value.service.settled();
+    const uncertain = value.store.readMutation(key);
+    expect(uncertain).toMatchObject({ state: "ambiguous" });
+    const facts = await eventBodies(value, started.session.id);
+    expect(facts.some((fact) => fact.type === "turn_started")).toBe(false);
+    expect(facts.some((fact) => fact.type === "user_message")).toBe(false);
+    expect(facts.find((fact) => fact.type === "turn_completed")).toMatchObject({ status: "completed" });
+    expect(facts.filter((fact) => fact.type === "turn_completed")).toHaveLength(1);
+    expect(value.store.requireSession(started.session.id).state).toBe("recovery_required");
+    expect(value.store.requireSession(started.session.id).activeTurnId).toBeUndefined();
+    const captured = value.store.requireSessionProviderAuthority(started.session.id);
+    expect(value.store.providerUsageObservations({
+      providerAccountId: captured.providerAccountId, component: "accounting",
+    })).toEqual([]);
+    expect(value.service.backgroundDiagnostics().byCode.find((diagnostic) =>
+      diagnostic.code === "provider_usage_persistence_failed"))
+      .toMatchObject({ count: 1 });
+    const writes = [...process.written];
+    await expect(value.service.execute(command, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(value.store.readMutation(key)).toEqual(uncertain);
+    expect(process.written).toEqual(writes);
+    await expect(value.service.execute({
+      ...command, idempotencyKey: crypto.randomUUID(), message: "Never replay under a new key",
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(process.written).toEqual(writes);
+    expect(value.processes).toHaveLength(1);
+  });
+
+  test("fences a different-key Claude send after a post-write rejection without a result", async () => {
+    const value = await claudeFixture();
+    const account = await authenticatedClaudeAccount(value, "Claude post-write uncertainty");
+    const started = await value.service.execute({
+      account, fast: false, kind: "session.start", preset: "fable-max", provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const process = value.processes[0];
+    if (process === undefined) throw new Error("Expected one pinned Claude process.");
+    await value.service.settled();
+    const authority = value.store.requireSessionProviderAuthority(started.session.id);
+    const initialWrites = [...process.written];
+    const writeError = new Error("test-only rejection after recording the Claude user frame");
+    process.beforeWriteReturn = () => {
+      process.beforeWriteReturn = undefined;
+      // FakeClaudeProcess.write has already recorded the actual user frame.
+      // Emit no result, assistant response, EOF or process exit before rejecting.
+      throw writeError;
+    };
+    const firstKey = crypto.randomUUID();
+    const firstMessage = "First input with an unsettled write outcome";
+    let firstError: unknown;
+    try {
+      await value.service.execute({
+        idempotencyKey: firstKey, kind: "session.send", message: firstMessage,
+        session: started.session.id,
+      }, { signal });
+    } catch (error: unknown) {
+      firstError = error;
+    }
+    await value.service.settled();
+    expect(firstError).toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(value.store.readMutation(firstKey)).toMatchObject({ state: "ambiguous" });
+    expect(value.store.requireSession(started.session.id)).toMatchObject({ state: "recovery_required" });
+    expect(value.store.requireSession(started.session.id).activeTurnId).toBeUndefined();
+    const firstWrites = [...process.written];
+    expect(firstWrites.slice(initialWrites.length)).toEqual([`${JSON.stringify({
+      message: { content: [{ text: firstMessage, type: "text" }], role: "user" },
+      type: "user",
+    })}\n`]);
+    expect(process.terminated).toBe(false);
+    expect(value.processes).toEqual([process]);
+    expect(value.store.requireSessionProviderAuthority(started.session.id)).toEqual(authority);
+    const firstFacts = await eventBodies(value, started.session.id);
+    expect(firstFacts.some((fact) => fact.type === "turn_started" || fact.type === "turn_completed"))
+      .toBe(false);
+    expect(value.store.providerUsageObservations({
+      providerAccountId: authority.providerAccountId, component: "accounting",
+    })).toEqual([]);
+
+    const secondKey = crypto.randomUUID();
+    expect(secondKey).not.toBe(firstKey);
+    const secondOutcome = await value.service.execute({
+      idempotencyKey: secondKey, kind: "session.send",
+      message: "Different-key input before any result or recovery", session: started.session.id,
+    }, { signal }).then(
+      () => ({ status: "fulfilled" as const }),
+      (error: unknown) => ({ status: "rejected" as const, error }),
+    );
+    await value.service.settled();
+    expect(process.terminated).toBe(false);
+    expect(value.processes).toEqual([process]);
+    expect(value.store.requireSessionProviderAuthority(started.session.id)).toEqual(authority);
+    expect((await eventBodies(value, started.session.id))
+      .some((fact) => fact.type === "turn_completed")).toBe(false);
+    // Decisive cross-layer safety oracle: no second frame may reach this same
+    // still-open process merely because the second caller chose another key.
+    expect({ outcome: secondOutcome.status, writes: process.written }).toEqual({
+      outcome: "rejected", writes: firstWrites,
+    });
+  }, 5_000);
+
+  test.each(["no_result", "result_before_rejection"] as const)(
+    "keeps later Claude queue entries pending after an uncertain dispatch (%s)", async (disposition) => {
+    const value = await claudeFixture();
+    const account = await authenticatedClaudeAccount(value, "Claude uncertain queue");
+    const started = await value.service.execute({
+      account, fast: false, kind: "session.start", preset: "fable-max", provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const session = started.session.id;
+    const process = value.processes[0];
+    if (process === undefined) throw new Error("Expected one pinned Claude process.");
+    const initial = await value.service.execute({
+      kind: "session.send", session, message: "Initial active turn",
+    }, { signal }) as { turnId: string };
+    const accountingAttempts: string[] = [];
+    const record = value.store.recordProviderUsageObservation.bind(value.store);
+    value.store.recordProviderUsageObservation = (observation) => {
+      if (observation.source === "claude_result") {
+        accountingAttempts.push(observation.turn.turnId);
+      }
+      return record(observation);
+    };
+    const first = await value.service.execute({
+      kind: "session.queue", session, message: "Uncertain queued input",
+    }, { signal }) as { queued: { id: `queue_${string}` } };
+    const second = await value.service.execute({
+      kind: "session.queue", session, message: "Must remain pending",
+    }, { signal }) as { queued: { id: `queue_${string}` } };
+    expect(value.store.requireQueue(first.queued.id).state).toBe("pending");
+    expect(value.store.requireQueue(second.queued.id).state).toBe("pending");
+    process.beforeWriteReturn = async () => {
+      process.beforeWriteReturn = undefined;
+      if (disposition === "result_before_rejection") {
+        const queuedResultRead = new Promise<void>((resolve) => {
+          process.afterStdoutChunkRead = () => {
+            process.afterStdoutChunkRead = undefined;
+            resolve();
+          };
+        });
+        process.emit({
+          ...resultLine("Queued turn actually completed before its write rejected"),
+          uuid: "48000000-0000-4000-8000-000000000052",
+        });
+        await queuedResultRead;
+      }
+      throw new Error("test-only queued frame rejection after write");
+    };
+    const resultRead = new Promise<void>((resolve) => {
+      process.afterStdoutChunkRead = () => {
+        process.afterStdoutChunkRead = undefined;
+        resolve();
+      };
+    });
+    process.emit(resultLine("Initial turn actually completed"));
+    await resultRead;
+    await value.service.settled();
+    expect(value.store.requireQueue(first.queued.id).state).toBe("ambiguous");
+    expect(value.store.requireQueue(second.queued.id).state).toBe("pending");
+    expect(value.store.requireSession(session).state).toBe("recovery_required");
+    expect(process.written).toHaveLength(2);
+    expect(process.written[1]).toContain("Uncertain queued input");
+    expect(process.written.join("")).not.toContain("Must remain pending");
+    expect((await eventBodies(value, session)).filter((fact) => fact.type === "turn_completed"))
+      .toHaveLength(disposition === "result_before_rejection" ? 2 : 1);
+    // Immutable accounting publication keeps its original FIFO. The initial
+    // turn remains bound; the uncertain queued turn must never gain a binding
+    // merely because its real completion was retained before quarantine.
+    expect(accountingAttempts[0]).toBe(initial.turnId);
+    expect(accountingAttempts).toHaveLength(disposition === "result_before_rejection" ? 2 : 1);
+    if (disposition === "result_before_rejection") {
+      expect(accountingAttempts[1]).not.toBe(initial.turnId);
+      expect(value.service.backgroundDiagnostics().byCode.find((diagnostic) =>
+        diagnostic.code === "provider_usage_persistence_failed")).toMatchObject({ count: 1 });
+    }
+    const authority = value.store.requireSessionProviderAuthority(session);
+    const accounting = value.store.providerUsageObservations({
+      component: "accounting", providerAccountId: authority.providerAccountId,
+    });
+    expect(accounting).toHaveLength(1);
+    expect(accounting[0]).toMatchObject({ turn: { sessionId: session, turnId: initial.turnId } });
+    expect(process.terminated).toBe(false);
+    const writes = [...process.written];
+    await expect(value.service.execute({
+      kind: "session.send", session, message: "Different-key input after uncertain queue",
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await value.service.settled();
+    expect(process.written).toEqual(writes);
+    expect(value.processes).toEqual([process]);
+    }, 5_000,
+  );
+
+  test.each(["session.steer", "session.stop"] as const)(
+    "requires recovery after a post-write Claude %s rejection", async (kind) => {
+      const value = await claudeFixture();
+      const account = await authenticatedClaudeAccount(value, "Claude uncertain active operation");
+      const started = await value.service.execute({
+        account, fast: false, kind: "session.start", preset: "fable-max", provider: "claude",
+      }, { signal }) as { session: { id: `sess_${string}` } };
+      const session = started.session.id;
+      const process = value.processes[0];
+      if (process === undefined) throw new Error("Expected one pinned Claude process.");
+      await value.service.execute({ kind: "session.send", session, message: "Active turn" }, { signal });
+      process.beforeWriteReturn = () => {
+        process.beforeWriteReturn = undefined;
+        throw new Error("test-only active operation write rejection");
+      };
+      const idempotencyKey = crypto.randomUUID();
+      const command = kind === "session.steer"
+        ? { kind, session, idempotencyKey, message: "Uncertain steering" }
+        : { kind, session, idempotencyKey };
+      await expect(value.service.execute(command, { signal }))
+        .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      await value.service.settled();
+      expect(value.store.readMutation(idempotencyKey)).toMatchObject({ state: "ambiguous" });
+      expect(value.store.requireSession(session).state).toBe("recovery_required");
+      expect(process.written).toHaveLength(2);
+      const writes = [...process.written];
+      await expect(value.service.execute({
+        kind: "session.steer", session, message: "Do not repeat an uncertain operation",
+      }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      expect(process.written).toEqual(writes);
+      expect(process.terminated).toBe(false);
+    }, 5_000,
+  );
+
+  test("does not replay a Claude approval after its written response rejects", async () => {
+    const value = await claudeFixture();
+    const account = await authenticatedClaudeAccount(value, "Claude uncertain approval");
+    const started = await value.service.execute({
+      account, fast: false, kind: "session.start", preset: "fable-max", provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const session = started.session.id;
+    const process = value.processes[0];
+    if (process === undefined) throw new Error("Expected one pinned Claude process.");
+    await value.service.execute({ kind: "session.send", session, message: "Ask for approval" }, { signal });
+    const requestRead = new Promise<void>((resolve) => {
+      process.afterStdoutChunkRead = () => {
+        process.afterStdoutChunkRead = undefined;
+        resolve();
+      };
+    });
+    const requestId = "48000000-0000-4000-8000-000000000061";
+    process.emit(approvalRequestLine(requestId));
+    await requestRead;
+    await value.service.settled();
+    const pending = await value.service.execute({
+      kind: "interaction.list", limit: 10, pending: true, session,
+    }, { signal }) as { interactions: readonly { id: string; revision: number }[] };
+    expect(pending.interactions).toHaveLength(1);
+    const interaction = pending.interactions[0];
+    if (interaction === undefined) throw new Error("Expected the pending approval.");
+    process.beforeWriteReturn = () => {
+      process.beforeWriteReturn = undefined;
+      throw new Error("test-only approval response rejection after write");
+    };
+    const command = {
+      expectedRevision: interaction.revision, interaction: interaction.id,
+      kind: "interaction.resolve" as const,
+      resolution: { decision: "once" as const, kind: "approval_decision" as const },
+    };
+    await expect(value.service.execute(command, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await value.service.settled();
+    expect(value.store.requireInteraction(interaction.id).state).toBe("resolution_unknown");
+    const writes = [...process.written];
+    expect(writes.filter((line) => line.includes("control_response"))).toHaveLength(1);
+    expect(writes.at(-1)).toContain(requestId);
+    await expect(value.service.execute(command, { signal })).rejects.toThrow();
+    await value.service.settled();
+    expect(value.store.requireInteraction(interaction.id).state).toBe("resolution_unknown");
+    expect(process.written).toEqual(writes);
+    await expect(value.service.execute({
+      kind: "session.steer", session, message: "Do not bypass an uncertain approval with fresh input",
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(process.written).toEqual(writes);
+    expect(process.terminated).toBe(false);
+    expect(value.processes).toEqual([process]);
+  }, 5_000);
+
+  test("drops Claude usage callbacks stamped with a retired provider authority", async () => {
+    const value = await claudeFixture();
+    const account = await authenticatedClaudeAccount(value, "Claude stale usage");
+    const started = await value.service.execute({
+      account,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const session = value.store.requireSession(started.session.id);
+    if (session.providerThreadId === undefined) throw new Error("Expected a bound Claude thread.");
+    const captured = value.store.requireProviderAccountAuthority(account, "claude");
+    const retiredAuthority = {
+      bindingGeneration: captured.bindingGeneration,
+      codexHome: "unused",
+      desktopUserData: "unused",
+      generation: captured.processGeneration,
+      id: captured.profileId,
+      provider: "claude" as const,
+      providerAccountId: captured.providerAccountId,
+    };
+    value.store.advanceProviderAccountProcessGeneration({
+      expectedProcessGeneration: captured.processGeneration,
+      profileId: account,
+      provider: "claude",
+    });
+
+    let writes = 0;
+    const record = value.store.recordProviderUsageObservation.bind(value.store);
+    value.store.recordProviderUsageObservation = (observation) => {
+      writes += 1;
+      return record(observation);
+    };
+    const frame = {
+      connectionId: "00000000-0000-4000-8000-000000000020",
+      observationRevision: 1,
+      observedAt: 10_000,
+      providerThreadId: session.providerThreadId,
+      receivedAt: 10_000,
+      sourceEventDigest: "a".repeat(64),
+      turnId: "turn-retired-authority",
+    };
+    await value.service.observeClaudeFact(retiredAuthority, {
+      ...frame,
+      quota: {
+        isUsingOverage: false,
+        overageDisabledReason: null,
+        overageStatus: null,
+        rateLimitType: "five_hour",
+        resetsAtMs: 11_000,
+        status: { state: "known", value: "allowed" },
+        windows: [],
+      },
+      sourceEventId: "00000000-0000-4000-8000-000000000021",
+      type: "rateLimitObserved",
+    });
+    await value.service.observeClaudeFact(retiredAuthority, {
+      ...frame,
+      accounting: {
+        models: [],
+        tokens: {
+          cacheCreationInputTokens: null,
+          cacheReadInputTokens: null,
+          inputTokens: 1,
+          outputTokens: 1,
+          thinkingTokens: null,
+        },
+        totalCostUsd: null,
+      },
+      sourceEventId: "00000000-0000-4000-8000-000000000022",
+      type: "usageAccountingObserved",
+    });
+    await value.service.settled();
+
+    expect(writes).toBe(0);
+    expect(value.store.latestProviderUsage(captured.providerAccountId)).toBeNull();
+    expect(value.store.requireProviderAccountAuthority(account, "claude")).toMatchObject({
+      bindingGeneration: captured.bindingGeneration,
+      processGeneration: captured.processGeneration + 1,
+    });
+  });
+
+  test("retains a deferred persistence diagnostic after close begins", async () => {
+    let observed!: () => void;
+    const callbackReturned = new Promise<void>((resolve) => { observed = resolve; });
+    const value = await claudeFixture({
+      onFactObserved: (fact) => {
+        if (fact.type === "rateLimitObserved") observed();
+      },
+    });
+    const account = await authenticatedClaudeAccount(value, "Claude close usage failure");
+    const started = await value.service.execute({
+      account,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const process = value.processes[0];
+    if (process === undefined) throw new Error("Expected one pinned Claude process.");
+    process.emit(initLine);
+    await settle();
+    await value.service.execute({
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.send",
+      message: "Observe quota before close",
+      session: started.session.id,
+    }, { signal });
+
+    let writes = 0;
+    value.store.recordProviderUsageObservation = () => {
+      writes += 1;
+      throw new Error("test-only persistence failure");
+    };
+    process.emit(rateLimitLine("00000000-0000-4000-8000-000000000011"));
+    await callbackReturned;
+    expect(writes).toBe(0);
+    await value.service.close();
+    expect(writes).toBe(1);
+    expect(value.service.backgroundDiagnostics().last).toMatchObject({
+      cause: "error",
+      code: "provider_usage_persistence_failed",
+      count: 1,
+    });
+  });
+
+  test("drops only the new usage observation when the owned queue is full", async () => {
+    let observed!: () => void;
+    const accountingCallbackReturned = new Promise<void>((resolve) => { observed = resolve; });
+    const value = await claudeFixture({
+      onFactObserved: (fact) => {
+        if (fact.type === "usageAccountingObserved") observed();
+      },
+    });
+    const account = await authenticatedClaudeAccount(value, "Claude usage overflow");
+    const started = await value.service.execute({
+      account,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const process = value.processes[0];
+    if (process === undefined) throw new Error("Expected one pinned Claude process.");
+    process.emit(initLine);
+    await settle();
+    await value.service.execute({
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.send",
+      message: "Fill the informational usage queue",
+      session: started.session.id,
+    }, { signal });
+
+    let writes = 0;
+    value.store.recordProviderUsageObservation = (observation) => {
+      writes += 1;
+      return { observation, status: "inserted" };
+    };
+    process.emit(
+      ...Array.from({ length: PROVIDER_USAGE_PERSISTENCE_QUEUE_LIMIT }, (_, index) => rateLimitLine(
+        `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`,
+        index / 2_048,
+      )),
+      resultLine("done"),
+    );
+    await accountingCallbackReturned;
+    expect(writes).toBe(0);
+    expect(value.service.backgroundDiagnostics().last).toMatchObject({
+      code: "provider_usage_queue_overflow",
+      count: 1,
+    });
+    await value.service.settled();
+    expect(writes).toBe(PROVIDER_USAGE_PERSISTENCE_QUEUE_LIMIT);
+    expect(value.store.requireSession(started.session.id).state).toBe("idle");
+  });
+
   test("stops an in-flight Claude turn through the same interrupt path", async () => {
     const value = await claudeFixture();
     const account = await authenticatedClaudeAccount(value, "Claude stop");
@@ -862,6 +1991,134 @@ describe("Claude sessions on the local authority", () => {
     expect(bodies.find((body) => body.type === "turn_completed")).toMatchObject({
       status: "interrupted",
     });
+  });
+
+  test("resumes only the exact Claude session whose transport is lost without replaying its input", async () => {
+    let observedDisconnect!: () => void;
+    const disconnectObserved = new Promise<void>((resolve) => { observedDisconnect = resolve; });
+    const value = await claudeFixture({
+      onFactObserved: (fact) => {
+        if (fact.type === "providerDisconnected") observedDisconnect();
+      },
+    });
+    const account = await authenticatedClaudeAccount(value, "Claude transport loss");
+    const idle = await value.service.execute({
+      account,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const active = await value.service.execute({
+      account,
+      fast: false,
+      kind: "session.start",
+      preset: "fable-max",
+      provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const sendKey = crypto.randomUUID();
+    await value.service.execute({
+      idempotencyKey: sendKey,
+      kind: "session.send",
+      message: "Keep working",
+      session: active.session.id,
+    }, { signal });
+    const profileBefore = value.store.requireProfile(account);
+    const claudeBefore = value.store.requireProviderAccountAuthority(account, "claude");
+    const capturedBefore = value.store.requireSessionProviderAuthority(active.session.id);
+    const acceptedBefore = value.store.readMutation(sendKey);
+    const idleBefore = value.store.requireSession(idle.session.id);
+    const activeProcess = value.processes[1];
+    if (activeProcess === undefined) throw new Error("Expected the active Claude process.");
+    const joins: Array<Readonly<{ thread: string; processCount: number }>> = [];
+    const endSession = value.runtime.endSession.bind(value.runtime);
+    value.runtime.endSession = async (input) => {
+      await endSession(input);
+      joins.push({ thread: input.providerThreadId, processCount: value.processes.length });
+    };
+    const diagnostics: unknown[] = [];
+    const recordDiagnostic = value.service.recordBackgroundDiagnostic.bind(value.service);
+    value.service.recordBackgroundDiagnostic = (code, error) => {
+      diagnostics.push({ code, error });
+      recordDiagnostic(code, error);
+    };
+
+    activeProcess.terminate();
+    // The reader first emits abandoned-turn facts, then its disconnect. Join
+    // that exact boundary before joining the daemon's recovery work.
+    await disconnectObserved;
+    await value.service.settled();
+
+    const resumed = value.store.requireSession(active.session.id);
+    expect(resumed.state).toBe("idle");
+    expect(resumed.activeTurnId).toBeUndefined();
+    expect(value.store.requireSession(idle.session.id)).toEqual(idleBefore);
+    expect(value.store.requireProviderAccountAuthority(account, "claude")).toEqual(claudeBefore);
+    expect(value.store.requireSessionProviderAuthority(active.session.id)).toEqual(capturedBefore);
+    expect(value.store.readMutation(sendKey)).toEqual(acceptedBefore);
+    expect(diagnostics).toEqual([]);
+    expect(joins).toEqual([{ thread: activeProcess.providerThreadId, processCount: 2 }]);
+    expect(value.processes).toHaveLength(3);
+    const replacement = value.processes[2];
+    if (replacement === undefined || resumed.providerThreadId === undefined) {
+      throw new Error("Expected the exact-thread replacement Claude process.");
+    }
+    expect(replacement.providerThreadId).toBe(activeProcess.providerThreadId);
+    expect(replacement.terminated).toBe(false);
+    expect(replacement.written.some((line) => line.includes("Keep working"))).toBe(false);
+    expect(value.processes[0]?.terminated).toBe(false);
+    expect(value.store.readClaudeProcessAuthority({
+      profileId: account, providerThreadId: resumed.providerThreadId, runtimeScope: "managed",
+    })).toMatchObject({
+      identity: await replacement.identity, providerAuthority: claudeBefore,
+      sessionId: active.session.id, state: "bound",
+    });
+    expect(value.store.requireProfile(account).processGeneration)
+      .toBe(profileBefore.processGeneration);
+    const events = await eventBodies(value, active.session.id);
+    expect(events.some((body) =>
+      body.type === "connection" && body.state === "disconnected"
+    )).toBe(true);
+    expect(events.some((body) =>
+      body.type === "gap" && body.reason === "provider_disconnect"
+    )).toBe(true);
+    const idleEvents = await eventBodies(value, idle.session.id);
+    expect(idleEvents.some((body) =>
+      body.type === "connection" && body.state === "disconnected"
+    )).toBe(false);
+  });
+
+  test("refuses an early Claude exit without committing a bound session or live launch", async () => {
+    const value = await claudeFixture({ immediatelyEndProcess: true });
+    const account = await authenticatedClaudeAccount(value, "Claude early transport loss");
+    const providerBefore = value.store.requireProviderAccountAuthority(account, "claude");
+    const key = crypto.randomUUID();
+    const command = {
+      account,
+      fast: false,
+      idempotencyKey: key,
+      kind: "session.start" as const,
+      preset: "fable-max" as const,
+      provider: "claude" as const,
+    };
+    await expect(value.service.execute(command, { signal }))
+      .rejects.toMatchObject({ code: "UNAVAILABLE" });
+    await settle();
+    await value.service.settled();
+    expect(value.store.listSessions(50, account)).toEqual([]);
+    expect(value.store.listClaudeProcessLaunchIntents()).toEqual([]);
+    expect(value.store.listUnreleasedClaudeProcessAuthorities()).toEqual([]);
+    expect(value.store.requireProviderAccountAuthority(account, "claude")).toEqual({
+      ...providerBefore,
+      bindingGeneration: providerBefore.bindingGeneration + 1,
+      processGeneration: providerBefore.processGeneration + 1,
+    });
+    const failed = value.store.readMutation(key);
+    expect(failed).toMatchObject({ state: "failed" });
+    await expect(value.service.execute(command, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(value.store.readMutation(key)).toEqual(failed);
+    expect(value.processes).toHaveLength(1);
+    expect(value.processes[0]?.terminated).toBe(true);
   });
 
   test("refuses the Claude provider with the pinned version when no binary is admitted", async () => {

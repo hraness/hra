@@ -947,7 +947,7 @@ describe("agent-first operation documents", () => {
       .toBe(false);
   });
 
-  test("binds actors to exact HRA session IDs", () => {
+  test("binds actors to exact Oompa session IDs", () => {
     const join = operations.find((operation) => operation.kind === "work.join");
     expect(join).toBeDefined();
     expect(workOperationSchema.safeParse({ ...join, actorSessionId: "worker-one" }).success)

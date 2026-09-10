@@ -1424,7 +1424,7 @@ export const boundedProcessRecoveryDirectory = (): string => {
   if (account.uid !== uid || !isAbsolute(account.homedir)) {
     throw new BoundedProcessRecoveryJournalError([], "owner_unavailable");
   }
-  return join(account.homedir, ".local", "state", "hra", "process-recovery");
+  return join(account.homedir, ".local", "state", "oompa", "process-recovery");
 };
 
 export const openOwnedPrivateStateDirectory = (
@@ -3445,7 +3445,7 @@ const runAuthorityRecoveryHelperLocked = async (
         throw new AuthorityControlProtocolError("recovery_helper_failed");
       }
       // The trusted helper reads its own immutable start time after becoming
-      // nondumpable and binds it to this authenticated channel. HRA can still
+      // nondumpable and binds it to this authenticated channel. Oompa can still
       // prove the announced PID is its exact direct child without a forbidden
       // cross-process /proc read, then binds RECOVERY_CLEAN to both values.
       const recoveryPid = child.pid;
@@ -4281,7 +4281,7 @@ export const runBoundedProcess = async (
       child = spawn("/bin/sh", [
         "-c",
         executionGateProgram,
-        "hra-process-gate",
+        "oompa-process-gate",
         request.executable,
         ...request.arguments,
       ], {

@@ -3,7 +3,7 @@ title: Codex scheduled tasks (automations) ground truth
 description: Where Codex Desktop stores recurring automations, how they land in sessions, and why their metadata stays private except for a narrow local adoption age gate.
 type: note
 status: current
-area: hra
+area: oompa
 tags:
   - codex
   - schedules
@@ -15,7 +15,7 @@ relations:
 
 # Codex scheduled tasks (automations) ground truth
 
-Ground truth for the local adoption age-gate integration. The original protocol probe used HRA's then-pinned Codex CLI `0.149.0` and generated its app-server JSON schema with `codex app-server generate-json-schema --experimental`; current compatibility remains governed by the repository's reviewed pin and schema digests. Every task name, prompt, thread id, path, and timestamp below is synthetic and carries no operator data.
+Ground truth for the local adoption age-gate integration. The original protocol probe used Oompa's then-pinned Codex CLI `0.149.0` and generated its app-server JSON schema with `codex app-server generate-json-schema --experimental`; current compatibility remains governed by the repository's reviewed pin and schema digests. Every task name, prompt, thread id, path, and timestamp below is synthetic and carries no operator data.
 
 ## What exists: "automations" (kind `heartbeat`)
 
@@ -96,7 +96,7 @@ Searched the generated schema (`codex app-server generate-json-schema --out ... 
 - There **is** a different, non-overlapping `ScheduledTask*` type family (`ScheduledTaskSummary { key, name, prompt, schedule }`, `ScheduledTaskSchedule` = one of `HourlyScheduledTaskSchedule { intervalHours, days? }` / `DailyScheduledTaskSchedule { time }` / `WeekdaysScheduledTaskSchedule { time }` / `WeeklyScheduledTaskSchedule { days, time }`, `ScheduledTaskWeekday` = `MO..SU`), but it appears only as `PluginDetail.scheduledTasks` inside the response of `plugin/read`. This describes scheduled tasks a **plugin manifest declares it wants to register** (no thread/session id field at all), not a live per-user automation. It is a lookalike name, not the same feature; do not build the projection from it.
 - The only reachable RPC surface adjacent to "recurring work" is `plugin/list`, `plugin/read`, `plugin/search`, `plugin/install`, `plugin/installed`, `plugin/uninstall`, none of which return the user's actual automations.
 
-The inspected Desktop build kept schedule authority under the Codex home rather than its ordinary Chromium/Electron app-support state, and no launchd plist drove firing. Timing therefore appears owned by the running Desktop process, consistent with the jitter-salt file; that mechanism is an inference and not part of HRA's authority contract.
+The inspected Desktop build kept schedule authority under the Codex home rather than its ordinary Chromium/Electron app-support state, and no launchd plist drove firing. Timing therefore appears owned by the running Desktop process, consistent with the jitter-salt file; that mechanism is an inference and not part of Oompa's authority contract.
 
 ## Session-adoption trigger
 
@@ -105,7 +105,7 @@ mapping: a present, valid `heartbeat` record with an exact nonblank
 `target_thread_id` makes that Codex thread discoverable even when it falls
 outside the ordinary recent-session window. Both `ACTIVE` and `PAUSED` records
 count because pausing does not delete the task or its conversation binding;
-deletion or retargeting removes the trigger. HRA opens and locally parses the
+deletion or retargeting removes the trigger. Oompa opens and locally parses the
 bounded TOML document, but it never selects, retains, logs, returns, or projects
 `prompt`, `cwds`, or another ignored field. It reads no transcript for this
 decision.
@@ -121,27 +121,27 @@ that deadline, the pass yields no authority and a later pass retries. Exact-sour
 rechecks still decide whether an individual target has authority, so directory
 churn can delay discovery but cannot turn a stale offset into a positive claim.
 
-The automation is only an age-gate hint. HRA obtains the exact target through
+The automation is only an age-gate hint. Oompa obtains the exact target through
 metadata-only `thread/read`, without resuming it during discovery, and then
 requires the ordinary account, registered-project, timestamp, liveness,
 quiescence, collision, and exact-resume proofs. It re-reads the association
-around claim. The Codex Desktop task remains owned by Codex Desktop; HRA adopts
-its target conversation as an ordinary HRA session and does not convert the
-record into an HRA conversation task. Claude has no equivalent schedule source.
+around claim. The Codex Desktop task remains owned by Codex Desktop; Oompa adopts
+its target conversation as an ordinary Oompa session and does not convert the
+record into an Oompa conversation task. Claude has no equivalent schedule source.
 
 ## Privacy and sync boundary
 
-Codex Desktop automation data is private provider-home input. HRA may read the
+Codex Desktop automation data is private provider-home input. Oompa may read the
 minimum TOML association needed to waive only the recent-session age limit
 during personal-session discovery, then it rechecks that association around
-claim. The automation does not become an HRA schedule, and adoption does not
+claim. The automation does not become an Oompa schedule, and adoption does not
 create a public schedule origin marker.
 
 The encrypted device registry and app-facing scheduled-task list contain only
-ordinary HRA conversation tasks from HRA's session-task store. They never
+ordinary Oompa conversation tasks from Oompa's session-task store. They never
 contain a Desktop automation's id, name, RRULE, status, target thread, mapped
 session correlation, firing history, or SQLite timing fields. This remains true
-when the target conversation is adopted: native and adopted HRA task rows have
+when the target conversation is adopted: native and adopted Oompa task rows have
 the same public shape and no provider-home source field.
 
 After Desktop fires a task, its exact provider-generated heartbeat user

@@ -150,7 +150,7 @@ describe("terminal-safe CLI boundaries", () => {
     expect(human.read().stdout.length).toBeLessThan(16_384);
     expect(human.read().stdout).not.toContain("REMOTE_EVENT_SENTINEL_DO_NOT_RENDER");
 
-    const localPath = ["", "private", "tmp", "hra", "secret.json"].join("/");
+    const localPath = ["", "private", "tmp", "oompa", "secret.json"].join("/");
     const bearer = ["Bearer", "failure-secret-value-123456789"].join(" ");
     const failureSentinel = "FAILURE_DETAILS_SENTINEL_DO_NOT_RENDER";
     const failed = capture();
@@ -170,7 +170,7 @@ describe("terminal-safe CLI boundaries", () => {
     const parsedFailure = JSON.parse(failureOutput) as { error: { message: string } };
     expect(Object.keys((JSON.parse(failureOutput) as { error: Record<string, unknown> }).error).sort())
       .toEqual(["code", "message"]);
-    expect(parsedFailure.error.message).toBe("HRA could not complete the request safely.");
+    expect(parsedFailure.error.message).toBe("Oompa could not complete the request safely.");
     expect(parsedFailure.error.message).not.toContain(localPath);
     expect(failureOutput.length).toBeLessThan(2_048);
     expect(failureOutput).not.toContain(failureSentinel);
@@ -187,7 +187,7 @@ describe("terminal-safe CLI boundaries", () => {
       },
     })).toBe(1);
     const thrownFailure = JSON.parse(thrown.read().stdout) as { error: { message: string } };
-    expect(thrownFailure.error.message).toBe("HRA could not complete the request safely.");
+    expect(thrownFailure.error.message).toBe("Oompa could not complete the request safely.");
     expect(thrown.read().stdout).not.toContain(localPath);
     expect(thrown.read().stdout).not.toContain("failure-secret-value-123456789");
     expect(thrown.read().stderr).toBe("");
@@ -286,7 +286,7 @@ describe("terminal-safe CLI boundaries", () => {
     expect(human.read().stdout).toBe("");
     expect(human.read().stderr).toContain("Projection recovery can preserve an unsynced transcript gap.");
     expect(human.read().stderr).toContain(
-      "hra sync projection recover 'My local session' --acknowledge-gap --idempotency-key",
+      "oompa sync projection recover 'My local session' --acknowledge-gap --idempotency-key",
     );
 
     const json = capture();
@@ -400,7 +400,7 @@ describe("terminal-safe CLI boundaries", () => {
       "session",
     ]);
     expect(firstOutput.data.sameKeyReplay.command).toBe(
-      `hra sync projection recover sess_1234567890abcdef1234567890abcdef --acknowledge-gap --idempotency-key ${key} --json`,
+      `oompa sync projection recover sess_1234567890abcdef1234567890abcdef --acknowledge-gap --idempotency-key ${key} --json`,
     );
     expect(first.target.read().stdout).not.toContain("projectionRevision");
     expect(first.target.read().stdout).not.toContain("boundaryTailDigest");
@@ -439,7 +439,7 @@ describe("terminal-safe CLI boundaries", () => {
     expect(human.target.read().stdout).toContain("Boundary head: 41");
     expect(human.target.read().stdout).toContain("Gap remains visible: yes");
     expect(human.target.read().stdout).toContain("Encrypted cloud history was preserved");
-    expect(human.target.read().stdout).toContain(`Same-key replay: hra sync projection recover sess_1234567890abcdef1234567890abcdef --acknowledge-gap --idempotency-key ${key}`);
+    expect(human.target.read().stdout).toContain(`Same-key replay: oompa sync projection recover sess_1234567890abcdef1234567890abcdef --acknowledge-gap --idempotency-key ${key}`);
   });
 
   test("projection recovery redacts failures and preserves the generated key after a lost response", async () => {
@@ -473,7 +473,7 @@ describe("terminal-safe CLI boundaries", () => {
     expect(Object.keys((JSON.parse(rejectedText) as { error: Record<string, unknown> }).error).sort())
       .toEqual(["code", "message"]);
     expect((JSON.parse(rejectedText) as { error: { message: string } }).error.message)
-      .toBe("HRA could not complete the request safely.");
+      .toBe("Oompa could not complete the request safely.");
     expect(rejectedText).not.toContain(localPath);
     expect(rejectedText).not.toContain("projection-secret-token-123456789");
     expect(rejectedText).not.toContain("baselineCompletedTurns");
@@ -550,7 +550,7 @@ describe("terminal-safe CLI boundaries", () => {
       data: Record<string, unknown>;
     };
     expect(response.data).toMatchObject({
-      nextCommand: "hra sync status --json",
+      nextCommand: "oompa sync status --json",
       phase: "rejected",
       rejectionCode: "HEAD_CHANGED",
       session: "sess_1234567890abcdef1234567890abcdef",
@@ -601,7 +601,7 @@ describe("terminal-safe CLI boundaries", () => {
       }),
     })).toBe(1);
     expect((JSON.parse(target.read().stdout) as { error: { message: string } }).error.message)
-      .toBe("HRA could not complete the request safely.");
+      .toBe("Oompa could not complete the request safely.");
     expect(target.read().stdout).not.toContain(secret);
     expect(target.read().stdout).not.toContain("device_private123");
     expect(target.read().stdout).not.toContain("user_private1234");

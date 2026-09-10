@@ -4,7 +4,7 @@ import type { Value } from "convex/values";
 import { convexTest } from "convex-test";
 
 import type { CanonicalAuthEmail } from "../src/cloud/authCredentials";
-import { buildHraAttentionEmailBody } from "./attentionEmail";
+import { buildOompaAttentionEmailBody } from "./attentionEmail";
 import {
   attentionNotificationQuotaReservations,
   attentionNotificationRetryRecoveryMs,
@@ -27,8 +27,8 @@ import {
 } from "./quota";
 import schema from "./schema";
 import {
-  hraAttentionResendApiKeyEnvironmentName,
-  hraResendApiKeyEnvironmentName,
+  oompaAttentionResendApiKeyEnvironmentName,
+  oompaResendApiKeyEnvironmentName,
 } from "./resendApiKey";
 import { modules } from "./test.setup";
 
@@ -95,26 +95,26 @@ const drainAccountDeletion = makeFunctionReference<"mutation", Args, unknown>(
   "accountDeletion:drain",
 );
 
-const hmacEnvironmentName = "HRA_AUTH_HMAC_SECRET";
+const hmacEnvironmentName = "OOMPA_AUTH_HMAC_SECRET";
 let originalHmacSecret: string | undefined;
 let originalAttentionKey: string | undefined;
 let originalAuthKey: string | undefined;
 
 beforeEach(() => {
   originalHmacSecret = process.env[hmacEnvironmentName];
-  originalAttentionKey = process.env[hraAttentionResendApiKeyEnvironmentName];
-  originalAuthKey = process.env[hraResendApiKeyEnvironmentName];
+  originalAttentionKey = process.env[oompaAttentionResendApiKeyEnvironmentName];
+  originalAuthKey = process.env[oompaResendApiKeyEnvironmentName];
   process.env[hmacEnvironmentName] = "attention-notification-test-secret-at-least-thirty-two-characters";
-  process.env[hraAttentionResendApiKeyEnvironmentName] = "re_notice_test";
-  process.env[hraResendApiKeyEnvironmentName] = "re_auth_test";
+  process.env[oompaAttentionResendApiKeyEnvironmentName] = "re_notice_test";
+  process.env[oompaResendApiKeyEnvironmentName] = "re_auth_test";
 });
 
 afterEach(() => {
   if (originalHmacSecret === undefined) Reflect.deleteProperty(process.env, hmacEnvironmentName);
   else process.env[hmacEnvironmentName] = originalHmacSecret;
   for (const [name, value] of [
-    [hraAttentionResendApiKeyEnvironmentName, originalAttentionKey],
-    [hraResendApiKeyEnvironmentName, originalAuthKey],
+    [oompaAttentionResendApiKeyEnvironmentName, originalAttentionKey],
+    [oompaResendApiKeyEnvironmentName, originalAuthKey],
   ] as const) {
     if (value === undefined) Reflect.deleteProperty(process.env, name);
     else process.env[name] = value;
@@ -407,7 +407,7 @@ async function insertHistoricalClaims(
       await ctx.db.patch(id, {
         delivery: {
           attemptCount: 1,
-          body: { text: "HRA needs your attention", version: 1 },
+          body: { text: "Oompa needs your attention", version: 1 },
           bodyDigest: "1".repeat(64),
           claimedAt,
           deadline: now + 60_000,
@@ -574,7 +574,7 @@ describe("inactive hosted attention notification runtime", () => {
       await ctx.db.query("attentionNotificationOutbox").unique());
     if (pending === null) throw new Error("missing reservation fixture");
     const now = Date.now();
-    const body = buildHraAttentionEmailBody(Array.from({ length: 8 }, () => ({
+    const body = buildOompaAttentionEmailBody(Array.from({ length: 8 }, () => ({
       interactionKind: "permission_approval" as const,
       sessionPublicId: "s".repeat(96),
     })));

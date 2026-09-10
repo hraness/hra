@@ -67,7 +67,7 @@ const defaultPollIntervalMs = 1_000;
 // serialized 15-second provider reads, and a 20-second local scheduling margin.
 const autonomousUsageProofDeadlineMs = 120_000;
 const memoryFaultDeadlineMs = 60_000;
-const commandProofContent = "hra-live-tool-progress";
+const commandProofContent = "oompa-live-tool-progress";
 const expectedPermissionName = "network";
 const expectedQuestionId = "acceptance_choice";
 
@@ -687,7 +687,7 @@ const createEmptyOwnedProtectedDocument = (directoryPath: string): string => {
     throw new ScenarioFailure("protected_document_path_invalid");
   }
   const owner = currentOwnerUid();
-  const fileName = `.hra-live-login-handoff-${randomUUID()}.json`;
+  const fileName = `.oompa-live-login-handoff-${randomUUID()}.json`;
   let parentDescriptor: number | undefined;
   let documentDescriptor: number | undefined;
   try {
@@ -748,7 +748,7 @@ const createCommandProof = (
     throw new ScenarioFailure("command_proof_directory_invalid");
   }
   const owner = currentOwnerUid();
-  const fileName = `.hra-live-command-proof-${randomUUID()}.txt`;
+  const fileName = `.oompa-live-command-proof-${randomUUID()}.txt`;
   let parentDescriptor: number | undefined;
   let proofDescriptor: number | undefined;
   let parentIdentity: FileIdentity;
@@ -911,7 +911,7 @@ const readDeviceLoginDocument = (
   ) {
     throw new ScenarioFailure("device_login_account_changed");
   }
-  if (document.cancelCommand !== `hra account login-cancel ${expectedAccountId}`) {
+  if (document.cancelCommand !== `oompa account login-cancel ${expectedAccountId}`) {
     throw new ScenarioFailure("device_login_cancel_command_changed");
   }
   return {
@@ -3071,8 +3071,8 @@ export async function runLiveAcceptanceScenario(
   const memorySessionB = await startSession(deviceB, accountBOnDeviceB, projectB);
   const commandProofA = prepareCommandProof(deviceA.projectDirectory);
   const commandProofB = prepareCommandProof(deviceA.projectDirectory);
-  const markerA = `hra-live-user-input-${randomUUID()}`;
-  const markerB = `hra-live-permission-${randomUUID()}`;
+  const markerA = `oompa-live-user-input-${randomUUID()}`;
+  const markerB = `oompa-live-permission-${randomUUID()}`;
   const turnA = await sendSessionTurn(
     deviceA,
     sessionA,
@@ -3241,7 +3241,7 @@ export async function runLiveAcceptanceScenario(
     pairA.device.publicId,
     turnA,
   );
-  const remoteMarker = `hra-live-remote-${randomUUID()}`;
+  const remoteMarker = `oompa-live-remote-${randomUUID()}`;
   const remoteReceipt = remoteCommandBindingSchema.parse(await executeJson(deviceB, [
     "remote",
     "send",
@@ -3560,7 +3560,7 @@ export class TerminalLiveAcceptanceOperator implements LiveAcceptanceScenarioOpe
   }
 
   async progress(step: string): Promise<void> {
-    process.stderr.write(`hra live acceptance: ${step}\n`);
+    process.stderr.write(`oompa live acceptance: ${step}\n`);
   }
 
   async protectedDocument(

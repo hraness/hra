@@ -36,13 +36,13 @@ export const productPreviewDefinition = defineDirect({
   parseWorld: parseProductPreviewWorld,
   defaultScenario: "product.overview",
   scenarios: PRODUCT_PREVIEW_VIEWS.map((view) => ({
-    id: `product.${view}`, title: `HRA ${view}`, route: "/" as const,
+    id: `product.${view}`, title: `Oompa ${view}`, route: "/" as const,
     world: { version: 1, view } satisfies ProductWorld,
     runtime: { schema: "direct.runtime/v1" as const, nowMs: PRODUCT_PREVIEW_NOW, nextOperation: 1, acceleration: 1 },
   })),
   coverage: [{
     key: "product.real-app-screens", mode: "fixture",
-    claim: "The actual HRA grid, conversation, closed-choice question, and settings screens render fictional observations through production reducers and components. These inert examples prove rendering only. Provider commands, authentication, credentials, storage, file reads, and live network IO are refused. They do not prove a connected account, accepted decisions, saved changes, or hosted activation.",
+    claim: "The actual Oompa grid, conversation, closed-choice question, and settings screens render fictional observations through production reducers and components. These inert examples prove rendering only. Provider commands, authentication, credentials, storage, file reads, and live network IO are refused. They do not prove a connected account, accepted decisions, saved changes, or hosted activation.",
     scenarios: ["product.overview", "product.conversation", "product.question", "product.settings"],
   }],
 });

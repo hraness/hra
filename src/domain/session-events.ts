@@ -50,7 +50,7 @@ export const sessionEventCursorWireSchema = z.string()
     return match !== null
       && canonicalBase64Url(match[1] ?? "")
       && canonicalBase64Url(match[2] ?? "");
-  }, "Must be one canonical HRA cursor envelope");
+  }, "Must be one canonical Oompa cursor envelope");
 
 export const sessionEventCursorPayloadSchema = z.object({
   version: z.literal(1),
@@ -91,7 +91,7 @@ const planStepSchema = z.object({
  */
 export const SESSION_EVENT_USER_MESSAGE_MAX_CHARACTERS = 16_384;
 
-/** Who authored the message HRA sent to the provider. */
+/** Who authored the message Oompa sent to the provider. */
 export const sessionMessageActorSchema = z.enum([
   "human",
   "automation",
@@ -160,7 +160,7 @@ export const sessionEventBodySchema = z.discriminatedUnion("type", [
     summary: toolSummarySchema.optional(),
   }).strict(),
   /**
-   * The text HRA sent to the provider, its source class, and the optional
+   * The text Oompa sent to the provider, its source class, and the optional
    * byte-free attachment manifest. Attachment contents remain in local blob
    * custody and are deliberately not embedded in an event.
    */
@@ -168,7 +168,7 @@ export const sessionEventBodySchema = z.discriminatedUnion("type", [
     type: z.literal("user_message"),
     // Null until the provider names the turn the message opened.
     turnId: publicProviderIdentifierSchema.nullable(),
-    // Stable HRA operation identity used to make transcript finalization
+    // Stable Oompa operation identity used to make transcript finalization
     // idempotent after a lost response or a post-provider storage failure.
     sourceId: boundedText(200).optional(),
     actor: sessionMessageActorSchema,
@@ -490,9 +490,9 @@ export const advanceSessionEventContinuity = (
   }
 
   for (const event of page.events) {
-    // A session may legitimately change account: `hra session switch` moves
+    // A session may legitimately change account: `oompa session switch` moves
     // one conversation to another provider, and the target provider may be a
-    // different HRA account. Continuity therefore follows the account rather
+    // different Oompa account. Continuity therefore follows the account rather
     // than pinning it; one page still never mixes two accounts.
     accountId = event.accountId;
 

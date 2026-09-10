@@ -17,7 +17,7 @@ import {
   DevStaleBuildError,
   DevTransientBuildError,
   DevUncollectedProcessError,
-  HRA_DEV_CACHE_LIMITS,
+  OOMPA_DEV_CACHE_LIMITS,
   parseDevSecurityHeaders,
   prepareDevCache,
   prepareLockedDevCache,
@@ -119,7 +119,7 @@ function inputArtifact(path: string, contents: string) {
   };
 }
 
-const rootPackageBytes = Buffer.from('{"name":"@hraness/hra","version":"0.6.1"}\n');
+const rootPackageBytes = Buffer.from('{"name":"@hraness/oompa","version":"0.6.1"}\n');
 
 function markerEvidence(
   environment: Readonly<Record<string, string | undefined>> = {},
@@ -166,13 +166,13 @@ function deferred<T>() {
 
 describe("compiled development input epochs", () => {
   test("separates source changes from restart-only dependency changes", async () => {
-    const root = await temporaryRoot("hra-dev-input-");
+    const root = await temporaryRoot("oompa-dev-input-");
     await mkdir(join(root, "src"), { mode: 0o700 });
     await writeFile(join(root, "package.json"), rootPackageBytes, { mode: 0o600 });
     await writeFile(join(root, "dependency.json"), "dependency-a\n", { mode: 0o600 });
     await writeFile(join(root, "src", "app.tsx"), "export const app = 'a';\n", { mode: 0o600 });
     let environment: AppSourceEnvironmentSnapshot = {
-      HRA_RELEASE_COMMIT: null,
+      OOMPA_RELEASE_COMMIT: null,
       VERCEL: null,
       VERCEL_GIT_COMMIT_SHA: null,
     };
@@ -194,7 +194,7 @@ describe("compiled development input epochs", () => {
     const dependencyChanged = await snapshotDevInputs(spec);
     expect(dependencyChanged.dependencyEpoch).not.toBe(first.dependencyEpoch);
     expect(dependencyChanged.sourceEpoch).toBe(sourceChanged.sourceEpoch);
-    environment = { HRA_RELEASE_COMMIT: "a".repeat(40), VERCEL: null, VERCEL_GIT_COMMIT_SHA: null };
+    environment = { OOMPA_RELEASE_COMMIT: "a".repeat(40), VERCEL: null, VERCEL_GIT_COMMIT_SHA: null };
     const markerChanged = await snapshotDevInputs(spec);
     expect(markerChanged.dependencyEpoch).toBe(dependencyChanged.dependencyEpoch);
     expect(markerChanged.sourceEpoch).not.toBe(dependencyChanged.sourceEpoch);
@@ -202,7 +202,7 @@ describe("compiled development input epochs", () => {
   });
 
   test("rejects descriptor drift and linked source files", async () => {
-    const root = await temporaryRoot("hra-dev-input-negative-");
+    const root = await temporaryRoot("oompa-dev-input-negative-");
     await mkdir(join(root, "src"), { mode: 0o700 });
     await writeFile(join(root, "package.json"), rootPackageBytes, { mode: 0o600 });
     await writeFile(join(root, "dependency.json"), "dependency\n", { mode: 0o600 });
@@ -214,7 +214,7 @@ describe("compiled development input epochs", () => {
         logicalPath: "dependency/tool.json",
         sha256: "0".repeat(64),
       }, { absolutePath: join(root, "package.json"), logicalPath: "repository/package.json" }],
-      sourceEnvironment: () => ({ HRA_RELEASE_COMMIT: null, VERCEL: null, VERCEL_GIT_COMMIT_SHA: null }),
+      sourceEnvironment: () => ({ OOMPA_RELEASE_COMMIT: null, VERCEL: null, VERCEL_GIT_COMMIT_SHA: null }),
       sourceFiles: [],
       sourceRoots: [{ absolutePath: join(root, "src"), logicalPrefix: "source/src" }],
     })).rejects.toThrow(/Dependency artifact changed/u);
@@ -224,7 +224,7 @@ describe("compiled development input epochs", () => {
         { absolutePath: join(root, "dependency.json"), logicalPath: "dependency/tool.json" },
         { absolutePath: join(root, "package.json"), logicalPath: "repository/package.json" },
       ],
-      sourceEnvironment: () => ({ HRA_RELEASE_COMMIT: null, VERCEL: null, VERCEL_GIT_COMMIT_SHA: null }),
+      sourceEnvironment: () => ({ OOMPA_RELEASE_COMMIT: null, VERCEL: null, VERCEL_GIT_COMMIT_SHA: null }),
       sourceFiles: [],
       sourceRoots: [{ absolutePath: join(root, "src"), logicalPrefix: "source/src" }],
     })).rejects.toThrow(/hardlinked/u);
@@ -557,21 +557,21 @@ describe("immutable development routing", () => {
       ["graphs/client/assets/foundation.css", `@layer base{:root{--label:${label}}}\n`],
       ["graphs/client/assets/main.js", `globalThis.__label=${JSON.stringify(label)};\n`],
       ["index.html", '<!doctype html><link rel="stylesheet" href="./graphs/client/assets/foundation.css"><link rel="stylesheet" href="./stylex.css"><script type="module" src="./graphs/client/assets/main.js"></script>\n'],
-      ["stylex.css", `@layer components.hra-app.priority1{.x{color:${label}}}\n`],
+      ["stylex.css", `@layer components.oompa-app.priority1{.x{color:${label}}}\n`],
     ]);
     for (const [path, contents] of files) await writeFile(join(directory, ...path.split("/")), contents, { mode: 0o600 });
     return { artifacts: await readAppInventory(directory), sourceMarker };
   }
 
   async function revisionFixture(label: string): Promise<DevPublishedRevision> {
-    const directory = await temporaryRoot(`hra-dev-revision-${label}-`);
+    const directory = await temporaryRoot(`oompa-dev-revision-${label}-`);
     const { artifacts, sourceMarker } = await writeRevisionTree(directory, label);
     return { artifacts, directory, revision: appDevRevision(artifacts, sourceMarker), sourceMarker };
   }
 
   for (const boundary of ["before-start", "snapshot-1", "snapshot-2", "snapshot-3", "snapshot-4", "durable-commit", "live-commit"] as const) {
     test(`publication cancellation preserves prior revision at ${boundary}`, async () => {
-      const root = await temporaryRoot("hra-dev-cancel-publication-");
+      const root = await temporaryRoot("oompa-dev-cancel-publication-");
       const cache = await prepareDevCache(root);
       const input = snapshot("publication");
       const lock = acquireAppPublicationLock(cache.root);
@@ -740,7 +740,7 @@ describe("immutable development routing", () => {
   });
 
   test("publishes one append-only receipt and recovers its latest immutable revision", async () => {
-    const root = await temporaryRoot("hra-dev-publication-");
+    const root = await temporaryRoot("oompa-dev-publication-");
     const cache = await prepareDevCache(root);
     const run = "build-fixture";
     const runDirectory = join(cache.runsDirectory, run);
@@ -810,7 +810,7 @@ describe("immutable development routing", () => {
   });
 
   test("refuses a source-marker epoch change at the final receipt join", async () => {
-    const root = await temporaryRoot("hra-dev-marker-stale-");
+    const root = await temporaryRoot("oompa-dev-marker-stale-");
     const cache = await prepareDevCache(root);
     const run = "build-marker-stale";
     const publicDirectory = join(cache.runsDirectory, run, "public");
@@ -820,7 +820,7 @@ describe("immutable development routing", () => {
     const changed = snapshot(
       "marker-stable",
       "dependency-a",
-      markerEvidence({ HRA_RELEASE_COMMIT: "a".repeat(40) }),
+      markerEvidence({ OOMPA_RELEASE_COMMIT: "a".repeat(40) }),
     );
     const candidate: DevBuildCandidate = {
       artifacts,
@@ -1171,7 +1171,7 @@ describe("pure development process collection", () => {
 describe("cache, security, and owned process boundaries", () => {
   for (const outcome of ["success", "cancelled", "uncertain"] as const) {
     test(`owner exit preserves correct publication admission after ${outcome} collection`, async () => {
-      const root = await temporaryRoot(`hra-dev-durable-${outcome}-`);
+      const root = await temporaryRoot(`oompa-dev-durable-${outcome}-`);
       const buildModule = new URL("./build-app.ts", import.meta.url).href;
       const devModule = new URL("./dev-app.ts", import.meta.url).href;
       const childIdentity = join(root, "child-pid.json");
@@ -1329,7 +1329,7 @@ describe("cache, security, and owned process boundaries", () => {
   }
 
   test("loads only bounded known cache state and preserves unknown entries", async () => {
-    const root = await temporaryRoot("hra-dev-cache-");
+    const root = await temporaryRoot("oompa-dev-cache-");
     const cache = await prepareDevCache(root);
     expect(cache.nextSequence).toBe(1);
     expect(cache.revisions.size).toBe(0);
@@ -1339,7 +1339,7 @@ describe("cache, security, and owned process boundaries", () => {
   });
 
   test("acquires the dev owner before inspecting retained publication state", async () => {
-    const root = await temporaryRoot("hra-dev-lock-before-recovery-");
+    const root = await temporaryRoot("oompa-dev-lock-before-recovery-");
     const cache = await prepareDevCache(root);
     const first = acquireAppPublicationLock(cache.root);
     try {
@@ -1354,13 +1354,13 @@ describe("cache, security, and owned process boundaries", () => {
   test("reserves capacity before a build can allocate", () => {
     expect(() => assertDevCacheCapacity({ bytes: 0, directories: 1, files: 0, revisions: 0, runs: 0 })).not.toThrow();
     expect(() => assertDevCacheCapacity({
-      bytes: HRA_DEV_CACHE_LIMITS.bytes - HRA_DEV_CACHE_LIMITS.reserveBytes + 1,
+      bytes: OOMPA_DEV_CACHE_LIMITS.bytes - OOMPA_DEV_CACHE_LIMITS.reserveBytes + 1,
       directories: 1,
       files: 0,
       revisions: 0,
       runs: 0,
     })).toThrow(/retained compiled-development cache/u);
-    expect(() => assertDevCacheCapacity({ bytes: 0, directories: 1, files: 0, revisions: HRA_DEV_CACHE_LIMITS.revisions, runs: 0 })).toThrow();
+    expect(() => assertDevCacheCapacity({ bytes: 0, directories: 1, files: 0, revisions: OOMPA_DEV_CACHE_LIMITS.revisions, runs: 0 })).toThrow();
   });
 
   test("binds development headers to the production policy", async () => {
@@ -1381,7 +1381,7 @@ describe("cache, security, and owned process boundaries", () => {
 
   for (const cancellation of ["without waiting for readiness (20 ms)", "after parent and grandchild readiness"] as const) {
     test(`terminates and reaps its exact child when a build is aborted ${cancellation}`, async () => {
-      const root = await temporaryRoot("hra-dev-child-");
+      const root = await temporaryRoot("oompa-dev-child-");
       const controller = new AbortController();
       const parentReady = join(root, "parent-ready.json");
       const grandchildReady = join(root, "grandchild-ready.json");
@@ -1448,7 +1448,7 @@ describe("cache, security, and owned process boundaries", () => {
   }
 
   test("reaps the owned process group when spawn bookkeeping rejects", async () => {
-    const root = await temporaryRoot("hra-dev-child-bookkeeping-");
+    const root = await temporaryRoot("oompa-dev-child-bookkeeping-");
     const controller = new AbortController();
     let pid: number | undefined;
     let collectionProved = false;

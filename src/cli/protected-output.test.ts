@@ -46,7 +46,7 @@ afterEach(() => {
 });
 
 const protectedFile = (): Readonly<{ path: string; root: string }> => {
-  const root = mkdtempSync(join(realpathSync(tmpdir()), "hra-protected-output-"));
+  const root = mkdtempSync(join(realpathSync(tmpdir()), "oompa-protected-output-"));
   roots.push(root);
   chmodSync(root, 0o700);
   const path = join(root, "login.json");
@@ -58,7 +58,7 @@ const protectedFile = (): Readonly<{ path: string; root: string }> => {
 const document = (label = "Personal"): DeviceLoginDocument => ({
   accountId: `acct_${"1".repeat(32)}`,
   accountLabel: label,
-  cancelCommand: `hra account login-cancel acct_${"1".repeat(32)}`,
+  cancelCommand: `oompa account login-cancel acct_${"1".repeat(32)}`,
   method: "device_code",
   type: "codex_device_login",
   userCode: "PRIVATE-CODE",
@@ -377,7 +377,7 @@ describe("protected login output", () => {
       idempotencyKey,
       login: {
         loginId: "provider-login",
-        next: `hra account login-cancel ${account.id}`,
+        next: `oompa account login-cancel ${account.id}`,
         status: "pending",
         userCode: "PRIVATE-CODE",
         verificationUrl: "https://example.test/device?private=1",
@@ -391,7 +391,7 @@ describe("protected login output", () => {
       idempotencyKey,
       login: {
         loginId: "provider-login",
-        next: `hra account login-cancel ${account.id}`,
+        next: `oompa account login-cancel ${account.id}`,
         status: "pending",
       },
     }, { accountId: account.id, deviceCode: true, idempotencyKey })).toMatchObject({ kind: "pending_replay" });
@@ -418,7 +418,7 @@ describe("protected login output", () => {
         account,
         login: {
           loginId: `provider${String.fromCodePoint(0x2028)}login${String.fromCodePoint(0x2029)}`,
-          next: `hra account login-cancel ${account.id}`,
+          next: `oompa account login-cancel ${account.id}`,
           status: "pending" as const,
           userCode: "ABCD-EFGH",
           verificationUrl: "https://example.test/device",
@@ -428,7 +428,7 @@ describe("protected login output", () => {
         account: { ...account, id: `acct_${"2".repeat(32)}` },
         login: {
           loginId: "provider-login",
-          next: `hra account login-cancel acct_${"2".repeat(32)}`,
+          next: `oompa account login-cancel acct_${"2".repeat(32)}`,
           status: "pending" as const,
           userCode: "ABCD-EFGH",
           verificationUrl: "https://example.test/device",
@@ -438,7 +438,7 @@ describe("protected login output", () => {
         account: { ...account, state: "signed_out" as const },
         login: {
           loginId: "provider-login",
-          next: `hra account login-cancel ${account.id}`,
+          next: `oompa account login-cancel ${account.id}`,
           status: "pending" as const,
           userCode: "ABCD-EFGH",
           verificationUrl: "https://example.test/device",
@@ -448,7 +448,7 @@ describe("protected login output", () => {
         account,
         login: {
           loginId: "provider-login",
-          next: "hra account login-cancel acct_22222222222222222222222222222222",
+          next: "oompa account login-cancel acct_22222222222222222222222222222222",
           status: "pending" as const,
           userCode: "ABCD-EFGH",
           verificationUrl: "https://example.test/device",
@@ -458,7 +458,7 @@ describe("protected login output", () => {
         account,
         login: {
           loginId: "provider-login",
-          next: `hra account login-cancel ${account.id}`,
+          next: `oompa account login-cancel ${account.id}`,
           status: "pending" as const,
           userCode: "not a device code",
           verificationUrl: "https://example.test/device",
@@ -468,7 +468,7 @@ describe("protected login output", () => {
         account,
         login: {
           loginId: "provider-login",
-          next: `hra account login-cancel ${account.id}`,
+          next: `oompa account login-cancel ${account.id}`,
           status: "pending" as const,
           userCode: "ABCD-EFGH",
           verificationUrl: "http://attacker.example/device",

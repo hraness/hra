@@ -32,7 +32,12 @@ export {
   type ClaudeStreamInitialization,
   type ClaudeStreamClientOptions,
 } from "./client.ts";
-export { ClaudeError, type ClaudeFailureCode } from "./errors.ts";
+export {
+  ClaudeError,
+  IndeterminateClaudeEffectError,
+  type ClaudeEffectOperation,
+  type ClaudeFailureCode,
+} from "./errors.ts";
 export { ClaudeJsonLineDecoder } from "./jsonl.ts";
 export {
   CLAUDE_HOST_TOOL_BINDING_VERSION,
@@ -71,13 +76,17 @@ export {
 export {
   CLAUDE_PIN,
   CLAUDE_PIN_EFFORT,
+  CLAUDE_PIN_FALLBACK_MODEL,
   CLAUDE_PIN_MCP_PROTOCOL_VERSION,
   CLAUDE_PIN_MODEL,
+  CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY,
+  CLAUDE_NATIVE_FALLBACK_UNAVAILABLE_REASON,
   CLAUDE_PIN_REFUSED_EFFORTS,
   CLAUDE_PIN_SUPPORTED_EFFORTS,
   PINNED_CLAUDE_ARTIFACT_DIGESTS,
   PINNED_CLAUDE_EVIDENCE_DIGESTS,
   PINNED_CLAUDE_MATRIX_DIGESTS,
+  type ClaudeNativeFallbackCapability,
   type ClaudePinVersion,
 } from "./pin.ts";
 export {
@@ -121,6 +130,7 @@ export {
   type ClaudeUsage,
 } from "./protocol.ts";
 export {
+  buildPinnedClaudeRuntimeArgv,
   claudeSessionArgv,
   locateClaudeExecutable,
   resolvePinnedClaudeRuntime,

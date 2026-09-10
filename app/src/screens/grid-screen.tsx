@@ -399,7 +399,7 @@ export function GridScreen({
 
   const hint = starting
     ? startTarget === null || project === null
-      ? "No machine here can start a session yet. Sign an account in on a machine, add a project, and leave `hra remote allow device-commands` set."
+      ? "No machine here can start a session yet. Sign an account in on a machine, add a project, and leave `oompa remote allow device-commands` set."
       : sessionStartTargetHint(startTarget)
     : steerTarget === null
       ? "Nothing to send to yet."

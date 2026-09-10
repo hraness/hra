@@ -6,6 +6,8 @@ import {
   claudeInteractionKind,
   sanitizeClaudeText,
   type ClaudeCanUseTool,
+  type ClaudeRateLimitObservation,
+  type ClaudeResultAccounting,
   type ClaudeStreamEvent,
   type ClaudeUsage,
 } from "./protocol.ts";
@@ -80,13 +82,36 @@ export type ClaudeFact =
       readonly resultText: string;
     }
   | { readonly type: "tokenUsageUpdated"; readonly turnId: string; readonly usage: ClaudeUsage }
-  | { readonly type: "rateLimitObserved"; readonly status: string }
+  | {
+      readonly type: "rateLimitObserved";
+      readonly turnId: string;
+      readonly observationRevision: number;
+      readonly observedAt: number;
+      readonly receivedAt: number;
+      readonly sourceEventId: string;
+      readonly sourceEventDigest: string;
+      readonly quota: ClaudeRateLimitObservation;
+    }
+  | {
+      readonly type: "usageAccountingObserved";
+      readonly turnId: string;
+      readonly observationRevision: number;
+      readonly observedAt: number;
+      readonly receivedAt: number;
+      readonly sourceEventId: string;
+      readonly sourceEventDigest: string;
+      readonly accounting: ClaudeResultAccounting;
+    }
   | {
       readonly type: "providerError";
       readonly turnId: string | null;
       readonly code: string;
       readonly message: string;
       readonly terminal: boolean;
+    }
+  | {
+      readonly type: "providerDisconnected";
+      readonly reason: "eof" | "protocol_fault";
     }
   | { readonly type: "protocolNotice"; readonly event: string };
 
@@ -99,23 +124,38 @@ type SubagentState = {
 
 const NICKNAME_BYTES = 256;
 const ROLE_BYTES = 128;
+export const CLAUDE_USAGE_EVENTS_PER_TURN_LIMIT = 1_024;
+
+type UsageEventRevision = Readonly<{
+  sourceEventDigest: string;
+  observationRevision: number;
+  observedAt: number;
+  receivedAt: number;
+}>;
 
 const safeLabel = (value: string, bytes: number): string =>
   boundClaudeText(sanitizeClaudeText(value), bytes);
 
 /**
- * Turns a stream of parsed Claude stream-json events into HRA facts. It owns
+ * Turns a stream of parsed Claude stream-json events into Oompa facts. It owns
  * exactly one concern: which turn, item, and subagent a line belongs to.
  *
- * The runtime tells it when a turn begins (HRA writes the `user` line, so HRA
+ * The runtime tells it when a turn begins (Oompa writes the `user` line, so Oompa
  * mints the turn id); Claude's own `result` line ends it.
  */
 export class ClaudeDeltaAssembler {
   #activeTurnId: string | null = null;
   #providerSessionId: string | null = null;
   #interrupted = false;
+  #nextQuotaObservationRevision = 1;
+  readonly #quotaEventRevisions = new Map<string, UsageEventRevision>();
   readonly #subagents = new Map<string, SubagentState>();
   readonly #subagentsByToolUse = new Map<string, string>();
+  readonly #now: () => number;
+
+  constructor(options: Readonly<{ now?: () => number }> = {}) {
+    this.#now = options.now ?? Date.now;
+  }
 
   get activeTurnId(): string | null {
     return this.#activeTurnId;
@@ -125,7 +165,7 @@ export class ClaudeDeltaAssembler {
     return this.#providerSessionId;
   }
 
-  /** HRA mints the turn id when it writes the turn's first `user` line. */
+  /** Oompa mints the turn id when it writes the turn's first `user` line. */
   beginTurn(turnId: string): readonly ClaudeFact[] {
     if (this.#activeTurnId !== null) {
       throw new ClaudeError("INVALID_INPUT", "A Claude turn is already in flight");
@@ -135,12 +175,14 @@ export class ClaudeDeltaAssembler {
     }
     this.#activeTurnId = turnId;
     this.#interrupted = false;
+    this.#nextQuotaObservationRevision = 1;
+    this.#quotaEventRevisions.clear();
     this.#subagents.clear();
     this.#subagentsByToolUse.clear();
     return [{ turnId, type: "turnStarted" }];
   }
 
-  /** Records that HRA asked the runtime to stop, so `result` reads as interrupted. */
+  /** Records that Oompa asked the runtime to stop, so `result` reads as interrupted. */
   markInterrupted(): void {
     if (this.#activeTurnId !== null) this.#interrupted = true;
   }
@@ -165,6 +207,12 @@ export class ClaudeDeltaAssembler {
   apply(event: ClaudeStreamEvent): readonly ClaudeFact[] {
     switch (event.type) {
       case "session_init":
+        if (
+          this.#providerSessionId !== null
+          && this.#providerSessionId !== event.sessionId
+        ) {
+          return [{ event: "session_init/session_mismatch", type: "protocolNotice" }];
+        }
         this.#providerSessionId = event.sessionId;
         return [
           {
@@ -266,12 +314,44 @@ export class ClaudeDeltaAssembler {
       }
       case "control_cancel_request":
         return [{ requestId: event.requestId, type: "interactionCanceled" }];
-      case "rate_limit":
-        return [{ status: event.status, type: "rateLimitObserved" }];
+      case "rate_limit": {
+        const turnId = this.#activeTurnId;
+        if (turnId === null) {
+          return [{ event: "rate_limit_event/outside_turn", type: "protocolNotice" }];
+        }
+        if (this.#providerSessionId === null) {
+          return [{ event: "rate_limit_event/session_uninitialized", type: "protocolNotice" }];
+        }
+        if (event.sessionId !== this.#providerSessionId) {
+          return [{ event: "rate_limit_event/session_mismatch", type: "protocolNotice" }];
+        }
+        const revision = this.#quotaRevision(event.eventId, event.sourceEventDigest);
+        if (revision === "conflict") {
+          return [{ event: "rate_limit_event/conflicting_duplicate", type: "protocolNotice" }];
+        }
+        if (revision === "limit") {
+          return [{ event: "rate_limit_event/observation_limit", type: "protocolNotice" }];
+        }
+        return [{
+          observationRevision: revision.observationRevision,
+          observedAt: revision.observedAt,
+          quota: event.quota,
+          receivedAt: revision.receivedAt,
+          sourceEventDigest: event.sourceEventDigest,
+          sourceEventId: event.eventId,
+          turnId,
+          type: "rateLimitObserved",
+        }];
+      }
       case "result": {
         const turnId = this.#activeTurnId;
-        this.#providerSessionId = event.sessionId;
         if (turnId === null) return [];
+        if (this.#providerSessionId === null) {
+          return [{ event: "result/session_uninitialized", type: "protocolNotice" }];
+        }
+        if (event.sessionId !== this.#providerSessionId) {
+          return [{ event: "result/session_mismatch", type: "protocolNotice" }];
+        }
         this.#activeTurnId = null;
         const status = this.#interrupted
           ? "interrupted"
@@ -280,6 +360,26 @@ export class ClaudeDeltaAssembler {
             : "completed";
         this.#interrupted = false;
         const facts: ClaudeFact[] = [{ turnId, type: "tokenUsageUpdated", usage: event.usage }];
+        let usageTail: ClaudeFact;
+        if (
+          event.accounting !== null
+          && event.eventId !== null
+          && event.sourceEventDigest !== null
+        ) {
+          const observedAt = this.#now();
+          usageTail = {
+            accounting: event.accounting,
+            observationRevision: 1,
+            observedAt,
+            receivedAt: observedAt,
+            sourceEventDigest: event.sourceEventDigest,
+            sourceEventId: event.eventId,
+            turnId,
+            type: "usageAccountingObserved",
+          };
+        } else {
+          usageTail = { event: "result/accounting_invalid", type: "protocolNotice" };
+        }
         if (event.isError) {
           facts.push({
             code: boundClaudeText(sanitizeClaudeText(event.terminalReason ?? "error"), 128),
@@ -300,6 +400,7 @@ export class ClaudeDeltaAssembler {
             turnId,
             type: "turnSummary",
           },
+          usageTail,
         );
         return facts;
       }
@@ -308,6 +409,31 @@ export class ClaudeDeltaAssembler {
       case "ignored":
         return [];
     }
+  }
+
+  #quotaRevision(
+    sourceEventId: string,
+    sourceEventDigest: string,
+  ): UsageEventRevision | "conflict" | "limit" {
+    const seen = this.#quotaEventRevisions.get(sourceEventId);
+    if (seen !== undefined) {
+      return seen.sourceEventDigest === sourceEventDigest
+        ? seen
+        : "conflict";
+    }
+    if (this.#quotaEventRevisions.size >= CLAUDE_USAGE_EVENTS_PER_TURN_LIMIT) return "limit";
+    const observationRevision = this.#nextQuotaObservationRevision;
+    if (!Number.isSafeInteger(observationRevision)) return "limit";
+    this.#nextQuotaObservationRevision += 1;
+    const observedAt = this.#now();
+    const admitted = {
+      observationRevision,
+      observedAt,
+      receivedAt: observedAt,
+      sourceEventDigest,
+    };
+    this.#quotaEventRevisions.set(sourceEventId, admitted);
+    return admitted;
   }
 
   #assistant(

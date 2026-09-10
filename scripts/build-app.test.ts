@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 import { afterAll, describe, expect, test } from "bun:test";
 import { getDesignPaletteTheme } from "@hraness/design-kit";
+import fc from "fast-check";
 
 import { appDevelopmentConfig, appProductionConfig } from "../app/vite.config.ts";
 import {
@@ -26,7 +27,9 @@ afterAll(async () => {
 });
 
 const entry = "/fixture/app/src/main.tsx";
-const shell = '<!doctype html>\n<html lang="en" data-palette="catppuccin" data-theme="dark"><head><meta name="viewport" content="width=device-width, viewport-fit=cover"><meta name="color-scheme" content="dark light"><meta name="referrer" content="no-referrer"><meta name="robots" content="noindex, nofollow"><title>HRA</title></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>\n';
+const faviconBytes = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Oompa">\n  <circle cx="32" cy="32" r="27" fill="#f58220" stroke="#ad430d" stroke-width="2"/>\n</svg>\n');
+const faviconTag = `<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,${faviconBytes.toString("base64")}">`;
+const shell = `<!doctype html>\n<html lang="en" data-palette="catppuccin" data-theme="dark"><head>${faviconTag}<meta name="viewport" content="width=device-width, viewport-fit=cover"><meta name="color-scheme" content="dark light"><meta name="referrer" content="no-referrer"><meta name="robots" content="noindex, nofollow"><title>Oompa</title></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>\n`;
 const chunk = (name: string, code: string, isEntry = false) => ({
   code, facadeModuleId: isEntry ? entry : null, fileName: `assets/${name}.js`, isEntry, map: null, type: "chunk",
 });
@@ -38,7 +41,7 @@ const bundle = () => ({ output: [
   { fileName: "assets/appearance-jkl.js", source: appearance.source, type: "asset" },
 ] });
 const hashed = (path: string, content: string) => ({ bytes: Buffer.byteLength(content), path, sha256: appSha256(content) });
-const packageBytes = Buffer.from('{"name":"@hraness/hra","version":"0.6.1"}\n');
+const packageBytes = Buffer.from('{"name":"@hraness/oompa","version":"0.6.1"}\n');
 const sourceMarker = (environment: Readonly<Record<string, string | undefined>> = process.env): AppSourceMarkerEvidence =>
   createAppSourceMarkerEvidence(packageBytes, environment);
 const markerBytes = (evidence: AppSourceMarkerEvidence): string => `${JSON.stringify(evidence.marker, null, 2)}\n`;
@@ -55,7 +58,7 @@ const complete = () => {
       hashed("index.html", prepareAppShell(shell, graph).replace(APP_CSS_PLACEHOLDER, "/stylex.css")),
     ],
     compilerSha256: "a".repeat(64), finalCss: hashed("stylex.css", "@layer components.hraness-stylex.priority1{.x{color:red}}"),
-    generationId: "hra-app", graphs: [{ id: "client", receiptSha256: "b".repeat(64) }],
+    generationId: "oompa-app", graphs: [{ id: "client", receiptSha256: "b".repeat(64) }],
     kind: "hraness-stylex-complete-generation", packages: [{ manifestSha256: "e".repeat(64), name: "@hraness/design-kit", version: "0.6.0" }, { manifestSha256: "c".repeat(64), name: "@hraness/ui", version: "0.5.6" }],
     planSha256: "d".repeat(64), schemaVersion: 2, state: "complete",
     unionPolicySha256: "1ceced1f1bf6359413ca6425ede61e1fdae272b897f4455c2347e2431d75caa1",
@@ -144,6 +147,55 @@ describe("app graph output values", () => {
 });
 
 describe("registered authored shell", () => {
+  test("admits only the exact Oompa favicon bytes already held by the shell", async () => {
+    const bytes = await readFile(new URL("../site/favicon.svg", import.meta.url));
+    const tag = `<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,${bytes.toString("base64")}">`;
+    expect(bytes).toEqual(faviconBytes);
+    expect(tag).toBe(faviconTag);
+    const authored = await readFile(new URL("../app/index.html", import.meta.url), "utf8");
+    const graph = snapshotAppGraph(bundle(), entry, appearance);
+    for (const mount of ["/", "./"] as const) {
+      expect(prepareAppShell(authored, graph, mount)).toContain(tag);
+    }
+  });
+
+  test("refuses missing, duplicate, alternate, inert, or active-payload favicons", () => {
+    const graph = snapshotAppGraph(bundle(), entry, appearance);
+    const active = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"><script>alert(1)</script></svg>').toString("base64");
+    for (const changed of [
+      shell.replace(faviconTag, ""),
+      shell.replace(faviconTag, faviconTag + faviconTag),
+      shell.replace(faviconTag, `${faviconTag}<link rel="icon" href="/favicon.svg">`),
+      shell.replace(faviconTag, '<link rel="icon" href="https://example.test/favicon.svg">'),
+      shell.replace(faviconTag, faviconTag.replace('rel="icon"', 'rel="shortcut icon"')),
+      shell.replace(faviconTag, faviconTag.replace('type="image/svg+xml"', 'type="image/png"')),
+      shell.replace(faviconTag, faviconTag.replace('href="data:', 'href="/favicon.svg" href="data:')),
+      shell.replace(faviconTag, faviconTag.replace(">", ' onload="alert(1)">')),
+      shell.replace(faviconTag, faviconTag.replace("base64,", "base64,\n")),
+      shell.replace(faviconTag, faviconTag.replace(faviconBytes.toString("base64"), active)),
+      shell.replace(faviconTag, faviconTag.replace(faviconBytes.toString("base64"), faviconBytes.toString("base64") + "=")),
+      shell.replace(faviconTag, `<!--${faviconTag}-->`),
+      shell.replace(faviconTag, `<title>${faviconTag}</title>`),
+      shell.replace(faviconTag, `<meta content='${faviconTag}'>`),
+      shell.replace(faviconTag, "").replace("</body>", `${faviconTag}</body>`),
+      shell.replace("<head>", "<textarea><head>"),
+    ]) expect(() => prepareAppShell(changed, graph)).toThrow();
+  });
+
+  test("rejects every sampled changed favicon byte under the unchanged finite asset contract", () => {
+    const graph = snapshotAppGraph(bundle(), entry, appearance);
+    fc.assert(fc.property(
+      fc.integer({ min: 0, max: faviconBytes.length - 1 }),
+      fc.integer({ min: 1, max: 255 }),
+      (offset, delta) => {
+        const changed = Buffer.from(faviconBytes);
+        changed[offset] = (changed[offset] ?? 0) ^ delta;
+        const altered = shell.replace(faviconBytes.toString("base64"), changed.toString("base64"));
+        expect(() => prepareAppShell(altered, graph)).toThrow("Unreviewed app favicon bytes");
+      },
+    ), { seed: 20_260_913, numRuns: 64 });
+  });
+
   test("retains metadata and every other authored byte with foundation before recipes", () => {
     const graph = snapshotAppGraph(bundle(), entry, appearance);
     const rendered = prepareAppShell(shell, graph);
@@ -170,7 +222,7 @@ describe("registered authored shell", () => {
       shell.replace("<head>", '<head><style>a{color:red}</style>'),
       shell.replace("<head>", '<head><base href="/elsewhere/">'),
       shell.replace('<div id="root">', '<div style="color:red" id="root">'),
-      shell.replace("HRA", APP_CSS_PLACEHOLDER),
+      shell.replace("Oompa", APP_CSS_PLACEHOLDER),
       shell.replace('data-palette="catppuccin"', 'data-palette="gruvbox"'),
       shell.replace('data-theme="dark"', 'data-theme="light"'),
       shell.replace('<html lang="en"', '<html class="other" lang="en"'),
@@ -203,7 +255,7 @@ describe("closed public projection and prior publication provenance", () => {
     expect(source).not.toContain(entry);
     expect(source).not.toContain("inputs");
     expect(source).not.toContain("rootDirectory");
-    expect(source).toContain('"path":".well-known/hra-app.json"');
+    expect(source).toContain('"path":".well-known/oompa-app.json"');
   });
 
   test("rejects foreign generations, graph/package metadata, artifact drift and leak paths", () => {
@@ -262,20 +314,20 @@ describe("closed public projection and prior publication provenance", () => {
       artifacts: output.filter(({ path }) => path !== APP_SOURCE_MARKER_PATH),
     })).toThrow();
     expect(() => createAppSourceMarkerEvidence(
-      Buffer.from('{"name":"hra","version":"0.6.1"}\n'),
+      Buffer.from('{"name":"oompa","version":"0.6.1"}\n'),
       {},
-    )).toThrow(/HRA root package/u);
-    for (const HRA_RELEASE_COMMIT of ["x".repeat(257), "safe\u0000hidden"]) {
+    )).toThrow(/Oompa root package/u);
+    for (const OOMPA_RELEASE_COMMIT of ["x".repeat(257), "safe\u0000hidden"]) {
       expect(() => createAppSourceMarkerEvidence(packageBytes, {
-        HRA_RELEASE_COMMIT,
+        OOMPA_RELEASE_COMMIT,
         VERCEL: "1",
         VERCEL_GIT_COMMIT_SHA: "e".repeat(40),
       })).toThrow(/Unsafe app source environment value/u);
     }
     const changedEvidence = structuredClone(evidence) as unknown as {
-      environment: { HRA_RELEASE_COMMIT: string | null };
+      environment: { OOMPA_RELEASE_COMMIT: string | null };
     };
-    changedEvidence.environment.HRA_RELEASE_COMMIT = "a".repeat(40);
+    changedEvidence.environment.OOMPA_RELEASE_COMMIT = "a".repeat(40);
     expect(() => parseAppPublication({
       ...(source as Record<string, unknown>),
       sourceMarker: changedEvidence,
@@ -326,7 +378,7 @@ async function writePublicTree(
 function publicationFixture(previous: true): Promise<PriorPublicationFixture>;
 function publicationFixture(previous: false): Promise<FreshPublicationFixture>;
 async function publicationFixture(previous: boolean): Promise<PublicationFixture> {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-build-publication-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-build-publication-")));
   temporaryRoots.push(root);
   const app = join(root, "app");
   const control = join(root, "control");
@@ -387,7 +439,7 @@ describe("durable app publication", () => {
       const bytes = await readFile(join(fixture.control, APP_PROCESS_CUSTODY_FILE));
       expect(bytes.byteLength).toBeLessThanOrEqual(512);
       expect(JSON.parse(bytes.toString())).toEqual({
-        kind: "hra-app-process-custody", run: "build-fixture", schemaVersion: 1, token: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        kind: "oompa-app-process-custody", run: "build-fixture", schemaVersion: 1, token: expect.stringMatching(/^[a-f0-9]{64}$/u),
       });
       expect(await readFile(join(dev, APP_PROCESS_CUSTODY_FILE))).toEqual(bytes);
       for (const directory of [fixture.control, dev]) {
@@ -457,12 +509,12 @@ describe("durable app publication", () => {
   });
 
   test("fences initial source-marker inputs across the compiler interval before marker emission", async () => {
-    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-build-source-inputs-")));
+    const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-build-source-inputs-")));
     temporaryRoots.push(root);
     await writeFile(join(root, "package.json"), packageBytes, { flag: "wx", mode: 0o600 });
     const evidence = sourceMarker();
     await expect(revalidateAppSourceMarkerInputs(root, evidence)).resolves.toBeUndefined();
-    await writeFile(join(root, "package.json"), '{"name":"@hraness/hra","version":"0.6.1"} \n');
+    await writeFile(join(root, "package.json"), '{"name":"@hraness/oompa","version":"0.6.1"} \n');
     await expect(revalidateAppSourceMarkerInputs(root, evidence)).rejects.toThrow(/source-marker inputs changed/u);
     await writeFile(join(root, "package.json"), packageBytes);
     const changedCommit = evidence.marker.source.commit === "a".repeat(40)
@@ -471,7 +523,7 @@ describe("durable app publication", () => {
     await expect(revalidateAppSourceMarkerInputs(
       root,
       evidence,
-      { HRA_RELEASE_COMMIT: changedCommit },
+      { OOMPA_RELEASE_COMMIT: changedCommit },
     )).rejects.toThrow(/source-marker inputs changed/u);
     await expect(lstat(join(root, APP_SOURCE_MARKER_PATH))).rejects.toMatchObject({ code: "ENOENT" });
   });
@@ -491,9 +543,9 @@ describe("durable app publication", () => {
       fixture.root,
       fixture.publish,
       fixture.sourceMarker,
-      { HRA_RELEASE_COMMIT: changedCommit },
+      { OOMPA_RELEASE_COMMIT: changedCommit },
     )).rejects.toThrow(/source-marker inputs changed/u);
-    await writeFile(join(fixture.root, "package.json"), '{ "name":"@hraness/hra", "version":"0.6.1" }\n');
+    await writeFile(join(fixture.root, "package.json"), '{ "name":"@hraness/oompa", "version":"0.6.1" }\n');
     await expect(withPublicationLock(fixture.control, async (lock) => {
       await commitAppPublication({
         appDirectory: fixture.app,

@@ -75,7 +75,7 @@ const emailB = "b".repeat(64);
 const codeA = "c".repeat(64);
 const codeB = "d".repeat(64);
 const hourMs = 60 * 60 * 1_000;
-const hmacEnvironmentName = "HRA_AUTH_HMAC_SECRET";
+const hmacEnvironmentName = "OOMPA_AUTH_HMAC_SECRET";
 const priorHmacSecret = process.env[hmacEnvironmentName];
 
 beforeAll(() => {
@@ -83,7 +83,7 @@ beforeAll(() => {
 });
 
 afterAll(() => {
-  if (priorHmacSecret === undefined) delete process.env.HRA_AUTH_HMAC_SECRET;
+  if (priorHmacSecret === undefined) delete process.env.OOMPA_AUTH_HMAC_SECRET;
   else process.env[hmacEnvironmentName] = priorHmacSecret;
 });
 

@@ -15,14 +15,15 @@ import type {
   PinnedClaudeRuntime,
 } from "../claude/index";
 import { ClaudeDeltaAssembler } from "../claude/assembler";
+import { ClaudeError, IndeterminateClaudeEffectError } from "../claude/errors";
+import { CLAUDE_PIN, CLAUDE_PIN_EFFORT, CLAUDE_PIN_MODEL, CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY } from "../claude/pin";
+import { presetRequirements, PresetProviderMismatchError } from "../domain/presets";
 import {
   CLAUDE_HOST_TOOL_SESSION_HISTORY_LIMIT,
   digestClaudeHostToolInvocation,
 } from "../claude/index";
-import type { HraHostToolCall } from "../codex/protocol";
-import { CLAUDE_PIN, CLAUDE_PIN_EFFORT, CLAUDE_PIN_MODEL } from "../claude/pin";
-import { HRA_SESSION_PREAMBLE } from "../domain/hra-preamble";
-import { PresetProviderMismatchError, presetRequirements } from "../domain/presets";
+import type { OompaHostToolCall } from "../codex/protocol";
+import { OOMPA_SESSION_PREAMBLE } from "../domain/oompa-preamble";
 import { effectiveClaudeRuntimeProfileSchema } from "../domain/runtime-profile";
 import { ensurePrivateDirectory } from "../storage/paths";
 import {
@@ -36,8 +37,8 @@ import {
   type ProfileAuthority,
 } from "./ports";
 
-const CONFIG_DIR = "/var/hra/profiles/acct/claude";
-const PROJECT_ROOT = "/var/hra/projects/demo";
+const CONFIG_DIR = "/var/oompa/profiles/acct/claude";
+const PROJECT_ROOT = "/var/oompa/projects/demo";
 const ADOPTED_PROVIDER_THREAD_ID = "726b1b3d-ed97-4b55-9904-e58fa7d7eb45";
 const ADOPTED_TITLE = "Existing Claude conversation";
 const PROCESS_IDENTITY: ClaudeProcessIdentity = Object.freeze({
@@ -45,14 +46,17 @@ const PROCESS_IDENTITY: ClaudeProcessIdentity = Object.freeze({
   pidDomain: "darwin",
   procStart: "Fri Sep  4 12:00:00 2026",
 });
-const HOST_TOOL_PRIVATE_ROOT = "/var/hra/private";
-const HOST_TOOL_SOCKET = "/var/hra/private/callback.sock";
+const HOST_TOOL_PRIVATE_ROOT = "/var/oompa/private";
+const HOST_TOOL_SOCKET = "/var/oompa/private/callback.sock";
 
 const authority: ProfileAuthority = {
-  codexHome: "/var/hra/profiles/acct/codex",
-  desktopUserData: "/var/hra/profiles/acct/desktop",
+  codexHome: "/var/oompa/profiles/acct/codex",
+  desktopUserData: "/var/oompa/profiles/acct/desktop",
   generation: 3,
   id: "acct_00000000000000000000000000000000",
+  provider: "claude",
+  providerAccountId: "pact_00000000000000000000000000000000",
+  bindingGeneration: 1,
 };
 
 class FakeClaudeProcess implements ClaudeProcess {
@@ -63,7 +67,8 @@ class FakeClaudeProcess implements ClaudeProcess {
   readonly #ignoreTerm: boolean;
   readonly #ignoreKill: boolean;
   onTerminate: (() => void) | undefined;
-  onWrite: (() => void) | undefined;
+  onWrite: (() => void | Promise<void>) | undefined;
+  afterStdoutChunkRead: (() => void) | undefined;
   #push: ((chunk: Uint8Array) => void) | undefined;
   #finish: (() => void) | undefined;
   #resolveExit: ((code: number) => void) | undefined;
@@ -85,11 +90,12 @@ class FakeClaudeProcess implements ClaudeProcess {
     let done = false;
     this.#push = (chunk) => { queue.push(chunk); waiter?.(); waiter = undefined; };
     this.#finish = () => { done = true; waiter?.(); waiter = undefined; };
+    const chunkRead = (): void => { this.afterStdoutChunkRead?.(); };
     this.stdout = {
       async *[Symbol.asyncIterator]() {
         for (;;) {
           const chunk = queue.shift();
-          if (chunk !== undefined) { yield chunk; continue; }
+          if (chunk !== undefined) { yield chunk; chunkRead(); continue; }
           if (done) return;
           await new Promise<void>((resolve) => { waiter = resolve; });
         }
@@ -103,7 +109,12 @@ class FakeClaudeProcess implements ClaudeProcess {
 
   async write(bytes: Uint8Array): Promise<void> {
     this.written.push(new TextDecoder().decode(bytes));
-    this.onWrite?.();
+    const pending = this.onWrite?.();
+    if (pending !== undefined) await pending;
+  }
+
+  endOutput(): void {
+    this.#finish?.();
   }
 
   terminate(): void {
@@ -205,6 +216,7 @@ const runtime: PinnedClaudeRuntime = {
   effort: CLAUDE_PIN_EFFORT,
   executablePath: "/usr/local/bin/claude",
   model: CLAUDE_PIN_MODEL,
+  nativeFallback: CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY,
   version: CLAUDE_PIN,
 };
 
@@ -237,8 +249,8 @@ const harness = (options: {
   processIdentity?: ClaudeProcessIdentity | "reject";
   processIgnoresKill?: boolean;
   processIgnoresTerm?: boolean;
-  hostTool?: (call: HraHostToolCall) => ClaudeHostToolPublicResult | Promise<ClaudeHostToolPublicResult>;
-  hostToolResponseWritten?: (call: HraHostToolCall) => void | Promise<void>;
+  hostTool?: (call: OompaHostToolCall) => ClaudeHostToolPublicResult | Promise<ClaudeHostToolPublicResult>;
+  hostToolResponseWritten?: (call: OompaHostToolCall) => void | Promise<void>;
   processFactory?: ConstructorParameters<typeof PinnedClaudeRuntimeManager>[0]["processFactory"];
   readAuthStatus?: ClaudeAuthStatusReader;
   resolveRuntime?: ConstructorParameters<typeof PinnedClaudeRuntimeManager>[0]["resolveRuntime"];
@@ -274,13 +286,13 @@ const harness = (options: {
       },
       ...(options.hostTool === undefined
         ? {}
-        : { hraHostTool: (_authority: ProfileAuthority, call: HraHostToolCall) => options.hostTool?.(call) ?? "" }),
+        : { oompaHostTool: (_authority: ProfileAuthority, call: OompaHostToolCall) => options.hostTool?.(call) ?? "" }),
       ...(options.hostToolResponseWritten === undefined
         ? {}
         : {
-            hraHostToolResponseWritten: (
+            oompaHostToolResponseWritten: (
               _authority: ProfileAuthority,
-              call: HraHostToolCall,
+              call: OompaHostToolCall,
             ) => options.hostToolResponseWritten?.(call),
           }),
     },
@@ -319,7 +331,7 @@ const harness = (options: {
       }
       return process;
     },
-    ...(options.readAuthStatus === undefined ? {} : { readAuthStatus: options.readAuthStatus }),
+    readAuthStatus: options.readAuthStatus ?? (async () => ({ signedIn: false })),
     resolveRuntime: options.resolveRuntime ?? (async () => runtime),
   });
   return { bindingAuthority, facts, launches, launchedRuntimes, manager, processes };
@@ -390,7 +402,151 @@ const startTurn = async (
   return turn.turnId;
 };
 
+const expectFencedClaudeWrite = async (
+  manager: PinnedClaudeRuntimeManager,
+  providerThreadId: string,
+  process: FakeClaudeProcess,
+): Promise<void> => {
+  // A frame fence is not invented process exit: truthful local projection
+  // remains readable, but neither a fresh turn nor a correctly targeted steer
+  // may cross that same process's writer again.
+  const projection = await manager.readSession({ authority, providerThreadId, detail: false, signal: signal() });
+  const writes = [...process.written];
+  await expect(projection.activeTurnId === undefined
+    ? startTurn(manager, providerThreadId, "A fresh key cannot reopen the writer")
+    : manager.steer({
+        activeTurnId: projection.activeTurnId, authority, clientMessageId: "later-exact-steer",
+        message: "A fresh key cannot reopen the writer", providerThreadId, signal: signal(),
+      })).rejects.toMatchObject({ code: "INDETERMINATE_EFFECT" });
+  expect(process.written).toEqual(writes);
+};
+
 describe("pinned Claude runtime manager", () => {
+  test("retains the exact child after an observer-local cleanup join is refused", async () => {
+    let closeError: unknown;
+    let observedResult!: () => void;
+    const resultObserved = new Promise<void>((resolve) => { observedResult = resolve; });
+    const value = harness({
+      onFact: async (factAuthority, fact) => {
+        if (fact.type === "turnStarted") {
+          try {
+            await value.manager.endSession({
+              authority: factAuthority, providerThreadId: fact.providerThreadId, signal: signal(),
+            });
+          } catch (error: unknown) { closeError = error; }
+        }
+        if (fact.type === "turnSummary") observedResult();
+      },
+    });
+    try {
+      const providerThreadId = await startSession(value.manager);
+      const turnId = await startTurn(value.manager, providerThreadId, "Keep exact cleanup custody");
+      expect(closeError).toMatchObject({ code: "INVALID_INPUT" });
+      const process = value.processes[0];
+      if (process === undefined) throw new Error("expected the exact child");
+      expect(process.signals).toEqual([]);
+      await expect(value.manager.readSessionProcessIdentity({ authority, providerThreadId, signal: signal() }))
+        .resolves.toEqual(PROCESS_IDENTITY);
+      await expect(value.manager.observeSession({ authority, providerThreadId, signal: signal() }))
+        .rejects.toBeInstanceOf(ClaudeSessionObservationError);
+      await expect(startSession(value.manager)).rejects.toThrow("still unjoined");
+      expect(value.processes).toHaveLength(1);
+      process.emit({
+        type: "result", session_id: providerThreadId, subtype: "success", is_error: false,
+        result: "Actual result remains observable", duration_ms: 1,
+        usage: { input_tokens: 1, output_tokens: 2 },
+      });
+      await resultObserved;
+      expect(value.facts.filter((fact) => fact.type === "turnSummary"))
+        .toMatchObject([{ turnId, status: "completed", resultText: "Actual result remains observable" }]);
+      await value.manager.endSession({ authority, providerThreadId, signal: signal() });
+      expect(process.signals).toEqual(["SIGTERM"]);
+      await expect(value.manager.readSessionProcessIdentity({ authority, providerThreadId, signal: signal() }))
+        .rejects.toThrow("not running");
+      await startSession(value.manager);
+      expect(value.processes).toHaveLength(2);
+    } finally { await value.manager.close(); }
+  });
+
+  test("rejects another provider before reviewing or spawning Claude", async () => {
+    const { manager, processes } = harness();
+    await expect(manager.reviewSessionStart({
+      authority: {
+        ...authority,
+        provider: "codex",
+        providerAccountId: "acct_00000000000000000000000000000000",
+      },
+      fast: false,
+      preset: "fable-max",
+      requirement: presetRequirements["fable-max"],
+      projectRoot: PROJECT_ROOT,
+      signal: signal(),
+    })).rejects.toThrow("authority changed");
+    expect(processes).toHaveLength(0);
+    await manager.close();
+  });
+
+  test("keeps reviewed adoption identity separate from readiness and rejects a retired identity read", async () => {
+    let current = true;
+    let retireDuringRead = false;
+    let reads = 0;
+    const identity = {
+      accountId: "claude-account",
+      email: "claude@example.com",
+      organizationId: "claude-organization",
+      signedIn: true,
+    };
+    const { manager, processes } = harness({
+      isCurrent: () => current,
+      readAuthStatus: async () => {
+        reads += 1;
+        if (retireDuringRead) current = false;
+        return identity;
+      },
+    });
+    await expect(manager.readProviderAccountIdentity({ authority, signal: signal() }))
+      .resolves.toEqual(identity);
+    await expect(manager.readAccount({ authority, signal: signal() })).resolves.toEqual({
+      observedAt: 1_700_000_000_000,
+      readiness: "signed_in",
+    });
+    retireDuringRead = true;
+    await expect(manager.readProviderAccountIdentity({ authority, signal: signal() }))
+      .rejects.toMatchObject({ code: "AUTHORITY_STALE" });
+    await expect(manager.readProviderAccountIdentity({ authority, signal: signal() }))
+      .rejects.toMatchObject({ code: "AUTHORITY_STALE" });
+    expect(reads).toBe(3);
+    expect(processes).toHaveLength(0);
+    await manager.close();
+  });
+
+  test("reports unverified when the pinned runtime cannot be admitted for an auth observation", async () => {
+    let probed = false;
+    const manager = new PinnedClaudeRuntimeManager({
+      configHome: "isolated",
+      configDirFor: () => CONFIG_DIR,
+      isCurrent: () => true,
+      now: () => 1_700_000_000_123,
+      observer: { fact: () => undefined },
+      hostTools: {
+        bindingAuthority: new FakeClaudeBindingAuthority(),
+        callbackSocketPath: HOST_TOOL_SOCKET,
+        privateRoot: HOST_TOOL_PRIVATE_ROOT,
+      },
+      readAuthStatus: async () => {
+        probed = true;
+        return { signedIn: true };
+      },
+      resolveRuntime: async () => { throw new Error("not installed"); },
+    });
+    await expect(manager.readAccount({ authority, signal: signal() })).resolves.toEqual({
+      observedAt: 1_700_000_000_123,
+      readiness: "unverified",
+    });
+    expect(probed).toBe(false);
+    await manager.close();
+  });
+
   test.each(["account", "session review", "turn review"] as const)(
     "cancels an in-flight version probe during %s admission",
     async (operation) => {
@@ -459,13 +615,13 @@ describe("pinned Claude runtime manager", () => {
         return Promise.resolve({ signedIn });
       },
     });
-    expect(await manager.readAccount({ authority, signal: signal() })).toEqual({ signedIn: false });
+    expect(await manager.readAccount({ authority, signal: signal() })).toEqual({ readiness: "signed_out", observedAt: 1_700_000_000_000 });
     await startSession(manager);
     // A running process is not evidence that the isolated home is currently
     // authenticated; only Claude's own status command is authoritative.
-    expect(await manager.readAccount({ authority, signal: signal() })).toEqual({ signedIn: false });
+    expect(await manager.readAccount({ authority, signal: signal() })).toEqual({ readiness: "signed_out", observedAt: 1_700_000_000_000 });
     signedIn = true;
-    expect(await manager.readAccount({ authority, signal: signal() })).toEqual({ signedIn: true });
+    expect(await manager.readAccount({ authority, signal: signal() })).toEqual({ readiness: "signed_in", observedAt: 1_700_000_000_000 });
     expect(reads.map(({ configDir }) => configDir)).toEqual([
       CONFIG_DIR,
       CONFIG_DIR,
@@ -474,8 +630,76 @@ describe("pinned Claude runtime manager", () => {
     await manager.close();
   });
 
+  test("permits an exact initial-generation account observation but no session effect", async () => {
+    const initialAuthority = { ...authority, generation: 0 };
+    let current = true;
+    let statusReads = 0;
+    const { manager, processes } = harness({
+      isCurrent: (candidate) => current && candidate === initialAuthority,
+      readAuthStatus: async () => {
+        statusReads += 1;
+        return { signedIn: false };
+      },
+    });
+    await expect(manager.readAccount({ authority: initialAuthority, signal: signal() }))
+      .resolves.toEqual({ readiness: "signed_out", observedAt: 1_700_000_000_000 });
+    await expect(manager.reviewSessionStart({
+      authority: initialAuthority,
+      fast: false,
+      preset: "fable-max",
+      requirement: presetRequirements["fable-max"],
+      projectRoot: PROJECT_ROOT,
+      signal: signal(),
+    })).rejects.toMatchObject({ code: "AUTHORITY_STALE" });
+    current = false;
+    await expect(manager.readAccount({ authority: initialAuthority, signal: signal() }))
+      .rejects.toMatchObject({ code: "AUTHORITY_STALE" });
+    expect(statusReads).toBe(1);
+    expect(processes).toHaveLength(0);
+    await manager.close();
+  });
+
+  test("keeps malformed auth evidence unverified without swallowing custody failures", async () => {
+    const malformed = harness({
+      readAuthStatus: async () => { throw new ClaudeError("PROTOCOL_ERROR", "invalid status"); },
+    });
+    expect(await malformed.manager.readAccount({ authority, signal: signal() })).toEqual({
+      readiness: "unverified",
+      observedAt: 1_700_000_000_000,
+    });
+    await malformed.manager.close();
+
+    for (const code of ["CONFIG_DIR_MISMATCH", "PROCESS_EXITED", "TIMEOUT"] as const) {
+      const unsafe = harness({
+        readAuthStatus: async () => { throw new ClaudeError(code, "custody not proven"); },
+      });
+      await expect(unsafe.manager.readAccount({ authority, signal: signal() }))
+        .rejects.toMatchObject({ code });
+      await unsafe.manager.close();
+    }
+  });
+
+  test("requires the exact durable model and effort before admitting a review", async () => {
+    for (const requirement of [
+      { model: "claude-opus-4-6", effort: "max" as const },
+      { model: CLAUDE_PIN_MODEL, effort: "ultra" as const },
+    ]) {
+      const { manager, processes } = harness();
+      await expect(manager.reviewSessionStart({
+        authority,
+        fast: false,
+        preset: "fable-max",
+        requirement,
+        projectRoot: PROJECT_ROOT,
+        signal: signal(),
+      })).rejects.toMatchObject({ code: "UNSUPPORTED_CAPABILITY" });
+      expect(processes).toEqual([]);
+      await manager.close();
+    }
+  });
+
   test("refuses a Claude config directory symlinked across account custody before any launch", async () => {
-    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-claude-config-link-")));
+    const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-claude-config-link-")));
     try {
       const sourceRoot = join(root, "profiles", "source");
       const target = join(root, "profiles", "target", "claude-config");
@@ -518,7 +742,7 @@ describe("pinned Claude runtime manager", () => {
   });
 
   test("repairs owned permissive Claude config custody immediately before each launch", async () => {
-    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-claude-config-mode-")));
+    const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-claude-config-mode-")));
     try {
       const configDir = join(root, "claude-config");
       await mkdir(configDir, { mode: 0o700 });
@@ -560,7 +784,7 @@ describe("pinned Claude runtime manager", () => {
   });
 
   test("refuses a wrong-shaped Claude config path before status or runtime admission", async () => {
-    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-claude-config-shape-")));
+    const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-claude-config-shape-")));
     try {
       const configDir = join(root, "claude-config");
       await writeFile(configDir, "not a directory", { mode: 0o600 });
@@ -717,8 +941,8 @@ describe("pinned Claude runtime manager", () => {
   test("retains a post-launch authority failure until the exact child can be joined", async () => {
     const alternateAuthority: ProfileAuthority = {
       ...authority,
-      codexHome: "/var/hra/profiles/alternate/codex",
-      desktopUserData: "/var/hra/profiles/alternate/desktop",
+      codexHome: "/var/oompa/profiles/alternate/codex",
+      desktopUserData: "/var/oompa/profiles/alternate/desktop",
       generation: 1,
       id: "acct_11111111111111111111111111111111",
     };
@@ -973,6 +1197,7 @@ describe("pinned Claude runtime manager", () => {
       configHome: "isolated",
       inputFormat: "stream-json",
       model: CLAUDE_PIN_MODEL,
+      nativeFallback: CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY,
       observedAt: 1_700_000_000_000,
       outputFormat: "stream-json",
       permissionMode: "default",
@@ -1036,6 +1261,7 @@ describe("pinned Claude runtime manager", () => {
         terminal_reason: "completed",
         type: "result",
         usage: { input_tokens: 2, output_tokens: 4 },
+        uuid: "00000000-0000-4000-8000-000000000010",
       },
     );
     await settle();
@@ -1046,7 +1272,26 @@ describe("pinned Claude runtime manager", () => {
       "tokenUsageUpdated",
       "turnCompleted",
       "turnSummary",
+      "usageAccountingObserved",
     ]);
+    const accountingFact = facts[5];
+    if (accountingFact?.type !== "usageAccountingObserved") {
+      throw new Error("expected accounted terminal result");
+    }
+    expect(accountingFact).toMatchObject({
+      accounting: {
+        models: [],
+        tokens: { inputTokens: 2, outputTokens: 4 },
+        totalCostUsd: null,
+      },
+      observationRevision: 1,
+      observedAt: 1_700_000_000_000,
+      receivedAt: 1_700_000_000_000,
+      sourceEventId: "00000000-0000-4000-8000-000000000010",
+      turnId,
+      type: "usageAccountingObserved",
+    });
+    expect(accountingFact.sourceEventDigest).toMatch(/^[0-9a-f]{64}$/u);
     expect(facts.every((fact) => fact.providerThreadId === started.providerThreadId)).toBe(true);
     const observation = await manager.observeSession({
       authority,
@@ -1085,7 +1330,7 @@ describe("pinned Claude runtime manager", () => {
     expect(launches[0]?.argv).toEqual([
       ...runtime.argv,
       "--append-system-prompt",
-      HRA_SESSION_PREAMBLE.text,
+      OOMPA_SESSION_PREAMBLE.text,
       "--mcp-config",
       `${HOST_TOOL_PRIVATE_ROOT}/binding-1/mcp.json`,
       "--strict-mcp-config",
@@ -1276,7 +1521,7 @@ describe("pinned Claude runtime manager", () => {
       requirement: presetRequirements["fable-max"],
       projectRoot: PROJECT_ROOT,
       signal: signal(),
-    })).rejects.toThrow("no HRA fast mode");
+    })).rejects.toThrow("no Oompa fast mode");
     await manager.close();
   });
 
@@ -1309,7 +1554,7 @@ describe("pinned Claude runtime manager", () => {
     await mismatched.manager.close();
   });
 
-  test("maps every can_use_tool request onto its HRA interaction kind", async () => {
+  test("maps every can_use_tool request onto its Oompa interaction kind", async () => {
     const { facts, manager, processes } = harness();
     const providerThreadId = await startSession(manager);
     await startTurn(manager, providerThreadId, "work");
@@ -1357,7 +1602,7 @@ describe("pinned Claude runtime manager", () => {
 
     // Answering goes through the provider authority, which fences the exact
     // request the daemon recorded.
-    const bashAuthority = manager.interactionAuthority(providerThreadId, "r-bash");
+    const bashAuthority = manager.interactionAuthority(authority, providerThreadId, "r-bash");
     expect(typeof bashAuthority.connectionId).toBe("string");
     expect(bashAuthority).toMatchObject({
       itemId: "toolu_r-bash",
@@ -1395,7 +1640,7 @@ describe("pinned Claude runtime manager", () => {
 
     // A session-scoped grant is refused: Claude's control response can only
     // ever authorise this one tool use.
-    const editAuthority = manager.interactionAuthority(providerThreadId, "r-edit");
+    const editAuthority = manager.interactionAuthority(authority, providerThreadId, "r-edit");
     await expect(manager.resolveInteraction({
       authority,
       deadlineAt: 1_700_000_100_000,
@@ -1419,7 +1664,7 @@ describe("pinned Claude runtime manager", () => {
     });
 
     // A question is answered by id; the wire map is keyed by question text.
-    const askAuthority = manager.interactionAuthority(providerThreadId, "r-ask");
+    const askAuthority = manager.interactionAuthority(authority, providerThreadId, "r-ask");
     await manager.resolveInteraction({
       authority,
       deadlineAt: 1_700_000_100_000,
@@ -1452,7 +1697,7 @@ describe("pinned Claude runtime manager", () => {
       type: "control_request",
     });
     await settle();
-    const provider = manager.interactionAuthority(providerThreadId, "req-1");
+    const provider = manager.interactionAuthority(authority, providerThreadId, "req-1");
     const validated = await manager.validateInteractionTimeout({ authority, provider, signal: signal() });
     expect(validated.responseDigest).toMatch(/^[a-f0-9]{64}$/u);
     await manager.timeoutInteraction({ authority, provider, signal: signal() });
@@ -1494,6 +1739,161 @@ describe("pinned Claude runtime manager", () => {
     await manager.close();
   });
 
+  test.each(([
+    "start", "steer", "interrupt", "resolve", "timeout",
+  ] as const).flatMap((method) => ([
+    "before_write", "write_rejected", "after_write_aborted",
+  ] as const).map((phase) => ({ method, phase }))))(
+    "classifies the exact Claude write boundary: $method / $phase", async ({ method, phase }) => {
+      let interactionObserved!: () => void;
+      const observed = new Promise<void>((resolve) => { interactionObserved = resolve; });
+      const value = harness({ onFact: (_authority, fact) => {
+        if (fact.type === "interactionRequested") interactionObserved();
+      } });
+      try {
+        const providerThreadId = await startSession(value.manager);
+        const process = value.processes[0];
+        if (process === undefined) throw new Error("expected the exact child");
+        const invoke: (writeSignal: AbortSignal) => Promise<unknown> = await (async () => {
+          if (method === "start") {
+            const review = await value.manager.reviewTurnStart({
+              authority, fast: false, preset: "fable-max", requirement: presetRequirements["fable-max"],
+              projectRoot: PROJECT_ROOT, providerThreadId, signal: signal(),
+            });
+            return async (writeSignal: AbortSignal) => await value.manager.startTurn({
+              authority, clientMessageId: "boundary-start", message: "Start once", providerThreadId,
+              review, signal: writeSignal,
+            });
+          }
+          const activeTurnId = await startTurn(value.manager, providerThreadId, "Initial accepted turn");
+          if (method === "steer") return async (writeSignal: AbortSignal) => await value.manager.steer({
+            activeTurnId, authority, clientMessageId: "boundary-steer", message: "Steer once",
+            providerThreadId, signal: writeSignal,
+          });
+          if (method === "interrupt") return async (writeSignal: AbortSignal) => await value.manager.interrupt({
+            activeTurnId, authority, providerThreadId, signal: writeSignal,
+          });
+          process.emit({
+            request: {
+              display_name: "Bash", input: { command: "true" }, subtype: "can_use_tool",
+              tool_name: "Bash", tool_use_id: "toolu_boundary",
+            },
+            request_id: "boundary-request", type: "control_request",
+          });
+          await observed;
+          const provider = value.manager.interactionAuthority(authority, providerThreadId, "boundary-request");
+          if (method === "resolve") return async (writeSignal: AbortSignal) => await value.manager.resolveInteraction({
+            authority, deadlineAt: 1_700_000_100_000, kind: "command_approval", provider,
+            resolution: { decision: "once", kind: "approval_decision" }, signal: writeSignal,
+          });
+          return async (writeSignal: AbortSignal) => await value.manager.timeoutInteraction({
+            authority, provider, signal: writeSignal,
+          });
+        })();
+        const before = [...process.written];
+        const controller = new AbortController();
+        const cause = new Error("test-only exact Claude write boundary failure");
+        if (phase === "before_write") controller.abort(cause);
+        process.onWrite = () => {
+          if (phase === "write_rejected") throw cause;
+          if (phase === "after_write_aborted") controller.abort(cause);
+        };
+        const outcome = await invoke(controller.signal).then(() => null, (error: unknown) => error);
+        if (phase === "before_write") {
+          expect(outcome).toBe(cause);
+          expect(outcome).not.toBeInstanceOf(IndeterminateClaudeEffectError);
+          expect(process.written).toEqual(before);
+          await expect(value.manager.observeSession({ authority, providerThreadId, signal: signal() }))
+            .resolves.toMatchObject({ projection: { providerThreadId } });
+        } else {
+          const operation = method === "start" ? "turn/start"
+            : method === "steer" ? "turn/steer"
+              : method === "interrupt" ? "turn/interrupt" : "interaction/resolve";
+          expect(outcome).toBeInstanceOf(IndeterminateClaudeEffectError);
+          if (!(outcome instanceof IndeterminateClaudeEffectError)) throw new Error("expected typed uncertainty");
+          expect(outcome.code).toBe("INDETERMINATE_EFFECT");
+          expect(outcome.operation).toBe(operation);
+          expect(outcome.cause).toBe(cause);
+          expect(process.written).toHaveLength(before.length + 1);
+          await expectFencedClaudeWrite(value.manager, providerThreadId, process);
+        }
+        expect(process.terminated).toBe(false);
+        expect(value.processes).toEqual([process]);
+      } finally {
+        await value.manager.close();
+      }
+    },
+  );
+
+  test("classifies observer failure after an accepted Claude write as indeterminate", async () => {
+    const cause = new Error("test-only admitted fact delivery failure");
+    const value = harness({ onFact: (_authority, fact) => {
+      if (fact.type === "turnStarted") throw cause;
+    } });
+    try {
+      const providerThreadId = await startSession(value.manager);
+      const outcome = await startTurn(value.manager, providerThreadId, "Accepted before observer failure")
+        .then(() => null, (error: unknown) => error);
+      expect(outcome).toBeInstanceOf(IndeterminateClaudeEffectError);
+      if (!(outcome instanceof IndeterminateClaudeEffectError)) throw new Error("expected typed uncertainty");
+      expect(outcome.cause).toBe(cause);
+      expect(outcome.operation).toBe("turn/start");
+      const process = value.processes[0];
+      if (process === undefined) throw new Error("expected the exact child");
+      expect(process.written).toHaveLength(1);
+      expect(value.facts.filter((fact) => fact.type === "turnStarted")).toHaveLength(1);
+      await expectFencedClaudeWrite(value.manager, providerThreadId, process);
+    } finally {
+      await value.manager.close();
+    }
+  });
+
+  test.each(["accepted", "rejected"] as const)(
+    "retains an actual early Claude result across adapter write settlement: %s", async (disposition) => {
+      const value = harness();
+      try {
+        const providerThreadId = await startSession(value.manager);
+        const process = value.processes[0];
+        if (process === undefined) throw new Error("expected the exact child");
+        const cause = new Error("test-only rejection after an actual result");
+        process.onWrite = async () => {
+          process.onWrite = undefined;
+          const consumed = new Promise<void>((resolve) => {
+            process.afterStdoutChunkRead = () => { process.afterStdoutChunkRead = undefined; resolve(); };
+          });
+          process.emit({
+            type: "result", session_id: providerThreadId, subtype: "success", is_error: false,
+            result: "Actual early result", duration_ms: 1, usage: { input_tokens: 1, output_tokens: 2 },
+          });
+          await consumed;
+          if (disposition === "rejected") throw cause;
+        };
+        const outcome = await startTurn(value.manager, providerThreadId, "Complete while write settles")
+          .then((turnId) => ({ turnId }), (error: unknown) => ({ error }));
+        expect(process.written).toHaveLength(1);
+        expect(value.facts.filter((fact) => fact.type === "turnSummary"))
+          .toMatchObject([{ status: "completed", resultText: "Actual early result" }]);
+        expect(value.facts.filter((fact) => fact.type === "turnCompleted")).toHaveLength(1);
+        expect(value.facts.filter((fact) => fact.type === "turnStarted"))
+          .toHaveLength(disposition === "accepted" ? 1 : 0);
+        if (disposition === "accepted") {
+          expect("turnId" in outcome).toBe(true);
+          await expect(value.manager.observeSession({ authority, providerThreadId, signal: signal() }))
+            .resolves.toMatchObject({ projection: { status: "idle" } });
+        } else {
+          expect("error" in outcome).toBe(true);
+          if (!("error" in outcome) || !(outcome.error instanceof IndeterminateClaudeEffectError)) {
+            throw new Error("expected typed uncertainty");
+          }
+          expect(outcome.error.cause).toBe(cause);
+          await expectFencedClaudeWrite(value.manager, providerThreadId, process);
+        }
+      } finally {
+        await value.manager.close();
+      }
+    },
+  );
+
   test("fences every operation on the exact account authority", async () => {
     let current = true;
     const { manager } = harness({ isCurrent: () => current });
@@ -1512,6 +1912,58 @@ describe("pinned Claude runtime manager", () => {
       providerThreadId,
       signal: signal(),
     })).rejects.toThrow("another authority");
+    await manager.close();
+  });
+
+  test("drops a callback before mutating projection state after authority retirement", async () => {
+    let current = true;
+    const { facts, manager, processes } = harness({ isCurrent: () => current });
+    const providerThreadId = await startSession(manager);
+    const turnId = await startTurn(manager, providerThreadId, "keep running");
+    const process = processes[0];
+    if (process === undefined) throw new Error("expected one spawned process");
+    facts.length = 0;
+    current = false;
+    process.emit(
+      {
+        message: {
+          content: [{ text: "stale reply", type: "text" }],
+          id: "msg_stale",
+          model: CLAUDE_PIN_MODEL,
+          role: "assistant",
+          type: "message",
+        },
+        parent_tool_use_id: null,
+        session_id: "stale-session",
+        type: "assistant",
+      },
+      {
+        duration_ms: 1,
+        is_error: false,
+        num_turns: 1,
+        result: "stale reply",
+        session_id: "stale-session",
+        stop_reason: "end_turn",
+        terminal_reason: "completed",
+        type: "result",
+        usage: { input_tokens: 1, output_tokens: 1 },
+      },
+    );
+    await settle();
+    expect(facts).toEqual([]);
+
+    // Re-enable only to inspect the in-memory object. Real generations are
+    // monotonic; this proves the rejected callback did not mutate it first.
+    current = true;
+    const projection = await manager.readSession({
+      authority,
+      detail: true,
+      providerThreadId,
+      signal: signal(),
+    });
+    expect(projection.status).toBe("active");
+    expect(projection.activeTurnId).toBe(turnId);
+    expect(projection.messages?.map((message) => message.text)).toEqual(["keep running"]);
     await manager.close();
   });
 
@@ -1536,8 +1988,8 @@ describe("pinned Claude runtime manager", () => {
     await manager.close();
   });
 
-  test("rekeys an idle live session and its host binding across one shared generation", async () => {
-    const handled: HraHostToolCall[] = [];
+  test("rekeys an idle live session and its host binding across one exact provider generation", async () => {
+    const handled: OompaHostToolCall[] = [];
     const value = harness({
       hostTool: (call) => {
         handled.push(call);
@@ -1548,11 +2000,24 @@ describe("pinned Claude runtime manager", () => {
     const nextAuthority = { ...authority, generation: authority.generation + 1 };
     const bindingId = `clhb_${"1".padStart(32, "0")}`;
 
+    for (const invalidNext of [
+      { ...nextAuthority, provider: "codex" as const },
+      { ...nextAuthority, providerAccountId: `pact_${"f".repeat(32)}` },
+      { ...nextAuthority, bindingGeneration: authority.bindingGeneration + 1 },
+      { ...nextAuthority, codexHome: `${authority.codexHome}/changed` },
+      { ...nextAuthority, generation: authority.generation + 2 },
+    ]) {
+      expect(() => value.manager.rebindProfileAuthority({
+        expectedAuthority: authority,
+        nextAuthority: invalidNext,
+      })).toThrow("exactly one safe generation");
+    }
+    expect(value.bindingAuthority.rebinds).toEqual([]);
     value.manager.rebindProfileAuthority({
-      expectedGeneration: authority.generation,
-      nextGeneration: nextAuthority.generation,
-      profileId: authority.id,
+      expectedAuthority: authority,
+      nextAuthority,
     });
+    value.manager.rebindProfileAuthority({ expectedAuthority: authority, nextAuthority });
     expect(value.bindingAuthority.rebinds).toEqual([{
       bindingId,
       expectedIdentity: {
@@ -1610,10 +2075,39 @@ describe("pinned Claude runtime manager", () => {
       turnId: turn.turnId,
     });
     expect(() => value.manager.rebindProfileAuthority({
-      expectedGeneration: nextAuthority.generation,
-      nextGeneration: nextAuthority.generation + 1,
-      profileId: nextAuthority.id,
+      expectedAuthority: nextAuthority,
+      nextAuthority: { ...nextAuthority, generation: nextAuthority.generation + 1 },
     })).toThrow("active Claude turn");
+    await value.manager.close();
+  });
+
+  test("starts a historical V1 target without provisioning or activating new host tools", async () => {
+    const value = harness();
+    const review = await value.manager.reviewSessionStart({
+      authority,
+      fast: false,
+      preset: "fable-max",
+      requirement: presetRequirements["fable-max"],
+      projectRoot: PROJECT_ROOT,
+      signal: signal(),
+    });
+    for (const hostCapabilities of ["disabled", "legacy", null]) {
+      await expect(value.manager.startSession({
+        authority, review, signal: signal(), hostCapabilities,
+      } as unknown as Parameters<PinnedClaudeRuntimeManager["startSession"]>[0]))
+        .rejects.toMatchObject({ code: "INVALID_INPUT" });
+    }
+    expect(value.launches).toEqual([]);
+    const started = await value.manager.startSession({
+      authority, review, signal: signal(), hostCapabilities: "historical_v1",
+    });
+    expect(value.bindingAuthority.provisions).toEqual([]);
+    expect(value.launches[0]?.argv).toEqual([...runtime.argv, "--session-id", started.providerThreadId]);
+    await expect(value.manager.activateSessionHostTools({
+      authority, providerThreadId: started.providerThreadId, signal: signal(),
+    })).rejects.toThrow("no admitted host tools");
+    await startTurn(value.manager, started.providerThreadId, "historical seed");
+    expect(value.bindingAuthority.activations).toEqual([]);
     await value.manager.close();
   });
 
@@ -1642,7 +2136,7 @@ describe("pinned Claude runtime manager", () => {
     expect(launches[0]?.argv).toEqual([
       ...runtime.argv,
       "--append-system-prompt",
-      HRA_SESSION_PREAMBLE.text,
+      OOMPA_SESSION_PREAMBLE.text,
       "--mcp-config",
       `${HOST_TOOL_PRIVATE_ROOT}/binding-1/mcp.json`,
       "--strict-mcp-config",
@@ -1879,7 +2373,7 @@ describe("pinned Claude runtime manager", () => {
     await manager.close();
   });
 
-  test("evicts and reports one committed process that exits", async () => {
+  test("retains cleanup identity and reports one committed process that exits", async () => {
     const { facts, manager, processes } = harness();
     const providerThreadId = await startSession(manager);
     const process = processes[0];
@@ -1896,8 +2390,13 @@ describe("pinned Claude runtime manager", () => {
       authority,
       providerThreadId,
       signal: signal(),
-    })).rejects.toThrow(/no longer live|cleanup is unresolved/u);
+    })).resolves.toEqual(PROCESS_IDENTITY);
+    await expect(startSession(manager)).rejects.toThrow("still unjoined");
+    expect(processes).toHaveLength(1);
     expect(facts.filter((fact) => fact.type === "providerDisconnected")).toHaveLength(1);
+    await manager.endSession({ authority, providerThreadId, signal: signal() });
+    await expect(manager.readSessionProcessIdentity({ authority, providerThreadId, signal: signal() }))
+      .rejects.toThrow("not running");
     await manager.close();
   });
 
@@ -2023,13 +2522,34 @@ describe("pinned Claude runtime manager", () => {
     const process = processes[0];
     if (process === undefined) throw new Error("expected one spawned process");
 
+    try {
     await expect(manager.endSession({ authority, providerThreadId, signal: signal() }))
       .rejects.toMatchObject({ code: "TIMEOUT" });
+    // Cleanup can identify the retained child without admitting any operation
+    // on its failed client. Execution and new launches stay fenced until join.
     await expect(manager.readSessionProcessIdentity({
       authority,
       providerThreadId,
       signal: signal(),
-    })).rejects.toThrow("cleanup is unresolved");
+    })).resolves.toEqual(PROCESS_IDENTITY);
+    for (const changed of [
+      { ...authority, id: "acct_11111111111111111111111111111111" as const },
+      { ...authority, providerAccountId: "pact_11111111111111111111111111111111" as const },
+      { ...authority, provider: "codex" as const },
+      { ...authority, generation: authority.generation + 1 },
+      { ...authority, bindingGeneration: authority.bindingGeneration + 1 },
+    ]) {
+      await expect(manager.readSessionProcessIdentity({
+        authority: changed, providerThreadId, signal: signal(),
+      })).rejects.toThrow("another authority");
+    }
+    await expect(manager.readSessionProcessIdentity({
+      authority, providerThreadId: "unowned-thread", signal: signal(),
+    })).rejects.toThrow("not running");
+    await expect(manager.observeSession({ authority, providerThreadId, signal: signal() }))
+      .rejects.toBeInstanceOf(ClaudeSessionObservationError);
+    await expect(startSession(manager)).rejects.toThrow("still unjoined");
+    expect(processes).toHaveLength(1);
 
     process.end();
     await expect(manager.endSession({ authority, providerThreadId, signal: signal() }))
@@ -2037,7 +2557,10 @@ describe("pinned Claude runtime manager", () => {
     await expect(manager.observeSession({ authority, providerThreadId, signal: signal() }))
       .rejects.toBeInstanceOf(ClaudeSessionObservationError);
     expect(process.signals).toEqual(["SIGTERM", "SIGKILL", "SIGTERM"]);
-    await manager.close();
+    } finally {
+      process.end();
+      await manager.close();
+    }
   });
 
   test("times out and cleans up a resumed process that never initializes", async () => {
@@ -2058,6 +2581,139 @@ describe("pinned Claude runtime manager", () => {
       title: ADOPTED_TITLE,
     })).rejects.toMatchObject({ code: "TIMEOUT" });
     expect(processes[0]?.terminated).toBe(true);
+    await manager.close();
+  });
+
+  test("retains disconnected child custody until shutdown proves its exit", async () => {
+    const { manager, processes } = harness({
+      processIgnoresTerm: true,
+      processIgnoresKill: true,
+      clientShutdownSettlementMs: 5,
+      clientShutdownTermGraceMs: 5,
+    });
+    await startSession(manager);
+    const child = processes[0];
+    if (child === undefined) throw new Error("expected one spawned process");
+    let exits = 0;
+    void child.exited.then(() => { exits += 1; });
+    child.endOutput();
+    await settle();
+    expect(exits).toBe(0);
+    await expect(startSession(manager)).rejects.toThrow("still unjoined");
+    expect(processes).toHaveLength(1);
+    child.end();
+    await manager.close();
+    expect(exits).toBe(1);
+  });
+
+  test("fences reviews, sessions, and interactions on provider-account generation", async () => {
+    const boundAuthority: ProfileAuthority = {
+      ...authority,
+      bindingGeneration: 7,
+      provider: "claude",
+      providerAccountId: "pact_11111111111111111111111111111111",
+    };
+    const { manager, processes } = harness();
+    const review = await manager.reviewSessionStart({
+      authority: boundAuthority,
+      fast: false,
+      preset: "fable-max",
+      requirement: presetRequirements["fable-max"],
+      projectRoot: PROJECT_ROOT,
+      signal: signal(),
+    });
+    const started = await manager.startSession({
+      authority: boundAuthority,
+      review,
+      signal: signal(),
+    });
+    await manager.activateSessionHostTools({
+      authority: boundAuthority,
+      providerThreadId: started.providerThreadId,
+      signal: signal(),
+    });
+    const turnReview = await manager.reviewTurnStart({
+      authority: boundAuthority,
+      fast: false,
+      preset: "fable-max",
+      requirement: presetRequirements["fable-max"],
+      projectRoot: PROJECT_ROOT,
+      providerThreadId: started.providerThreadId,
+      signal: signal(),
+    });
+    await manager.startTurn({
+      authority: boundAuthority,
+      clientMessageId: "client-bound",
+      message: "work",
+      providerThreadId: started.providerThreadId,
+      review: turnReview,
+      signal: signal(),
+    });
+    const process = processes[0];
+    if (process === undefined) throw new Error("expected one spawned process");
+    process.emit({
+      request: {
+        display_name: "Bash",
+        input: { command: "true" },
+        subtype: "can_use_tool",
+        tool_name: "Bash",
+        tool_use_id: "toolu_bound",
+      },
+      request_id: "req-bound",
+      type: "control_request",
+    });
+    await settle();
+
+    const interaction = manager.interactionAuthority(
+      boundAuthority,
+      started.providerThreadId,
+      "req-bound",
+    );
+    expect(interaction).toMatchObject({
+      bindingGeneration: 7,
+      processGeneration: 3,
+      provider: "claude",
+      providerAccountId: boundAuthority.providerAccountId,
+    });
+    expect(() => manager.interactionAuthority(
+      { ...boundAuthority, bindingGeneration: 8 },
+      started.providerThreadId,
+      "req-bound",
+    )).toThrow("another authority");
+    await expect(manager.validateInteractionResolution({
+      authority: boundAuthority,
+      kind: "command_approval",
+      provider: { ...interaction, bindingGeneration: 8 },
+      resolution: { decision: "once", kind: "approval_decision" },
+      signal: signal(),
+    })).rejects.toThrow("interaction authority changed");
+    await expect(manager.readSession({
+      authority: { ...boundAuthority, bindingGeneration: 8 },
+      detail: false,
+      providerThreadId: started.providerThreadId,
+      signal: signal(),
+    })).rejects.toThrow("another authority");
+    const staleReview = await manager.reviewSessionStart({
+      authority: boundAuthority,
+      fast: false,
+      preset: "fable-max",
+      requirement: presetRequirements["fable-max"],
+      projectRoot: PROJECT_ROOT,
+      signal: signal(),
+    });
+    await expect(manager.startSession({
+      authority: { ...boundAuthority, bindingGeneration: 8 },
+      review: staleReview,
+      signal: signal(),
+    })).rejects.toThrow("runtime review belongs to another authority");
+    await expect(manager.reviewSessionStart({
+      authority: { ...boundAuthority, provider: "codex" },
+      fast: false,
+      preset: "fable-max",
+      requirement: presetRequirements["fable-max"],
+      projectRoot: PROJECT_ROOT,
+      signal: signal(),
+    })).rejects.toThrow("account authority changed");
     await manager.close();
   });
 
@@ -2137,8 +2793,8 @@ describe("pinned Claude runtime manager", () => {
   }
 
   test("provisions a strict MCP binding before spawn and activates it only after session commit", async () => {
-    const handled: HraHostToolCall[] = [];
-    const receipts: HraHostToolCall[] = [];
+    const handled: OompaHostToolCall[] = [];
+    const receipts: OompaHostToolCall[] = [];
     const value = harness({
       hostTool: (call) => { handled.push(call); return { sessions: [] }; },
       hostToolResponseWritten: (call) => { receipts.push(call); },
@@ -2247,7 +2903,7 @@ describe("pinned Claude runtime manager", () => {
     const disconnected = new Promise<void>((resolve) => { markDisconnected = resolve; });
     const turnResultReceived = new Promise<void>((resolve) => { markTurnResultReceived = resolve; });
     const turnResultGate = new Promise<void>((resolve) => { releaseTurnResult = resolve; });
-    let normalizedCall: HraHostToolCall | undefined;
+    let normalizedCall: OompaHostToolCall | undefined;
     const value = harness({
       hostTool: async (call) => {
         normalizedCall = call;
@@ -2281,6 +2937,21 @@ describe("pinned Claude runtime manager", () => {
         requestDigest: normalizedCall.requestDigest,
       };
       expect(value.manager.hasLiveHostToolCall(liveAuthority)).toBe(true);
+      expect(normalizedCall.authority).toEqual({
+        bindingGeneration: authority.bindingGeneration,
+        processGeneration: authority.generation,
+        profileId: authority.id,
+        provider: "claude",
+        providerAccountId: authority.providerAccountId,
+      });
+      for (const changedAuthority of [
+        { ...authority, bindingGeneration: authority.bindingGeneration + 1 },
+        { ...authority, providerAccountId: `pact_${"f".repeat(32)}` },
+        { ...authority, provider: "codex" as const },
+      ]) {
+        expect(value.manager.hasLiveHostToolCall({ ...liveAuthority, authority: changedAuthority })).toBe(false);
+        expect(value.manager.hasLiveSession({ authority: changedAuthority, providerThreadId })).toBe(false);
+      }
       expect(value.manager.hasLiveHostToolCall({
         ...liveAuthority,
         connectionId: "30000000-0000-4000-8000-000000000099",
@@ -2408,4 +3079,66 @@ describe("pinned Claude runtime manager", () => {
     ]);
     await value.manager.close();
   });
+});
+
+describe("Claude pre-acquisition reservation cleanup", () => {
+  test("admits one fresh reviewed reservation with an injected process", async () => {
+    const { manager, processes, bindingAuthority } = harness();
+    try {
+      const review = await manager.reviewSessionStart({
+        authority, fast: false, preset: "fable-max", requirement: presetRequirements["fable-max"],
+        projectRoot: PROJECT_ROOT, signal: signal(),
+      });
+      const started = await manager.startSession({
+        authority, review, providerThreadId: ADOPTED_PROVIDER_THREAD_ID, signal: signal(),
+      });
+      expect(started.providerThreadId).toBe(ADOPTED_PROVIDER_THREAD_ID);
+      expect(processes).toHaveLength(1);
+      expect(bindingAuthority.provisions).toHaveLength(1);
+    } finally { await manager.close(); }
+  });
+
+  test.each(["lookup_rejection", "abort_after_lookup"] as const)(
+    "releases the reserved ID after pre-acquisition failure (%s)",
+    async (failure) => {
+      let lookups = 0;
+      const controller = new AbortController();
+      const reason = new Error("Synthetic start-only configuration failure.");
+      const { manager, processes, bindingAuthority } = harness({
+        configDirFor: () => {
+          lookups++;
+          if (lookups === 2) {
+            if (failure === "lookup_rejection") return Promise.reject(reason);
+            controller.abort(reason);
+          }
+          return CONFIG_DIR;
+        },
+      });
+      const review = () => manager.reviewSessionStart({
+        authority, fast: false, preset: "fable-max", requirement: presetRequirements["fable-max"],
+        projectRoot: PROJECT_ROOT, signal: signal(),
+      });
+      try {
+        const original = await review();
+        expect(lookups).toBe(1);
+        await expect(manager.startSession({
+          authority, review: original, providerThreadId: ADOPTED_PROVIDER_THREAD_ID, signal: controller.signal,
+        })).rejects.toBe(reason);
+        expect(lookups).toBe(2);
+        expect(processes).toEqual([]);
+        expect(bindingAuthority.provisions).toEqual([]);
+        const renewed = await review();
+        expect(renewed).not.toBe(original);
+        expect(renewed.reviewId).not.toBe(original.reviewId);
+        expect(lookups).toBe(3);
+        const started = await manager.startSession({
+          authority, review: renewed, providerThreadId: ADOPTED_PROVIDER_THREAD_ID, signal: signal(),
+        });
+        expect(started.providerThreadId).toBe(ADOPTED_PROVIDER_THREAD_ID);
+        expect(lookups).toBe(4);
+        expect(processes).toHaveLength(1);
+        expect(bindingAuthority.provisions).toHaveLength(1);
+      } finally { await manager.close(); }
+    },
+  );
 });

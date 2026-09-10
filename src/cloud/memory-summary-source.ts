@@ -222,7 +222,7 @@ const fitMemorySummaryProjection = (source: MemorySummaryPayload): MemorySummary
   return parsed;
 };
 
-export class HraMemorySummarySource {
+export class OompaMemorySummarySource {
   readonly #engine: Pick<OhSqliteFactsMemoryEngine, "inspectCanonicalMemorySnapshot">;
   readonly #identityNamespace: string;
   readonly #now: () => number;

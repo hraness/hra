@@ -18,7 +18,7 @@ import {
   parseRemoteCommandPayload,
   type RemoteCommandPayload,
   type SupportedPreset,
-} from "../hra/cloud";
+} from "../oompa/cloud";
 
 export type SessionProvider = "codex" | "claude";
 

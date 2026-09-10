@@ -43,7 +43,7 @@ export type DeviceRevocationCapacity = Readonly<{
 }> | Readonly<{ kind: "legacy" }>;
 
 type LogicalDocument = Readonly<Record<string, Value | undefined>>;
-const hraOtpProviderId = "hra-control-plane-otp-v1";
+const oompaOtpProviderId = "hra-control-plane-otp-v1";
 export const authorityReductionOrphanRetentionMs = 24 * 60 * 60 * 1_000;
 
 export type AuthorityReductionCapacityDisposition =
@@ -72,7 +72,7 @@ function isCapacityCorruption(error: unknown): boolean {
     );
 }
 
-async function hasExactHraAuthTopology(
+async function hasExactOompaAuthTopology(
   ctx: QueryCtx | MutationCtx,
   user: DataModel["users"]["document"],
 ): Promise<boolean> {
@@ -94,7 +94,7 @@ async function hasExactHraAuthTopology(
   if (
     accounts.length !== 1
     || account === undefined
-    || account.provider !== hraOtpProviderId
+    || account.provider !== oompaOtpProviderId
     || account.providerAccountId !== user.email
     || account.userId !== user._id
     || subjects.length !== 1
@@ -362,7 +362,7 @@ export async function inspectLegacyOtpOrphanCandidate(
   const account = accounts[0];
   if (
     account === undefined
-    || account.provider !== hraOtpProviderId
+    || account.provider !== oompaOtpProviderId
     || account.emailVerified !== undefined
     || !isCanonicalAuthEmail(account.providerAccountId)
     || user.email !== account.providerAccountId
@@ -442,7 +442,7 @@ export async function classifyAuthorityReductionCapacityForUser(
         ? { disposition: "ready", missing: 0 }
         : { disposition: "topology_blocked", missing: 1 };
     }
-    if (!(await hasExactHraAuthTopology(ctx, user))) {
+    if (!(await hasExactOompaAuthTopology(ctx, user))) {
       const orphan = await inspectLegacyOtpOrphanCandidate(ctx, user, now);
       return orphan === null
         ? { disposition: "topology_blocked", missing: 1 }
@@ -491,7 +491,7 @@ export async function backfillAuthorityReductionCapacityForUser(
     if (!(await hasExactDrainingDeletionTopology(ctx, user, deletionJob))) corrupt();
     return { reserved: 0 };
   }
-  if (!(await hasExactHraAuthTopology(ctx, user))) corrupt();
+  if (!(await hasExactOompaAuthTopology(ctx, user))) corrupt();
   let reserved = 0;
   if ((await loadAccountDeletionCapacity(ctx, userId)).kind === "legacy") {
     await createAccountDeletionCapacityForNewUser(ctx, userId);

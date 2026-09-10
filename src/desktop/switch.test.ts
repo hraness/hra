@@ -32,13 +32,32 @@ const capability: ChatGptBundleCapability = {
   },
 };
 
+const sourceProfileId = "acct_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as const;
+const targetProfileId = "acct_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" as const;
+const sourceProviderAuthority = {
+  providerAccountId: sourceProfileId,
+  profileId: sourceProfileId,
+  provider: "codex" as const,
+  bindingGeneration: 2,
+  processGeneration: 2,
+};
+const targetProviderAuthority = {
+  providerAccountId: targetProfileId,
+  profileId: targetProfileId,
+  provider: "codex" as const,
+  bindingGeneration: 3,
+  processGeneration: 3,
+};
+
 const request: DesktopSwitchRequest = {
   idempotencyKey: "switch-1",
   switchGeneration: 4,
-  sourceProfileId: "account-a",
+  sourceProfileId,
   sourceProcessGeneration: 2,
-  targetProfileId: "account-b",
+  sourceProviderAuthority,
+  targetProfileId,
   targetProcessGeneration: 3,
+  targetProviderAuthority,
   expectedAccountKey: "account-key-b",
   stateRoot: "/tmp/hra-control-plane",
   baseEnvironment: {
@@ -67,7 +86,7 @@ function fakePorts(options: { readonly staleAfterQuit?: boolean } = {}): {
     lock: { withLock: async (effect) => effect() },
     journal: {
       prepare: () => Promise.resolve(),
-      advance: (_key, _generation, stage) => {
+      advance: (_binding, stage) => {
         stages.push(stage);
         return Promise.resolve();
       },
@@ -109,7 +128,7 @@ describe("DesktopSwitchController", () => {
     const result = await new DesktopSwitchController(fixture.ports).switchProfile(request);
     expect(result).toEqual({
       status: "switched",
-      profileId: "account-b",
+      profileId: targetProfileId,
       processGeneration: 3,
       desktopPid: 202,
       switchGeneration: 4,
@@ -124,21 +143,22 @@ describe("DesktopSwitchController", () => {
     expect(fixture.launches).toHaveLength(1);
     expect(fixture.launches[0]).toMatchObject({
       HOME: "/workspace/home",
-      CODEX_HOME: "/tmp/hra-control-plane/profiles/account-b/codex-home",
+      CODEX_HOME: `/tmp/hra-control-plane/profiles/${targetProfileId}/codex-home`,
       CODEX_ELECTRON_USER_DATA_PATH:
-        "/tmp/hra-control-plane/profiles/account-b/desktop-user-data",
+        `/tmp/hra-control-plane/profiles/${targetProfileId}/desktop-user-data`,
     });
     expect(fixture.launches[0]).not.toHaveProperty("OPENAI_API_KEY");
     expect(fixture.observations).toEqual([
       {
-        profileId: "account-b",
+        profileId: targetProfileId,
         processGeneration: 3,
+        providerAuthority: targetProviderAuthority,
         instance: {
           pid: 202,
           executablePath: capability.executablePath,
           bundleCdHash: capability.cdHash,
-          codexHome: "/tmp/hra-control-plane/profiles/account-b/codex-home",
-          desktopUserData: "/tmp/hra-control-plane/profiles/account-b/desktop-user-data",
+          codexHome: `/tmp/hra-control-plane/profiles/${targetProfileId}/codex-home`,
+          desktopUserData: `/tmp/hra-control-plane/profiles/${targetProfileId}/desktop-user-data`,
         },
       },
     ]);

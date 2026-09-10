@@ -8,7 +8,7 @@ import {
   sessionStateTone,
   type SessionTone,
 } from "../model/session-view";
-import type { SessionStateValue } from "../hra/cloud";
+import type { SessionStateValue } from "../oompa/cloud";
 import { stateIndicatorStyles } from "./state-indicator.stylex";
 
 const toneStyles: Readonly<Record<SessionTone, StyleXStyles>> = {

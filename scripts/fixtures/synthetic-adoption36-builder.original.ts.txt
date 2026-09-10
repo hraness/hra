@@ -1,0 +1,133 @@
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { gzipSync } from "node:zlib";
+import { Database } from "bun:sqlite";
+
+// CONSTRUCTION ONLY: no archived TypeScript is imported or executed. The
+// archived database supplies DDL only; all resulting rows are synthetic.
+const repository = process.argv[2];
+assert.equal(typeof repository, "string");
+if (repository === undefined) throw new Error("Repository argument required.");
+const hash = (input: string | Uint8Array) => createHash("sha256").update(input).digest("hex");
+const { default: ts } = await import(pathToFileURL(join(repository, "node_modules/typescript/lib/typescript.js")).href);
+const { canonical34StorageDatabaseBytes, canonical34StorageFixture } = await import(
+  pathToFileURL(join(repository, "scripts/fixtures/canonical34-storage.ts")).href,
+);
+const ref = "6f056dcafd6435cd11ae504c75e9b1f869955ca7";
+const gitSource = (path: string) => execFileSync("git", ["show", `${ref}:${path}`], {
+  cwd: repository, maxBuffer: 8 * 1024 * 1024,
+}).toString("utf8");
+const stateSource = gitSource("src/storage/state-store.ts");
+const testSource = gitSource("src/storage/state-store.test.ts");
+// Parse literal templates, never eval/transpile/import archived source code.
+function template(source: string, name: string, substitutions: Readonly<Record<string, string>> = {}): string {
+  const file = ts.createSourceFile("frozen.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const matches: unknown[] = [];
+  const visit = (node: unknown): void => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === name) matches.push(node.initializer);
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  assert.equal(matches.length, 1, name);
+  const node = matches[0];
+  if (ts.isNoSubstitutionTemplateLiteral(node)) return node.text;
+  assert.equal(ts.isTemplateExpression(node), true, name);
+  let value = node.head.text;
+  for (const span of node.templateSpans) {
+    assert.equal(ts.isIdentifier(span.expression), true);
+    const substitution = substitutions[span.expression.text];
+    assert.notEqual(substitution, undefined, span.expression.text);
+    value += substitution + span.literal.text;
+  }
+  return value;
+}
+const rawAdoption = template(stateSource, "schemaVersion40SessionAdoption", {
+  schemaVersion40CandidateLastLiveObservedAtColumn: "",
+  schemaVersion40CandidateProviderProjectRootColumn: "",
+});
+// These exact identifier substitutions are the frozen recognizer's admitted
+// pre-provider-v39 variant, not an inferred historical writer implementation.
+const legacyProvider = (sql: string) => sql.replace(/\bprovider_v39\b/gu, "provider");
+const adoptionSql = legacyProvider(rawAdoption);
+const updateSql = legacyProvider(template(stateSource, "schemaVersion40SessionAccountAuthorityUpdateGuard"));
+const sourceIdentitySql = legacyProvider(template(stateSource, "schemaVersion40CandidateSourceProcessIdentity"));
+const profileColumn = template(stateSource, "schemaVersion40ProfileCodexAccountKeyColumn");
+const switchSql = template(stateSource, "schemaVersion35ProviderSwitchProgress");
+const workSql = template(testSource, "legacyAdoptionWorkAuthorityGuards");
+const archiveBytes = canonical34StorageDatabaseBytes();
+assert.equal(hash(archiveBytes), "95d9e375061ac090f1409e50937d68f66ae702176fae06287ff137c23f049e6b");
+assert.equal(canonical34StorageFixture.sourceCommit, "127c1e7dcf8ef1461b7d71ab4d077a93f85cc682");
+const schemaRow = (value: unknown) => {
+  assert.equal(typeof value, "object");
+  assert.notEqual(value, null);
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("Invalid schema row.");
+  const row: Record<string, unknown> = value;
+  assert.deepEqual(Object.keys(row).sort(), ["name", "sql", "tbl_name", "type"]);
+  for (const key of ["type", "name", "tbl_name", "sql"]) assert.equal(typeof row[key], "string");
+  return { type: row.type, name: row.name, tbl_name: row.tbl_name, sql: row.sql };
+};
+const readSchema = (db: Database) => db.query(
+  "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name LIMIT 1025",
+).all().map(schemaRow);
+// WAL-mode archives need an ordinary open even for read-only inspection. Use
+// one new exact byte copy with query_only; never alter the frozen input bytes.
+const baseDirectory = mkdtempSync(join(import.meta.dir, "base-"));
+const basePath = join(baseDirectory, "source.sqlite");
+writeFileSync(basePath, archiveBytes, { mode: 0o600, flag: "wx" });
+const base = new Database(basePath, { create: false, strict: true });
+base.exec("PRAGMA query_only=ON");
+const baseSchema = readSchema(base);
+assert.ok(baseSchema.length < 1025);
+assert.deepEqual(base.query("PRAGMA user_version").get(), { user_version: 34 });
+base.close(false);
+assert.equal(hash(readFileSync(basePath)), hash(archiveBytes));
+const database = new Database(":memory:");
+database.exec("PRAGMA foreign_keys=ON");
+for (const type of ["table", "index", "trigger"]) {
+  for (const object of baseSchema.filter((object) => object.type === type)) database.exec(object.sql);
+}
+assert.equal(database.query("SELECT total_changes() AS changes").get().changes, 0);
+database.exec(`ALTER TABLE profiles ADD COLUMN ${profileColumn}`);
+database.exec(switchSql);
+database.exec(adoptionSql);
+database.exec("DROP TRIGGER session_account_authority_update_guard");
+database.exec(updateSql);
+database.exec(sourceIdentitySql);
+const workNames = [...workSql.matchAll(/^CREATE TRIGGER IF NOT EXISTS ([a-z_]+)/gmu)].map((match) => match[1]);
+assert.equal(workNames.length, 6);
+for (const name of workNames) database.exec(`DROP TRIGGER IF EXISTS ${name}`);
+database.exec(workSql);
+const schema = readSchema(database);
+assert.ok(schema.length < 1025);
+assert.deepEqual(database.query("PRAGMA foreign_key_check").all(), []);
+assert.equal(database.query("SELECT total_changes() AS changes").get().changes, 0);
+for (const name of ["notification_hours", "attention_email_policy", "provider_accounts"]) {
+  assert.equal(database.query("SELECT 1 FROM sqlite_schema WHERE name=?").get(name), null);
+}
+for (const [table, column] of [["sessions", "preset_contract"], ["works", "preset_contract"],
+  ["session_adoption_candidates", "last_live_observed_at"], ["session_adoption_candidates", "provider_project_root"]]) {
+  assert.equal(database.query(`SELECT 1 FROM pragma_table_info('${table}') WHERE name=?`).get(column), null);
+}
+database.close(false);
+const serialized = JSON.stringify(schema);
+const compressed = gzipSync(serialized, { level: 9 });
+const metadata = {
+  kind: "synthetic_adoption_v36_recognizer_contract", historicalWriterProvenance: false,
+  sourceCommit: ref, sourceStateSha256: hash(stateSource), sourceTestsSha256: hash(testSource),
+  baseSourceCommit: canonical34StorageFixture.sourceCommit, baseDatabaseSha256: hash(archiveBytes),
+  baseSchemaSha256: hash(JSON.stringify(baseSchema)),
+  selection: "full canonical34 DDL; frozen provider-switch35; frozen adoption40 definition with only the explicitly admitted legacy-provider and absent-retention variants; exact six legacy Work guards",
+  fragmentSha256: { adoptionSql: hash(adoptionSql), updateSql: hash(updateSql), sourceIdentitySql: hash(sourceIdentitySql),
+    profileColumn: hash(profileColumn), switchSql: hash(switchSql), workSql: hash(workSql) },
+  objectCount: schema.length, tableCount: schema.filter((object) => object.type === "table").length,
+  schemaBytes: Buffer.byteLength(serialized), schemaSha256: hash(serialized),
+  manifest: schema.map(({ type, name, tbl_name, sql }) => ({ type, name, tbl_name, sha256: hash(sql) })),
+};
+const code = `import { createHash } from "node:crypto";\nimport { gunzipSync } from "node:zlib";\nimport { z } from "zod";\n\n// Test-only synthetic exact-schema recognizer fixture. No actual v36 producer\n// is available. This is NOT an emitted historical database or migration-stage\n// capture. It is built into empty SQLite, never downgraded from current state.\nexport const syntheticAdoption36SchemaFixture = ${JSON.stringify(metadata, null, 2)} as const;\n\nconst compressedSchema = ${JSON.stringify(compressed.toString("base64"))};\nconst objectSchema = z.object({ type: z.enum(["table", "index", "trigger"]),\n  name: z.string().regex(/^[a-z0-9_]+$/u), tbl_name: z.string().regex(/^[a-z0-9_]+$/u),\n  sql: z.string().min(1).max(65536) }).strict();\nexport function syntheticAdoption36SchemaObjects() {\n  const bytes = gunzipSync(Buffer.from(compressedSchema, "base64"), { maxOutputLength: 1024 * 1024 });\n  if (bytes.length !== syntheticAdoption36SchemaFixture.schemaBytes\n    || createHash("sha256").update(bytes).digest("hex") !== syntheticAdoption36SchemaFixture.schemaSha256) {\n    throw new Error("SYNTHETIC_ADOPTION36_SCHEMA_INVALID");\n  }\n  const objects = z.array(objectSchema).length(syntheticAdoption36SchemaFixture.objectCount)\n    .parse(JSON.parse(bytes.toString("utf8")) as unknown);\n  const manifest = objects.map(({ type, name, tbl_name, sql }) => ({ type, name, tbl_name,\n    sha256: createHash("sha256").update(sql).digest("hex") }));\n  if (JSON.stringify(manifest) !== JSON.stringify(syntheticAdoption36SchemaFixture.manifest)) {\n    throw new Error("SYNTHETIC_ADOPTION36_MANIFEST_INVALID");\n  }\n  return objects;\n}\n`;
+assert.ok(Buffer.byteLength(code) < 256 * 1024);
+const recipe = readFileSync(import.meta.path, "utf8");
+console.log(JSON.stringify({ code, recipe, summary: { ...metadata, manifest: undefined, recipeSha256: hash(recipe) } }));

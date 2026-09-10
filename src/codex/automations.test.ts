@@ -49,7 +49,7 @@ afterEach(async () => {
 });
 
 async function automationsRoot(): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), "hra-codex-automations-"));
+  const root = await mkdtemp(join(tmpdir(), "oompa-codex-automations-"));
   roots.push(root);
   const directory = join(root, "automations");
   await mkdir(directory);

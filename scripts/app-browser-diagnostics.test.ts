@@ -267,5 +267,5 @@ test("the canonical browser gate enables native custody before acceptance", asyn
   expect(Reflect.get(scripts, "check:browser"))
     .toBe("bun run build:app && bun run build:site && bun run test:browser:custody && bun run test:browser");
   expect(Reflect.get(scripts, "test:browser:custody"))
-    .toBe("HRA_BROWSER_CUSTODY_NATIVE=1 bun test --bail=1 ./scripts/app-browser-custody.process.test.ts");
+    .toBe("OOMPA_BROWSER_CUSTODY_NATIVE=1 bun test --bail=1 ./scripts/app-browser-custody.process.test.ts");
 });

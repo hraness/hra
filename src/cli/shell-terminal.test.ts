@@ -284,7 +284,7 @@ describe("persistent shell terminal coordination", () => {
 
   test("redraws wrapped partial input and preserves a middle cursor exactly", async () => {
     const fixture = terminalFixture(7);
-    const answer = fixture.coordinator.question("hra> ");
+    const answer = fixture.coordinator.question("ask> ");
     await settleStreams();
     fixture.input.write("abcdefghijkl");
     await settleStreams();
@@ -293,7 +293,7 @@ describe("persistent shell terminal coordination", () => {
 
     fixture.coordinator.writeLive("LIVE");
     const screen = screenFor(fixture.output);
-    expect(screen.lines()).toEqual(["LIVE", "hra> ab", "cdefghi", "jkl"]);
+    expect(screen.lines()).toEqual(["LIVE", "ask> ab", "cdefghi", "jkl"]);
     expect(screen.cursor()).toEqual({ column: 0, row: 3 });
 
     fixture.input.write("X\n");
@@ -318,15 +318,15 @@ describe("persistent shell terminal coordination", () => {
 
   test("normalizes delayed terminal autowrap at an exact redraw boundary", async () => {
     const fixture = terminalFixture(7);
-    const answer = fixture.coordinator.question("hra> ");
+    const answer = fixture.coordinator.question("ask> ");
     await settleStreams();
     fixture.input.write("ab");
     await settleStreams();
     fixture.coordinator.writeLive("LIVE");
     const screen = screenFor(fixture.output);
-    expect(screen.lines()).toEqual(["LIVE", "hra> ab"]);
+    expect(screen.lines()).toEqual(["LIVE", "ask> ab"]);
     expect(screen.cursor()).toEqual({ column: 0, row: 2 });
-    expect(fixture.output.value).toContain("hra> ab \b");
+    expect(fixture.output.value).toContain("ask> ab \b");
     fixture.input.write("!\n");
     expect(await answer).toBe("ab!");
     fixture.coordinator.close();
@@ -407,7 +407,7 @@ describe("persistent shell terminal coordination", () => {
 
   test("keeps each repeated update and only one active prompt", async () => {
     const fixture = terminalFixture(10);
-    const answer = fixture.coordinator.question("hra> ");
+    const answer = fixture.coordinator.question("ask> ");
     await settleStreams();
     fixture.input.write("draft");
     await settleStreams();
@@ -415,8 +415,8 @@ describe("persistent shell terminal coordination", () => {
     fixture.coordinator.writeLive("first");
     fixture.coordinator.writeLive("second\n");
     const screen = screenFor(fixture.output);
-    expect(screen.lines()).toEqual(["first", "second", "hra> draft"]);
-    expect(screen.lines().join("\n").match(/hra> /gu)).toHaveLength(1);
+    expect(screen.lines()).toEqual(["first", "second", "ask> draft"]);
+    expect(screen.lines().join("\n").match(/ask> /gu)).toHaveLength(1);
 
     fixture.input.write("!\n");
     expect(await answer).toBe("draft!");
@@ -426,7 +426,7 @@ describe("persistent shell terminal coordination", () => {
   test("fences the active draft when any live redraw stage fails synchronously", async () => {
     for (const stage of ["cursor", "live", "prompt"] as const) {
       const fixture = terminalFixture(40);
-      const answer = fixture.coordinator.question("hra> ");
+      const answer = fixture.coordinator.question("ask> ");
       await settleStreams();
       fixture.input.write("draft");
       await settleStreams();
@@ -438,7 +438,7 @@ describe("persistent shell terminal coordination", () => {
           ? value.includes("\u001b[1G")
           : stage === "live"
             ? value === "LIVE\n"
-            : value === "hra> draft";
+            : value === "ask> draft";
         if (fail && targeted) {
           fail = false;
           throw new Error(`${stage} redraw unavailable`);
@@ -1079,7 +1079,7 @@ describe("persistent shell terminal coordination", () => {
 
   test("fences active input without throwing from a failed backpressure drain notice", async () => {
     const fixture = terminalFixture(40);
-    const answer = fixture.coordinator.question("hra> ");
+    const answer = fixture.coordinator.question("ask> ");
     await settleStreams();
     fixture.input.write("draft");
     await settleStreams();
@@ -1137,7 +1137,7 @@ describe("persistent shell terminal coordination", () => {
     fixture.coordinator.writeLive("idle without newline");
     expect(fixture.output.value).toBe("idle without newline");
 
-    const answer = fixture.coordinator.question("hra> ");
+    const answer = fixture.coordinator.question("ask> ");
     await settleStreams();
     fixture.coordinator.close();
     fixture.coordinator.close();

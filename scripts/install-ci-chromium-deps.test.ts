@@ -8,7 +8,7 @@ const host: ChromiumSetupHost = {
   platform: "linux", arch: "x64", nodeVersion: "24.18.1", uid: 1001,
   osRelease: 'ID=ubuntu\nVERSION_ID="24.04"\nVERSION_CODENAME=noble\n', environment: {},
 };
-const paths = { config: "/runner/hra-apt/apt.conf", sourceParts: "/runner/hra-apt/sourceparts", lists: "/runner/hra-apt/lists" };
+const paths = { config: "/runner/oompa-apt/apt.conf", sourceParts: "/runner/oompa-apt/sourceparts", lists: "/runner/oompa-apt/lists" };
 const shell = `SOURCE='/etc/apt/sources.list.d/ubuntu.sources'\nPARTS='${paths.sourceParts}/'\nLISTS='${paths.lists}/'\n`;
 const dump = 'Dir "/";\nDir::Etc "etc/apt";\nBinary::apt "";\nBinary::apt::APT::Keep-Downloaded-Packages "0";\n';
 const source = [

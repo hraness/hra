@@ -15,7 +15,7 @@ import {
   type FactsMemoryStoreReceipt,
   type FactsMemoryStoreInspection,
 } from "../domain/facts-memory";
-import { unixMillisecondsSchema } from "../domain/values";
+import { profileIdSchema, sessionIdSchema, unixMillisecondsSchema } from "../domain/values";
 import {
   factsMemoryCleanupReasonSchema,
   type FactsMemoryCleanupReason,
@@ -34,7 +34,7 @@ export const factsMemoryBrokerInspectionSchema = z.discriminatedUnion("status", 
 export type FactsMemoryBrokerInspection = z.infer<typeof factsMemoryBrokerInspectionSchema>;
 
 /**
- * Host-only semantic-store boundary. Implementations may use Oh, but HRA never
+ * Host-only semantic-store boundary. Implementations may use Oh, but Oompa never
  * receives facts, rules, projections, credentials, database paths, or raw handles.
  */
 export interface FactsMemoryBrokerPort {
@@ -90,7 +90,7 @@ export interface FactsMemoryAttestationLifecyclePort {
   }>): number;
 }
 
-export type HraFactsMemoryLifecycleReceipt = Readonly<{
+export type OompaFactsMemoryLifecycleReceipt = Readonly<{
   bindingDigest: string;
   epoch: number;
   handleHash: string | null;
@@ -100,36 +100,43 @@ export type HraFactsMemoryLifecycleReceipt = Readonly<{
   state: FactsMemoryControlRecord["state"];
 }>;
 
-export interface HraFactsMemoryLifecyclePort {
+export interface OompaFactsMemoryLifecyclePort {
   cleanupSession(input: Readonly<{
     ownerId: string;
     reason: FactsMemoryCleanupReason;
     sessionId: string;
-  }>): Promise<HraFactsMemoryLifecycleReceipt | null>;
+  }>): Promise<OompaFactsMemoryLifecycleReceipt | null>;
   ensureSession(input: Readonly<{
     expiresAt: number;
     ownerId: string;
     sessionId: string;
-  }>): Promise<HraFactsMemoryLifecycleReceipt>;
+  }>): Promise<OompaFactsMemoryLifecycleReceipt>;
   forkSession(input: Readonly<{
     childExpiresAt: number;
     childSessionId: string;
     ownerId: string;
     parentSessionId: string;
-  }>): Promise<HraFactsMemoryLifecycleReceipt>;
-  readSession(sessionId: string): HraFactsMemoryLifecycleReceipt | null;
+  }>): Promise<OompaFactsMemoryLifecycleReceipt>;
+  readSession(sessionId: string): OompaFactsMemoryLifecycleReceipt | null;
   resumeSession(input: Readonly<{
     ownerId: string;
     sessionId: string;
-  }>): Promise<HraFactsMemoryLifecycleReceipt>;
+  }>): Promise<OompaFactsMemoryLifecycleReceipt>;
   sweepExpired(
     now: number,
     /** Evaluated under the session lifecycle lock after the expiry record is revalidated. */
     policy?: Readonly<{ canCleanupSession: (sessionId: string) => boolean }>,
   ): Promise<Readonly<{ attempted: number; failed: number; purged: number }>>;
+  transferSessionOwner(input: Readonly<{
+    expiresAt: number;
+    fromOwnerId: string;
+    operationKey: string;
+    sessionId: string;
+    toOwnerId: string;
+  }>): Promise<OompaFactsMemoryLifecycleReceipt>;
 }
 
-const lifecycleReceipt = (record: FactsMemoryControlRecord): HraFactsMemoryLifecycleReceipt => ({
+const lifecycleReceipt = (record: FactsMemoryControlRecord): OompaFactsMemoryLifecycleReceipt => ({
   bindingDigest: record.binding.bindingDigest,
   epoch: record.binding.epoch,
   handleHash: record.handleHash,
@@ -195,7 +202,7 @@ const assertPurgeReceipt = (
   return receipt;
 };
 
-export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
+export class OompaFactsMemoryLifecycle implements OompaFactsMemoryLifecyclePort {
   readonly #broker: FactsMemoryBrokerPort;
   readonly #control: FactsMemoryControlStore;
   readonly #attestations: FactsMemoryAttestationLifecyclePort | undefined;
@@ -214,7 +221,7 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
     this.#control = input.control;
   }
 
-  readSession(sessionId: string): HraFactsMemoryLifecycleReceipt | null {
+  readSession(sessionId: string): OompaFactsMemoryLifecycleReceipt | null {
     const record = this.#control.get(sessionId);
     return record === null ? null : lifecycleReceipt(record);
   }
@@ -223,42 +230,103 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
     expiresAt: number;
     ownerId: string;
     sessionId: string;
-  }>): Promise<HraFactsMemoryLifecycleReceipt> {
+  }>): Promise<OompaFactsMemoryLifecycleReceipt> {
     return this.#serialize(input.sessionId, async () => {
-      const current = this.#control.get(input.sessionId);
-      if (current !== null && current.binding.ownerId !== input.ownerId) {
+      return lifecycleReceipt(await this.#ensureSessionLocked(input));
+    });
+  }
+
+  transferSessionOwner(input: Readonly<{
+    expiresAt: number;
+    fromOwnerId: string;
+    operationKey: string;
+    sessionId: string;
+    toOwnerId: string;
+  }>): Promise<OompaFactsMemoryLifecycleReceipt> {
+    const expiresAt = unixMillisecondsSchema.parse(input.expiresAt);
+    const fromOwnerId = profileIdSchema.parse(input.fromOwnerId);
+    const operationKey = z.string().min(1).max(200).parse(input.operationKey);
+    const sessionId = sessionIdSchema.parse(input.sessionId);
+    const toOwnerId = profileIdSchema.parse(input.toOwnerId);
+    return this.#serialize(sessionId, async () => {
+      if (fromOwnerId === toOwnerId) {
+        return lifecycleReceipt(await this.#ensureSessionLocked({
+          expiresAt,
+          ownerId: toOwnerId,
+          sessionId,
+        }));
+      }
+      const observed = this.#control.get(sessionId);
+      if (observed === null) {
+        const targetBinding = createFactsMemoryBinding({ ownerId: toOwnerId, sessionId });
+        const fresh = this.#control.reserveFreshOwnerTransfer({
+          binding: targetBinding,
+          createOperationKey: this.#createOperationKey(targetBinding, "create"),
+          expiresAt,
+          fromOwnerId,
+          operationKey,
+        });
+        return lifecycleReceipt(await this.#ensureReserved(fresh));
+      }
+      if (observed.binding.ownerId === toOwnerId) {
+        const exactTarget = this.#control.requireOwnerTransferTarget({
+          binding: observed.binding,
+          fromOwnerId,
+          operationKey,
+        });
+        if (
+          exactTarget.cleanupReason === "abandon"
+          || exactTarget.cleanupReason === "archive"
+        ) {
+          if (exactTarget.state !== "cleanup_pending" && exactTarget.state !== "purged") {
+            throw new Error("FACTS_MEMORY_OWNER_TRANSFER_REPLAY_MISMATCH");
+          }
+          return lifecycleReceipt(exactTarget);
+        }
+        if (
+          exactTarget.state === "cleanup_pending"
+          && exactTarget.cleanupReason === "expired"
+        ) await this.#purgePending(exactTarget);
+        const target = await this.#ensureSessionLocked({
+          expiresAt,
+          ownerId: toOwnerId,
+          sessionId,
+        });
+        return lifecycleReceipt(target);
+      }
+      if (observed.binding.ownerId !== fromOwnerId) {
         throw new Error("FACTS_MEMORY_AUTHORITY_MISMATCH");
       }
-      if (current?.state === "purged") {
-        this.#attestations?.purgeMemoryWorkingPageAttestations({
-          bindingDigest: current.binding.bindingDigest,
-        });
+      const sourceBinding = observed.binding;
+      let source = observed;
+      if (source.state === "cleanup_pending" && source.cleanupReason === "expired") {
+        source = await this.#purgePending(source);
       }
-      const binding = createFactsMemoryBinding({
-        epoch: current?.state === "purged" && current.cleanupReason === "expired"
-          ? current.binding.epoch + 1
-          : current?.binding.epoch ?? 1,
-        ownerId: input.ownerId,
-        sessionId: input.sessionId,
+      const pending = source.state === "purged" && source.cleanupReason === "expired"
+        ? this.#control.adoptExpiredPurgeForOwnerTransfer({
+            binding: sourceBinding,
+            operationKey,
+            toOwnerId,
+          })
+        : this.#control.beginOwnerTransfer({
+            binding: sourceBinding,
+            operationKey,
+            toOwnerId,
+          });
+      await this.#purgePending(pending);
+      const targetBinding = createFactsMemoryBinding({
+        epoch: sourceBinding.epoch + 1,
+        ownerId: toOwnerId,
+        sessionId,
       });
-      if (current === null) {
-        this.#attestations?.purgeMemoryWorkingPageAttestations({
-          bindingDigest: binding.bindingDigest,
-        });
-      }
-      const record = this.#control.reserve({
-        binding,
-        createOperationKey: current !== null && current.binding.epoch === binding.epoch
-          ? current.createOperationKey
-          : this.#createOperationKey(binding, "create"),
-        expiresAt: input.expiresAt,
-        ...(current?.parent === null || current?.parent === undefined
-          ? {}
-          : { parent: current.parent }),
+      const target = this.#control.advanceOwnerTransfer({
+        createOperationKey: this.#createOperationKey(targetBinding, "create"),
+        expiresAt,
+        fromBinding: sourceBinding,
+        operationKey,
+        toBinding: targetBinding,
       });
-      return lifecycleReceipt(await (record.parent === null
-        ? this.#ensureReserved(record)
-        : this.#ensureForkReserved(record)));
+      return lifecycleReceipt(await this.#ensureReserved(target));
     });
   }
 
@@ -267,7 +335,7 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
     childSessionId: string;
     ownerId: string;
     parentSessionId: string;
-  }>): Promise<HraFactsMemoryLifecycleReceipt> {
+  }>): Promise<OompaFactsMemoryLifecycleReceipt> {
     const childExpiresAt = unixMillisecondsSchema.parse(input.childExpiresAt);
     if (input.childSessionId === input.parentSessionId) throw new Error("FACTS_MEMORY_SELF_FORK");
     const existingChild = this.#control.get(input.childSessionId);
@@ -353,7 +421,7 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
   resumeSession(input: Readonly<{
     ownerId: string;
     sessionId: string;
-  }>): Promise<HraFactsMemoryLifecycleReceipt> {
+  }>): Promise<OompaFactsMemoryLifecycleReceipt> {
     return this.#serialize(input.sessionId, async () => {
       const current = this.#control.get(input.sessionId);
       if (current === null) throw new Error("FACTS_MEMORY_NOT_FOUND");
@@ -397,7 +465,7 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
     ownerId: string;
     reason: FactsMemoryCleanupReason;
     sessionId: string;
-  }>): Promise<HraFactsMemoryLifecycleReceipt | null> {
+  }>): Promise<OompaFactsMemoryLifecycleReceipt | null> {
     const requestedReason = factsMemoryCleanupReasonSchema.parse(input.reason);
     return this.#serialize(input.sessionId, async () => {
       const existing = this.#control.get(input.sessionId);
@@ -439,10 +507,9 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
           if (policy !== undefined && !policy.canCleanupSession(record.binding.sessionId)) {
             return null;
           }
-          return lifecycleReceipt(await this.#cleanupRecord(
-            current,
-            current.cleanupReason ?? "expired",
-          ));
+          return lifecycleReceipt(current.cleanupReason === "provider_switch"
+            ? await this.#purgePending(current)
+            : await this.#cleanupRecord(current, current.cleanupReason ?? "expired"));
         });
         if (result?.state === "purged") purged += 1;
       } catch {
@@ -503,6 +570,50 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
       }
     }
     return { attempted: records.length + attestationForksInspected, failed, purged };
+  }
+
+  async #ensureSessionLocked(input: Readonly<{
+    expiresAt: number;
+    ownerId: string;
+    sessionId: string;
+  }>): Promise<FactsMemoryControlRecord> {
+    const expiresAt = unixMillisecondsSchema.parse(input.expiresAt);
+    const ownerId = profileIdSchema.parse(input.ownerId);
+    const sessionId = sessionIdSchema.parse(input.sessionId);
+    const current = this.#control.get(sessionId);
+    if (current !== null && current.binding.ownerId !== ownerId) {
+      throw new Error("FACTS_MEMORY_AUTHORITY_MISMATCH");
+    }
+    if (current?.state === "purged") {
+      this.#attestations?.purgeMemoryWorkingPageAttestations({
+        bindingDigest: current.binding.bindingDigest,
+      });
+    }
+    const binding = createFactsMemoryBinding({
+      epoch: current?.state === "purged" && current.cleanupReason === "expired"
+        ? current.binding.epoch + 1
+        : current?.binding.epoch ?? 1,
+      ownerId,
+      sessionId,
+    });
+    if (current === null) {
+      this.#attestations?.purgeMemoryWorkingPageAttestations({
+        bindingDigest: binding.bindingDigest,
+      });
+    }
+    const record = this.#control.reserve({
+      binding,
+      createOperationKey: current !== null && current.binding.epoch === binding.epoch
+        ? current.createOperationKey
+        : this.#createOperationKey(binding, "create"),
+      expiresAt,
+      ...(current?.parent === null || current?.parent === undefined
+        ? {}
+        : { parent: current.parent }),
+    });
+    return await (record.parent === null
+      ? this.#ensureReserved(record)
+      : this.#ensureForkReserved(record));
   }
 
   async #ensureReserved(record: FactsMemoryControlRecord): Promise<FactsMemoryControlRecord> {
@@ -727,6 +838,9 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
   ): Promise<FactsMemoryControlRecord> {
     const binding = existing.binding;
     const exact = this.#control.requireExact(binding);
+    if (exact.cleanupReason === "provider_switch") {
+      throw new Error("FACTS_MEMORY_OWNER_TRANSFER_IN_PROGRESS");
+    }
     const sealsExpiredPurge = exact.state === "purged"
       && exact.cleanupReason === "expired"
       && requestedReason !== "expired";
@@ -739,16 +853,26 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
       && this.#attestations?.hasMemoryWorkingAttestationForkFromParent(binding.bindingDigest) === true
     ) throw new Error("FACTS_MEMORY_PARENT_REFERENCED");
     const pending = this.#control.beginCleanup({ binding, operationKey, reason });
+    return await this.#purgePending(pending);
+  }
+
+  async #purgePending(pendingValue: FactsMemoryControlRecord): Promise<FactsMemoryControlRecord> {
+    const binding = pendingValue.binding;
+    const pending = this.#control.requireExact(binding);
     if (pending.state === "purged") {
-      this.#attestations?.purgeMemoryWorkingPageAttestations({
-        bindingDigest: binding.bindingDigest,
-      });
+      this.#attestations?.purgeMemoryWorkingPageAttestations({ bindingDigest: binding.bindingDigest });
       return pending;
+    }
+    if (pending.state !== "cleanup_pending" || pending.cleanupOperationKey === null) {
+      throw new Error("FACTS_MEMORY_CLEANUP_STATE_INVALID");
+    }
+    if (this.#attestations?.hasMemoryWorkingAttestationForkFromParent(binding.bindingDigest) === true) {
+      throw new Error("FACTS_MEMORY_PARENT_REFERENCED");
     }
     const purge = assertPurgeReceipt(binding, await this.#broker.purge({
       binding,
       expectedHandleHash: pending.handleHash,
-      operationKey: pending.cleanupOperationKey ?? operationKey,
+      operationKey: pending.cleanupOperationKey,
     }));
     const purged = this.#control.finalizePurged(binding, purge);
     this.#attestations?.purgeMemoryWorkingPageAttestations({

@@ -5,7 +5,7 @@ import { lstat, open, realpath, writeFile } from "node:fs/promises";
 import { dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export type HraAppearanceAsset = Readonly<{
+export type OompaAppearanceAsset = Readonly<{
   sourcePath: string;
   source: string;
   verifyInputs: () => Promise<void>;
@@ -42,7 +42,7 @@ async function readSnapshot(root: string, path: string): Promise<Snapshot> {
   } finally { await file.close(); }
 }
 
-async function compileHraAppearance(rootDirectory: string): Promise<Readonly<{ source: string; verifyInputs: () => Promise<void> }>> {
+async function compileOompaAppearance(rootDirectory: string): Promise<Readonly<{ source: string; verifyInputs: () => Promise<void> }>> {
   const root = await realpath(rootDirectory);
   const sources = new Map<string, Snapshot>();
   const configuration = new Map<string, Snapshot | null>();
@@ -78,7 +78,7 @@ async function compileHraAppearance(rootDirectory: string): Promise<Readonly<{ s
     target: "browser",
     metafile: true,
     plugins: [{
-      name: "hra-appearance-source-capture",
+      name: "oompa-appearance-source-capture",
       setup(build) {
         build.onLoad({ filter: /.*/, namespace: "file" }, async ({ path }) => {
           assert.ok(sources.size < 512, "Appearance input graph exceeded its bound");
@@ -109,7 +109,7 @@ async function compileHraAppearance(rootDirectory: string): Promise<Readonly<{ s
   });
   assert.equal(process.cwd(), buildWorkingDirectory, "Appearance compiler working directory changed");
   const output = result.outputs[0];
-  assert.ok(result.success, `HRA appearance bundle failed: ${result.logs.map((log) => log.message).join("\n")}`);
+  assert.ok(result.success, `Oompa appearance bundle failed: ${result.logs.map((log) => log.message).join("\n")}`);
   assert.ok(result.outputs.length === 1 && output?.kind === "entry-point", "Appearance bootstrap must emit one classic program");
   const metafile = result.metafile;
   assert.ok(metafile !== undefined && Object.keys(metafile.inputs).length > 0, "Appearance compiler input graph was not captured");
@@ -163,18 +163,18 @@ async function compileHraAppearance(rootDirectory: string): Promise<Readonly<{ s
 }
 
 /** A classic external script applies the saved palette before the page paints. */
-export async function buildHraAppearance(): Promise<string> {
+export async function buildOompaAppearance(): Promise<string> {
   const root = fileURLToPath(new URL("..", import.meta.url));
-  return (await compileHraAppearance(root)).source;
+  return (await compileOompaAppearance(root)).source;
 }
 
 /** Stage immutable compiler bytes so the StyleX adapter can bind a native asset. */
-export async function stageHraAppearance(rootDirectory: string, runDirectory: string): Promise<HraAppearanceAsset> {
+export async function stageOompaAppearance(rootDirectory: string, runDirectory: string): Promise<OompaAppearanceAsset> {
   const root = await realpath(rootDirectory);
   const run = await realpath(runDirectory);
   assertContained(root, run);
   assert.ok((await lstat(run)).isDirectory(), "Appearance staging directory is not ordinary");
-  const compiled = await compileHraAppearance(root);
+  const compiled = await compileOompaAppearance(root);
   const sourcePath = join(run, "appearance.js");
   await writeFile(sourcePath, compiled.source, { flag: "wx", mode: 0o600 });
   const staged = await readSnapshot(root, sourcePath);
@@ -187,4 +187,4 @@ export async function stageHraAppearance(rootDirectory: string, runDirectory: st
   return { sourcePath, source: compiled.source, verifyInputs };
 }
 
-if (import.meta.main) process.stdout.write(await buildHraAppearance());
+if (import.meta.main) process.stdout.write(await buildOompaAppearance());

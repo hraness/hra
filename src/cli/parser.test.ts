@@ -33,7 +33,7 @@ describe("CLI parser", () => {
     expect(parseCli(["status", "--json"])).toEqual({ json: true, kind: "status" });
     expect(() => parseCli(["status", "extra"])).toThrow(CliUsageError);
     expect(() => parseCli(["status", "--jsonl"])).toThrow(
-      "supported only by `hra session events` and `hra session watch`",
+      "supported only by `oompa session events` and `oompa session watch`",
     );
     expect(() => parseCli([
       "status",
@@ -64,7 +64,7 @@ describe("CLI parser", () => {
       handoffFile: "/private/login/handoff.json",
       json: true,
       kind: "account.login-handoff",
-      replayCommand: `hra account login 'personal account' --device-code --idempotency-key ${idempotencyKey} --handoff-file /private/login/handoff.json --json`,
+      replayCommand: `oompa account login 'personal account' --device-code --idempotency-key ${idempotencyKey} --handoff-file /private/login/handoff.json --json`,
     });
     expect(() => parseCli([
       "account",
@@ -99,7 +99,7 @@ describe("CLI parser", () => {
       command: { account: "personal", idempotencyKey: key, kind: "account.claude-login.prepare" },
       json: true,
       kind: "account.claude-login",
-      replayCommand: `hra account login personal --provider claude --idempotency-key ${key}`,
+      replayCommand: `oompa account login personal --provider claude --idempotency-key ${key}`,
     });
     expect(parseCli(["account", "show", "personal", "--provider", "claude", "--json"])).toEqual({
       command: { account: "personal", kind: "account.show", provider: "claude" },
@@ -124,13 +124,13 @@ describe("CLI parser", () => {
     expect(() => parseCli(["account", "login", "bad\nselector", "--provider", "claude", "--json"]))
       .toThrow("control characters");
     expect(claudeAccountLoginCommand("work profile; false")).toBe(
-      "hra account login 'work profile; false' --provider claude",
+      "oompa account login 'work profile; false' --provider claude",
     );
 
     const attemptId = `attempt_${"a".repeat(32)}`;
     const abandon = claudeAccountLoginAbandonCommand("personal", attemptId, key, 7);
     expect(abandon).toBe(
-      `hra account login-cancel personal --provider claude --attempt-id ${attemptId}`
+      `oompa account login-cancel personal --provider claude --attempt-id ${attemptId}`
       + ` --provider-generation 7 --idempotency-key ${key} --acknowledge-child-exited`,
     );
     expect(parseCli(abandon.split(" ").slice(1))).toEqual({
@@ -1254,7 +1254,7 @@ describe("CLI parser", () => {
     }
     expect(approval.command.fingerprint).toBe(fingerprint);
     expect(deviceMutationReplayCommand(approval.command, true)).toBe(
-      "hra device approve device_target"
+      "oompa device approve device_target"
       + ` --fingerprint ${fingerprint}`
       + ` --idempotency-key ${approval.command.idempotencyKey} --json`,
     );
@@ -1336,7 +1336,7 @@ describe("CLI parser", () => {
       /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
     );
     expect(nextCommand).toBe(
-      `hra sync projection recover 'My session' --acknowledge-gap --idempotency-key ${idempotencyKey} --json`,
+      `oompa sync projection recover 'My session' --acknowledge-gap --idempotency-key ${idempotencyKey} --json`,
     );
 
     expect(parseCli([
@@ -1481,8 +1481,8 @@ describe("CLI parser", () => {
 
     expect(resolveUsage("session", "peer-policy").usage).toContain([
       "Usage:",
-      "  hra session peer-policy get <session> [--json]",
-      "  hra session peer-policy set <session> <off|inspect|coordinate> --revision <n> [--json]",
+      "  oompa session peer-policy get <session> [--json]",
+      "  oompa session peer-policy set <session> <off|inspect|coordinate> --revision <n> [--json]",
     ].join("\n"));
   });
 
@@ -1600,9 +1600,9 @@ describe("CLI parser", () => {
     expect(() => parseCli(["session", "events", "release", "--jsonl", "--json"]))
       .toThrow("mutually exclusive");
     expect(() => parseCli(["session", "status", "release", "--jsonl"]))
-      .toThrow("supported only by `hra session events` and `hra session watch`");
+      .toThrow("supported only by `oompa session events` and `oompa session watch`");
     expect(() => parseCli(["account", "list", "--jsonl"]))
-      .toThrow("supported only by `hra session events` and `hra session watch`");
+      .toThrow("supported only by `oompa session events` and `oompa session watch`");
     expect(() => parseCli(["session", "watch", "release", "--json"]))
       .toThrow("does not support --json");
     expect(() => parseCli(["session", "watch", "release", "--follow"]))
@@ -1977,13 +1977,13 @@ describe("CLI parser", () => {
 
 describe("CLI help", () => {
   const sessionEventsHelp = [
-    "HRA session events",
+    "Oompa session events",
     "",
     "Usage:",
-    "  hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]",
+    "  oompa session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]",
     "",
     "Examples:",
-    "  hra session events my-session --wait-ms 30000 --jsonl",
+    "  oompa session events my-session --wait-ms 30000 --jsonl",
   ].join("\n");
 
   test("parses --help, -h, and the help alias at root, group, and leaf depth", () => {
@@ -2011,24 +2011,24 @@ describe("CLI help", () => {
   test("resolves leaf help to only that leaf plus the group's shared notes", () => {
     expect(resolveUsage("session", "events")).toEqual({ group: "session", leaf: "events", usage: sessionEventsHelp });
     expect(usageForGroup("session", "events")).toBe(sessionEventsHelp);
-    expect(usageForGroup("session", "events")).not.toContain("hra session watch");
-    expect(usageForGroup("session", "events")).not.toContain("hra session start");
+    expect(usageForGroup("session", "events")).not.toContain("oompa session watch");
+    expect(usageForGroup("session", "events")).not.toContain("oompa session start");
 
     const decide = resolveUsage("interaction", "decide");
     expect(decide).toMatchObject({ group: "interaction", leaf: "decide" });
-    expect(decide.usage).toContain("Usage:\n  hra interaction decide <interaction-id> --revision <n> --decision <once|session|decline|cancel>\n\n");
+    expect(decide.usage).toContain("Usage:\n  oompa interaction decide <interaction-id> --revision <n> --decision <once|session|decline|cancel>\n\n");
     expect(decide.usage).toContain("Protected values are accepted only through stdin or an explicit file descriptor.");
-    expect(decide.usage).toContain("Examples:\n  hra interaction decide <id> --revision 1 --decision once");
-    expect(decide.usage).not.toContain("hra interaction answer <id>");
-    expect(decide.usage).not.toContain("hra interaction list");
+    expect(decide.usage).toContain("Examples:\n  oompa interaction decide <id> --revision 1 --decision once");
+    expect(decide.usage).not.toContain("oompa interaction answer <id>");
+    expect(decide.usage).not.toContain("oompa interaction list");
 
     const send = resolveUsage("session", "send");
-    expect(send.usage).toContain("  hra session send|queue|steer <session> [--attach <path>]... <message>");
-    expect(send.usage).toContain('  hra session send my-session -- "run --help exactly"');
-    expect(send.usage).not.toContain("hra session events");
+    expect(send.usage).toContain("  oompa session send|queue|steer <session> [--attach <path>]... <message>");
+    expect(send.usage).toContain('  oompa session send my-session -- "run --help exactly"');
+    expect(send.usage).not.toContain("oompa session events");
 
     const note = resolveUsage("session", "note");
-    expect(note.usage).toContain("  hra session note get|edit|clear <session>\n  hra session note set <session> <note>");
+    expect(note.usage).toContain("  oompa session note get|edit|clear <session>\n  oompa session note set <session> <note>");
     expect(note.usage).not.toContain("Examples:");
 
     const claudeLogin = resolveUsage("account", "login");
@@ -2042,35 +2042,35 @@ describe("CLI help", () => {
     expect(resolveUsage("bogus", "events")).toEqual({ usage });
     expect(resolveUsage("session", "bogus")).toEqual({ group: "session", usage: usageForGroup("session") });
     expect(resolveUsage("session", "")).toEqual({ group: "session", usage: usageForGroup("session") });
-    expect(resolveUsage("session", "hra")).toEqual({ group: "session", usage: usageForGroup("session") });
+    expect(resolveUsage("session", "oompa")).toEqual({ group: "session", usage: usageForGroup("session") });
     expect(resolveUsage("session", "session")).toEqual({ group: "session", usage: usageForGroup("session") });
   });
 
   test("root help uses ASCII quotes and names the help alias", () => {
     expect(usage).not.toMatch(/[\u2018\u2019\u201c\u201d]/u);
-    expect(usage).toContain("  hra help [<group> [<command>]]\n");
-    expect(usage).toContain("Run `hra <group> --help` or `hra help <group> [<command>]` for command examples.");
+    expect(usage).toContain("  oompa help [<group> [<command>]]\n");
+    expect(usage).toContain("Run `oompa <group> --help` or `oompa help <group> [<command>]` for command examples.");
     expect(usage).toContain("Codex provider commands run on macOS and Linux");
     expect(usage).toContain("Claude login, status,\n  sessions, and provider switches require Linux");
     expect(usage).toContain("high        Sol Max         (codex)");
     expect(usage).toContain("ultra       Sol Ultra       (codex)");
     expect(usage).not.toContain("Astra Max       (codex)");
     expect(usage).not.toContain("Astra Ultra     (codex)");
-    for (const group of helpGroupNames) expect(usage).toContain(`hra ${group}`);
+    for (const group of helpGroupNames) expect(usage).toContain(`oompa ${group}`);
   });
 
   test("every group leaf named in a usage line resolves to help holding exactly its own usage lines", () => {
     let leaves = 0;
     for (const group of helpGroupNames) {
       const groupHelp = usageForGroup(group);
-      const usageLines = groupHelp.split("\n").filter((line) => line.startsWith(`  hra ${group} `));
+      const usageLines = groupHelp.split("\n").filter((line) => line.startsWith(`  oompa ${group} `));
       const leafNames = new Set(usageLines.flatMap((line) => line.trim().split(/\s+/u)[2]?.split("|") ?? []));
       for (const leaf of leafNames) {
         if (leaf.startsWith("<") || leaf.startsWith("[") || leaf.startsWith("-")) continue;
         leaves += 1;
         const resolved = resolveUsage(group, leaf);
         expect(resolved).toMatchObject({ group, leaf });
-        expect(resolved.usage.startsWith(`HRA ${group} ${leaf}\n\nUsage:\n  hra ${group} `)).toBe(true);
+        expect(resolved.usage.startsWith(`Oompa ${group} ${leaf}\n\nUsage:\n  oompa ${group} `)).toBe(true);
         const resolvedLines = new Set(resolved.usage.split("\n"));
         for (const line of usageLines) {
           const named = line.trim().split(/\s+/u)[2]?.split("|").includes(leaf) ?? false;

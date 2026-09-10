@@ -59,7 +59,7 @@ export function SignInScreen() {
       <AppearanceHeader />
       <Card>
         <CardHeader>
-          <CardTitle>Sign in to HRA</CardTitle>
+          <CardTitle>Sign in to Oompa</CardTitle>
           <CardDescription>
             {stage === "email"
               ? "Enter your email address and we will send a one-time code."

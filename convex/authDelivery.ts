@@ -32,7 +32,7 @@ import {
 import { internalMutation, type MutationCtx } from "./server";
 
 const authenticationRejectedMessage = "Authentication could not be completed.";
-const hraOtpProviderId = "hra-control-plane-otp-v1";
+const oompaOtpProviderId = "hra-control-plane-otp-v1";
 
 function rejectAuthentication(): never {
   throw new Error(authenticationRejectedMessage);
@@ -320,7 +320,7 @@ export const storeOtpChallenge = internalMutation({
       subject?.status !== "active"
       || subject.authEpoch !== args.authEpoch
       || (subject.userId !== undefined && subject.userId !== args.userId)
-      || account?.provider !== hraOtpProviderId
+      || account?.provider !== oompaOtpProviderId
       || account.userId !== args.userId
       || user?._id === undefined
       || !Number.isFinite(args.expiresAt)
@@ -451,7 +451,7 @@ export const consumeOtpChallenge = internalMutation({
       ctx.db.get(challenge.accountId),
       ctx.db.get(challenge.userId),
     ]);
-    if (account?.provider !== hraOtpProviderId || user === null) rejectAuthentication();
+    if (account?.provider !== oompaOtpProviderId || user === null) rejectAuthentication();
     if (
       subject.userId !== user._id
       || account.userId !== user._id

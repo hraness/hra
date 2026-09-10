@@ -778,14 +778,14 @@ export class ShellTerminalCoordinator {
     } catch {
       this.close();
       await this.#quarantineInput(
-        "hra: Protected input cannot prove an empty terminal queue. HRA will discard input until EOF; press Ctrl-D to return safely.\n",
+        "oompa: Protected input cannot prove an empty terminal queue. Oompa will discard input until EOF; press Ctrl-D to return safely.\n",
       );
       throw new Error("Protected terminal input could not establish an empty input queue.");
     }
     if (discarded > 0) {
       this.close();
       await this.#quarantineInput(
-        "hra: Protected input rejected queued shell input. HRA flushed the current queue and will discard any remaining paste through EOF; press Ctrl-D to exit safely.\n",
+        "oompa: Protected input rejected queued shell input. Oompa flushed the current queue and will discard any remaining paste through EOF; press Ctrl-D to exit safely.\n",
       );
     }
     return discarded;
@@ -983,8 +983,8 @@ export class ShellTerminalCoordinator {
     this.close();
     await this.#quarantineInput(
       flushProved
-        ? "hra: Shell typeahead exceeded the bounded input queue. HRA flushed the current queue and will discard any remaining paste through EOF; press Ctrl-D to exit the shell safely.\n"
-        : "hra: Shell typeahead overflowed and the terminal input queue could not be flushed. HRA will discard input until EOF; press Ctrl-D to return safely.\n",
+        ? "oompa: Shell typeahead exceeded the bounded input queue. Oompa flushed the current queue and will discard any remaining paste through EOF; press Ctrl-D to exit the shell safely.\n"
+        : "oompa: Shell typeahead overflowed and the terminal input queue could not be flushed. Oompa will discard input until EOF; press Ctrl-D to return safely.\n",
     );
   }
 
@@ -1002,8 +1002,8 @@ export class ShellTerminalCoordinator {
     this.close();
     await this.#quarantineInput(
       flushProved
-        ? "hra: Shell input was interrupted. HRA flushed the current queue and will discard any same-paste tail through EOF; press Ctrl-D to exit safely.\n"
-        : "hra: Shell input was interrupted and the terminal queue could not be flushed. HRA will discard input through EOF; press Ctrl-D to exit safely.\n",
+        ? "oompa: Shell input was interrupted. Oompa flushed the current queue and will discard any same-paste tail through EOF; press Ctrl-D to exit safely.\n"
+        : "oompa: Shell input was interrupted and the terminal queue could not be flushed. Oompa will discard input through EOF; press Ctrl-D to exit safely.\n",
     );
   }
 

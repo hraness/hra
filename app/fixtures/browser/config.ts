@@ -18,7 +18,7 @@ export function browserIoPlugin(root: string): Plugin {
   const adapter = resolve(root, "app/fixtures/browser/io.ts");
   const allowed = new Set(browserIoModules.map((path) => resolve(root, path)));
   return {
-    name: "hra-browser-fixture-io", enforce: "pre",
+    name: "oompa-browser-fixture-io", enforce: "pre",
     resolveId(source, importer) {
       if (source === "@convex-dev/auth/react") return adapter;
       if (source === "convex/react") throw new Error("Unreplaced live Convex IO in browser fixture");

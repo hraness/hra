@@ -13,7 +13,7 @@ export function ProductPreview({ view = "overview", id = "product-preview" }: Re
       <button className={classes("button")} data-preview-enlarge="" disabled type="button" aria-haspopup="dialog">Enlarge ↗</button>
     </div>
     <div className={classes("viewport")}>
-      <iframe aria-hidden="true" className={classes("frame")} data-preview-frame="" loading="lazy" referrerPolicy="no-referrer" sandbox="allow-scripts" src={`/examples/app/index.html?view=${view}`} tabIndex={-1} title={`HRA example: ${scene.label}`} />
+      <iframe aria-hidden="true" className={classes("frame")} data-preview-frame="" loading="lazy" referrerPolicy="no-referrer" sandbox="allow-scripts" src={`/examples/app/index.html?view=${view}`} tabIndex={-1} title={`Oompa example: ${scene.label}`} />
     </div>
     <figcaption className={classes("caption")}>
       <p className={classes("description")} data-preview-description="">{scene.description}</p>
@@ -26,7 +26,7 @@ export function ProductPreview({ view = "overview", id = "product-preview" }: Re
     </figcaption>
     <dialog aria-labelledby={`${id}-dialog-title`} className={classes("dialog")} data-preview-dialog="">
       <div className={classes("toolbar")}>
-        <h2 className={classes("dialogTitle")} id={`${id}-dialog-title`}>HRA · <span data-preview-dialog-title="">{scene.label}</span></h2>
+        <h2 className={classes("dialogTitle")} id={`${id}-dialog-title`}>Oompa · <span data-preview-dialog-title="">{scene.label}</span></h2>
         <button autoFocus className={classes("button")} data-preview-close="" type="button">Close</button>
       </div>
       <div className={classes("expandedViewport")} data-preview-expanded="" />

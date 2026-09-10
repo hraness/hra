@@ -19,11 +19,11 @@ const hasControlCharacter = (value: string): boolean => {
   return false;
 };
 
-export const HRA_V0_CONVEX_PROJECT_ID = 2_680_173;
-export const HRA_V0_CONVEX_DEPLOYMENT_ID = 4_677_913;
-export const HRA_CONVEX_TEAM_ID = 513_923;
-export const HRA_CONVEX_TEAM_SLUG = "cclrte";
-export const HRA_CONVEX_PROJECT_ID = 2_854_545;
+export const OOMPA_V0_CONVEX_PROJECT_ID = 2_680_173;
+export const OOMPA_V0_CONVEX_DEPLOYMENT_ID = 4_677_913;
+export const OOMPA_CONVEX_TEAM_ID = 513_923;
+export const OOMPA_CONVEX_TEAM_SLUG = "cclrte";
+export const OOMPA_CONVEX_PROJECT_ID = 2_854_545;
 
 const generatedDeploymentNameSchema = z.string()
   .min(5)
@@ -52,19 +52,19 @@ const expectedTargetSchema = z.object({
   deploymentId: numericIdentifierSchema,
   deploymentName: generatedDeploymentNameSchema,
   deploymentUrl: deploymentUrlSchema,
-  projectId: z.literal(HRA_CONVEX_PROJECT_ID),
-  teamId: z.literal(HRA_CONVEX_TEAM_ID),
+  projectId: z.literal(OOMPA_CONVEX_PROJECT_ID),
+  teamId: z.literal(OOMPA_CONVEX_TEAM_ID),
 }).strict().superRefine((target, context) => {
-  if (target.deploymentId === HRA_V0_CONVEX_DEPLOYMENT_ID) {
-    context.addIssue({ code: "custom", message: "HRA v0 deployment is forbidden." });
+  if (target.deploymentId === OOMPA_V0_CONVEX_DEPLOYMENT_ID) {
+    context.addIssue({ code: "custom", message: "Oompa v0 deployment is forbidden." });
   }
 });
 
 const teamAndProjectSchema = z.object({
   project: z.string().min(1).max(256),
   projectId: numericIdentifierSchema,
-  team: z.literal(HRA_CONVEX_TEAM_SLUG),
-  teamId: z.literal(HRA_CONVEX_TEAM_ID),
+  team: z.literal(OOMPA_CONVEX_TEAM_SLUG),
+  teamId: z.literal(OOMPA_CONVEX_TEAM_ID),
 }).passthrough();
 
 const deploymentReadbackSchema = z.object({
@@ -79,7 +79,7 @@ const deploymentReadbackSchema = z.object({
 const projectReadbackSchema = z.object({
   id: numericIdentifierSchema,
   prodDeploymentName: generatedDeploymentNameSchema.nullable(),
-  teamId: z.literal(HRA_CONVEX_TEAM_ID),
+  teamId: z.literal(OOMPA_CONVEX_TEAM_ID),
 }).passthrough();
 
 const configSchema = z.object({

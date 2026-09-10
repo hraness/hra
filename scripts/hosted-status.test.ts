@@ -12,8 +12,8 @@ import {
   readHostedStatus,
 } from "./hosted-status";
 import {
-  HRA_CONVEX_PROJECT_ID,
-  HRA_CONVEX_TEAM_ID,
+  OOMPA_CONVEX_PROJECT_ID,
+  OOMPA_CONVEX_TEAM_ID,
   type ConvexTarget,
   type ConvexTargetVerifier,
 } from "./convex-target";
@@ -22,8 +22,8 @@ const target: ConvexTarget = {
   deploymentId: 7_654_321,
   deploymentName: "steady-otter-321",
   deploymentUrl: "https://steady-otter-321.convex.cloud",
-  projectId: HRA_CONVEX_PROJECT_ID,
-  teamId: HRA_CONVEX_TEAM_ID,
+  projectId: OOMPA_CONVEX_PROJECT_ID,
+  teamId: OOMPA_CONVEX_TEAM_ID,
 };
 
 const targetArguments = [
@@ -40,10 +40,10 @@ const requiredEnvironmentNames = [
   "SITE_URL",
   "JWT_PRIVATE_KEY",
   "JWKS",
-  "HRA_AUTH_HMAC_SECRET",
-  "HRA_RESEND_API_KEY",
-  "HRA_AUTH_EMAIL_REPLY_TO",
-  "HRA_ATTENTION_RESEND_API_KEY",
+  "OOMPA_AUTH_HMAC_SECRET",
+  "OOMPA_RESEND_API_KEY",
+  "OOMPA_AUTH_EMAIL_REPLY_TO",
+  "OOMPA_ATTENTION_RESEND_API_KEY",
 ] as const;
 
 const outputWriter = (chunks: string[]): Pick<NodeJS.WriteStream, "write"> => ({

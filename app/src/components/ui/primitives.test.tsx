@@ -48,21 +48,21 @@ const consumerStyles = stylex.create({
 
 const typedBadge: BadgeProps = { tone: "accent", xstyle: consumerStyles.override };
 const typedButton: ButtonProps = { xstyle: consumerStyles.override };
-// @ts-expect-error HRA primitive xstyle accepts compiled StyleX recipes, not raw CSS objects.
+// @ts-expect-error Oompa primitive xstyle accepts compiled StyleX recipes, not raw CSS objects.
 const rawButtonXstyle: ButtonProps = { xstyle: { color: "red" } };
-// @ts-expect-error HRA primitives never accept caller inline styles.
+// @ts-expect-error Oompa primitives never accept caller inline styles.
 const inlineBadge: BadgeProps = { style: { color: "red" } };
-// @ts-expect-error HRA primitives never accept caller inline styles.
+// @ts-expect-error Oompa primitives never accept caller inline styles.
 const inlineButton: ButtonProps = { style: { color: "red" } };
-// @ts-expect-error HRA primitives never accept caller inline styles.
+// @ts-expect-error Oompa primitives never accept caller inline styles.
 const inlineCard: CardProps = { style: { color: "red" } };
-// @ts-expect-error HRA primitives never accept caller inline styles.
+// @ts-expect-error Oompa primitives never accept caller inline styles.
 const inlineCardTitle: CardTitleProps = { style: { color: "red" } };
-// @ts-expect-error HRA primitives never accept caller inline styles.
+// @ts-expect-error Oompa primitives never accept caller inline styles.
 const inlineCardDescription: CardDescriptionProps = { style: { color: "red" } };
-// @ts-expect-error HRA primitives never accept caller inline styles.
+// @ts-expect-error Oompa primitives never accept caller inline styles.
 const inlineInput: InputProps = { style: { color: "red" } };
-// @ts-expect-error HRA primitives never accept caller inline styles.
+// @ts-expect-error Oompa primitives never accept caller inline styles.
 const inlineTextarea: TextareaProps = { style: { color: "red" } };
 void [
   inlineBadge,
@@ -313,7 +313,7 @@ test("class-only StyleX composition fails closed on a dynamic presentation", () 
   expect(() => staticStylexClassName(
     { className: "x-static", style: { color: "red" } },
     "consumer",
-  )).toThrow("HRA primitives accept only extracted static StyleX styles.");
+  )).toThrow("Oompa primitives accept only extracted static StyleX styles.");
 });
 
 test("native primitive boundaries reject caller inline styles at runtime", () => {
@@ -332,7 +332,7 @@ test("native primitive boundaries reject caller inline styles at runtime", () =>
     expect(
       () => { Reflect.apply(component, undefined, [{ style: { color: "red" } }]); },
       name,
-    ).toThrow("HRA primitives do not accept caller inline styles.");
+    ).toThrow("Oompa primitives do not accept caller inline styles.");
   }
 });
 

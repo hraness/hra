@@ -23,6 +23,9 @@ const authority: ProfileAuthority = {
   generation: 3,
   codexHome: instance.codexHome,
   desktopUserData: instance.desktopUserData,
+  provider: "codex",
+  providerAccountId: profileId,
+  bindingGeneration: 1,
 };
 
 const capability: ChatGptBundleCapability = {
@@ -196,7 +199,7 @@ describe("PidBoundDesktopAccountRuntime", () => {
 
 describe("parseDarwinProcArgs", () => {
   test("preserves spaces and duplicate reviewed environment bindings", () => {
-    const profileHome = ["", "Users", "person", "Library", "Application Support", "HRA", "profile"].join("/");
+    const profileHome = ["", "Users", "person", "Library", "Application Support", "Oompa", "profile"].join("/");
     const bytes = procArgsFixture({
       executablePath: instance.executablePath,
       arguments: [instance.executablePath],

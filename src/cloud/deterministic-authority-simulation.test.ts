@@ -50,13 +50,13 @@ const invalidLeaseDurations: readonly number[] = [
 type SimulationCampaign = "authority" | "leases" | "reducer";
 
 function selectedCampaign(): SimulationCampaign | null {
-  const requested = process.env.HRA_SIMULATION_CAMPAIGN;
+  const requested = process.env.OOMPA_SIMULATION_CAMPAIGN;
   if (requested === undefined) return null;
   if (requested === "authority" || requested === "leases" || requested === "reducer") {
     return requested;
   }
   throw new Error(
-    "HRA_SIMULATION_CAMPAIGN must be one of: authority, leases, reducer.",
+    "OOMPA_SIMULATION_CAMPAIGN must be one of: authority, leases, reducer.",
   );
 }
 
@@ -75,18 +75,18 @@ function describeCampaign(
 }
 
 function replayCommand(candidate: SimulationCampaign, seed: number): string {
-  return `HRA_SIMULATION_CAMPAIGN=${candidate} HRA_SIMULATION_SEED=${seed} bun run test:simulation`;
+  return `OOMPA_SIMULATION_CAMPAIGN=${candidate} OOMPA_SIMULATION_SEED=${seed} bun run test:simulation`;
 }
 
 function selectedSeeds(): readonly number[] {
-  const requested = process.env.HRA_SIMULATION_SEED;
+  const requested = process.env.OOMPA_SIMULATION_SEED;
   if (requested === undefined) return [1, 11, 97, 0x5eed_0a];
   if (!/^\d{1,10}$/u.test(requested)) {
-    throw new Error("HRA_SIMULATION_SEED must be one unsigned decimal 32-bit seed.");
+    throw new Error("OOMPA_SIMULATION_SEED must be one unsigned decimal 32-bit seed.");
   }
   const seed = Number(requested);
   if (!Number.isSafeInteger(seed) || seed > 0xffff_ffff) {
-    throw new Error("HRA_SIMULATION_SEED must be one unsigned decimal 32-bit seed.");
+    throw new Error("OOMPA_SIMULATION_SEED must be one unsigned decimal 32-bit seed.");
   }
   return [seed];
 }

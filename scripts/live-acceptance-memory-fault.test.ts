@@ -16,7 +16,7 @@ import type {
   CanonicalMemorySpaceSummary,
   CanonicalMemoryWriteResult,
 } from "../src/cloud/memory-sync-contracts";
-import { HRA_VERSION } from "../src/version";
+import { OOMPA_VERSION } from "../src/version";
 import type { LiveAcceptanceCandidate } from "./live-acceptance-installation";
 import {
   LiveAcceptanceMemoryFaultController,
@@ -32,7 +32,7 @@ const sha256 = (value: string): string => createHash("sha256")
 const cloudDeploymentUrl = "https://memory-acceptance.convex.cloud";
 const candidate: LiveAcceptanceCandidate = {
   cloudTargetDigest: sha256(cloudDeploymentUrl),
-  packageVersion: HRA_VERSION,
+  packageVersion: OOMPA_VERSION,
   sourceRevision: "a".repeat(40),
 };
 const runId = "00000000-0000-4000-8000-000000000601";
