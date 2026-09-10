@@ -37,6 +37,7 @@ import { canonical39DevinDatabaseBytes, canonical39DevinFixture } from "../../sc
 import { canonical39RetiredDatabaseBytes, canonical39RetiredFixtures, type Canonical39RetiredKind } from "../../scripts/fixtures/canonical39-retired-effects";
 import { canonical39RetiredRecoveryDatabaseBytes, canonical39RetiredRecoveryFixtures } from "../../scripts/fixtures/canonical39-retired-recovery";
 import { retiredSuccessorDatabaseBytes, retiredSuccessorFixtures } from "../../scripts/fixtures/retired-successors";
+import { provisionMigratedStateTemplate } from "../../scripts/fixtures/migrated-state-template";
 import { deriveDesktopProfilePaths } from "../desktop/profile";
 import { AUTORESPOND_DAY_MS } from "../domain/autorespond-budget";
 import {
@@ -444,16 +445,27 @@ async function fixture(
     now?: () => number;
     resolveMachineTimeZone?: MachineTimeZoneResolver;
     securityScrubCheckpoint?: SecurityScrubCheckpointPolicy;
+    /**
+     * `template`, this file's default, copies the process-wide migrated
+     * template before the open so the store starts at the current schema
+     * without replaying the migration chain. `migrate` opens an empty file
+     * and runs the real chain; a test that inspects the migration ledger, the
+     * schema version stamp, cohort classification, schema refusal on reopen,
+     * or first-open behaviour chooses it explicitly.
+     */
+    provision?: "template" | "migrate";
   }> = {},
 ): Promise<{ store: StateStore; home: string }> {
   const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
-  const store = new StateStore(paths, {
-    now: options.now ?? (() => { let value = 1_000; return () => value++; })(),
-    resolveMachineTimeZone: () => "America/Puerto_Rico",
-    ...options,
-  });
+  const { provision = "template", ...storeOptions } = options;
+  const now = storeOptions.now ?? (() => { let value = 1_000; return () => value++; })();
+  const resolveMachineTimeZone = storeOptions.resolveMachineTimeZone ?? (() => "America/Puerto_Rico");
+  if (provision === "template") {
+    await provisionMigratedStateTemplate(paths, { now, resolveMachineTimeZone });
+  }
+  const store = new StateStore(paths, { ...storeOptions, now, resolveMachineTimeZone });
   stores.push(store);
   return { store, home };
 }
@@ -1104,7 +1116,7 @@ describe("automatic usage policy configuration", () => {
   };
 
   test("starts at the domain default and changes only configuration and its global receipt", async () => {
-    const { store, home } = await fixture();
+    const { store, home } = await fixture({ provision: "migrate" });
     seedUnrelatedState(store);
     const database = inspect(home);
     try {
@@ -1243,7 +1255,7 @@ describe("automatic usage policy configuration", () => {
   });
 
   test.each(["missing_table", "missing_initial", "weakened_guard", "digest", "receipt", "request"])("fails closed on current-schema corruption: %s", async (damage) => {
-    const { store, home } = await fixture();
+    const { store, home } = await fixture({ provision: "migrate" });
     const request = command();
     store.updateAutomaticUsagePolicyConfiguration(request);
     const database = inspect(home);
@@ -1351,7 +1363,7 @@ describe("automatic usage policy configuration", () => {
   });
 
   test.each([false, true])("refuses an adversarial joined-schema v43 restamp with missing or partial policy without writes (partial=%s)", async (partial) => {
-    const { store, home } = await fixture();
+    const { store, home } = await fixture({ provision: "migrate" });
     seedUnrelatedState(store);
     if (partial) store.updateAutomaticUsagePolicyConfiguration(command());
     const database = inspect(home);
@@ -1387,7 +1399,7 @@ describe("automatic usage policy configuration", () => {
   });
 
   test("refuses an adversarial joined-schema v43 restamp with a malformed policy table without writes", async () => {
-    const { home } = await fixture();
+    const { home } = await fixture({ provision: "migrate" });
     const database = inspect(home);
     try {
       database.exec("DROP TABLE automatic_usage_policy_revisions");
@@ -1403,7 +1415,7 @@ describe("automatic usage policy configuration", () => {
   });
 
   test.each([false, true])("refuses an adversarial joined-schema v43 restamp with empty policy history without repair (retained receipt=%s)", async (retainedReceipt) => {
-    const { store, home } = await fixture();
+    const { store, home } = await fixture({ provision: "migrate" });
     if (retainedReceipt) store.updateAutomaticUsagePolicyConfiguration(command());
     const database = inspect(home);
     try {
@@ -1438,7 +1450,7 @@ describe("automatic usage policy configuration", () => {
   });
 
   test("refuses an orphan current-schema configuration intent on writable and readonly reopen", async () => {
-    const { home } = await fixture();
+    const { home } = await fixture({ provision: "migrate" });
     const database = inspect(home);
     try {
       database.query(`INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at)
@@ -4702,7 +4714,7 @@ describe("StateStore", () => {
   });
 
   test("refuses current anchored plan tampering without startup repair", async () => {
-    const { store } = await fixture();
+    const { store } = await fixture({ provision: "migrate" });
     const prepared = prepareDedicatedSessionSwitch(store, 773);
     const paths = store.paths;
     store.close();
@@ -5903,7 +5915,7 @@ describe("StateStore", () => {
   });
 
   test("refuses an adversarial joined-schema v42 restamp without rewriting switch evidence", async () => {
-    const value = await fixture();
+    const value = await fixture({ provision: "migrate" });
     const prepared = prepareDedicatedSessionSwitch(value.store, 739);
     advanceDedicatedSessionSwitch(value.store, prepared, "target_starting");
     const paths = value.store.paths;
@@ -6779,7 +6791,7 @@ describe("StateStore", () => {
   });
 
   test("creates a project and session with CAS metadata", async () => {
-    const { store, home } = await fixture();
+    const { store, home } = await fixture({ provision: "migrate" });
     const repository = join(home, "Documents");
     await mkdir(repository);
     const profile = store.createProfile("Main");
@@ -10240,7 +10252,7 @@ describe("StateStore", () => {
   });
 
   test("rejects a weakened same-name Work authority guard in current adoption-v39", async () => {
-    const { store } = await fixture();
+    const { store } = await fixture({ provision: "migrate" });
     const candidate = store.upsertSessionAdoptionCandidate({
       provider: "codex",
       providerThreadId: "current-v39-weakened-work-guard",
@@ -11937,7 +11949,7 @@ describe("StateStore", () => {
   });
 
   test("rejects a malformed current Claude authority table without rewriting custody", async () => {
-    const { store } = await fixture();
+    const { store } = await fixture({ provision: "migrate" });
     const profile = signInProfile(store, "Legacy Claude authority", "legacy-claude@example.com");
     const identities = [
       { pid: 52_001, pidDomain: "darwin" as const, procStart: "legacy-claimed" },
@@ -12327,7 +12339,7 @@ describe("StateStore", () => {
   });
 
   test("rejects a malformed current adoption candidate table without releasing fences", async () => {
-    const { store } = await fixture();
+    const { store } = await fixture({ provision: "migrate" });
     const candidate = store.upsertSessionAdoptionCandidate({
       provider: "claude",
       providerThreadId: "legacy-v35-candidate",
@@ -17779,7 +17791,7 @@ describe("StateStore", () => {
 
   test("refuses missing or changed current timestamp guards before maintenance without repairing them", async () => {
     for (const definition of ["missing", "weaker", "changed_literal"] as const) {
-      const { store } = await fixture();
+      const { store } = await fixture({ provision: "migrate" });
       const inspector = new Database(store.paths.database, { create: false, strict: true });
       try {
         const original = z.object({ sql: z.string() }).parse(inspector.query("SELECT sql FROM sqlite_master WHERE name='mutation_resolutions_timestamp_proof_insert'").get()).sql;
@@ -17923,7 +17935,7 @@ describe("StateStore", () => {
         if (version === 45 || version === 46) return canonicalAuthBudgetArchive(version);
         if (version === 47) return stagedCanonical47Archive();
         if (version === 48) return canonical48WorkArchive();
-        const { store } = await fixture();
+        const { store } = await fixture({ provision: "migrate" });
         signInProfile(store, "Auth schema drift", "auth-schema@example.com");
         return store.paths;
       })();
@@ -19128,7 +19140,7 @@ describe("StateStore", () => {
     "queue_message_resolution_scrub", "queue_message_settlement_guard",
   ])("refuses a damaged current queue scrub guard without repairing history: %s", async (guard) => {
     for (const damage of ["missing", "weakened", "wrong_table"] as const) {
-    const { store } = await fixture();
+    const { store } = await fixture({ provision: "migrate" });
     const profile = signInProfile(store, "Stale queue trigger", "stale-trigger@example.com");
     const session = createProvenTestSession(store, {
       profileId: profile.id,
@@ -24437,7 +24449,7 @@ describe("StateStore", () => {
   });
 
   test("readonly open rejects a stale same-name reset-policy guard", async () => {
-    const { store } = await fixture();
+    const { store } = await fixture({ provision: "migrate" });
     const paths = store.paths;
     store.close();
     stores.splice(stores.indexOf(store), 1);
@@ -24458,7 +24470,7 @@ describe("StateStore", () => {
   });
 
   test("readonly open rejects a weakened same-name reset-policy table", async () => {
-    const { store } = await fixture();
+    const { store } = await fixture({ provision: "migrate" });
     const paths = store.paths;
     store.close();
     stores.splice(stores.indexOf(store), 1);
@@ -25927,7 +25939,7 @@ describe("StateStore", () => {
   });
 
   test("refuses weakened same-name usage guards in current60 without rewriting authority", async () => {
-    const { store } = await fixture();
+    const { store } = await fixture({ provision: "migrate" });
     const profile = signInProfile(store, "Repair v36 guards", "repair-v36@example.com");
     const codexAuthority = store.requireProviderAccountAuthority(profile.id, "codex");
     const snapshot = usageSnapshot({
@@ -25966,7 +25978,7 @@ describe("StateStore", () => {
     expectInertSchemaRefusal(paths, "STATE_SCHEMA_COHORT_INVALID:joined60:account_scoped_provider_authorities_immutable_update");
   });
   test("refuses weakened same-name switch guards in current49 without rewriting authority", async () => {
-    const { store } = await fixture();
+    const { store } = await fixture({ provision: "migrate" });
     const paths = store.paths;
     store.close();
     stores.splice(stores.indexOf(store), 1);
@@ -26940,7 +26952,7 @@ describe("StateStore", () => {
   });
 
   test("creates fresh databases at the latest append-only schema version", async () => {
-    const { store } = await fixture();
+    const { store } = await fixture({ provision: "migrate" });
     const inspector = new Database(store.paths.database, { readonly: true, strict: true });
     try {
       expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
@@ -28137,7 +28149,7 @@ describe("StateStore", () => {
 
   test("refuses a missing or weakened current60 transcript authority guard without repair", async () => {
     for (const damage of ["missing", "weakened"] as const) {
-      const { store } = await fixture();
+      const { store } = await fixture({ provision: "migrate" });
       const paths = store.paths;
       store.close();
       stores.splice(stores.indexOf(store), 1);
@@ -28989,7 +29001,7 @@ describe("StateStore", () => {
   });
 
   test("replays a finalized attachment queue from sealed identity after display manifest pruning", async () => {
-    const { store } = await fixture();
+    const { store } = await fixture({ provision: "migrate" });
     const daemon = startInputFixtureDaemon(store);
     const profile = signInProfile(
       store,
@@ -29346,7 +29358,7 @@ describe("StateStore", () => {
   }
 
   test("rejects stale same-name v39 provider-revocation policy guards", async () => {
-    const value = await fixture();
+    const value = await fixture({ provision: "migrate" });
     const store = value.store;
     const profile = signInProfile(
       store,
@@ -29391,7 +29403,7 @@ describe("StateStore", () => {
   });
 
   test("readonly open rejects a malformed same-name v39 authority trigger", async () => {
-    const { store } = await fixture();
+    const { store } = await fixture({ provision: "migrate" });
     const paths = store.paths;
     store.close();
     stores.splice(stores.indexOf(store), 1);
@@ -29414,7 +29426,7 @@ describe("StateStore", () => {
     "last_live_observed_at",
     "provider_project_root",
   ] as const)("current v39 opens never repair a missing candidate retention column: %s", async (column) => {
-    const { store } = await fixture();
+    const { store } = await fixture({ provision: "migrate" });
     const paths = store.paths;
     store.close();
     stores.splice(stores.indexOf(store), 1);
@@ -29441,7 +29453,7 @@ describe("StateStore", () => {
   });
 
   test("current60 never recreates missing provider-v39 authority", async () => {
-    const { store } = await fixture();
+    const { store } = await fixture({ provision: "migrate" });
     const paths = store.paths;
     store.close();
     stores.splice(stores.indexOf(store), 1);
@@ -29471,7 +29483,7 @@ describe("StateStore", () => {
   });
 
   test("current v60 rejects a weakened same-name provider-v39 authority trigger without repair", async () => {
-    const { store } = await fixture();
+    const { store } = await fixture({ provision: "migrate" });
     const paths = store.paths;
     store.close();
     stores.splice(stores.indexOf(store), 1);
@@ -29510,7 +29522,7 @@ describe("StateStore", () => {
   });
 
   test("current60 never backfills a missing provider-v39 column", async () => {
-    const { store } = await fixture();
+    const { store } = await fixture({ provision: "migrate" });
     const paths = store.paths;
     store.close();
     stores.splice(stores.indexOf(store), 1);
@@ -29540,7 +29552,7 @@ describe("StateStore", () => {
   });
 
   test("writable open rejects malformed v39 identity uniqueness and revision guards", async () => {
-    const { store } = await fixture();
+    const { store } = await fixture({ provision: "migrate" });
     const first = store.createProfile("First repaired Claude identity");
     const second = store.createProfile("Second repaired Claude identity");
     const identity = {
@@ -30228,7 +30240,7 @@ describe("StateStore", () => {
   });
 
   test("refuses missing and noncanonical notification-hours authority: weakened update guard", async () => {
-    const weakenedFixture = await fixture();
+    const weakenedFixture = await fixture({ provision: "migrate" });
     const weakenedPaths = weakenedFixture.store.paths;
     weakenedFixture.store.close();
     stores.splice(stores.indexOf(weakenedFixture.store), 1);
@@ -30249,7 +30261,7 @@ describe("StateStore", () => {
   });
 
   test("refuses missing and noncanonical notification-hours authority: weakened insert guard", async () => {
-    const weakenedInsertFixture = await fixture();
+    const weakenedInsertFixture = await fixture({ provision: "migrate" });
     const weakenedInsertPaths = weakenedInsertFixture.store.paths;
     weakenedInsertFixture.store.close();
     stores.splice(stores.indexOf(weakenedInsertFixture.store), 1);
@@ -30335,7 +30347,7 @@ describe("StateStore", () => {
   });
 
   test("current v60 opens reject a missing v35 authority object without repairing it", async () => {
-    const { store } = await fixture();
+    const { store } = await fixture({ provision: "migrate" });
     const paths = store.paths;
     store.close();
     stores.splice(stores.indexOf(store), 1);
@@ -30362,7 +30374,7 @@ describe("StateStore", () => {
   });
 
   test("current60 refuses a missing provider-switch object without recreating evidence", async () => {
-    const { store } = await fixture();
+    const { store } = await fixture({ provision: "migrate" });
     const paths = store.paths;
     store.close();
     stores.splice(stores.indexOf(store), 1);
@@ -30376,7 +30388,7 @@ describe("StateStore", () => {
     expectInertSchemaRefusal(paths, "STATE_SCHEMA_V35_OBJECT_MISSING:session_provider_switch_target_releases");
   });
   test("rejects a same-name no-op v35 immutable trigger as invalid", async () => {
-    const { store } = await fixture();
+    const { store } = await fixture({ provision: "migrate" });
     const paths = store.paths;
     store.close();
     stores.splice(stores.indexOf(store), 1);
@@ -30397,7 +30409,7 @@ describe("StateStore", () => {
   });
 
   test("rejects a same-name v35 immutable trigger attached to the wrong table", async () => {
-    const { store } = await fixture();
+    const { store } = await fixture({ provision: "migrate" });
     const paths = store.paths;
     store.close();
     stores.splice(stores.indexOf(store), 1);
@@ -30419,7 +30431,7 @@ describe("StateStore", () => {
 
 
   test("current49 refuses a nonunique Unicode label index without changing state", async () => {
-    const { store } = await fixture();
+    const { store } = await fixture({ provision: "migrate" });
     const paths = store.paths;
     store.createProfile("Équipe");
     store.close();
@@ -30436,7 +30448,7 @@ describe("StateStore", () => {
     expectInertSchemaRefusal(paths, "STATE_SCHEMA_V24_STRUCTURE_INVALID");
   });
   test("current49 refuses a stale label guard without rewriting authority", async () => {
-    const { store } = await fixture();
+    const { store } = await fixture({ provision: "migrate" });
     const paths = store.paths;
     store.close();
     stores.splice(stores.indexOf(store), 1);
@@ -30496,7 +30508,7 @@ describe("StateStore", () => {
 
   test("migrates an exact v17 writer to the current prepared-response supersession guards", async () => {
     const paths = await canonicalLabelPresetArchive("canonical17-approval-controls");
-    const { store: reference } = await fixture();
+    const { store: reference } = await fixture({ provision: "migrate" });
     const selectGuards = (database: Database) => database.query(
       `SELECT name,tbl_name,sql FROM sqlite_master WHERE type='trigger' AND name IN (
          'provider_interactions_intent_immutable','provider_interactions_response_fields_guard',
@@ -35963,7 +35975,7 @@ describe("StateStore", () => {
   });
 
   test("rejects a pre-portable memory lookalike stamped as current without repairing it", async () => {
-    const { store, home } = await fixture();
+    const { store, home } = await fixture({ provision: "migrate" });
     const root = join(home, "legacy-project-memory-identity");
     await mkdir(root);
     const project = await store.createProject("Legacy memory identity", root);
@@ -36122,7 +36134,7 @@ describe("StateStore", () => {
 
   test("current v60 refuses missing or changed hosted-memory triggers without repair", async () => {
     for (const damage of ["missing", "changed"] as const) {
-      const { store } = await fixture();
+      const { store } = await fixture({ provision: "migrate" });
       const paths = store.paths;
       store.close();
       stores.splice(stores.indexOf(store), 1);
@@ -36165,7 +36177,7 @@ describe("StateStore", () => {
   });
 
   test("current v60 opens require the exact peer and local-memory guards", async () => {
-    const { store } = await fixture();
+    const { store } = await fixture({ provision: "migrate" });
     const paths = store.paths;
     store.close();
     stores.splice(stores.indexOf(store), 1);
@@ -36193,7 +36205,7 @@ describe("StateStore", () => {
 
   test("current v60 rejects widened peer queue columns and non-peer actor vocabulary without writes", async () => {
     for (const damage of ["widened_column", "invalid_row"] as const) {
-      const { store } = await fixture();
+      const { store } = await fixture({ provision: "migrate" });
       const profile = signInProfile(store, "Queue provenance column", "queue-column@example.com");
       const session = createProvenTestSession(store, {
         profileId: profile.id,
@@ -36257,7 +36269,7 @@ describe("StateStore", () => {
   });
 
   test("current v60 opens never recreate a missing peer authority trigger or index", async () => {
-    const { store } = await fixture();
+    const { store } = await fixture({ provision: "migrate" });
     const paths = store.paths;
     store.close();
     stores.splice(stores.indexOf(store), 1);
@@ -36285,7 +36297,7 @@ describe("StateStore", () => {
 
 
   test("readonly open rejects a weakened previously unaudited v40 guard", async () => {
-    const { store } = await fixture();
+    const { store } = await fixture({ provision: "migrate" });
     const paths = store.paths;
     store.close();
     stores.splice(stores.indexOf(store), 1);

@@ -44,6 +44,7 @@ import type {
 } from "./ports";
 import { SessionEventCursorCodec } from "./session-event-cursor";
 import { CommandFailure, OompaService } from "./service";
+import { provisionMigratedStateTemplate } from "../../scripts/fixtures/migrated-state-template";
 
 const signal = new AbortController().signal;
 
@@ -333,7 +334,11 @@ async function fixture(registerStore?: (store: StateStore) => void): Promise<Fix
   await mkdir(projectRoot, { recursive: true });
   await initializeStatePaths(paths);
   let observedAt = 10_000;
-  const store = new StateStore(paths, { now: () => observedAt++ });
+  const now = (): number => observedAt++;
+  // Every test here starts from an empty current-schema store and none
+  // inspects migrations, so the whole file uses the migrated template.
+  await provisionMigratedStateTemplate(paths, { now });
+  const store = new StateStore(paths, { now });
   registerStore?.(store);
   const daemonBootId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
   const daemonGeneration = store.nextDaemonGeneration(daemonBootId);
