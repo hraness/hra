@@ -147,7 +147,7 @@ const installPrivateTask48State = (databasePath: string): void => {
     historical.close(false);
   }
 };
-// An install written by a newer HRA build than this one. No migration exists for
+// An install written by a newer Oompa build than this one. No migration exists for
 // it, so every entry point must refuse instead of guessing.
 // Keep this expectation independent of the implementation's schema constant.
 const expectedStateSchemaVersion = 60;
@@ -231,7 +231,7 @@ const stagedClaudeStartupRecoveryFixture = async (
   name: string,
   pid: number,
 ) => {
-  const runRoot = await realpath(await mkdtemp(join(tmpdir(), `hra-claude-startup-${name}-`)));
+  const runRoot = await realpath(await mkdtemp(join(tmpdir(), `oompa-claude-startup-${name}-`)));
   const paths = resolveStatePaths({ homeDirectory: runRoot, platform: "darwin" });
   await initializeStatePaths(paths);
   const store = new StateStore(paths, { now: (() => {
@@ -296,7 +296,7 @@ const stagedClaudeStartupRecoveryFixture = async (
 };
 
 const stagedClaudeLaunchIntentStartupFixture = async (name: string) => {
-  const runRoot = await realpath(await mkdtemp(join(tmpdir(), `hra-claude-launch-${name}-`)));
+  const runRoot = await realpath(await mkdtemp(join(tmpdir(), `oompa-claude-launch-${name}-`)));
   const paths = resolveStatePaths({ homeDirectory: runRoot, platform: "darwin" });
   await initializeStatePaths(paths);
   const store = new StateStore(paths, { now: (() => {
@@ -1008,7 +1008,7 @@ describe("CLI entry point", () => {
   });
 
   test("exports a transcript only to a new private file and never overwrites it", async () => {
-    const runRoot = await realpath(await mkdtemp(join(tmpdir(), "hra-transcript-export-")));
+    const runRoot = await realpath(await mkdtemp(join(tmpdir(), "oompa-transcript-export-")));
     const outputPath = join(runRoot, "transcript.json");
     const sessionId = `sess_${"e".repeat(32)}`;
     const transcript = {
@@ -1074,7 +1074,7 @@ describe("CLI entry point", () => {
       ], second.output, { callDaemon })).toBe(1);
       expect(second.read().stdout).toBe("");
       expect(second.read().stderr).toBe(
-        "hra: HRA failed before a safe command response was available.\n",
+        "oompa: Oompa failed before a safe command response was available.\n",
       );
       expect(await readFile(outputPath, "utf8")).toBe(before);
     } finally {
@@ -1217,10 +1217,10 @@ describe("CLI entry point", () => {
     });
     expect(stdout).toContain(`Interaction in progress: command approval ${interactionId}`);
     expect(stdout).not.toContain(`Interaction required: command approval ${interactionId}`);
-    expect(stdout).toContain(`Show: hra interaction show ${pendingInteractionId}`);
+    expect(stdout).toContain(`Show: oompa interaction show ${pendingInteractionId}`);
     expect(stdout).toContain("does not carry complete decision authority");
     expect(stdout).not.toContain(
-      `hra interaction answer ${pendingInteractionId} --revision 4 --input-stdin`,
+      `oompa interaction answer ${pendingInteractionId} --revision 4 --input-stdin`,
     );
     expect(stdout).not.toMatch(/\n\s*\//u);
     expect(stdout).toContain("Trailing live delta text omitted");
@@ -1912,7 +1912,7 @@ describe("CLI entry point", () => {
     await waitFor(() => captured.read().stderr.includes("Type BEGIN-"));
     input.write(`${beginPhraseFrom(captured.read().stderr)}\r`);
     setTimeout(() => input.write("\u0004"), 5);
-    await waitFor(() => captured.read().stderr.includes("remains hidden while HRA discards its tail"));
+    await waitFor(() => captured.read().stderr.includes("remains hidden while Oompa discards its tail"));
     input.write("\u0004");
     await expect(read).rejects.toThrow("ended before a document");
     expect(captured.read().stderr).not.toContain("Protected JSON input (hidden)");
@@ -2072,40 +2072,40 @@ describe("CLI entry point", () => {
   test("help is offline and stable", async () => {
     const captured = capture();
     expect(await main(["--help"], captured.output)).toBe(0);
-    expect(captured.read().stdout).toContain("hra session");
-    expect(captured.read().stdout).toContain("Usage:\n  hra\n");
+    expect(captured.read().stdout).toContain("oompa session");
+    expect(captured.read().stdout).toContain("Usage:\n  oompa\n");
     expect(captured.read().stdout).toContain("--json                    Emit one versioned JSON result");
-    expect(captured.read().stdout).toContain("hra device list|pair|approve|revoke|key-loss");
-    expect(captured.read().stdout).toContain("Run bare `hra` in a TTY to start the persistent agent-and-human shell.");
+    expect(captured.read().stdout).toContain("oompa device list|pair|approve|revoke|key-loss");
+    expect(captured.read().stdout).toContain("Run bare `oompa` in a TTY to start the persistent agent-and-human shell.");
     expect(captured.read().stderr).toBe("");
 
     const group = capture();
     expect(await main(["session", "--help"], group.output)).toBe(0);
-    expect(group.read().stdout).toContain("HRA session");
-    expect(group.read().stdout).toContain("hra session events");
-    expect(group.read().stdout).toContain("hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]");
-    expect(group.read().stdout).toContain("hra session task create <session>");
+    expect(group.read().stdout).toContain("Oompa session");
+    expect(group.read().stdout).toContain("oompa session events");
+    expect(group.read().stdout).toContain("oompa session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]");
+    expect(group.read().stdout).toContain("oompa session task create <session>");
     expect(group.read().stdout).toContain("They never create a standalone task or a new conversation.");
-    expect(group.read().stdout).not.toContain("hra device pair");
+    expect(group.read().stdout).not.toContain("oompa device pair");
     expect(group.read().stderr).toBe("");
 
     const protectedGroup = capture();
     expect(await main(["interaction", "answer", "--help"], protectedGroup.output)).toBe(0);
     expect(protectedGroup.read().stdout).toContain("--input-stdin|--input-fd");
-    expect(protectedGroup.read().stdout).not.toContain("hra interaction list [session] [--pending] [--limit <1..100>] [--cursor <cursor>]");
+    expect(protectedGroup.read().stdout).not.toContain("oompa interaction list [session] [--pending] [--limit <1..100>] [--cursor <cursor>]");
     expect(protectedGroup.read().stdout).toContain("Protected values");
     expect(protectedGroup.read().stderr).toBe("");
   });
 
   test("leaf help prints only that leaf and the help alias matches --help byte for byte", async () => {
     const leafHelp = [
-      "HRA session events",
+      "Oompa session events",
       "",
       "Usage:",
-      "  hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]",
+      "  oompa session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]",
       "",
       "Examples:",
-      "  hra session events my-session --wait-ms 30000 --jsonl",
+      "  oompa session events my-session --wait-ms 30000 --jsonl",
       "",
     ].join("\n");
     for (const argv of [
@@ -2120,7 +2120,7 @@ describe("CLI entry point", () => {
     const root = capture();
     expect(await main(["help"], root.output)).toBe(0);
     expect(root.read()).toEqual({ stdout: `${usageForGroup(undefined)}\n`, stderr: "" });
-    expect(root.read().stdout).toContain("Run `hra <group> --help` or `hra help <group> [<command>]` for command examples.");
+    expect(root.read().stdout).toContain("Run `oompa <group> --help` or `oompa help <group> [<command>]` for command examples.");
     const group = capture();
     expect(await main(["help", "session"], group.output)).toBe(0);
     expect(group.read()).toEqual({ stdout: `${usageForGroup("session")}\n`, stderr: "" });
@@ -2221,7 +2221,7 @@ describe("CLI entry point", () => {
   });
 
   test("offline doctor returns one JSON value", async () => {
-    const temporary = await mkdtemp(join(tmpdir(), "hra-doctor-"));
+    const temporary = await mkdtemp(join(tmpdir(), "oompa-doctor-"));
     try {
       const captured = capture();
       const statePaths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
@@ -2235,7 +2235,7 @@ describe("CLI entry point", () => {
   });
 
   test("offline doctor treats a private pre-initialization root without a database as not initialized", async () => {
-    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-doctor-preinit-")));
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "oompa-doctor-preinit-")));
     try {
       const statePaths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
       await mkdir(statePaths.root, { recursive: true, mode: 0o700 });
@@ -2255,14 +2255,14 @@ describe("CLI entry point", () => {
   });
 
   test("offline doctor makes a released failed daemon receipt an explicit restart-safe observation", async () => {
-    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-doctor-daemon-failed-")));
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "oompa-doctor-daemon-failed-")));
     const statePaths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
     try {
       await initializeStatePaths(statePaths);
       const authority = await DaemonLock.acquire(statePaths, { state: "maintenance" });
       await authority.release({ state: "failed", failure: "bounded test failure" });
       expect(await stopDaemonWithExactAuthority(statePaths)).toMatchObject({
-        error: { code: "RECOVERY_REQUIRED", details: { nextCommand: "hra doctor --offline" } },
+        error: { code: "RECOVERY_REQUIRED", details: { nextCommand: "oompa doctor --offline" } },
         kind: "failure",
       });
 
@@ -2294,7 +2294,7 @@ describe("CLI entry point", () => {
   });
 
   test("offline doctor refuses restart when a live receipt outlives its named authority database", async () => {
-    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-doctor-daemon-missing-authority-")));
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "oompa-doctor-daemon-missing-authority-")));
     const statePaths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
     try {
       await initializeStatePaths(statePaths);
@@ -2323,7 +2323,7 @@ describe("CLI entry point", () => {
             },
           },
         },
-        error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
+        error: { code: "UNHEALTHY", message: "Oompa checks found 1 problem." },
         ok: false,
       });
       expect(captured.read().stderr).toBe("");
@@ -2334,7 +2334,7 @@ describe("CLI entry point", () => {
 
   test("offline doctor diagnoses every immediate daemon-stop authority recovery without leaking paths", async () => {
     for (const scenario of ["unsafe_receipt", "unsafe_database", "invalid_database"] as const) {
-      const temporary = await realpath(await mkdtemp(join(tmpdir(), `hra-doctor-daemon-${scenario}-`)));
+      const temporary = await realpath(await mkdtemp(join(tmpdir(), `oompa-doctor-daemon-${scenario}-`)));
       const statePaths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
       try {
         await initializeStatePaths(statePaths);
@@ -2349,7 +2349,7 @@ describe("CLI entry point", () => {
         }
 
         expect(await stopDaemonWithExactAuthority(statePaths)).toMatchObject({
-          error: { code: "RECOVERY_REQUIRED", details: { nextCommand: "hra doctor --offline" } },
+          error: { code: "RECOVERY_REQUIRED", details: { nextCommand: "oompa doctor --offline" } },
           kind: "failure",
         });
         const captured = capture();
@@ -2360,7 +2360,7 @@ describe("CLI entry point", () => {
             healthy: false,
             state: { daemonAuthority: { state: scenario } },
           },
-          error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
+          error: { code: "UNHEALTHY", message: "Oompa checks found 1 problem." },
           ok: false,
         });
         expect(JSON.stringify(result)).not.toContain(temporary);
@@ -2372,7 +2372,7 @@ describe("CLI entry point", () => {
   });
 
   test("offline doctor rejects a state root not owned by the invoking user", async () => {
-    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-doctor-owner-")));
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "oompa-doctor-owner-")));
     try {
       const statePaths = resolveStatePaths({ rootDirectory: join(temporary, "state") });
       await mkdir(statePaths.root, { recursive: true, mode: 0o700 });
@@ -2384,7 +2384,7 @@ describe("CLI entry point", () => {
       })).toBe(1);
       expect(JSON.parse(captured.read().stdout)).toMatchObject({
         ok: false,
-        error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
+        error: { code: "UNHEALTHY", message: "Oompa checks found 1 problem." },
         data: {
           healthy: false,
           problems: ["The state root is not a private canonical directory."],
@@ -2398,7 +2398,7 @@ describe("CLI entry point", () => {
   });
 
   test("offline doctor rejects a state root reached through a symbolic-link ancestor", async () => {
-    const temporary = await mkdtemp(join(tmpdir(), "hra-doctor-symlink-"));
+    const temporary = await mkdtemp(join(tmpdir(), "oompa-doctor-symlink-"));
     try {
       const actualParent = join(temporary, "actual");
       const linkedParent = join(temporary, "linked");
@@ -2411,7 +2411,7 @@ describe("CLI entry point", () => {
       })).toBe(1);
       expect(JSON.parse(captured.read().stdout)).toMatchObject({
         ok: false,
-        error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
+        error: { code: "UNHEALTHY", message: "Oompa checks found 1 problem." },
         data: {
           healthy: false,
           problems: ["The state root is not a private canonical directory."],
@@ -2424,7 +2424,7 @@ describe("CLI entry point", () => {
   });
 
   test("offline doctor rejects a group-readable local database", async () => {
-    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-doctor-database-mode-")));
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "oompa-doctor-database-mode-")));
     try {
       const statePaths = resolveStatePaths({ rootDirectory: join(temporary, "state") });
       await initializeStatePaths(statePaths);
@@ -2437,7 +2437,7 @@ describe("CLI entry point", () => {
       })).toBe(1);
       expect(JSON.parse(captured.read().stdout)).toMatchObject({
         ok: false,
-        error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
+        error: { code: "UNHEALTHY", message: "Oompa checks found 1 problem." },
         data: {
           healthy: false,
           problems: ["The local database check failed without exposing its runtime diagnostic."],
@@ -2451,7 +2451,7 @@ describe("CLI entry point", () => {
   });
 
   test("offline doctor rejects a dangling state-root symbolic link instead of treating it as absent", async () => {
-    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-doctor-dangling-root-")));
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "oompa-doctor-dangling-root-")));
     try {
       const statePaths = resolveStatePaths({ rootDirectory: join(temporary, "state") });
       await symlink(join(temporary, "missing-target"), statePaths.root);
@@ -2461,7 +2461,7 @@ describe("CLI entry point", () => {
       })).toBe(1);
       expect(JSON.parse(captured.read().stdout)).toMatchObject({
         ok: false,
-        error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
+        error: { code: "UNHEALTHY", message: "Oompa checks found 1 problem." },
         data: {
           healthy: false,
           problems: ["The state root is not a private canonical directory."],
@@ -2786,7 +2786,7 @@ describe("CLI entry point", () => {
       version: 1,
       error: {
         code: "INTERNAL",
-        message: "HRA could not complete the request safely.",
+        message: "Oompa could not complete the request safely.",
       },
     });
     expect(runtime.read().stdout).not.toContain("do-not-echo");
@@ -2838,7 +2838,7 @@ describe("CLI entry point", () => {
     expect(JSON.parse(json.read().stdout)).toMatchObject({
       error: {
         code: "INVALID_RESPONSE",
-        message: "The HRA daemon returned an invalid response for this command.",
+        message: "The Oompa daemon returned an invalid response for this command.",
       },
       ok: false,
       version: 1,
@@ -2855,14 +2855,14 @@ describe("CLI entry point", () => {
       }),
     })).toBe(1);
     expect(human.read().stdout).toBe("");
-    expect(human.read().stderr).toBe("hra: The HRA daemon returned an invalid response for this command.\n");
+    expect(human.read().stderr).toBe("oompa: The Oompa daemon returned an invalid response for this command.\n");
     expect(human.read().stderr).not.toContain(secret);
   });
 
   test("version is sourced from package metadata", async () => {
     const captured = capture();
     expect(await main(["--version"], captured.output)).toBe(0);
-    expect(captured.read()).toEqual({ stdout: `hra ${packageMetadata.version}\n`, stderr: "" });
+    expect(captured.read()).toEqual({ stdout: `oompa ${packageMetadata.version}\n`, stderr: "" });
   });
 
   test("completes protected interaction input outside argv and never renders its value", async () => {
@@ -2938,7 +2938,7 @@ describe("CLI entry point", () => {
   test("reads the gateway key from a descriptor and keeps it off argv and output", async () => {
     // Twenty-four printable characters, assembled rather than written.
     const key = ["gw", "k".repeat(22)].join("");
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-gateway-key-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-gateway-key-")));
     try {
       const file = join(home, "key");
       await writeFile(file, `${key}\n`, { mode: 0o600 });
@@ -2972,7 +2972,7 @@ describe("CLI entry point", () => {
   });
 
   test("refuses a gateway key that is not one printable line", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-gateway-key-bad-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-gateway-key-bad-")));
     try {
       const file = join(home, "key");
       await writeFile(file, "short\n", { mode: 0o600 });
@@ -3146,7 +3146,7 @@ describe("CLI entry point", () => {
       error: {
         code: "INTERACTION_REQUIRED",
         details: {
-          nextCommand: `hra interaction inspect ${interaction} --revision 3 --handoff-file /absolute/path/to/empty-protected-approval.json --json`,
+          nextCommand: `oompa interaction inspect ${interaction} --revision 3 --handoff-file /absolute/path/to/empty-protected-approval.json --json`,
         },
       },
       ok: false,
@@ -3154,7 +3154,7 @@ describe("CLI entry point", () => {
   });
 
   test("writes exact live approval authority only to the pre-proven protected file", async () => {
-    const root = await mkdtemp(join(await realpath(tmpdir()), "hra-cli-approval-"));
+    const root = await mkdtemp(join(await realpath(tmpdir()), "oompa-cli-approval-"));
     const handoff = join(root, "approval.json");
     await chmod(root, 0o700);
     await writeFile(handoff, "", { flag: "wx", mode: 0o600 });
@@ -3362,14 +3362,14 @@ describe("CLI entry point", () => {
       } else {
         expect(captured.read().stderr).not.toContain(sentinel);
         expect(captured.read().stderr).toContain(
-          `hra interaction inspect ${interaction} --revision 5 --handoff-file /absolute/path/to/empty-protected-approval.json`,
+          `oompa interaction inspect ${interaction} --revision 5 --handoff-file /absolute/path/to/empty-protected-approval.json`,
         );
       }
     }
   });
 
   test("does not invent cancellation authority when the pre-effect account lookup is uncertain", async () => {
-    const root = await mkdtemp(join(await realpath(tmpdir()), "hra-cli-login-lookup-"));
+    const root = await mkdtemp(join(await realpath(tmpdir()), "oompa-cli-login-lookup-"));
     const handoff = join(root, "login.json");
     await chmod(root, 0o700);
     await writeFile(handoff, "", { flag: "wx", mode: 0o600 });
@@ -3439,7 +3439,7 @@ describe("CLI entry point", () => {
     });
     expect(rendered.error.details.nextCommand)
       .toBe(
-        "hra device approve device_pending"
+        "oompa device approve device_pending"
         + " --fingerprint 0000-1111-2222-3333-4444-5555-6666-7777"
         + ` --idempotency-key ${generatedKey} --json`,
       );
@@ -3474,7 +3474,7 @@ describe("CLI entry point", () => {
       })).toBe(0);
       const rendered = captured.read();
       const replayCommand = [
-        "hra sync projection recover",
+        "oompa sync projection recover",
         session,
         "--acknowledge-gap --idempotency-key",
         idempotencyKey,
@@ -3485,7 +3485,7 @@ describe("CLI entry point", () => {
           command: "sync.projection-recover",
           data: {
             idempotencyKey,
-            nextCommand: "hra sync status --json",
+            nextCommand: "oompa sync status --json",
             phase: "rejected",
             rejectionCode: "REMOTE_HEAD_CHANGED",
             sameKeyReplay: { command: replayCommand, supported: true },
@@ -3500,7 +3500,7 @@ describe("CLI entry point", () => {
           "Reason: REMOTE_HEAD_CHANGED",
           "Encrypted cloud history and provider/app state were unchanged.",
           `Same-key replay: ${replayCommand}`,
-          "Next: hra sync status --json",
+          "Next: oompa sync status --json",
           "",
         ].join("\n"));
       }
@@ -3528,7 +3528,7 @@ describe("CLI entry point", () => {
           error: {
             code: "RECOVERY_REQUIRED",
             details: {
-              nextCommand: "hra sync status --json",
+              nextCommand: "oompa sync status --json",
               providerDetail: providerSentinel,
               providerPath: "/private/provider/projection",
             },
@@ -3548,7 +3548,7 @@ describe("CLI entry point", () => {
         expect(JSON.parse(rendered.stdout)).toEqual({
           error: {
             code: "RECOVERY_REQUIRED",
-            details: { nextCommand: "hra sync status --json" },
+            details: { nextCommand: "oompa sync status --json" },
             message: "Projection recovery requires local status inspection.",
           },
           ok: false,
@@ -3558,8 +3558,8 @@ describe("CLI entry point", () => {
       } else {
         expect(rendered.stdout).toBe("");
         expect(rendered.stderr).toBe([
-          "hra: Projection recovery requires local status inspection.",
-          "Next: hra sync status --json",
+          "oompa: Projection recovery requires local status inspection.",
+          "Next: oompa sync status --json",
           "",
         ].join("\n"));
       }
@@ -3571,8 +3571,8 @@ describe("CLI entry point", () => {
     const idempotencyKey = "018bcfe5-6800-7000-8000-000000000702";
     const providerSentinel = "PRIVATE-PROVIDER-FAILURE-DETAIL";
     for (const details of [
-      { nextCommand: "hra sync status --json; touch /tmp/unsafe", providerDetail: providerSentinel },
-      { nextCommand: "hra doctor", providerDetail: providerSentinel },
+      { nextCommand: "oompa sync status --json; touch /tmp/unsafe", providerDetail: providerSentinel },
+      { nextCommand: "oompa doctor", providerDetail: providerSentinel },
       { providerDetail: providerSentinel },
     ]) {
       for (const json of [false, true]) {
@@ -3610,7 +3610,7 @@ describe("CLI entry point", () => {
         } else {
           expect(rendered.stdout).toBe("");
           expect(rendered.stderr).toBe(
-            "hra: Projection recovery requires local status inspection.\n",
+            "oompa: Projection recovery requires local status inspection.\n",
           );
         }
       }
@@ -3748,7 +3748,7 @@ describe("CLI entry point", () => {
   });
 
   test("writes first-use Codex login secrets only to the held protected file", async () => {
-    const root = await mkdtemp(join(await realpath(tmpdir()), "hra-cli-login-"));
+    const root = await mkdtemp(join(await realpath(tmpdir()), "oompa-cli-login-"));
     const handoff = join(root, "login.json");
     await chmod(root, 0o700);
     await writeFile(handoff, "", { flag: "wx", mode: 0o600 });
@@ -3798,7 +3798,7 @@ describe("CLI entry point", () => {
               idempotencyKey: command.idempotencyKey,
               login: {
                 loginId: "provider-login",
-                next: `hra account login-cancel acct_${"1".repeat(32)}`,
+                next: `oompa account login-cancel acct_${"1".repeat(32)}`,
                 status: "pending",
                 userCode: secretCode,
                 verificationUrl: secretUrl,
@@ -3991,7 +3991,7 @@ describe("CLI entry point", () => {
               data: {
                 account: { id: accountId, label: "Incoherent" },
                 authentication: { provider: "claude", signedIn: false },
-                nextCommand: `hra account login ${accountId} --provider claude`,
+                nextCommand: `oompa account login ${accountId} --provider claude`,
                 providerGeneration: 7,
               },
               ok: true as const,
@@ -4076,7 +4076,7 @@ describe("CLI entry point", () => {
             data: {
               account: { id: accountId, label: "Work" },
               authentication: { provider: "claude", signedIn: false },
-              nextCommand: `hra account login ${accountId} --provider claude`,
+              nextCommand: `oompa account login ${accountId} --provider claude`,
               providerGeneration: 7,
             },
             ok: true as const,
@@ -4093,7 +4093,7 @@ describe("CLI entry point", () => {
         data: {
           account: { id: accountId, label: "Work" },
           authentication: { provider: "claude", signedIn: false },
-          nextCommand: `hra account login ${accountId} --provider claude`,
+          nextCommand: `oompa account login ${accountId} --provider claude`,
           providerGeneration: 7,
         },
         ok: true,
@@ -4138,8 +4138,8 @@ describe("CLI entry point", () => {
                 attemptId,
                 idempotencyKey: key,
                 providerGeneration,
-                statusCommand: `hra account show ${accountId} --provider claude`,
-                sameKeyReplayCommand: `hra account login ${accountId} --provider claude --idempotency-key ${key}`,
+                statusCommand: `oompa account show ${accountId} --provider claude`,
+                sameKeyReplayCommand: `oompa account login ${accountId} --provider claude --idempotency-key ${key}`,
                 abandonCommand,
                 diagnostic: "Credential presence does not prove that the original child exited.",
               },
@@ -4210,7 +4210,7 @@ describe("CLI entry point", () => {
             data: {
               account: { id: accountId, label: "Unknown" },
               authentication: { provider: "claude", signedIn: null },
-              ...(includeNextCommand ? { nextCommand: `hra account login ${accountId} --provider claude` } : {}),
+              ...(includeNextCommand ? { nextCommand: `oompa account login ${accountId} --provider claude` } : {}),
               providerGeneration: 0,
             },
             ok: true as const,
@@ -4229,7 +4229,7 @@ describe("CLI entry point", () => {
       expect(foregroundCalls).toBe(0);
       expect(captured.read().stdout).toBe("");
       expect(captured.read().stderr).toContain("Claude authentication status could not be verified");
-      expect(captured.read().stderr).toContain(`hra account show ${accountId} --provider claude`);
+      expect(captured.read().stderr).toContain(`oompa account show ${accountId} --provider claude`);
       expect(captured.read().stderr).not.toContain("signed out");
     } finally {
       await rm(runRoot, { force: true, recursive: true });
@@ -4259,7 +4259,7 @@ describe("CLI entry point", () => {
               data: {
                 account: { id: accountId, label: "Preflight" },
                 authentication: { provider: "claude", signedIn: false },
-                nextCommand: `hra account login ${accountId} --provider claude`,
+                nextCommand: `oompa account login ${accountId} --provider claude`,
                 providerGeneration: 0,
               },
               ok: true as const,
@@ -4307,7 +4307,7 @@ describe("CLI entry point", () => {
             data: {
               account: { id: accountId, label: "Path swap" },
               authentication: { provider: "claude", signedIn: false },
-              nextCommand: `hra account login ${accountId} --provider claude`,
+              nextCommand: `oompa account login ${accountId} --provider claude`,
               providerGeneration: 3,
             },
             ok: true as const,
@@ -4384,7 +4384,7 @@ describe("CLI entry point", () => {
             data: {
               account: { id: accountId, label: "Runtime swap" },
               authentication: { provider: "claude", signedIn: false },
-              nextCommand: `hra account login ${accountId} --provider claude`,
+              nextCommand: `oompa account login ${accountId} --provider claude`,
               providerGeneration: 4,
             },
             ok: true as const,
@@ -4468,7 +4468,7 @@ describe("CLI entry point", () => {
               data: {
                 account: { id: accountId, label: "Complete" },
                 authentication: { provider: "claude", signedIn: false },
-                nextCommand: `hra account login ${accountId} --provider claude`,
+                nextCommand: `oompa account login ${accountId} --provider claude`,
                 providerGeneration: 2,
               },
               ok: true as const,
@@ -4565,7 +4565,7 @@ describe("CLI entry point", () => {
               data: {
                 account: { id: accountId, label: "Signal custody" },
                 authentication: { provider: "claude", signedIn: false },
-                nextCommand: `hra account login ${accountId} --provider claude`,
+                nextCommand: `oompa account login ${accountId} --provider claude`,
                 providerGeneration: 4,
               },
               ok: true as const,
@@ -4649,7 +4649,7 @@ describe("CLI entry point", () => {
               data: {
                 account: { id: accountId, label: "Interrupted" },
                 authentication: { provider: "claude", signedIn: false },
-                nextCommand: `hra account login ${accountId} --provider claude`,
+                nextCommand: `oompa account login ${accountId} --provider claude`,
                 providerGeneration: 2,
               },
               ok: true as const,
@@ -4713,7 +4713,7 @@ describe("CLI entry point", () => {
     expect(JSON.parse(captured.read().stdout)).toMatchObject({
       error: {
         code: "INTERACTION_REQUIRED",
-        details: { nextCommand: expect.stringMatching(/^hra account login Personal --provider claude --idempotency-key [0-9a-f-]{36}$/u) },
+        details: { nextCommand: expect.stringMatching(/^oompa account login Personal --provider claude --idempotency-key [0-9a-f-]{36}$/u) },
       },
       ok: false,
     });
@@ -4721,7 +4721,7 @@ describe("CLI entry point", () => {
   });
 
   test("reports recovery without leaking or claiming success when the held login file is rebound", async () => {
-    const root = await mkdtemp(join(await realpath(tmpdir()), "hra-cli-login-rebound-"));
+    const root = await mkdtemp(join(await realpath(tmpdir()), "oompa-cli-login-rebound-"));
     const handoff = join(root, "login.json");
     const moved = join(root, "held-login.json");
     await chmod(root, 0o700);
@@ -4775,7 +4775,7 @@ describe("CLI entry point", () => {
               idempotencyKey,
               login: {
                 loginId: "provider-login",
-                next: `hra account login-cancel ${accountId}`,
+                next: `oompa account login-cancel ${accountId}`,
                 status: "pending",
                 userCode: secretCode,
                 verificationUrl: secretUrl,
@@ -4795,7 +4795,7 @@ describe("CLI entry point", () => {
         error: {
           code: "RECOVERY_REQUIRED",
           details: {
-            cancelCommand: `hra account login-cancel ${accountId}`,
+            cancelCommand: `oompa account login-cancel ${accountId}`,
             idempotencyKey,
           },
         },
@@ -4811,7 +4811,7 @@ describe("CLI entry point", () => {
   });
 
   test("never claims or rewrites a one-time handoff on same-key replay", async () => {
-    const root = await mkdtemp(join(await realpath(tmpdir()), "hra-cli-login-replay-"));
+    const root = await mkdtemp(join(await realpath(tmpdir()), "oompa-cli-login-replay-"));
     const handoff = join(root, "login.json");
     await chmod(root, 0o700);
     await writeFile(handoff, "", { flag: "wx", mode: 0o600 });
@@ -4856,7 +4856,7 @@ describe("CLI entry point", () => {
                 idempotencyKey,
                 login: {
                   loginId: "provider-login",
-                  next: `hra account login-cancel acct_${"1".repeat(32)}`,
+                  next: `oompa account login-cancel acct_${"1".repeat(32)}`,
                   status: "pending",
                 },
               },
@@ -4913,7 +4913,7 @@ describe("CLI entry point", () => {
               idempotencyKey: "idempotencyKey" in command ? command.idempotencyKey : "",
               login: {
                 loginId: "provider-login",
-                next: `hra account login-cancel acct_${"1".repeat(32)}`,
+                next: `oompa account login-cancel acct_${"1".repeat(32)}`,
                 status: "pending",
                 userCode: secretCode,
                 verificationUrl: secretUrl,
@@ -4978,7 +4978,7 @@ describe("CLI entry point", () => {
       session: "sess_22222222222222222222222222222222",
       message: "hello from shell",
     });
-    expect(captured.read().stderr).toContain("HRA shell");
+    expect(captured.read().stderr).toContain("Oompa shell");
   });
 
   test("rejects malformed daemon selection identities without changing the shell prompt", async () => {
@@ -5018,7 +5018,7 @@ describe("CLI entry point", () => {
         throw new Error(`Unexpected shell selection command: ${command.kind}`);
       },
     })).toBe(0);
-    expect(prompts).toEqual(["hra> ", "hra> ", "hra> "]);
+    expect(prompts).toEqual(["oompa> ", "oompa> ", "oompa> "]);
     expect(captured.read().stderr).toContain("Selected account response is invalid.");
     expect(captured.read().stderr).toContain("Selected session response is invalid.");
     expect(captured.read().stderr).not.toContain("x".repeat(128));
@@ -5066,7 +5066,7 @@ describe("CLI entry point", () => {
         throw new Error(`Unexpected shell selection command: ${command.kind}`);
       },
     })).toBe(0);
-    expect(prompts).toEqual(["hra> ", "hra> ", "hra> "]);
+    expect(prompts).toEqual(["oompa> ", "oompa> ", "oompa> "]);
     expect(captured.read().stderr).toContain(
       "Selected account response does not match the exact requested account.",
     );
@@ -5608,12 +5608,12 @@ describe("CLI entry point", () => {
     expect(reads).toBe(2);
     expect(observedSignal?.aborted).toBe(true);
     expect(process.listenerCount("SIGINT")).toBe(originalSigintListeners);
-    expect(captured.read().stderr).toContain("HRA shell");
+    expect(captured.read().stderr).toContain("Oompa shell");
     expect(captured.read().stderr).not.toContain("could not start or continue");
   });
 
   test("keeps event and interaction cursor signatures stable across daemon restarts", async () => {
-    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-cursor-custody-")));
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "oompa-cursor-custody-")));
     try {
       const paths = resolveStatePaths({ homeDirectory: temporary, platform: "linux" });
       await initializeStatePaths(paths);
@@ -5648,7 +5648,7 @@ describe("CLI entry point", () => {
   });
 
   test("refuses to replace a lost cursor key after durable event authority exists", async () => {
-    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-lost-cursor-key-")));
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "oompa-lost-cursor-key-")));
     try {
       const paths = resolveStatePaths({ homeDirectory: temporary, platform: "linux" });
       await initializeStatePaths(paths);
@@ -6113,7 +6113,7 @@ describe("CLI entry point", () => {
     expect(rendered).toContain("\\u{202e}");
     expect(rendered).toContain("Interaction 70000000-0000-4000-8000-000000000001  permission approval");
     expect(rendered).toContain("pending  revision 3  blocking");
-    expect(rendered).toContain("Decline remotely with `hra remote resolve");
+    expect(rendered).toContain("Decline remotely with `oompa remote resolve");
     expect(rendered).toContain("--interaction 70000000-0000-4000-8000-000000000001 --revision 3 --decision decline");
     expect(rendered).not.toContain("--decision once");
     expect(rendered).not.toContain("cancel");
@@ -6188,9 +6188,9 @@ describe("CLI entry point", () => {
 
     const rendered = human.read().stdout;
     expect(rendered).toContain("No remote action is available. Resolve this interaction on the execution device.");
-    expect(rendered).toContain("Answer remotely in the HRA app, or resolve this interaction on the execution device.");
+    expect(rendered).toContain("Answer remotely in the Oompa app, or resolve this interaction on the execution device.");
     expect(rendered).toContain("The remote-action deadline has passed. Resolve this interaction on the execution device.");
-    expect(rendered).not.toContain("hra remote resolve");
+    expect(rendered).not.toContain("oompa remote resolve");
     expect(rendered).not.toContain("cancel");
   });
 
@@ -6267,8 +6267,8 @@ describe("CLI entry point", () => {
   });
 
   test("stopping an absent daemon does not initialize or autostart it", async () => {
-    const temporary = await mkdtemp(join(tmpdir(), "hra-stop-"));
-    const stateRoot = join(temporary, "Library", "Application Support", "HRA");
+    const temporary = await mkdtemp(join(tmpdir(), "oompa-stop-"));
+    const stateRoot = join(temporary, "Library", "Application Support", "Oompa");
     const previousHome = process.env.HOME;
     process.env.HOME = temporary;
     try {
@@ -6287,10 +6287,10 @@ describe("CLI entry point", () => {
   });
 
   test("builds the exact detached daemon spawn descriptor inside the private state root", () => {
-    expect(daemonRunProcessArguments("/opt/hra/bun", "/opt/hra/src/cli.ts")).toEqual([
-      "/opt/hra/bun",
+    expect(daemonRunProcessArguments("/opt/oompa/bun", "/opt/oompa/src/cli.ts")).toEqual([
+      "/opt/oompa/bun",
       "--no-env-file",
-      "/opt/hra/src/cli.ts",
+      "/opt/oompa/src/cli.ts",
       "daemon",
       "run",
     ]);
@@ -6625,7 +6625,7 @@ describe("CLI entry point", () => {
       expect(JSON.parse(captured.read().stdout)).toEqual({
         error: {
           code: "RECOVERY_REQUIRED",
-          details: { nextCommand: "hra daemon start" },
+          details: { nextCommand: "oompa daemon start" },
           message: `The local state schema needs a migration (48 to ${expectedStateSchemaVersion}); start the daemon to migrate it.`,
         },
         ok: false,
@@ -6639,7 +6639,7 @@ describe("CLI entry point", () => {
     }
   });
 
-  test("daemon start refuses local state written by a newer HRA build", async () => {
+  test("daemon start refuses local state written by a newer Oompa build", async () => {
     const { installation, runRoot } = await upgradeFixture("daemon-start-newer");
     let daemonStarts = 0;
     const input = {
@@ -6660,7 +6660,7 @@ describe("CLI entry point", () => {
       expect(JSON.parse(captured.read().stdout)).toEqual({
         error: {
           code: "RECOVERY_REQUIRED",
-          message: `This HRA build is older than the local state schema (${expectedStateSchemaVersion + 1} vs ${expectedStateSchemaVersion}); install the newer HRA.`,
+          message: `This Oompa build is older than the local state schema (${expectedStateSchemaVersion + 1} vs ${expectedStateSchemaVersion}); install the newer Oompa.`,
         },
         ok: false,
         version: 1,
@@ -6675,7 +6675,7 @@ describe("CLI entry point", () => {
   });
 
   test("offline doctor names a pending schema migration instead of an opaque diagnostic", async () => {
-    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-doctor-schema-pending-")));
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "oompa-doctor-schema-pending-")));
     try {
       const statePaths = resolveStatePaths({ rootDirectory: join(temporary, "state") });
       await initializeStatePaths(statePaths);
@@ -6688,10 +6688,10 @@ describe("CLI entry point", () => {
       const rendered = JSON.parse(captured.read().stdout) as unknown;
       expect(rendered).toMatchObject({
         ok: false,
-        error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
+        error: { code: "UNHEALTHY", message: "Oompa checks found 1 problem." },
         data: {
           healthy: false,
-          problems: [`The local state schema needs a migration (48 to ${expectedStateSchemaVersion}). Run \`hra daemon start\` to migrate it.`],
+          problems: [`The local state schema needs a migration (48 to ${expectedStateSchemaVersion}). Run \`oompa daemon start\` to migrate it.`],
           state: { database: "invalid", initialized: false },
         },
       });
@@ -6703,8 +6703,8 @@ describe("CLI entry point", () => {
     }
   });
 
-  test("offline doctor names local state written by a newer HRA build", async () => {
-    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-doctor-schema-newer-")));
+  test("offline doctor names local state written by a newer Oompa build", async () => {
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "oompa-doctor-schema-newer-")));
     try {
       const statePaths = resolveStatePaths({ rootDirectory: join(temporary, "state") });
       await initializeStatePaths(statePaths);
@@ -6717,10 +6717,10 @@ describe("CLI entry point", () => {
       const rendered = JSON.parse(captured.read().stdout) as unknown;
       expect(rendered).toMatchObject({
         ok: false,
-        error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
+        error: { code: "UNHEALTHY", message: "Oompa checks found 1 problem." },
         data: {
           healthy: false,
-          problems: [`This HRA build is older than the local state schema (${expectedStateSchemaVersion + 1} vs ${expectedStateSchemaVersion}). Install the newer HRA.`],
+          problems: [`This Oompa build is older than the local state schema (${expectedStateSchemaVersion + 1} vs ${expectedStateSchemaVersion}). Install the newer Oompa.`],
           state: { database: "invalid", initialized: false },
         },
       });
@@ -6766,8 +6766,8 @@ describe("CLI entry point", () => {
         expect(JSON.parse(captured.read().stdout)).toEqual({
           error: {
             code: "INTERACTION_REQUIRED",
-            details: { nextCommand: "hra init --yes" },
-            message: "Initialize HRA before starting its daemon.",
+            details: { nextCommand: "oompa init --yes" },
+            message: "Initialize Oompa before starting its daemon.",
           },
           ok: false,
           version: 1,
@@ -6782,8 +6782,8 @@ describe("CLI entry point", () => {
       expect(JSON.parse(status.read().stdout)).toEqual({
         error: {
           code: "INTERACTION_REQUIRED",
-          details: { nextCommand: "hra init --yes" },
-          message: "Initialize HRA before reading local status.",
+          details: { nextCommand: "oompa init --yes" },
+          message: "Initialize Oompa before reading local status.",
         },
         ok: false,
         version: 1,
@@ -6892,7 +6892,7 @@ describe("CLI entry point", () => {
     expect(JSON.parse(held.read().stdout)).toMatchObject({
       error: {
         code: "RECOVERY_REQUIRED",
-        details: { nextCommand: "hra daemon status --json" },
+        details: { nextCommand: "oompa daemon status --json" },
       },
       ok: false,
     });
@@ -6948,7 +6948,7 @@ describe("CLI entry point", () => {
       ok: false,
       error: {
         code: "RECOVERY_REQUIRED",
-        details: { nextCommand: "hra daemon status --json" },
+        details: { nextCommand: "oompa daemon status --json" },
       },
     });
     expect(captured.read().stdout).not.toContain('"released":true');
@@ -7026,8 +7026,8 @@ describe("CLI entry point", () => {
       version: 1,
       error: {
         code: "RECOVERY_REQUIRED",
-        message: "The local daemon authority could not be safely verified. Run `hra doctor --offline` before taking further action.",
-        details: { nextCommand: "hra doctor --offline", authorityPhase, stopRequestState },
+        message: "The local daemon authority could not be safely verified. Run `oompa doctor --offline` before taking further action.",
+        details: { nextCommand: "oompa doctor --offline", authorityPhase, stopRequestState },
       },
     });
     expect(requests).toBe(expectedRequests);
@@ -7041,7 +7041,7 @@ describe("CLI entry point", () => {
   test("turns daemon-authority safety errors into an actionable closed recovery", async () => {
     const safety = new DaemonAuthoritySafetyError("unsafe authority fixture");
     let observations = 0;
-    const paths = resolveStatePaths({ rootDirectory: join(tmpdir(), "hra-unused-stop-safety") });
+    const paths = resolveStatePaths({ rootDirectory: join(tmpdir(), "oompa-unused-stop-safety") });
     await expect(stopDaemonWithExactAuthority(paths, exactStopDependencies({
       observeReceipt: () => {
         observations += 1;
@@ -7051,7 +7051,7 @@ describe("CLI entry point", () => {
       kind: "failure",
       error: {
         code: "RECOVERY_REQUIRED",
-        details: { nextCommand: "hra doctor --offline" },
+        details: { nextCommand: "oompa doctor --offline" },
       },
     });
     expect(observations).toBe(1);
@@ -7060,7 +7060,7 @@ describe("CLI entry point", () => {
   test("turns an invalid daemon-authority database into an actionable closed recovery", async () => {
     const invalid = new Error("The daemon authority database is invalid and requires manual recovery.");
     let observations = 0;
-    const paths = resolveStatePaths({ rootDirectory: join(tmpdir(), "hra-unused-stop-invalid") });
+    const paths = resolveStatePaths({ rootDirectory: join(tmpdir(), "oompa-unused-stop-invalid") });
     await expect(stopDaemonWithExactAuthority(paths, exactStopDependencies({
       observeReceipt: () => {
         observations += 1;
@@ -7070,7 +7070,7 @@ describe("CLI entry point", () => {
       kind: "failure",
       error: {
         code: "RECOVERY_REQUIRED",
-        details: { nextCommand: "hra doctor --offline" },
+        details: { nextCommand: "oompa doctor --offline" },
       },
     });
     expect(observations).toBe(1);
@@ -7105,7 +7105,7 @@ describe("CLI entry point", () => {
       updatedAt: 2,
     };
     let requests = 0;
-    const paths = resolveStatePaths({ rootDirectory: join(tmpdir(), "hra-unused-maintenance-stop") });
+    const paths = resolveStatePaths({ rootDirectory: join(tmpdir(), "oompa-unused-maintenance-stop") });
     await expect(stopDaemonWithExactAuthority(paths, exactStopDependencies({
       observeReceipt: () => Promise.resolve(maintenanceReceipt),
       inspectAuthority: () => Promise.resolve({
@@ -7126,7 +7126,7 @@ describe("CLI entry point", () => {
   });
 
   test("requires database-backed release proof before calling a terminal or malformed receipt stopped", async () => {
-    const paths = resolveStatePaths({ rootDirectory: join(tmpdir(), "hra-unused-terminal-stop-proof") });
+    const paths = resolveStatePaths({ rootDirectory: join(tmpdir(), "oompa-unused-terminal-stop-proof") });
     const absentDatabaseWithStoppedReceipt = exactStopDependencies({
       observeReceipt: () => Promise.resolve(daemonAuthorityReceipt("stopped")),
       inspectAuthority: () => Promise.resolve({
@@ -7181,7 +7181,7 @@ describe("CLI entry point", () => {
 
   test("treats safely released stale receipt evidence as already stopped without hiding it from doctor", async () => {
     for (const receiptKind of ["live", "malformed"] as const) {
-      const temporary = await realpath(await mkdtemp(join(tmpdir(), `hra-stop-stale-${receiptKind}-`)));
+      const temporary = await realpath(await mkdtemp(join(tmpdir(), `oompa-stop-stale-${receiptKind}-`)));
       const statePaths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
       try {
         await initializeStatePaths(statePaths);
@@ -7293,7 +7293,7 @@ describe("CLI entry point", () => {
       ok: false,
       error: {
         code: "RECOVERY_REQUIRED",
-        details: { nextCommand: "hra doctor --offline" },
+        details: { nextCommand: "oompa doctor --offline" },
       },
     });
     expect(captured.read().stdout).not.toContain("bounded shutdown failure");
@@ -7325,7 +7325,7 @@ describe("CLI entry point", () => {
       ok: false,
       error: {
         code: "RECOVERY_REQUIRED",
-        details: { nextCommand: "hra doctor --offline" },
+        details: { nextCommand: "oompa doctor --offline" },
       },
     });
   });
@@ -7349,7 +7349,7 @@ describe("CLI entry point", () => {
   });
 
   test("init without explicit acceptance reports the next command without creating state", async () => {
-    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-init-confirm-")));
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "oompa-init-confirm-")));
     const paths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
     const previousHome = process.env.HOME;
     process.env.HOME = temporary;
@@ -7361,7 +7361,7 @@ describe("CLI entry point", () => {
         ok: false,
         error: {
           code: "INTERACTION_REQUIRED",
-          message: "Confirm the default Documents project with `hra init --yes`.",
+          message: "Confirm the default Documents project with `oompa init --yes`.",
         },
       });
       await expect(lstat(paths.root)).rejects.toMatchObject({ code: "ENOENT" });
@@ -7373,7 +7373,7 @@ describe("CLI entry point", () => {
   });
 
   test("init creates a missing default Documents directory before committing local state", async () => {
-    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-init-empty-home-")));
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "oompa-init-empty-home-")));
     const paths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
     const documents = join(temporary, "Documents");
     try {
@@ -7402,7 +7402,7 @@ describe("CLI entry point", () => {
   });
 
   test("init escapes terminal-format scalars in its JSON state-root value", async () => {
-    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-init-json-control-")));
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "oompa-init-json-control-")));
     const paths = resolveStatePaths({ rootDirectory: join(temporary, "state-\u202e-private") });
     const documents = join(temporary, "Documents");
     try {
@@ -7420,7 +7420,7 @@ describe("CLI entry point", () => {
   });
 
   test("project add rejects missing or unusable paths locally with actionable output", async () => {
-    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-project-add-path-")));
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "oompa-project-add-path-")));
     const missing = join(temporary, "missing-private-project");
     const regularFile = join(temporary, "not-a-directory-private-project");
     await writeFile(regularFile, "not a project directory", { mode: 0o600 });
@@ -7465,7 +7465,7 @@ describe("CLI entry point", () => {
   });
 
   test("init rejects an unsafe default Documents path before creating the database", async () => {
-    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-init-unsafe-documents-")));
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "oompa-init-unsafe-documents-")));
     const paths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
     const documents = join(temporary, "Documents");
     await writeFile(documents, "not a directory", { encoding: "utf8", mode: 0o600 });
@@ -7476,7 +7476,7 @@ describe("CLI entry point", () => {
         ok: false,
         error: {
           code: "UNAVAILABLE",
-          message: "The default Documents project is not a readable, writable, and traversable canonical directory. Repair it, then run `hra init --yes` again.",
+          message: "The default Documents project is not a readable, writable, and traversable canonical directory. Repair it, then run `oompa init --yes` again.",
         },
       });
       await expect(lstat(paths.database)).rejects.toMatchObject({ code: "ENOENT" });
@@ -7486,7 +7486,7 @@ describe("CLI entry point", () => {
   });
 
   test("init rejects a non-traversable default directory before creating the database", async () => {
-    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-init-nontraversable-")));
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "oompa-init-nontraversable-")));
     const paths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
     const documents = join(temporary, "Documents");
     await mkdir(documents, { mode: 0o600 });
@@ -7497,7 +7497,7 @@ describe("CLI entry point", () => {
         ok: false,
         error: {
           code: "UNAVAILABLE",
-          message: "The default Documents project is not a readable, writable, and traversable canonical directory. Repair it, then run `hra init --yes` again.",
+          message: "The default Documents project is not a readable, writable, and traversable canonical directory. Repair it, then run `oompa init --yes` again.",
         },
       });
       await expect(lstat(paths.database)).rejects.toMatchObject({ code: "ENOENT" });
@@ -7508,7 +7508,7 @@ describe("CLI entry point", () => {
   });
 
   test("repeated init leaves unrelated default paths untouched after initialization", async () => {
-    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-init-idempotent-")));
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "oompa-init-idempotent-")));
     const paths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
     const documents = join(temporary, "Documents");
     const absent = join(temporary, "Absent Documents");
@@ -7537,7 +7537,7 @@ describe("CLI entry point", () => {
   });
 
   test("offline doctor reports a projectless database as incomplete initialization", async () => {
-    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-doctor-projectless-")));
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "oompa-doctor-projectless-")));
     const paths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
     try {
       await initializeStatePaths(paths);
@@ -7547,10 +7547,10 @@ describe("CLI entry point", () => {
       expect(await main(["doctor", "--offline", "--json"], captured.output, { statePaths: paths })).toBe(1);
       expect(JSON.parse(captured.read().stdout)).toMatchObject({
         ok: false,
-        error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
+        error: { code: "UNHEALTHY", message: "Oompa checks found 1 problem." },
         data: {
           healthy: false,
-          problems: ["No project directory is configured. Run `hra init --yes`."],
+          problems: ["No project directory is configured. Run `oompa init --yes`."],
           state: {
             database: "ready",
             initialized: false,
@@ -7565,8 +7565,8 @@ describe("CLI entry point", () => {
 
   for (const scenario of ["missing", "symlink", "non_traversable"] as const) {
     test(`offline doctor separates unusable project roots from a healthy database: ${scenario}`, async () => {
-      const problem = "A configured project directory is missing or unsafe. Run `hra project list`, then restore or repair every listed directory so it is readable, writable, traversable, and canonical.";
-      const temporary = await realpath(await mkdtemp(join(tmpdir(), `hra-doctor-project-${scenario}-`)));
+      const problem = "A configured project directory is missing or unsafe. Run `oompa project list`, then restore or repair every listed directory so it is readable, writable, traversable, and canonical.";
+      const temporary = await realpath(await mkdtemp(join(tmpdir(), `oompa-doctor-project-${scenario}-`)));
       const paths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
       const documents = join(temporary, "Documents");
       try {
@@ -7585,7 +7585,7 @@ describe("CLI entry point", () => {
         expect(await main(["doctor", "--offline", "--json"], captured.output, { statePaths: paths })).toBe(1);
         expect(JSON.parse(captured.read().stdout)).toMatchObject({
           ok: false,
-          error: { code: "UNHEALTHY", message: "HRA checks found 1 problem." },
+          error: { code: "UNHEALTHY", message: "Oompa checks found 1 problem." },
           data: {
             healthy: false,
             problems: [problem],
@@ -7604,13 +7604,13 @@ describe("CLI entry point", () => {
   }
 
   test("online doctor keeps its envelope and exit code in agreement over validated health", async () => {
-    const invalid = "HRA checks returned an invalid local result.";
+    const invalid = "Oompa checks returned an invalid local result.";
     for (const entry of [
       { data: { healthy: true, problems: [] }, exitCode: 0 },
-      { data: { healthy: false, problems: ["Cloud projection recovery is unsettled."] }, exitCode: 1, message: "HRA checks found 1 problem." },
-      { data: { healthy: false, problems: [] }, exitCode: 1, message: "HRA checks did not pass, but no safe diagnostic was available." },
+      { data: { healthy: false, problems: ["Cloud projection recovery is unsettled."] }, exitCode: 1, message: "Oompa checks found 1 problem." },
+      { data: { healthy: false, problems: [] }, exitCode: 1, message: "Oompa checks did not pass, but no safe diagnostic was available." },
       { data: { healthy: "yes", problems: [] }, exitCode: 1, message: invalid },
-      { data: { healthy: true, problems: ["Cloud status is inconsistent.", "Cloud device is stale."] }, exitCode: 1, message: "HRA checks found 2 problems." },
+      { data: { healthy: true, problems: ["Cloud status is inconsistent.", "Cloud device is stale."] }, exitCode: 1, message: "Oompa checks found 2 problems." },
       { data: { healthy: true, problems: "none" }, exitCode: 1, message: invalid },
       { data: { healthy: true, problems: [1] }, exitCode: 1, message: invalid },
     ] as const) {
@@ -7646,11 +7646,11 @@ describe("CLI entry point", () => {
         data: { healthy: false, problems: ["Cloud status is inconsistent."] },
       }),
     })).toBe(1);
-    expect(human.read()).toEqual({ stdout: "HRA checks found 1 problem:\n- Cloud status is inconsistent.\n", stderr: "" });
+    expect(human.read()).toEqual({ stdout: "Oompa checks found 1 problem:\n- Cloud status is inconsistent.\n", stderr: "" });
   });
 
   test("init never opens or migrates the state database outside exclusive authority", async () => {
-    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-init-lock-")));
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "oompa-init-lock-")));
     const paths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
     await initializeStatePaths(paths);
     const documents = join(temporary, "Documents");

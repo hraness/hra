@@ -5,7 +5,7 @@ import { convexTest } from "convex-test";
 
 import { parseAuthCredentials } from "../src/cloud/authCredentials";
 import { sha256Hex } from "../src/cloud/crypto";
-import { buildHraAttentionEmailBody } from "./attentionEmail";
+import { buildOompaAttentionEmailBody } from "./attentionEmail";
 import { attentionNotificationQuotaReservations } from "./attentionNotifications";
 import { reserveAttentionNotificationFaultCapacity } from "./attentionNotificationControl";
 import { createAccountDeletionCapacityForNewUser } from "./authorityReductionCapacity";
@@ -66,7 +66,7 @@ const genesisQuota = makeFunctionReference<"mutation", Record<string, never>, un
 const consumeOtpChallenge = makeFunctionReference<"mutation", Args, unknown>(
   "authDelivery:consumeOtpChallenge",
 );
-const hmacEnvironmentName = "HRA_AUTH_HMAC_SECRET";
+const hmacEnvironmentName = "OOMPA_AUTH_HMAC_SECRET";
 const priorHmacSecret = process.env[hmacEnvironmentName];
 
 beforeAll(() => {
@@ -74,7 +74,7 @@ beforeAll(() => {
 });
 
 afterAll(() => {
-  if (priorHmacSecret === undefined) delete process.env.HRA_AUTH_HMAC_SECRET;
+  if (priorHmacSecret === undefined) delete process.env.OOMPA_AUTH_HMAC_SECRET;
   else process.env[hmacEnvironmentName] = priorHmacSecret;
 });
 
@@ -1478,17 +1478,17 @@ describe("bounded cloud retention", () => {
         "attentionNotificationOutbox",
         startedNotification,
       );
-      const startedBody = buildHraAttentionEmailBody([{
+      const startedBody = buildOompaAttentionEmailBody([{
         interactionKind: startedNotification.interactionKind,
         sessionPublicId: startedNotification.sessionPublicId,
       }]);
       const startedBodyDigest = await sha256Hex(
-        `hra-attention-body:v1\u0000${startedBody.text}`,
+        `oompa-attention-body:v1\u0000${startedBody.text}`,
       );
       const startedDeliveryId = "01912345-6789-7abc-8def-0123456789d1";
       const startedRecipientDigest = "7".repeat(64);
       const startedIdempotencyKey = await sha256Hex([
-        "hra-attention-resend:v1",
+        "oompa-attention-resend:v1",
         startedDeliveryId,
         startedRecipientDigest,
         startedBodyDigest,
@@ -1833,15 +1833,15 @@ describe("bounded cloud retention", () => {
       await reserveSessionHeadQuotaForInsert(ctx, userId, session);
       const sessionId = await ctx.db.insert("sessionHeads", session);
       for (let groupIndex = 0; groupIndex < 3; groupIndex += 1) {
-        const body = buildHraAttentionEmailBody(Array.from({ length: 8 }, () => ({
+        const body = buildOompaAttentionEmailBody(Array.from({ length: 8 }, () => ({
           interactionKind: "command_approval" as const,
           sessionPublicId: session.publicId,
         })));
-        const bodyDigest = await sha256Hex(`hra-attention-body:v1\u0000${body.text}`);
+        const bodyDigest = await sha256Hex(`oompa-attention-body:v1\u0000${body.text}`);
         const deliveryId = `01912345-6789-7abc-8def-0123456789e${String(groupIndex)}`;
         const recipientDigest = String(groupIndex + 7).repeat(64);
         const idempotencyKey = await sha256Hex([
-          "hra-attention-resend:v1",
+          "oompa-attention-resend:v1",
           deliveryId,
           recipientDigest,
           bodyDigest,

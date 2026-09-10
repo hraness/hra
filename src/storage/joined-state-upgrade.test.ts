@@ -40,7 +40,7 @@ const snapshot = (path: string) => {
   } finally { database.close(false); }
 };
 const pathsFor = async (bytes?: Uint8Array) => {
-  const directory = await realpath(await mkdtemp(join(tmpdir(), "hra-joined-state-upgrade-")));
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "oompa-joined-state-upgrade-")));
   directories.push(directory);
   const paths = resolveStatePaths({ homeDirectory: directory, platform: "darwin" });
   await initializeStatePaths(paths);

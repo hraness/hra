@@ -22,8 +22,8 @@ import {
   CLAUDE_HOST_TOOL_SESSION_HISTORY_LIMIT,
   digestClaudeHostToolInvocation,
 } from "../claude/index";
-import type { HraHostToolCall } from "../codex/protocol";
-import { HRA_SESSION_PREAMBLE } from "../domain/hra-preamble";
+import type { OompaHostToolCall } from "../codex/protocol";
+import { OOMPA_SESSION_PREAMBLE } from "../domain/oompa-preamble";
 import { effectiveClaudeRuntimeProfileSchema } from "../domain/runtime-profile";
 import { ensurePrivateDirectory } from "../storage/paths";
 import {
@@ -37,8 +37,8 @@ import {
   type ProfileAuthority,
 } from "./ports";
 
-const CONFIG_DIR = "/var/hra/profiles/acct/claude";
-const PROJECT_ROOT = "/var/hra/projects/demo";
+const CONFIG_DIR = "/var/oompa/profiles/acct/claude";
+const PROJECT_ROOT = "/var/oompa/projects/demo";
 const ADOPTED_PROVIDER_THREAD_ID = "726b1b3d-ed97-4b55-9904-e58fa7d7eb45";
 const ADOPTED_TITLE = "Existing Claude conversation";
 const PROCESS_IDENTITY: ClaudeProcessIdentity = Object.freeze({
@@ -46,12 +46,12 @@ const PROCESS_IDENTITY: ClaudeProcessIdentity = Object.freeze({
   pidDomain: "darwin",
   procStart: "Fri Sep  4 12:00:00 2026",
 });
-const HOST_TOOL_PRIVATE_ROOT = "/var/hra/private";
-const HOST_TOOL_SOCKET = "/var/hra/private/callback.sock";
+const HOST_TOOL_PRIVATE_ROOT = "/var/oompa/private";
+const HOST_TOOL_SOCKET = "/var/oompa/private/callback.sock";
 
 const authority: ProfileAuthority = {
-  codexHome: "/var/hra/profiles/acct/codex",
-  desktopUserData: "/var/hra/profiles/acct/desktop",
+  codexHome: "/var/oompa/profiles/acct/codex",
+  desktopUserData: "/var/oompa/profiles/acct/desktop",
   generation: 3,
   id: "acct_00000000000000000000000000000000",
   provider: "claude",
@@ -249,8 +249,8 @@ const harness = (options: {
   processIdentity?: ClaudeProcessIdentity | "reject";
   processIgnoresKill?: boolean;
   processIgnoresTerm?: boolean;
-  hostTool?: (call: HraHostToolCall) => ClaudeHostToolPublicResult | Promise<ClaudeHostToolPublicResult>;
-  hostToolResponseWritten?: (call: HraHostToolCall) => void | Promise<void>;
+  hostTool?: (call: OompaHostToolCall) => ClaudeHostToolPublicResult | Promise<ClaudeHostToolPublicResult>;
+  hostToolResponseWritten?: (call: OompaHostToolCall) => void | Promise<void>;
   processFactory?: ConstructorParameters<typeof PinnedClaudeRuntimeManager>[0]["processFactory"];
   readAuthStatus?: ClaudeAuthStatusReader;
   resolveRuntime?: ConstructorParameters<typeof PinnedClaudeRuntimeManager>[0]["resolveRuntime"];
@@ -286,13 +286,13 @@ const harness = (options: {
       },
       ...(options.hostTool === undefined
         ? {}
-        : { hraHostTool: (_authority: ProfileAuthority, call: HraHostToolCall) => options.hostTool?.(call) ?? "" }),
+        : { oompaHostTool: (_authority: ProfileAuthority, call: OompaHostToolCall) => options.hostTool?.(call) ?? "" }),
       ...(options.hostToolResponseWritten === undefined
         ? {}
         : {
-            hraHostToolResponseWritten: (
+            oompaHostToolResponseWritten: (
               _authority: ProfileAuthority,
-              call: HraHostToolCall,
+              call: OompaHostToolCall,
             ) => options.hostToolResponseWritten?.(call),
           }),
     },
@@ -699,7 +699,7 @@ describe("pinned Claude runtime manager", () => {
   });
 
   test("refuses a Claude config directory symlinked across account custody before any launch", async () => {
-    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-claude-config-link-")));
+    const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-claude-config-link-")));
     try {
       const sourceRoot = join(root, "profiles", "source");
       const target = join(root, "profiles", "target", "claude-config");
@@ -742,7 +742,7 @@ describe("pinned Claude runtime manager", () => {
   });
 
   test("repairs owned permissive Claude config custody immediately before each launch", async () => {
-    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-claude-config-mode-")));
+    const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-claude-config-mode-")));
     try {
       const configDir = join(root, "claude-config");
       await mkdir(configDir, { mode: 0o700 });
@@ -784,7 +784,7 @@ describe("pinned Claude runtime manager", () => {
   });
 
   test("refuses a wrong-shaped Claude config path before status or runtime admission", async () => {
-    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-claude-config-shape-")));
+    const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-claude-config-shape-")));
     try {
       const configDir = join(root, "claude-config");
       await writeFile(configDir, "not a directory", { mode: 0o600 });
@@ -941,8 +941,8 @@ describe("pinned Claude runtime manager", () => {
   test("retains a post-launch authority failure until the exact child can be joined", async () => {
     const alternateAuthority: ProfileAuthority = {
       ...authority,
-      codexHome: "/var/hra/profiles/alternate/codex",
-      desktopUserData: "/var/hra/profiles/alternate/desktop",
+      codexHome: "/var/oompa/profiles/alternate/codex",
+      desktopUserData: "/var/oompa/profiles/alternate/desktop",
       generation: 1,
       id: "acct_11111111111111111111111111111111",
     };
@@ -1330,7 +1330,7 @@ describe("pinned Claude runtime manager", () => {
     expect(launches[0]?.argv).toEqual([
       ...runtime.argv,
       "--append-system-prompt",
-      HRA_SESSION_PREAMBLE.text,
+      OOMPA_SESSION_PREAMBLE.text,
       "--mcp-config",
       `${HOST_TOOL_PRIVATE_ROOT}/binding-1/mcp.json`,
       "--strict-mcp-config",
@@ -1521,7 +1521,7 @@ describe("pinned Claude runtime manager", () => {
       requirement: presetRequirements["fable-max"],
       projectRoot: PROJECT_ROOT,
       signal: signal(),
-    })).rejects.toThrow("no HRA fast mode");
+    })).rejects.toThrow("no Oompa fast mode");
     await manager.close();
   });
 
@@ -1554,7 +1554,7 @@ describe("pinned Claude runtime manager", () => {
     await mismatched.manager.close();
   });
 
-  test("maps every can_use_tool request onto its HRA interaction kind", async () => {
+  test("maps every can_use_tool request onto its Oompa interaction kind", async () => {
     const { facts, manager, processes } = harness();
     const providerThreadId = await startSession(manager);
     await startTurn(manager, providerThreadId, "work");
@@ -1989,7 +1989,7 @@ describe("pinned Claude runtime manager", () => {
   });
 
   test("rekeys an idle live session and its host binding across one exact provider generation", async () => {
-    const handled: HraHostToolCall[] = [];
+    const handled: OompaHostToolCall[] = [];
     const value = harness({
       hostTool: (call) => {
         handled.push(call);
@@ -2136,7 +2136,7 @@ describe("pinned Claude runtime manager", () => {
     expect(launches[0]?.argv).toEqual([
       ...runtime.argv,
       "--append-system-prompt",
-      HRA_SESSION_PREAMBLE.text,
+      OOMPA_SESSION_PREAMBLE.text,
       "--mcp-config",
       `${HOST_TOOL_PRIVATE_ROOT}/binding-1/mcp.json`,
       "--strict-mcp-config",
@@ -2793,8 +2793,8 @@ describe("pinned Claude runtime manager", () => {
   }
 
   test("provisions a strict MCP binding before spawn and activates it only after session commit", async () => {
-    const handled: HraHostToolCall[] = [];
-    const receipts: HraHostToolCall[] = [];
+    const handled: OompaHostToolCall[] = [];
+    const receipts: OompaHostToolCall[] = [];
     const value = harness({
       hostTool: (call) => { handled.push(call); return { sessions: [] }; },
       hostToolResponseWritten: (call) => { receipts.push(call); },
@@ -2903,7 +2903,7 @@ describe("pinned Claude runtime manager", () => {
     const disconnected = new Promise<void>((resolve) => { markDisconnected = resolve; });
     const turnResultReceived = new Promise<void>((resolve) => { markTurnResultReceived = resolve; });
     const turnResultGate = new Promise<void>((resolve) => { releaseTurnResult = resolve; });
-    let normalizedCall: HraHostToolCall | undefined;
+    let normalizedCall: OompaHostToolCall | undefined;
     const value = harness({
       hostTool: async (call) => {
         normalizedCall = call;

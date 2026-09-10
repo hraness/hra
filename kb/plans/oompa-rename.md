@@ -10,7 +10,7 @@ tags:
 
 ## Outcome
 
-Rename the maintained HRA product to Oompa across the command, package, source, documentation, website, app, integrations, and Hraness organization consumers. Use `oompa.app` as the canonical product domain. The product mark is the orange circle emoji, 🟠; the favicon and branding take their shape and color from it. The organization remains `hraness`.
+Rename the maintained Oompa product to Oompa across the command, package, source, documentation, website, app, integrations, and Hraness organization consumers. Use `oompa.app` as the canonical product domain. The product mark is the orange circle emoji, 🟠; the favicon and branding take their shape and color from it. The organization remains `hraness`.
 
 The intended forward identities are `Oompa`, `oompa`, `@hraness/oompa`, and `hraness/oompa`. New package documentation and metadata serve the local CLI and its public imports. They must not reuse the website's marketing content or ship its implementation. The root README becomes independently package-authored, and the package description has its own authority. This also makes ordinary `npm pack .` safe without a second artifact producer. Standard development metadata is not itself website content; existing production dependency and archive restrictions still apply.
 
@@ -30,7 +30,7 @@ Old-name release, repository rename, domain promotion, and dependent polish deli
 - Preserve the existing repository's numeric identity if an in-place rename can satisfy legacy recovery. The old tagged installer rejects redirects and requires its original repository path. Repository movement is blocked until a reviewed originating-release recovery path is proved; ordinary Git redirects are insufficient.
 - [GitHub's repository rename contract](https://docs.github.com/en/repositories/creating-and-managing-repositories/renaming-a-repository) preserves ordinary Git redirects but does not redirect reusable action calls. Inventory those consumers explicitly.
 - [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/) binds a package to configured repository and workflow identity. A new coordinate or repository path needs its own supported authority and non-publishing preflight. Preserve authentication, provenance, tag protections, and immutable old artifacts.
-- Keep one existing state and daemon-custody root. Do not create a parallel Oompa root beside an existing HRA writer, copy databases, rename provider-owned homes, regenerate keys, or use a symlink as migration authority.
+- Keep one existing state and daemon-custody root. Do not create a parallel Oompa root beside an existing Oompa writer, copy databases, rename provider-owned homes, regenerate keys, or use a symlink as migration authority.
 - Existing encryption domains, opaque identifiers, signed cursors, receipts, schema preimages, and recovery journals remain byte-exact until an explicitly versioned migration is proved. Source symbols and filenames may change without changing those values.
 - Resolve renamed environment variables before any effect. Preserve absent versus explicitly empty values, retain necessary legacy input compatibility, and reject contradictory aliases. Do not change a user's cloud-disabled setting into hosted enrollment.
 - Existing provider sessions retain their exact bound tool manifests and preamble digests. New Oompa contracts need explicit versioned admission and per-session selection, not a global acceptance of two writer namespaces.
@@ -68,7 +68,7 @@ Old-name release, repository rename, domain promotion, and dependent polish deli
 - **Objective:** Account for every old-name reference and decide its treatment before effects.
 - **Scope:** Repository tracked paths and text, the full organization default-head census, runtime/release compatibility specifications, and a closed rename-audit checker.
 - **Out of scope:** Provider writes, old-history edits, dormant-feature activation, and archived repository unarchiving.
-- **Approach:** Discover domain, package, command, symbol, filename, plugin, workflow, documentation and asset references separately. Distinguish `hra` from the unchanged organization name `hraness`. Bind retained compatibility literals to exact values, consumers and regression tests. Search-index results are discovery, not completeness proof.
+- **Approach:** Discover domain, package, command, symbol, filename, plugin, workflow, documentation and asset references separately. Distinguish `oompa` from the unchanged organization name `hraness`. Bind retained compatibility literals to exact values, consumers and regression tests. Search-index results are discovery, not completeness proof.
 - **Acceptance criteria:** Every repository is represented by an exact inspected default head or an explicit coverage blocker. Every retained product identifier has a concrete compatibility or historical reason. The checker rejects newly introduced unclassified names and stale exceptions. The installer and domain cutover decisions are resolved before their operational phase.
 - **Validation:** New deterministic and property tests beside the rename checker; `git diff --check`; independent inventory and compatibility review. Retain a fresh organization-head readback for final acceptance.
 

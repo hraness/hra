@@ -44,16 +44,16 @@ import {
   type ProviderActivityTargetEvidence,
 } from "./current-project-alias-release";
 import {
-  HRA_CONVEX_PROJECT_ID,
-  HRA_CONVEX_TEAM_ID,
+  OOMPA_CONVEX_PROJECT_ID,
+  OOMPA_CONVEX_TEAM_ID,
   type ConvexTarget,
 } from "./convex-target";
 import {
-  HRA_RELEASE_VERSION,
-  HRA_REPOSITORY,
-  HRA_REPOSITORY_ID,
-  HRA_VERCEL_PROJECT_ID,
-  HRA_VERCEL_TEAM_ID,
+  OOMPA_RELEASE_VERSION,
+  OOMPA_REPOSITORY,
+  OOMPA_REPOSITORY_ID,
+  OOMPA_VERCEL_PROJECT_ID,
+  OOMPA_VERCEL_TEAM_ID,
   readProtectedJson,
   withSelfDigest,
 } from "./release-evidence";
@@ -66,13 +66,13 @@ import {
 
 const source: CurrentProjectAliasEndpoint = {
   deploymentId: "dpl_SourceCurrent1234567890123",
-  deploymentUrl: "hra-source-current-hraness.vercel.app",
+  deploymentUrl: "oompa-source-current-hraness.vercel.app",
   sourceCommit: "1".repeat(40),
 };
 
 const target: CurrentProjectAliasEndpoint = {
   deploymentId: "dpl_TargetCurrent1234567890123",
-  deploymentUrl: "hra-target-current-hraness.vercel.app",
+  deploymentUrl: "oompa-target-current-hraness.vercel.app",
   sourceCommit: "2".repeat(40),
 };
 
@@ -80,24 +80,24 @@ const convex: ConvexTarget = {
   deploymentId: 5_089_017,
   deploymentName: "qualified-hummingbird-537",
   deploymentUrl: "https://qualified-hummingbird-537.convex.cloud",
-  projectId: HRA_CONVEX_PROJECT_ID,
-  teamId: HRA_CONVEX_TEAM_ID,
+  projectId: OOMPA_CONVEX_PROJECT_ID,
+  teamId: OOMPA_CONVEX_TEAM_ID,
 };
 
 const plan: CurrentProjectAliasReleasePlan = {
-  alias: "hra.sh",
+  alias: "oompa.app",
   convex,
   idempotencyKey: "607f32a6-98a9-4597-b54e-32e72fe32b56",
   kind: "current-project-canonical-alias",
-  repository: { id: HRA_REPOSITORY_ID, name: HRA_REPOSITORY },
+  repository: { id: OOMPA_REPOSITORY_ID, name: OOMPA_REPOSITORY },
   schemaVersion: 1,
   vercel: {
-    projectId: HRA_VERCEL_PROJECT_ID,
+    projectId: OOMPA_VERCEL_PROJECT_ID,
     source,
     target,
-    teamId: HRA_VERCEL_TEAM_ID,
+    teamId: OOMPA_VERCEL_TEAM_ID,
   },
-  version: HRA_RELEASE_VERSION,
+  version: OOMPA_RELEASE_VERSION,
 };
 
 const cliSourcePlan: CurrentProjectAliasReleasePlan = {
@@ -114,34 +114,34 @@ const cliSourcePlan: CurrentProjectAliasReleasePlan = {
 };
 
 const legacyReceiptlessIntentPlan: CurrentProjectAliasReleasePlan = {
-  alias: "hra.sh",
+  alias: "oompa.app",
   convex,
   idempotencyKey: "1a27c773-2ddd-4fa9-913f-e806826984e0",
   kind: "current-project-canonical-alias",
-  repository: { id: HRA_REPOSITORY_ID, name: HRA_REPOSITORY },
+  repository: { id: OOMPA_REPOSITORY_ID, name: OOMPA_REPOSITORY },
   schemaVersion: 1,
   vercel: {
-    projectId: HRA_VERCEL_PROJECT_ID,
+    projectId: OOMPA_VERCEL_PROJECT_ID,
     source: {
       deploymentId: "dpl_E8smsZp1C2K594UxHfR4RtJFrnZ6",
-      deploymentUrl: "hra-bdopeqch0-hraness.vercel.app",
+      deploymentUrl: "oompa-bdopeqch0-hraness.vercel.app",
       sourceCommit: "86648e8ca3623e66c7c2386581386688b30bb061",
     },
     target: {
       deploymentId: "dpl_CKw276hGrZsRJhFUwMyKCJ6tFApM",
-      deploymentUrl: "hra-i022lu6xk-hraness.vercel.app",
+      deploymentUrl: "oompa-i022lu6xk-hraness.vercel.app",
       sourceCommit: "ab6f3d66cce5d505769907f29f66eef83133b0f2",
     },
-    teamId: HRA_VERCEL_TEAM_ID,
+    teamId: OOMPA_VERCEL_TEAM_ID,
   },
-  version: HRA_RELEASE_VERSION,
+  version: OOMPA_RELEASE_VERSION,
 };
 
 const withStateDirectory = async <Value>(
   operation: (directory: string) => Promise<Value>,
 ): Promise<Value> => {
   const directory = await realpath(
-    await mkdtemp(join(tmpdir(), "hra-alias-release-state-")),
+    await mkdtemp(join(tmpdir(), "oompa-alias-release-state-")),
   );
   await chmod(directory, 0o700);
   try {
@@ -176,12 +176,12 @@ const deploymentFor = (
 ): CurrentDeploymentReadback => ({
   gitSource: {
     ref: "main",
-    repoId: HRA_REPOSITORY_ID,
+    repoId: OOMPA_REPOSITORY_ID,
     sha: endpoint.sourceCommit,
     type: "github",
   },
   id: endpoint.deploymentId,
-  projectId: HRA_VERCEL_PROJECT_ID,
+  projectId: OOMPA_VERCEL_PROJECT_ID,
   readyState: "READY",
   source: "git",
   target: "production",
@@ -199,7 +199,7 @@ const cliDeploymentFor = (
     gitCommitSha: endpoint.sourceCommit,
     gitRootDirectory: "",
   },
-  projectId: HRA_VERCEL_PROJECT_ID,
+  projectId: OOMPA_VERCEL_PROJECT_ID,
   readyState: "READY",
   source: "cli",
   target: "production",
@@ -215,25 +215,25 @@ const cliDeploymentWithoutGitSourceFor = (
 };
 
 const aliasFor = (endpoint: CurrentProjectAliasEndpoint): CurrentAliasReadback => ({
-  alias: "hra.sh",
+  alias: "oompa.app",
   deployment: { id: endpoint.deploymentId, url: endpoint.deploymentUrl },
   deploymentId: endpoint.deploymentId,
-  projectId: HRA_VERCEL_PROJECT_ID,
+  projectId: OOMPA_VERCEL_PROJECT_ID,
 });
 
 const projectReadback: CurrentProjectReadback = {
-  accountId: HRA_VERCEL_TEAM_ID,
+  accountId: OOMPA_VERCEL_TEAM_ID,
   autoAssignCustomDomains: false,
-  id: HRA_VERCEL_PROJECT_ID,
+  id: OOMPA_VERCEL_PROJECT_ID,
 };
 
 const markerFor = (endpoint: CurrentProjectAliasEndpoint): unknown => ({
   generation: 1,
-  product: "HRA",
-  repository: { id: HRA_REPOSITORY_ID, path: HRA_REPOSITORY },
+  product: "Oompa",
+  repository: { id: OOMPA_REPOSITORY_ID, path: OOMPA_REPOSITORY },
   schemaVersion: 2,
   source: { commit: endpoint.sourceCommit },
-  version: HRA_RELEASE_VERSION,
+  version: OOMPA_RELEASE_VERSION,
 });
 
 const markerWithVersion = (
@@ -260,7 +260,7 @@ const providerActivityEvidenceFor = (
     },
     alias: {
       createdAtMs: Math.max(0, Math.floor(intentPublishedAtMs) - 1_000),
-      uid: "alias_CurrentHra12345678901234567890",
+      uid: "alias_CurrentOompa12345678901234567890",
       updatedAtMs,
     },
     custody: { soleWriterConfirmed: true },
@@ -300,10 +300,10 @@ const seedTargetPhase = async (
     inputPlan,
     intent,
     {
-      alias: "hra.sh",
+      alias: "oompa.app",
       created: 1_787_961_600_000,
       oldDeploymentId: inputPlan.vercel.source.deploymentId,
-      uid: "alias_CurrentHra1234567890",
+      uid: "alias_CurrentOompa1234567890",
     },
   );
   await writeFile(paths.targetPhase, `${JSON.stringify(targetPhase)}\n`, {
@@ -386,7 +386,7 @@ class FakeProvider implements CurrentProjectAliasReleaseProvider {
     }
     const readback = this.targetDeploymentOverride ?? deploymentFor(target);
     return this.breakTargetDeployment
-      ? { ...readback, url: "hra-wrong-current-hraness.vercel.app" }
+      ? { ...readback, url: "oompa-wrong-current-hraness.vercel.app" }
       : readback;
   }
 
@@ -401,7 +401,7 @@ class FakeProvider implements CurrentProjectAliasReleaseProvider {
     if (observedState === "target") return aliasFor(target);
     return aliasFor({
       deploymentId: "dpl_UnknownCurrent12345678901",
-      deploymentUrl: "hra-unknown-current-hraness.vercel.app",
+      deploymentUrl: "oompa-unknown-current-hraness.vercel.app",
       sourceCommit: "3".repeat(40),
     });
   }
@@ -420,7 +420,7 @@ class FakeProvider implements CurrentProjectAliasReleaseProvider {
     endpoint: CurrentProjectAliasEndpoint,
     idempotencyKey: string,
   ): Promise<Readonly<{
-    alias: "hra.sh";
+    alias: "oompa.app";
     created: number;
     oldDeploymentId: string;
     uid: string;
@@ -432,10 +432,10 @@ class FakeProvider implements CurrentProjectAliasReleaseProvider {
         ? target.deploymentId
         : "dpl_UnknownCurrent12345678901";
     const response = {
-      alias: "hra.sh" as const,
+      alias: "oompa.app" as const,
       created: 1_787_961_600_000,
       oldDeploymentId: this.mutationOldDeploymentIdOverride ?? oldDeploymentId,
-      uid: "alias_CurrentHra1234567890",
+      uid: "alias_CurrentOompa1234567890",
     };
     expect(idempotencyKey).toBe(currentAliasReleaseMutationKey(
       this.activePlan,
@@ -572,7 +572,7 @@ class FakeDirectVercelTransport {
       JSON.stringify(value),
       { headers: { "content-type": "application/json" }, status },
     );
-    if (url.startsWith("https://hra.sh/.well-known/hra.json?release=")) {
+    if (url.startsWith("https://oompa.app/.well-known/oompa.json?release=")) {
       const headers = new Headers(init.headers);
       expect(headers.has("authorization")).toBeFalse();
       expect(init.method).toBe("GET");
@@ -592,7 +592,7 @@ class FakeDirectVercelTransport {
 
     const parsedUrl = new URL(url);
     expect(parsedUrl.origin).toBe("https://api.vercel.com");
-    expect(parsedUrl.searchParams.get("teamId")).toBe(HRA_VERCEL_TEAM_ID);
+    expect(parsedUrl.searchParams.get("teamId")).toBe(OOMPA_VERCEL_TEAM_ID);
     if (parsedUrl.pathname !== "/v3/events") {
       expect([...parsedUrl.searchParams.keys()]).toEqual(["teamId"]);
     }
@@ -605,7 +605,7 @@ class FakeDirectVercelTransport {
       const targetPath = `/v2/deployments/${target.deploymentId}/aliases`;
       const sourcePath = `/v2/deployments/${source.deploymentId}/aliases`;
       expect([sourcePath, targetPath]).toContain(parsedUrl.pathname);
-      expect(init.body).toBe(JSON.stringify({ alias: "hra.sh" }));
+      expect(init.body).toBe(JSON.stringify({ alias: "oompa.app" }));
       expect(headers.get("content-type")).toBe("application/json");
       const assigningTarget = parsedUrl.pathname === targetPath;
       expect(headers.get("idempotency-key")).toBe(currentAliasReleaseMutationKey(
@@ -619,28 +619,28 @@ class FakeDirectVercelTransport {
         expect(this.mode).toBe("recover-source");
         this.aliasState = "source";
         return json({
-          alias: "hra.sh",
+          alias: "oompa.app",
           created: 1_787_961_603_000,
           oldDeploymentId: target.deploymentId,
-          uid: "alias_CurrentHra1234567890",
+          uid: "alias_CurrentOompa1234567890",
         });
       }
       if (this.mode === "mutation-rejected") return json({ error: "refused" }, 500);
       if (this.mode === "mutation-malformed") {
         this.aliasState = "target";
-        return json({ alias: "hra.sh" });
+        return json({ alias: "oompa.app" });
       }
       this.aliasState = "target";
       return json({
-        alias: "hra.sh",
+        alias: "oompa.app",
         created: 1_787_961_600_000,
         oldDeploymentId: source.deploymentId,
-        uid: "alias_CurrentHra1234567890",
+        uid: "alias_CurrentOompa1234567890",
       });
     }
 
     expect(init.method).toBe("GET");
-    if (parsedUrl.pathname === `/v9/projects/${HRA_VERCEL_PROJECT_ID}`) {
+    if (parsedUrl.pathname === `/v9/projects/${OOMPA_VERCEL_PROJECT_ID}`) {
       return json(projectReadback);
     }
     if (parsedUrl.pathname === `/v13/deployments/${source.deploymentId}`) {
@@ -649,7 +649,7 @@ class FakeDirectVercelTransport {
     if (parsedUrl.pathname === `/v13/deployments/${target.deploymentId}`) {
       return json(deploymentFor(target));
     }
-    if (parsedUrl.pathname === "/v4/aliases/hra.sh") {
+    if (parsedUrl.pathname === "/v4/aliases/oompa.app") {
       const alias = aliasFor(this.aliasState === "source" ? source : target);
       return json(this.activityEvidence === undefined
         ? alias
@@ -664,7 +664,7 @@ class FakeDirectVercelTransport {
       return json({
         aliases: this.activityEvidence === undefined
           ? []
-          : [{ alias: "hra.sh", uid: this.activityEvidence.alias.uid }],
+          : [{ alias: "oompa.app", uid: this.activityEvidence.alias.uid }],
       });
     }
     if (parsedUrl.pathname === `/v2/deployments/${source.deploymentId}/aliases`) {
@@ -906,12 +906,12 @@ describe("private descriptor fixture protocol", () => {
 describe("current-project alias plan", () => {
   test("parses the checked exact editorial-image release plan", async () => {
     const document = await readFile(
-      join(import.meta.dir, "..", "docs", "hra-sh-80c20f7-plan.json"),
+      join(import.meta.dir, "..", "docs", "oompa-sh-80c20f7-plan.json"),
       "utf8",
     );
     const parsed = parseCurrentProjectAliasReleasePlan(document);
 
-    expect(parsed.repository).toEqual({ id: 1_343_008_607, name: "hraness/hra" });
+    expect(parsed.repository).toEqual({ id: 1_343_008_607, name: "hraness/oompa" });
     expect(parsed.vercel.projectId).toBe("prj_8ciIt9t9foE3utG45frRN7cxckjS");
     expect(parsed.vercel.source.deploymentId).toBe("dpl_7pK5Y4G5G6rrNWzExGCYCjr6kMKN");
     expect(parsed.vercel.target.deploymentId).toBe("dpl_5um4zKKeN7WhLT58xoycxRkeoVKZ");
@@ -948,7 +948,7 @@ describe("current-project alias plan", () => {
 
   test("derives one exact record confirmation including project, IDs, and hostnames", () => {
     expect(requiredAliasConfirmation(plan)).toBe(
-      `reassign hra.sh in ${HRA_VERCEL_PROJECT_ID} from ${source.deploymentId}@${source.deploymentUrl} to ${target.deploymentId}@${target.deploymentUrl} using plan ${plan.idempotencyKey}`,
+      `reassign oompa.app in ${OOMPA_VERCEL_PROJECT_ID} from ${source.deploymentId}@${source.deploymentUrl} to ${target.deploymentId}@${target.deploymentUrl} using plan ${plan.idempotencyKey}`,
     );
     expect(requiredAliasConfirmation({
       ...plan,
@@ -981,10 +981,10 @@ describe("current-project alias plan", () => {
       plan,
       intent,
       {
-        alias: "hra.sh",
+        alias: "oompa.app",
         created: 1_787_961_600_000,
         oldDeploymentId: source.deploymentId,
-        uid: "alias_CurrentHra1234567890",
+        uid: "alias_CurrentOompa1234567890",
       },
     );
     const sourceRecovery = currentAliasReleaseSourceRecoveryFor(
@@ -1012,10 +1012,10 @@ describe("current-project alias plan", () => {
       plan,
       intent,
       {
-        alias: "hra.sh",
+        alias: "oompa.app",
         created: 1_787_961_600_000,
         oldDeploymentId: "dpl_UnknownCurrent12345678901",
-        uid: "alias_CurrentHra1234567890",
+        uid: "alias_CurrentOompa1234567890",
       },
     )).toThrow("provider_readback_invalid");
 
@@ -1344,7 +1344,7 @@ describe("current-project alias authority", () => {
           undefined,
           "approve both",
           "confirmed do it",
-          "reassign hra.sh",
+          "reassign oompa.app",
         ] as const) {
           const provider = new FakeProvider();
           const stderr: string[] = [];
@@ -1709,11 +1709,11 @@ describe("current-project Vercel provider", () => {
       "--method",
       "POST",
       "--raw-field",
-      "alias=hra.sh",
+      "alias=oompa.app",
       "--header",
       `Idempotency-Key:${key}`,
       "--scope",
-      HRA_VERCEL_TEAM_ID,
+      OOMPA_VERCEL_TEAM_ID,
       "--raw",
     ]);
     const request = currentAliasReleaseVercelApiRequest(
@@ -1722,7 +1722,7 @@ describe("current-project Vercel provider", () => {
       "fixture-vercel-token",
     );
     expect(request).toEqual({
-      body: JSON.stringify({ alias: "hra.sh" }),
+      body: JSON.stringify({ alias: "oompa.app" }),
       headers: {
         accept: "application/json",
         authorization: "Bearer fixture-vercel-token",
@@ -1730,7 +1730,7 @@ describe("current-project Vercel provider", () => {
         "idempotency-key": key,
       },
       method: "POST",
-      url: `https://api.vercel.com/v2/deployments/${target.deploymentId}/aliases?teamId=${HRA_VERCEL_TEAM_ID}`,
+      url: `https://api.vercel.com/v2/deployments/${target.deploymentId}/aliases?teamId=${OOMPA_VERCEL_TEAM_ID}`,
     });
 
     const implementation = await readFile(
@@ -1835,7 +1835,7 @@ describe("current-project Vercel provider", () => {
       const invalidPath = join(stateDirectory, "recovery-evidence-invalid.json");
       await writeFile(invalidPath, JSON.stringify({
         ...providerActivityEvidence,
-        observedTargetMarkerVersion: HRA_RELEASE_VERSION,
+        observedTargetMarkerVersion: OOMPA_RELEASE_VERSION,
       }), { mode: 0o600 });
       await chmod(invalidPath, 0o600);
       expect(() => readProtectedProviderActivityEvidenceFile(invalidPath))
@@ -1868,12 +1868,12 @@ describe("current-project Vercel provider", () => {
         status: "ready",
       });
       expect(transport.requests.map(({ url }) => new URL(url).pathname)).toEqual([
-        `/v9/projects/${HRA_VERCEL_PROJECT_ID}`,
+        `/v9/projects/${OOMPA_VERCEL_PROJECT_ID}`,
         `/v13/deployments/${source.deploymentId}`,
         `/v13/deployments/${target.deploymentId}`,
-        "/v4/aliases/hra.sh",
-        "/.well-known/hra.json",
-        "/v4/aliases/hra.sh",
+        "/v4/aliases/oompa.app",
+        "/.well-known/oompa.json",
+        "/v4/aliases/oompa.app",
       ]);
 
       const executed = await runDirectApiCli(
@@ -3213,7 +3213,7 @@ describe("current-project alias CLI", () => {
       expect(exitCode).toBe(0);
       expect(stderr).toEqual([]);
       expect(JSON.parse(stdout.join(""))).toEqual({
-        alias: "hra.sh",
+        alias: "oompa.app",
         idempotencyKey: plan.idempotencyKey,
         nextAction: "execute_with_machine_token_under_standing_task_authority",
         observedState: "source",
@@ -3223,7 +3223,7 @@ describe("current-project alias CLI", () => {
         sourceDeploymentId: source.deploymentId,
         status: "ready",
         targetDeploymentId: target.deploymentId,
-        targetProjectId: HRA_VERCEL_PROJECT_ID,
+        targetProjectId: OOMPA_VERCEL_PROJECT_ID,
       });
     });
   });

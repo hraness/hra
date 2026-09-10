@@ -3,14 +3,14 @@ import { stylexVite } from "@hraness/ui/stylex-build/vite";
 import react from "@vitejs/plugin-react";
 import { relative } from "node:path";
 import { defineConfig, type InlineConfig, type Plugin } from "vite";
-import type { HraAppearanceAsset } from "../scripts/build-appearance.ts";
+import type { OompaAppearanceAsset } from "../scripts/build-appearance.ts";
 
-// The app publication driver owns `.well-known/hra-app.json`; Vite emits only
+// The app publication driver owns `.well-known/oompa-app.json`; Vite emits only
 // the closed compiled graph.
 
-function appearanceAssetPlugin(rootDirectory: string, appearance: HraAppearanceAsset): Plugin {
+function appearanceAssetPlugin(rootDirectory: string, appearance: OompaAppearanceAsset): Plugin {
   return {
-    name: "hra-appearance-asset",
+    name: "oompa-appearance-asset",
     async buildStart() {
       await appearance.verifyInputs();
       this.emitFile({
@@ -29,7 +29,7 @@ function appearanceAssetPlugin(rootDirectory: string, appearance: HraAppearanceA
 export function appProductionConfig(
   rootDirectory: string,
   generation: StylexGenerationHandleV1,
-  appearance: HraAppearanceAsset,
+  appearance: OompaAppearanceAsset,
 ): InlineConfig {
   return {
     // The public adapter owns root, input, outDir, assetsInlineLimit: 0, publicDir,
@@ -48,7 +48,7 @@ export function appProductionConfig(
 export function appDevelopmentConfig(
   rootDirectory: string,
   generation: StylexGenerationHandleV1,
-  appearance: HraAppearanceAsset,
+  appearance: OompaAppearanceAsset,
 ): InlineConfig {
   return {
     build: { minify: false, target: "es2022" },

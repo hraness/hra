@@ -233,7 +233,7 @@ const pendingInteractionCommands = (
 ): readonly string[] => {
   const binding = `${interaction.id} --revision ${String(interaction.revision)}`;
   const show = commandStyle === "cli"
-    ? `  Show: hra interaction show ${interaction.id}`
+    ? `  Show: oompa interaction show ${interaction.id}`
     : `  Show: /interaction show ${interaction.id}`;
   if (interaction.guidance === "show_only") {
     return [
@@ -245,7 +245,7 @@ const pendingInteractionCommands = (
   const decisionCommands = (decisions: readonly ("once" | "session" | "decline" | "cancel")[]): readonly string[] =>
     decisions.map((decision) => {
       if (commandStyle === "cli") {
-        return `  ${decision === "once" ? "Approve once" : decision === "session" ? "Approve for session" : decision === "decline" ? "Decline" : "Cancel"}: hra interaction decide ${binding} --decision ${decision}`;
+        return `  ${decision === "once" ? "Approve once" : decision === "session" ? "Approve for session" : decision === "decline" ? "Decline" : "Cancel"}: oompa interaction decide ${binding} --decision ${decision}`;
       }
       if (decision === "once") return `  Approve once: /approve ${binding}`;
       if (decision === "session") return `  Approve for session: /approve ${binding} --decision session`;
@@ -258,13 +258,13 @@ const pendingInteractionCommands = (
       case "command_approval":
         return [
           show,
-          `  Inspect authority: hra interaction inspect ${binding}`,
+          `  Inspect authority: oompa interaction inspect ${binding}`,
           ...decisionCommands(interaction.display.availableDecisions),
         ];
       case "file_change_approval":
         return [
           show,
-          "  File-change approval is disabled because HRA cannot display exact affected paths.",
+          "  File-change approval is disabled because Oompa cannot display exact affected paths.",
           ...decisionCommands(interaction.display.availableDecisions.filter(
             (decision) => decision === "decline" || decision === "cancel",
           )),
@@ -272,23 +272,23 @@ const pendingInteractionCommands = (
       case "permission_approval":
         return [
           show,
-          `  Inspect authority: hra interaction inspect ${binding}`,
+          `  Inspect authority: oompa interaction inspect ${binding}`,
           ...(interaction.display.requested.length === 0
             ? []
-            : [`  Grant selected permissions: hra interaction grant ${binding} --input-stdin`]),
-          `  Decline: hra interaction decide ${binding} --decision decline`,
+            : [`  Grant selected permissions: oompa interaction grant ${binding} --input-stdin`]),
+          `  Decline: oompa interaction decide ${binding} --decision decline`,
         ];
       case "user_input":
-        return [show, `  Answer: hra interaction answer ${binding} --input-stdin`];
+        return [show, `  Answer: oompa interaction answer ${binding} --input-stdin`];
       case "mcp_elicitation":
         if (interaction.display.mode !== "form" || interaction.display.fields === undefined) {
-          return [show, "  This MCP request cannot be resolved safely through HRA."];
+          return [show, "  This MCP request cannot be resolved safely through Oompa."];
         }
         return [
           show,
-          `  Accept: hra interaction submit ${binding} --action accept --input-stdin`,
-          `  Decline: hra interaction submit ${binding} --action decline`,
-          `  Cancel: hra interaction submit ${binding} --action cancel`,
+          `  Accept: oompa interaction submit ${binding} --action accept --input-stdin`,
+          `  Decline: oompa interaction submit ${binding} --action decline`,
+          `  Cancel: oompa interaction submit ${binding} --action cancel`,
         ];
     }
   }
@@ -302,7 +302,7 @@ const pendingInteractionCommands = (
     case "file_change_approval":
       return [
         show,
-        "  File-change approval is disabled because HRA cannot display exact affected paths.",
+        "  File-change approval is disabled because Oompa cannot display exact affected paths.",
         ...decisionCommands(interaction.display.availableDecisions.filter(
           (decision) => decision === "decline" || decision === "cancel",
         )),
@@ -320,7 +320,7 @@ const pendingInteractionCommands = (
       return [show, `  Answer: /answer ${binding}`];
     case "mcp_elicitation":
       if (interaction.display.mode !== "form" || interaction.display.fields === undefined) {
-        return [show, "  This MCP request cannot be resolved safely through HRA."];
+        return [show, "  This MCP request cannot be resolved safely through Oompa."];
       }
       return [
         show,
@@ -471,7 +471,7 @@ export const enumerateUnsettledSessionInteractions = async (input: Readonly<{
   let pageCount = 0;
   let itemCount = 0;
   const fail = (): never => {
-    throw new Error("HRA could not safely enumerate every pending interaction.");
+    throw new Error("Oompa could not safely enumerate every pending interaction.");
   };
   for (const interaction of initial) {
     if (sessionId === null) sessionId = interaction.sessionId;
@@ -503,7 +503,7 @@ export const enumerateUnsettledSessionInteractions = async (input: Readonly<{
     }
     if (raced.kind === "error") throw raced.error;
     if (!raced.value.ok) {
-      throw Object.assign(new Error("HRA could not enumerate current pending interactions."), {
+      throw Object.assign(new Error("Oompa could not enumerate current pending interactions."), {
         commandError: raced.value.error,
       });
     }
@@ -594,7 +594,7 @@ export class ShellLivePresenter {
         if (!this.#unknownDeltaNoticeWritten) {
           this.#unknownDeltaNoticeWritten = true;
           this.#emit(
-            "Live delta text omitted until HRA observes a trustworthy item-start boundary.",
+            "Live delta text omitted until Oompa observes a trustworthy item-start boundary.",
           );
         }
         return;
@@ -730,7 +730,7 @@ export class ShellLivePresenter {
     this.#trustedDeltaItems.clear();
     this.#deltaRedactionQuarantined = true;
     this.#emit(
-      "Live delta text paused because the bounded redaction state was exhausted. HRA will resume after a new item-start boundary or session reselection.",
+      "Live delta text paused because the bounded redaction state was exhausted. Oompa will resume after a new item-start boundary or session reselection.",
     );
   }
 
@@ -909,7 +909,7 @@ export class ShellLiveObserver {
       } catch {
         if (!signal.aborted) {
           this.#write(
-            "\nLive updates paused because HRA could not safely enumerate every pending interaction. Reselect the session to resume.\n",
+            "\nLive updates paused because Oompa could not safely enumerate every pending interaction. Reselect the session to resume.\n",
           );
         }
         return;
@@ -930,7 +930,7 @@ export class ShellLiveObserver {
         if (raced.kind === "error" || !raced.value.ok) {
           consecutiveFailures += 1;
           if (!failureNoticeWritten) {
-            this.#write("\nLive updates are temporarily unavailable; HRA is retrying in the background.\n");
+            this.#write("\nLive updates are temporarily unavailable; Oompa is retrying in the background.\n");
             failureNoticeWritten = true;
           }
           if (consecutiveFailures >= this.#retryLimit) {

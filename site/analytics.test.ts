@@ -6,44 +6,44 @@ import {
   isPostHogBrowserEligible,
 } from "@hraness/posthog/client";
 
-import { hraPostHogSite } from "./analytics-site.ts";
+import { oompaPostHogSite } from "./analytics-site.ts";
 
 const publicProjectToken = "phc_public_test_token";
 
-describe("hra.sh analytics boundary", () => {
-  test("classifies only canonical HRA routes without queries or fragments", () => {
-    expect(classifyAnalyticsRoute(hraPostHogSite, "https://hra.sh/"))
+describe("oompa.app analytics boundary", () => {
+  test("classifies only canonical Oompa routes without queries or fragments", () => {
+    expect(classifyAnalyticsRoute(oompaPostHogSite, "https://oompa.app/"))
       .toMatchObject({
         analytics_schema_version: 1,
-        canonical_domain: "hra.sh",
+        canonical_domain: "oompa.app",
         canonical_path: "/",
         content_group: "product",
         page_kind: "product_home",
-        site_id: "hra",
+        site_id: "oompa",
       });
     expect(classifyAnalyticsRoute(
-      hraPostHogSite,
-      "https://hra.sh/privacy/?token=private#account",
+      oompaPostHogSite,
+      "https://oompa.app/privacy/?token=private#account",
     )).toMatchObject({
       canonical_path: "/privacy",
       content_group: "legal",
       page_kind: "privacy",
     });
-    expect(classifyAnalyticsRoute(hraPostHogSite, "https://hra.sh/private/path"))
+    expect(classifyAnalyticsRoute(oompaPostHogSite, "https://oompa.app/private/path"))
       .toMatchObject({
         canonical_path: "/not-found",
         page_kind: "other",
       });
-    expect(classifyAnalyticsRoute(hraPostHogSite, "https://www.hra.sh/"))
+    expect(classifyAnalyticsRoute(oompaPostHogSite, "https://www.oompa.app/"))
       .toBeNull();
-    expect(classifyAnalyticsRoute(hraPostHogSite, "https://attacker.example/"))
+    expect(classifyAnalyticsRoute(oompaPostHogSite, "https://attacker.example/"))
       .toBeNull();
   });
 
-  test("is eligible only for an exact production hra.sh page and public token", () => {
+  test("is eligible only for an exact production oompa.app page and public token", () => {
     const evidence = {
-      hostname: "hra.sh",
-      href: "https://hra.sh/",
+      hostname: "oompa.app",
+      href: "https://oompa.app/",
       production: true,
       referrer: "",
     } as const;
@@ -51,22 +51,22 @@ describe("hra.sh analytics boundary", () => {
     expect(isPostHogBrowserEligible({
       apiKey: publicProjectToken,
       evidence,
-      site: hraPostHogSite,
+      site: oompaPostHogSite,
     })).toBe(true);
     expect(isPostHogBrowserEligible({
       apiKey: publicProjectToken,
-      evidence: { ...evidence, hostname: "hra-preview.vercel.app" },
-      site: hraPostHogSite,
+      evidence: { ...evidence, hostname: "oompa-preview.vercel.app" },
+      site: oompaPostHogSite,
     })).toBe(false);
     expect(isPostHogBrowserEligible({
       apiKey: publicProjectToken,
       evidence: { ...evidence, production: false },
-      site: hraPostHogSite,
+      site: oompaPostHogSite,
     })).toBe(false);
     expect(isPostHogBrowserEligible({
       apiKey: "not-a-project-token",
       evidence,
-      site: hraPostHogSite,
+      site: oompaPostHogSite,
     })).toBe(false);
   });
 
@@ -75,20 +75,20 @@ describe("hra.sh analytics boundary", () => {
       ["/docs", "docs_index"], ["/docs/start", "guide"], ["/docs/web", "guide"],
       ["/docs/sessions", "guide"], ["/docs/reference", "reference"], ["/docs/status", "status"],
     ] as const;
-    expect(hraPostHogSite.routes.map(({ path }) => path)).toEqual(["/", "/privacy", ...pages.map(([path]) => path)]);
+    expect(oompaPostHogSite.routes.map(({ path }) => path)).toEqual(["/", "/privacy", ...pages.map(([path]) => path)]);
     for (const [path, kind] of pages) {
-      expect(classifyAnalyticsRoute(hraPostHogSite, `https://hra.sh${path}/?token=private#local-account`)).toMatchObject({
+      expect(classifyAnalyticsRoute(oompaPostHogSite, `https://oompa.app${path}/?token=private#local-account`)).toMatchObject({
         canonical_path: path, page_kind: kind, content_group: "documentation",
       });
     }
     for (const path of ["/docs/private", "/docs/start/private", "/examples/app/", "/examples/app/index.html?view=settings", "/preview/"]) {
-      expect(classifyAnalyticsRoute(hraPostHogSite, `https://hra.sh${path}`)).toMatchObject({ canonical_path: "/not-found", page_kind: "other" });
+      expect(classifyAnalyticsRoute(oompaPostHogSite, `https://oompa.app${path}`)).toMatchObject({ canonical_path: "/not-found", page_kind: "other" });
     }
   });
 
   test("uses anonymous cookieless memory state with invasive capture disabled", () => {
-    const config = createPostHogBrowserConfig(hraPostHogSite, {
-      href: "https://hra.sh/",
+    const config = createPostHogBrowserConfig(oompaPostHogSite, {
+      href: "https://oompa.app/",
       referrer: "https://www.google.com/search?q=private",
     });
 

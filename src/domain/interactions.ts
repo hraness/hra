@@ -53,7 +53,7 @@ export type InteractionDecision = z.infer<typeof interactionDecisionSchema>;
  * Per-session and daemon-default answering policy for brokered protocol
  * approvals. `auto:all` autoresponds command and permission approvals;
  * `auto:workspace` escalates both until their exact provider authority can be
- * proved workspace-local. File changes remain local because HRA cannot show
+ * proved workspace-local. File changes remain local because Oompa cannot show
  * their exact affected paths. `manual` never autoresponds.
  */
 export const approvalModeSchema = z.enum(["auto:all", "auto:workspace", "manual"]);
@@ -84,7 +84,7 @@ export type InteractionIntendedTerminalState = z.infer<
   typeof interactionIntendedTerminalStateSchema
 >;
 
-/** HRA never leaves an admitted provider callback pending longer than 30 minutes. */
+/** Oompa never leaves an admitted provider callback pending longer than 30 minutes. */
 export const INTERACTION_MAX_PENDING_MS = 30 * 60 * 1_000;
 
 const providerInteractionAuthorityFields = {
@@ -604,7 +604,7 @@ export function computeInteractionPresentation(display: InteractionDisplay): Int
       const lines: string[] = [];
       if (display.grantRoot !== null) lines.push(`Grant root: ${display.grantRoot}`);
       if (display.reason !== null) lines.push(`Reason: ${display.reason}`);
-      lines.push("HRA cannot show the exact affected paths for this provider version.");
+      lines.push("Oompa cannot show the exact affected paths for this provider version.");
       return {
         label: "File change approval",
         glyph: "file-edit",

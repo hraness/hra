@@ -13,14 +13,14 @@ tags:
 
 ## Outcome
 
-Attention email uses its own strict `HRA_ATTENTION_RESEND_API_KEY`. It never
+Attention email uses its own strict `OOMPA_ATTENTION_RESEND_API_KEY`. It never
 falls back to the sign-in credential or accepts the same value. A missing,
 malformed, or shared credential stops the production drain before it claims
 an outbox attempt. Sign-in email keeps its existing credential and behavior.
 
 ## Context
 
-The existing attention transport reads `HRA_RESEND_API_KEY`, which also sends
+The existing attention transport reads `OOMPA_RESEND_API_KEY`, which also sends
 sign-in codes. Its drain claims an attempt before the transport checks that
 configuration, so a configuration refusal is recorded as a retryable network
 failure. The [hosted runbook](../../docs/hosted-sync.md) also needs to distinguish

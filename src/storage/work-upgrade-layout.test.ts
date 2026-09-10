@@ -25,7 +25,7 @@ const snapshot = (database: Database) => ({
 });
 
 test("retains the exact Work table layout produced by a canonical30 upgrade", async () => {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-work-upgrade-layout-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-work-upgrade-layout-")));
   let store: StateStore | undefined;
   let actual: Database | undefined;
   let reference: Database | undefined;

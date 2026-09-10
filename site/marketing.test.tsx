@@ -35,7 +35,7 @@ describe("public server marketing composition", () => {
       expect(links.filter((link) => link.getAttribute("aria-current") === "page").map((link) => link.textContent))
         .toEqual(currentPath === "/" ? ["Product"] : currentPath.startsWith("/docs/") ? ["Docs"] : []);
       expect(header?.querySelector(".hraness-marketing-header__actions > a")?.getAttribute("href")).toBe(publicContent.links.app);
-      expect(header?.querySelector(".hraness-marketing-header__actions > a")?.textContent).toBe("Open HRA");
+      expect(header?.querySelector(".hraness-marketing-header__actions > a")?.textContent).toBe("Open Oompa");
       expect(document.querySelector("[style], style, script")).toBeNull();
     }
   });
@@ -51,7 +51,7 @@ describe("public server marketing composition", () => {
     expect(html).not.toContain(publicContent.installCommand);
     expect(html).not.toContain(publicContent.initCommand);
     expect(document.querySelector("[style], style, script")).toBeNull();
-    expect(document.querySelector("h1")?.id).toBe("hra-title");
+    expect(document.querySelector("h1")?.id).toBe("oompa-title");
     expect(document.querySelector("h1")?.textContent).toBe(publicContent.hero.heading);
     expect(document.querySelectorAll("h1")).toHaveLength(1);
     const heroClasses = classNames(document.querySelector('[data-hraness-marketing="hero"]')?.className);
@@ -138,7 +138,7 @@ describe("public server marketing composition", () => {
     ]);
     expect(actionsAt(".hraness-marketing-cta__actions > a")).toEqual([
       ["/docs/start/", "Set up your first machine", "primary"],
-      [publicContent.links.app, "Open HRA", "secondary"],
+      [publicContent.links.app, "Open Oompa", "secondary"],
     ]);
     expect(textAt(".hraness-marketing-cta__summary")).toBe("The setup guide starts with the admitted predecessor and this candidate's unavailable install command. Wait for exact artifact admission and the capacity rollout prerequisites before starting a new machine.");
     expect(textAt(".hraness-marketing-cta__footnote")).toBe(publicContent.hero.boundary);

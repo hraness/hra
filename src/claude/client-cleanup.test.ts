@@ -45,7 +45,7 @@ test.each(["turnStarted", "providerError"] as const)(
     const observerGate = new Promise<void>((resolve) => { releaseObserver = resolve; });
     const client = new ClaudeStreamClient({
       process: child.process,
-      configDir: "/var/hra/profiles/synthetic/claude",
+      configDir: "/var/oompa/profiles/synthetic/claude",
       shutdownSettlementMs: 10,
       onFact: async (fact) => {
         facts.push(fact);
@@ -130,7 +130,7 @@ test.each(["turnStarted", "providerError"] as const)(
     });
     const client = new ClaudeStreamClient({
       process: child.process,
-      configDir: "/var/hra/profiles/synthetic/claude",
+      configDir: "/var/oompa/profiles/synthetic/claude",
       shutdownSettlementMs: 10,
       onFact: async (fact) => {
         facts.push(fact);

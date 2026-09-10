@@ -8,7 +8,7 @@ import type { ProviderAccountAuthority } from "../domain/provider-accounts";
 
 /**
  * One Claude fact with the session identity the runtime manager binds to it.
- * The bridge itself knows nothing about HRA sessions, so the manager stamps
+ * The bridge itself knows nothing about Oompa sessions, so the manager stamps
  * the provider thread and the exact connection generation onto every fact.
  */
 export type ClaudeSessionFact = ClaudeFact & {
@@ -376,7 +376,7 @@ export class ClaudeSessionFactTranslator {
         return { connectionId, method: fact.event, type: "protocolNotice" };
       // The turn summary's exact runtime and result text reach the projection
       // through `readSession`, not the event stream; the rate-limit line names
-      // no Codex usage counter HRA could refresh.
+      // no Codex usage counter Oompa could refresh.
       case "turnSummary":
       case "rateLimitObserved":
       case "usageAccountingObserved":

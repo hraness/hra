@@ -154,7 +154,7 @@ function staticSiteFixture(sanitized = false) {
   const fontPaths = fontNames.map((path, index) => `graphs/foundation/assets/${path.split("/").at(-1)!.replace(".woff2", `-testhash${index}.woff2`).replace("[wght]", sanitized ? "_wght_" : "[wght]")}`);
   const css = fontPaths.map((path, index) => `@font-face{font-family:"Fixture ${index}";src:url("./${path.split("/").at(-1)}") format("woff2")}`).join("");
   const appearance = '<script src="/appearance.js"></script>';
-  const menu = '<header><details data-hra-appearance><summary>Appearance</summary></details></header>';
+  const menu = '<header><details data-oompa-appearance><summary>Appearance</summary></details></header>';
   const html = Buffer.from(`<!doctype html><html data-palette="catppuccin" data-theme="dark"><head><link rel="stylesheet" href="/${foundation}"><link rel="stylesheet" href="/stylex.css">${appearance}</head><body>${menu}<h1 class="x123">Fixture</h1></body></html>`);
   const inertHtml = Buffer.from(html.toString().replace(appearance, "").replace(menu, ""));
   const files = new Map<string, Buffer>([
@@ -164,7 +164,7 @@ function staticSiteFixture(sanitized = false) {
     [foundation, Buffer.from(css)], ["stylex.css", Buffer.from("@layer components.hraness-stylex{.x123{font-size:40px}}")],
     ...fontPaths.map((path, index) => [path, Buffer.from(`public:${fontNames[index]}`)] as const),
     ...["analytics.js", "appearance.js", "site.js", "favicon.svg", "social-card.svg", "social-card.png", "robots.txt", "sitemap.xml", "llms.txt",
-      ".well-known/security.txt", ".well-known/hra.json", "fonts/nebula-sans/LICENSE.txt", "fonts/nebula-sans/PROVENANCE.md",
+      ".well-known/security.txt", ".well-known/oompa.json", "fonts/nebula-sans/LICENSE.txt", "fonts/nebula-sans/PROVENANCE.md",
       "fonts/geist-mono/OFL.txt", "fonts/geist-mono/PROVENANCE.md", ...docsRoutes.map((path) => `${path}/index.md`)].map((path) => [path, Buffer.from(`support:${path}`)] as const),
   ]);
   return { files, publicFonts, foundation, fontPaths, css, html };
@@ -178,7 +178,7 @@ describe("static site graph acceptance", () => {
         (html: string) => html.replace('src="/appearance.js"', 'defer src="/appearance.js"'),
         (html: string) => html.replace('data-palette="catppuccin"', 'data-palette="other"'),
         (html: string) => html.replace('data-theme="dark"', 'data-theme="light"'),
-        (html: string) => html.replace("data-hra-appearance", "data-unbound-appearance"),
+        (html: string) => html.replace("data-oompa-appearance", "data-unbound-appearance"),
       ]) {
         const fixture = staticSiteFixture();
         fixture.files.set(path, Buffer.from(mutate(fixture.html.toString())));
@@ -727,7 +727,7 @@ describe("browser acceptance boundaries", () => {
     }
   });
   test("hashes executable bytes separately and rejects linked or nonexecutable files", async () => {
-    const root = await mkdtemp(join(tmpdir(), "hra-browser-executable-test-"));
+    const root = await mkdtemp(join(tmpdir(), "oompa-browser-executable-test-"));
     try {
       const path = join(root, "browser");
       const bytes = "#!/bin/sh\nexit 0\n";

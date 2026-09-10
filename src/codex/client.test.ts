@@ -1,16 +1,16 @@
 import { describe, expect, jest, spyOn, test } from "bun:test";
 
-import { HRA_VERSION } from "../version.ts";
+import { OOMPA_VERSION } from "../version.ts";
 import { CodexAppServerClient, type CodexAppServerClientOptions } from "./client.ts";
 import { CodexError } from "./errors.ts";
 import type { CodexProcess } from "./process.ts";
 import {
-  HRA_HOST_DYNAMIC_TOOLS,
-  HRA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS,
+  OOMPA_HOST_DYNAMIC_TOOLS,
+  OOMPA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS,
   type CodexAuthority,
   type CodexFact,
   type FencedCodexValue,
-  type HraHostToolCall,
+  type OompaHostToolCall,
 } from "./protocol.ts";
 
 const CONNECTION_ID = "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b";
@@ -65,7 +65,7 @@ const conversationAutomationParams = (argumentsValue: unknown = {
   threadId: "thread-1",
   turnId: "turn-1",
   callId: "call-1",
-  namespace: "hra",
+  namespace: "oompa",
   tool: "automation_update",
   arguments: argumentsValue,
 });
@@ -286,8 +286,8 @@ describe("CodexAppServerClient", () => {
       } else if (message.method === "config/read") {
         expect(message.params).toEqual({
           cwd: configReads === 0
-            ? "/private/tmp/hra-acceptance/project-a"
-            : "/private/tmp/hra-acceptance/project-b",
+            ? "/private/tmp/oompa-acceptance/project-a"
+            : "/private/tmp/oompa-acceptance/project-b",
           includeLayers: false,
         });
         configReads += 1;
@@ -308,7 +308,7 @@ describe("CodexAppServerClient", () => {
       authority: codexAuthority(7),
       credentialStorePreflight: {
         cliAuth: "file",
-        cwd: "/private/tmp/hra-acceptance/project-a",
+        cwd: "/private/tmp/oompa-acceptance/project-a",
         mcpOauth: "file",
       },
       expectedCodexHome: codexHome,
@@ -319,13 +319,13 @@ describe("CodexAppServerClient", () => {
       authority: codexAuthority(7),
     });
     await expect(client.assertCredentialStores(
-      "/private/tmp/hra-acceptance/project-b",
+      "/private/tmp/oompa-acceptance/project-b",
     )).resolves.toBeUndefined();
     expect(process.writes).toContainEqual({
       id: 2,
       method: "config/read",
       params: {
-        cwd: "/private/tmp/hra-acceptance/project-a",
+        cwd: "/private/tmp/oompa-acceptance/project-a",
         includeLayers: false,
       },
     });
@@ -443,7 +443,7 @@ describe("CodexAppServerClient", () => {
       authority: codexAuthority(7),
       credentialStorePreflight: {
         cliAuth: "file",
-        cwd: "/private/tmp/hra-acceptance/project-a",
+        cwd: "/private/tmp/oompa-acceptance/project-a",
         mcpOauth: "file",
       },
       expectedCodexHome: codexHome,
@@ -489,7 +489,7 @@ describe("CodexAppServerClient", () => {
       authority: codexAuthority(7),
       credentialStorePreflight: {
         cliAuth: "file",
-        cwd: "/private/tmp/hra-acceptance/project-a",
+        cwd: "/private/tmp/oompa-acceptance/project-a",
         mcpOauth: "file",
       },
       expectedCodexHome: codexHome,
@@ -521,7 +521,7 @@ describe("CodexAppServerClient", () => {
       id: 91,
       error: {
         code: -32_001,
-        message: "HRA has not activated this provider connection",
+        message: "Oompa has not activated this provider connection",
       },
     });
   });
@@ -566,7 +566,7 @@ describe("CodexAppServerClient", () => {
       authority: codexAuthority(7),
       credentialStorePreflight: {
         cliAuth: "file",
-        cwd: "/private/tmp/hra-acceptance/project-a",
+        cwd: "/private/tmp/oompa-acceptance/project-a",
         mcpOauth: "file",
       },
       expectedCodexHome: codexHome,
@@ -1064,7 +1064,7 @@ describe("CodexAppServerClient", () => {
       id: configRequestId,
       error: {
         code: -32_001,
-        message: "HRA has not activated this provider connection",
+        message: "Oompa has not activated this provider connection",
       },
     });
     await client.close();
@@ -1222,7 +1222,7 @@ describe("CodexAppServerClient", () => {
       id: 1,
       method: "initialize",
       params: {
-        clientInfo: { name: "hra", title: "HRA", version: HRA_VERSION },
+        clientInfo: { name: "oompa", title: "Oompa", version: OOMPA_VERSION },
         capabilities: {
           experimentalApi: false,
           extensions: { "openai/standard-form-input": {} },
@@ -1261,7 +1261,7 @@ describe("CodexAppServerClient", () => {
   test("accepts the pinned desktop user agent and rejects protocol version drift", async () => {
     const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
     const pinned = createClient({
-      process: successfulFake(codexHome, "Codex Desktop/0.153.2 (Mac OS 26.5; arm64) dumb (hra; 0.6.1)"),
+      process: successfulFake(codexHome, "Codex Desktop/0.153.2 (Mac OS 26.5; arm64) dumb (oompa; 0.6.1)"),
       authority: codexAuthority(1),
       expectedCodexHome: codexHome,
       isAuthorityCurrent: () => true,
@@ -1334,7 +1334,7 @@ describe("CodexAppServerClient", () => {
       id: 900,
       error: {
         code: -32_601,
-        message: "HRA does not support this server request",
+        message: "Oompa does not support this server request",
       },
     });
     await client.close();
@@ -1360,13 +1360,13 @@ describe("CodexAppServerClient", () => {
     expect(() => createClient({
       ...base,
       process: successfulFake(codexHome),
-      onHraHostToolCall: async () => ({ scope: "session" }),
-    })).toThrow("HRA host tools require paired call and response-written callbacks");
+      onOompaHostToolCall: async () => ({ scope: "session" }),
+    })).toThrow("Oompa host tools require paired call and response-written callbacks");
     expect(() => createClient({
       ...base,
       process: successfulFake(codexHome),
-      onHraHostToolResponseWritten: () => undefined,
-    })).toThrow("HRA host tools require paired call and response-written callbacks");
+      onOompaHostToolResponseWritten: () => undefined,
+    })).toThrow("Oompa host tools require paired call and response-written callbacks");
   });
 
   test("routes the exact conversation automation tool and wakes only after the response write", async () => {
@@ -1435,7 +1435,7 @@ describe("CodexAppServerClient", () => {
     await client.close();
   });
 
-  test("routes every admitted dynamic tool through the generic HRA callback", async () => {
+  test("routes every admitted dynamic tool through the generic Oompa callback", async () => {
     const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
     const calls: unknown[] = [];
     const written: unknown[] = [];
@@ -1446,11 +1446,11 @@ describe("CodexAppServerClient", () => {
       experimentalApi: true,
       isAuthorityCurrent: () => true,
       connectionId: CONNECTION_ID,
-      onHraHostToolCall: async (call) => {
+      onOompaHostToolCall: async (call) => {
         calls.push(call);
         return { accepted: true, tool: call.tool };
       },
-      onHraHostToolResponseWritten: (call) => {
+      onOompaHostToolResponseWritten: (call) => {
         written.push(call);
       },
     });
@@ -1462,7 +1462,7 @@ describe("CodexAppServerClient", () => {
         threadId: "thread-1",
         turnId: "turn-1",
         callId: "call-2",
-        namespace: "hra",
+        namespace: "oompa",
         tool: "session_message",
         arguments: {
           sessionId: `sess_${"a".repeat(32)}`,
@@ -1502,9 +1502,9 @@ describe("CodexAppServerClient", () => {
     const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
     const handlerGate = deferred<undefined>();
     const completionGate = deferred<undefined>();
-    const calls: HraHostToolCall[] = [];
+    const calls: OompaHostToolCall[] = [];
     const liveAtAdmission: boolean[] = [];
-    const written: HraHostToolCall[] = [];
+    const written: OompaHostToolCall[] = [];
     let completionObserverEntered = false;
     let markerObserved = false;
     const client = createClient({
@@ -1514,13 +1514,13 @@ describe("CodexAppServerClient", () => {
       experimentalApi: true,
       isAuthorityCurrent: () => true,
       connectionId: CONNECTION_ID,
-      onHraHostToolCall: async (call) => {
+      onOompaHostToolCall: async (call) => {
         calls.push(call);
-        liveAtAdmission.push(client.hasLiveHraHostToolCall(call));
+        liveAtAdmission.push(client.hasLiveOompaHostToolCall(call));
         await handlerGate.promise;
         return { accepted: true };
       },
-      onHraHostToolResponseWritten: (call) => { written.push(call); },
+      onOompaHostToolResponseWritten: (call) => { written.push(call); },
       onFact: async ({ value }) => {
         if (value.type === "turnCompleted" && value.threadId === "thread-1") {
           completionObserverEntered = true;
@@ -1568,16 +1568,16 @@ describe("CodexAppServerClient", () => {
     const second = calls[1];
     if (first === undefined || second === undefined) throw new Error("Missing host-tool calls.");
     expect(liveAtAdmission).toEqual([true, true]);
-    expect(client.hasLiveHraHostToolCall(first)).toBe(true);
-    expect(client.hasLiveHraHostToolCall(second)).toBe(true);
+    expect(client.hasLiveOompaHostToolCall(first)).toBe(true);
+    expect(client.hasLiveOompaHostToolCall(second)).toBe(true);
     for (const changedAuthority of [
       { ...first.authority, bindingGeneration: first.authority.bindingGeneration + 1 },
       { ...first.authority, providerAccountId: `acct_${"f".repeat(32)}` },
       { ...first.authority, provider: "claude" as const },
     ]) {
-      expect(client.hasLiveHraHostToolCall({ ...first, authority: changedAuthority })).toBe(false);
+      expect(client.hasLiveOompaHostToolCall({ ...first, authority: changedAuthority })).toBe(false);
     }
-    expect(client.hasLiveHraHostToolCall({
+    expect(client.hasLiveOompaHostToolCall({
       ...first,
       requestDigest: "f".repeat(64),
     })).toBe(false);
@@ -1587,8 +1587,8 @@ describe("CodexAppServerClient", () => {
       params: { threadId: "thread-1", turn: rawTurn("turn-1", "completed") },
     });
     await waitFor(() => completionObserverEntered);
-    expect(client.hasLiveHraHostToolCall(first)).toBe(false);
-    expect(client.hasLiveHraHostToolCall(second)).toBe(true);
+    expect(client.hasLiveOompaHostToolCall(first)).toBe(false);
+    expect(client.hasLiveOompaHostToolCall(second)).toBe(true);
     completionGate.resolve(undefined);
 
     process.respond({
@@ -1619,7 +1619,7 @@ describe("CodexAppServerClient", () => {
     const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
     const oldHandlerGate = deferred<undefined>();
     const replacementHandlerGate = deferred<undefined>();
-    const calls: HraHostToolCall[] = [];
+    const calls: OompaHostToolCall[] = [];
     const client = createClient({
       process,
       authority: codexAuthority(7),
@@ -1627,7 +1627,7 @@ describe("CodexAppServerClient", () => {
       experimentalApi: true,
       isAuthorityCurrent: () => true,
       connectionId: CONNECTION_ID,
-      onHraHostToolCall: async (call) => {
+      onOompaHostToolCall: async (call) => {
         calls.push(call);
         if (call.requestId.type !== "string") throw new Error("Expected a string request id.");
         await (call.requestId.value === "old-request"
@@ -1635,7 +1635,7 @@ describe("CodexAppServerClient", () => {
           : replacementHandlerGate.promise);
         return { accepted: true };
       },
-      onHraHostToolResponseWritten: () => undefined,
+      onOompaHostToolResponseWritten: () => undefined,
     });
     await client.initialize();
     const params = conversationAutomationParams();
@@ -1650,11 +1650,11 @@ describe("CodexAppServerClient", () => {
     const replacement = calls[1];
     if (replacement === undefined) throw new Error("Missing replacement host-tool call.");
     expect(replacement.requestId).toEqual({ type: "string", value: "replacement-request" });
-    expect(client.hasLiveHraHostToolCall(replacement)).toBe(true);
+    expect(client.hasLiveOompaHostToolCall(replacement)).toBe(true);
 
     oldHandlerGate.resolve(undefined);
     for (let index = 0; index < 4; index += 1) await Promise.resolve();
-    expect(client.hasLiveHraHostToolCall(replacement)).toBe(true);
+    expect(client.hasLiveOompaHostToolCall(replacement)).toBe(true);
     expect(process.writes.some((frame) =>
       (frame as { id?: unknown }).id === "old-request")).toBe(false);
 
@@ -1671,7 +1671,7 @@ describe("CodexAppServerClient", () => {
     const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
     const handlerGate = deferred<undefined>();
     let accountAuthoritySignaled = false;
-    let call: HraHostToolCall | undefined;
+    let call: OompaHostToolCall | undefined;
     let postWriteCalls = 0;
     const client = createClient({
       process,
@@ -1684,12 +1684,12 @@ describe("CodexAppServerClient", () => {
         accountAuthoritySignaled = true;
         return Promise.reject(new Error("injected account refresh rejection"));
       },
-      onHraHostToolCall: async (input) => {
+      onOompaHostToolCall: async (input) => {
         call = input;
         await handlerGate.promise;
         return { accepted: true };
       },
-      onHraHostToolResponseWritten: () => { postWriteCalls += 1; },
+      onOompaHostToolResponseWritten: () => { postWriteCalls += 1; },
     });
     await client.initialize();
     process.respond({
@@ -1698,9 +1698,9 @@ describe("CodexAppServerClient", () => {
       params: conversationAutomationParams(),
     });
     await waitFor(() => call !== undefined);
-    if (call === undefined) throw new Error("Missing HRA host-tool call.");
+    if (call === undefined) throw new Error("Missing Oompa host-tool call.");
     const retainedCall = call;
-    expect(client.hasLiveHraHostToolCall(retainedCall)).toBe(true);
+    expect(client.hasLiveOompaHostToolCall(retainedCall)).toBe(true);
 
     process.respond({
       method: "account/updated",
@@ -1708,7 +1708,7 @@ describe("CodexAppServerClient", () => {
     });
     await waitFor(() => accountAuthoritySignaled);
     handlerGate.resolve(undefined);
-    await waitFor(() => !client.hasLiveHraHostToolCall(retainedCall));
+    await waitFor(() => !client.hasLiveOompaHostToolCall(retainedCall));
 
     expect(client.state).toBe("ready");
     expect(postWriteCalls).toBe(0);
@@ -1994,7 +1994,7 @@ describe("CodexAppServerClient", () => {
       (frame as { id?: unknown }).id === "tool-disabled"));
     expect(process.writes.at(-1)).toEqual({
       id: "tool-disabled",
-      error: { code: -32_601, message: "HRA did not advertise this host service" },
+      error: { code: -32_601, message: "Oompa did not advertise this host service" },
     });
     expect(calls).toBe(0);
     await client.close();
@@ -2033,7 +2033,7 @@ describe("CodexAppServerClient", () => {
     await client.close();
     expect(client.state).toBe("closed");
     expect(diagnostics).toContain(
-      "HRA dynamic-tool handling did not settle after Codex termination",
+      "Oompa dynamic-tool handling did not settle after Codex termination",
     );
     handlerGate.resolve(undefined);
     await Bun.sleep(1);
@@ -2092,7 +2092,7 @@ describe("CodexAppServerClient", () => {
       (frame as { id?: unknown }).id === 949));
     expect(process.writes.at(-1)).toEqual({
       id: 949,
-      error: { code: -32_601, message: "HRA did not advertise this host service" },
+      error: { code: -32_601, message: "Oompa did not advertise this host service" },
     });
     expect(calls).toBe(0);
     expect(JSON.stringify({ writes: process.writes, diagnostics })).not.toContain("PRIVATE_");
@@ -2130,7 +2130,7 @@ describe("CodexAppServerClient", () => {
         result: {
           contentItems: [{
             type: "inputText",
-            text: "HRA could not complete this conversation-bound scheduled task request.",
+            text: "Oompa could not complete this conversation-bound scheduled task request.",
           }],
           success: false,
         },
@@ -2282,7 +2282,7 @@ describe("CodexAppServerClient", () => {
       id: 901,
       error: {
         code: -32_601,
-        message: "HRA cannot broker this server request capability",
+        message: "Oompa cannot broker this server request capability",
         data: { code: "UNSUPPORTED_CAPABILITY" },
       },
     });
@@ -2367,7 +2367,7 @@ describe("CodexAppServerClient", () => {
         id: 910 + index,
         error: {
           code: -32_601,
-          message: "HRA cannot broker this server request capability",
+          message: "Oompa cannot broker this server request capability",
           data: { code: "UNSUPPORTED_CAPABILITY" },
         },
       });
@@ -2603,7 +2603,7 @@ describe("CodexAppServerClient", () => {
       .resolves.toEqual({ responseWritten: true });
     expect(process.writes.at(-1)).toEqual({
       id: "deadline-request",
-      error: { code: -32_008, message: "HRA interaction deadline expired" },
+      error: { code: -32_008, message: "Oompa interaction deadline expired" },
     });
     process.respond({
       method: "serverRequest/resolved",
@@ -2665,7 +2665,7 @@ describe("CodexAppServerClient", () => {
       .resolves.toEqual({ responseWritten: true });
     expect(process.writes.at(-1)).toEqual({
       id: 72,
-      error: { code: -32_008, message: "HRA interaction deadline expired" },
+      error: { code: -32_008, message: "Oompa interaction deadline expired" },
     });
     await client.close();
   });
@@ -3962,15 +3962,15 @@ describe("CodexAppServerClient", () => {
       expectedCodexHome: codexHome,
       experimentalApi: true,
       isAuthorityCurrent: () => true,
-      onHraHostToolCall: async () => ({ scope: "conversation" }),
-      onHraHostToolResponseWritten: () => undefined,
+      onOompaHostToolCall: async () => ({ scope: "conversation" }),
+      onOompaHostToolResponseWritten: () => undefined,
     });
     await client.initialize();
     const request = {
       cwd: "/workspace/project",
       ...(hostCapabilities === "historical_v1"
         ? { hostCapabilities }
-        : { developerInstructions: "Static HRA preamble." }),
+        : { developerInstructions: "Static Oompa preamble." }),
       preset: { alias: "high", model: "gpt-5.6-sol", effort: "max", serviceTier: null, fast: false },
       policy: { review: "auto_review", permissionProfile: ":workspace", writableRoots: ["/workspace/project"] },
     } as const;
@@ -3997,11 +3997,11 @@ describe("CodexAppServerClient", () => {
         approvalPolicy: "on-request",
         approvalsReviewer: "auto_review",
         config: { model_reasoning_effort: "max" },
-        ...(hostCapabilities === "historical_v1" ? {} : { developerInstructions: "Static HRA preamble." }),
+        ...(hostCapabilities === "historical_v1" ? {} : { developerInstructions: "Static Oompa preamble." }),
         ephemeral: false,
         historyMode: "paginated",
         dynamicTools: hostCapabilities === "historical_v1"
-          ? HRA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS : HRA_HOST_DYNAMIC_TOOLS,
+          ? OOMPA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS : OOMPA_HOST_DYNAMIC_TOOLS,
       },
     });
     await client.close();
@@ -4040,7 +4040,7 @@ describe("CodexAppServerClient", () => {
     await client.initialize();
     await expect(client.startThread({
       cwd: "/workspace/project",
-      developerInstructions: "Static HRA preamble.",
+      developerInstructions: "Static Oompa preamble.",
       preset: { alias: "high", model: "gpt-5.6-sol", effort: "max", serviceTier: null, fast: false },
       policy: { review: "auto_review", permissionProfile: ":workspace", writableRoots: ["/workspace/project"] },
     })).rejects.toMatchObject({ code: "INDETERMINATE_EFFECT", operation: "thread/start" });
@@ -4092,13 +4092,13 @@ describe("CodexAppServerClient", () => {
       onConversationAutomationToolResponseWritten: () => undefined,
     });
     await client.initialize();
-    await client.resumeThread("thread-legacy", "Static HRA preamble.");
+    await client.resumeThread("thread-legacy", "Static Oompa preamble.");
     expect(process.writes.at(-1)).toEqual({
       id: 3,
       method: "thread/resume",
       params: {
         threadId: "thread-legacy",
-        developerInstructions: "Static HRA preamble.",
+        developerInstructions: "Static Oompa preamble.",
       },
     });
     await client.resumeThread("thread-legacy");

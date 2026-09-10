@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { sha256Hex } from "../hra/cloud";
+import { sha256Hex } from "../oompa/cloud";
 import {
   newConnectionId,
   nextPresenceSequence,

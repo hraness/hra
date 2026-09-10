@@ -22,7 +22,7 @@ const captures = [
   { name: "retired-provider retained authority", bytes: combined49RetiredDatabaseBytes },
 ] as const;
 const openFixture = async (bytes: Uint8Array, readonly = false): Promise<Database> => {
-  const root = await mkdtemp(join(tmpdir(), "hra-combined49-adoption-schema-"));
+  const root = await mkdtemp(join(tmpdir(), "oompa-combined49-adoption-schema-"));
   roots.push(root);
   const path = join(root, "state.sqlite");
   await writeFile(path, bytes, { mode: 0o600 });

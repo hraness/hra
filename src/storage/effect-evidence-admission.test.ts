@@ -101,7 +101,7 @@ const withEffectFixture = async (
     staged: ReturnType<typeof stageEffect>;
   }) => Promise<void>,
 ): Promise<void> => {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-effect-evidence-admission-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-effect-evidence-admission-")));
   let store: StateStore | undefined;
   let database: Database | undefined;
   try {
@@ -341,7 +341,7 @@ for (const corrupt of [false, true]) {
     expect(fixture.sourceRevision).toBe("576ccd76a6742cd62759ab6176a6a41844846daa");
     const bytes = canonical41TimestampsDatabaseBytes();
     expect(hash(bytes)).toBe("ad4842496d9ee5f8d51210ef9a99e255d76e6c42505cc3f6e996c919b2caa106");
-    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-canonical41-effect-admission-")));
+    const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-canonical41-effect-admission-")));
     let database: Database | undefined;
     let store: StateStore | undefined;
     try {

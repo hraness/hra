@@ -59,7 +59,7 @@ export async function resolvePinnedCodexRuntime(
   if (name !== "@openai/codex" || version !== PINNED_CODEX_VERSION) {
     throw new CodexError(
       "RUNTIME_MISMATCH",
-      `HRA requires @openai/codex ${PINNED_CODEX_VERSION}`,
+      `Oompa requires @openai/codex ${PINNED_CODEX_VERSION}`,
     );
   }
 

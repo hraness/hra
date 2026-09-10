@@ -6,7 +6,7 @@ import { ClaudeStreamClient } from "./client";
 import { ClaudeError, IndeterminateClaudeEffectError } from "./errors";
 import type { ClaudeProcess, ClaudeProcessIdentity } from "./process";
 
-const CONFIG_DIR = "/var/hra/profiles/acct/claude";
+const CONFIG_DIR = "/var/oompa/profiles/acct/claude";
 
 /**
  * A deterministic in-memory stand-in for the pinned `claude` process. Every

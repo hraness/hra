@@ -8,8 +8,8 @@ import {
 } from "@hraness/site-footer";
 
 import {
-  buildHraGlobalInstallCommand,
-  HRA_INSTALL_PREFLIGHT_SOURCE_URL,
+  buildOompaGlobalInstallCommand,
+  OOMPA_INSTALL_PREFLIGHT_SOURCE_URL,
 } from "../src/install-preflight";
 import { helpGroupNames, usageForGroup } from "../src/cli/parser";
 import packageJson from "../package.json";
@@ -28,10 +28,10 @@ import {
 } from "./content.ts";
 import { docsPages, docsPathForSection, docsPaths, findDocsPage, renderDocsMarkdown, type DocsPath } from "./docs-content.ts";
 import {
-  HRA_MAILING_TURNSTILE_SITEKEY_ENV,
-  hraMailingListConfig,
-  renderHraAnalyticsScript,
-  renderHraSiteFooter,
+  OOMPA_MAILING_TURNSTILE_SITEKEY_ENV,
+  oompaMailingListConfig,
+  renderOompaAnalyticsScript,
+  renderOompaSiteFooter,
   renderDocsHtml,
   renderPreviewHtml,
   renderPrivacyHtml,
@@ -130,7 +130,7 @@ describe("public content contract", () => {
     }
     const historicalAdmission = renderMarkdownBlocks(publicContent.introduction, 2);
     expect(historicalAdmission).toContain("https://github.com/hraness/hra/actions/runs/34367591503");
-    expect(historicalAdmission).toContain("https://github.com/hraness/hra/releases/tag/v0.7.1");
+    expect(historicalAdmission).toContain("https://github.com/hraness/oompa/releases/tag/v0.7.1");
     expect(historicalAdmission).toContain("attempt 2");
     expect(historicalAdmission).toContain("artifact admission does not authorize current-daemon startup or hosted command writers");
     expect(historicalAdmission).toContain("does not admit v0.8.0");
@@ -168,8 +168,8 @@ describe("public content contract", () => {
     expect(readme).toContain("The v0.7.0 release retains this policy without enabling it.");
     expect(readme).toContain("They use a separate local opt-in, disabled on new and upgraded installations.");
     expect(readme).toContain("After the applicable artifact admission and daemon rollout gates are satisfied");
-    expect(readme).toContain("hra autorespond-after-hours enable --revision <revision>");
-    expect(readme).toContain("hra autorespond-after-hours disable --revision <revision>");
+    expect(readme).toContain("oompa autorespond-after-hours enable --revision <revision>");
+    expect(readme).toContain("oompa autorespond-after-hours disable --revision <revision>");
     expect(readme).toContain("Prose always stays at three, ten, and forty.");
     expect(readme).toContain("Both paths spend the same counters.");
     expect(readme).toContain("Policy changes and schedule boundaries never reset or refund them");
@@ -186,29 +186,29 @@ describe("public content contract", () => {
       expect(surface).toContain("reserves its budget before provider dispatch");
       expect(surface).toContain("pauses automatic approvals for 24 hours");
       expect(surface).toContain("requires a new human message to reopen its consecutive budget");
-      expect(surface).toContain("hra autorespond status --session <session>");
-      expect(surface).not.toMatch(/hra autorespond status`? (?:shows the counters|reports the hold)/u);
+      expect(surface).toContain("oompa autorespond status --session <session>");
+      expect(surface).not.toMatch(/oompa autorespond status`? (?:shows the counters|reports the hold)/u);
       expect(surface).toContain("A newer question or changed authority cancels the stale reply");
     }
   });
-  test("publishes the exact HRA release identity", () => {
+  test("publishes the exact Oompa release identity", () => {
     expect(publicContent).toMatchObject({
-      doctorCommand: "hra doctor --offline",
-      initCommand: "hra init --yes",
-      installCommand: buildHraGlobalInstallCommand(
-        "https://github.com/hraness/hra/releases/download/v0.8.0/hraness-hra-0.8.0.tgz",
+      doctorCommand: "oompa doctor --offline",
+      initCommand: "oompa init --yes",
+      installCommand: buildOompaGlobalInstallCommand(
+        "https://github.com/hraness/oompa/releases/download/v0.8.0/hraness-oompa-0.8.0.tgz",
       ),
       links: {
-        github: "https://github.com/hraness/hra",
+        github: "https://github.com/hraness/oompa",
       },
-      productName: "HRA",
-      siteUrl: "https://hra.sh",
+      productName: "Oompa",
+      siteUrl: "https://oompa.app",
     });
   });
 
   test("keeps website positioning and install claims independent of the technical package description", () => {
     const markdown = renderLlmsText();
-    expect(markdown.split("\n")[0]).toBe("# HRA");
+    expect(markdown.split("\n")[0]).toBe("# Oompa");
     expect(markdown).toContain(publicContent.thesis);
     expect(markdown).toContain(publicContent.statusLine);
     expect(publicContent.statusLine).toContain("Local CLI v0.8.0 is a release candidate, not an admitted artifact");
@@ -251,7 +251,7 @@ describe("public content contract", () => {
       expect(badge.image).toMatch(/^https:\/\/img\.shields\.io\//u);
       expect(badge.href).toMatch(/^https:\/\//u);
     }
-    expect(publicContent.badges[2]?.image).toContain("/hraness/hra/ci.yml?branch=main");
+    expect(publicContent.badges[2]?.image).toContain("/hraness/oompa/ci.yml?branch=main");
     expect(publicContent.badges[4]?.image).toBe("https://img.shields.io/badge/Bun-1.3.14-14151a");
     expect(publicContent.badges[5]?.image).toBe("https://img.shields.io/badge/runtime-Codex%200.153.2-0b5fa5");
     expect(publicContent.badges[6]?.image).toBe("https://img.shields.io/badge/runtime-Claude%20Code%202.1.260-6f42c1");
@@ -288,19 +288,19 @@ describe("public content contract", () => {
     expect(previewEyebrow.textContent).toBe(publicContent.tagline);
     expectCompiledClasses(previewEyebrow);
     expect(publicContent.socialCard).toEqual({
-      alt: "HRA command-line card showing offline diagnostics and read-only status · v0.8.0 candidate · daemon rollout blocked on capacity · hra.sh",
+      alt: "Oompa command-line card showing offline diagnostics and read-only status · v0.8.0 candidate · daemon rollout blocked on capacity · oompa.app",
       height: 630,
       path: "/social-card.png",
       width: 1200,
     });
     for (const document of [html, renderPrivacyHtml(), renderPreviewHtml()]) {
-      expect(document).toContain('<meta property="og:image" content="https://hra.sh/social-card.png">');
+      expect(document).toContain('<meta property="og:image" content="https://oompa.app/social-card.png">');
       expect(document).toContain('<meta property="og:image:type" content="image/png">');
       expect(document).toContain('<meta property="og:image:width" content="1200">');
       expect(document).toContain('<meta property="og:image:height" content="630">');
       expect(document).toContain(`<meta property="og:image:alt" content="${publicContent.socialCard.alt}">`);
       expect(document).toContain('<meta name="twitter:card" content="summary_large_image">');
-      expect(document).toContain('<meta name="twitter:image" content="https://hra.sh/social-card.png">');
+      expect(document).toContain('<meta name="twitter:image" content="https://oompa.app/social-card.png">');
       expect(document).not.toContain("social-card.svg");
     }
     const llms = renderLlmsText();
@@ -318,13 +318,13 @@ describe("public content contract", () => {
       "Stable working and shared project memory",
       "reads that lane together with durable project memory",
       "shares one attested page only through conflict-checked adoption",
-      "hra memory status|list|get|search|explain|remember|share",
+      "oompa memory status|list|get|search|explain|remember|share",
       "Claude Code uses its live provider-neutral projection while the exact controller is present",
       "only after prior-process exit or an already-completed exact process release is proven",
       "Provider-native rename remains Codex-only",
       "Protected full-turn inspection remains Codex-only",
-      "For Claude, HRA admits only the pinned Fable profile and reviewed host-tool boundary",
-      "Bound Codex and Claude Code models use closed HRA tools",
+      "For Claude, Oompa admits only the pinned Fable profile and reviewed host-tool boundary",
+      "Bound Codex and Claude Code models use closed Oompa tools",
       "Attributed peer coordination",
       "list, inspect, and message only bounded same-project peers",
       "Retired sessions cannot participate",
@@ -337,12 +337,12 @@ describe("public content contract", () => {
       "causal cycles, and a ninth hop",
       "120 new peer actions per actor and per project in a rolling hour",
       "25,000-action project cap fails closed",
-      "hra session start <account> [--project <project>] [--provider <codex|claude>] [--preset <low|high|ultra|fable-max>] [--fast]",
-      "hra session peer-policy get <session> [--json]",
-      "hra session peer-policy set <session> <off|inspect|coordinate> --revision <n> [--json]",
-      "hra session preset <session> <low|high|ultra|fable-max>",
-      "hra session switch <session> --provider <codex|claude> [--preset <low|high|ultra|fable-max>] [--account <account>]",
-      "hra session export <session> [--format <trajectory|json>] [--out <path>]",
+      "oompa session start <account> [--project <project>] [--provider <codex|claude>] [--preset <low|high|ultra|fable-max>] [--fast]",
+      "oompa session peer-policy get <session> [--json]",
+      "oompa session peer-policy set <session> <off|inspect|coordinate> --revision <n> [--json]",
+      "oompa session preset <session> <low|high|ultra|fable-max>",
+      "oompa session switch <session> --provider <codex|claude> [--preset <low|high|ultra|fable-max>] [--account <account>]",
+      "oompa session export <session> [--format <trajectory|json>] [--out <path>]",
     ];
 
     for (const claim of claims) {
@@ -352,8 +352,8 @@ describe("public content contract", () => {
     for (const surface of [markdown, html, renderLlmsText()]) {
       expect(surface).not.toContain("Codex is supported today; Claude is next.");
       expect(surface).not.toContain("Codex today, Claude next.");
-      expect(surface).not.toContain("Claude authentication happens outside HRA");
-      expect(surface).not.toContain("HRA does not expose Claude login");
+      expect(surface).not.toContain("Claude authentication happens outside Oompa");
+      expect(surface).not.toContain("Oompa does not expose Claude login");
     }
   });
 
@@ -409,7 +409,7 @@ describe("public content contract", () => {
     const document = parseHTML(html).document;
     const commands = [...document.querySelectorAll("pre.command-list")];
     for (const version of ["v0.7.1", "v0.8.0"]) {
-      const versionCodes = [...document.querySelectorAll("code.hra-inline-code")].filter((code) => code.textContent === version);
+      const versionCodes = [...document.querySelectorAll("code.oompa-inline-code")].filter((code) => code.textContent === version);
       expect(versionCodes.length).toBeGreaterThan(0);
       for (const code of versionCodes) expectCompiledClasses(code);
     }
@@ -471,7 +471,7 @@ describe("public content contract", () => {
       expect(surface).toContain(publicContent.daemonRolloutNotice);
       expect(surface).toContain("/docs/status/");
     }
-    expect(markdown).toContain("https://github.com/hraness/hra/releases/tag/v0.7.1");
+    expect(markdown).toContain("https://github.com/hraness/oompa/releases/tag/v0.7.1");
     expect(markdown).toContain("https://github.com/hraness/hra/actions/runs/34367591503");
     expect(markdown).toContain("Local v0.8.0 candidate; hosted sync live as an open beta");
     const reference = renderDocsMarkdown("/docs/reference/");
@@ -516,11 +516,11 @@ describe("public content contract", () => {
   });
 
   test.each([
-    ["first-account", "First account", "hra account add personal"],
-    ["first-session", "First session", "hra session start personal --provider codex"],
-    ["cloud-sign-in-and-device-pairing", "Cloud sign-in and device pairing", "hra auth login --input-stdin"],
-    ["terminal-and-agent-interfaces", "Terminal and agent interfaces", "hra"],
-    ["presets-and-permissions", "Presets and permissions", "hra init --yes"],
+    ["first-account", "First account", "oompa account add personal"],
+    ["first-session", "First session", "oompa session start personal --provider codex"],
+    ["cloud-sign-in-and-device-pairing", "Cloud sign-in and device pairing", "oompa auth login --input-stdin"],
+    ["terminal-and-agent-interfaces", "Terminal and agent interfaces", "oompa"],
+    ["presets-and-permissions", "Presets and permissions", "oompa init --yes"],
   ])("guards the directly linked %s first-run section before its startup instructions", (id, heading, command) => {
     const section = publicContent.sections.find((entry) => entry.id === id);
     expect(section?.blocks[0]).toEqual({
@@ -576,10 +576,10 @@ describe("public content contract", () => {
     ];
 
     for (const command of [
-      "hra auth login --input-stdin",
-      "hra auth login --input-fd <fd>",
-      "hra auth delete --acknowledge-erasure",
-      "hra device pair",
+      "oompa auth login --input-stdin",
+      "oompa auth login --input-fd <fd>",
+      "oompa auth delete --acknowledge-erasure",
+      "oompa device pair",
     ]) {
       expect(markdown).toContain(command);
       expect(visibleHtml).toContain(command);
@@ -593,17 +593,17 @@ describe("public content contract", () => {
       expect(surface).not.toContain("auth login --code");
     }
     expect(markdown).toContain(
-      "hra device approve <pending-device-id-or-prefix> --fingerprint <value>"
+      "oompa device approve <pending-device-id-or-prefix> --fingerprint <value>"
       + " [--idempotency-key <current-uuidv7>]",
     );
-    expect(visibleHtml).toContain("hra device approve <pending-device-id-or-prefix>");
+    expect(visibleHtml).toContain("oompa device approve <pending-device-id-or-prefix>");
     for (const claim of [
-      "hra device key-loss --acknowledge-no-key-holders",
+      "oompa device key-loss --acknowledge-no-key-holders",
       "the account key as a closed status",
       "recovery requires an existing account-key holder",
       "no remaining holder makes the encrypted content unrecoverable",
       "authenticated, registered, active installation",
-      "current HRA cloud identity's isolated local custody",
+      "current Oompa cloud identity's isolated local custody",
       "current auth token generation, identity, auth epoch, registered device, and pairing observation agree exactly",
       "no network, provider, or cloud mutation",
       "does not mint, replace, or delete a key or ciphertext",
@@ -614,7 +614,7 @@ describe("public content contract", () => {
       "Search again for an existing holder",
       "the real key restores ready status and supersedes the acknowledgement",
       "Only after that renewed holder search is exhausted",
-      "erasing and reinitializing the HRA cloud account",
+      "erasing and reinitializing the Oompa cloud account",
       "does not regenerate the lost account key",
       "not the default response to a key-loss acknowledgement",
     ]) {
@@ -649,22 +649,22 @@ describe("public content contract", () => {
     const html = htmlVisibleText(renderDocumentationHtml("/docs/sessions/"));
     for (const surface of [markdown, html]) {
       expect(surface).toContain("the daemon restarts before completion");
-      expect(surface).toContain("hra account show personal");
-      expect(surface).toContain("hra account login-cancel");
+      expect(surface).toContain("oompa account show personal");
+      expect(surface).toContain("oompa account login-cancel");
       expect(surface).toContain("exact current-generation provider login");
-      expect(surface).toContain("Verification URLs and user codes never enter local durable HRA state, logs, or ordinary command output");
+      expect(surface).toContain("Verification URLs and user codes never enter local durable Oompa state, logs, or ordinary command output");
       expect(surface).toContain("account-key-encrypted, one-read hosted result");
       expect(surface).toContain("always selects device-code mode");
       expect(surface).toContain("--handoff-file /absolute/private/login.json --json");
       expect(surface).toContain("A same-key replay never claims or rewrites a handoff");
       expect(surface).toContain("after completion or cancellation it reports the terminal account state");
-      expect(surface).toContain("hra account login personal --provider claude");
+      expect(surface).toContain("oompa account login personal --provider claude");
       expect(surface).toContain("CLAUDE_CONFIG_DIR");
-      expect(surface).toContain("Claude exposes no HRA device-code, handoff-file, or web-linking protocol");
+      expect(surface).toContain("Claude exposes no Oompa device-code, handoff-file, or web-linking protocol");
       expect(surface).toContain("retains the one-child fence even if Claude reports signed in");
       expect(surface).toContain("After confirming that original child has exited");
       expect(surface).toContain("recovery does not stop Claude or read, change, or delete a credential");
-      expect(surface).not.toContain("HRA does not implement Claude Code sign-in");
+      expect(surface).not.toContain("Oompa does not implement Claude Code sign-in");
     }
   });
 
@@ -675,7 +675,7 @@ describe("public content contract", () => {
       expect(surface).toContain("Devin support has been removed");
       expect(surface).toContain("Existing Devin history is read-only");
       expect(surface).not.toContain("devin acp");
-      expect(surface).not.toContain("hra account login personal --provider devin");
+      expect(surface).not.toContain("oompa account login personal --provider devin");
       expect(surface).not.toContain("|devin");
       expect(surface).not.toContain("|astra");
     }
@@ -685,7 +685,7 @@ describe("public content contract", () => {
     for (const surface of [renderDocumentationMarkdown("/docs/sessions/", "/docs/status/"), htmlVisibleText(renderDocumentationHtml("/docs/sessions/", "/docs/status/"))]) {
       expect(surface).toContain("Automatic account movement is not exposed yet.");
       expect(surface).toContain("Explicit sessions and work tasks stay pinned to the account you selected.");
-      expect(surface).toContain("Claude and Devin accounts never rotate automatically, and HRA never replays a failed or ambiguous turn under another account.");
+      expect(surface).toContain("Claude and Devin accounts never rotate automatically, and Oompa never replays a failed or ambiguous turn under another account.");
       expect(surface).toContain("The experimental desktop switch never copies");
       expect(surface).toContain("changes Keychain blindly, responds to a provider limit, or retries an uncertain switch.");
       expect(surface).toContain("The separately adopted provider-usage contract permits bounded managed Codex movement only under fresh local authority; explicit sessions, work tasks, Claude accounts, and cross-machine execution remain outside that boundary.");
@@ -695,13 +695,13 @@ describe("public content contract", () => {
 
   test("publishes an explicit read-only plugin boundary", () => {
     const claims = [
-      "hra plugin list <account> [--project <project>] [--refresh]",
-      "hra plugin show <account> <plugin> [--project <project>] [--refresh]",
+      "oompa plugin list <account> [--project <project>] [--refresh]",
+      "oompa plugin show <account> <plugin> [--project <project>] [--refresh]",
       "Plugin commands are read-only discovery.",
       "Pinned Codex 0.153.2 has no safely separated install, enablement, and OAuth lifecycle surface",
-      "HRA therefore does not expose plugin install, enable, disable, OAuth, or permission effects.",
+      "Oompa therefore does not expose plugin install, enable, disable, OAuth, or permission effects.",
       "The pinned tool-suggestion form that can invoke that compound plugin or connector lifecycle is also rejected before admission.",
-      "Other standard MCP forms are brokered only when their pinned schema fits HRA's closed primitive-field contract.",
+      "Other standard MCP forms are brokered only when their pinned schema fits Oompa's closed primitive-field contract.",
       "Opaque openai/form, unsupported schema constructs, and URL elicitation fail before durable admission",
     ];
     const markdown = renderDocumentationMarkdown("/docs/reference/");
@@ -714,7 +714,7 @@ describe("public content contract", () => {
 
   test("publishes informed protected approval inspection", () => {
     const claims = [
-      "hra interaction inspect <interaction-id> --revision <n> [--handoff-file <absolute-path>]",
+      "oompa interaction inspect <interaction-id> --revision <n> [--handoff-file <absolute-path>]",
       "intentionally returns only a durable safe summary",
       "complete authority still held by the live provider callback",
       "ordinary stdout receives only safe binding and cleanup metadata",
@@ -780,16 +780,16 @@ describe("public content contract", () => {
       "The machine that created a provider session remains its only executor in v1.",
       "send, queue, steer, stop, preset, provider-switch, and Codex Fast commands",
       "Project directories are local-only and are neither synced nor remotely changed.",
-      "hra remote send <cloud-session> <message>",
-      "hra remote command <uuidv7>",
-      "hra remote provider <cloud-session> <codex|claude> [--preset <low|high|ultra|fable-max>]",
+      "oompa remote send <cloud-session> <message>",
+      "oompa remote command <uuidv7>",
+      "oompa remote provider <cloud-session> <codex|claude> [--preset <low|high|ultra|fable-max>]",
       "--idempotency-key <current-uuidv7>",
       "includes interaction events with a public interaction ID, kind, state, revision, blocking status, bounded safe summary, and a nested version 2 remote policy",
       "Another device may decline a pending command, permission, or file-change request with",
       "every MCP answer stays on the execution machine",
       "Transcript upload is bound to a durable local stream ledger",
-      "HRA never resets, aliases, overwrites, or destructively reseeds encrypted history.",
-      "hra sync projection recover <local-session> --acknowledge-gap [--idempotency-key <uuidv7>] [--json]",
+      "Oompa never resets, aliases, overwrites, or destructively reseeds encrypted history.",
+      "oompa sync projection recover <local-session> --acknowledge-gap [--idempotency-key <uuidv7>] [--json]",
       "performs no daemon call and returns",
       "JSON mode never prompts.",
       "preserves all older encrypted cloud history and changes no provider or app state.",
@@ -808,7 +808,7 @@ describe("public content contract", () => {
     const markdown = renderDocsMarkdown("/docs/web/");
     const html = htmlVisibleText(renderDocumentationHtml("/docs/web/"));
     const privacy = renderPrivacyMarkdown();
-    const command = "hra sync projection recover <local-session> --acknowledge-gap [--idempotency-key <uuidv7>] [--json]";
+    const command = "oompa sync projection recover <local-session> --acknowledge-gap [--idempotency-key <uuidv7>] [--json]";
 
     expect(markdown).toContain(command);
     expect(html).toContain(command);
@@ -866,15 +866,15 @@ describe("public content contract", () => {
       "browser extensions, accessibility APIs, screenshots, and explicit user selection can observe rendered text",
       "Email access alone does not recover that key.",
       "an uncontested, unrevoked copy can impersonate that device",
-      "HRA uses Convex to authenticate the HRA identity",
-      "HRA uses Resend to deliver verification email.",
+      "Oompa uses Convex to authenticate the Oompa identity",
+      "Oompa uses Resend to deliver verification email.",
       "one-time verification code and message content",
       "anonymous, cookieless PostHog analytics",
       "Collection runs only on the canonical production host",
       "honors Do Not Track",
       "disables person profiles, autocapture, heatmaps, feature flags, surveys, conversations, and session recording",
-      "HRA sends no form values, account identity, provider or session data, URL query, or fragment.",
-      "Vercel serves hra.sh",
+      "Oompa sends no form values, account identity, provider or session data, URL query, or fragment.",
+      "Vercel serves oompa.app",
       "GitHub hosts the source repository, releases, and release downloads",
     ];
     const surfaces = [
@@ -894,13 +894,13 @@ describe("public content contract", () => {
     const markdown = renderDocumentationMarkdown("/docs/status/");
     const html = htmlVisibleText(renderDocumentationHtml("/docs/status/"));
     const surfaces = [markdown, html];
-    expect(publicContent.installCommand).toContain(HRA_INSTALL_PREFLIGHT_SOURCE_URL);
+    expect(publicContent.installCommand).toContain(OOMPA_INSTALL_PREFLIGHT_SOURCE_URL);
     expect(publicContent.installCommand).toContain("unset BUN_OPTIONS NODE_OPTIONS");
     expect(publicContent.installCommand).toContain(
       "| command bun --no-env-file --config=/dev/null -e '",
     );
     expect(publicContent.installCommand).toContain(
-      "-- https://github.com/hraness/hra/releases/download/v0.8.0/hraness-hra-0.8.0.tgz",
+      "-- https://github.com/hraness/oompa/releases/download/v0.8.0/hraness-oompa-0.8.0.tgz",
     );
     expect(publicContent.installCommand).toContain("hra-install-safe");
     expect(publicContent.installCommand).not.toContain("bun add --global");
@@ -908,13 +908,13 @@ describe("public content contract", () => {
     expect(markdown).toContain(publicContent.installCommand);
     expect(html).toContain(publicContent.installCommand);
     for (const surface of surfaces) {
-      expect(surface).toContain("HRA requires Bun 1.3.14");
+      expect(surface).toContain("Oompa requires Bun 1.3.14");
       expect(surface).toContain("curl with HTTPS and TLS 1.2 support");
       expect(surface).toContain("support macOS and Linux");
       expect(surface).toContain("Codex effects run on both platforms");
       expect(surface).toContain("Claude Code effects run on Linux only");
       expect(surface).toContain("refuses new Claude Code effects on macOS pending authenticated isolated-Keychain and detached-read acceptance");
-      expect(surface).toContain(HRA_INSTALL_PREFLIGHT_SOURCE_URL);
+      expect(surface).toContain(OOMPA_INSTALL_PREFLIGHT_SOURCE_URL);
       expect(surface).toContain("hra-install-safe");
       expect(surface).toContain("fresh random private staging root");
       expect(surface).toContain("GitHub repository ID 1343008607");
@@ -925,7 +925,7 @@ describe("public content contract", () => {
       expect(surface).toContain("immutable release metadata");
       expect(surface).toContain("verified in-memory snapshot");
       expect(surface).toContain("bounded package-file manifest");
-      expect(surface).toContain("every extracted HRA package path and SHA-256");
+      expect(surface).toContain("every extracted Oompa package path and SHA-256");
       expect(surface).toContain("separate full-digest version namespaces");
       expect(surface).toContain("lifecycle scripts disabled");
       expect(surface).toContain("complete staged tree");
@@ -934,16 +934,16 @@ describe("public content contract", () => {
       expect(surface).toContain("detached staging worker and its Bun package-install child repeat the runtime neutralization");
       expect(surface).toContain("configured registry, proxy, and certificate trust inputs");
       expect(surface).toContain("prior verified command remains active throughout staging");
-      expect(surface).toContain("atomically replaces only the $BUN_INSTALL/bin/hra symlink");
+      expect(surface).toContain("atomically replaces only the $BUN_INSTALL/bin/oompa symlink");
       expect(surface).toContain("next invocation of that exact release's installer recovers or removes only the proven private stage");
       expect(surface).toContain("another release's installer refuses the durable intent");
       expect(surface).toContain("invoking shell, PATH-selected pinned Bun binary");
       expect(surface).toContain("Existing trustedDependencies remain unchanged");
-      expect(surface).toContain("hra daemon stop");
-      expect(surface).toContain("hra daemon status --json");
-      expect(surface).toContain("hra daemon start");
+      expect(surface).toContain("oompa daemon stop");
+      expect(surface).toContain("oompa daemon status --json");
+      expect(surface).toContain("oompa daemon start");
       expect(surface).toContain("Only after immutable GitHub release admission for v0.8.0, install its exact release and verify the installed version and offline health");
-      expect(surface).not.toContain("bun remove --global hra");
+      expect(surface).not.toContain("bun remove --global oompa");
       expect(surface).not.toContain("uninstall the package");
     }
   });
@@ -973,7 +973,7 @@ describe("public content contract", () => {
       "Never install a moving branch on a release machine",
       "never run an older daemon against this state root after the current daemon has started",
       "Settle any durable installer intent left by an interrupted installation",
-      "$BUN_INSTALL/install/hra/install-intent.json",
+      "$BUN_INSTALL/install/oompa/install-intent.json",
       "Do not edit or delete that file or its staging or version directories",
       "the exact immutable install command from the originating release's trusted README or release notes",
       "If that installer refuses the intent, stop installation and use bounded read-only diagnosis while preserving the intent and its directories",
@@ -991,7 +991,7 @@ describe("public content contract", () => {
       "do not invent an unsupported option",
       "This command has no idempotency key",
       "Block the update on any remaining prepared or indeterminate local mutation",
-      "HRA exposes no general command to cancel a prepared session start or provider switch",
+      "Oompa exposes no general command to cancel a prepared session start or provider switch",
       "Do not generate a fresh key or edit SQLite as a workaround",
       "durable local outbox",
       "current tab's returned command handle and public ID",
@@ -1044,8 +1044,8 @@ describe("public content contract", () => {
       "6. Stop the daemon and prove that it released authority:",
       "",
       "   ```text",
-      "   hra daemon stop --json",
-      "   hra daemon status --json",
+      "   oompa daemon stop --json",
+      "   oompa daemon status --json",
       "   ```",
       "",
       "   Require the stop command itself to exit zero; its recovery path is the authority-release proof. Treat a status response containing `data.running: false` only as a secondary no-listener confirmation. Status alone does not prove authority release. Stop on any stop or recovery error.",
@@ -1054,11 +1054,11 @@ describe("public content contract", () => {
       "9. Start the current daemon. This is the no-downgrade boundary: after this command begins, never launch an older daemon against the same state root. Prove post-migration health before syncing, then inspect every retained CLI session-command ID:",
       "",
       "   ```text",
-      "   hra daemon start",
-      "   hra doctor --offline",
-      "   hra sync now --json",
-      "   hra sync status",
-      "   hra remote command <uuidv7>",
+      "   oompa daemon start",
+      "   oompa doctor --offline",
+      "   oompa sync now --json",
+      "   oompa sync status",
+      "   oompa remote command <uuidv7>",
       "   ```",
     ].join("\n"));
     expect(markdown.indexOf("1. Settle any durable installer intent")).toBeLessThan(
@@ -1078,7 +1078,7 @@ describe("public content contract", () => {
       rawHtml.indexOf("Optional full local-data removal"),
     );
     expect(parseHTML(runbookHtml).document.querySelectorAll("li")).toHaveLength(10);
-    expect(htmlVisibleText(runbookHtml)).toMatch(/Stop the daemon[\s\S]+?hra daemon stop --json[\s\S]+?Status alone does not prove authority release/u);
+    expect(htmlVisibleText(runbookHtml)).toMatch(/Stop the daemon[\s\S]+?oompa daemon stop --json[\s\S]+?Status alone does not prove authority release/u);
     expect(markdown).not.toContain("Before replacing the installed binary");
   });
 
@@ -1124,22 +1124,22 @@ describe("public content contract", () => {
     const html = htmlVisibleText(rawHtml);
     const claims = [
       "Human terminal",
-      "hra session start personal --provider codex",
+      "oompa session start personal --provider codex",
       "/account personal",
       "/session <session-id>",
       "Agent caller",
       "data.session.id",
       "data.eventStream.cursor",
-      "hra session start personal --provider codex --json",
-      "hra session status <session-id> --json",
-      "hra session watch <session-id> --cursor <status-cursor> --jsonl",
+      "oompa session start personal --provider codex --json",
+      "oompa session status <session-id> --json",
+      "oompa session watch <session-id> --cursor <status-cursor> --jsonl",
       "--follow",
       "equivalent compatibility spelling",
-      "hra session interactions <session-id> --pending --json",
+      "oompa session interactions <session-id> --pending --json",
       "Claude Code and provider switching",
-      "hra session start personal --provider claude --preset fable-max --json",
-      "hra session switch <session-id> --provider claude --preset fable-max",
-      "hra session export <session-id> --format json",
+      "oompa session start personal --provider claude --preset fable-max --json",
+      "oompa session switch <session-id> --provider claude --preset fable-max",
+      "oompa session export <session-id> --format json",
       "seeds a fresh provider-native runtime from the latest retained tail",
       "does not move a provider-native thread",
       "accepted direct, queued, Work and scheduled automation, autorespond, and provider-switch handoff messages with actor provenance",
@@ -1147,16 +1147,16 @@ describe("public content contract", () => {
       "Retention is capped at 50,000 events, 64 MiB, and seven days",
       "Keep following while a separate one-shot invocation handles the approval, question, permission grant, or supported MCP form.",
       "Scheduled work in the same conversation",
-      "hra session task create <session-id> --name daily-review --every-minutes 1440",
-      "hra session task list <session-id>",
-      "hra session task show <session-id> <task-id>",
-      "hra session task edit <session-id> <task-id> --revision <revision> --pause",
-      "hra session task edit <session-id> <task-id> --revision <revision> --resume",
-      "hra session task delete <session-id> <task-id> --revision <revision>",
+      "oompa session task create <session-id> --name daily-review --every-minutes 1440",
+      "oompa session task list <session-id>",
+      "oompa session task show <session-id> <task-id>",
+      "oompa session task edit <session-id> <task-id> --revision <revision> --pause",
+      "oompa session task edit <session-id> <task-id> --revision <revision> --resume",
+      "oompa session task delete <session-id> <task-id> --revision <revision>",
       "A task cannot independently retarget its account, provider, project, model, or execution environment",
       "later explicit changes to the session apply to future runs",
       "Missed intervals coalesce into one queued turn",
-      "HRA never creates a replacement provider conversation or writes a provider's private automation registry",
+      "Oompa never creates a replacement provider conversation or writes a provider's private automation registry",
     ];
 
     expect(markdown).toContain("## First session");
@@ -1166,14 +1166,14 @@ describe("public content contract", () => {
       expect(html).toContain(claim);
     }
     expect(publicContent.hero.steps[0]).toMatchObject({
-      command: "hra session start personal --provider codex --json",
+      command: "oompa session start personal --provider codex --json",
     });
     expect(publicContent.hero.steps[2]).toMatchObject({
-      command: "hra session switch <session-id> --provider claude --preset fable-max",
-      detail: "Continue on your signed-in Claude Code profile. HRA carries over the conversation it has retained and flags any missing history.",
+      command: "oompa session switch <session-id> --provider claude --preset fable-max",
+      detail: "Continue on your signed-in Claude Code profile. Oompa carries over the conversation it has retained and flags any missing history.",
     });
-    expect(markdown).toContain("New HRA-created Codex sessions that use `high` or `ultra`");
-    expect(html).toContain("New HRA-created Codex sessions that use high or ultra");
+    expect(markdown).toContain("New Oompa-created Codex sessions that use `high` or `ultra`");
+    expect(html).toContain("New Oompa-created Codex sessions that use high or ultra");
     expect(markdown).toContain("The `low` and `fable-max` bindings are unchanged");
     expect(markdown).not.toContain("every explicit preset selection use the Sol mapping");
     expect(markdown).toContain("sessions already bound to historical contract 2 keep their exact Astra model and effort");
@@ -1186,7 +1186,7 @@ describe("public content contract", () => {
     const html = htmlVisibleText(renderDocumentationHtml("/docs/reference/"));
     const claims = [
       "Bounded local status",
-      "hra status [--json]",
+      "oompa status [--json]",
       "bounded, effect-free read of local SQLite state",
       "does not start, stop, or contact the daemon",
       "at most 50 ID-and-revision action records",
@@ -1223,9 +1223,9 @@ describe("public content contract", () => {
     const documentedCommands = publicContent.sections.flatMap((section) =>
       section.blocks.flatMap((block) => block.kind === "commands" ? block.commands : []),
     );
-    expect(documentedCommands).toContain("hra status [--json]");
-    expect(documentedCommands).toContain("hra session watch <session> [--cursor <cursor>] [--jsonl]");
-    expect(documentedCommands.some((command) => command.startsWith("hra session wait"))).toBe(false);
+    expect(documentedCommands).toContain("oompa status [--json]");
+    expect(documentedCommands).toContain("oompa session watch <session> [--cursor <cursor>] [--jsonl]");
+    expect(documentedCommands.some((command) => command.startsWith("oompa session wait"))).toBe(false);
     expect(documentedCommands.some((command) => /<\d+-\d+>/u.test(command))).toBe(false);
   });
 
@@ -1238,7 +1238,7 @@ describe("public content contract", () => {
       "Configuring a gateway key explicitly enables the separate prose-approval path",
       "openai/gpt-5-nano",
       "one request with a 10-second deadline and no retry",
-      "The model cannot create arbitrary text that HRA will send",
+      "The model cannot create arbitrary text that Oompa will send",
       "a byte-exact substring already present in the assistant message",
       "Claude Code public profiles include the pinned CLI, model, reasoning effort, default permission mode, and stream formats",
       "omits that custody identity and legacy isolation marker",
@@ -1266,7 +1266,7 @@ describe("public content contract", () => {
       expect(usageSection).toBeDefined();
       for (const line of usageSection?.split("\n").slice(1) ?? []) {
         const command = line.trim();
-        if (command.startsWith("hra ")) expect(documentedCommands).toContain(command);
+        if (command.startsWith("oompa ")) expect(documentedCommands).toContain(command);
       }
     }
   });
@@ -1276,8 +1276,8 @@ describe("public content contract", () => {
     const html = htmlVisibleText(renderDocumentationHtml("/docs/status/"));
     const claims = [
       "Optional full local-data removal",
-      "hra auth delete --acknowledge-erasure",
-      "hra account logout <profile>",
+      "oompa auth delete --acknowledge-erasure",
+      "oompa account logout <profile>",
       "data.running",
       "$HOME/Library/Application Support/HRA Control Plane v1",
       "$HOME/.local/state/hra-control-plane-v1",
@@ -1327,7 +1327,7 @@ describe("public content contract", () => {
     }
     for (const [status, meaning] of statuses) {
       expect(markdown).toContain(`- \`${status}\`: ${meaning}`);
-      const codes = [...parseHTML(html).document.querySelectorAll("li > code.hra-inline-code")]
+      const codes = [...parseHTML(html).document.querySelectorAll("li > code.oompa-inline-code")]
         .filter((code) => code.textContent === status && code.parentElement?.textContent === `${status}: ${meaning}`);
       expect(codes).toHaveLength(1);
       expectCompiledClasses(codes[0]!);
@@ -1347,7 +1347,7 @@ describe("public content contract", () => {
   test("contains JSON-LD, owned appearance bootstrap, and one owned analytics module on public pages", () => {
     const html = renderSiteHtml();
     const privacy = renderPrivacyHtml();
-    expect(html).toContain('<link rel="canonical" href="https://hra.sh/">');
+    expect(html).toContain('<link rel="canonical" href="https://oompa.app/">');
     expect(html).toContain('<meta property="og:type" content="website">');
     expect(html).toContain('<link rel="stylesheet" href="/styles.css">');
     expect(html).toContain('<script type="application/ld+json">');
@@ -1355,17 +1355,17 @@ describe("public content contract", () => {
     expect(html.match(/<script[^>]+src=/gu)).toHaveLength(3);
     expect(html).toContain('<script src="/site.js" type="module"></script>');
     expect(html).toContain('<script src="/appearance.js"></script>');
-    expect(html).toContain(renderHraAnalyticsScript());
-    expect(privacy).toContain(renderHraAnalyticsScript());
-    expect(renderPreviewHtml()).not.toContain(renderHraAnalyticsScript());
+    expect(html).toContain(renderOompaAnalyticsScript());
+    expect(privacy).toContain(renderOompaAnalyticsScript());
+    expect(renderPreviewHtml()).not.toContain(renderOompaAnalyticsScript());
     expect(html).not.toContain("onclick=");
     for (const page of docsPages) {
       const document = parseHTML(renderDocsHtml(page)).document;
-      expect(document.querySelector('link[rel="canonical"]')?.getAttribute("href")).toBe(`https://hra.sh${page.path}`);
+      expect(document.querySelector('link[rel="canonical"]')?.getAttribute("href")).toBe(`https://oompa.app${page.path}`);
       expect([...document.querySelectorAll("script[src]")].map((script) => script.getAttribute("src"))).toEqual(["/appearance.js", "/analytics.js", "/site.js"]);
       expect(document.documentElement.getAttribute("data-palette")).toBe("catppuccin");
       expect(document.documentElement.getAttribute("data-theme")).toBe("dark");
-      expect(document.querySelectorAll("details[data-hra-appearance]")).toHaveLength(1);
+      expect(document.querySelectorAll("details[data-oompa-appearance]")).toHaveLength(1);
       expect(document.querySelectorAll('script[type="application/ld+json"]')).toHaveLength(1);
     }
   });
@@ -1399,25 +1399,25 @@ describe("public content contract", () => {
     }
   });
 
-  test("renders only the HRA mailing audience when Turnstile is configured", () => {
+  test("renders only the Oompa mailing audience when Turnstile is configured", () => {
     const sitekey = "1x00000000000000000000AA";
-    expect(hraMailingListConfig({
-      [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: sitekey,
+    expect(oompaMailingListConfig({
+      [OOMPA_MAILING_TURNSTILE_SITEKEY_ENV]: sitekey,
     })).toEqual({
-      audience: "hra",
+      audience: "oompa",
       kind: "signup",
       turnstileSitekey: sitekey,
     });
-    expect(hraMailingListConfig({})).toEqual({ kind: "none" });
-    expect(hraMailingListConfig({
-      [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: "",
+    expect(oompaMailingListConfig({})).toEqual({ kind: "none" });
+    expect(oompaMailingListConfig({
+      [OOMPA_MAILING_TURNSTILE_SITEKEY_ENV]: "",
     })).toEqual({ kind: "none" });
 
-    const footer = renderHraSiteFooter({
-      [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: sitekey,
+    const footer = renderOompaSiteFooter({
+      [OOMPA_MAILING_TURNSTILE_SITEKEY_ENV]: sitekey,
     });
     expect(footer).toContain('data-mailing-list="signup"');
-    expect(footer).toContain('name="audience" type="hidden" value="hra"');
+    expect(footer).toContain('name="audience" type="hidden" value="oompa"');
     expect(footer).toContain('data-action="mailing_hra"');
     expect(footer).toContain(
       'action="https://account.hraness.com/api/mailing/subscribe"',
@@ -1429,16 +1429,16 @@ describe("public content contract", () => {
   });
 
   test("fails production closed on missing or malformed Turnstile configuration", () => {
-    expect(hraMailingListConfig({ VERCEL_ENV: "preview" }))
+    expect(oompaMailingListConfig({ VERCEL_ENV: "preview" }))
       .toEqual({ kind: "none" });
     for (const turnstileSitekey of [undefined, ""]) {
       expect(() => {
-        hraMailingListConfig({
-          [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: turnstileSitekey,
+        oompaMailingListConfig({
+          [OOMPA_MAILING_TURNSTILE_SITEKEY_ENV]: turnstileSitekey,
           VERCEL_ENV: "production",
         });
       })
-        .toThrow(HRA_MAILING_TURNSTILE_SITEKEY_ENV);
+        .toThrow(OOMPA_MAILING_TURNSTILE_SITEKEY_ENV);
     }
     for (const turnstileSitekey of [
       "too-short",
@@ -1446,11 +1446,11 @@ describe("public content contract", () => {
       "x".repeat(101),
     ]) {
       expect(() => {
-        hraMailingListConfig({
-          [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: turnstileSitekey,
+        oompaMailingListConfig({
+          [OOMPA_MAILING_TURNSTILE_SITEKEY_ENV]: turnstileSitekey,
         });
       })
-        .toThrow(HRA_MAILING_TURNSTILE_SITEKEY_ENV);
+        .toThrow(OOMPA_MAILING_TURNSTILE_SITEKEY_ENV);
     }
   });
 
@@ -1458,7 +1458,7 @@ describe("public content contract", () => {
     const preview = renderPreviewHtml();
     expectCompiledClasses(oneElement(preview, "body.preview-page"));
     expect(preview).toContain('<meta name="robots" content="noindex, nofollow">');
-    expect(preview).toContain('<link rel="canonical" href="https://hra.sh/">');
+    expect(preview).toContain('<link rel="canonical" href="https://oompa.app/">');
     const title = oneElement(preview, "h1#preview-title");
     expect(title.textContent).toBe(publicContent.productName);
     expectCompiledClasses(title);
@@ -1516,8 +1516,8 @@ describe("public content contract", () => {
     const memory = await readFile(new URL("../docs/facts-memory.md", import.meta.url), "utf8");
     const backup = memory.split("### Backup, restore, and rollback\n")[1]?.split("\n## ")[0];
     expect(backup).toBeDefined();
-    expect(backup).toContain("Run `hra daemon stop --json` and require that command itself to exit zero before taking or restoring a snapshot");
-    expect(backup).toContain("`hra daemon status --json` reporting `data.running: false` is only a secondary no-listener check");
+    expect(backup).toContain("Run `oompa daemon stop --json` and require that command itself to exit zero before taking or restoring a snapshot");
+    expect(backup).toContain("`oompa daemon status --json` reporting `data.running: false` is only a secondary no-listener check");
     expect(backup).toContain("Stop on any stop or recovery error");
     expect(backup).toContain("complete private state root at one filesystem checkpoint");
   });

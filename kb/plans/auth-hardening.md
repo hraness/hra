@@ -11,11 +11,11 @@ after-hours policy foundation through `4b50465`.
 
 ## Scope and invariants
 
-Providers own credentials and the sign-in ceremony. HRA owns exact local
+Providers own credentials and the sign-in ceremony. Oompa owns exact local
 mutation authority, bounded process lifetime, and the protected handoff. Codex
 web linking remains device-code-only, locally opted in, account-key encrypted,
 and single-read. Claude login remains a foreground provider command on Linux;
-the unproved managed macOS credential-isolation gate stays closed. HRA cloud
+the unproved managed macOS credential-isolation gate stays closed. Oompa cloud
 email authentication remains separate from provider authentication.
 
 Effect owns Codex request deadlines, read cancellation, ordered facts, and

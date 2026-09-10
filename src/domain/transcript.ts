@@ -24,9 +24,9 @@ import {
 } from "./values";
 
 /**
- * The provider-neutral conversation HRA owns.
+ * The provider-neutral conversation Oompa owns.
  *
- * Every record here is rebuilt from HRA's own durable session events, never
+ * Every record here is rebuilt from Oompa's own durable session events, never
  * from a provider transcript read. That is the whole point: a session can be
  * moved from one provider to another, and a session whose provider is gone
  * still has a conversation. The records carry only what the event stream
@@ -167,7 +167,7 @@ export const transcriptRecordSchema = z.discriminatedUnion("kind", [
     itemKind: labelSchema,
     status: labelSchema.optional(),
     summary: labelSchema.optional(),
-    /** Null when the provider named no status HRA can classify. */
+    /** Null when the provider named no status Oompa can classify. */
     ok: z.boolean().nullable(),
   }).strict(),
   z.object({
@@ -225,7 +225,7 @@ const canonicalJson = (value: unknown): string => {
 export const digestTranscriptRecords = (
   records: readonly TranscriptRecord[],
 ): string => createHash("sha256")
-  .update("hra:session-transcript:v1\0", "utf8")
+  .update("oompa:session-transcript:v1\0", "utf8")
   .update(canonicalJson(records), "utf8")
   .digest("hex");
 
@@ -535,7 +535,7 @@ export const boundSessionTranscriptSerializedBytes = (input: Readonly<{
 };
 
 /** The first line of every rendered handoff seed. */
-export const TRANSCRIPT_SEED_HEADER = "[HRA provider handoff]";
+export const TRANSCRIPT_SEED_HEADER = "[Oompa provider handoff]";
 
 const actorLabel = (actor: SessionMessageActor): string =>
   actor === "human"
@@ -565,7 +565,7 @@ const seedLine = (record: TranscriptRecord): string => {
     // provider_switched record retains the boundary; this marker retains the
     // fact that a seed was sent without nesting its generated body.
     case "user": return record.actor === "provider_switch"
-      ? "User (handoff): [prior HRA handoff seed omitted]"
+      ? "User (handoff): [prior Oompa handoff seed omitted]"
       : `${actorLabel(record.actor)}: ${record.text}${
       record.omittedCharacters > 0 ? ` [+${String(record.omittedCharacters)} characters omitted]` : ""}${
       attachmentManifestSuffix(record.attachments)}`;
@@ -609,7 +609,7 @@ export type TranscriptSeed = Readonly<{
 }>;
 
 export const digestTranscriptSeed = (text: string): string => createHash("sha256")
-  .update("hra:session-transcript-seed:v1\0", "utf8")
+  .update("oompa:session-transcript-seed:v1\0", "utf8")
   .update(text, "utf8")
   .digest("hex");
 
@@ -638,9 +638,9 @@ export const renderTranscriptSeedV1 = (input: Readonly<{
   const omittedRecords = input.transcript.records.length - included
     + input.transcript.omittedRecords;
   const header = [
-    "[HRA provider handoff]",
+    "[Oompa provider handoff]",
     `This conversation ran on ${input.fromProvider} and now runs on ${input.toProvider}.`,
-    "What follows is HRA's own record of it, not the previous provider's transcript:"
+    "What follows is Oompa's own record of it, not the previous provider's transcript:"
     + " secrets, absolute paths, raw tool arguments, and raw tool output were never stored"
     + " and are not here.",
     omittedRecords > 0
@@ -652,7 +652,7 @@ export const renderTranscriptSeedV1 = (input: Readonly<{
   const text = `${header}${lines.join("\n")}`;
   return {
     text,
-    digest: createHash("sha256").update("hra:session-transcript-seed:v1\0", "utf8").update(text, "utf8").digest("hex"),
+    digest: createHash("sha256").update("oompa:session-transcript-seed:v1\0", "utf8").update(text, "utf8").digest("hex"),
     omittedRecords,
     includedRecords: included,
   };
@@ -663,7 +663,7 @@ export const renderTranscriptSeedV1 = (input: Readonly<{
  * provider is seeded with.
  *
  * The rendering is explicitly labelled as a handoff summary, is built only
- * from records that already passed HRA's redaction, is capped, and states its
+ * from records that already passed Oompa's redaction, is capped, and states its
  * own omission count. The most recent records are the ones kept: a handoff
  * needs the end of the conversation more than its beginning.
  */
@@ -684,7 +684,7 @@ export const renderTranscriptSeed = (input: Readonly<{
   const verboseHeaderFor = (omittedRecords: number): string => [
     TRANSCRIPT_SEED_HEADER,
     `This conversation ran on ${fromProvider} and now runs on ${toProvider}.`,
-    "What follows is HRA's own record of it, not the previous provider's transcript:"
+    "What follows is Oompa's own record of it, not the previous provider's transcript:"
     + " secrets, absolute paths, raw tool arguments, raw tool output, and attachment contents"
     + " were never embedded and are not here.",
     ...(retentionGapReason === undefined
@@ -692,7 +692,7 @@ export const renderTranscriptSeed = (input: Readonly<{
           ? `${String(omittedRecords)} earlier records were omitted to fit this summary.`
           : "No retained records were omitted."]
       : [
-          `WARNING: HRA pruned earlier ledger history (${retentionGapReason});`
+          `WARNING: Oompa pruned earlier ledger history (${retentionGapReason});`
           + " the number of unavailable records is unknown.",
           omittedRecords > 0
             ? `${String(omittedRecords)} additional retained records were omitted to fit this summary.`
@@ -703,7 +703,7 @@ export const renderTranscriptSeed = (input: Readonly<{
   ].join("\n");
   const compactHeaderFor = (omittedRecords: number): string => [
     TRANSCRIPT_SEED_HEADER,
-    `${fromProvider} to ${toProvider}; HRA's retained record, not the provider transcript.`,
+    `${fromProvider} to ${toProvider}; Oompa's retained record, not the provider transcript.`,
     "Secrets, absolute paths, raw tool data, and attachment contents are excluded.",
     ...(retentionGapReason === undefined
       ? [omittedRecords > 0

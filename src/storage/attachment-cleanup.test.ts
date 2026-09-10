@@ -8,7 +8,7 @@ import { AttachmentBlobStore, parseAttachmentCleanupCandidate } from "./attachme
 
 const roots: string[] = [];
 const fixture = async () => {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-attachment-cleanup-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-attachment-cleanup-")));
   roots.push(root);
   const blobs = new AttachmentBlobStore(join(root, "attachments"));
   const stored = await blobs.put("text/plain", new TextEncoder().encode("retained exact bytes"));

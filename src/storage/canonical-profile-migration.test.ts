@@ -89,7 +89,7 @@ const createWorkStore = (store: StateStore) => store.createWorkStore(1,
   });
 
 async function fixture(state: AttemptState) {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-canonical-migration-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-canonical-migration-")));
   roots.push(root);
   const paths = resolveStatePaths({ homeDirectory: root, platform: "linux", rootDirectory: join(root, "state") });
   await initializeStatePaths(paths);
@@ -217,7 +217,7 @@ describe("canonical profile real-StateStore integration", () => {
   test.each(["archive", "bind", "turn", "quarantine"] as const)(
     "session projection keeps %s mutation atomic on canonical corruption", async (operation) => {
       for (const corrupt of [false, true]) {
-        const root = await realpath(await mkdtemp(join(tmpdir(), "hra-canonical-writer-")));
+        const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-canonical-writer-")));
         roots.push(root);
         const paths = resolveStatePaths({ homeDirectory: root, platform: "linux", rootDirectory: join(root, "state") });
         await initializeStatePaths(paths);
@@ -372,7 +372,7 @@ const fixture49Schema = z.object({
     runtimeManifestSha256: z.string(), stateStoreSha256: z.string(), workStoreSha256: z.string(),
     lockSha256: z.string(), packageSha256: z.string(), bunVersion: z.literal("1.3.14") }).strict(),
   generatorSha256: z.string(), fixedNow: z.literal(10_000), daemonGeneration: z.literal(1),
-  publicSyntheticProject: z.literal("/private/tmp/hra-public-canonical49-profile-fixture/project"),
+  publicSyntheticProject: z.literal("/private/tmp/oompa-public-canonical49-profile-fixture/project"),
   usageV9Maintenance: z.string(), logicalRestoration: z.string(), payloadSha256: z.string(),
   cases: z.array(z.object({ state: z.enum(["claimed", "released", "submitted"]), sessionId: z.string(),
     workId: z.string(), taskId: z.string(), attemptId: z.string(), claim: workOperationSchema,
@@ -404,7 +404,7 @@ async function source49Fixture() {
   expect(transpiler.transformSync(currentRecipe)).toBe(originalRuntime);
   expect(sha256(canonicalWorkJson(fixture.payload))).toBe(fixture.payloadSha256);
   expect(fixture.payload.version).toEqual([{ user_version: 49 }]);
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-source49-migration-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-source49-migration-")));
   roots.push(root);
   const paths = resolveStatePaths({ homeDirectory: root, platform: "linux", rootDirectory: join(root, "state") });
   await initializeStatePaths(paths);

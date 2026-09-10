@@ -4,7 +4,7 @@ import { open, realpath, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { inventory } from "./app-browser.ts";
 import { APP_CSS_PLACEHOLDER, parseAppComplete, prepareAppShell, snapshotAppGraph } from "./build-app.ts";
-import { stageHraAppearance } from "./build-appearance.ts";
+import { stageOompaAppearance } from "./build-appearance.ts";
 import { browserIoPlugin } from "../app/fixtures/browser/config.ts";
 import {
   BROWSER_BUN_VERSION, browserDigest, browserExecutable, browserFile, browserInventory,
@@ -22,10 +22,10 @@ async function buildFixture(root: string, run: string): Promise<void> {
   const shell = await readBrowserFile(join(root, "app/index.html"));
   const outputDirectory = join(run, "fixture");
   const entry = "app/fixtures/browser/main.tsx";
-  const appearance = await stageHraAppearance(root, run);
+  const appearance = await stageOompaAppearance(root, run);
   const generation = await createStylexGeneration({
     expectedGraphs: [{ adapter: "vite", entrypoints: [entry], id: "client", kind: "client" }],
-    finalCssPath: "stylex.css", generationId: "hra-app", outputDirectory,
+    finalCssPath: "stylex.css", generationId: "oompa-app", outputDirectory,
     packageManifests: [import.meta.resolve("@hraness/ui/stylex-manifest.json"), import.meta.resolve("@hraness/design-kit/stylex-manifest.json")], rootDirectory: root,
     templates: [{ cssHref: "/stylex.css", graphId: "client", outputPath: "index.html", sourcePath: "app/index.html", stylesheetGraphId: "client" }],
   });
@@ -38,7 +38,7 @@ async function buildFixture(root: string, run: string): Promise<void> {
   await sealStylexProducedTemplate(generation, "index.html");
   const completed = await finalizeStylexGeneration({ generation, outputDirectory, rootDirectory: root });
   await appearance.verifyInputs();
-  assert.equal(completed, join(run, "fixture/hra-app"));
+  assert.equal(completed, join(run, "fixture/oompa-app"));
   const files = await inventory(completed);
   const complete = files.get("stylex-complete.json");
   assert.ok(complete !== undefined);
@@ -165,7 +165,7 @@ export async function prepareAppBrowser(run: string): Promise<void> {
   const prepared = parseBrowserPrepared({
     schemaVersion: 1, kind: "hra-browser-prepared", requestSha256: browserDigest(requestBytes),
     buildRuntime: { name: "bun", version: Bun.version, executable: await browserExecutable(process.execPath) },
-    driver, fixture: await browserInventory(join(run, "fixture/hra-app")),
+    driver, fixture: await browserInventory(join(run, "fixture/oompa-app")),
   });
   await publishBrowserJson(join(run, "prepared.json"), prepared);
 }

@@ -12,13 +12,13 @@ import {
 } from "./release-distribution-policy";
 
 const version = "1.2.3";
-const tarball = Buffer.from("exact HRA tarball");
+const tarball = Buffer.from("exact Oompa tarball");
 const tarballDigest = createHash("sha256").update(tarball).digest("hex");
-const checksum = Buffer.from(`${tarballDigest}  hraness-hra-1.2.3.tgz\n`);
+const checksum = Buffer.from(`${tarballDigest}  hraness-oompa-1.2.3.tgz\n`);
 const digest = (value: Uint8Array): string => createHash("sha256").update(value).digest("hex");
 
 const asset = (name: string, bytes: Uint8Array, id: number) => ({
-  browser_download_url: `https://github.com/hraness/hra/releases/download/v1.2.3/${name}`,
+  browser_download_url: `https://github.com/hraness/oompa/releases/download/v1.2.3/${name}`,
   digest: `sha256:${digest(bytes)}`,
   id,
   name,
@@ -26,7 +26,7 @@ const asset = (name: string, bytes: Uint8Array, id: number) => ({
   state: "uploaded",
 });
 
-describe("HRA public distribution policy", () => {
+describe("Oompa public distribution policy", () => {
   test("binds reviewed ancestry to one stable captured main commit", () => {
     const reviewedSha = "a".repeat(40);
     const nextSha = "b".repeat(40);
@@ -34,10 +34,10 @@ describe("HRA public distribution policy", () => {
       object: {
         sha,
         type: "commit",
-        url: `https://api.github.com/repos/hraness/hra/git/commits/${sha}`,
+        url: `https://api.github.com/repos/hraness/oompa/git/commits/${sha}`,
       },
       ref: "refs/heads/main",
-      url: "https://api.github.com/repos/hraness/hra/git/refs/heads/main",
+      url: "https://api.github.com/repos/hraness/oompa/git/refs/heads/main",
     });
     const comparison = (headSha: string, aheadBy: number, status: string) => ({
       ahead_by: aheadBy,
@@ -47,7 +47,7 @@ describe("HRA public distribution policy", () => {
       merge_base_commit: { sha: reviewedSha },
       status,
       total_commits: aheadBy,
-      url: `https://api.github.com/repos/hraness/hra/compare/${reviewedSha}...${headSha}`,
+      url: `https://api.github.com/repos/hraness/oompa/compare/${reviewedSha}...${headSha}`,
     });
 
     expect(parseGitHubBranchCommitSha(head(reviewedSha), "main")).toBe(reviewedSha);
@@ -81,7 +81,7 @@ describe("HRA public distribution policy", () => {
       behind_by: 0,
       merge_base_commit: { sha: reviewedSha },
       status: "ahead",
-      url: `https://api.github.com/repos/hraness/hra/compare/${reviewedSha}...${headSha}`,
+      url: `https://api.github.com/repos/hraness/oompa/compare/${reviewedSha}...${headSha}`,
     };
     const assert = (value: unknown) => assertReviewedReleaseCommitOnStableBranch(
       value,
@@ -94,7 +94,7 @@ describe("HRA public distribution policy", () => {
       { ...exact, ahead_by: 0 },
       { ...exact, behind_by: 1 },
       { ...exact, status: "diverged" },
-      { ...exact, url: `https://api.github.com/repos/hraness/hra/compare/${reviewedSha}...main` },
+      { ...exact, url: `https://api.github.com/repos/hraness/oompa/compare/${reviewedSha}...main` },
       { ...exact, base_commit: { sha: headSha } },
       { ...exact, merge_base_commit: { sha: headSha } },
     ]) expect(() => assert(invalid)).toThrow("not an ancestor");
@@ -120,23 +120,23 @@ describe("HRA public distribution policy", () => {
         },
         integrity: `sha512-${Buffer.alloc(64).toString("base64")}`,
         shasum: "b".repeat(40),
-        tarball: "https://registry.npmjs.org/@hraness/hra/-/hra-1.2.3.tgz",
+        tarball: "https://registry.npmjs.org/@hraness/oompa/-/oompa-1.2.3.tgz",
       },
       license: "MIT",
-      name: "@hraness/hra",
+      name: "@hraness/oompa",
       version,
     };
-    expect(parseNpmRelease(payload, version).tarball).toEndWith("/hra-1.2.3.tgz");
+    expect(parseNpmRelease(payload, version).tarball).toEndWith("/oompa-1.2.3.tgz");
     delete (payload._npmUser as { trustedPublisher?: unknown }).trustedPublisher;
     expect(() => parseNpmRelease(payload, version)).toThrow("trusted publisher");
   });
 
   test("classifies exact npm metadata and endpoint-specific package documents", async () => {
-    const exact = { license: "MIT", name: "@hraness/hra", version };
-    const other = { license: "MIT", name: "@hraness/hra", version: "1.2.2" };
+    const exact = { license: "MIT", name: "@hraness/oompa", version };
+    const other = { license: "MIT", name: "@hraness/oompa", version: "1.2.2" };
     const packument = {
-      _id: "@hraness/hra",
-      name: "@hraness/hra",
+      _id: "@hraness/oompa",
+      name: "@hraness/oompa",
       versions: { "1.2.2": other },
     };
     expect(classifyNpmRegistryRelease(exact, version)).toEqual(exact);
@@ -155,7 +155,7 @@ describe("HRA public distribution policy", () => {
       "dist-tags": { latest: version },
       versions: { ...packument.versions, [version]: exact },
     }, version, "latest")).toEqual(exact);
-    expect(() => classifyNpmRegistryRelease({ ...packument, _id: ["@attacker", "hra"].join("/") }, version))
+    expect(() => classifyNpmRegistryRelease({ ...packument, _id: ["@attacker", "oompa"].join("/") }, version))
       .toThrow("neither exact version metadata nor the exact package document");
     expect(() => classifyNpmRegistryRelease({
       ...packument,
@@ -183,7 +183,7 @@ describe("HRA public distribution policy", () => {
   test("requires exactly the immutable tarball and checksum bytes", () => {
     const coordinate = parseGitHubRelease({
       assets: [
-        asset("hraness-hra-1.2.3.tgz", tarball, 1),
+        asset("hraness-oompa-1.2.3.tgz", tarball, 1),
         asset("SHA256SUMS", checksum, 2),
       ],
       draft: false,

@@ -43,7 +43,7 @@ import type {
   RuntimeStartReview,
 } from "./ports";
 import { SessionEventCursorCodec } from "./session-event-cursor";
-import { CommandFailure, HraService } from "./service";
+import { CommandFailure, OompaService } from "./service";
 
 const signal = new AbortController().signal;
 
@@ -302,14 +302,14 @@ class CurrentDaemonAuthority {
 }
 
 type Fixture = Readonly<{
-  createService: () => HraService;
+  createService: () => OompaService;
   daemonGeneration: number;
   daemonBootId: string;
   eventCursors: SessionEventCursorCodec;
   paths: ReturnType<typeof resolveStatePaths>;
   projectRoot: string;
   runtime: WorkRuntime;
-  service: HraService;
+  service: OompaService;
   store: StateStore;
   workStore: WorkStore;
 }>;
@@ -326,7 +326,7 @@ afterEach(async () => {
 });
 
 async function fixture(registerStore?: (store: StateStore) => void): Promise<Fixture> {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-work-service-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-work-service-")));
   fixtureRoots.push(home);
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   const projectRoot = join(home, "Documents");
@@ -340,7 +340,7 @@ async function fixture(registerStore?: (store: StateStore) => void): Promise<Fix
   const runtime = new WorkRuntime();
   const eventCursors = new SessionEventCursorCodec(SessionEventCursorCodec.generateKey());
   const workCapabilities = new WorkCapabilityCodec(WorkCapabilityCodec.generateKey());
-  const createService = (): HraService => new HraService({
+  const createService = (): OompaService => new OompaService({
       store,
       paths,
       codex: runtime,
@@ -683,7 +683,7 @@ function beginNestedSend(
   return { providerAuthority, runtimeProfile, session };
 }
 
-describe("HraService work protocol", () => {
+describe("OompaService work protocol", () => {
   test("preserves v1 replay identity while requiring current v2 source for rebound creation", async () => {
     const value = await fixture();
     const actor = await createActor(value);
@@ -816,9 +816,9 @@ describe("HraService work protocol", () => {
     );
     expect(JSON.parse(value.runtime.startTurnCalls[0]!.message)).toMatchObject({
       control: {
-        apply: { argv: ["hra", "work", "apply", "--input-stdin"] },
+        apply: { argv: ["oompa", "work", "apply", "--input-stdin"] },
         poll: {
-          argv: ["hra", "work", "poll", created.work.id, "--actor", actor.sessionId],
+          argv: ["oompa", "work", "poll", created.work.id, "--actor", actor.sessionId],
         },
         requests: {
           checkpoint: {

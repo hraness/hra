@@ -211,7 +211,7 @@ test("upgrades exact released v0.5.0 state and restores the whole root for downg
     archiveName: "hraness-hra-0.5.0.tgz",
     archiveSha256: "d0d958a95b15989f639e60ba90a2abefa7d01a3c54af601c300657d365f39063",
     archiveSRI: "sha512-lpiJw1nEDc1CKVpnbtvw4+3+3DZAAKDJ2rvP0VZCwfzatP3gEMh6iTQNQjvZn1z4kyKCQcwo//cRg3/HLyz27Q==",
-    packageName: "@hraness/hra",
+    packageName: "@hraness/oompa",
     stateStoreSha256: "9c40a3a616f308c7387ba2861e3307624f75019aed79608626a0a7325e04caad",
     tag: "v0.5.0",
     tagCommit: "846f5c99f573f97ce99f1f23ac1ea45d93e63042",
@@ -228,7 +228,7 @@ test("upgrades exact released v0.5.0 state and restores the whole root for downg
   expect(sqlBytes.byteLength).toBe(manifest.state.sqlBytes);
   expect(sha256(sqlBytes)).toBe(manifest.state.sqlSha256);
 
-  const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-released-upgrade-")));
+  const temporary = await realpath(await mkdtemp(join(tmpdir(), "oompa-released-upgrade-")));
   const releasedRoot = join(temporary, "state");
   const backupRoot = join(temporary, "state.v0.5.0.backup");
   const upgradedRoot = join(temporary, "state.upgraded");

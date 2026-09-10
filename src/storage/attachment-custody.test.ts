@@ -24,7 +24,7 @@ async function fixture(): Promise<{
   sessionId: SessionId;
   store: StateStore;
 }> {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-attachment-custody-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-attachment-custody-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const store = new StateStore(paths, { now: () => 1_700_000_000_000 });

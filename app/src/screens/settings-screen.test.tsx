@@ -5,7 +5,7 @@ import { parseHTML } from "linkedom";
 import { fileURLToPath } from "node:url";
 import { renderToStaticMarkup } from "react-dom/server";
 
-import { decodeHistoricalProfileKey } from "../hra/cloud";
+import { decodeHistoricalProfileKey } from "../oompa/cloud";
 import type { AccountRowView, MachineView, ProfileBindingView } from "../model/settings-view";
 import { AccountBrowserLoginControls, DefaultProfileObservation, MemorySupervision } from "./settings-screen";
 import { settingsScreenStyles } from "./settings-screen.stylex";
@@ -135,17 +135,17 @@ describe("read-only memory supervision", () => {
     }],
     peerPolicies: [{
       mode: "coordinate" as const,
-      projectLabel: "HRA",
+      projectLabel: "Oompa",
       session: { label: "Planner", ref: digest("a") },
       updatedAt: now - 3_000,
     }],
     spaces: [{
       bindingDigest: digest("c"),
-      canonicalSpaceId: `hra:project:space-${"d".repeat(32)}`,
+      canonicalSpaceId: `oompa:project:space-${"d".repeat(32)}`,
       enrollment: "attached" as const,
       head: { digest: digest(head), operationSha256: digest(head), sequence: 2 },
       lastExchangeAt: now,
-      projectLabel: "HRA",
+      projectLabel: "Oompa",
       recentRecords: [{ key: "release-policy", kind: "memory_page" as const, updatedAt: now }],
       recordCount: 1,
       remoteHead: { digest: digest(head), operationSha256: digest(head), sequence: 2 },

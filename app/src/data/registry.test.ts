@@ -8,7 +8,7 @@ import {
   type DeviceRegistryPayload,
   type EncryptedEnvelope,
   type ProfileBindingPayload,
-} from "../hra/cloud";
+} from "../oompa/cloud";
 import { createCancellation } from "../lib/cancellation";
 import {
   decryptRegistryProjection,
@@ -444,11 +444,11 @@ describe("notification policy registry compatibility", () => {
   test("drops legacy Codex Desktop automation metadata before it reaches the app", async () => {
     const key = randomKeyBytes();
     const authority = { devicePublicId, keyVersion: 1, userPublicId } as const;
-    const hraTask = {
+    const oompaTask = {
       cadence: "every 60 minutes",
       id: "stask_public_hra_task",
       kind: "hra_conversation",
-      label: "Public HRA task",
+      label: "Public Oompa task",
       nextRunAt: 1_760_000_060_000,
       sessionPublicId: "sess_public_hra_session",
     } as const;
@@ -464,7 +464,7 @@ describe("notification policy registry compatibility", () => {
     // existing row rather than the current writer, which already strips it.
     const envelope = await encryptedJson({
       ...registryPayload(),
-      scheduledTasks: [hraTask, privateAutomation],
+      scheduledTasks: [oompaTask, privateAutomation],
     }, key, registryAad(authority));
     const projection = await decryptRegistryProjection({
       key,
@@ -478,7 +478,7 @@ describe("notification policy registry compatibility", () => {
       userPublicId,
     });
 
-    expect(projection.registry.scheduledTasks).toEqual([hraTask]);
+    expect(projection.registry.scheduledTasks).toEqual([oompaTask]);
     const appProjection = JSON.stringify(projection);
     for (const privateValue of [
       privateAutomation.id,
@@ -502,11 +502,11 @@ describe("notification policy registry compatibility", () => {
       peerPolicies: [],
       spaces: [{
         bindingDigest: digest("a"),
-        canonicalSpaceId: `hra:project:space-${"b".repeat(32)}`,
+        canonicalSpaceId: `oompa:project:space-${"b".repeat(32)}`,
         enrollment: "not_enrolled",
         head: { digest: digest("c"), operationSha256: null, sequence: 0 },
         lastExchangeAt: null,
-        projectLabel: "HRA",
+        projectLabel: "Oompa",
         recentRecords: [],
         recordCount: 0,
         remoteHead: null,

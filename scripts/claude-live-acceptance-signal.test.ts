@@ -36,9 +36,9 @@ class FakeRunnerSignalSource {
 }
 
 const runtime = {
-  argv: [join(tmpdir(), "hra-claude-live-signal-runtime"), "--print"],
+  argv: [join(tmpdir(), "oompa-claude-live-signal-runtime"), "--print"],
   effort: CLAUDE_PIN_EFFORT,
-  executablePath: join(tmpdir(), "hra-claude-live-signal-runtime"),
+  executablePath: join(tmpdir(), "oompa-claude-live-signal-runtime"),
   model: CLAUDE_PIN_MODEL,
   nativeFallback: CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY,
   version: CLAUDE_PIN,
@@ -57,7 +57,7 @@ describe("Claude live-acceptance signal custody", () => {
       let spawnCalls = 0;
       try {
         await expect(runClaudeForegroundLogin({
-          configDir: join(tmpdir(), "hra-claude-live-signal-config"),
+          configDir: join(tmpdir(), "oompa-claude-live-signal-config"),
           processFactory: () => {
             spawnCalls += 1;
             throw new Error("must not spawn after an early terminal signal");

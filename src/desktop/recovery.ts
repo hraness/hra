@@ -215,7 +215,7 @@ export type DesktopRecoveryResult =
       readonly switchGeneration: number;
       readonly targetProfileId: string;
       readonly diagnostic: string;
-      readonly action: "hra account switch-recover";
+      readonly action: "oompa account switch-recover";
     };
 
 export interface DesktopSwitchRecoveryControllerInput {
@@ -262,7 +262,7 @@ export class DesktopSwitchRecoveryController {
       switchGeneration: plan.switchGeneration,
       targetProfileId: plan.targetProfileId,
       diagnostic: diagnosticSchema.parse(diagnostic),
-      action: "hra account switch-recover",
+      action: "oompa account switch-recover",
     });
 
     assertNotAborted(signal);
@@ -439,7 +439,7 @@ export class DesktopSwitchRecoveryController {
         switchGeneration: plan.switchGeneration,
         targetProfileId: plan.targetProfileId,
         diagnostic: "RECOVERY_AUTHORITY_CHANGED",
-        action: "hra account switch-recover",
+        action: "oompa account switch-recover",
       };
     }
   }

@@ -7,7 +7,7 @@ import {
   generateDeviceWrappingKeyPair,
   parseDevicePublicKeyJson,
   sha256Hex,
-} from "../hra/cloud";
+} from "../oompa/cloud";
 import {
   deviceKeyFingerprint,
   fingerprintGroupCount,

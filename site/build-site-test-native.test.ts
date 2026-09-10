@@ -8,7 +8,7 @@ import { createSiteCompilerCase, siteCompilerOuterMs, siteCompilerWorkMs } from 
 
 test("collects a deadline-stalled native compiler before a fresh isolated builder succeeds", async () => {
   const sourceRoot = await realpath(join(import.meta.dir, ".."));
-  const root = await mkdtemp(join(tmpdir(), "hra-site-native-owner-"));
+  const root = await mkdtemp(join(tmpdir(), "oompa-site-native-owner-"));
   const readyPath = join(root, "native-compiler-ready.json");
   let expire: (() => void) | undefined;
   let collected: CompletedBoundedProcessResult | undefined;
@@ -48,7 +48,7 @@ test("collects a deadline-stalled native compiler before a fresh isolated builde
     expect(absence).toMatchObject({ code: "ESRCH" });
   } finally { await stalled.close(); }
 
-  const freshRoot = await mkdtemp(join(tmpdir(), "hra-site-native-fresh-"));
+  const freshRoot = await mkdtemp(join(tmpdir(), "oompa-site-native-fresh-"));
   const fresh = createSiteCompilerCase(sourceRoot);
   fresh.registerRoot(freshRoot);
   try {

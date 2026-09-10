@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 
-import { buildHraGlobalInstallCommand } from "../src/install-preflight";
+import { buildOompaGlobalInstallCommand } from "../src/install-preflight";
 
 // Package documentation is authored in root README.md. This admission contract
 // reads no website content and never renders or rewrites the package document.
@@ -10,12 +10,12 @@ export const packageDescription = "Bun CLI and local daemon for isolated Codex a
 
 const manifestSchema = z.object({
   description: z.literal(packageDescription),
-  name: z.literal("@hraness/hra"),
+  name: z.literal("@hraness/oompa"),
   version: z.literal("0.8.0"),
 });
 
-export const packageInstallCommand = buildHraGlobalInstallCommand(
-  "https://github.com/hraness/hra/releases/download/v0.8.0/hraness-hra-0.8.0.tgz",
+export const packageInstallCommand = buildOompaGlobalInstallCommand(
+  "https://github.com/hraness/oompa/releases/download/v0.8.0/hraness-oompa-0.8.0.tgz",
 );
 
 export const packageCandidateNotice = "This release candidate is not yet admitted. The v0.8.0 install command is unavailable until its immutable GitHub artifact passes exact release admission. The optional npm mirror has separate admission.";
@@ -29,7 +29,7 @@ export function assertPackageContent(manifest: unknown, readme: unknown): void {
   manifestSchema.parse(manifest);
   const text = readmeSchema.parse(readme);
   const required = [
-    "# HRA\n\n`@hraness/hra` supplies the `hra` command and local daemon.",
+    "# Oompa\n\n`@hraness/oompa` supplies the `oompa` command and local daemon.",
     "Local CLI v0.8.0 is a release candidate, not an admitted artifact",
     "The v0.8.0 candidate is not yet admitted.",
     "https://github.com/hraness/hra/tree/v0.7.1#get-started",
@@ -43,12 +43,12 @@ export function assertPackageContent(manifest: unknown, readme: unknown): void {
     "```sh\nhra doctor --offline\n```",
     packageDaemonNotice,
     "## CLI usage\n",
-    "hra session start personal --provider codex --json",
+    "oompa session start personal --provider codex --json",
     "## Package contents\n",
     "The npm archive contains CLI and daemon source, this package README, the license, and third-party notices.",
     "Website assets and website-authored content are not package inputs.",
-    "https://hra.sh/docs/status/#install-and-update",
-    "https://github.com/hraness/hra/blob/main/PRIVACY.md",
+    "https://oompa.app/docs/status/#install-and-update",
+    "https://github.com/hraness/oompa/blob/main/PRIVACY.md",
   ];
   if (required.some((part) => !text.includes(part))) {
     throw new Error("Package README is missing its technical identity, commands, or release prerequisites.");
@@ -57,7 +57,7 @@ export function assertPackageContent(manifest: unknown, readme: unknown): void {
     [packageCandidateNotice, packageInstallCommand],
     [packageInstallPrerequisite, packageInstallCommand],
     [packageInstallCommand, "\nhra doctor --offline\n"],
-    [packageDaemonNotice, "hra session start personal --provider codex --json"],
+    [packageDaemonNotice, "oompa session start personal --provider codex --json"],
   ] as const) {
     if (text.indexOf(before) >= text.indexOf(after)) {
       throw new Error("Package README places a command before its prerequisite.");
@@ -70,7 +70,7 @@ export function assertPackageContent(manifest: unknown, readme: unknown): void {
     "The v0.7.1 candidate is not yet admitted",
     "\nhra init --yes\n",
     "img.shields.io",
-    "[Open HRA]",
+    "[Open Oompa]",
     "## Use the interface that fits the work",
   ].some((part) => text.includes(part))) {
     throw new Error("Package README contains a conflicting release claim or website presentation.");

@@ -158,7 +158,7 @@ describe("pinned Codex runtime", () => {
   });
 
   test("forces both credential stores to files in the real pinned app-server", async () => {
-    const codexHome = await realpath(await mkdtemp(join(tmpdir(), "hra-codex-custody-")));
+    const codexHome = await realpath(await mkdtemp(join(tmpdir(), "oompa-codex-custody-")));
     roots.push(codexHome);
     const client = await launchPinnedCodexAppServer({
       authority: codexAuthority(1),

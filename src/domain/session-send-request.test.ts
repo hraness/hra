@@ -44,7 +44,7 @@ const request = (changes: Partial<SessionSendRequest> = {}): SessionSendRequest 
 });
 
 const hash = (domain: string, text: string): string => createHash("sha256")
-  .update(`hra:session-send-${domain}:v1\0`, "utf8").update(text, "utf8").digest("hex");
+  .update(`oompa:session-send-${domain}:v1\0`, "utf8").update(text, "utf8").digest("hex");
 
 describe("original session-send request", () => {
   test("uses parsed selector and UUID contracts without borrowing execution authority", () => {

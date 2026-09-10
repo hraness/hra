@@ -3,8 +3,8 @@
 - `index.html` is the only shell. It carries the mobile viewport with `viewport-fit=cover` and one authored module entry. The sealed build adds a same-origin appearance bootstrap before paint.
 - `src/appearance-entry.ts` and `src/appearance.ts` apply shared themes and restrict preference storage to a bounded palette/mode record. The bootstrap binds static controls; each mounted app menu owns and releases its controller reference.
 - `vite.config.ts` and the repository's app build script compile the shell with no runtime asset or style inlining. The sole authored exception is one canonical data-URI favicon pinned to the reviewed Oompa SVG bytes; it adds no image origin or public asset type. Every compiler foundation precedes one finalized same-origin StyleX recipe stylesheet.
-- `vercel.json` configures the second Vercel project (`app.hra.sh`) with the F1 Content Security Policy and the no-store shell headers.
-- `src/hra/` re-exports the browser-safe repository modules the app is allowed to reach.
+- `vercel.json` configures the second Vercel project (`app.oompa.app`) with the F1 Content Security Policy and the no-store shell headers.
+- `src/oompa/` re-exports the browser-safe repository modules the app is allowed to reach.
 - `src/auth/` holds the Convex client, the in-memory token storage adapter, and the one-time-code sign-in screen.
 - `src/custody/` holds device key generation, IndexedDB key storage, the enrollment flow, the account-key unlock context, idle lock, and presence.
 - `src/data/` holds the wire parsers, the session heads and one head, the compact history walk, the subscribed compact and detail stream tails, the session metadata cache, the session and device command hooks, the device, device registry, and archived session hooks, the composer attachment state, the in-memory hold of bytes this tab sent, and the manual grid arrangement bound to this browser.
@@ -19,7 +19,7 @@
 
 # Guidelines
 
-- Import repository source only from `src/cloud/crypto`, `src/cloud/projection`, `src/cloud/payloads`, `src/cloud/contracts`, `src/cloud/client`, and `src/domain/*`, and reach all of them through `app/src/hra/`. The other `src/cloud` modules are node-only and must never enter the bundle.
+- Import repository source only from `src/cloud/crypto`, `src/cloud/projection`, `src/cloud/payloads`, `src/cloud/contracts`, `src/cloud/client`, and `src/domain/*`, and reach all of them through `app/src/oompa/`. The other `src/cloud` modules are node-only and must never enter the bundle.
 - Never write an inline style attribute or a style element. `style-src 'self'` blocks both. Author component-owned presentation in colocated static StyleX recipes, compiled through the public `@hraness/ui/stylex-build` contract with runtime injection disabled. Retain only tokens, resets, and document grammar in `src/index.css`.
 - Reuse the pure native menu and recipe in `src/components/appearance-menu*` for both app and site. Use the public framework-neutral design-kit palette controller; do not import the aggregate shared React barrels into this closed app graph.
 - Compose primitive styles in base, finite variant/size, then caller `xstyle` order; retain ordinary caller classes last. Reject dynamic StyleX output that requires inline styles. Preserve native control semantics, physical safe-area edges, finite state behavior, and reduced-motion and forced-color contracts.

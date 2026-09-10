@@ -36,7 +36,7 @@ Fresh actual-main [CI34273862908](https://github.com/hraness/hra/actions/runs/34
 passed all eight jobs and Required;
 [CodeQL34273861597](https://github.com/hraness/hra/actions/runs/34273861597)
 and separate `bun run check:package` installation, PTY and daemon-lifecycle
-proof also passed. Exact-source deployment to hra.sh passed independent provider,
+proof also passed. Exact-source deployment to oompa.app passed independent provider,
 protected-receipt, public-content and browser verification by
 `2026-09-08T20:52:05Z`. The
 [model-routing implementation log](./model-routing-autonomy.md#implementation-log)

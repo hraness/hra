@@ -1,6 +1,6 @@
 # Session portability
 
-HRA owns a bounded, provider-neutral retained record from the point at which
+Oompa owns a bounded, provider-neutral retained record from the point at which
 the v0.6 daemon begins recording a session. On Linux, that recorded portion of
 a conversation can move from Codex to Claude Code and back while it is running,
 and it can be exported as a schema-valid letta-ai trajectory v1 array for tools
@@ -9,8 +9,8 @@ Codex switching remains available on macOS, but a switch into Claude is refused
 there until authenticated testing proves isolated Keychain custody and
 detached-daemon reads without a prompt.
 
-Before this, HRA stored no conversation of its own. Assistant text existed only
-as `assistant_delta` events, there was no record of what HRA had sent, and
+Before this, Oompa stored no conversation of its own. Assistant text existed only
+as `assistant_delta` events, there was no record of what Oompa had sent, and
 `readSession` asked the provider for its transcript: `thread/items/list` for
 Codex, and an in-memory, process-lifetime message list for Claude. A session
 therefore could not outlive its provider, and could not be handed to another
@@ -23,11 +23,11 @@ obeys the bounds and redaction rules that already governed the event stream
 (`SESSION_EVENT_MAX_BYTES`, `containsAbsolutePath`, the secret patterns, and
 the projection's `forbiddenDetailKeyPattern`).
 
-- `user_message`, the bounded text HRA sent to the provider, with the actor that
+- `user_message`, the bounded text Oompa sent to the provider, with the actor that
   authored it: `human`, `automation`, `autorespond`, `peer_session`, or `provider_switch` for a
   handoff seed.
   It is written after the provider accepted the message, so the transcript
-  never claims HRA sent something the provider rejected. Text is capped at
+  never claims Oompa sent something the provider rejected. Text is capped at
   16,384 characters and the remainder is stated as an exact
   `omittedCharacters` count. A message with attachments includes only a bounded
   manifest (safe name, media type, byte length, and SHA-256); attachment bytes
@@ -69,7 +69,7 @@ record. A tail keeps the newest records, reports the exact number additionally
 omitted from retained history, and has no continuation cursor.
 
 That retention marker does not describe an origin boundary. An adopted
-personal-home session does not import provider history from before HRA admitted
+personal-home session does not import provider history from before Oompa admitted
 it, and a session upgraded from v0.5 has no synthesized `user_message` or
 `provider_switched` events for its pre-v0.6 turns. Those older provider/local
 records may still exist on their original surfaces, but they are absent from
@@ -83,7 +83,7 @@ still has a readable conversation.
 ## Switching provider
 
 ```
-hra session switch <session> --provider codex|claude [--preset <preset>] [--account <account>] [--idempotency-key <uuid> [--preset-contract <1|2>]]
+oompa session switch <session> --provider codex|claude [--preset <preset>] [--account <account>] [--idempotency-key <uuid> [--preset-contract <1|2>]]
 ```
 
 `--preset-contract` is valid only when paired with an explicit
@@ -116,10 +116,10 @@ In order, a switch:
 
 Store schema v35 adds the append-only target, seed-intent, seed-result,
 source-release, target-release, and authority-rebind records behind that
-sequence. After a crash, HRA advances only from durable evidence and a complete
+sequence. After a crash, Oompa advances only from durable evidence and a complete
 provider projection. It never repeats an unproven target-start or seed effect.
 Before the seed result exists, abandonment may release the addressable target
-and retain the source. After the target is seeded, HRA preserves it until it can
+and retain the source. After the target is seeded, Oompa preserves it until it can
 prove the source release and complete the atomic rebind; it does not discard the
 only provider that is known to contain the handoff.
 
@@ -127,9 +127,9 @@ Every new switch receipt also names the daemon generation that admitted its
 provider effects. Claude sessions exist only in the runtime manager that
 started their isolated CLI process, so an unreleased Claude source or target
 cannot be read, resumed, or released after that generation changes. In that
-case `hra session recover` returns `RECOVERY_REQUIRED` without starting,
+case `oompa session recover` returns `RECOVERY_REQUIRED` without starting,
 seeding, ending, or otherwise probing either provider. Only an explicit
-`hra session abandon` settles the local authority: it terminalizes the session
+`oompa session abandon` settles the local authority: it terminalizes the session
 with provider-state-unknown evidence, never calls the inaccessible Claude
 side, and narrows what remains unknown only by observing an addressable Codex
 source or releasing an addressable Codex target. It never reports all provider
@@ -141,37 +141,37 @@ Claude target is still live.
 A switch is refused, with no effect, when:
 
 - a turn is active, the turn would be stranded on the outgoing provider with
-  no way to attribute its result. Stop it with `hra session stop` first;
+  no way to attribute its result. Stop it with `oompa session stop` first;
 - the session is quarantined or terminal;
 - the requested preset is not one the target provider can run (`low` on
   Claude, `fable-max` on Codex). With no `--preset`, the switch keeps the
   session's tier when the target has one and otherwise takes the target's
   highest;
 - the target is Claude and the custodian daemon is not running on Linux;
-- `--account` selects another HRA profile after the session has acquired its
-  working-memory authority. HRA does not transfer that account-bound working
+- `--account` selects another Oompa profile after the session has acquired its
+  working-memory authority. Oompa does not transfer that account-bound working
   lane in this release, so it refuses before either provider is touched. A
   same-profile Codex, Claude Code, or Devin switch remains supported;
 - the session already runs that provider, preset, and account.
 
 ### What a switch preserves, and what it cannot
 
-**Preserved:** the retained conversation as HRA saw it, what was asked, what the
+**Preserved:** the retained conversation as Oompa saw it, what was asked, what the
 assistant said, what its reasoning summaries said, which tools were called and
 whether they succeeded, and the switch boundary itself. Also the session's
 identity, its project, its note, its title, its queue, its session tasks, and
 its event stream; the session id never changes.
 
 The session's expiring working-memory authority is also preserved when the
-provider changes inside the same HRA account profile. Its current-project
-canonical memory is project-scoped and is selected again through the same HRA
+provider changes inside the same Oompa account profile. Its current-project
+canonical memory is project-scoped and is selected again through the same Oompa
 coordinator. Cross-account working-memory transfer is not implemented; start a
 new session under the target account instead.
 
 **Not preserved, and not recoverable:**
 
 - the provider's own hidden state, Codex's server-side thread and Claude's
-  full reasoning traces, neither of which HRA ever stored;
+  full reasoning traces, neither of which Oompa ever stored;
 - the provider's native thread. Codex `thread/resume` takes only a thread id,
   and the pinned Claude CLI's `--resume` takes only its own session id and
   cannot import a foreign transcript. Neither provider can be handed the
@@ -183,8 +183,8 @@ new session under the target account instead.
   reappear;
 - attachment contents. Only the byte-free manifest described above can cross a
   provider handoff or trajectory export;
-- provider history from before HRA admitted an adopted personal-home session,
-  and pre-v0.6 user messages or switch boundaries in an upgraded session. HRA
+- provider history from before Oompa admitted an adopted personal-home session,
+  and pre-v0.6 user messages or switch boundaries in an upgraded session. Oompa
   does not backfill either origin prefix into the neutral transcript, and the
   current retention-gap field does not mark it;
 - any ledger prefix removed by the seven-day, 50,000-event, or 64-MiB retention
@@ -196,16 +196,16 @@ new session under the target account instead.
 ### The seeding rule
 
 The seed is one user message, and it is built only from records that already
-passed HRA's redaction. It opens with the literal header
-`[HRA provider handoff]`, states which provider the conversation ran on and
-which it now runs on, states plainly that this is HRA's own record rather than
+passed Oompa's redaction. It opens with the literal header
+`[Oompa provider handoff]`, states which provider the conversation ran on and
+which it now runs on, states plainly that this is Oompa's own record rather than
 the previous provider's transcript, and instructs the model to ask rather than
 assume anything the summary does not state. It states the exact number of
 otherwise-retained records omitted by the 500-record and 24,576-character
 bounds. If the ledger had already pruned older history, the header separately
 warns that earlier records are unavailable and their count is unknown.
 It cannot warn about a pre-admission or pre-v0.6 origin prefix because that
-prefix was never in the HRA ledger and has no current gap marker.
+prefix was never in the Oompa ledger and has no current gap marker.
 
 It is capped at 24,576 characters. When the transcript does not fit, the
 **most recent** records are the ones kept: a handoff needs the end of a
@@ -214,13 +214,13 @@ any retention-gap reason, and the seed's digest are recorded on the
 `provider_switched` event, so the bounded text the new provider was told and
 the known-versus-unknown history boundary are provable after the fact.
 
-Codex and Claude Code start with HRA's current static preamble and closed
+Codex and Claude Code start with Oompa's current static preamble and closed
 host-tool binding. The initial Devin ACP adapter does not bind either surface in
 this release, so a switch to Devin transfers the bounded handoff seed as an
-ordinary text prompt only. The owner can still use HRA's memory and policy CLI
+ordinary text prompt only. The owner can still use Oompa's memory and policy CLI
 against that session. Devin accepts a new message while idle and a durable
 queued message for later delivery, but ACP v1 has no unambiguous in-turn steer;
-`hra session steer` therefore refuses an active Devin turn without an effect.
+`oompa session steer` therefore refuses an active Devin turn without an effect.
 
 ## The remote surface
 
@@ -268,32 +268,32 @@ The payload deliberately has no account field. Account selection is
 user-directed and stays on the machine that holds the credentials; a remote
 switch keeps the session's account.
 
-`hra remote provider <cloud-session> <codex|claude> [--preset <preset>]` is the
+`oompa remote provider <cloud-session> <codex|claude> [--preset <preset>]` is the
 CLI form. The custodian daemon applies the same Linux-only admission rule to a
 remote switch into Claude; the browser cannot widen platform support.
 
 ## Exporting a trajectory
 
 ```
-hra session export <session> [--format trajectory|json] [--out <path>]
+oompa session export <session> [--format trajectory|json] [--out <path>]
 ```
 
-`--format json` writes HRA's own neutral transcript. `--format trajectory`
+`--format json` writes Oompa's own neutral transcript. `--format trajectory`
 (the default) writes the letta-ai trajectory v1 shape. With `--out`, the path
-must not already exist. HRA creates one new mode-`0600` file and refuses an
+must not already exist. Oompa creates one new mode-`0600` file and refuses an
 existing file or symlink; use a path inside a current-user-owned private
 directory and remove it when it is no longer needed.
 
-Without `--out`, HRA writes the complete document to standard output. Use that
+Without `--out`, Oompa writes the complete document to standard output. Use that
 only with a controlled pipe. Terminal scrollback, command capture, and shell
 redirection can disclose conversation content, and shell redirection does not
-inherit HRA's private-mode, no-overwrite file checks. Prefer `--out` when
+inherit Oompa's private-mode, no-overwrite file checks. Prefer `--out` when
 keeping an export.
 
 **Upstream is import-oriented.** `@letta-ai/trajectory` and its
 `schema/trajectory-v1.schema.json` exist to normalize many agent harnesses'
 native logs *into* that shape; the package does not convert back out of it.
-HRA's runtime emits the shape without calling that normalizer. Development
+Oompa's runtime emits the shape without calling that normalizer. Development
 pins `@letta-ai/trajectory` 0.3.0 and validates representative output against
 the JSON Schema and `validateTranscript(..., { partial: true })` runtime
 validator exported by that exact package. Partial mode is deliberate: a bounded
@@ -301,32 +301,32 @@ retained tail may lack a user or assistant turn, and it may retain a tool result
 whose call fell outside the tail. Validation still enforces exact fields,
 timestamps, JSON-object argument strings, and unique tool-call ids. This proves
 the normalized document contract, not a round trip to a provider-native log or
-acceptance by every downstream tool. The mapping below is HRA's, and
+acceptance by every downstream tool. The mapping below is Oompa's, and
 `src/domain/trajectory.ts` is its runtime implementation.
 
 | Neutral record | Trajectory record | Notes |
 | --- | --- | --- |
-| (none) | `meta` | Always first and exactly `{ "role": "meta", "source": "hra" }`. Trajectory v1 forbids HRA-specific extension fields on this record. |
-| HRA export context | `observation` | Always second. Its `content` is an HRA-defined JSON string containing `hra_export_context: 1`, `session_id`, `provider`, `transcript_digest`, `omitted_records`, and optional `retention_gap_reason`; its `timestamp` is the export time. These are text inside a standard observation, not trajectory v1 properties. |
-| `user` | `user` | `role`, `content`, `timestamp`. Automation and autorespond messages are explicitly prefixed; a handoff seed keeps its own `[HRA provider handoff]` header and is not labelled twice. Attachment manifests are appended, but contents are not embedded. |
-| `assistant` | `assistant` | `role`, nonempty `content`, `timestamp`. A zero-length HRA assistant event becomes the explicit marker `[hra] assistant message was empty` because v1 forbids empty assistant prose. |
-| `reasoning` | `reasoning` | `role`, `content`, `timestamp`. The content is the provider's reasoning summary, which is all HRA ever stored. |
+| (none) | `meta` | Always first and exactly `{ "role": "meta", "source": "oompa" }`. Trajectory v1 forbids Oompa-specific extension fields on this record. |
+| Oompa export context | `observation` | Always second. Its `content` is an Oompa-defined JSON string containing `hra_export_context: 1`, `session_id`, `provider`, `transcript_digest`, `omitted_records`, and optional `retention_gap_reason`; its `timestamp` is the export time. These are text inside a standard observation, not trajectory v1 properties. |
+| `user` | `user` | `role`, `content`, `timestamp`. Automation and autorespond messages are explicitly prefixed; a handoff seed keeps its own `[Oompa provider handoff]` header and is not labelled twice. Attachment manifests are appended, but contents are not embedded. |
+| `assistant` | `assistant` | `role`, nonempty `content`, `timestamp`. A zero-length Oompa assistant event becomes the explicit marker `[oompa] assistant message was empty` because v1 forbids empty assistant prose. |
+| `reasoning` | `reasoning` | `role`, `content`, `timestamp`. The content is the provider's reasoning summary, which is all Oompa ever stored. |
 | `tool_call` | `assistant` | `content` is `null`; `tool_calls` contains one entry whose `id` is deterministically derived from the provider, turn id, event sequence, and neutral call id, whose `name` is `server/tool` or the item kind, and whose `args` is a stringified JSON object. This keeps ids unique when providers or turns reuse a native id. |
 | `tool_result` | `tool` | `tool_call_id` links to that deterministic export id when the call is inside the same provider segment of the bounded export. A tail can begin after the call and retain only its result; partial-mode validation deliberately permits that orphan. `ok` is present only when the provider's status classifies; `content` says the output was never retained. |
 | `provider_switch` | `observation` | States the providers, presets, whether the account changed, and the seed digest. |
 
-`args` deserves a note. The format requires a string, and HRA holds no raw
-arguments because it never stored them. Rather than invent provider input, HRA
+`args` deserves a note. The format requires a string, and Oompa holds no raw
+arguments because it never stored them. Rather than invent provider input, Oompa
 emits a stringified object that states exactly what it does hold:
 `{"hra_arguments_retained":false,"item_kind":"...","server":"...","tool":"...","summary":"..."}`.
-Optional keys are absent when HRA did not retain them. A consumer can therefore
-distinguish an HRA tool call from one captured with real arguments.
+Optional keys are absent when Oompa did not retain them. A consumer can therefore
+distinguish an Oompa tool call from one captured with real arguments.
 
-Event-derived records use ISO 8601 timestamps from their recorded time; the HRA
+Event-derived records use ISO 8601 timestamps from their recorded time; the Oompa
 export-context observation uses export time. Export reads one latest bounded
 retained tail and never asks a provider, so a session whose provider is gone
-still exports. HRA JSON exposes typed `retentionGapReason` and `omittedRecords`
-fields. In a trajectory document, the corresponding HRA-only values are inside
+still exports. Oompa JSON exposes typed `retentionGapReason` and `omittedRecords`
+fields. In a trajectory document, the corresponding Oompa-only values are inside
 the export-context observation's JSON text, not the trajectory meta record.
 `omittedRecords` / `omitted_records` counts only known records dropped from the
 retained tail, never an already pruned prefix whose size is unknown. Neither

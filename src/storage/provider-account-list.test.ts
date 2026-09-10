@@ -19,7 +19,7 @@ afterEach(async () => {
 });
 
 async function fixture(labels: readonly string[] = ["Zulu", "Alpha"]) {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-account-list-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-account-list-")));
   roots.push(root);
   const paths = resolveStatePaths({ homeDirectory: root, platform: "darwin" });
   await initializeStatePaths(paths);

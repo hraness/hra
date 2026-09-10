@@ -51,7 +51,7 @@ afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 async function archive(bytes: Uint8Array) {
-  const root = await mkdtemp(join(tmpdir(), "hra-joined-column-audit-"));
+  const root = await mkdtemp(join(tmpdir(), "oompa-joined-column-audit-"));
   roots.push(root);
   const path = join(root, "state.sqlite");
   await writeFile(path, bytes, { mode: 0o600 });

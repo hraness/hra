@@ -17,7 +17,7 @@
  */
 
 /** The one key this app writes outside IndexedDB. Versioned so a shape change is a new key. */
-export const cardOrderStorageKey = "hra.grid-order.v1";
+export const cardOrderStorageKey = "oompa.grid-order.v1";
 
 /** A bound on the stored list, so an account with many sessions cannot grow it without end. */
 export const maximumOrderedCards = 200;

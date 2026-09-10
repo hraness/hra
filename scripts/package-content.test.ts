@@ -23,8 +23,8 @@ describe("independently authored package content", () => {
     await assertPackageContentAt(join(import.meta.dir, ".."));
     expect(await readFile(new URL("../README.md", import.meta.url), "utf8")).toBe(readme);
     expect(manifest.description).toBe(packageDescription);
-    expect(readme.split("\n")[0]).toBe("# HRA");
-    expect(readme).toContain("The local CLI does not need an HRA cloud identity.");
+    expect(readme.split("\n")[0]).toBe("# Oompa");
+    expect(readme).toContain("The local CLI does not need an Oompa cloud identity.");
     expect(readme).toContain("optional encrypted sync");
     expect(readme).toContain("Codex execution supports macOS and Linux; Claude Code execution supports Linux.");
   });
@@ -39,12 +39,12 @@ describe("independently authored package content", () => {
     expect(readme.indexOf(packageInstallPrerequisite)).toBeLessThan(readme.indexOf(packageInstallCommand));
     expect(readme.indexOf(packageInstallCommand)).toBeLessThan(readme.indexOf("\nhra doctor --offline\n"));
     expect(readme).toContain(packageDaemonNotice);
-    expect(readme.indexOf(packageDaemonNotice)).toBeLessThan(readme.indexOf("hra session start personal --provider codex --json"));
-    expect(readme).toContain("[Availability](https://hra.sh/docs/status/)");
-    expect(readme).toContain("[ordered update runbook](https://hra.sh/docs/status/#install-and-update)");
-    expect(readme).toContain("https://github.com/hraness/hra/blob/main/PRIVACY.md");
-    expect(readme).toContain("HRA is maintained by [Hraness](https://hraness.com/) and published under the MIT license.");
-    expect(readme.match(/HRA is maintained by/gu)).toHaveLength(1);
+    expect(readme.indexOf(packageDaemonNotice)).toBeLessThan(readme.indexOf("oompa session start personal --provider codex --json"));
+    expect(readme).toContain("[Availability](https://oompa.app/docs/status/)");
+    expect(readme).toContain("[ordered update runbook](https://oompa.app/docs/status/#install-and-update)");
+    expect(readme).toContain("https://github.com/hraness/oompa/blob/main/PRIVACY.md");
+    expect(readme).toContain("Oompa is maintained by [Hraness](https://hraness.com/) and published under the MIT license.");
+    expect(readme.match(/Oompa is maintained by/gu)).toHaveLength(1);
     expect(readme).not.toContain("short for harness");
     expect(readme).not.toContain("invite-only beta");
     expect(readme).not.toContain("\u2014");
@@ -74,7 +74,7 @@ describe("independently authored package content", () => {
     for (const version of ["0.7.0", "0.7.1", "0.7.2", "0.8.1", "v0.8.0", "0.8.0-beta.1", ""]) {
       expect(() => assertPackageContent({ ...manifest, version }, readme)).toThrow();
     }
-    for (const name of ["hra", ["@", "other", "/hra"].join(""), ""]) {
+    for (const name of ["oompa", ["@", "other", "/oompa"].join(""), ""]) {
       expect(() => assertPackageContent({ ...manifest, name }, readme)).toThrow();
     }
     for (const value of [null, [], true, 1, {}, "manifest"]) {

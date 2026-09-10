@@ -12,7 +12,7 @@ import { StateStore } from "./state-store";
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const dispose of cleanup.splice(0).reverse()) await dispose(); });
 const fixture = async () => {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-claude-custody-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-claude-custody-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const store = new StateStore(paths, { now: () => 10_000 });

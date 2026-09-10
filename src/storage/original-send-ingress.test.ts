@@ -21,7 +21,7 @@ afterEach(async () => {
 });
 
 async function fixture() {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-original-send-ingress-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-original-send-ingress-")));
   roots.push(root);
   const paths = resolveStatePaths({ rootDirectory: root });
   await initializeStatePaths(paths);

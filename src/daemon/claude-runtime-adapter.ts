@@ -31,7 +31,7 @@ import {
   type PinnedClaudeRuntime,
   type ResolvePinnedClaudeRuntimeOptions,
 } from "../claude/index";
-import type { HraHostToolCall } from "../codex/protocol";
+import type { OompaHostToolCall } from "../codex/protocol";
 import type { PreparedAttachment } from "../domain/attachments";
 import { claudeProviderAccountIdSchema } from "../domain/provider-accounts";
 import type {
@@ -164,8 +164,8 @@ type RunningSession = {
   updatedAt: number;
   /**
    * The bounded local transcript. Claude Code publishes no thread-read
-   * method, so HRA is the only record of what this session said: the
-   * projection every reader sees (`hra session show`, the compact cloud
+   * method, so Oompa is the only record of what this session said: the
+   * projection every reader sees (`oompa session show`, the compact cloud
    * projection, and the recovery baseline) is assembled here from the same
    * facts the event stream carries.
    */
@@ -180,7 +180,7 @@ type RunningSession = {
 
 type RetainedHostToolCall = Readonly<{
   bindingId: string;
-  call: HraHostToolCall;
+  call: OompaHostToolCall;
   requestDigest: string;
 }>;
 
@@ -193,13 +193,13 @@ type UnboundHostToolBinding = Readonly<{
 export type { ClaudeSessionFact } from "./claude-session-facts";
 
 export type ClaudeRuntimeObserver = {
-  hraHostTool?(
+  oompaHostTool?(
     authority: ProfileAuthority,
-    call: HraHostToolCall,
+    call: OompaHostToolCall,
   ): ClaudeHostToolPublicResult | Promise<ClaudeHostToolPublicResult>;
-  hraHostToolResponseWritten?(
+  oompaHostToolResponseWritten?(
     authority: ProfileAuthority,
-    call: HraHostToolCall,
+    call: OompaHostToolCall,
   ): void | Promise<void>;
   fact(authority: ProfileAuthority, fact: ClaudeSessionFact): void | Promise<void>;
 };
@@ -236,7 +236,7 @@ const INITIALIZATION_FACT_LIMIT = 16;
 
 const requestDigestOf = (requestId: string, request: ClaudeCanUseTool): string =>
   createHash("sha256")
-    .update("hra:claude-interaction-authority:v1\0", "utf8")
+    .update("oompa:claude-interaction-authority:v1\0", "utf8")
     .update(JSON.stringify({ requestId, toolUseId: request.toolUseId }), "utf8")
     .digest("hex");
 
@@ -636,7 +636,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
   /**
    * Reclaims a durable Claude conversation only after its external process is
    * proven gone. The new pinned stream owns stdin and therefore has the same
-   * interaction and autorespond authority as a session HRA created itself.
+   * interaction and autorespond authority as a session Oompa created itself.
    */
   async claimSession(input: {
     authority: ProfileAuthority;
@@ -792,7 +792,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
       throw new ClaudeError("INVALID_INPUT", "The Claude session already has an active turn.");
     }
     await this.#assertSessionConfig(session, input.signal);
-    // HRA mints the turn id: Claude's own `result` line is the only turn
+    // Oompa mints the turn id: Claude's own `result` line is the only turn
     // boundary it publishes, and it carries no id of its own.
     const turnId = randomUUID();
     const startAttachments = input.attachments ?? [];
@@ -1037,10 +1037,10 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
       requestDigest: call.requestDigest,
     });
     try {
-      if (this.#observer.hraHostTool === undefined) {
-        throw new ClaudeError("UNSUPPORTED_CAPABILITY", "The HRA host-tool service is unavailable.");
+      if (this.#observer.oompaHostTool === undefined) {
+        throw new ClaudeError("UNSUPPORTED_CAPABILITY", "The Oompa host-tool service is unavailable.");
       }
-      return await this.#observer.hraHostTool(session.authority, normalized);
+      return await this.#observer.oompaHostTool(session.authority, normalized);
     } catch (error: unknown) {
       session.hostToolCalls.delete(key);
       this.#rememberHostToolCall(session, key, call.requestDigest);
@@ -1061,7 +1061,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     ) {
       throw new ClaudeError("AUTHORITY_STALE", "Claude host-tool response receipt is stale.");
     }
-    await this.#observer.hraHostToolResponseWritten?.(session.authority, retained.call);
+    await this.#observer.oompaHostToolResponseWritten?.(session.authority, retained.call);
     session.hostToolCalls.delete(key);
     this.#rememberHostToolCall(session, key, receipt.requestDigest);
   }
@@ -1082,7 +1082,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     session: RunningSession,
     turnId: string,
     call: ClaudeHostToolCall,
-  ): HraHostToolCall {
+  ): OompaHostToolCall {
     const base = {
       authority: {
         processGeneration: session.authority.generation,
@@ -1110,7 +1110,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
 
   #hostToolCallKey(callId: string): string {
     return createHash("sha256")
-      .update("hra:claude-runtime-host-call:v1\0", "utf8")
+      .update("oompa:claude-runtime-host-call:v1\0", "utf8")
       .update(callId, "utf8")
       .digest("hex");
   }
@@ -1135,7 +1135,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
       const detail = error instanceof ClaudeError ? error.message : "it could not be admitted";
       throw new ClaudeError(
         "RUNTIME_MISMATCH",
-        `HRA cannot start a Claude Code session on this machine: ${detail}. `
+        `Oompa cannot start a Claude Code session on this machine: ${detail}. `
         + `Install Claude Code ${CLAUDE_PIN} exactly, put \`claude\` on this daemon's PATH, `
         + "then sign in inside the configured Claude profile and retry.",
         { cause: error },
@@ -1233,7 +1233,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     const response = {
       responseDigest: session.client.validateInteractionResolution(requestId, {
         kind: "deny",
-        message: "HRA did not receive a decision in time",
+        message: "Oompa did not receive a decision in time",
       }).responseDigest,
     };
     input.signal.throwIfAborted();
@@ -1251,7 +1251,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     return await this.#withWriteWitness(session.client, "interaction/resolve", async (onWriteStarted) => {
       await session.client.resolveInteraction(requestId, {
         kind: "deny",
-        message: "HRA did not receive a decision in time",
+        message: "Oompa did not receive a decision in time",
       }, onWriteStarted);
       this.#reportInteractionSettled(session, requestId);
       input.signal.throwIfAborted();
@@ -1379,13 +1379,13 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     if (!isAdmittedPresetRequirement(input.preset, input.requirement)) {
       throw new ClaudeError(
         "UNSUPPORTED_CAPABILITY",
-        `${input.preset} requested an unadmitted exact HRA model and reasoning tuple`,
+        `${input.preset} requested an unadmitted exact Oompa model and reasoning tuple`,
       );
     }
     if (input.fast) {
       throw new ClaudeError(
         "UNSUPPORTED_CAPABILITY",
-        "Claude Code has no HRA fast mode; start the session without `--fast`.",
+        "Claude Code has no Oompa fast mode; start the session without `--fast`.",
       );
     }
     const projectRoot = input.projectRoot;
@@ -1749,7 +1749,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     if (initialization.providerSessionId !== providerThreadId) {
       throw new ClaudeError(
         "PROTOCOL_ERROR",
-        "Claude initialized a different provider session than HRA requested.",
+        "Claude initialized a different provider session than Oompa requested.",
       );
     }
     if (
@@ -1759,7 +1759,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     ) {
       throw new ClaudeError(
         "RUNTIME_MISMATCH",
-        "Claude initialized with a different version, model, or permission mode than HRA reviewed.",
+        "Claude initialized with a different version, model, or permission mode than Oompa reviewed.",
       );
     }
   }
@@ -1900,7 +1900,7 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
       messages: [...session.messages],
       omission: {
         hasMoreOlderTurns: session.droppedTurns > 0,
-        // Every turn HRA started is proven by its own `user` line and its
+        // Every turn Oompa started is proven by its own `user` line and its
         // `result`, so nothing is ever unread or incomplete here.
         incompleteTurnIds: [],
         omittedMessages: session.droppedMessages,

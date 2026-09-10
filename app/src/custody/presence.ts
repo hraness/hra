@@ -7,7 +7,7 @@
  * stores it and refuses a heartbeat whose fingerprint does not match the
  * sequence it claims, so this is a wire contract rather than a local choice.
  */
-import { sha256Hex } from "../hra/cloud";
+import { sha256Hex } from "../oompa/cloud";
 import type { WirePresenceArgs } from "../data/functions";
 
 export type PresenceIdentity = Readonly<{

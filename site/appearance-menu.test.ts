@@ -14,7 +14,7 @@ describe("public appearance delivery", () => {
     const compiled = await collector.transform(await readFile(path, "utf8"), path);
     const css = compiled.rules.map(([, rule]) => rule.ltr).join("\n");
     const { document } = parseHTML(renderSiteHtml());
-    const menu = document.querySelector("[data-hra-appearance]")!;
+    const menu = document.querySelector("[data-oompa-appearance]")!;
     for (const element of [menu, ...menu.querySelectorAll("[class]")]) {
       for (const className of element.classList) expect(css).toContain(`.${className}`);
     }
@@ -29,15 +29,15 @@ describe("public appearance delivery", () => {
   test("public pages expose one native header menu and a blocking external bootstrap", () => {
     for (const html of [renderSiteHtml(), renderPrivacyHtml(), ...Object.values(renderDocsPages())]) {
       const { document } = parseHTML(html);
-      const menus = document.querySelectorAll("details[data-hra-appearance]");
+      const menus = document.querySelectorAll("details[data-oompa-appearance]");
       expect(menus.length).toBe(1);
       const menu = menus[0]!;
       expect(menu.closest("header")).not.toBeNull();
       expect(menu.nextElementSibling).toBeNull();
-      const palettes = menu.querySelectorAll("select[data-hra-palette] option");
+      const palettes = menu.querySelectorAll("select[data-oompa-palette] option");
       expect([...palettes].map((option) => option.getAttribute("value"))).toEqual([...designPalettes]);
       expect([...palettes].map((option) => option.textContent)).toEqual(designPalettes.map((palette) => designPaletteLabels[palette]));
-      expect(menu.querySelectorAll("select[data-hra-mode] option").length).toBe(3);
+      expect(menu.querySelectorAll("select[data-oompa-mode] option").length).toBe(3);
       const bootstrap = document.head.querySelector('script[src="/appearance.js"]');
       expect(bootstrap).not.toBeNull();
       expect(bootstrap?.hasAttribute("async")).toBe(false);

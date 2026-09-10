@@ -10,8 +10,8 @@ test("authority supervisor keeps control separate from target stdio", async () =
 
   expect(source).toContain("--control-socket");
   expect(source).toContain("--nonce");
-  expect(source).toContain("HRA_AUTHORITY_SUPERVISOR/1 READY");
-  expect(source).toContain("HRA_AUTHORITY_SUPERVISOR/1 CLEAN");
+  expect(source).toContain("OOMPA_AUTHORITY_SUPERVISOR/1 READY");
+  expect(source).toContain("OOMPA_AUTHORITY_SUPERVISOR/1 CLEAN");
   expect(source).toContain("init_host_pid");
   expect(source).toContain("init_start_time");
   expect(source).toContain("init_pid_namespace_inode");
@@ -292,7 +292,7 @@ test("recovery binds the sealed init namespace while revalidating both process i
   expect(source).toContain("RECOVERY_READY nonce={s} recovery_pid={d} recovery_start_time={d} outer_pid={d} outer_start_time={d} init_host_pid={d} init_start_time={d} init_pid_namespace_inode={d}");
   expect(source).toContain("RECOVERY_CLEAN nonce={s} recovery_pid={d} recovery_start_time={d} outer_pid={d} outer_start_time={d} boot_id={s} init_host_pid={d} init_start_time={d} init_pid_namespace_inode={d} method={s}");
   expect(source).toContain("never claims remote provider-effect rollback");
-  expect(source).toContain("Before RECOVERY_GO, HRA must bind recovery_pid");
+  expect(source).toContain("Before RECOVERY_GO, Oompa must bind recovery_pid");
   expect(source).toContain("nonce-authenticated, nondumpable helper reports");
-  expect(source).toContain("HRA binds RECOVERY_CLEAN to that exact");
+  expect(source).toContain("Oompa binds RECOVERY_CLEAN to that exact");
 });

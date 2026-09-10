@@ -27,7 +27,7 @@ function manifest(attachments: readonly StoredMessageAttachment[]) {
 }
 
 async function fixture() {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-queue-attachment-identity-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-queue-attachment-identity-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const clock = { now: 1_800_000_000_000 };

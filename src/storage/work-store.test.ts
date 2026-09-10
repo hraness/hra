@@ -441,7 +441,7 @@ async function originalSendOwnerFixture(): Promise<Fixture & Readonly<{
   daemonGeneration: number;
   bootId: string;
 }>> {
-  const home = await realpath(await mkdtemp(joinPath(tmpdir(), "hra-work-send-owner-")));
+  const home = await realpath(await mkdtemp(joinPath(tmpdir(), "oompa-work-send-owner-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const now = { value: 10_000 };
@@ -2366,7 +2366,7 @@ describe("WorkStore original send ownership", () => {
 });
 
 describe("WorkStore claims, fences, and prepared effects", () => {
-  test("requires signed-in HRA account authority for established Claude work", () => {
+  test("requires signed-in Oompa account authority for established Claude work", () => {
     const value = fixture();
     value.database.query("UPDATE sessions SET provider='claude' WHERE profile_id=?")
       .run(value.accountId);
@@ -2987,7 +2987,7 @@ describe("WorkStore claims, fences, and prepared effects", () => {
     expect(claimTask()).toMatchObject({ kind: "task.claim" });
   });
 
-  test("refuses Codex work admission while the HRA profile is signed out", () => {
+  test("refuses Codex work admission while the Oompa profile is signed out", () => {
     const value = fixture();
     value.database.query("UPDATE profiles SET state='signed_out',process_generation=0 WHERE id=?")
       .run(value.accountId);

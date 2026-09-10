@@ -238,7 +238,7 @@ describe("dark canonical memory sync", () => {
       "userId",
       "wrappedSpaceKey",
     ]);
-    expect(JSON.stringify(stored)).not.toContain("hra:project:");
+    expect(JSON.stringify(stored)).not.toContain("oompa:project:");
     expect(JSON.stringify(stored)).not.toContain("canonicalRealmId");
 
     await expect(world.browser.query(getHead, { spaceId }))

@@ -25,7 +25,7 @@ const recordSchema = z.object({
 }).strict();
 export type TerminalAttachmentAcknowledgment = z.infer<typeof recordSchema>;
 const digestOf = (record: TerminalAttachmentAcknowledgment): string =>
-  hash(`hra:attachment-terminal-acknowledgment:v1\0${JSON.stringify(record)}`);
+  hash(`oompa:attachment-terminal-acknowledgment:v1\0${JSON.stringify(record)}`);
 const table = "attachment_terminal_acknowledgments";
 const anchor = "attachment_terminal_acknowledgment_anchors";
 const json = (alias: string, field: string): string => `json_extract(${alias}.acknowledgment_json,'$.${field}')`;
@@ -194,7 +194,7 @@ function facts(db: Database, attemptId: string) {
   if (JSON.stringify(resolution) !== resolutionJson) return failure();
   const originJson = decoder.decode(row.origin_bytes);
   const origin = JSON.parse(originJson) as unknown;
-  if (JSON.stringify(origin) !== originJson || hash(JSON.stringify({ domain: "hra:attachment-custody:v1", value: origin })) !== row.attachment_input_digest) return failure();
+  if (JSON.stringify(origin) !== originJson || hash(JSON.stringify({ domain: "oompa:attachment-custody:v1", value: origin })) !== row.attachment_input_digest) return failure();
   const effect = readMutationEffectEvidenceProvenance(db, attemptId);
   if (effect.kind !== "parsed" || effect.evidence.kind !== row.kind || effect.evidence.clientMessageId !== row.id
     || hash(effect.canonicalJson) !== effect.digest) return failure();

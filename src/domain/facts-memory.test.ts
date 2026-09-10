@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import * as publicHraApi from "../index";
+import * as publicOompaApi from "../index";
 import {
   createFactsMemoryBinding,
   digestFactsMemoryPurgeReceipt,
@@ -18,10 +18,10 @@ describe("facts-memory public authority values", () => {
   test("keeps host custody and purge controls out of the package's agent-facing surface", () => {
     for (const key of [
       "FactsMemoryControlStore",
-      "HraFactsMemoryLifecycle",
+      "OompaFactsMemoryLifecycle",
       "LocalFactsMemoryBroker",
       "factsMemoryBindingSchema",
-    ]) expect(Object.hasOwn(publicHraApi, key)).toBe(false);
+    ]) expect(Object.hasOwn(publicOompaApi, key)).toBe(false);
   });
 
   test("derives a stable binding only from the host-owned owner/session pair", () => {

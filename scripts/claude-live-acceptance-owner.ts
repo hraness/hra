@@ -86,13 +86,13 @@ export async function acquireClaudeLiveAcceptanceOwner(input: Readonly<{
     const parent = dirname(receiptPath);
     const temporaryRoot = realpathSync(tmpdir());
     if (!isAbsolute(receiptPath) || resolve(receiptPath) !== receiptPath
-      || basename(receiptPath) !== `.hra-live-claude-acceptance-${runId}.recovery.json`
+      || basename(receiptPath) !== `.oompa-live-claude-acceptance-${runId}.recovery.json`
       || (parent !== temporaryRoot && !parent.startsWith(`${temporaryRoot}${sep}`))
       || privatePathsOverlap(parent, homedir()) || privatePathsOverlap(parent, resolveStatePaths().root)
       || realpathSync(parent) !== parent) return refused("scope_refused");
     const uid = process.getuid?.();
     if (uid === undefined) return refused("primitive_unavailable");
-    const lockPath = join(parent, `.hra-live-claude-acceptance-${runId}.lock`);
+    const lockPath = join(parent, `.oompa-live-claude-acceptance-${runId}.lock`);
     parentFd = openSync(parent, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK | constants.O_DIRECTORY);
     const parentIdentity = fstatSync(parentFd);
     requireThat(parentIdentity.isDirectory() && parentIdentity.nlink > 0 && sameNode(parentIdentity, lstatSync(parent)));

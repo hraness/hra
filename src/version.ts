@@ -1,3 +1,3 @@
 import packageMetadata from "../package.json";
 
-export const HRA_VERSION = packageMetadata.version;
+export const OOMPA_VERSION = packageMetadata.version;

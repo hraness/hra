@@ -46,7 +46,7 @@ const link = (label: string, href: string): InlineContent => ({ kind: "link", la
 const paragraph = (...content: readonly InlineContent[]): ContentBlock => ({ kind: "paragraph", content });
 const commands = (...values: readonly string[]): ContentBlock => ({ kind: "commands", commands: values });
 const list = (...items: readonly (readonly InlineContent[])[]): ContentBlock => ({ kind: "list", items });
-const source = (path: string): string => `https://github.com/hraness/hra/blob/main/${path}`;
+const source = (path: string): string => `https://github.com/hraness/oompa/blob/main/${path}`;
 
 const candidateInstallNotice: ContentBlock = {
   kind: "notice",
@@ -62,7 +62,7 @@ const candidateInstallNotice: ContentBlock = {
     text(isAdmittedRelease(publicContent.releaseVersion)
       ? ` for v${admittedReleaseVersion}, or use its `
       : ` for v${admittedReleaseVersion}. Only after immutable GitHub release admission may you run the candidate install command below. For the admitted v${admittedReleaseVersion} artifact, you can also use its `),
-    link("immutable README", `https://github.com/hraness/hra/tree/v${admittedReleaseVersion}#get-started`),
+    link("immutable README", `https://github.com/hraness/oompa/tree/v${admittedReleaseVersion}#get-started`),
     text(". Neither artifact admission nor installation authorizes daemon startup."),
   ],
 };
@@ -85,8 +85,8 @@ const setupNotice: ContentBlock = {
 export const docsPages: readonly DocsPage[] = [
   {
     path: "/docs/",
-    title: "HRA documentation",
-    description: "Set up HRA, follow your coding sessions in the web app, and use the terminal or CLI when you need more control.",
+    title: "Oompa documentation",
+    description: "Set up Oompa, follow your coding sessions in the web app, and use the terminal or CLI when you need more control.",
     keywords: ["guides", "browser", "CLI", "getting started"],
     reviewDate: "2026-09-08",
     admission: {
@@ -94,8 +94,8 @@ export const docsPages: readonly DocsPage[] = [
       checkedOn: "2026-09-08",
       reassessOn: "2026-10-20",
       decision: "keep",
-      readerJob: "Choose the right HRA guide without first reading the command catalog.",
-      contribution: "A task map separates browser supervision, local setup, conversation management, automation, and current availability using HRA's actual entry points.",
+      readerJob: "Choose the right Oompa guide without first reading the command catalog.",
+      contribution: "A task map separates browser supervision, local setup, conversation management, automation, and current availability using Oompa's actual entry points.",
       overlapDecision: "The homepage explains the product; Start is a procedure; Reference is an interface catalog. This index connects those different tasks without repeating their procedures.",
       evidence: ["app/src/routing/route.ts", "src/cli/parser.ts", "site/content.ts"],
       scores: [2, 2, 2, 2, 2, 2],
@@ -106,7 +106,7 @@ export const docsPages: readonly DocsPage[] = [
         heading: "What do you want to do?",
         blocks: [
           list(
-            [link("Set up HRA", "/docs/start/"), text(": install the CLI, connect a provider account, and open your first session.")],
+            [link("Set up Oompa", "/docs/start/"), text(": install the CLI, connect a provider account, and open your first session.")],
             [link("Use the web app", "/docs/web/"), text(": pair a browser, follow the session grid, and send the next instruction.")],
             [link("Manage sessions and accounts", "/docs/sessions/"), text(": continue a conversation, switch providers, inspect usage, or recover a stopped flow.")],
             [link("Find a command", "/docs/reference/"), text(": look up CLI families, machine-readable output, memory, and automation.")],
@@ -115,16 +115,16 @@ export const docsPages: readonly DocsPage[] = [
         ],
       },
       {
-        id: "three-parts-of-hra",
+        id: "three-parts-of-oompa",
         heading: "Your machine runs the work. You choose the interface.",
         blocks: [
-          paragraph(text("HRA keeps Codex and Claude Code sessions on the machine that runs them. The web app shows their synchronized state; the terminal and CLI address the same local accounts and conversations. Other devices can send commands, but do not take over execution.")),
+          paragraph(text("Oompa keeps Codex and Claude Code sessions on the machine that runs them. The web app shows their synchronized state; the terminal and CLI address the same local accounts and conversations. Other devices can send commands, but do not take over execution.")),
           list(
             [code("Provider account"), text(": your Codex or Claude Code sign-in, owned by that provider and used on the execution machine.")],
-            [code("HRA identity"), text(": an email sign-in for optional encrypted sync and paired devices. It does not sign you into a provider.")],
-            [code("Session"), text(": one HRA conversation with an account, project, and execution machine. Changing its provider does not move a provider-native thread.")],
+            [code("Oompa identity"), text(": an email sign-in for optional encrypted sync and paired devices. It does not sign you into a provider.")],
+            [code("Session"), text(": one Oompa conversation with an account, project, and execution machine. Changing its provider does not move a provider-native thread.")],
           ),
-          paragraph(text("Local use does not require an HRA cloud identity. The web app does require sync, an approved machine, and a paired browser. "), link("Current setup limits", "/docs/status/"), text(" apply to either route.")),
+          paragraph(text("Local use does not require an Oompa cloud identity. The web app does require sync, an approved machine, and a paired browser. "), link("Current setup limits", "/docs/status/"), text(" apply to either route.")),
         ],
       },
     ],
@@ -133,7 +133,7 @@ export const docsPages: readonly DocsPage[] = [
   },
   {
     path: "/docs/start/",
-    title: "Set up HRA",
+    title: "Set up Oompa",
     description: "Find the admitted CLI and this candidate's installation limits, then follow the first-run path only when artifact admission and rollout prerequisites are satisfied.",
     keywords: ["install", "setup", "login", "first session", "Bun"],
     reviewDate: "2026-09-09",
@@ -142,7 +142,7 @@ export const docsPages: readonly DocsPage[] = [
       checkedOn: "2026-09-09",
       reassessOn: "2026-10-06",
       decision: "keep",
-      readerJob: "Install HRA safely and understand the shortest path to a first local conversation.",
+      readerJob: "Install Oompa safely and understand the shortest path to a first local conversation.",
       contribution: "An ordered installer-to-session path separates the immutable admitted predecessor from the unavailable candidate installer and puts the still-closed startup boundary before the first state-changing setup command.",
       overlapDecision: "The homepage offers a product overview, Sessions covers an existing setup, and Status owns upgrade and rollout detail. This page alone owns first-run order.",
       evidence: ["src/install-preflight.ts", "src/cli/parser.ts", "site/content.ts", "docs/beta-release-notes.md"],
@@ -155,9 +155,9 @@ export const docsPages: readonly DocsPage[] = [
         blocks: [
           candidateInstallNotice,
           commands(publicContent.installCommand),
-          paragraph(text(`Only after exact artifact admission, use macOS or Linux with Bun ${publicPins.bun} and curl to install v${publicContent.releaseVersion}. The installer verifies the immutable release before replacing the HRA command. It does not start the daemon.`)),
-          commands("hra --version", publicContent.doctorCommand),
-          paragraph(text("Already using HRA? Follow the "), link("update runbook", "/docs/status/#install-and-update"), text(" before changing a daemon or restoring local state. Do not apply first-run instructions to an existing installation.")),
+          paragraph(text(`Only after exact artifact admission, use macOS or Linux with Bun ${publicPins.bun} and curl to install v${publicContent.releaseVersion}. The installer verifies the immutable release before replacing the Oompa command. It does not start the daemon.`)),
+          commands("oompa --version", publicContent.doctorCommand),
+          paragraph(text("Already using Oompa? Follow the "), link("update runbook", "/docs/status/#install-and-update"), text(" before changing a daemon or restoring local state. Do not apply first-run instructions to an existing installation.")),
         ],
       },
       {
@@ -166,27 +166,27 @@ export const docsPages: readonly DocsPage[] = [
         blocks: [
           setupNotice,
           paragraph(text("After the rollout prerequisites are satisfied, run these as separate commands in a foreground terminal. Initialization sets up the local state and a default project. Name your profile, then let Codex complete its own device-code sign-in.")),
-          commands(publicContent.initCommand, "hra account add personal", "hra account login personal --provider codex --device-code"),
-          paragraph(text("For Claude Code on Linux, use "), code("hra account login personal --provider claude"), text(" instead. Claude owns its terminal prompts and browser handoff. Managed Claude login and execution are not available on macOS, and Claude has no HRA browser-linking flow.")),
-          paragraph(text("Provider login is a one-shot command, not a command inside HRA's persistent shell. HRA never asks you to paste a provider credential. "), link("Account status and login recovery", "/docs/sessions/#accounts"), text(" cover an interrupted sign-in.")),
+          commands(publicContent.initCommand, "oompa account add personal", "oompa account login personal --provider codex --device-code"),
+          paragraph(text("For Claude Code on Linux, use "), code("oompa account login personal --provider claude"), text(" instead. Claude owns its terminal prompts and browser handoff. Managed Claude login and execution are not available on macOS, and Claude has no Oompa browser-linking flow.")),
+          paragraph(text("Provider login is a one-shot command, not a command inside Oompa's persistent shell. Oompa never asks you to paste a provider credential. "), link("Account status and login recovery", "/docs/sessions/#accounts"), text(" cover an interrupted sign-in.")),
         ],
       },
       {
         id: "open-a-conversation",
         heading: "3. Start a conversation",
         blocks: [
-          paragraph(text("With setup complete and your provider signed in, start a session. Keep the session ID returned by the first command. Open HRA's shell and select that exact session before writing your request.")),
-          paragraph(text("If you signed in to Claude Code, replace the first command below with "), code("hra session start personal --provider claude --preset fable-max"), text(". The remaining shell steps are the same.")),
-          commands("hra session start personal --provider codex", "hra", "/account personal", "/session <session-id>", "Review this project and summarize its current state."),
+          paragraph(text("With setup complete and your provider signed in, start a session. Keep the session ID returned by the first command. Open Oompa's shell and select that exact session before writing your request.")),
+          paragraph(text("If you signed in to Claude Code, replace the first command below with "), code("oompa session start personal --provider claude --preset fable-max"), text(". The remaining shell steps are the same.")),
+          commands("oompa session start personal --provider codex", "oompa", "/account personal", "/session <session-id>", "Review this project and summarize its current state."),
           paragraph(text("Type "), code("/exit"), text(" to leave the shell. The daemon keeps the session running. Return later, select the same account and session, and continue.")),
-          paragraph(text("To use a specific repository, register it with "), code("hra project add --path <directory> --name <name>"), text(" and select it with "), code("hra project use <project>"), text(" before starting the session.")),
+          paragraph(text("To use a specific repository, register it with "), code("oompa project add --path <directory> --name <name>"), text(" and select it with "), code("oompa project use <project>"), text(" before starting the session.")),
         ],
       },
       {
         id: "add-your-browser",
         heading: "4. Add the web app when you want it",
         blocks: [
-          paragraph(text("You can stay local, or connect your HRA identity and approve a browser to see sessions away from the terminal. The "), link("web app guide", "/docs/web/"), text(" walks through email sign-in, device approval, and the session grid.")),
+          paragraph(text("You can stay local, or connect your Oompa identity and approve a browser to see sessions away from the terminal. The "), link("web app guide", "/docs/web/"), text(" walks through email sign-in, device approval, and the session grid.")),
         ],
       },
     ],
@@ -205,7 +205,7 @@ export const docsPages: readonly DocsPage[] = [
       checkedOn: "2026-09-09",
       reassessOn: "2026-10-06",
       decision: "keep",
-      readerJob: "Enroll a browser and use HRA's real grid, conversation, and Settings screens without mistaking a browser for an execution machine.",
+      readerJob: "Enroll a browser and use Oompa's real grid, conversation, and Settings screens without mistaking a browser for an execution machine.",
       contribution: "A screen-by-screen guide joins the app's actual enrollment states, target picker, composer, and remote interaction policy into a usable first browser journey.",
       overlapDecision: "Start owns local installation, Sessions owns CLI conversation operations, and the deployment runbook addresses operators. None explains everyday browser use.",
       evidence: ["app/src/custody/enrollment-screen.tsx", "app/src/screens/grid-screen.tsx", "app/src/screens/session-screen.tsx", "app/src/screens/settings-screen.tsx", "src/domain/remote-interaction-policy.ts"],
@@ -217,14 +217,14 @@ export const docsPages: readonly DocsPage[] = [
         heading: "Pair your browser with an approved machine",
         blocks: [
           setupNotice,
-          paragraph(text("First-time machine setup belongs in "), link("Set up HRA", "/docs/start/"), text(". On a configured, eligible machine, complete HRA's "), link("protected email-code sign-in", "/docs/web/#cloud-sign-in-and-device-pairing"), text(" with "), code("hra auth login --input-stdin"), text(". Each invocation reads one protected JSON document; the linked instructions show how to request and verify a code. Complete machine sign-in before enrolling the browser. Your provider sign-in is separate.")),
-          paragraph(text("Open "), link("app.hra.sh", "https://app.hra.sh/"), text(" and sign in with your HRA email and one-time code. Use the same identity as your execution machine. A browser cannot be the first device on an account or approve another device.")),
+          paragraph(text("First-time machine setup belongs in "), link("Set up Oompa", "/docs/start/"), text(". On a configured, eligible machine, complete Oompa's "), link("protected email-code sign-in", "/docs/web/#cloud-sign-in-and-device-pairing"), text(" with "), code("oompa auth login --input-stdin"), text(". Each invocation reads one protected JSON document; the linked instructions show how to request and verify a code. Complete machine sign-in before enrolling the browser. Your provider sign-in is separate.")),
+          paragraph(text("Open "), link("app.oompa.app", "https://app.oompa.app/"), text(" and sign in with your Oompa email and one-time code. Use the same identity as your execution machine. A browser cannot be the first device on an account or approve another device.")),
           list(
-            [text("Choose Enroll this browser. HRA generates this browser's device keys and shows a fingerprint.")],
+            [text("Choose Enroll this browser. Oompa generates this browser's device keys and shows a fingerprint.")],
             [text("On an already approved machine, list devices and compare the browser fingerprint before approving its exact device ID.")],
             [text("Return to the waiting browser and choose Check again. Once approved and unlocked, it can decrypt your synchronized sessions.")],
           ),
-          commands("hra device list", "hra device approve <pending-device-id-or-prefix> --fingerprint <value>"),
+          commands("oompa device list", "oompa device approve <pending-device-id-or-prefix> --fingerprint <value>"),
           paragraph(text("Email access alone cannot recover encrypted history. Keep an approved device with the account key. The browser drops its unwrapped account key when locked; "), code("Ctrl+L"), text(" also locks the app.")),
         ],
       },
@@ -241,7 +241,7 @@ export const docsPages: readonly DocsPage[] = [
         id: "direct-a-session",
         heading: "Read, answer, and send the next instruction",
         blocks: [
-          paragraph(text("Inside a session, follow the transcript and send your next message. HRA lets the execution machine decide whether to begin a turn or steer the active one. Stop is available while a turn is running. The session menu offers model presets, Codex Fast mode, approval settings, and eligible provider changes.")),
+          paragraph(text("Inside a session, follow the transcript and send your next message. Oompa lets the execution machine decide whether to begin a turn or steer the active one. Stop is available while a turn is running. The session menu offers model presets, Codex Fast mode, approval settings, and eligible provider changes.")),
           paragraph(text("Attach supported images or text files by picking, pasting, or dropping them into an existing conversation. A new session starts with text only. Other devices see attachment names and metadata, not a copy of the original file or image.")),
           paragraph(text("A supported, non-secret multiple-choice question can be answered here. Command, file-change, and permission requests can be declined remotely; accepting them, granting permission, typing a free-text or Other answer, and completing MCP forms stay on the execution machine. Follow the interaction's local instruction when the browser cannot act.")),
         ],
@@ -252,7 +252,7 @@ export const docsPages: readonly DocsPage[] = [
         blocks: [
           list(
             [text("Machines show published defaults and projects. Changes travel as commands to that machine, so wait for the confirmed result.")],
-            [text("Accounts show provider sign-in status. Codex can offer Link here after the machine enables "), code("hra remote allow account-linking"), text(". Claude sign-in stays in a foreground terminal on Linux.")],
+            [text("Accounts show provider sign-in status. Codex can offer Link here after the machine enables "), code("oompa remote allow account-linking"), text(". Claude sign-in stays in a foreground terminal on Linux.")],
             [text("Memory and peer activity show read-only summaries, coverage, and recent activity. The browser does not edit memory pages.")],
             [text("Archived sessions remain readable and can be restored to the grid. Scheduled tasks are read-only here; create or edit them with the CLI.")],
             [text("Devices show enrollment state. Approve or revoke a device from an active machine, not from this browser.")],
@@ -275,7 +275,7 @@ export const docsPages: readonly DocsPage[] = [
       checkedOn: "2026-09-09",
       reassessOn: "2026-10-20",
       decision: "keep",
-      readerJob: "Operate an existing HRA conversation and know which identity, provider, and recovery action it belongs to.",
+      readerJob: "Operate an existing Oompa conversation and know which identity, provider, and recovery action it belongs to.",
       contribution: "A practical command sequence connects account status, explicit provider switching, retained conversation history, and exact interrupted-operation recovery.",
       overlapDecision: "Start ends at a first conversation, Web explains screen controls, and Reference lists complete syntax. This page owns the ongoing conversation workflow and its recovery decisions.",
       evidence: ["src/cli/parser.ts", "site/content.ts", "docs/providers/claude.md", "docs/facts-memory.md", "docs/attachments.md"],
@@ -287,18 +287,18 @@ export const docsPages: readonly DocsPage[] = [
         heading: "Check the account before starting work",
         blocks: [
           paragraph(text("Use these commands on an existing, initialized machine whose rollout prerequisites are satisfied. Each named profile isolates its managed provider configuration. Select the provider explicitly when checking sign-in state.")),
-          commands("hra account list", "hra account show personal --provider codex", "hra account usage personal --refresh"),
-          paragraph(text("Codex usage reports observed limits and resets; "), code("hra account usage-history personal --limit 50 --json"), text(" reads its retained local history. Claude exposes sign-in status, not account quotas or usage history. HRA does not pool subscription limits or automatically move a failed turn to another account.")),
-          paragraph(text("A pending Codex login can be checked with "), code("hra account show personal --provider codex"), text(" and canceled with "), code("hra account login-cancel personal --provider codex"), text(". A lost one-time URL cannot be recovered by starting another login over the pending attempt. Claude recovery instead requires the exact acknowledged command reported by status, after you have confirmed the original login child exited.")),
+          commands("oompa account list", "oompa account show personal --provider codex", "oompa account usage personal --refresh"),
+          paragraph(text("Codex usage reports observed limits and resets; "), code("oompa account usage-history personal --limit 50 --json"), text(" reads its retained local history. Claude exposes sign-in status, not account quotas or usage history. Oompa does not pool subscription limits or automatically move a failed turn to another account.")),
+          paragraph(text("A pending Codex login can be checked with "), code("oompa account show personal --provider codex"), text(" and canceled with "), code("oompa account login-cancel personal --provider codex"), text(". A lost one-time URL cannot be recovered by starting another login over the pending attempt. Claude recovery instead requires the exact acknowledged command reported by status, after you have confirmed the original login child exited.")),
         ],
       },
       {
         id: "continue-a-session",
         heading: "Continue the same conversation",
         blocks: [
-          commands("hra session list", "hra session status <session-id> --json", "hra session send <session-id> -- \"Review the latest changes.\"", "hra session stop <session-id>"),
-          paragraph(text("Use the returned session ID in scripts. A session name is convenient for people, but can change. For live observation, read "), code("data.eventStream.cursor"), text(" from status and pass that exact cursor to "), code("hra session watch <session-id> --cursor <status-cursor> --jsonl"), text(" so the status snapshot and subsequent events join without a gap.")),
-          paragraph(text("Queue a message for later with "), code("hra session queue <session-id> -- <message>"), text(". Use "), code("hra session steer <session-id> -- <message>"), text(" for the current turn. The "), link("attachment contract", source("docs/attachments.md")), text(" lists accepted files and limits.")),
+          commands("oompa session list", "oompa session status <session-id> --json", "oompa session send <session-id> -- \"Review the latest changes.\"", "oompa session stop <session-id>"),
+          paragraph(text("Use the returned session ID in scripts. A session name is convenient for people, but can change. For live observation, read "), code("data.eventStream.cursor"), text(" from status and pass that exact cursor to "), code("oompa session watch <session-id> --cursor <status-cursor> --jsonl"), text(" so the status snapshot and subsequent events join without a gap.")),
+          paragraph(text("Queue a message for later with "), code("oompa session queue <session-id> -- <message>"), text(". Use "), code("oompa session steer <session-id> -- <message>"), text(" for the current turn. The "), link("attachment contract", source("docs/attachments.md")), text(" lists accepted files and limits.")),
         ],
       },
       {
@@ -306,8 +306,8 @@ export const docsPages: readonly DocsPage[] = [
         heading: "Change the provider for the next turn",
         blocks: [
           paragraph(text("When the session is idle and the target provider is signed in, switch it explicitly. Claude Code requires a Linux execution machine.")),
-          commands("hra session switch <session-id> --provider claude --preset fable-max", "hra session export <session-id> --format json"),
-          paragraph(text("The new provider receives the retained tail of HRA's conversation record. Its native thread, hidden state, and cached context do not transfer. HRA states a retention gap when older recorded history was pruned; it does not invent history from before a session was adopted.")),
+          commands("oompa session switch <session-id> --provider claude --preset fable-max", "oompa session export <session-id> --format json"),
+          paragraph(text("The new provider receives the retained tail of Oompa's conversation record. Its native thread, hidden state, and cached context do not transfer. Oompa states a retention gap when older recorded history was pruned; it does not invent history from before a session was adopted.")),
           paragraph(text("Switching providers within the same account profile preserves the session's working-memory binding. An eligible manual switch to another account can transfer custody only after outstanding memory submissions settle. That transfer purges the old working lane and starts a fresh empty epoch; it does not carry working-memory contents across accounts. A failed transfer remains recoverable before the session is rebound. Shared project memory stays project-scoped. Presets control future turns and do not reinterpret an already-bound historical model until you select a preset.")),
         ],
       },
@@ -315,9 +315,9 @@ export const docsPages: readonly DocsPage[] = [
         id: "recover-without-repeating-work",
         heading: "Inspect an interrupted operation before retrying",
         blocks: [
-          paragraph(text("A lost connection is not proof that a command failed before taking effect. Keep the command ID and reuse the exact recovery command or idempotency key HRA reports. An ambiguous result needs inspection, not a new send.")),
-          commands("hra status --json", "hra session status <session-id> --json", "hra remote command <uuidv7>", "hra sync status"),
-          paragraph(text("A recovery-required session stays fenced while HRA cannot prove who owns the provider process. Do not delete state or launch a second writer to clear it. "), code("hra session abandon <session-id>"), text(" ends HRA's local session with provider state still unknown; use it only when you accept that consequence.")),
+          paragraph(text("A lost connection is not proof that a command failed before taking effect. Keep the command ID and reuse the exact recovery command or idempotency key Oompa reports. An ambiguous result needs inspection, not a new send.")),
+          commands("oompa status --json", "oompa session status <session-id> --json", "oompa remote command <uuidv7>", "oompa sync status"),
+          paragraph(text("A recovery-required session stays fenced while Oompa cannot prove who owns the provider process. Do not delete state or launch a second writer to clear it. "), code("oompa session abandon <session-id>"), text(" ends Oompa's local session with provider state still unknown; use it only when you accept that consequence.")),
         ],
       },
     ],
@@ -327,7 +327,7 @@ export const docsPages: readonly DocsPage[] = [
   {
     path: "/docs/reference/",
     title: "CLI reference",
-    description: "Find the right HRA command family, the machine-readable output contract, and the deeper guides for automation and memory.",
+    description: "Find the right Oompa command family, the machine-readable output contract, and the deeper guides for automation and memory.",
     keywords: ["commands", "JSON", "automation", "memory", "work", "help"],
     reviewDate: "2026-09-08",
     admission: {
@@ -346,13 +346,13 @@ export const docsPages: readonly DocsPage[] = [
         id: "find-a-command",
         heading: "Start with command help",
         blocks: [
-          commands("hra --help", "hra session --help", "hra help session send"),
+          commands("oompa --help", "oompa session --help", "oompa help session send"),
           paragraph(text("Root help lists the command families. Group and command help give the accepted flags and examples. The full catalog below is checked against the CLI's group help.")),
           list(
             [code("account"), text(" and "), code("project"), text(": provider profiles, sign-in status, Codex usage, and local workspaces.")],
             [code("session"), text(": conversation lifecycle, messages, presets, provider changes, schedules, and exports.")],
             [code("interaction"), text(" and "), code("turn"), text(": local protected inspection and provider-specific approval or question handling.")],
-            [code("auth"), text(", "), code("device"), text(", "), code("sync"), text(", and "), code("remote"), text(": HRA identity, encrypted pairing, synchronized views, and remote command receipts.")],
+            [code("auth"), text(", "), code("device"), text(", "), code("sync"), text(", and "), code("remote"), text(": Oompa identity, encrypted pairing, synchronized views, and remote command receipts.")],
             [code("work"), text(" and "), code("memory"), text(": bounded local agent coordination and working or shared project memory.")],
             [code("status"), text(", "), code("doctor"), text(", and "), code("daemon"), text(": local health, prerequisites, and process lifecycle.")],
           ),
@@ -373,11 +373,11 @@ export const docsPages: readonly DocsPage[] = [
         blocks: [
           list(
             [link("Working and project memory", source("docs/facts-memory.md")), text(": session-scoped notes, explicit sharing, and hosted memory boundaries.")],
-            [link("Personal-session adoption", source("docs/session-adoption.md")), text(": opt in locally to bring eligible existing provider sessions into HRA.")],
+            [link("Personal-session adoption", source("docs/session-adoption.md")), text(": opt in locally to bring eligible existing provider sessions into Oompa.")],
             [link("Attachments", source("docs/attachments.md")), text(": supported media, byte limits, and what crosses a device boundary.")],
             [link("Cloud retention", source("docs/retention.md")), text(": retention windows and command-receipt recovery.")],
           ),
-          paragraph(text("Recurring conversation tasks are created with "), code("hra session task"), text(" and stay bound to that session. The browser displays schedules but does not edit them. The separate "), code("hra work"), text(" protocol coordinates bounded local work; it is not cross-device execution or automatic provider failover.")),
+          paragraph(text("Recurring conversation tasks are created with "), code("oompa session task"), text(" and stay bound to that session. The browser displays schedules but does not edit them. The separate "), code("oompa work"), text(" protocol coordinates bounded local work; it is not cross-device execution or automatic provider failover.")),
         ],
       },
     ],
@@ -409,7 +409,7 @@ export const docsPages: readonly DocsPage[] = [
           : `v${publicContent.releaseVersion} is a candidate. v${admittedReleaseVersion} remains admitted.`,
         blocks: [
           candidateInstallNotice,
-          paragraph(text(`The v${admittedReleaseVersion} CLI passed immutable GitHub and npm artifact admission. ${isAdmittedRelease(publicContent.releaseVersion) ? "For its exact installation instructions, use the " : `The v${publicContent.releaseVersion} candidate is not yet admitted and requires its own immutable GitHub proof. For the admitted predecessor, use its `}`), link("immutable README", `https://github.com/hraness/hra/tree/v${admittedReleaseVersion}#get-started`), text(" to install and run "), code("hra doctor --offline"), text(". The public website, browser app, and open-beta sync service are available; their availability does not authorize starting the current daemon or sending new hosted commands.")),
+          paragraph(text(`The v${admittedReleaseVersion} CLI passed immutable GitHub and npm artifact admission. ${isAdmittedRelease(publicContent.releaseVersion) ? "For its exact installation instructions, use the " : `The v${publicContent.releaseVersion} candidate is not yet admitted and requires its own immutable GitHub proof. For the admitted predecessor, use its `}`), link("immutable README", `https://github.com/hraness/oompa/tree/v${admittedReleaseVersion}#get-started`), text(" to install and run "), code("oompa doctor --offline"), text(". The public website, browser app, and open-beta sync service are available; their availability does not authorize starting the current daemon or sending new hosted commands.")),
           paragraph(text(`The v${publicContent.releaseVersion} ${isAdmittedRelease(publicContent.releaseVersion) ? "release" : "candidate"} retains the read-only exact Codex default-profile observation admitted in v0.7.1. The display remains unavailable until the intended daemon publishes a matching fresh companion after its rollout gates pass. This does not change Ultra defaults, admit models, choose a route, or authorize a command.`)),
           releaseAdmissionNotice,
           { kind: "notice", label: "Current runtime hold", content: [text(publicContent.daemonRolloutNotice)] },
@@ -422,11 +422,11 @@ export const docsPages: readonly DocsPage[] = [
         blocks: [
           list(
             [text(`Codex: macOS and Linux, through pinned Codex ${publicPins.codex}. Managed device-code sign-in, account usage and reset observations, and opt-in browser linking are implemented.`)],
-            [text(`Claude Code: Linux for managed sign-in and execution, using an installed executable that reports the exact ${publicPins.claude} compatibility pin. HRA reports signed-in status only; quota, usage history, Fast mode, and browser linking are unavailable.`)],
+            [text(`Claude Code: Linux for managed sign-in and execution, using an installed executable that reports the exact ${publicPins.claude} compatibility pin. Oompa reports signed-in status only; quota, usage history, Fast mode, and browser linking are unavailable.`)],
             [text("macOS Claude: new managed effects remain disabled pending authenticated isolated-Keychain and detached-daemon acceptance. A discovered executable is not acceptance evidence.")],
-            [text("Devin: retired. Historical records remain read-only; HRA does not start new Devin logins or sessions.")],
+            [text("Devin: retired. Historical records remain read-only; Oompa does not start new Devin logins or sessions.")],
           ),
-          paragraph(text("Providers own their accounts, billing, tools, and native execution. HRA's automated tests do not imply that every live provider and device flow has been qualified. "), link("Claude compatibility details", source("docs/providers/claude.md")), text(" record the remaining live checks.")),
+          paragraph(text("Providers own their accounts, billing, tools, and native execution. Oompa's automated tests do not imply that every live provider and device flow has been qualified. "), link("Claude compatibility details", source("docs/providers/claude.md")), text(" record the remaining live checks.")),
         ],
       },
       {
@@ -439,7 +439,7 @@ export const docsPages: readonly DocsPage[] = [
       },
     ],
     referenceSectionIds: ["install-and-update", "authority-boundaries"],
-    related: [{ path: "/docs/start/", label: "Install and check HRA" }, { path: source("docs/beta-release-notes.md"), label: "Release notes" }, { path: source("SECURITY.md"), label: "Security support policy" }],
+    related: [{ path: "/docs/start/", label: "Install and check Oompa" }, { path: source("docs/beta-release-notes.md"), label: "Release notes" }, { path: source("SECURITY.md"), label: "Security support policy" }],
   },
 ];
 

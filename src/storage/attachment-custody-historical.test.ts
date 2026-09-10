@@ -23,8 +23,8 @@ afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
-const ownerHash = (kind: string, value: unknown) => hash(JSON.stringify({ domain: `hra.session-send.${kind}.v1`, value }));
-const custodyHash = (value: unknown) => hash(JSON.stringify({ domain: "hra:attachment-custody:v1", value }));
+const ownerHash = (kind: string, value: unknown) => hash(JSON.stringify({ domain: `oompa.session-send.${kind}.v1`, value }));
+const custodyHash = (value: unknown) => hash(JSON.stringify({ domain: "oompa:attachment-custody:v1", value }));
 const captures = [
   { name: "private48 original", bytes: privateTask48DatabaseBytes, format: "private_task48_v1", inputFormat: "empty_v1" },
   { name: "private48 pinned", bytes: privateTask48PinnedDatabaseBytes, format: "private_task48_v1", inputFormat: "retained_v1" },
@@ -52,7 +52,7 @@ function snapshot(database: Database) {
 async function settledFixture(capture: (typeof captures)[number]) {
   const bytes = capture.bytes();
   const originalBytes = Uint8Array.from(bytes);
-  const root = await mkdtemp(join(tmpdir(), "hra-historical-custody-"));
+  const root = await mkdtemp(join(tmpdir(), "oompa-historical-custody-"));
   roots.push(root);
   const path = join(root, "state.sqlite");
   await writeFile(path, bytes, { mode: 0o600 });

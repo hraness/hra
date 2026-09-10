@@ -11,7 +11,7 @@ import {
 
 const sha = "b787e4d767d9bc95a70952e1002c150f5f33661c";
 const otherSha = "0e9287bc2ead3af2d432375efb86247455c2223d";
-const identity = { defaultBranch: "main", repository: "hraness/hra", sha } as const;
+const identity = { defaultBranch: "main", repository: "hraness/oompa", sha } as const;
 
 function run(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -19,12 +19,12 @@ function run(overrides: Record<string, unknown> = {}): Record<string, unknown> {
     display_title: "docs: release",
     event: "push",
     head_branch: "main",
-    head_repository: { full_name: "hraness/hra" },
+    head_repository: { full_name: "hraness/oompa" },
     head_sha: sha,
     id: 33562319207,
     name: "CI",
     path: ciWorkflowPath,
-    repository: { full_name: "hraness/hra" },
+    repository: { full_name: "hraness/oompa" },
     run_attempt: 1,
     status: "completed",
     ...overrides,
@@ -89,7 +89,7 @@ describe("release CI run readback", () => {
       .toBe("ci_run_missing");
     expect(code(() => admitCommitCiRun(runs(run({ path: ".github/workflows/release.yml" })), identity)))
       .toBe("ci_run_missing");
-    expect(code(() => admitCommitCiRun(runs(run({ repository: { full_name: "fork/hra" } })), identity)))
+    expect(code(() => admitCommitCiRun(runs(run({ repository: { full_name: "fork/oompa" } })), identity)))
       .toBe("ci_run_missing");
     expect(code(() => admitCommitCiRun(runs(run({ head_repository: null })), identity)))
       .toBe("ci_run_missing");
@@ -169,10 +169,10 @@ describe("release CI run readback", () => {
       .toThrow("lowercase commit SHA");
     expect(() => admitCommitCiRun(runs(run()), { ...identity, defaultBranch: "main branch" }))
       .toThrow("default branch");
-    expect(() => admitCommitCiRun(runs(run()), { ...identity, repository: "fork/hra" }))
-      .toThrow("hraness/hra");
-    expect(() => admitCommitCiRequiredJob(jobs(job()), admittedRun, { ...identity, repository: "fork/hra" }))
-      .toThrow("hraness/hra");
+    expect(() => admitCommitCiRun(runs(run()), { ...identity, repository: "fork/oompa" }))
+      .toThrow("hraness/oompa");
+    expect(() => admitCommitCiRequiredJob(jobs(job()), admittedRun, { ...identity, repository: "fork/oompa" }))
+      .toThrow("hraness/oompa");
   });
 
   test("names every refusal with one closed error code", () => {

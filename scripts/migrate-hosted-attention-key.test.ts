@@ -6,8 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
-  hraAttentionResendApiKeyEnvironmentName,
-  hraResendApiKeyEnvironmentName,
+  oompaAttentionResendApiKeyEnvironmentName,
+  oompaResendApiKeyEnvironmentName,
 } from "../convex/resendApiKey";
 import {
   BoundedProcessCleanupUnprovenError,
@@ -15,7 +15,7 @@ import {
   BoundedProcessRecoveryJournalError,
 } from "./bounded-process";
 import { HOSTED_ENVIRONMENT_NAMES, type CommandRequest, type CommandRunner } from "./configure-hosted-sync";
-import { HRA_CONVEX_PROJECT_ID, HRA_CONVEX_TEAM_ID, type ConvexTarget } from "./convex-target";
+import { OOMPA_CONVEX_PROJECT_ID, OOMPA_CONVEX_TEAM_ID, type ConvexTarget } from "./convex-target";
 import {
   executeHostedAttentionKeyObservation,
   hostedAttentionKeyObservationSchema,
@@ -41,7 +41,7 @@ const inputDocument = JSON.stringify({ attentionResendApiKey: intendedKey });
 const target: ConvexTarget = {
   deploymentId: 7_654_321, deploymentName: "steady-otter-321",
   deploymentUrl: "https://steady-otter-321.convex.cloud",
-  projectId: HRA_CONVEX_PROJECT_ID, teamId: HRA_CONVEX_TEAM_ID,
+  projectId: OOMPA_CONVEX_PROJECT_ID, teamId: OOMPA_CONVEX_TEAM_ID,
 };
 const targetArguments = [
   "--deployment", target.deploymentName, "--deployment-url", target.deploymentUrl,
@@ -67,7 +67,7 @@ afterEach(async () => {
 });
 
 const harness = async () => {
-  const directory = await realpath(await mkdtemp(join(tmpdir(), "hra-attention-observe-")));
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "oompa-attention-observe-")));
   directories.push(directory);
   await chmod(directory, 0o700);
   const deployEvidencePath = join(directory, "candidate.json");
@@ -84,7 +84,7 @@ const harness = async () => {
     head: sourceCommit,
     inactive: inactive as unknown,
     names: new Set<string>(HOSTED_ENVIRONMENT_NAMES.filter((name) =>
-      name !== hraAttentionResendApiKeyEnvironmentName)),
+      name !== oompaAttentionResendApiKeyEnvironmentName)),
     namesOutput: undefined as string | undefined,
     otp: otpKey,
     status: "",
@@ -103,7 +103,7 @@ const harness = async () => {
       return { exitCode: 0, stderr: "", stdout: state.namesOutput ?? `${[...state.names].join("\n")}\n` };
     }
     if (arguments_[0] === "env" && arguments_[1] === "get") {
-      const value = arguments_[2] === hraResendApiKeyEnvironmentName ? state.otp : state.attention;
+      const value = arguments_[2] === oompaResendApiKeyEnvironmentName ? state.otp : state.attention;
       return value === undefined
         ? { exitCode: 1, stderr: "missing synthetic key", stdout: "" }
         : { exitCode: 0, stderr: "", stdout: `${value}\n` };
@@ -271,7 +271,7 @@ describe("read-only preparation and reconciliation", () => {
     const value = await harness();
     if (key !== undefined) {
       value.state.attention = key;
-      value.state.names.add(hraAttentionResendApiKeyEnvironmentName);
+      value.state.names.add(oompaAttentionResendApiKeyEnvironmentName);
     }
     const result = await observeHostedAttentionKey(value.options);
     expect(result.code).toBe("provider_add_only_unavailable");
@@ -294,7 +294,7 @@ describe("read-only preparation and reconciliation", () => {
     const prepared = await observeHostedAttentionKey(value.options);
     if (key !== undefined) {
       value.state.attention = key;
-      value.state.names.add(hraAttentionResendApiKeyEnvironmentName);
+      value.state.names.add(oompaAttentionResendApiKeyEnvironmentName);
     }
     const reconciled = await observeHostedAttentionKey({
       ...value.options, phase: "reconcile", preparationEvidencePath: value.options.evidencePath,
@@ -347,13 +347,13 @@ describe("read-only preparation and reconciliation", () => {
   test("filters all inherited credential shapes before the first source or provider command", async () => {
     const value = await harness();
     value.state.attention = otherKey;
-    value.state.names.add(hraAttentionResendApiKeyEnvironmentName);
+    value.state.names.add(oompaAttentionResendApiKeyEnvironmentName);
     await observeHostedAttentionKey({
       ...value.options,
       environment: {
         HOME: `/protected/${otpKey}`, PATH: `/tools/${intendedKey}`, TMPDIR: `/temporary/${otherKey}`,
         APPDATA: "/settings/re_bad!fragment", USERPROFILE: "/profile/re_", SystemRoot: "/system",
-        HRA_RESEND_API_KEY: otpKey, HRA_ATTENTION_RESEND_API_KEY: intendedKey,
+        OOMPA_RESEND_API_KEY: otpKey, OOMPA_ATTENTION_RESEND_API_KEY: intendedKey,
         CONVEX_DEPLOY_KEY: "fake-deploy", RESEND_API_KEY: otherKey,
       },
     });
@@ -414,16 +414,16 @@ describe("closed prestate, binding, and capability failures", () => {
     ["dirty source", (value: Harness) => { value.state.status = " M file\n"; }, "source_changed"],
     ["different HEAD", (value: Harness) => { value.state.head = "b".repeat(40); }, "source_changed"],
     ["reused OTP", (value: Harness) => { value.state.otp = intendedKey; }, "otp_key_reused"],
-    ["missing OTP", (value: Harness) => { value.state.names.delete(hraResendApiKeyEnvironmentName); }, "prerequisites_missing"],
-    ["missing reply-to", (value: Harness) => { value.state.names.delete("HRA_AUTH_EMAIL_REPLY_TO"); }, "prerequisites_missing"],
+    ["missing OTP", (value: Harness) => { value.state.names.delete(oompaResendApiKeyEnvironmentName); }, "prerequisites_missing"],
+    ["missing reply-to", (value: Harness) => { value.state.names.delete("OOMPA_AUTH_EMAIL_REPLY_TO"); }, "prerequisites_missing"],
     ["duplicate names", (value: Harness) => { value.state.namesOutput = "SITE_URL\nSITE_URL\n"; }, "environment_ambiguous"],
     ["malformed OTP", (value: Harness) => { value.state.otp = "re_bad\nline"; }, "environment_ambiguous"],
     ["malformed attention", (value: Harness) => {
       value.state.attention = "re_bad'quote";
-      value.state.names.add(hraAttentionResendApiKeyEnvironmentName);
+      value.state.names.add(oompaAttentionResendApiKeyEnvironmentName);
     }, "environment_ambiguous"],
     ["missing listed key", (value: Harness) => {
-      value.state.names.add(hraAttentionResendApiKeyEnvironmentName);
+      value.state.names.add(oompaAttentionResendApiKeyEnvironmentName);
     }, "environment_ambiguous"],
     ["different runtime", (value: Harness) => { value.state.attestation = before; }, "release_attestation_invalid"],
     ["enabled", (value: Harness) => { value.state.inactive = { ...inactive, globalState: "enabled", generation: 1 }; }, "attention_not_inactive"],
@@ -446,7 +446,7 @@ describe("closed prestate, binding, and capability failures", () => {
       if (request.phase !== "hosted-attention-key-inactive-read" || ++statusReads !== 2) return;
       if (kind === "attention") {
         value.state.attention = otherKey;
-        value.state.names.add(hraAttentionResendApiKeyEnvironmentName);
+        value.state.names.add(oompaAttentionResendApiKeyEnvironmentName);
       } else if (kind === "otp") value.state.otp = otherKey;
       else if (kind === "runtime") value.state.attestation = before;
       else value.state.inactive = { ...inactive, outboxOccupancy: 1 };

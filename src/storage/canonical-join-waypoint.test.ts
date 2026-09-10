@@ -62,7 +62,7 @@ const predecessors = [
 ] as const;
 
 async function upgrade() {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-canonical-waypoint-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-canonical-waypoint-")));
   roots.push(root);
   const paths = resolveStatePaths({ homeDirectory: root, platform: "darwin" });
   await initializeStatePaths(paths);

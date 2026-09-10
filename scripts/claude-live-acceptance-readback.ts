@@ -15,7 +15,7 @@ import {
   createLocalClaudeProcessLivenessProbe,
   type ClaudeProcessLivenessProbe,
 } from "../src/daemon/personal-session-discovery";
-import { HRA_SESSION_PREAMBLE } from "../src/domain/hra-preamble";
+import { OOMPA_SESSION_PREAMBLE } from "../src/domain/oompa-preamble";
 import { createFactsMemoryBinding } from "../src/domain/facts-memory";
 import { memoryPageContentDigest, memoryPageKeyDigest } from "../src/domain/memory-page";
 import { projectMemoryIdentityContractSchema } from "../src/domain/project-memory";
@@ -211,7 +211,7 @@ const requireOriginalMutationAuthority = (
 /** Mirrors the production host-call idempotency preimage, independently of its result. */
 const rememberKey = (receipt: ClaudeLiveAcceptanceProvisionalPrivateReceipt): string => {
   const bytes = createHash("sha256").update([
-    "hra:host-tool-call:v1", receipt.profileId, receipt.providerThreadId,
+    "oompa:host-tool-call:v1", receipt.profileId, receipt.providerThreadId,
     receipt.turnId, receipt.callId, "memory_remember",
   ].join("\0"), "utf8").digest();
   bytes[6] = (bytes[6] ?? 0) & 0x0f | 0x50;
@@ -277,7 +277,7 @@ const readArtifacts = async (paths: StatePaths, receipt: ClaudeLiveAcceptancePro
   let entries = 0;
   for await (const entry of await opendir(paths.runtime)) {
     requireThat(++entries <= 64);
-    if (entry.name.startsWith(".hra-claude-host-tools-")) directories.push(join(paths.runtime, entry.name));
+    if (entry.name.startsWith(".oompa-claude-host-tools-")) directories.push(join(paths.runtime, entry.name));
   }
   requireThat(directories.length === 1);
   const directory = directories[0] ?? refused();
@@ -296,7 +296,7 @@ const readArtifacts = async (paths: StatePaths, receipt: ClaudeLiveAcceptancePro
   }).strict().parse(await privateJson(bindingPath));
   requireThat(binding.bindingId === receipt.bindingId && binding.callbackSocketPath === socketPath);
   const config = await privateJson(configPath);
-  requireThat(same(config, { mcpServers: { hra: {
+  requireThat(same(config, { mcpServers: { oompa: {
     args: [CLAUDE_HOST_TOOL_BRIDGE_ENTRYPOINT, "--binding", bindingPath],
     command: process.execPath, type: "stdio",
   } } }));
@@ -309,7 +309,7 @@ const requireManagedArtifactsAbsent = async (paths: StatePaths): Promise<void> =
   await privateNode(paths.runtime, "directory");
   let entries = 0;
   for await (const entry of await opendir(paths.runtime)) {
-    requireThat(++entries <= 64 && !entry.name.startsWith(".hra-claude-host-tools-"));
+    requireThat(++entries <= 64 && !entry.name.startsWith(".oompa-claude-host-tools-"));
   }
   await absent(claudeHostToolCallbackSocketPath(paths));
 };
@@ -392,10 +392,10 @@ const readStartedScope = (store: StateStore, input: ClaudeLiveAcceptanceStartedS
     && reviewed.processGeneration === generation && "configHome" in reviewed && reviewed.configHome === "isolated"
     && "claudeVersion" in reviewed && reviewed.claudeVersion === CLAUDE_PIN);
   const capabilities = store.requireSessionHostCapabilityBinding(session.id);
-  requireThat(capabilities.preambleVersion === HRA_SESSION_PREAMBLE.version
-    && capabilities.preambleDigest === HRA_SESSION_PREAMBLE.digest
-    && capabilities.manifestVersion === HRA_SESSION_PREAMBLE.manifestVersion
-    && capabilities.manifestDigest === HRA_SESSION_PREAMBLE.manifestDigest);
+  requireThat(capabilities.preambleVersion === OOMPA_SESSION_PREAMBLE.version
+    && capabilities.preambleDigest === OOMPA_SESSION_PREAMBLE.digest
+    && capabilities.manifestVersion === OOMPA_SESSION_PREAMBLE.manifestVersion
+    && capabilities.manifestDigest === OOMPA_SESSION_PREAMBLE.manifestDigest);
   const process = store.readClaudeProcessAuthority({ runtimeScope: "managed", profileId: input.profileId,
     providerThreadId: session.providerThreadId ?? refused() });
   requireThat(process !== null && process.sessionId === session.id && process.providerAuthority?.processGeneration === generation
@@ -428,10 +428,10 @@ const readRecords = (store: StateStore, input: ClaudeLiveAcceptanceReadbackLiveI
   const authority = store.readSessionProviderAccountAuthority(r.sessionId);
   requireThat(authority?.provider === "claude" && authority.runtimeScope === "managed");
   const capabilities = store.requireSessionHostCapabilityBinding(r.sessionId);
-  requireThat(capabilities.preambleVersion === HRA_SESSION_PREAMBLE.version
-    && capabilities.preambleDigest === HRA_SESSION_PREAMBLE.digest
-    && capabilities.manifestVersion === HRA_SESSION_PREAMBLE.manifestVersion
-    && capabilities.manifestDigest === HRA_SESSION_PREAMBLE.manifestDigest);
+  requireThat(capabilities.preambleVersion === OOMPA_SESSION_PREAMBLE.version
+    && capabilities.preambleDigest === OOMPA_SESSION_PREAMBLE.digest
+    && capabilities.manifestVersion === OOMPA_SESSION_PREAMBLE.manifestVersion
+    && capabilities.manifestDigest === OOMPA_SESSION_PREAMBLE.manifestDigest);
   const start = store.readMutation(input.startIdempotencyKey);
   const send = store.readMutation(input.sendIdempotencyKey);
   requireThat(start !== null && send !== null);
@@ -704,7 +704,7 @@ export function createClaudeLiveAcceptanceReadback(options: Readonly<{
         cleanupPhase = "done";
         return Object.freeze({ version: 1 as const, source: "independent_cleanup_readback" as const,
           phase: "cleanup_stopped" as const, snapshotDigest: canonicalSha256(first.records),
-          scopeBindingDigest: canonicalSha256({ domain: "hra.claude.cleanup-readback.v1", profileId: parsed.profileId,
+          scopeBindingDigest: canonicalSha256({ domain: "oompa.claude.cleanup-readback.v1", profileId: parsed.profileId,
             profileGeneration: parsed.profileGeneration ?? null, sessionId: parsed.sessionId ?? null }),
           unreleasedProcessesAbsent: true as const, privateArtifactsAbsent: true as const,
           retainedSessionProcess: first.records.process === null ? "absent" as const : "released_not_live" as const });

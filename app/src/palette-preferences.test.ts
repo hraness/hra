@@ -3,7 +3,7 @@ import fc from "fast-check";
 import { designPalettes, designThemes } from "@hraness/design-kit";
 import { parseHTML } from "linkedom";
 
-import { bindHraAppearanceMenus, hraAppearanceStorage, hraAppearanceStorageKey, initializeHraAppearance } from "./appearance";
+import { bindOompaAppearanceMenus, oompaAppearanceStorage, oompaAppearanceStorageKey, initializeOompaAppearance } from "./appearance";
 
 function memoryStorage() {
   const values = new Map<string, string>();
@@ -23,20 +23,20 @@ describe("bounded appearance persistence", () => {
       fc.string({ maxLength: 16 }),
       (palette, mode, unrecognized) => {
         const storage = memoryStorage();
-        const adapter = hraAppearanceStorage(storage)!;
-        adapter.setItem(hraAppearanceStorageKey, JSON.stringify({ palette, mode, unrecognized }));
+        const adapter = oompaAppearanceStorage(storage)!;
+        adapter.setItem(oompaAppearanceStorageKey, JSON.stringify({ palette, mode, unrecognized }));
         expect(storage.values.size).toBe(1);
-        expect(JSON.parse(storage.values.get(hraAppearanceStorageKey)!)).toEqual({ palette, mode });
-        expect(JSON.parse(adapter.getItem(hraAppearanceStorageKey)!)).toEqual({ palette, mode });
+        expect(JSON.parse(storage.values.get(oompaAppearanceStorageKey)!)).toEqual({ palette, mode });
+        expect(JSON.parse(adapter.getItem(oompaAppearanceStorageKey)!)).toEqual({ palette, mode });
       },
     ), { numRuns: 60 });
   });
 
   test("never reads or writes another browser key", () => {
     const storage = memoryStorage();
-    const adapter = hraAppearanceStorage(storage)!;
+    const adapter = oompaAppearanceStorage(storage)!;
     const preference = JSON.stringify({ palette: "catppuccin", mode: "dark" });
-    for (const key of ["auth-token", "hraness-design-theme-v1", "", `${hraAppearanceStorageKey}-other`]) {
+    for (const key of ["auth-token", "hraness-design-theme-v1", "", `${oompaAppearanceStorageKey}-other`]) {
       adapter.setItem(key, preference);
       expect(adapter.getItem(key)).toBeNull();
     }
@@ -46,25 +46,25 @@ describe("bounded appearance persistence", () => {
 
   test("refuses malformed, partial, and oversized records", () => {
     const storage = memoryStorage();
-    const adapter = hraAppearanceStorage(storage)!;
+    const adapter = oompaAppearanceStorage(storage)!;
     for (const value of [
       "invalid", "null", "[]", '{"palette":"catppuccin"}',
       '{"palette":"unknown","mode":"dark"}',
       '{"palette":"catppuccin","mode":"unknown"}',
       JSON.stringify({ palette: "catppuccin", mode: "dark", extra: "x".repeat(256) }),
     ]) {
-      adapter.setItem(hraAppearanceStorageKey, value);
+      adapter.setItem(oompaAppearanceStorageKey, value);
       expect(storage.values.size).toBe(0);
-      storage.values.set(hraAppearanceStorageKey, value);
-      expect(adapter.getItem(hraAppearanceStorageKey)).toBeNull();
+      storage.values.set(oompaAppearanceStorageKey, value);
+      expect(adapter.getItem(oompaAppearanceStorageKey)).toBeNull();
       storage.values.clear();
     }
-    expect(hraAppearanceStorage(null)).toBeNull();
+    expect(oompaAppearanceStorage(null)).toBeNull();
   });
 });
 
 test("native menus change the shared preference, follow external changes, and release their listeners", () => {
-  const parsed = parseHTML(`<!doctype html><html><head></head><body><details data-hra-appearance><summary>Appearance</summary><select data-hra-palette>${designPalettes.map((value) => `<option value="${value}">${value}</option>`).join("")}</select><select data-hra-mode>${designThemes.map((value) => `<option value="${value}">${value}</option>`).join("")}</select></details><div id="outside"></div></body></html>`);
+  const parsed = parseHTML(`<!doctype html><html><head></head><body><details data-oompa-appearance><summary>Appearance</summary><select data-oompa-palette>${designPalettes.map((value) => `<option value="${value}">${value}</option>`).join("")}</select><select data-oompa-mode>${designThemes.map((value) => `<option value="${value}">${value}</option>`).join("")}</select></details><div id="outside"></div></body></html>`);
   const document = parsed.document as unknown as Document;
   const storage = memoryStorage();
   Object.defineProperty(parsed.window, "localStorage", { configurable: true, value: storage });
@@ -77,11 +77,11 @@ test("native menus change the shared preference, follow external changes, and re
       set(next: string) { value = next; },
     });
   }
-  const controller = initializeHraAppearance(document);
-  const unbind = bindHraAppearanceMenus(document, controller);
+  const controller = initializeOompaAppearance(document);
+  const unbind = bindOompaAppearanceMenus(document, controller);
   const menu = document.querySelector<HTMLDetailsElement>("details")!;
-  const palette = document.querySelector<HTMLSelectElement>("[data-hra-palette]")!;
-  const mode = document.querySelector<HTMLSelectElement>("[data-hra-mode]")!;
+  const palette = document.querySelector<HTMLSelectElement>("[data-oompa-palette]")!;
+  const mode = document.querySelector<HTMLSelectElement>("[data-oompa-mode]")!;
   try {
     expect(palette.value).toBe("catppuccin");
     expect(mode.value).toBe("dark");
@@ -91,7 +91,7 @@ test("native menus change the shared preference, follow external changes, and re
     mode.dispatchEvent(new parsed.window.Event("change", { bubbles: true }));
     expect(controller.getSnapshot().preference).toEqual({ palette: "gruvbox", mode: "light" });
     expect(document.documentElement.getAttribute("data-theme")).toBe("light");
-    expect(JSON.parse(storage.values.get(hraAppearanceStorageKey)!)).toEqual({ palette: "gruvbox", mode: "light" });
+    expect(JSON.parse(storage.values.get(oompaAppearanceStorageKey)!)).toEqual({ palette: "gruvbox", mode: "light" });
 
     controller.setPreference({ palette: "rose-pine", mode: "system" });
     expect(palette.value).toBe("rose-pine");

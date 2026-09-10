@@ -10,7 +10,7 @@ import { StateStore } from "./state-store";
 test.each(["provider_accounts", "automatic_usage_policy_revisions"])(
   "readonly admission rejects a literal-altered %s constraint without changing retained evidence",
   async (tableName) => {
-    const scratch = await realpath(await mkdtemp(join(tmpdir(), "hra-schema-sql-admission-")));
+    const scratch = await realpath(await mkdtemp(join(tmpdir(), "oompa-schema-sql-admission-")));
     const paths = resolveStatePaths({ homeDirectory: scratch, platform: "darwin" });
     try {
       await initializeStatePaths(paths);
@@ -56,7 +56,7 @@ test.each(["provider_accounts", "automatic_usage_policy_revisions"])(
 );
 
 test("readonly current-schema admission requires the complete migration ledger without filling a gap", async () => {
-  const scratch = await realpath(await mkdtemp(join(tmpdir(), "hra-schema-ledger-admission-")));
+  const scratch = await realpath(await mkdtemp(join(tmpdir(), "oompa-schema-ledger-admission-")));
   const paths = resolveStatePaths({ homeDirectory: scratch, platform: "darwin" });
   try {
     await initializeStatePaths(paths);

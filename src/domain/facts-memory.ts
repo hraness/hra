@@ -15,8 +15,8 @@ const digestParts = (domain: string, parts: readonly string[]): string => {
 };
 
 const bindingDigestFor = (ownerId: string, sessionId: string, epoch: number): string => epoch === 1
-  ? digestParts("hra-facts-memory-binding-v1", [ownerId, sessionId])
-  : digestParts("hra-facts-memory-binding-v2", [ownerId, sessionId, String(epoch)]);
+  ? digestParts("oompa-facts-memory-binding-v1", [ownerId, sessionId])
+  : digestParts("oompa-facts-memory-binding-v2", [ownerId, sessionId, String(epoch)]);
 
 export const factsMemoryDigestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
 export const factsMemoryHeadSchema = z.object({
@@ -129,7 +129,7 @@ export const digestFactsMemoryReceipt = (
 
 export const digestFactsMemoryPurgeReceipt = (
   input: Omit<FactsMemoryPurgeReceipt, "purgeDigest">,
-): string => digestParts("hra-facts-memory-purge-receipt-v1", [
+): string => digestParts("oompa-facts-memory-purge-receipt-v1", [
   input.bindingDigest,
   input.handleHash ?? "unknown-handle",
   String(input.purgedAt),
@@ -137,7 +137,7 @@ export const digestFactsMemoryPurgeReceipt = (
 
 export const digestFactsMemoryInspection = (
   input: Omit<FactsMemoryStoreInspection, "inspectionDigest">,
-): string => digestParts("hra-facts-memory-store-inspection-v1", [
+): string => digestParts("oompa-facts-memory-store-inspection-v1", [
   input.bindingDigest,
   input.handleHash,
   String(input.createdAt),

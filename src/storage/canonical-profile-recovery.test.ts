@@ -74,7 +74,7 @@ function corruptSessionKey(store: StateStore, sessionId: string, key: string | n
 }
 
 async function fixture() {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-canonical-recovery-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-canonical-recovery-")));
   roots.push(root);
   const paths = resolveStatePaths({ homeDirectory: root, platform: "linux", rootDirectory: join(root, "state") });
   await initializeStatePaths(paths);

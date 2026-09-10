@@ -16,7 +16,7 @@ afterEach(async () => {
 });
 
 async function fixture(state: "prepared" | "retryable" | "ambiguous") {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-reset-policy-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-reset-policy-")));
   roots.push(root);
   const paths = resolveStatePaths({ homeDirectory: root, platform: "darwin" });
   await initializeStatePaths(paths);

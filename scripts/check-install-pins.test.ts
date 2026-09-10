@@ -54,22 +54,22 @@ describe("installer pins", () => {
     const digest = (source: string) => createHash("sha256").update(source).digest("hex");
     const cli = "export const cli = true;\n";
     const cliDigest = digest(cli);
-    const normalizer = `export const HRA_INSTALL_CLI_SHA256 = "${cliDigest}";\n`;
+    const normalizer = `export const OOMPA_INSTALL_CLI_SHA256 = "${cliDigest}";\n`;
     const normalizerDigest = digest(normalizer);
     const runtime = [
-      `export const HRA_INSTALL_CLI_SHA256 = "${cliDigest}";`,
-      `export const HRA_INSTALL_NORMALIZER_SHA256 = "${normalizerDigest}";`,
-      "export const HRA_INSTALL_ARCHIVE_URL = \"https://github.com/hraness/hra/releases/download/v0.6.1/hraness-hra-0.6.1.tgz\";",
+      `export const OOMPA_INSTALL_CLI_SHA256 = "${cliDigest}";`,
+      `export const OOMPA_INSTALL_NORMALIZER_SHA256 = "${normalizerDigest}";`,
+      "export const OOMPA_INSTALL_ARCHIVE_URL = \"https://github.com/hraness/hra/releases/download/v0.6.1/hraness-hra-0.6.1.tgz\";",
       "",
     ].join("\n");
     const runtimeDigest = digest(runtime);
     const sources = {
       cli,
-      manifest: JSON.stringify({ name: "@hraness/hra", version: "0.6.1" }),
+      manifest: JSON.stringify({ name: "@hraness/oompa", version: "0.6.1" }),
       normalizer,
       preflight: [
-        "export const HRA_INSTALL_PREFLIGHT_SOURCE_URL = \"https://raw.githubusercontent.com/hraness/hra/v0.6.1/src/install-preflight-runtime.ts\";",
-        `export const HRA_INSTALL_PREFLIGHT_SOURCE_SHA256 = "${runtimeDigest}";`,
+        "export const OOMPA_INSTALL_PREFLIGHT_SOURCE_URL = \"https://raw.githubusercontent.com/hraness/hra/v0.6.1/src/install-preflight-runtime.ts\";",
+        `export const OOMPA_INSTALL_PREFLIGHT_SOURCE_SHA256 = "${runtimeDigest}";`,
         "",
       ].join("\n"),
       runtime,
@@ -82,7 +82,7 @@ describe("installer pins", () => {
   });
 
   test("release preparation alone moves the public runtime digest after inner pins converge", async () => {
-    const fixture = await mkdtemp(join(tmpdir(), "hra-release-pins-"));
+    const fixture = await mkdtemp(join(tmpdir(), "oompa-release-pins-"));
     await mkdir(join(fixture, "src"));
     for (const path of [
       "package.json",

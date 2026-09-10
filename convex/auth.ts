@@ -35,7 +35,7 @@ import {
   loadAccountDeletionCapacity,
 } from "./authorityReductionCapacity";
 
-export const hraOtpProviderId = "hra-control-plane-otp-v1";
+export const oompaOtpProviderId = "hra-control-plane-otp-v1";
 
 type ReserveArgs = Readonly<{
   emailDigest: string;
@@ -467,8 +467,8 @@ export async function runQuotaAwareAuthStoreForTest<T>(
   return await handler({ ...ctx, db: quotaAwareDatabase(ctx, newIdentityBinding) });
 }
 
-const hraOtp = ConvexCredentials<DataModel>({
-  id: hraOtpProviderId,
+const oompaOtp = ConvexCredentials<DataModel>({
+  id: oompaOtpProviderId,
   authorize: async (credentials, ctx) => {
     try {
       const parsed = parseAuthCredentials(credentials);
@@ -501,7 +501,7 @@ const hraOtp = ConvexCredentials<DataModel>({
       const { account, user } = await createAccount(ctx, {
         account: { id: parsed.email },
         profile: { email: parsed.email },
-        provider: hraOtpProviderId,
+        provider: oompaOtpProviderId,
         shouldLinkViaEmail: true,
       });
       const challengeId = await ctx.runMutation(storeOtpChallenge, {
@@ -536,7 +536,7 @@ const configuredAuth = convexAuth({
     },
   },
   jwt: { durationMs: 15 * 60 * 1_000 },
-  providers: [hraOtp],
+  providers: [oompaOtp],
   session: {
     inactiveDurationMs: 24 * 60 * 60 * 1_000,
     totalDurationMs: 7 * 24 * 60 * 60 * 1_000,
@@ -639,7 +639,7 @@ export const store = internalMutation({
         ? (account as Record<string, unknown>).id
         : undefined;
       if (
-        root.provider !== hraOtpProviderId
+        root.provider !== oompaOtpProviderId
         || !isCanonicalAuthEmail(email)
         || accountId !== email
       ) return rejectAuthStore();

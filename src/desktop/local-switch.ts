@@ -721,7 +721,7 @@ async function acquireSwitchLock(path: string): Promise<SwitchLockOwnership> {
       if (processIsAlive(payload.pid)) {
         throw new DesktopSwitchError(
           "PROCESS_AMBIGUOUS",
-          "another HRA process owns the desktop switch",
+          "another Oompa process owns the desktop switch",
         );
       }
       await quarantineStaleLock(path);

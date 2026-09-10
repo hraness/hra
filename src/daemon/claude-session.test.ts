@@ -28,7 +28,7 @@ import {
   type CodexRuntimePort,
   type CompactProjectionRecoveryBlocker,
 } from "./ports";
-import { HraService } from "./service";
+import { OompaService } from "./service";
 
 const signal = new AbortController().signal;
 const PROVIDER_USAGE_PERSISTENCE_QUEUE_LIMIT = 1_024;
@@ -166,9 +166,9 @@ const resultLine = (resultText: string) => ({
 });
 
 const pinnedRuntime: PinnedClaudeRuntime = {
-  argv: ["/opt/hra/bin/claude", "--print"],
+  argv: ["/opt/oompa/bin/claude", "--print"],
   effort: CLAUDE_PIN_EFFORT,
-  executablePath: "/opt/hra/bin/claude",
+  executablePath: "/opt/oompa/bin/claude",
   model: CLAUDE_PIN_MODEL,
   nativeFallback: CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY,
   version: CLAUDE_PIN,
@@ -295,7 +295,7 @@ class OfflineCloud extends UnavailableCloudControl {
 
 const stores: StateStore[] = [];
 const roots: string[] = [];
-const services: HraService[] = [];
+const services: OompaService[] = [];
 const hostToolAuthorities: ClaudeHostToolBindingAuthority[] = [];
 
 afterEach(async () => {
@@ -306,7 +306,7 @@ afterEach(async () => {
 });
 
 type ClaudeFixture = Readonly<{
-  service: HraService;
+  service: OompaService;
   runtime: PinnedClaudeRuntimeManager;
   store: StateStore;
   cloud: CloudControlPort;
@@ -318,7 +318,7 @@ type ClaudeFixture = Readonly<{
 async function claudeFixture(
   options: Readonly<{
     beforeProjectionRecoveryCheck?: () => Promise<void>;
-    daemonAuthority?: ConstructorParameters<typeof HraService>[0]["daemonAuthority"];
+    daemonAuthority?: ConstructorParameters<typeof OompaService>[0]["daemonAuthority"];
     immediatelyEndProcess?: boolean;
     now?: () => number;
     onFactObserved?: (fact: Readonly<{ type: string }>) => void;
@@ -326,7 +326,7 @@ async function claudeFixture(
     resolveRuntime?: () => Promise<PinnedClaudeRuntime>;
   }> = {},
 ): Promise<ClaudeFixture> {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-claude-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-claude-")));
   roots.push(home);
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   const documents = join(home, "Documents");
@@ -342,7 +342,7 @@ async function claudeFixture(
   // These tests drive every approval by hand.
   store.setDefaultApprovalMode("manual");
   const processes: FakeClaudeProcess[] = [];
-  const reference: { current?: HraService } = {};
+  const reference: { current?: OompaService } = {};
   const hostToolAuthority = new ClaudeHostToolBindingAuthority();
   hostToolAuthorities.push(hostToolAuthority);
   const claude = new PinnedClaudeRuntimeManager({
@@ -399,7 +399,7 @@ async function claudeFixture(
     ...(options.now === undefined ? {} : { now: options.now }),
   });
   const cloud = new OfflineCloud(options.beforeProjectionRecoveryCheck);
-  const service = new HraService({
+  const service = new OompaService({
     claude,
     claudeProcessLiveness: async (identity) => {
       for (const process of processes) {

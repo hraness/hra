@@ -93,7 +93,7 @@ const makeFixture = async (): Promise<Readonly<{
   sourcePath: string;
   x64Path: string;
 }>> => {
-  const root = await mkdtemp(join(tmpdir(), "hra-authority-artifact-"));
+  const root = await mkdtemp(join(tmpdir(), "oompa-authority-artifact-"));
   const source = Buffer.from("//! fixture authority supervisor\n", "utf8");
   const x64 = elf(62);
   const arm64 = elf(183);
@@ -354,7 +354,7 @@ describe("authority supervisor artifact resolver", () => {
         target: expectedArtifact.target,
       });
       expect(opened.executionPath).toMatch(/^\/proc\/\d+\/fd\/\d+$/u);
-      await expect(readlink(opened.executionPath)).resolves.toContain("memfd:hra-authority-supervisor");
+      await expect(readlink(opened.executionPath)).resolves.toContain("memfd:oompa-authority-supervisor");
       await expect(readFile(opened.executionPath).then(digest)).resolves.toBe(expectedArtifact.sha256);
       const inspection = await open(opened.executionPath, constants.O_RDONLY);
       try {

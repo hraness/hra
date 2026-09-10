@@ -3,10 +3,10 @@ import {
   type PostHogSiteDefinition,
 } from "@hraness/posthog";
 
-export const hraPostHogSite = {
-  id: "hra",
-  canonicalDomain: "hra.sh",
-  allowedHosts: ["hra.sh"],
+export const oompaPostHogSite = {
+  id: "oompa",
+  canonicalDomain: "oompa.app",
+  allowedHosts: ["oompa.app"],
   schemaVersion: POSTHOG_SCHEMA_VERSION,
   routes: [
     {

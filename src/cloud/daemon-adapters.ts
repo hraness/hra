@@ -75,7 +75,7 @@ import {
 } from "../domain/attachments";
 import { AttachmentBlobStore } from "../storage/attachment-store";
 import type { StatePaths } from "../storage/paths";
-import { HRA_VERSION } from "../version";
+import { OOMPA_VERSION } from "../version";
 import type {
   InteractionListPosition,
   ProfileRecord,
@@ -853,7 +853,7 @@ function interactionDetailMarkdown(
         lines.push(projectionLine("Grant root", display.grantRoot));
       }
       if (display.reason !== null) lines.push(projectionLine("Reason", display.reason));
-      lines.push("- HRA cannot show the exact affected paths for this provider version.");
+      lines.push("- Oompa cannot show the exact affected paths for this provider version.");
       break;
     case "permission_approval": {
       // Categories are classed for presentation only, never named. Exact
@@ -1247,7 +1247,7 @@ class CloudProjectionCache {
     const observedVersion = observeProjectionUserVersion(path);
     assertProjectionFileIdentity(path, expectedIdentity);
     if (observedVersion > 5) {
-      throw new Error("The cloud projection cache was created by a newer HRA version.");
+      throw new Error("The cloud projection cache was created by a newer Oompa version.");
     }
     const database = new Database(path, { create: true, strict: true });
     try {
@@ -2641,7 +2641,7 @@ function projectionCacheFailure(error: unknown): Exclude<CloudProjectionCacheSta
   if (message === "The cloud projection cache cannot be a symbolic link.") {
     return { code: "CACHE_SYMLINK", diagnostic: message, state: "unavailable" };
   }
-  if (message === "The cloud projection cache was created by a newer HRA version.") {
+  if (message === "The cloud projection cache was created by a newer Oompa version.") {
     return { code: "CACHE_NEWER_VERSION", diagnostic: message, state: "unavailable" };
   }
   if (message === "The cloud projection cache has unsafe filesystem authority.") {
@@ -2762,7 +2762,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
     this.#executeLocal = options.executeLocal ?? (() => {
       throw new Error("The local command service is not available for device commands.");
     });
-    // HRA has no desktop notification facility today (nothing in `src/` shells
+    // Oompa has no desktop notification facility today (nothing in `src/` shells
     // out to `osascript -e 'display notification'`, `terminal-notifier`, or
     // `notify-send`). The default notice is therefore a daemon diagnostic; the
     // CLI injects the real notifier when the daemon has one.
@@ -3509,7 +3509,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
 
   /**
    * The device settings projection: machine, daemon defaults, accounts,
-   * projects, HRA conversation tasks, and provider-level personal-session
+   * projects, Oompa conversation tasks, and provider-level personal-session
    * adoption aggregates. Codex Desktop automation metadata is private input
    * to the adoption age gate and never enters this projection. Candidate
    * detail and runtime provenance stay private too.
@@ -3749,7 +3749,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
     const registry = {
       accountLinkingAllowed: deviceCommandPolicy.accountLinkingAllowed,
       accounts,
-      daemonVersion: registryLabel(HRA_VERSION, "unknown", deviceRegistryLimits.versionCharacters),
+      daemonVersion: registryLabel(OOMPA_VERSION, "unknown", deviceRegistryLimits.versionCharacters),
       defaultApprovalMode: this.#store.readDefaultApprovalMode(),
       defaultPreset,
       deviceCommandsAllowed: deviceCommandPolicy.deviceCommandsAllowed,
@@ -4198,7 +4198,7 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
 
   /*
    * Device commands. Every guard is evaluated here, before any effect, from
-   * purely local state: the two `hra remote allow|deny` switches, the requesting
+   * purely local state: the two `oompa remote allow|deny` switches, the requesting
    * device's day bucket, and the account and project the registry projected.
    * Only after `deviceCommandGuardDecision` admits the request does anything
    * reach the provider.
@@ -4269,8 +4269,8 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
     });
     if (decision.notifyFirstSessionStart) {
       await this.#notifyOperator({
-        body: "A browser device started its first session on this machine. Run `hra remote deny device-commands` to stop accepting them.",
-        title: "HRA: new device started a session",
+        body: "A browser device started its first session on this machine. Run `oompa remote deny device-commands` to stop accepting them.",
+        title: "Oompa: new device started a session",
       });
     }
     try {
@@ -4446,12 +4446,12 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
             ? "failed"
             : "idle";
       const instruction = status === "pending"
-        ? `A login is in progress for this account. Finish its existing browser or device-code handoff, or cancel it with \`hra account login-cancel ${profile.id}\`.`
+        ? `A login is in progress for this account. Finish its existing browser or device-code handoff, or cancel it with \`oompa account login-cancel ${profile.id}\`.`
         : status === "signed_in"
           ? "This account is signed in on this machine."
           : status === "failed"
-            ? `This account needs local recovery. Inspect it with \`hra account show ${profile.id}\` before starting another login.`
-            : `No login is in progress for this account. Start one on this machine with \`hra account login ${profile.id}\`.`;
+            ? `This account needs local recovery. Inspect it with \`oompa account show ${profile.id}\` before starting another login.`
+            : `No login is in progress for this account. Start one on this machine with \`oompa account login ${profile.id}\`.`;
       return {
         code: "APPLIED",
         result: { instruction, kind: "account_login_status", status },
@@ -4468,8 +4468,8 @@ implements CloudDaemonLocalSourcePort, CloudCommandExecutorPort, CloudDeviceComm
       code: "APPLIED",
       result: {
         instruction: pending
-          ? "A login is in progress on this machine. Finish it in the browser it opened, or cancel it with `hra account login-cancel <account>`."
-          : "No login is in progress. Start one on this machine with `hra account login <account>`.",
+          ? "A login is in progress on this machine. Finish it in the browser it opened, or cancel it with `oompa account login-cancel <account>`."
+          : "No login is in progress. Start one on this machine with `oompa account login <account>`.",
         kind: "account_login_status",
         status: pending ? "pending" : "idle",
       },

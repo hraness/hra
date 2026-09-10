@@ -5,7 +5,7 @@ import { z } from "zod";
 import { profileIdSchema, unixMillisecondsSchema } from "../domain/values";
 
 const CURSOR_PREFIX = "hrau1";
-const ACCOUNT_BINDING_CONTEXT = "hra:usage-history-cursor:account-binding:v1";
+const ACCOUNT_BINDING_CONTEXT = "oompa:usage-history-cursor:account-binding:v1";
 export const USAGE_HISTORY_CURSOR_MAX_BYTES = 2_048;
 export const USAGE_HISTORY_CURSOR_TTL_MS = 5 * 60_000;
 

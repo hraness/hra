@@ -20,7 +20,7 @@ afterEach(async () => {
   for (const path of roots.splice(0)) await rm(path, { recursive: true, force: true });
 });
 async function fixture(legacy = false) {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-custody-integrity-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-custody-integrity-")));
   roots.push(home);
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);

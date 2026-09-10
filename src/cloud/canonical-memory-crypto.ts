@@ -26,7 +26,7 @@ import {
   CANONICAL_MEMORY_TERMINAL_HEAD_PROOF_PURPOSE,
   canonicalMemoryCiphertextLimits,
   canonicalMemoryPlaintextLimits,
-  HRA_CANONICAL_MEMORY_OPERATION_MAX_BYTES,
+  OOMPA_CANONICAL_MEMORY_OPERATION_MAX_BYTES,
   parseCanonicalMemoryHostedSpaceId,
 } from "../domain/canonical-memory-sync";
 import { hasExactKeys, isRecord, snapshotForeignJson } from "../domain/guards";
@@ -50,7 +50,7 @@ import {
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
-const portableCanonicalSpaceIdPattern = /^hra:project:space-[a-f0-9]{32}$/u;
+const portableCanonicalSpaceIdPattern = /^oompa:project:space-[a-f0-9]{32}$/u;
 
 // Kept mechanically coupled to USER_RESOURCE_QUOTAS.device by the focused
 // cross-layer contract test. Do not import Convex server code into shipped
@@ -58,7 +58,7 @@ const portableCanonicalSpaceIdPattern = /^hra:project:space-[a-f0-9]{32}$/u;
 const canonicalMemoryOwnerDeviceQuota = 16;
 
 // NIST's random-nonce bound is shared by every device holding a space key.
-// The minus one leaves the aggregate strictly below the 2^31 HRA ceiling.
+// The minus one leaves the aggregate strictly below the 2^31 Oompa ceiling.
 export const canonicalMemoryGcmMessageBudgetPerDevice = Math.floor(
   (gcmMessageBudgetPerKey - 1) / canonicalMemoryOwnerDeviceQuota,
 );
@@ -564,7 +564,7 @@ export async function deriveCanonicalMemoryHostedSpaceId(input: Readonly<{
     ?? reject("PORTABLE_SPACE_ID_INVALID");
   const bindingDigest = canonicalMemoryBindingDigest(canonicalSpaceId);
   const routeKey = Uint8Array.from(
-    (await sha256Hex(`hra-canonical-memory-route-key:v1:${canonicalSpaceId}`))
+    (await sha256Hex(`oompa-canonical-memory-route-key:v1:${canonicalSpaceId}`))
       .match(/../gu) ?? [],
     (byte) => Number.parseInt(byte, 16),
   );
@@ -613,10 +613,10 @@ export function parseCanonicalMemorySpaceKey(value: unknown): Uint8Array | null 
 export function canonicalMemoryBindingDigest(canonicalSpaceId: string): string {
   const parsed = parsePortableCanonicalMemorySpaceId(canonicalSpaceId);
   if (parsed === null) reject("PORTABLE_SPACE_ID_INVALID");
-  const identitySuffix = parsed.slice("hra:project:".length);
+  const identitySuffix = parsed.slice("oompa:project:".length);
   return createOhStoreBindingV1({
     profile: OH_CANONICAL_STORE_PROFILE_V1,
-    realmId: `hra:project-memory:${identitySuffix}`,
+    realmId: `oompa:project-memory:${identitySuffix}`,
     spaceId: parsed,
     v: 1,
   }).bindingSha256;
@@ -1102,7 +1102,7 @@ export async function encryptCanonicalMemoryOperation(input: Readonly<{
     || operation.parentOperationSha256 !== priorHead.operationSha256
   ) reject("OPERATION_INVALID");
   const operationBytes = utf8ByteLength(canonicalJson(operation));
-  if (operationBytes > HRA_CANONICAL_MEMORY_OPERATION_MAX_BYTES) {
+  if (operationBytes > OOMPA_CANONICAL_MEMORY_OPERATION_MAX_BYTES) {
     reject("OPERATION_TOO_LARGE");
   }
   const head = headFromOperation(operation);
@@ -1227,7 +1227,7 @@ export async function decryptCanonicalMemoryOperation(input: Readonly<{
       || operation.spaceId !== authority.canonicalSpaceId
       || operation.sequence !== wire.sequence
       || operation.parentOperationSha256 !== expectedPriorHead.operationSha256
-      || utf8ByteLength(canonicalJson(operation)) > HRA_CANONICAL_MEMORY_OPERATION_MAX_BYTES
+      || utf8ByteLength(canonicalJson(operation)) > OOMPA_CANONICAL_MEMORY_OPERATION_MAX_BYTES
     ) reject("OPERATION_BUNDLE_INVALID");
     const head = headFromOperation(operation);
     const expectedHeadToken = await tokenForHead(spaceKey, authority, head);

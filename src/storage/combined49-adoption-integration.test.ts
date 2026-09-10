@@ -149,7 +149,7 @@ const withNullableLaunchFixture = async (
   const bytes = capture.bytes();
   expect(hash(bytes)).toBe(capture.identity.databaseSha256);
   expect(capture.identity.schemaVersion).toBe(49);
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-combined49-nullable-launch-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-combined49-nullable-launch-")));
   let holder: Database | undefined;
   try {
     const paths = resolveStatePaths({ rootDirectory: root });

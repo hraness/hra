@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { activeRemotePresetSelection, parseRemoteCommandPayload } from "../hra/cloud";
+import { activeRemotePresetSelection, parseRemoteCommandPayload } from "../oompa/cloud";
 import {
   approvalModeCommand,
   approvalModeLabels,
@@ -24,7 +24,7 @@ import {
  * The daemon's own parser is the oracle. Every builder has to survive
  * `parseRemoteCommandPayload`, which enforces the exact key set of each command
  * kind, so a builder that adds or drops a field fails here rather than at the
- * machine. It is reached through the `app/src/hra/` seam like every other
+ * machine. It is reached through the `app/src/oompa/` seam like every other
  * repository import in this app.
  */
 function accepted(payload: unknown): unknown {

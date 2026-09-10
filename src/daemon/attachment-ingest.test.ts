@@ -24,7 +24,7 @@ const png = new Uint8Array([
 const machO = new Uint8Array([0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0x00, 0x00, 0x01]);
 
 async function fixture(): Promise<{ blobs: AttachmentBlobStore; cwd: string }> {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-attachment-ingest-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-attachment-ingest-")));
   roots.push(root);
   return { blobs: new AttachmentBlobStore(join(root, "state", "attachments")), cwd: root };
 }

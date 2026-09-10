@@ -7,8 +7,8 @@
 - `kb/` contains maintained product knowledge and executable implementation plans.
 - `.agents/skills/` contains the portable five-skill phased planning and execution pack.
 - `.agents/plugins/` contains the repository marketplace catalog.
-- `plugins/hra-local-efficiency/` contains the local-only Codex efficiency plugin and its operating skill.
-- `plugins/hra-cloud-efficiency/` contains the Codex Cloud repository-worker routing plugin and its operating skill.
+- `plugins/oompa-local-efficiency/` contains the local-only Codex efficiency plugin and its operating skill.
+- `plugins/oompa-cloud-efficiency/` contains the Codex Cloud repository-worker routing plugin and its operating skill.
 - `docs/attachments.md` documents message file and image attachments end to end, including the contract a browser client follows.
 - `docs/local-efficiency-plugin.md` documents cross-machine marketplace installation and maintainer validation.
 - `docs/cloud-efficiency-plugin.md` documents Cloud routing, environment profiles, installation, and pilot operation.
@@ -16,9 +16,9 @@
 
 # Guidelines
 
-- Keep HRA one small Bun product. Add a package boundary only for a concrete second consumer.
+- Keep Oompa one small Bun product. Add a package boundary only for a concrete second consumer.
 - Pin Bun to 1.3.14. Use one `bun.lock`; do not add another package manager or lockfile.
-- Provider runtimes own authentication, native sessions and threads, execution, tools, approvals, and hidden state. HRA owns isolated profiles, the provider-neutral transcript and command record, process generations, local projections, encrypted sync, and recovery. Keep Codex-only account, usage, plugin, desktop, and native-transcript operations explicit rather than implying Claude Code parity.
+- Provider runtimes own authentication, native sessions and threads, execution, tools, approvals, and hidden state. Oompa owns isolated profiles, the provider-neutral transcript and command record, process generations, local projections, encrypted sync, and recovery. Keep Codex-only account, usage, plugin, desktop, and native-transcript operations explicit rather than implying Claude Code parity.
 - Parse every foreign value from `unknown`. Expose closed domain operations instead of a generic JSON-RPC, HTTP, filesystem, or shell escape hatch.
 - Record every mutation before dispatch, bind it to an idempotency key and exact authority generation, and reconcile an uncertain result without speculative replay.
 - Keep provider credentials, raw reasoning, environment values, arbitrary tool output, approval secrets, and unbounded paths out of cloud sync, logs, JSON output, and receipts.
@@ -31,7 +31,7 @@
 - Update the active plan in `kb/plans/` as work changes. Do not call a phase complete without the acceptance evidence named there.
 - Preserve public independence. Do not include private paths, credentials, private package dependencies, internal project names, or unpublished provenance.
 
-<!-- hra-local-efficiency:start -->
+<!-- oompa-local-efficiency:start -->
 - Treat the user's request to change this repository as standing authorization for routine task-owned commits, pushes, pull requests, merges, releases, deployments, and production verification after the gates applicable to that action pass. Do not ask for duplicate confirmation. Build confidence through relevant automated checks, bounded diagnostics, and independent review, not another human approval. Passing checks does not expand task scope or authority.
 - Prefer agentic service provisioning for new infrastructure. Check Vercel Marketplace for a native product that can provision the required resource first; use Stripe Projects as a supported alternative when it better covers the service or the Marketplace route only connects an existing account. Verify the current catalog, account, region, plan, recurring cost and resource capabilities before selecting a route. Prefer supported provider CLIs or APIs over browser-only setup when neither catalog fits, and explain the concrete exception. Reuse existing owner-controlled resources where appropriate; this preference alone does not authorize migrations, duplicate accounts, paid upgrades or wider access. Continue setup already authorized by the task and budget without duplicate confirmation. Keep provider credentials and generated environment files private, complete required interactive authentication, and verify deployment, persistence and recovery separately from successful provisioning.
 - Separate artifact admission from live qualification and operational activation. Use applicable automated source, security, package/install, and provenance evidence for artifact admission; live provider qualification is not a universal publication prerequisite. Preserve explicit live acceptance criteria and require relevant live evidence for claims that depend on it. If publication or an artifact's install, upgrade, or default-use path activates risky unqualified behavior, keep that behavior guarded or disabled, or obtain bounded relevant evidence before shipping or activation.
@@ -41,13 +41,13 @@
 - Keep delivery gates proportional to the failure they prevent. Prefer required checks on the current integration candidate, independent agent review, and atomic or conditional integration. Add a merge queue or another approval stage only for a demonstrated coordination or safety need. Replace redundant queues, serial waits, and duplicate checks through reviewed policy changes while retaining evidence for the integrated result.
 - Preserve useful reasoning fan-out, but avoid unnecessary checkout fan-out. Prefer subagents in the current task for bounded research, review, diagnosis, and focused checks when they can safely share one working tree; create a separate task or worktree only for independently deliverable divergent edits, an isolated verification tree, or a different execution environment.
 - Give each expensive focused validation command and external wait one owner. The integration owner reviews that evidence and runs the repository-required aggregate or final gate once after convergence. Reuse evidence only for the exact Git tree, command, lockfiles, toolchain, relevant environment, and validity period, and never to skip a required final integration, merge, release, deployment, or production-verification gate.
-- On Hraness development machines, use `$hra-local-efficiency` and the installed host scheduler for heavyweight top-level commands when available. Keep ordinary work in the compute lane; give authenticated browser/dev-server/Chromium work one `browser-auth` owner and Mac-only validation one `mac-native` owner.
+- On Hraness development machines, use `$oompa-local-efficiency` and the installed host scheduler for heavyweight top-level commands when available. Keep ordinary work in the compute lane; give authenticated browser/dev-server/Chromium work one `browser-auth` owner and Mac-only validation one `mac-native` owner.
 - When a CI or policy gate scans complete Git history, check out the exact governed SHA and fetch only the fully qualified governed refs before scanning. Preserve the complete-history gate and reject unexpected refs instead of importing unrelated concurrent heads.
 - At closeout, record applicable branch, PR, check, merge, release, deployment, and production evidence. Archive only conclusively finished tasks, never from silence alone, and reclaim only freshly revalidated clean merged worktrees through the guarded exact-path flow.
-<!-- hra-local-efficiency:end -->
+<!-- oompa-local-efficiency:end -->
 
-<!-- hra-cloud-efficiency:start -->
-- Use `$hra-cloud-efficiency` only for bounded Codex Cloud repository work from an exact pushed branch. Keep the root integrator on the caller-selected model and record the worker as `cloud-default`.
+<!-- oompa-cloud-efficiency:start -->
+- Use `$oompa-cloud-efficiency` only for bounded Codex Cloud repository work from an exact pushed branch. Keep the root integrator on the caller-selected model and record the worker as `cloud-default`.
 - Keep authenticated browser, interactive auth, 2FA, private local data, Mac-native, signing, release, deployment, production, agent-phase secret, agent-phase network, and exact-model work on its authoritative local or CI lane.
 - Give every editable Cloud task one unique branch and owner. Cloud workers may run focused validation but may not merge, weaken gates, release, deploy, or replace the repository's final exact-tree validation.
-<!-- hra-cloud-efficiency:end -->
+<!-- oompa-cloud-efficiency:end -->

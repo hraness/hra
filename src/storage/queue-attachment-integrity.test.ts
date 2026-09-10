@@ -19,7 +19,7 @@ afterEach(() => {
 const attachment: StoredMessageAttachment = { digest: createHash("sha256").update("private bytes").digest("hex"),
   name: "notes.txt", mediaType: "text/plain", canonicalMediaType: "text/plain", byteLength: 13 };
 async function fixture() {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-queue-integrity-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-queue-integrity-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const clock = { now: 10_000 };
@@ -61,7 +61,7 @@ async function fixture() {
 async function legacyFixture(state: "pending" | "cancelled") {
   const entry = canonical40QueuesFixture.queues.find((queue) => queue.state === state);
   if (entry === undefined) throw new Error("Missing archived queue fixture.");
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-canonical40-queue-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-canonical40-queue-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   await writeFile(paths.database, canonical40QueuesDatabaseBytes());
@@ -249,7 +249,7 @@ describe("queue attachment durable integrity", () => {
   });
   test.each(["none", "occurrence", "schedule"] as const)("scheduled task uses one sealed empty queue and rolls back every row after %s failure", async (failure) => {
     const f = await fixture();
-    const projectRoot = await realpath(await mkdtemp(join(tmpdir(), "hra-queue-task-project-")));
+    const projectRoot = await realpath(await mkdtemp(join(tmpdir(), "oompa-queue-task-project-")));
     const project = await f.store.createProject("Scheduled queue project", projectRoot);
     f.store.updateSessionMetadata({ sessionId: f.session.id, expectedRevision: f.session.revision, projectId: project.id });
     const tasks = f.store.createSessionTaskStore();

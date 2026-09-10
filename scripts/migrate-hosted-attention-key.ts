@@ -8,10 +8,10 @@ import { makeFunctionReference } from "convex/server";
 import { z } from "zod";
 
 import {
-  hraAttentionResendApiKeyEnvironmentName,
-  hraResendApiKeyEnvironmentName,
+  oompaAttentionResendApiKeyEnvironmentName,
+  oompaResendApiKeyEnvironmentName,
   isStrictResendApiKey,
-  requireHraAttentionResendApiKey,
+  requireOompaAttentionResendApiKey,
 } from "../convex/resendApiKey";
 import {
   isAuthorityContainmentUnavailable,
@@ -248,7 +248,7 @@ const observe = async (options: ObservationOptions) => {
   const target = parseConvexTarget(options.target);
   const intendedKey = parseHostedAttentionKeyInput(options.inputDocument);
   const intendedKeyDigest = createHash("sha256")
-    .update("hra-attention-key-observation-v1\0", "utf8")
+    .update("oompa-attention-key-observation-v1\0", "utf8")
     .update(intendedKey, "utf8").digest("hex");
   const forbiddenValues = [intendedKey];
   const environment = () => Object.fromEntries(Object.entries(buildConvexChildEnvironment(
@@ -282,7 +282,7 @@ const observe = async (options: ObservationOptions) => {
       : operation === "inactive"
         ? ["run", "attentionNotificationControl:inactiveDeploymentStatus", "{}"]
         : ["env", "get", operation === "otp"
-          ? hraResendApiKeyEnvironmentName : hraAttentionResendApiKeyEnvironmentName];
+          ? oompaResendApiKeyEnvironmentName : oompaAttentionResendApiKeyEnvironmentName];
     await verifyTarget(target);
     const result = await runner({
       arguments: [convexCli, ...arguments_, "--deployment", target.deploymentName],
@@ -344,7 +344,7 @@ const observe = async (options: ObservationOptions) => {
       names.add(name);
     }
     if (!HOSTED_ENVIRONMENT_NAMES.every((name) =>
-      name === hraAttentionResendApiKeyEnvironmentName || names.has(name))) {
+      name === oompaAttentionResendApiKeyEnvironmentName || names.has(name))) {
       throw new HostedAttentionKeyObservationError("prerequisites_missing");
     }
     const readKey = async (operation: "otp" | "attention") => {
@@ -358,11 +358,11 @@ const observe = async (options: ObservationOptions) => {
     };
     const otp = await readKey("otp");
     if (otp === intendedKey) throw new HostedAttentionKeyObservationError("otp_key_reused");
-    requireHraAttentionResendApiKey({
-      [hraAttentionResendApiKeyEnvironmentName]: intendedKey,
-      [hraResendApiKeyEnvironmentName]: otp,
+    requireOompaAttentionResendApiKey({
+      [oompaAttentionResendApiKeyEnvironmentName]: intendedKey,
+      [oompaResendApiKeyEnvironmentName]: otp,
     });
-    const attention = names.has(hraAttentionResendApiKeyEnvironmentName)
+    const attention = names.has(oompaAttentionResendApiKeyEnvironmentName)
       ? await readKey("attention") : undefined;
     const keyState = attention === undefined ? "absent" as const
       : attention === intendedKey ? "existing_equal" as const : "existing_mismatched" as const;

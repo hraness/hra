@@ -15,7 +15,7 @@ import {
 } from "./secret-custody";
 import type { StatePaths } from "./paths";
 
-export const LEGACY_HRA_KEYCHAIN_SERVICE = "sh.hra.control-plane.v1";
+export const LEGACY_OOMPA_KEYCHAIN_SERVICE = "sh.oompa.control-plane.v1";
 
 const maximumPointerCount = 1_024;
 const maximumMetadataArtifactCount = maximumPointerCount * 4;
@@ -68,7 +68,7 @@ export class BunLegacySecretReader implements LegacySecretReader {
   async get(account: string): Promise<string | null> {
     return await Bun.secrets.get({
       name: account,
-      service: LEGACY_HRA_KEYCHAIN_SERVICE,
+      service: LEGACY_OOMPA_KEYCHAIN_SERVICE,
     });
   }
 }

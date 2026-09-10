@@ -238,7 +238,7 @@ export class ClaudeStreamClient {
     }
   }
 
-  /** Starts a turn: HRA mints the turn id, then writes the turn's `user` line. */
+  /** Starts a turn: Oompa mints the turn id, then writes the turn's `user` line. */
   async startTurn(input: Readonly<{
     turnId: string;
     message: string;
@@ -270,7 +270,7 @@ export class ClaudeStreamClient {
         await this.#drainPendingTurnStart(pending, false);
       } catch {
         try {
-          this.#onSafeDiagnostic?.("HRA fact delivery failed after Claude turn admission failed");
+          this.#onSafeDiagnostic?.("Oompa fact delivery failed after Claude turn admission failed");
         } catch {
           // An informational observer cannot replace the admission failure
           // or prevent the local turn from being abandoned below.
@@ -576,7 +576,7 @@ export class ClaudeStreamClient {
       try {
         await this.#emitFact(fact);
       } catch {
-        this.#onSafeDiagnostic?.("HRA fact delivery failed during Claude disconnection");
+        this.#onSafeDiagnostic?.("Oompa fact delivery failed during Claude disconnection");
       }
     }
   }
@@ -595,7 +595,7 @@ export class ClaudeStreamClient {
       try {
         await this.#emitFact(fact);
       } catch {
-        this.#onSafeDiagnostic?.("HRA fact delivery failed during Claude disconnection");
+        this.#onSafeDiagnostic?.("Oompa fact delivery failed during Claude disconnection");
       }
     }
     if (reason !== "process_exit") {
@@ -617,7 +617,7 @@ export class ClaudeStreamClient {
       try {
         await this.#drainPendingTurnStart(this.#pendingTurnStart, false);
       } catch {
-        this.#onSafeDiagnostic?.("HRA fact delivery failed during Claude disconnection");
+        this.#onSafeDiagnostic?.("Oompa fact delivery failed during Claude disconnection");
       }
     }
     this.#disconnectEmitted = true;
@@ -684,7 +684,7 @@ export class ClaudeStreamClient {
         if (retained < chunk.byteLength) truncated = true;
       }
     } catch {
-      // Diagnostics are advisory; provider stderr never becomes HRA data.
+      // Diagnostics are advisory; provider stderr never becomes Oompa data.
     }
     if (observed > 0) {
       this.#onSafeDiagnostic?.(

@@ -4,7 +4,7 @@ import { pathToFileURL } from "node:url";
 
 const GITHUB_REPOSITORY_OWNER = "hraness";
 const GITHUB_REPOSITORY_OWNER_ID = "307125679";
-const GITHUB_REPOSITORY_NAME = "hra";
+const GITHUB_REPOSITORY_NAME = "oompa";
 const GITHUB_REPOSITORY_ID = "1343008607";
 const GITHUB_REPOSITORY = `${GITHUB_REPOSITORY_OWNER}/${GITHUB_REPOSITORY_NAME}`;
 const GITHUB_REPOSITORY_URL = `https://github.com/${GITHUB_REPOSITORY}`;
@@ -12,7 +12,7 @@ const GITHUB_OIDC_ISSUER = "https://token.actions.githubusercontent.com";
 const MAXIMUM_INPUT_BYTES = 1024 * 1_024;
 const SHA = /^[0-9a-f]{40}$/u;
 const STABLE_TAG = /^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u;
-const INVOCATION = /^https:\/\/github\.com\/hraness\/hra\/actions\/runs\/[1-9][0-9]*\/attempts\/[1-9][0-9]*$/u;
+const INVOCATION = /^https:\/\/github\.com\/hraness\/oompa\/actions\/runs\/[1-9][0-9]*\/attempts\/[1-9][0-9]*$/u;
 
 function record(value, label) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {

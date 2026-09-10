@@ -22,8 +22,8 @@ import {
 } from "./configure-hosted-sync";
 import {
   ConvexTargetError,
-  HRA_CONVEX_PROJECT_ID,
-  HRA_CONVEX_TEAM_ID,
+  OOMPA_CONVEX_PROJECT_ID,
+  OOMPA_CONVEX_TEAM_ID,
   parseConvexTarget,
   parseConvexTargetArguments,
   type ConvexTarget,
@@ -52,13 +52,13 @@ const targetSchema = z.object({
       && parsed.origin === value
       && parsed.hostname.endsWith(".convex.cloud");
   }),
-  projectId: z.literal(HRA_CONVEX_PROJECT_ID),
-  teamId: z.literal(HRA_CONVEX_TEAM_ID),
+  projectId: z.literal(OOMPA_CONVEX_PROJECT_ID),
+  teamId: z.literal(OOMPA_CONVEX_TEAM_ID),
 }).strict();
 
 const digestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
 const replacementIdSchema = z.string().refine(isUuidV7);
-const replacementReferenceSchema = z.string().regex(/^hra-replace-[0-9a-f]{32}$/u);
+const replacementReferenceSchema = z.string().regex(/^oompa-replace-[0-9a-f]{32}$/u);
 
 const createIntentSchema = z.object({
   kind: z.literal("convex-target-replacement-create-intent"),
@@ -252,7 +252,7 @@ class HostedConvexReplacementError extends Error {
 }
 
 const replacementReference = (replacementId: string): string =>
-  `hra-replace-${replacementId.replaceAll("-", "")}`;
+  `oompa-replace-${replacementId.replaceAll("-", "")}`;
 
 const targetsAreDistinct = (left: ConvexTarget, right: ConvexTarget): boolean => (
   left.deploymentId !== right.deploymentId

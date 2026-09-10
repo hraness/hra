@@ -4,7 +4,7 @@ import type { DeviceRegistries } from "../../src/data/registry";
 import {
   parseCompactSessionEvent, parseDetailSessionEvent, parseDeviceRegistryPayload,
   type CompactSessionEvent, type DetailSessionEvent, type DeviceRegistryPayload,
-} from "../../src/hra/cloud";
+} from "../../src/oompa/cloud";
 import { initialSessionModel, sessionModelReducer } from "../../src/model/session-model";
 import { toMachineView } from "../../src/model/settings-view";
 

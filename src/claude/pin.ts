@@ -1,7 +1,7 @@
 // This module is the only place in `src/` that spells the pinned Claude Code
 // version, its Fable/Opus model ladder, and the reviewed stream-json matrix
 // digests.
-// Claude Code's stream-json surface is not a published contract, so HRA pins
+// Claude Code's stream-json surface is not a published contract, so Oompa pins
 // one exact release and fails closed on drift instead of tolerating it.
 //
 // Re-pinning procedure (mirrors `bun run codex:bump`, run by hand because the
@@ -70,7 +70,7 @@ export type ClaudeNativeFallbackCapability =
   }>;
 
 /**
- * No isolated signed-in HRA Claude profile was available for the 2.1.260
+ * No isolated signed-in Oompa Claude profile was available for the 2.1.260
  * authenticated acceptance. Help output and binary strings are not evidence,
  * so production runtime resolution remains fail-closed.
  */
@@ -81,7 +81,7 @@ export const CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY = Object.freeze({
 } as const satisfies ClaudeNativeFallbackCapability);
 
 /**
- * Reasoning efforts the pinned build's model listing reports for Fable. HRA
+ * Reasoning efforts the pinned build's model listing reports for Fable. Oompa
  * requests only `max`; the set exists so an unexpected effort is refused
  * rather than silently forwarded. `ultracode` is deliberately never requested
  * (the plan's "max without ultracode").

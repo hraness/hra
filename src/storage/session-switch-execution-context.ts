@@ -52,7 +52,7 @@ const sha256 = (value: string): string => createHash("sha256").update(value).dig
 // a separately proved process-generation rebind. No current capability defaults
 // enter this preimage or the historical branch.
 const contextDigest = (value: SessionSwitchExecutionContext): string => sha256(JSON.stringify({
-  domain: "hra:session-switch-execution-context:v2",
+  domain: "oompa:session-switch-execution-context:v2",
   ...value,
 }));
 

@@ -1,15 +1,15 @@
-# HRA local efficiency plugin
+# Oompa local efficiency plugin
 
-The repository marketplace distributes `hra-local-efficiency`, a local-only Codex plugin for managed Codex and Claude Code approval defaults, repository delivery guidance, machine-wide heavyweight-command scheduling, capability lanes, privacy-safe throughput telemetry, validation ownership, complete-history CI ref audits, stale-task review, and guarded worktree cleanup. It preserves useful agent fan-out and every repository final gate while avoiding unnecessary approval and checkout churn. It does not configure or route cloud execution.
+The repository marketplace distributes `oompa-local-efficiency`, a local-only Codex plugin for managed Codex and Claude Code approval defaults, repository delivery guidance, machine-wide heavyweight-command scheduling, capability lanes, privacy-safe throughput telemetry, validation ownership, complete-history CI ref audits, stale-task review, and guarded worktree cleanup. It preserves useful agent fan-out and every repository final gate while avoiding unnecessary approval and checkout churn. It does not configure or route cloud execution.
 
-The plugin is separate from the published `@hraness/hra` package. Install the repository marketplace and plugin on each development machine. The marketplace checkout includes the complete `plugins/` directory so it can also distribute the separate [HRA Cloud efficiency plugin](cloud-efficiency-plugin.md):
+The plugin is separate from the published `@hraness/oompa` package. Install the repository marketplace and plugin on each development machine. The marketplace checkout includes the complete `plugins/` directory so it can also distribute the separate [Oompa Cloud efficiency plugin](cloud-efficiency-plugin.md):
 
 ```sh
-codex plugin marketplace add hraness/hra --ref main --sparse .agents/plugins --sparse plugins
-codex plugin add hra-local-efficiency@hraness
+codex plugin marketplace add hraness/oompa --ref main --sparse .agents/plugins --sparse plugins
+codex plugin add oompa-local-efficiency@hraness
 ```
 
-Start a new Codex task after installation so Codex discovers the skill. Ask it to install the HRA local efficiency baseline on the Mac. The skill applies marker-bounded global Codex and Claude guidance, sets Codex to on-request approval with automatic review and the workspace permission profile, and sets Claude Code to Auto mode with its built-in classifier defaults retained after a capability probe succeeds. When entering Auto mode it removes bare or universal whole-tool allows and every wildcarded Bash or PowerShell allow such as `Bash(gh *)`, because explicit allow rules resolve before Auto's classifier; exact command rules, path-bounded non-shell rules, and every deny remain in the configuration. Claude may apply its own additional runtime filtering when Auto starts. It installs the scheduler, report, audit, and optional worker-profile commands, verifies a minimal private scheduler runtime, and adds one marker-bounded prompt rule under the Codex rules directory for the absolute installed `hra-host-run` command. Unrelated TOML, JSON, Markdown, rules, and global Bun packages remain unchanged.
+Start a new Codex task after installation so Codex discovers the skill. Ask it to install the Oompa local efficiency baseline on the Mac. The skill applies marker-bounded global Codex and Claude guidance, sets Codex to on-request approval with automatic review and the workspace permission profile, and sets Claude Code to Auto mode with its built-in classifier defaults retained after a capability probe succeeds. When entering Auto mode it removes bare or universal whole-tool allows and every wildcarded Bash or PowerShell allow such as `Bash(gh *)`, because explicit allow rules resolve before Auto's classifier; exact command rules, path-bounded non-shell rules, and every deny remain in the configuration. Claude may apply its own additional runtime filtering when Auto starts. It installs the scheduler, report, audit, and optional worker-profile commands, verifies a minimal private scheduler runtime, and adds one marker-bounded prompt rule under the Codex rules directory for the absolute installed `oompa-host-run` command. Unrelated TOML, JSON, Markdown, rules, and global Bun packages remain unchanged.
 
 This baseline records the user's standing authority once: task-owned commits, pushes, pull requests, merges, tags, releases, deployments, and verification proceed through the gates applicable to that action without another conversational confirmation. Relevant automated checks, bounded diagnostics, and independent review establish confidence; another human approval is not a substitute for missing evidence. Passing checks does not expand task scope or authority.
 
@@ -27,31 +27,31 @@ The 0.4.3 global policy makes verified immutable GitHub Release artifacts canoni
 
 Merge queues and additional approval stages need a demonstrated coordination or safety purpose. Required checks on the current integration candidate, independent agent review, and atomic or conditional integration can provide the needed evidence without another queue. Replace redundant serial waits or repeated checks through the reviewed policy path and verify the integrated result. This guidance does not change live branch protection by itself.
 
-The host rule deliberately uses `prompt`, never `allow`: `hra-host-run` can carry arbitrary child argv. A top-level scheduled command must therefore keep the absolute wrapper and complete child command visible while requesting reviewed host access. Codex auto-review can review that boundary without a human pause, but neither the rule nor auto-review expands the sandbox by itself. Codex loads configuration and rules at task startup, so start another new task after bootstrap installation or update.
+The host rule deliberately uses `prompt`, never `allow`: `oompa-host-run` can carry arbitrary child argv. A top-level scheduled command must therefore keep the absolute wrapper and complete child command visible while requesting reviewed host access. Codex auto-review can review that boundary without a human pause, but neither the rule nor auto-review expands the sandbox by itself. Codex loads configuration and rules at task startup, so start another new task after bootstrap installation or update.
 
 Claude Code Auto mode requires Claude Code 2.1.83 or later and an eligible account, model, and organization setting. Before any write, the bootstrap checks the CLI version and requires `claude auto-mode config` to return a bounded valid configuration. That command proves the local CLI/configuration surface, not account, model, or organization eligibility; Claude Code enforces those conditions when a session starts. The managed `autoMode.environment` contains only `$defaults`, so upstream safeguards update without globally treating sibling Hraness repositories or the public npm registry as internal. The permission migration is applied only when that capability probe succeeds; otherwise bootstrap leaves the ordinary mode and its allow rules untouched and reports why. If the runtime eligibility gate refuses Auto mode, use the ordinary permission mode; never substitute bypass permissions.
 
 Inspect the complete machine baseline without changing it:
 
 ```sh
-hra-local-efficiency --json
+oompa-local-efficiency --json
 ```
 
-The doctor reports the Codex and Claude guidance/configuration drift, command links, pinned scheduler runtime, and Claude Auto-mode CLI/configuration capability. Run `hra-workspace-audit` separately for repository adoption state and `hra-session-audit` for privacy-safe interruption evidence.
+The doctor reports the Codex and Claude guidance/configuration drift, command links, pinned scheduler runtime, and Claude Auto-mode CLI/configuration capability. Run `oompa-workspace-audit` separately for repository adoption state and `oompa-session-audit` for privacy-safe interruption evidence.
 
-If a sandboxed or incompletely permitted wrapper reaches machine-wide state, it fails before child execution with `HRA_HOST_ACCESS_REQUIRED` and exit 77. Retry that identical wrapper invocation once with reviewed host access. Do not run the child directly, delete scheduler or HRA recovery locks, or weaken fail-closed custody. A repeated exit 77 is a permission-configuration failure to diagnose, not cleanup authority.
+If a sandboxed or incompletely permitted wrapper reaches machine-wide state, it fails before child execution with `OOMPA_HOST_ACCESS_REQUIRED` and exit 77. Retry that identical wrapper invocation once with reviewed host access. Do not run the child directly, delete scheduler or Oompa recovery locks, or weaken fail-closed custody. A repeated exit 77 is a permission-configuration failure to diagnose, not cleanup authority.
 
 Use the compute lane for ordinary scheduled work. Use one `browser-auth` owner for authenticated browser, fixed-port dev-server, or Chromium work, and use `mac-native` only for work that actually requires macOS:
 
 ```sh
-hra-host-run --mode=heavy --lane=compute --label=repo-check -- bun run check
-hra-host-run --mode=exclusive --lane=browser-auth --label=browser-suite -- bun run test:e2e
-hra-host-run --mode=heavy --lane=mac-native --label=native-check -- xcodebuild test
+oompa-host-run --mode=heavy --lane=compute --label=repo-check -- bun run check
+oompa-host-run --mode=exclusive --lane=browser-auth --label=browser-suite -- bun run test:e2e
+oompa-host-run --mode=heavy --lane=mac-native --label=native-check -- xcodebuild test
 ```
 
-For HRA's own local aggregate, use `--mode=exclusive --lane=compute` with the unchanged `bun run check` child. Its package-command tests exercise the machine-wide process-recovery journal, so separate checkouts under two admitted heavy leases can still contend and fail with `bounded_process_recovery_journal_blocked:concurrent_invocation`. Keep that refusal and the journal intact; wait for admitted work to finish and run the converged aggregate under one exclusive lease. This HRA-specific custody requirement does not make ordinary focused checks or independent source review exclusive. Retain complete private gate output when investigating a failure, and preserve the wrapper's exit status.
+For Oompa's own local aggregate, use `--mode=exclusive --lane=compute` with the unchanged `bun run check` child. Its package-command tests exercise the machine-wide process-recovery journal, so separate checkouts under two admitted heavy leases can still contend and fail with `bounded_process_recovery_journal_blocked:concurrent_invocation`. Keep that refusal and the journal intact; wait for admitted work to finish and run the converged aggregate under one exclusive lease. This Oompa-specific custody requirement does not make ordinary focused checks or independent source review exclusive. Retain complete private gate output when investigating a failure, and preserve the wrapper's exit status.
 
-HRA's [final validation policy](../CONTRIBUTING.md#final-validation) assigns complete required CI as the final source aggregate, including executable changes, when command coverage and shard equivalence are established. Independently review the complete diff and impact, run relevant focused local contracts and the existing equivalence tests, then verify fresh complete CI for the final head and current-base integration candidate. Explicit local, native, coupled-run, live, installation, release, and deployment acceptance remains separate. Investigate observed failures and stalls with bounded diagnostics; green CI alone does not resolve them. The local full aggregate remains available for diagnosis and is required when CI coverage or equivalence is absent or uncertain.
+Oompa's [final validation policy](../CONTRIBUTING.md#final-validation) assigns complete required CI as the final source aggregate, including executable changes, when command coverage and shard equivalence are established. Independently review the complete diff and impact, run relevant focused local contracts and the existing equivalence tests, then verify fresh complete CI for the final head and current-base integration candidate. Explicit local, native, coupled-run, live, installation, release, and deployment acceptance remains separate. Investigate observed failures and stalls with bounded diagnostics; green CI alone does not resolve them. The local full aggregate remains available for diagnosis and is required when CI coverage or equivalence is absent or uncertain.
 
 The browser capability is serialized separately before weighted CPU admission, so it does not consume a compute permit while waiting. The Mac lane fails before child execution on another operating system. Nested wrappers may use only a mode and capability already covered by the outer lease.
 
@@ -73,7 +73,7 @@ The report shows queue and run percentiles, failures, permit-weighted runtime, c
 Audit a repository's history-fetch posture with:
 
 ```sh
-hra-ci-ref-audit --check --root /absolute/repository/path
+oompa-ci-ref-audit --check --root /absolute/repository/path
 ```
 
 The audit is read-only. It rejects an unbounded ref fetch coupled to a detected complete-history consumer, recognizes explicit exact-ref allowlists, and leaves uncertain broad-history cases for review. It never rewrites workflows or weakens `rev-list --all` and equivalent policy gates.
@@ -89,18 +89,18 @@ After a marketplace update, refresh the Git snapshot, reinstall the plugin, and 
 
 ```sh
 codex plugin marketplace upgrade hraness
-codex plugin add hra-local-efficiency@hraness
+codex plugin add oompa-local-efficiency@hraness
 ```
 
 Machines that installed the earlier plugin-specific sparse checkout must replace that marketplace snapshot once before upgrading:
 
 ```sh
 codex plugin marketplace remove hraness
-codex plugin marketplace add hraness/hra --ref main --sparse .agents/plugins --sparse plugins
-codex plugin add hra-local-efficiency@hraness
+codex plugin marketplace add hraness/oompa --ref main --sparse .agents/plugins --sparse plugins
+codex plugin add oompa-local-efficiency@hraness
 ```
 
-In that new task, invoke `$hra-local-efficiency` and have it run the freshly installed skill's `scripts/bootstrap.ts --apply` followed by `--check`. This repoints the convenience-command symlinks from the prior versioned plugin cache before they are used and refreshes the prompt-only host-access rule.
+In that new task, invoke `$oompa-local-efficiency` and have it run the freshly installed skill's `scripts/bootstrap.ts --apply` followed by `--check`. This repoints the convenience-command symlinks from the prior versioned plugin cache before they are used and refreshes the prompt-only host-access rule.
 
 Run the plugin's deterministic test suite before handoff:
 
@@ -108,7 +108,7 @@ Run the plugin's deterministic test suite before handoff:
 bun run test:local-efficiency-plugin
 ```
 
-The bootstrap and audits are local operations. The read-only workspace audit reports managed-guidance drift alongside the existing Hraness repository and worktree inventory. Repository adoption changes only the exact `hra-local-efficiency` marker block in root `AGENTS.md`; it creates root `CLAUDE.md` as `@AGENTS.md` when missing, preserves an existing active import byte-for-byte, or adds a marker-bounded import without replacing Claude-specific guidance. The managed policy keeps bounded research and review subagents in one working tree when safe, creates another worktree only for genuinely divergent delivery, assigns one owner to each focused check and external wait, prefers short-lived workload identities to personal credentials, and records final delivery evidence before closeout.
+The bootstrap and audits are local operations. The read-only workspace audit reports managed-guidance drift alongside the existing Hraness repository and worktree inventory. Repository adoption changes only the exact `oompa-local-efficiency` marker block in root `AGENTS.md`; it creates root `CLAUDE.md` as `@AGENTS.md` when missing, preserves an existing active import byte-for-byte, or adds a marker-bounded import without replacing Claude-specific guidance. The managed policy keeps bounded research and review subagents in one working tree when safe, creates another worktree only for genuinely divergent delivery, assigns one owner to each focused check and external wait, prefers short-lived workload identities to personal credentials, and records final delivery evidence before closeout.
 
 When a repository is already in scope for a change, check its managed baseline and refresh drift with `scripts/repo-adoption.ts` in the same task-owned change and existing final gate, preserving unmanaged rules; do not open a separate rollout solely to repeat expensive checks.
 

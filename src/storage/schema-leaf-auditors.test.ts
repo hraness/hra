@@ -19,7 +19,7 @@ let home: string;
 const assertCurrentAttachmentCustodySchema = (db: Database): void =>
   assertAttachmentCustodySchema(db, "joined", "acknowledged_v1");
 beforeAll(async () => {
-  home = await realpath(await mkdtemp(join(tmpdir(), "hra-leaf-ddl-")));
+  home = await realpath(await mkdtemp(join(tmpdir(), "oompa-leaf-ddl-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const store = new StateStore(paths);

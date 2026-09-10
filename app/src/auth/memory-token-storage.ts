@@ -1,5 +1,5 @@
 /**
- * In-memory token custody (HRA v2 F5).
+ * In-memory token custody (Oompa v2 F5).
  *
  * Convex Auth writes its JWT, its refresh token, and its OAuth verifier through
  * a `TokenStorage` object, defaulting to `localStorage`. A refresh token in

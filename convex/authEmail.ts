@@ -1,3 +1,4 @@
+import { readAliasedEnvironment } from "./environmentAliases";
 import {
   isCanonicalAuthEmail,
   type CanonicalAuthEmail,
@@ -21,7 +22,7 @@ export function timingSafeEqualAuthDigest(left: string, right: string): boolean 
 }
 
 function requireHmacSecret(): string {
-  const secret = process.env.HRA_AUTH_HMAC_SECRET;
+  const secret = readAliasedEnvironment(process.env, "OOMPA_AUTH_HMAC_SECRET");
   if (secret === undefined || secret.length < minimumHmacSecretLength) {
     throw new Error("Authentication is not configured.");
   }

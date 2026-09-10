@@ -1,9 +1,9 @@
 ---
 title: Personal-home session adoption
-description: Delivery plan for automatically adopting Codex and Claude Code sessions from the owner's normal provider homes without weakening HRA session authority.
+description: Delivery plan for automatically adopting Codex and Claude Code sessions from the owner's normal provider homes without weakening Oompa session authority.
 type: plan
 status: completed
-area: hra
+area: oompa
 tags:
   - codex
   - claude
@@ -15,9 +15,9 @@ tags:
 
 ## Outcome
 
-After the owner explicitly enables personal-home discovery for an HRA account,
-HRA discovers recently active Codex and Claude Code conversations from the
-owner's normal provider homes. A discovered conversation becomes an HRA
+After the owner explicitly enables personal-home discovery for an Oompa account,
+Oompa discovers recently active Codex and Claude Code conversations from the
+owner's normal provider homes. A discovered conversation becomes an Oompa
 session only after provider-specific admission succeeds. From that point onward
 it has the ordinary session shape, commands, approval authority, autorespond
 policy, queue, cloud projection, and grid presentation. There is no observed,
@@ -33,11 +33,11 @@ the imported-session provider bug. The following parts are rejected:
   work for any normal session row.
 - No origin-specific account-change prerequisite or public detach command.
   Login, logout, provider replacement, and unprovable identity use one
-  fail-closed recovery contract for HRA-created and adopted sessions.
+  fail-closed recovery contract for Oompa-created and adopted sessions.
 - No fabricated transcript seed and no `foreign_turn` transport-gap event.
-  Provider history is projected from the provider where supported; HRA's local
-  event ledger begins when HRA gains custody.
-- No claim of a provider-wide exclusive lease. HRA enforces one local binding,
+  Provider history is projected from the provider where supported; Oompa's local
+  event ledger begins when Oompa gains custody.
+- No claim of a provider-wide exclusive lease. Oompa enforces one local binding,
   but Codex exposes no exclusive handoff and Claude cannot prevent a later
   external resume. Admission must state and test the narrower guarantees it
   actually has.
@@ -54,22 +54,22 @@ idle rows older than 10 minutes are eligible inside the 15-minute discovery
 window or when a present valid Codex Desktop heartbeat automation names the
 exact target thread. Active and paused records both count until deletion or
 retargeting; the association waives only age and is re-read around claim. After
-commit, every HRA-owned turn applies a fresh reviewed
+commit, every Oompa-owned turn applies a fresh reviewed
 model, workspace permission profile, `on-request` approval routing, and
 `auto_review` reviewer immediately before dispatch.
 
-Claude's private peer surface does not carry tool-approval authority, so HRA
+Claude's private peer surface does not carry tool-approval authority, so Oompa
 does not use its private key or socket. An active or uncertain Claude process
 remains a candidate; after exact PID-domain, PID, and process-start evidence
-proves the old process exited, HRA resumes the same session through the pinned
+proves the old process exited, Oompa resumes the same session through the pinned
 stream-JSON bridge and accepts it only when `system/init` proves the requested
 session ID. The new process is held under durable process authority.
 
 ## Authority model
 
 - Personal-home discovery is opt in, scoped to one provider and one existing
-  HRA account, and defaults off.
-- A provider home can be bound to at most one HRA account on one daemon.
+  Oompa account, and defaults off.
+- A provider home can be bound to at most one Oompa account on one daemon.
 - Runtime-home provenance and pending discovery state remain private SQLite
   authority. They never enter `SessionRecord`, Convex, or app session heads.
 - Personal-home Claude account proof transiently reads bounded account, email,
@@ -172,7 +172,7 @@ Status: complete; delivered in PR 113. See the delivery evidence below.
 
 Acceptance: a quiet eligible external thread becomes a normal session; an
 active, recently updated, or unknown thread remains pending without a public
-  session row; a later poll can adopt it; every HRA session uses the same
+  session row; a later poll can adopt it; every Oompa session uses the same
   approval and autorespond integration path. A stale idle Codex thread with a
   valid active or paused heartbeat target is discovered by exact metadata read
   and admitted only while that association, account, project, liveness, and
@@ -182,7 +182,7 @@ active, recently updated, or unknown thread remains pending without a public
 
 Status: complete; delivered in PR 113. See the delivery evidence below.
 
-- Fix HRA-created Claude sessions to use and validate one real provider session ID.
+- Fix Oompa-created Claude sessions to use and validate one real provider session ID.
 - Discover sessions only through bounded scalar live-session registry metadata
   that names the exact pinned version. Do not invoke an unverified discovery
   command. Prove liveness with PID domain plus exact process start, never
@@ -190,7 +190,7 @@ Status: complete; delivered in PR 113. See the delivery evidence below.
 - When the source process is dead, launch the normal stream-JSON bridge with
   `--resume <session-id>` and accept custody only after `system/init` matches.
 
-Acceptance: an HRA-created Claude session survives daemon restart; a dead external session is
+Acceptance: an Oompa-created Claude session survives daemon restart; a dead external session is
 resumed under the same ID; a live, unknown, copied, or mismatched candidate is
 not admitted as a public session or granted runtime authority; future turns
 expose the normal interaction and autorespond path.
@@ -251,17 +251,17 @@ Neither provider exposes a global lease against all later external resumes.
 Codex adoption relies on the accepted 10-minute inactivity inference, and exact
 resume cannot detect a still-open but quiet terminal. Claude proves that the
 specific old process exited, but another process can race by resuming later.
-HRA therefore promises one HRA binding plus exact resumed-channel authority,
+Oompa therefore promises one Oompa binding plus exact resumed-channel authority,
 not universal exclusion. The operator chooses one controller for subsequent
-writes and must not resume the provider conversation elsewhere while HRA
+writes and must not resume the provider conversation elsewhere while Oompa
 controls it.
 
-HRA does not answer an approval already delivered only to another controller
+Oompa does not answer an approval already delivered only to another controller
 and does not fabricate that authority. Pre-adoption content can appear through
-a real bounded provider projection, but HRA's local event export begins at
+a real bounded provider projection, but Oompa's local event export begins at
 admission. The pinned Codex resume method also cannot add a thread-creation-only
 dynamic tool to a thread that never had it. That limits model-originated
-automation changes in arbitrary existing Codex threads, not the public HRA
+automation changes in arbitrary existing Codex threads, not the public Oompa
 session commands, scheduler, approval authority, or autorespond path.
 
 ## Provider timestamp recovery repair

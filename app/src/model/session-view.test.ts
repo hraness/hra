@@ -5,7 +5,7 @@ import {
   type CompactInteractionKind,
   type CompactRemoteInteractionPolicy,
   type SessionStateValue,
-} from "../hra/cloud";
+} from "../oompa/cloud";
 import {
   formatDuration,
   interactionAffordance,

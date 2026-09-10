@@ -79,7 +79,7 @@ const inspectArchive = async (
   expect(bytes.byteLength).toBe(fixture.databaseBytes);
   expect(hash(bytes)).toBe(fixture.databaseSha256);
   expect(hash(generator)).toBe(fixture.generatorSha256);
-  const directory = await realpath(await mkdtemp(join(tmpdir(), "hra-canonical-history-")));
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "oompa-canonical-history-")));
   await chmod(directory, 0o700);
   const path = join(directory, "archive.sqlite");
   let initializer: Database | undefined;

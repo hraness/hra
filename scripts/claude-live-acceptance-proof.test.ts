@@ -2,9 +2,9 @@ import { describe, expect, test } from "bun:test";
 
 import type { ClaudeHostToolResponseWritten } from "../src/claude/index";
 import { digestClaudeHostToolInvocation } from "../src/claude/index";
-import type { HraHostToolCall } from "../src/codex/protocol";
+import type { OompaHostToolCall } from "../src/codex/protocol";
 import type { ProfileAuthority } from "../src/daemon/ports";
-import { HRA_VERSION } from "../src/version";
+import { OOMPA_VERSION } from "../src/version";
 import type { LiveAcceptanceCandidate } from "./live-acceptance-installation";
 import {
   ClaudeLiveAcceptanceProofCollector,
@@ -30,7 +30,7 @@ const profileAuthority = {
 } satisfies ProfileAuthority;
 const candidate: LiveAcceptanceCandidate = {
   cloudTargetDigest: "3".repeat(64),
-  packageVersion: HRA_VERSION,
+  packageVersion: OOMPA_VERSION,
   sourceRevision: "4".repeat(40),
 };
 const memory = {
@@ -42,7 +42,7 @@ const memory = {
 const request = { input: memory, tool: "memory_remember" } as const;
 const callId = "acceptance-call-one";
 const requestDigest = digestClaudeHostToolInvocation(callId, request);
-const call: HraHostToolCall = {
+const call: OompaHostToolCall = {
   authority: { processGeneration: 7, profileId, provider: "claude", providerAccountId, bindingGeneration: 1 },
   callId,
   connectionId: "acceptance-connection-one",
@@ -113,7 +113,7 @@ const arm = (value: ClaudeLiveAcceptanceProofCollector, corroborate = true): voi
 
 const capture = async (
   value: ClaudeLiveAcceptanceProofCollector,
-  inputCall: HraHostToolCall = call,
+  inputCall: OompaHostToolCall = call,
   result: unknown = response,
 ): Promise<unknown> => await value.handleManagedHostToolCall({
   authority: profileAuthority,

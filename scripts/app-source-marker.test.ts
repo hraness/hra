@@ -6,8 +6,8 @@ const commit = "a75e7487594ce5b68345ccd3536974a10f7a93ee";
 const otherCommit = "576ccd76a6742cd62759ab6176a6a41844846daa";
 const expected = {
   generation: 1,
-  product: "HRA App",
-  repository: { id: 1343008607, path: "hraness/hra" },
+  product: "Oompa App",
+  repository: { id: 1343008607, path: "hraness/oompa" },
   schemaVersion: 1,
   source: { commit },
   version: "0.6.1",
@@ -15,23 +15,23 @@ const expected = {
 
 describe("app deployment source marker", () => {
   test("preserves the exact existing public identity and serialization", () => {
-    expect(APP_SOURCE_MARKER_PATH).toBe(".well-known/hra-app.json");
-    const manifest = Object.freeze({ name: "hra", version: "0.6.1" });
-    const environment = Object.freeze({ VERCEL: "1", VERCEL_GIT_COMMIT_SHA: commit, HRA_RELEASE_COMMIT: otherCommit });
+    expect(APP_SOURCE_MARKER_PATH).toBe(".well-known/oompa-app.json");
+    const manifest = Object.freeze({ name: "oompa", version: "0.6.1" });
+    const environment = Object.freeze({ VERCEL: "1", VERCEL_GIT_COMMIT_SHA: commit, OOMPA_RELEASE_COMMIT: otherCommit });
     expect(createAppSourceMarker(manifest, environment)).toBe(`${JSON.stringify(expected, null, 2)}\n`);
     expect(parseAppSourceMarker(JSON.parse(createAppSourceMarker(manifest, environment)) as unknown)).toEqual(expected);
-    expect(manifest).toEqual({ name: "hra", version: "0.6.1" });
-    expect(environment.HRA_RELEASE_COMMIT).toBe(otherCommit);
+    expect(manifest).toEqual({ name: "oompa", version: "0.6.1" });
+    expect(environment.OOMPA_RELEASE_COMMIT).toBe(otherCommit);
   });
 
   test("requires exact provider provenance and preserves local fallback precedence", () => {
     expect(resolveAppSourceCommit({})).toBe("local");
-    expect(resolveAppSourceCommit({ HRA_RELEASE_COMMIT: commit })).toBe(commit);
-    expect(resolveAppSourceCommit({ VERCEL_GIT_COMMIT_SHA: commit, HRA_RELEASE_COMMIT: otherCommit })).toBe(commit);
-    expect(() => resolveAppSourceCommit({ VERCEL: "1", HRA_RELEASE_COMMIT: commit })).toThrow(/Vercel app build requires/u);
+    expect(resolveAppSourceCommit({ OOMPA_RELEASE_COMMIT: commit })).toBe(commit);
+    expect(resolveAppSourceCommit({ VERCEL_GIT_COMMIT_SHA: commit, OOMPA_RELEASE_COMMIT: otherCommit })).toBe(commit);
+    expect(() => resolveAppSourceCommit({ VERCEL: "1", OOMPA_RELEASE_COMMIT: commit })).toThrow(/Vercel app build requires/u);
     for (const invalid of ["", "local", "main", "abc123", commit.toUpperCase(), `${commit}\n`, ` ${commit}`]) {
       expect(() => resolveAppSourceCommit({ VERCEL: "1", VERCEL_GIT_COMMIT_SHA: invalid })).toThrow();
-      expect(() => resolveAppSourceCommit({ HRA_RELEASE_COMMIT: invalid })).toThrow();
+      expect(() => resolveAppSourceCommit({ OOMPA_RELEASE_COMMIT: invalid })).toThrow();
     }
   });
 
@@ -52,7 +52,7 @@ describe("app deployment source marker", () => {
       null, [], 1, {}, { ...expected, generation: 2 }, { ...expected, schemaVersion: 2 },
       { ...expected, product: "another app" }, { ...expected, private: "state" },
       { ...expected, repository: { ...expected.repository, id: 1 } },
-      { ...expected, repository: { ...expected.repository, path: "other/hra" } },
+      { ...expected, repository: { ...expected.repository, path: "other/oompa" } },
       { ...expected, repository: { ...expected.repository, extra: true } },
       { ...expected, source: { commit: "main" } }, { ...expected, source: { commit, token: "state" } },
       { ...expected, source: [] },

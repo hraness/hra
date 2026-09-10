@@ -36,7 +36,7 @@ for (const figure of document.querySelectorAll<HTMLElement>("[data-product-previ
     if (guide !== null) guide.href = scene.guide;
     const title = figure.querySelector("[data-preview-dialog-title]");
     if (title !== null) title.textContent = scene.label;
-    frame.title = `HRA example: ${scene.label}`;
+    frame.title = `Oompa example: ${scene.label}`;
     loading.reset();
     loading.begin();
     frame.src = previewUrl(view);
@@ -75,8 +75,8 @@ for (const figure of document.querySelectorAll<HTMLElement>("[data-product-previ
     if (event.origin !== "null" || (event.source !== frame.contentWindow && event.source !== enlargedFrame?.contentWindow)) return;
     const data = parsePreviewMessage(event.data);
     if (data === undefined || data.view !== current) return;
-    if (event.source === frame.contentWindow) loading.complete(data.type === "hra-preview-ready");
-    else enlargedLoading?.complete(data.type === "hra-preview-ready");
+    if (event.source === frame.contentWindow) loading.complete(data.type === "oompa-preview-ready");
+    else enlargedLoading?.complete(data.type === "oompa-preview-ready");
   });
   // A lazy frame should not time out before it approaches the viewport.
   const observer = new IntersectionObserver((entries) => {
@@ -87,7 +87,7 @@ for (const figure of document.querySelectorAll<HTMLElement>("[data-product-previ
   // can abort the initial document while progressive enhancement is loading.
   // Request an already-settled observation after installing our listener. If
   // the child is not listening yet, its ordinary completion message arrives later.
-  frame.contentWindow?.postMessage({ type: "hra-preview-status", view: current }, "*");
+  frame.contentWindow?.postMessage({ type: "oompa-preview-status", view: current }, "*");
 }
 
 const search = document.querySelector<HTMLInputElement>("#docs-search");

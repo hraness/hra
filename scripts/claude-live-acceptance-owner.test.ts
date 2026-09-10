@@ -11,10 +11,10 @@ const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const operation of cleanup.splice(0).reverse()) await operation(); });
 
 const fixture = async () => {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-claude-owner-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-claude-owner-")));
   const runId = randomUUID();
-  const receiptPath = join(root, `.hra-live-claude-acceptance-${runId}.recovery.json`);
-  const lockPath = join(root, `.hra-live-claude-acceptance-${runId}.lock`);
+  const receiptPath = join(root, `.oompa-live-claude-acceptance-${runId}.recovery.json`);
+  const lockPath = join(root, `.oompa-live-claude-acceptance-${runId}.lock`);
   const owners: ClaudeLiveAcceptanceOwner[] = [];
   cleanup.push(async () => {
     for (const owner of owners) await owner.releasePreserving().catch(() => undefined);
@@ -121,7 +121,7 @@ describe("exact Claude acceptance invocation owner", () => {
     const f = await fixture();
     for (const input of [{ ...f.input, extra: true }, { ...f.input, runId: randomUUID() },
       { ...f.input, receiptPath: `${f.root}/../${f.root.split("/").at(-1) ?? ""}/${f.input.receiptPath.split("/").at(-1) ?? ""}` },
-      { ...f.input, receiptPath: `/var/.hra-live-claude-acceptance-${f.input.runId}.recovery.json` }]) {
+      { ...f.input, receiptPath: `/var/.oompa-live-claude-acceptance-${f.input.runId}.recovery.json` }]) {
       await expect(acquireClaudeLiveAcceptanceOwner(input)).rejects.toMatchObject({ code: "scope_refused" });
     }
     await expect(lstat(f.lockPath)).rejects.toMatchObject({ code: "ENOENT" });

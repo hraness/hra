@@ -28,7 +28,7 @@ afterEach(async () => {
 });
 
 async function fixture() {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-usage-source-metadata-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-usage-source-metadata-")));
   roots.push(root);
   const paths = resolveStatePaths({ homeDirectory: root, platform: "darwin" });
   await initializeStatePaths(paths);

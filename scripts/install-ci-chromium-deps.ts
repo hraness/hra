@@ -165,7 +165,7 @@ export function installCiChromium(): void {
   const temporaryRoot = realpathSync("/tmp");
   const temporaryRootStat = lstatSync(temporaryRoot);
   assertAptTemporaryRoot(temporaryRootStat.uid, temporaryRootStat.mode, temporaryRootStat.isDirectory());
-  const root = mkdtempSync(join(temporaryRoot, "hra-chromium-apt-"));
+  const root = mkdtempSync(join(temporaryRoot, "oompa-chromium-apt-"));
   const paths = { config: join(root, "apt.conf"), sourceParts: join(root, "sourceparts"), lists: join(root, "lists") };
   chmodSync(root, 0o755);
   for (const path of [paths.sourceParts, paths.lists, join(paths.lists, "partial")]) {

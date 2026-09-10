@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import fc from "fast-check";
 
-import { parseDeviceRegistryPayload, type DeviceRegistryPayload, type ProfileBindingPayload } from "../hra/cloud";
+import { parseDeviceRegistryPayload, type DeviceRegistryPayload, type ProfileBindingPayload } from "../oompa/cloud";
 import {
   accountBrowserLoginAllowed,
   accountRows,
@@ -44,7 +44,7 @@ function registry(overrides: Partial<DeviceRegistryPayload> = {}): DeviceRegistr
     defaultPreset: "ultra",
     heartbeatAt: now - minute,
     machineLabel: "studio",
-    projects: [{ label: "hra", publicId: "proj_one" }],
+    projects: [{ label: "oompa", publicId: "proj_one" }],
     proseAutorespondConfigured: true,
     scheduledTasks: [
       {
@@ -213,14 +213,14 @@ describe("toMachineView", () => {
       ["personal", "claude", "signed_out"],
       ["build", "devin", "login_pending"],
     ]);
-    expect(view.projects.map((project) => project.label)).toEqual(["hra"]);
+    expect(view.projects.map((project) => project.label)).toEqual(["oompa"]);
   });
 
   test("renders personal-home consent as a local command in both directions", () => {
     expect(personalSessionAdoptionCommand("codex", false))
-      .toBe("hra session adoption enable <account> --provider codex");
+      .toBe("oompa session adoption enable <account> --provider codex");
     expect(personalSessionAdoptionCommand("claude", true))
-      .toBe("hra session adoption disable --provider claude");
+      .toBe("oompa session adoption disable --provider claude");
   });
 
   test("carries exact provider aggregates and never guesses an older daemon's opt-in", () => {
@@ -269,14 +269,14 @@ describe("toMachineView", () => {
       updatedAt: now,
     });
     expect(view.scheduledTasks.map((task) => [task.label, task.kindLabel])).toEqual([
-      ["morning sweep", "HRA"],
-      ["weekly review", "HRA"],
+      ["morning sweep", "Oompa"],
+      ["weekly review", "Oompa"],
     ]);
     for (const task of view.scheduledTasks) expect(task.machineLabel).toBe("studio");
   });
 
-  test("names the public HRA conversation task kind", () => {
-    expect(scheduledTaskKindLabel("hra_conversation")).toBe("HRA");
+  test("names the public Oompa conversation task kind", () => {
+    expect(scheduledTaskKindLabel("hra_conversation")).toBe("Oompa");
   });
 });
 
@@ -391,7 +391,7 @@ describe("last reported Codex default", () => {
 
 describe("hosted memory supervision", () => {
   const digest = (scalar: string) => scalar.repeat(64);
-  const canonicalSpaceId = `hra:project:space-${"d".repeat(32)}`;
+  const canonicalSpaceId = `oompa:project:space-${"d".repeat(32)}`;
   const summary = (headScalar: string, observedAt = now) => ({
     coverage: { peerActions: "complete" as const, peerPolicies: "complete" as const, spaces: "complete" as const },
     observedAt,
@@ -405,7 +405,7 @@ describe("hosted memory supervision", () => {
     }],
     peerPolicies: [{
       mode: "coordinate" as const,
-      projectLabel: "HRA",
+      projectLabel: "Oompa",
       session: { label: "Planner", ref: digest("a") },
       updatedAt: now - 3_000,
     }],
@@ -415,7 +415,7 @@ describe("hosted memory supervision", () => {
       enrollment: "attached" as const,
       head: { digest: digest(headScalar), operationSha256: digest(headScalar), sequence: 4 },
       lastExchangeAt: now - 500,
-      projectLabel: "HRA",
+      projectLabel: "Oompa",
       recentRecords: [{ key: "release-policy", kind: "memory_page" as const, updatedAt: now - 4_000 }],
       recordCount: 3,
       remoteHead: { digest: digest(headScalar), operationSha256: digest(headScalar), sequence: 4 },

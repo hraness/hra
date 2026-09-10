@@ -80,7 +80,7 @@ type OwnedBuildChild = Readonly<{
 const ownedBuildChildren = new Set<OwnedBuildChild>();
 
 const controlledBuildEnvironment = new Set<string>([
-  "HRA_RELEASE_COMMIT",
+  "OOMPA_RELEASE_COMMIT",
   "VERCEL",
   "VERCEL_GIT_COMMIT_SHA",
 ]);
@@ -242,14 +242,14 @@ describe("built shell", () => {
 
   test("contains only the closed public graph and separate marker, with no receipts, maps, or source paths", async () => {
     for (const artifact of artifacts) {
-      expect(artifact.name === ".well-known/hra-app.json"
+      expect(artifact.name === ".well-known/oompa-app.json"
         || artifact.name === "index.html" || artifact.name === "stylex.css"
         || /^graphs\/client\/assets\/[A-Za-z0-9_-][A-Za-z0-9_.-]*\.(?:js|css)$/u.test(artifact.name)).toBe(true);
       expect(artifact.text).not.toContain(repositoryRoot);
       expect(artifact.text).not.toContain(".stylex-generation/");
     }
     expect(artifacts.filter(({ name }) => name.endsWith(".json")).map(({ name }) => name))
-      .toEqual([".well-known/hra-app.json"]);
+      .toEqual([".well-known/oompa-app.json"]);
     expect(artifacts.some(({ name }) => name.endsWith(".map"))).toBe(false);
     const foundation = artifacts.find(({ name }) => /^graphs\/client\/assets\/[^/]+\.css$/u.test(name));
     expect(foundation?.text).toMatch(/--ui-radius\s*:\s*0?\.75rem/u);
@@ -299,10 +299,10 @@ describe("built shell", () => {
     ) as { version?: unknown };
     const expected = {
       generation: 1,
-      product: "HRA App",
+      product: "Oompa App",
       repository: {
         id: 1_343_008_607,
-        path: "hraness/hra",
+        path: "hraness/oompa",
       },
       schemaVersion: 1,
       source: {
@@ -311,7 +311,7 @@ describe("built shell", () => {
       version: packageManifest.version,
     };
     const marker = artifacts.find((artifact) =>
-      artifact.name === ".well-known/hra-app.json");
+      artifact.name === ".well-known/oompa-app.json");
 
     expect(packageManifest.version).toBe("0.8.0");
     expect(buildSourceCommit).toMatch(/^[0-9a-f]{40}$/u);
@@ -320,17 +320,17 @@ describe("built shell", () => {
   });
 
   test("uses the root-site-compatible source fallbacks outside Vercel", async () => {
-    const releaseBuild = await runAppBuild({ HRA_RELEASE_COMMIT: buildSourceCommit });
+    const releaseBuild = await runAppBuild({ OOMPA_RELEASE_COMMIT: buildSourceCommit });
     expect(releaseBuild.status).toBe(0);
     const releaseMarker = JSON.parse(
-      await readFile(join(distributionRoot, ".well-known/hra-app.json"), "utf8"),
+      await readFile(join(distributionRoot, ".well-known/oompa-app.json"), "utf8"),
     ) as { source?: { commit?: unknown } };
     expect(releaseMarker.source?.commit).toBe(buildSourceCommit);
 
     const localBuild = await runAppBuild({});
     expect(localBuild.status).toBe(0);
     const localMarker = JSON.parse(
-      await readFile(join(distributionRoot, ".well-known/hra-app.json"), "utf8"),
+      await readFile(join(distributionRoot, ".well-known/oompa-app.json"), "utf8"),
     ) as { source?: { commit?: unknown } };
     expect(localMarker.source?.commit).toBe("local");
   }, 180_000);
@@ -345,7 +345,7 @@ describe("built shell", () => {
       "a".repeat(41),
     ]) {
       const build = await runAppBuild({
-        HRA_RELEASE_COMMIT: buildSourceCommit,
+        OOMPA_RELEASE_COMMIT: buildSourceCommit,
         VERCEL: "1",
         VERCEL_GIT_COMMIT_SHA: sourceCommit,
       });
@@ -481,7 +481,7 @@ describe("vercel project headers", () => {
     }
     for (const path of ["/", "/index.html", "/session/example", "/settings", "/stylexXcss", "/stylex.css/other"]) expect(rewrite.test(path)).toBe(true);
     expect(rewrite.test("/assets/legacy.js")).toBe(false);
-    expect(rewrite.test("/.well-known/hra-app.json")).toBe(false);
+    expect(rewrite.test("/.well-known/oompa-app.json")).toBe(false);
   });
 
   test("serve the F1 policy, the referrer policy, and the clipboard denial", async () => {
@@ -505,7 +505,7 @@ describe("vercel project headers", () => {
     expect(find("/(.*)", "Permissions-Policy")).toContain("clipboard-read=()");
     expect(find("/", "Cache-Control")).toBe("no-store");
     expect(find("/index.html", "Cache-Control")).toBe("no-store");
-    expect(find("/.well-known/hra-app.json", "Cache-Control")).toBe("no-store");
+    expect(find("/.well-known/oompa-app.json", "Cache-Control")).toBe("no-store");
   });
 
   test("the SPA fallback cannot rewrite assets or well-known files", async () => {
@@ -523,7 +523,7 @@ describe("vercel project headers", () => {
     expect(matcher.test("/graphs/client/assets/index-example.js")).toBe(false);
     expect(matcher.test("/stylex.css")).toBe(false);
     expect(matcher.test("/stylex.css/other")).toBe(true);
-    expect(matcher.test("/.well-known/hra-app.json")).toBe(false);
+    expect(matcher.test("/.well-known/oompa-app.json")).toBe(false);
   });
 
   /*

@@ -14,7 +14,7 @@ const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const dispose of cleanup.splice(0).reverse()) await dispose(); });
 
 const fixture = async (cohort: "current49" | "canonical40" | "combined49") => {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-owned-column-ddl-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-owned-column-ddl-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   cleanup.push(async () => { await rm(home, { recursive: true, force: true }); });

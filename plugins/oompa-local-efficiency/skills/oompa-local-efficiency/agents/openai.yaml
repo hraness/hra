@@ -1,0 +1,6 @@
+interface:
+  display_name: "Oompa Local Efficiency"
+  short_description: "Reduce local agent approval friction safely"
+  default_prompt: "Use $oompa-local-efficiency to align Codex and Claude approval defaults, repository guidance, and local Hraness swarm throughput without weakening gates or using cloud execution."
+policy:
+  allow_implicit_invocation: true

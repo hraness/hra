@@ -104,7 +104,7 @@ export async function verifyAuthoritySupervisorBuild(
     await assertAuthoritySupervisorArtifactPublicFile(root, artifact.relativePath);
   }
 
-  const temporaryDirectory = await mkdtemp(join(tmpdir(), "hra-authority-supervisor-build-"));
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), "oompa-authority-supervisor-build-"));
   try {
     const sourcePath = join(root, authoritySupervisorArtifactManifest.source.relativePath);
     for (const artifact of artifacts) {

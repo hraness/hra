@@ -28,15 +28,15 @@ const outputMaximumBytes = 4 * 1024;
 const sourceReadMaximumBytes = 64 * 1024;
 const observationMaximumMs = 5 * 60 * 1_000;
 const vercelApiOrigin = "https://api.vercel.com";
-const publicRepositoryUrl = "https://github.com/hraness/hra.git";
+const publicRepositoryUrl = "https://github.com/hraness/oompa.git";
 
-export const hraAppAlias = "app.hra.sh";
-export const hraAppBranch = "main";
-export const hraAppProjectId = "prj_3olYDT29BrwKO9PLByVq9HlgRkdA";
-export const hraAppRepositoryId = 1_343_008_607;
-export const hraAppTeamId = "team_UAd1iD2XogJlbFg4h14mRaPM";
+export const oompaAppAlias = "app.oompa.app";
+export const oompaAppBranch = "main";
+export const oompaAppProjectId = "prj_3olYDT29BrwKO9PLByVq9HlgRkdA";
+export const oompaAppRepositoryId = 1_343_008_607;
+export const oompaAppTeamId = "team_UAd1iD2XogJlbFg4h14mRaPM";
 
-const hraAppBuildSettings = Object.freeze({
+const oompaAppBuildSettings = Object.freeze({
   buildCommand: "cd .. && bun install --frozen-lockfile --ignore-scripts && bun run build:app",
   commandForIgnoringBuildStep: 'test "$VERCEL_ENV" != "production"',
   devCommand: null,
@@ -69,11 +69,11 @@ const digestBuildSettings = (settings: BuildSettingsDigestInput): string =>
       ["sourceFilesOutsideRootDirectory", settings.sourceFilesOutsideRootDirectory],
     ]))
     .digest("hex");
-export const hraAppBuildSettingsDigest = digestBuildSettings(hraAppBuildSettings);
-const hraAppProjectBuildSettingsDigests = new Set([
-  hraAppBuildSettingsDigest,
+export const oompaAppBuildSettingsDigest = digestBuildSettings(oompaAppBuildSettings);
+const oompaAppProjectBuildSettingsDigests = new Set([
+  oompaAppBuildSettingsDigest,
   digestBuildSettings({
-    ...hraAppBuildSettings,
+    ...oompaAppBuildSettings,
     commandForIgnoringBuildStep: null,
   }),
 ]);
@@ -95,45 +95,45 @@ const evidencePathSchema = z.string().min(1).max(4_096)
 const digestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
 
 const deploymentBuildSettingsSchema = z.object({
-  buildCommand: z.literal(hraAppBuildSettings.buildCommand),
-  commandForIgnoringBuildStep: z.literal(hraAppBuildSettings.commandForIgnoringBuildStep),
+  buildCommand: z.literal(oompaAppBuildSettings.buildCommand),
+  commandForIgnoringBuildStep: z.literal(oompaAppBuildSettings.commandForIgnoringBuildStep),
   devCommand: z.null(),
   framework: z.null(),
-  installCommand: z.literal(hraAppBuildSettings.installCommand),
-  outputDirectory: z.literal(hraAppBuildSettings.outputDirectory),
+  installCommand: z.literal(oompaAppBuildSettings.installCommand),
+  outputDirectory: z.literal(oompaAppBuildSettings.outputDirectory),
 });
 const deploymentSnapshotBuildSettingsSchema = deploymentBuildSettingsSchema.extend({
-  rootDirectory: z.literal(hraAppBuildSettings.rootDirectory),
+  rootDirectory: z.literal(oompaAppBuildSettings.rootDirectory),
   sourceFilesOutsideRootDirectory: z.literal(true),
 });
 
 const projectReadbackSchema = deploymentSnapshotBuildSettingsSchema.extend({
-  accountId: z.literal(hraAppTeamId),
+  accountId: z.literal(oompaAppTeamId),
   // app/vercel.json supplies this exact effective deployment setting. The
   // dashboard value may therefore be either unset or the same exact command.
   commandForIgnoringBuildStep: z.union([
     z.null(),
-    z.literal(hraAppBuildSettings.commandForIgnoringBuildStep),
+    z.literal(oompaAppBuildSettings.commandForIgnoringBuildStep),
   ]),
-  id: z.literal(hraAppProjectId),
+  id: z.literal(oompaAppProjectId),
   link: z.object({
     org: z.literal("hraness"),
-    productionBranch: z.literal(hraAppBranch),
-    repo: z.literal("hra"),
-    repoId: z.literal(hraAppRepositoryId),
+    productionBranch: z.literal(oompaAppBranch),
+    repo: z.literal("oompa"),
+    repoId: z.literal(oompaAppRepositoryId),
     type: z.literal("github"),
   }),
-  name: z.literal("hra-app"),
+  name: z.literal("oompa-app"),
   skewProtectionBoundaryAt: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
   skewProtectionMaxAge: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
 });
 
 const projectDomainReadbackSchema = z.object({
-  apexName: z.literal("hra.sh"),
+  apexName: z.literal("oompa.app"),
   customEnvironmentId: z.null().optional(),
   gitBranch: z.null().optional(),
-  name: z.literal(hraAppAlias),
-  projectId: z.literal(hraAppProjectId),
+  name: z.literal(oompaAppAlias),
+  projectId: z.literal(oompaAppProjectId),
   redirect: z.null().optional(),
   redirectStatusCode: z.null().optional(),
   verified: z.literal(true),
@@ -146,14 +146,14 @@ const domainConfigReadbackSchema = z.object({
 
 const deploymentReadbackSchema = z.object({
   gitSource: z.object({
-    ref: z.literal(hraAppBranch),
-    repoId: z.literal(hraAppRepositoryId),
+    ref: z.literal(oompaAppBranch),
+    repoId: z.literal(oompaAppRepositoryId),
     sha: commitSchema,
     type: z.literal("github"),
   }),
   id: deploymentIdSchema,
   prebuilt: z.literal(false).optional(),
-  projectId: z.literal(hraAppProjectId),
+  projectId: z.literal(oompaAppProjectId),
   projectSettings: deploymentBuildSettingsSchema,
   readyState: z.literal("READY"),
   // Vercel documents this as a best-effort metrics field. It is retained only
@@ -166,7 +166,7 @@ const deploymentReadbackSchema = z.object({
 
 const deploymentSnapshotReadbackSchema = z.object({
   prebuilt: z.literal(false).optional(),
-  projectId: z.literal(hraAppProjectId),
+  projectId: z.literal(oompaAppProjectId),
   projectSettings: deploymentSnapshotBuildSettingsSchema,
   readyState: z.literal("READY"),
   source: z.literal("git"),
@@ -254,8 +254,8 @@ const firewallReadbackSchema = z.object({
   firewallEnabled: z.boolean(),
   id: z.string().min(1).max(256),
   ips: z.array(z.unknown()).max(10_000),
-  ownerId: z.literal(hraAppTeamId),
-  projectKey: z.literal(hraAppProjectId),
+  ownerId: z.literal(oompaAppTeamId),
+  projectKey: z.literal(oompaAppProjectId),
   rules: z.array(firewallRuleSchema).max(10_000),
   rulesets: z.union([
     z.array(firewallRulesetSchema).max(10_000),
@@ -266,14 +266,14 @@ const firewallReadbackSchema = z.object({
 });
 
 const aliasReadbackSchema = z.object({
-  alias: z.literal(hraAppAlias),
+  alias: z.literal(oompaAppAlias),
   deployment: z.object({
     id: deploymentIdSchema,
     url: deploymentUrlSchema,
   }),
   deploymentId: deploymentIdSchema,
   microfrontends: z.null().optional(),
-  projectId: z.literal(hraAppProjectId),
+  projectId: z.literal(oompaAppProjectId),
   redirect: z.null().optional(),
   redirectStatusCode: z.null().optional(),
   uid: z.string().min(1).max(256),
@@ -282,10 +282,10 @@ const aliasReadbackSchema = z.object({
 
 const markerSchema = z.object({
   generation: z.literal(1),
-  product: z.literal("HRA App"),
+  product: z.literal("Oompa App"),
   repository: z.object({
-    id: z.literal(hraAppRepositoryId),
-    path: z.literal("hraness/hra"),
+    id: z.literal(oompaAppRepositoryId),
+    path: z.literal("hraness/oompa"),
   }).strict(),
   schemaVersion: z.literal(1),
   source: z.object({ commit: commitSchema }).strict(),
@@ -293,10 +293,10 @@ const markerSchema = z.object({
 }).strict();
 
 const appSourceProofUnsignedSchema = z.object({
-  alias: z.literal(hraAppAlias),
+  alias: z.literal(oompaAppAlias),
   aliasUid: z.string().min(1).max(256),
   aliasUpdatedAt: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-  branch: z.literal(hraAppBranch),
+  branch: z.literal(oompaAppBranch),
   bulkRedirectVersionId: routeVersionIdSchema.nullable(),
   cacheControl: z.literal("no-store"),
   completedAt: z.string().datetime(),
@@ -311,11 +311,11 @@ const appSourceProofUnsignedSchema = z.object({
   marker: markerSchema,
   observationBoundary: z.literal("sequential-readback-without-provider-lock"),
   projectBuildSettingsDigest: digestSchema,
-  projectId: z.literal(hraAppProjectId),
+  projectId: z.literal(oompaAppProjectId),
   projectRouteVersionId: routeVersionIdSchema.nullable(),
   readyState: z.literal("READY"),
   releaseVersion: releaseVersionSchema,
-  repositoryId: z.literal(hraAppRepositoryId),
+  repositoryId: z.literal(oompaAppRepositoryId),
   rollingReleaseState: z.enum(["ABORTED", "COMPLETE"]).nullable(),
   schemaVersion: z.literal(2),
   skewProtectionBoundaryAt: z.null(),
@@ -324,7 +324,7 @@ const appSourceProofUnsignedSchema = z.object({
   sourceRemoteMainCommit: commitSchema,
   startedAt: z.string().datetime(),
   target: z.literal("production"),
-  teamId: z.literal(hraAppTeamId),
+  teamId: z.literal(oompaAppTeamId),
   verifierIndexTransparent: z.literal(true),
   verifierSourceCommit: commitSchema,
   verifierTrackedAndUntrackedClean: z.literal(true),
@@ -337,8 +337,8 @@ export const appSourceProofEvidenceSchema = appSourceProofUnsignedSchema.extend(
   const completed = Date.parse(value.completedAt);
   if (
     selfDigest !== canonicalDigest(unsigned)
-    || value.deploymentBuildSettingsDigest !== hraAppBuildSettingsDigest
-    || !hraAppProjectBuildSettingsDigests.has(value.projectBuildSettingsDigest)
+    || value.deploymentBuildSettingsDigest !== oompaAppBuildSettingsDigest
+    || !oompaAppProjectBuildSettingsDigests.has(value.projectBuildSettingsDigest)
     || value.marker.source.commit !== value.sourceCommit
     || value.marker.version !== value.releaseVersion
     || value.sourceRemoteMainCommit !== value.sourceCommit
@@ -369,7 +369,7 @@ export class AppSourceProofError extends Error {
   readonly code: AppSourceProofErrorCode;
 
   constructor(code: AppSourceProofErrorCode) {
-    super(`HRA app source proof refused: ${code}`);
+    super(`Oompa app source proof refused: ${code}`);
     this.name = "AppSourceProofError";
     this.code = code;
   }
@@ -575,7 +575,7 @@ const readLocalSourceState = (): AppSourceState => {
     "ls-remote",
     "--heads",
     publicRepositoryUrl,
-    `refs/heads/${hraAppBranch}`,
+    `refs/heads/${oompaAppBranch}`,
   ]);
   const remoteResult = spawnSync(remoteCommand[0] as string, remoteCommand.slice(1), {
     cwd: "/",
@@ -671,7 +671,7 @@ const providerUrl = (path: string): string => {
   if (url.origin !== vercelApiOrigin || !url.pathname.startsWith("/v")) {
     fail("provider_readback_invalid");
   }
-  url.searchParams.set("teamId", hraAppTeamId);
+  url.searchParams.set("teamId", oompaAppTeamId);
   return url.href;
 };
 
@@ -716,8 +716,8 @@ const readExactDeploymentSnapshot = async (
     const document = await readProviderJson(
       fetcher,
       accessToken,
-      `/v7/deployments?projectId=${hraAppProjectId}`
-        + `&target=production&state=READY&branch=${hraAppBranch}`
+      `/v7/deployments?projectId=${oompaAppProjectId}`
+        + `&target=production&state=READY&branch=${oompaAppBranch}`
         + `&sha=${expected.sourceCommit}&limit=${deploymentListPageLimit}${cursor}`,
     );
     const result = deploymentListReadbackSchema.safeParse(document);
@@ -749,7 +749,7 @@ const readProviderSample = async (
   const projectDocument = await readProviderJson(
     fetcher,
     accessToken,
-    `/v9/projects/${hraAppProjectId}`,
+    `/v9/projects/${oompaAppProjectId}`,
   );
   const project = projectReadbackSchema.safeParse(projectDocument);
   if (!project.success) fail("provider_readback_invalid");
@@ -763,7 +763,7 @@ const readProviderSample = async (
   const projectDomainDocument = await readProviderJson(
     fetcher,
     accessToken,
-    `/v9/projects/${hraAppProjectId}/domains/${hraAppAlias}`,
+    `/v9/projects/${oompaAppProjectId}/domains/${oompaAppAlias}`,
   );
   const projectDomain = projectDomainReadbackSchema.safeParse(
     projectDomainDocument,
@@ -773,7 +773,7 @@ const readProviderSample = async (
   const domainConfigDocument = await readProviderJson(
     fetcher,
     accessToken,
-    `/v6/domains/${hraAppAlias}/config?projectIdOrName=${hraAppProjectId}`,
+    `/v6/domains/${oompaAppAlias}/config?projectIdOrName=${oompaAppProjectId}`,
   );
   const domainConfig = domainConfigReadbackSchema.safeParse(domainConfigDocument);
   if (!domainConfig.success) fail("provider_readback_invalid");
@@ -781,7 +781,7 @@ const readProviderSample = async (
   const rollingReleaseDocument = await readProviderJson(
     fetcher,
     accessToken,
-    `/v1/projects/${hraAppProjectId}/rolling-release`,
+    `/v1/projects/${oompaAppProjectId}/rolling-release`,
   );
   const rollingRelease = rollingReleaseReadbackSchema.safeParse(
     rollingReleaseDocument,
@@ -794,7 +794,7 @@ const readProviderSample = async (
   const bulkRedirectDocument = await readProviderJson(
     fetcher,
     accessToken,
-    `/v1/bulk-redirects?projectId=${hraAppProjectId}&page=1&per_page=1`,
+    `/v1/bulk-redirects?projectId=${oompaAppProjectId}&page=1&per_page=1`,
   );
   const bulkRedirects = bulkRedirectReadbackSchema.safeParse(bulkRedirectDocument);
   if (
@@ -806,7 +806,7 @@ const readProviderSample = async (
   const firewallDocument = await readProviderJson(
     fetcher,
     accessToken,
-    `/v1/security/firewall/config/active?projectId=${hraAppProjectId}`,
+    `/v1/security/firewall/config/active?projectId=${oompaAppProjectId}`,
   );
   const firewall = firewallReadbackSchema.safeParse(firewallDocument);
   if (!firewall.success) fail("provider_readback_invalid");
@@ -830,7 +830,7 @@ const readProviderSample = async (
   const routeVersionsDocument = await readProviderJson(
     fetcher,
     accessToken,
-    `/v1/projects/${hraAppProjectId}/routes/versions`,
+    `/v1/projects/${oompaAppProjectId}/routes/versions`,
   );
   const routeVersions = routeVersionsReadbackSchema.safeParse(
     routeVersionsDocument,
@@ -848,7 +848,7 @@ const readProviderSample = async (
     const exactRoutesDocument = await readProviderJson(
       fetcher,
       accessToken,
-      `/v1/projects/${hraAppProjectId}/routes?versionId=${encodeURIComponent(liveRouteVersion.id)}`,
+      `/v1/projects/${oompaAppProjectId}/routes?versionId=${encodeURIComponent(liveRouteVersion.id)}`,
     );
     const exactRoutes = exactRoutesReadbackSchema.safeParse(exactRoutesDocument);
     if (
@@ -884,7 +884,7 @@ const readProviderSample = async (
   const aliasDocument = await readProviderJson(
     fetcher,
     accessToken,
-    `/v4/aliases/${hraAppAlias}`,
+    `/v4/aliases/${oompaAppAlias}`,
   );
   const alias = aliasReadbackSchema.safeParse(aliasDocument);
   if (
@@ -928,7 +928,7 @@ const readProviderSample = async (
 
 const markerUrl = (nonce: string): string => {
   if (!nonceSchema.safeParse(nonce).success) fail("proof_output_invalid");
-  const url = new URL(`https://${hraAppAlias}/.well-known/hra-app.json`);
+  const url = new URL(`https://${oompaAppAlias}/.well-known/oompa-app.json`);
   url.searchParams.set("proof", nonce);
   return url.href;
 };
@@ -1099,10 +1099,10 @@ export const executeAppSourceProof = async (
     ) fail("authority_changed_during_observation");
     const completedAt = completed.toISOString();
     const proof = appSourceProofEvidenceSchema.parse(withSelfDigest({
-      alias: hraAppAlias,
+      alias: oompaAppAlias,
       aliasUid: after.aliasUid,
       aliasUpdatedAt: after.aliasUpdatedAt,
-      branch: hraAppBranch,
+      branch: oompaAppBranch,
       bulkRedirectVersionId: after.bulkRedirectVersionId,
       cacheControl: "no-store",
       completedAt,
@@ -1117,11 +1117,11 @@ export const executeAppSourceProof = async (
       marker,
       observationBoundary: "sequential-readback-without-provider-lock",
       projectBuildSettingsDigest: after.projectBuildSettingsDigest,
-      projectId: hraAppProjectId,
+      projectId: oompaAppProjectId,
       projectRouteVersionId: after.projectRouteVersionId,
       readyState: "READY",
       releaseVersion: expected.releaseVersion,
-      repositoryId: hraAppRepositoryId,
+      repositoryId: oompaAppRepositoryId,
       rollingReleaseState: after.rollingReleaseState,
       schemaVersion: 2,
       skewProtectionBoundaryAt: after.skewProtectionBoundaryAt,
@@ -1130,7 +1130,7 @@ export const executeAppSourceProof = async (
       sourceRemoteMainCommit: sourceAfter.remoteMainCommit,
       startedAt,
       target: "production",
-      teamId: hraAppTeamId,
+      teamId: oompaAppTeamId,
       verifierIndexTransparent: true,
       verifierSourceCommit: sourceAfter.commit,
       verifierTrackedAndUntrackedClean: true,

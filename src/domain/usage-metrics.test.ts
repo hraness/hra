@@ -464,13 +464,13 @@ describe("automaticRateLimitResetDecision", () => {
 
 describe("account usage schema digest", () => {
   const retiredDigest = createHash("sha256")
-    .update("hra:codex-account-usage:0.149.0:lifetimeTokens:v1")
+    .update("oompa:codex-account-usage:0.149.0:lifetimeTokens:v1")
     .digest("hex");
 
   test("is derived from a stable domain and schema id, not the Codex pin", () => {
     expect(ACCOUNT_USAGE_SCHEMA_ID).toBe("lifetimeTokens:v1");
     expect(ACCOUNT_USAGE_SCHEMA_DIGEST).toBe(
-      createHash("sha256").update(`hra:codex-account-usage:v2:${ACCOUNT_USAGE_SCHEMA_ID}`).digest("hex"),
+      createHash("sha256").update(`oompa:codex-account-usage:v2:${ACCOUNT_USAGE_SCHEMA_ID}`).digest("hex"),
     );
     expect(ACCOUNT_USAGE_SCHEMA_DIGEST).toBe("a562dbf3053074aa570c194d3caa812c28640dd615c4d5a0c334b8b50f5ebd46");
     expect(ACCOUNT_USAGE_SCHEMA_DIGEST).not.toBe(retiredDigest);

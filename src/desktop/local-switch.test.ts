@@ -59,7 +59,7 @@ const capability: ChatGptBundleCapability = {
 };
 
 async function fixture() {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-local-switch-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-local-switch-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   await initializeProfilePaths(paths, sourceId);

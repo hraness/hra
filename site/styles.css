@@ -41,7 +41,7 @@ body {
   margin: 0;
 }
 
-/* Marketing grammar reads the same shared palette as the rest of HRA. */
+/* Marketing grammar reads the same shared palette as the rest of Oompa. */
 :where(.hraness-marketing-page, .hraness-marketing-header) {
   --hraness-marketing-ink: var(--foreground);
   --hraness-marketing-muted: var(--muted);

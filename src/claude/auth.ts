@@ -478,7 +478,7 @@ export async function readClaudeAuthenticationObservation(
       });
     }
     // Draining stderr is a required bounded process join, never a diagnostic
-    // source: provider output is not copied into an HRA result or log.
+    // source: provider output is not copied into an Oompa result or log.
     void outcome.diagnostic;
     return parseClaudeAuthenticationObservation({
       configDir: options.configDir,
@@ -500,7 +500,7 @@ const descriptor = (value: number): number => {
 };
 
 /**
- * Runs Claude's own subscription login in the foreground. HRA supplies only
+ * Runs Claude's own subscription login in the foreground. Oompa supplies only
  * the isolated directory and terminal descriptors; Claude owns every prompt,
  * URL, code, and credential write. The result is deliberately only a process
  * outcome—callers re-read `auth status` before claiming sign-in.

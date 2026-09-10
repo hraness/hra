@@ -69,7 +69,7 @@ function readGuard(database: Database): string {
 }
 
 async function fixture(run: (database: Database, paths: ReturnType<typeof resolveStatePaths>) => void) {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-retained-profile-migration-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-retained-profile-migration-")));
   let database: Database | undefined;
   try {
     const bytes = combined49SwitchDatabaseBytes();

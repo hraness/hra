@@ -137,10 +137,10 @@ const safeLabel = (value: string, bytes: number): string =>
   boundClaudeText(sanitizeClaudeText(value), bytes);
 
 /**
- * Turns a stream of parsed Claude stream-json events into HRA facts. It owns
+ * Turns a stream of parsed Claude stream-json events into Oompa facts. It owns
  * exactly one concern: which turn, item, and subagent a line belongs to.
  *
- * The runtime tells it when a turn begins (HRA writes the `user` line, so HRA
+ * The runtime tells it when a turn begins (Oompa writes the `user` line, so Oompa
  * mints the turn id); Claude's own `result` line ends it.
  */
 export class ClaudeDeltaAssembler {
@@ -165,7 +165,7 @@ export class ClaudeDeltaAssembler {
     return this.#providerSessionId;
   }
 
-  /** HRA mints the turn id when it writes the turn's first `user` line. */
+  /** Oompa mints the turn id when it writes the turn's first `user` line. */
   beginTurn(turnId: string): readonly ClaudeFact[] {
     if (this.#activeTurnId !== null) {
       throw new ClaudeError("INVALID_INPUT", "A Claude turn is already in flight");
@@ -182,7 +182,7 @@ export class ClaudeDeltaAssembler {
     return [{ turnId, type: "turnStarted" }];
   }
 
-  /** Records that HRA asked the runtime to stop, so `result` reads as interrupted. */
+  /** Records that Oompa asked the runtime to stop, so `result` reads as interrupted. */
   markInterrupted(): void {
     if (this.#activeTurnId !== null) this.#interrupted = true;
   }

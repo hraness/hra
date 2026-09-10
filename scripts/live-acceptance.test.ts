@@ -27,7 +27,7 @@ import type { CommandResponse, LocalCommand } from "../src/domain/contracts";
 import { readDaemonAuthorityReceipt } from "../src/daemon/daemon-lock";
 import { DEFAULT_CLOUD_DEPLOYMENT_URL } from "../src/cloud/identity-custody";
 import { resolveStatePaths } from "../src/storage/paths";
-import { HRA_VERSION } from "../src/version";
+import { OOMPA_VERSION } from "../src/version";
 import {
   acceptanceInstallationDescriptorSchema,
   createAcceptanceInstallation,
@@ -71,8 +71,8 @@ import {
   type RuntimeReleaseAttestation,
 } from "./release-evidence";
 import {
-  HRA_CONVEX_PROJECT_ID,
-  HRA_CONVEX_TEAM_ID,
+  OOMPA_CONVEX_PROJECT_ID,
+  OOMPA_CONVEX_TEAM_ID,
 } from "./convex-target";
 
 const deadPidBase = 900_000;
@@ -99,22 +99,22 @@ const releaseDeployEvidence: DeployEvidence = deployEvidenceSchema.parse(withSel
     deploymentId: 5_089_017,
     deploymentName: "qualified-hummingbird-537",
     deploymentUrl: DEFAULT_CLOUD_DEPLOYMENT_URL,
-    projectId: HRA_CONVEX_PROJECT_ID,
-    teamId: HRA_CONVEX_TEAM_ID,
+    projectId: OOMPA_CONVEX_PROJECT_ID,
+    teamId: OOMPA_CONVEX_TEAM_ID,
   },
   targetDigest: canonicalDigest({
     deploymentId: 5_089_017,
     deploymentName: "qualified-hummingbird-537",
     deploymentUrl: DEFAULT_CLOUD_DEPLOYMENT_URL,
-    projectId: HRA_CONVEX_PROJECT_ID,
-    teamId: HRA_CONVEX_TEAM_ID,
+    projectId: OOMPA_CONVEX_PROJECT_ID,
+    teamId: OOMPA_CONVEX_TEAM_ID,
   }),
 }));
 const releaseCandidate = {
   cloudTargetDigest: createHash("sha256")
     .update(DEFAULT_CLOUD_DEPLOYMENT_URL, "utf8")
     .digest("hex"),
-  packageVersion: HRA_VERSION,
+  packageVersion: OOMPA_VERSION,
   sourceRevision: releaseSourceCommit,
 } as const;
 
@@ -721,8 +721,8 @@ describe("source-only live acceptance isolation", () => {
       "live-source-status:status --porcelain=v1 --untracked-files=all",
     ]);
     expect(attestation.sourceRevision).toBe(sourceRevision);
-    expect(attestation.packageVersion).toBe(HRA_VERSION);
-    expect(() => assertCurrentLiveAcceptancePackageVersion(HRA_VERSION)).not.toThrow();
+    expect(attestation.packageVersion).toBe(OOMPA_VERSION);
+    expect(() => assertCurrentLiveAcceptancePackageVersion(OOMPA_VERSION)).not.toThrow();
     expect(() => assertCurrentLiveAcceptancePackageVersion("0.1.0")).toThrow("input_invalid");
   });
 
@@ -967,7 +967,7 @@ describe("source-only live acceptance isolation", () => {
       sourceReads: 0,
     }));
     expect(await new Response(child.stderr).text()).toBe(
-      "hra live acceptance: --deploy-evidence is required for the current memory gate\n",
+      "oompa live acceptance: --deploy-evidence is required for the current memory gate\n",
     );
   });
 

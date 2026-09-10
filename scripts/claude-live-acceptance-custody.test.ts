@@ -7,7 +7,7 @@ import { join } from "node:path";
 
 import { createProfileId, createSessionId } from "../src/domain/values";
 import { protectedInteractionDetailDocumentSchema } from "../src/domain/interactions";
-import { HRA_VERSION } from "../src/version";
+import { OOMPA_VERSION } from "../src/version";
 import {
   assertClaudeLiveAcceptanceLayout as assertLayout,
   claudeLiveAcceptanceRecoveryReceiptSchema,
@@ -25,7 +25,7 @@ import { AtomicPrivateJsonReceipt, observePrivateDirectory } from "./live-accept
 const invalid = () => new Error("synthetic_custody_refused");
 
 async function withDirectory(operation: (directory: string) => Promise<void>): Promise<void> {
-  const directory = await mkdtemp(join(await realpath(tmpdir()), "hra-claude-helper-test-"));
+  const directory = await mkdtemp(join(await realpath(tmpdir()), "oompa-claude-helper-test-"));
   await chmod(directory, 0o700);
   try { await operation(directory); }
   finally { await rm(directory, { force: false, recursive: true }); }
@@ -62,16 +62,16 @@ async function withRecovery(
     await mkdir(state, { mode: 0o700 });
     await mkdir(project, { mode: 0o700 });
     const initial = claudeLiveAcceptanceRecoveryReceiptSchema.parse({
-      accountLabel: "hra-claude-live-000000000001",
+      accountLabel: "oompa-claude-live-000000000001",
       candidate: {
-        cloudTargetDigest: "a".repeat(64), packageVersion: HRA_VERSION,
+        cloudTargetDigest: "a".repeat(64), packageVersion: OOMPA_VERSION,
         sourceRevision: "b".repeat(40),
       },
       checkpoint: "prepared", createdAt: 1, updatedAt: 1,
       expectedHomeDirectory: homedir(), loginIdempotencyKey: randomUUID(),
-      projectLabel: "hra-claude-live-000000000002",
+      projectLabel: "oompa-claude-live-000000000002",
       project: { identity: await observePrivateDirectory(project, invalid), state: "active" },
-      receiptPath: join(directory, `.hra-live-claude-acceptance-${runId}.recovery.json`),
+      receiptPath: join(directory, `.oompa-live-claude-acceptance-${runId}.recovery.json`),
       runId, runRoot: await observePrivateDirectory(root, invalid),
       sendIdempotencyKey: randomUUID(), startIdempotencyKey: randomUUID(),
       state: { identity: await observePrivateDirectory(state, invalid), state: "active" },
@@ -89,7 +89,7 @@ async function quarantine(
   receipt: AtomicPrivateJsonReceipt<ClaudeLiveAcceptanceRecoveryReceipt>,
   key: "project" | "state",
 ): Promise<string> {
-  const quarantinePath = join(receipt.value.runRoot.path, `.hra-claude-quarantine-${key}-${randomUUID()}`);
+  const quarantinePath = join(receipt.value.runRoot.path, `.oompa-claude-quarantine-${key}-${randomUUID()}`);
   await receipt.update((current) => ({
     ...current, [key]: { ...current[key], quarantinePath, state: "quarantine_planned" },
   }));

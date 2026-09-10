@@ -34,13 +34,13 @@ const newProjectId = "prj_8ciIt9t9foE3utG45frRN7cxckjS";
 const oldRepositoryId = 1_334_876_494;
 const newRepositoryId = 1_343_008_607;
 const teamId = "team_UAd1iD2XogJlbFg4h14mRaPM";
-const canonicalAlias = "hra.sh";
-const fallbackAlias = "hra-weld.vercel.app";
-const newStagingAlias = "try-hra.vercel.app";
+const canonicalAlias = "oompa.app";
+const fallbackAlias = "oompa-weld.vercel.app";
+const newStagingAlias = "oompa.vercel.app";
 
 const oldEndpoint: CutoverEndpoint = {
   deploymentId: "dpl_ArchiveAccepted1234567890",
-  deploymentUrl: "hra-v0-accepted-hraness.vercel.app",
+  deploymentUrl: "oompa-v0-accepted-hraness.vercel.app",
   generation: 1,
   projectId: oldProjectId,
   repositoryId: oldRepositoryId,
@@ -50,7 +50,7 @@ const oldEndpoint: CutoverEndpoint = {
 
 const newEndpoint: CutoverEndpoint = {
   deploymentId: "dpl_NewAccepted1234567890123",
-  deploymentUrl: "hra-new-accepted-hraness.vercel.app",
+  deploymentUrl: "oompa-new-accepted-hraness.vercel.app",
   generation: 1,
   projectId: newProjectId,
   repositoryId: newRepositoryId,
@@ -77,7 +77,7 @@ const reversePlan: CutoverPlan = {
 const baselineEndpoint: CutoverEndpoint = {
   ...oldEndpoint,
   deploymentId: "dpl_BaselineAccepted123456789",
-  deploymentUrl: "hra-baseline-hraness.vercel.app",
+  deploymentUrl: "oompa-baseline-hraness.vercel.app",
   generation: null,
   sourceCommit: "6221f79b745f154882080936b961ff431569f33e",
 };
@@ -124,10 +124,10 @@ const projectFor = (
 const markerFor = (endpoint: CutoverEndpoint): unknown => {
   const shared = {
     generation: endpoint.generation,
-    product: "HRA",
+    product: "Oompa",
     repository: {
       id: endpoint.repositoryId,
-      path: endpoint.projectId === oldProjectId ? "hraness/hra-v0" : "hraness/hra",
+      path: endpoint.projectId === oldProjectId ? "hraness/hra-v0" : "hraness/oompa",
     },
     schemaVersion: 2,
     source: { commit: endpoint.sourceCommit },
@@ -267,7 +267,7 @@ class FakeCutoverProvider implements CutoverProvider {
       this.ownerReadOverrideDomainReads -= 1;
       if (this.ownerReadOverrideDomainReads === 0) this.ownerReadOverride = undefined;
     } else if (this.staleOwnerDomainReads > 0) this.staleOwnerDomainReads -= 1;
-    if (owner === "ambiguous") return ["hra.sh"];
+    if (owner === "ambiguous") return ["oompa.app"];
     const sourceProjectId = this.plan.direction === "archive"
       ? oldProjectId
       : this.plan.source.projectId;
@@ -275,9 +275,9 @@ class FakeCutoverProvider implements CutoverProvider {
       ? newProjectId
       : this.plan.target.projectId;
     if (owner === "source") {
-      return projectId === sourceProjectId ? ["hra.sh"] : [];
+      return projectId === sourceProjectId ? ["oompa.app"] : [];
     }
-    return projectId === targetProjectId ? ["hra.sh"] : [];
+    return projectId === targetProjectId ? ["oompa.app"] : [];
   }
 
   async readMarker(aliasName: ManagedAlias): Promise<unknown> {
@@ -413,7 +413,7 @@ describe("domain cutover runbook", () => {
       "utf8",
     );
 
-    expect(runbook).toContain("HRA v0 status: retired on 2026-08-27.");
+    expect(runbook).toContain("Oompa v0 status: retired on 2026-08-27.");
     expect(runbook).toContain("current-project-only");
     expect(runbook).toContain("1343008607");
     expect(runbook).toContain("prj_8ciIt9t9foE3utG45frRN7cxckjS");
@@ -489,13 +489,13 @@ describe("domain cutover runbook", () => {
     expect(runbook).toContain("8,193 persistent-entry bound");
     expect(runbook).toContain("transient 8,194th hardlink");
     expect(runbook).toContain("standing task authority may continue to cover it");
-    expect(runbook).toContain("HRA v0 is never a fallback");
+    expect(runbook).toContain("Oompa v0 is never a fallback");
     expect(runbook).not.toContain("/move");
   });
 
   test("keeps the active plan aligned with phase-aware source recovery", async () => {
     const plan = await readFile(
-      join(import.meta.dir, "..", "kb", "plans", "hra-v1.md"),
+      join(import.meta.dir, "..", "kb", "plans", "oompa-v1.md"),
       "utf8",
     );
 
@@ -720,7 +720,7 @@ describe("domain cutover operator", () => {
     ];
     for (const scenario of cases) {
       const evidenceDirectory = await realpath(
-        await mkdtemp(join(tmpdir(), "hra-domain-terminal-evidence-")),
+        await mkdtemp(join(tmpdir(), "oompa-domain-terminal-evidence-")),
       );
       try {
         await chmod(evidenceDirectory, 0o700);
@@ -1417,7 +1417,7 @@ describe("domain cutover operator", () => {
       initial: {
         ...oldEndpoint,
         deploymentId: "dpl_UnknownAccepted1234567890",
-        deploymentUrl: "hra-unknown-hraness.vercel.app",
+        deploymentUrl: "oompa-unknown-hraness.vercel.app",
       },
       restored: oldEndpoint,
     },
@@ -1830,12 +1830,12 @@ describe("domain cutover operator", () => {
     );
   });
 
-  test("refuses HRA v0 markers with a wrong schema or top-level-only version", async () => {
+  test("refuses Oompa v0 markers with a wrong schema or top-level-only version", async () => {
     for (const value of [
       { ...markerFor(oldEndpoint) as object, schemaVersion: 1 },
       {
         generation: 1,
-        product: "HRA",
+        product: "Oompa",
         repository: {
           id: oldEndpoint.repositoryId,
           path: "hraness/hra-v0",
@@ -1846,11 +1846,11 @@ describe("domain cutover operator", () => {
       },
       {
         ...markerFor(oldEndpoint) as object,
-        repository: { id: newRepositoryId, path: "hraness/hra" },
+        repository: { id: newRepositoryId, path: "hraness/oompa" },
       },
       {
         ...markerFor(oldEndpoint) as object,
-        repository: { id: oldRepositoryId, path: "hraness/hra" },
+        repository: { id: oldRepositoryId, path: "hraness/oompa" },
       },
     ]) {
       const provider = new FakeCutoverProvider(archivePlan);
@@ -1882,7 +1882,7 @@ describe("domain cutover operator", () => {
     expect(provider.owner).toBe("source");
   });
 
-  test("restores both aliases to P if hra.sh fails after fallback Q is proven", async () => {
+  test("restores both aliases to P if oompa.app fails after fallback Q is proven", async () => {
     const provider = new FakeCutoverProvider(archivePlan);
     provider.targetAliasSetFailure = canonicalAlias;
 
@@ -2010,7 +2010,7 @@ describe("domain cutover operator", () => {
   });
 
   test("refuses an invalid reserved evidence destination before provider authority reads", async () => {
-    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-domain-evidence-test-")));
+    const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-domain-evidence-test-")));
     await chmod(root, 0o700);
     try {
       const evidencePath = join(root, "forward.json");
@@ -2232,7 +2232,7 @@ describe("domain cutover operator", () => {
       if (request.arguments[0] === "--version") {
         return { exitCode: 0, stderr: "", stdout: "54.18.0\n" };
       }
-      if (path === "/v4/aliases/hra.sh") {
+      if (path === "/v4/aliases/oompa.app") {
         return { exitCode: 0, stderr: "", stdout: JSON.stringify(aliasFor(oldEndpoint)) };
       }
       if (path === `/v4/aliases/${fallbackAlias}`) {
@@ -2297,7 +2297,7 @@ describe("domain cutover operator", () => {
       deploymentFor(oldEndpoint),
     );
     expect(await provider.readProject(oldProjectId)).toEqual(projectFor(oldProjectId));
-    expect(await provider.readDomainNames(oldProjectId)).toEqual(["other.example", "hra.sh"]);
+    expect(await provider.readDomainNames(oldProjectId)).toEqual(["other.example", "oompa.app"]);
     expect(await provider.readMarker(canonicalAlias)).toEqual(markerFor(oldEndpoint));
     expect(await provider.readMarker(fallbackAlias)).toEqual(markerFor(oldEndpoint));
     await provider.setAlias(oldEndpoint.deploymentUrl, canonicalAlias);
@@ -2312,7 +2312,7 @@ describe("domain cutover operator", () => {
 
     expect(requests.map((request) => request.arguments)).toContainEqual([
       "api",
-      "/v4/aliases/hra.sh",
+      "/v4/aliases/oompa.app",
       "--scope",
       "hraness",
       "--raw",
@@ -2355,7 +2355,7 @@ describe("domain cutover operator", () => {
     ]);
     expect(requests.map((request) => request.arguments)).toContainEqual([
       "api",
-      `/v1/projects/${oldProjectId}/domains/hra.sh/move`,
+      `/v1/projects/${oldProjectId}/domains/oompa.app/move`,
       "--scope",
       "hraness",
       "-X",
@@ -2366,7 +2366,7 @@ describe("domain cutover operator", () => {
     ]);
     expect(requests.every((request) => request.environment.VERCEL_TOKEN === undefined)).toBe(true);
     expect(markerRequests.some((request) => request.startsWith(
-      `https://${fallbackAlias}/.well-known/hra.json?cutover=`,
+      `https://${fallbackAlias}/.well-known/oompa.json?cutover=`,
     ))).toBe(true);
     expect(buildVercelEnvironment({ HOME: "/safe/home", VERCEL_TOKEN: "no" }))
       .toEqual({ HOME: "/safe/home", NO_COLOR: "1", TERM: "dumb" });
@@ -2395,7 +2395,7 @@ describe("domain cutover operator", () => {
         return {
           exitCode: 0,
           stderr: "",
-          stdout: JSON.stringify(domainPage(["not-hra.example"], 42)),
+          stdout: JSON.stringify(domainPage(["not-oompa.example"], 42)),
         };
       },
       vercelCli: "/safe/vercel",

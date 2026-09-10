@@ -3757,7 +3757,7 @@ describe("cloud daemon bridge", () => {
       .toBe("effect_started");
   });
 
-  test("rejects recovery custody under a different HRA user or source device", async () => {
+  test("rejects recovery custody under a different Oompa user or source device", async () => {
     for (const mismatch of ["user", "device"] as const) {
       const cloud = new FakeCloud();
       cloud.failEpochAfterEffectOnce = true;
@@ -7411,11 +7411,11 @@ describe("device registry publication", () => {
       peerPolicies: [],
       spaces: [{
         bindingDigest: digest("a"),
-        canonicalSpaceId: `hra:project:space-${"b".repeat(32)}`,
+        canonicalSpaceId: `oompa:project:space-${"b".repeat(32)}`,
         enrollment: "not_enrolled",
         head: { digest: digest("c"), operationSha256: null, sequence: 0 },
         lastExchangeAt: null,
-        projectLabel: "HRA",
+        projectLabel: "Oompa",
         recentRecords: [],
         recordCount: 0,
         remoteHead: null,

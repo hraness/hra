@@ -34,7 +34,7 @@ describe("product example IO-only graph boundary", () => {
   test("leaves real screens, components, reducers, styles and browser-safe contracts untouched", async () => {
     for (const source of [
       "./grid-screen", "../components/interaction-panel", "../components/ui/button",
-      "../model/session-model", "../model/settings-view", "./session-screen.stylex", "../hra/cloud", "react",
+      "../model/session-model", "../model/settings-view", "./session-screen.stylex", "../oompa/cloud", "react",
       "../components/appearance", "../components/appearance-menu", "../components/appearance.stylex",
     ]) expect(await resolveImport(source)).toBeNull();
     expect(productIoModules.some((path) => /\/(?:screens|components|model)\//u.test(path))).toBe(false);

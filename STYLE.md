@@ -1,6 +1,6 @@
 # Public writing
 
-Public prose must be precise, useful, and free of hype. State what HRA does, how to use it, and where its authority stops.
+Public prose must be precise, useful, and free of hype. State what Oompa does, how to use it, and where its authority stops.
 
 ## Leave the reader with a clearer model
 

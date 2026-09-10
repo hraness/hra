@@ -698,7 +698,7 @@ const boundedProcessHostIdentity = (): string => {
     throw new BoundedProcessRecoveryJournalError([], "host_identity_unavailable");
   }
   cachedBoundedProcessHostIdentity = createHash("sha256")
-    .update("hra-bounded-process-host-v1\0", "utf8")
+    .update("oompa-bounded-process-host-v1\0", "utf8")
     .update(process.platform, "utf8")
     .update("\0", "utf8")
     .update(raw, "utf8")
@@ -750,7 +750,7 @@ const custodyNameKey = (
   value: string,
 ): string =>
   createHash("sha256")
-    .update("hra-bounded-process-custody-name-v1\0", "utf8")
+    .update("oompa-bounded-process-custody-name-v1\0", "utf8")
     .update(domain, "utf8")
     .update("\0", "utf8")
     .update(value, "utf8")
@@ -1424,7 +1424,7 @@ export const boundedProcessRecoveryDirectory = (): string => {
   if (account.uid !== uid || !isAbsolute(account.homedir)) {
     throw new BoundedProcessRecoveryJournalError([], "owner_unavailable");
   }
-  return join(account.homedir, ".local", "state", "hra", "process-recovery");
+  return join(account.homedir, ".local", "state", "oompa", "process-recovery");
 };
 
 export const openOwnedPrivateStateDirectory = (
@@ -2582,7 +2582,7 @@ const recoverBoundedProcessJournalLocked = (directory: string): void => {
   if (failure !== undefined) throw failure;
 };
 
-const authorityProtocolPrefix = "HRA_AUTHORITY_SUPERVISOR/1 ";
+const authorityProtocolPrefix = "OOMPA_AUTHORITY_SUPERVISOR/1 ";
 const authorityControlMaximumBytes = 1_024;
 const authoritySocketMaximumPathBytes = 107;
 
@@ -3445,7 +3445,7 @@ const runAuthorityRecoveryHelperLocked = async (
         throw new AuthorityControlProtocolError("recovery_helper_failed");
       }
       // The trusted helper reads its own immutable start time after becoming
-      // nondumpable and binds it to this authenticated channel. HRA can still
+      // nondumpable and binds it to this authenticated channel. Oompa can still
       // prove the announced PID is its exact direct child without a forbidden
       // cross-process /proc read, then binds RECOVERY_CLEAN to both values.
       const recoveryPid = child.pid;
@@ -3922,12 +3922,12 @@ type BoundedProcessDependencies = Readonly<{
 
 const executionGateProgram = [
   "IFS= read -r hra_gate || exit 125",
-  '[ "$hra_gate" = "hra-release-v1" ] || exit 125',
+  '[ "$hra_gate" = "oompa-release-v1" ] || exit 125',
   'exec "$@"',
 ].join("; ");
 
 const executionGateInput = (stdin: string | undefined): string =>
-  `hra-release-v1\n${stdin ?? ""}`;
+  `oompa-release-v1\n${stdin ?? ""}`;
 
 const authorityUnprovenResult = (
   journal: AuthorityPreparedRecoveryJournal
@@ -4281,7 +4281,7 @@ export const runBoundedProcess = async (
       child = spawn("/bin/sh", [
         "-c",
         executionGateProgram,
-        "hra-process-gate",
+        "oompa-process-gate",
         request.executable,
         ...request.arguments,
       ], {

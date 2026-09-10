@@ -171,18 +171,18 @@ describe("cloud identity-scoped custody", () => {
     await unbound.assertCurrentIdentity(null);
     await unbound.activateIdentity("user_aaaaaaaa");
     await expect(unbound.assertCurrentIdentity(null))
-      .rejects.toThrow("Cloud identity selection changed; restart HRA.");
+      .rejects.toThrow("Cloud identity selection changed; restart Oompa.");
 
     const identityA = await IdentityScopedCloudSecretCustody.open(raw);
     await identityA.assertCurrentIdentity("user_aaaaaaaa");
     await identityA.activateIdentity("user_bbbbbbbb");
     await expect(identityA.assertCurrentIdentity("user_aaaaaaaa"))
-      .rejects.toThrow("Cloud identity selection changed; restart HRA.");
+      .rejects.toThrow("Cloud identity selection changed; restart Oompa.");
 
     const identityB = await IdentityScopedCloudSecretCustody.open(raw);
     await identityB.activateIdentity("user_aaaaaaaa");
     await expect(identityA.assertCurrentIdentity("user_aaaaaaaa"))
-      .rejects.toThrow("Cloud identity selection changed; restart HRA.");
+      .rejects.toThrow("Cloud identity selection changed; restart Oompa.");
     const returnedA = await IdentityScopedCloudSecretCustody.open(raw);
     await returnedA.assertCurrentIdentity("user_aaaaaaaa");
   });
@@ -201,16 +201,16 @@ describe("cloud identity-scoped custody", () => {
     );
     await identityA.activateIdentity("user_bbbbbbbb");
     await expect(identityA.read("cloud-attention-notification-reconciliation"))
-      .rejects.toThrow("Cloud identity selection changed; restart HRA.");
+      .rejects.toThrow("Cloud identity selection changed; restart Oompa.");
     await expect(identityA.compareAndSwap(
       "cloud-attention-notification-reconciliation",
       0,
       "stale-write",
-    )).rejects.toThrow("Cloud identity selection changed; restart HRA.");
+    )).rejects.toThrow("Cloud identity selection changed; restart Oompa.");
     await expect(identityA.clearIfGeneration(
       "cloud-attention-notification-reconciliation",
       0,
-    )).rejects.toThrow("Cloud identity selection changed; restart HRA.");
+    )).rejects.toThrow("Cloud identity selection changed; restart Oompa.");
 
     const identityB = await IdentityScopedCloudSecretCustody.open(raw);
     expect(await identityB.read("cloud-attention-notification-reconciliation")).toBeNull();

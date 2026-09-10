@@ -31,7 +31,7 @@ function databaseSnapshot(database: Database) {
 }
 
 async function fixture(hook?: CleanupHook, legacyKind?: "session.send" | "session.steer") {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-attachment-reservations-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-attachment-reservations-")));
   roots.push(home);
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);

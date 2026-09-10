@@ -23,7 +23,7 @@ afterEach(async () => {
 });
 
 async function fixture(canonical40 = false) {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-pointer-move-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-pointer-move-")));
   homes.push(home);
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);

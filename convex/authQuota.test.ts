@@ -48,7 +48,7 @@ const transitionAdmission = makeFunctionReference<
   { expectedGeneration: number; mutationId: string; state: "frozen" | "open" },
   unknown
 >("admissionControl:transition");
-const hmacEnvironmentName = "HRA_AUTH_HMAC_SECRET";
+const hmacEnvironmentName = "OOMPA_AUTH_HMAC_SECRET";
 const priorHmacSecret = process.env[hmacEnvironmentName];
 
 beforeAll(() => {
@@ -56,7 +56,7 @@ beforeAll(() => {
 });
 
 afterAll(() => {
-  if (priorHmacSecret === undefined) delete process.env.HRA_AUTH_HMAC_SECRET;
+  if (priorHmacSecret === undefined) delete process.env.OOMPA_AUTH_HMAC_SECRET;
   else process.env[hmacEnvironmentName] = priorHmacSecret;
 });
 

@@ -69,27 +69,27 @@ remains pending the exact-tree aggregate gates below.
 
 ## Product decision
 
-HRA will run the official local Devin CLI as an ACP v1 subprocess. The admitted
+Oompa will run the official local Devin CLI as an ACP v1 subprocess. The admitted
 runtime is exactly Devin CLI `3000.6.14`, and every session starts with the exact
-`devin acp --model gpt-6-astra` command before HRA validates ACP v1
+`devin acp --model gpt-6-astra` command before Oompa validates ACP v1
 initialization. A model-catalog probe is not part of admission because the
 foreground login path must remain usable while the isolated profile is signed
-out. HRA will not use Devin's cloud REST or MCP APIs for local sessions: those
+out. Oompa will not use Devin's cloud REST or MCP APIs for local sessions: those
 APIs require separate `cog_` credential custody, create a different
 remote-session lifecycle, and cannot currently guarantee an arbitrary model
 selection.
 
 Codex `high` and `ultra` actively resolve to `gpt-5.6-sol` at `max` and `ultra`
-reasoning, respectively. New HRA sessions and explicit Codex preset selections
+reasoning, respectively. New Oompa sessions and explicit Codex preset selections
 bind the immutable Sol contract. Established contract 2 Codex sessions retain
 their exact Astra mapping and reviewed runtime history; queued and recovered
 work cannot reinterpret that evidence. At the superseded implementation point,
-Devin used an explicit `astra` preset on contract 2. Current HRA preserves those
+Devin used an explicit `astra` preset on contract 2. Current Oompa preserves those
 rows only as read-only history and exposes no Devin execution or selection.
 
 ## Authority and privacy invariants
 
-- Devin owns its credential file. HRA launches `devin auth login` in the exact
+- Devin owns its credential file. Oompa launches `devin auth login` in the exact
   profile-isolated XDG/HOME directories and reports only signed-in readiness.
 - The ACP child inherits an allowlisted environment and receives no ambient
   `WINDSURF_API_KEY`, provider token, or user's global Devin configuration.
@@ -101,20 +101,20 @@ rows only as read-only history and exposes no Devin execution or selection.
 - The neutral transcript stores bounded human/assistant text, lifecycle, tools,
   approvals, and usage projections, never raw ACP frames, credentials, or ACP
   thought chunks. ACP does not certify thought chunks as safe summaries, so
-  HRA drops their content at the provider boundary.
-- Account selection remains user-directed. HRA never switches or rotates Devin
+  Oompa drops their content at the provider boundary.
+- Account selection remains user-directed. Oompa never switches or rotates Devin
   accounts to evade provider limits.
 
 ## Usage truth
 
 ACP `usage_update` carries context usage (`used`, `size`) and may carry a
-monetary cost. HRA records only those supplied usage and cost facts. The
-effective runtime profile separately records the exact model HRA requested in
-the launch argv. HRA does not reinterpret context usage as account quota.
+monetary cost. Oompa records only those supplied usage and cost facts. The
+effective runtime profile separately records the exact model Oompa requested in
+the launch argv. Oompa does not reinterpret context usage as account quota.
 
 The local Devin CLI has human-facing `/usage` and `/session-stats` commands, but
 ACP v1 and `devin auth status` expose no documented machine-readable allowance,
-remaining balance, reset time, or reset-credit mutation. HRA therefore reports
+remaining balance, reset time, or reset-credit mutation. Oompa therefore reports
 account allowance as unavailable/unknown and maps explicit provider refusals
 such as exhausted credits or quota to bounded provider errors. It never submits
 `/usage` as a hidden model turn and never invokes Codex reset-credit behavior for
@@ -128,16 +128,16 @@ The first shipped matrix admits only:
 - `initialize` with ACP protocol version 1;
 - `session/new` and capability-gated `session/load`;
 - `session/prompt`, `session/update`, and `session/cancel`;
-- `session/request_permission` with bounded, durable HRA interaction authority;
-- the standard file/terminal callbacks only when HRA advertises and implements
+- `session/request_permission` with bounded, durable Oompa interaction authority;
+- the standard file/terminal callbacks only when Oompa advertises and implements
   them (the initial client advertises neither);
 - standard message, tool, plan, command/config, and usage updates that have an
-  explicit neutral reduction. HRA observes the kind of an ACP thought update
+  explicit neutral reduction. Oompa observes the kind of an ACP thought update
   but does not read or project its content.
 
-ACP v1 has no in-turn steering method. HRA refuses a direct steer while a Devin
+ACP v1 has no in-turn steering method. Oompa refuses a direct steer while a Devin
 turn is active; the caller can explicitly queue the message for the next prompt
-or stop the turn before sending another message. HRA never issues concurrent
+or stop the turn before sending another message. Oompa never issues concurrent
 prompt requests for one session. Interrupt sends `session/cancel` and waits for
 the prompt result or child termination boundary.
 

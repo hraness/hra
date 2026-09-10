@@ -37,8 +37,8 @@ import {
   type CommandRunner,
 } from "./configure-hosted-sync";
 import {
-  HRA_EXPECTED_CONVEX_DEPLOY_URL,
-  HRA_RESOLVED_CONVEX_DEPLOY_URL,
+  OOMPA_EXPECTED_CONVEX_DEPLOY_URL,
+  OOMPA_RESOLVED_CONVEX_DEPLOY_URL,
 } from "./assert-convex-deploy-target";
 import {
   ConvexTargetError,
@@ -430,7 +430,7 @@ async function createDeploymentBinding(
 ): Promise<DeploymentBinding> {
   let directory: string;
   try {
-    directory = await mkdtemp(join(temporaryRoot, "hra-hosted-deploy-"));
+    directory = await mkdtemp(join(temporaryRoot, "oompa-hosted-deploy-"));
   } catch {
     throw new HostedDeployError("target_file_refused");
   }
@@ -866,7 +866,7 @@ export async function deployHostedSync(
   const repositoryRoot = options.repositoryRoot ?? defaultRepositoryRoot;
   const environment = {
     ...buildConvexChildEnvironment(options.environment ?? process.env, []),
-    [HRA_EXPECTED_CONVEX_DEPLOY_URL]: target.deploymentUrl,
+    [OOMPA_EXPECTED_CONVEX_DEPLOY_URL]: target.deploymentUrl,
   };
   const verifyTarget = options.verifyTarget ?? verifyConvexDefaultTarget;
   const authorityTimeout = options.authorityTimeoutMs ?? convexAuthorityTimeoutMs;
@@ -1020,10 +1020,10 @@ export async function deployHostedSync(
             ? resolvedTargetAssertionCommand
             : archivedTargetAssertionCommand(deploymentSourceRoot),
           "--cmd-url-env-var-name",
-          HRA_RESOLVED_CONVEX_DEPLOY_URL,
+          OOMPA_RESOLVED_CONVEX_DEPLOY_URL,
           "--skip-workos-check",
           "--message",
-          `HRA source ${options.sourceCommit}`,
+          `Oompa source ${options.sourceCommit}`,
         ],
         containment: "authority",
         cwd: sourceBinding?.path ?? repositoryRoot,

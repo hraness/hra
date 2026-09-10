@@ -22,7 +22,7 @@ afterEach(async () => {
 });
 const hash = (bytes: string | Uint8Array): string => createHash("sha256").update(bytes).digest("hex");
 const open = async (readonly = false, bytes = canonical49WorkDatabaseBytes()) => {
-  const root = await mkdtemp(join(tmpdir(), "hra-canonical49-schema-"));
+  const root = await mkdtemp(join(tmpdir(), "oompa-canonical49-schema-"));
   roots.push(root);
   const path = join(root, "state.sqlite");
   await writeFile(path, bytes, { mode: 0o600 });

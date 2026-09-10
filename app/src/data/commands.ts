@@ -8,7 +8,7 @@ import {
   enqueueRequestDigest,
 } from "../custody/registration";
 import { commandLifetimeMs } from "../env";
-import { createCloudUuidV7, encryptRemoteCommand, type RemoteCommandPayload } from "../hra/cloud";
+import { createCloudUuidV7, encryptRemoteCommand, type RemoteCommandPayload } from "../oompa/cloud";
 import {
   acknowledgeObservedCommandReceipt,
   parseSessionCommandEnqueueReceipt,

@@ -84,7 +84,7 @@ describe("usage auto CLI contract", () => {
 
   test("help exposes required authority flags, examples and independent overrides", () => {
     expect(helpGroupNames).toContain("usage");
-    expect(usage).toContain("hra usage auto status|on|off|inherit");
+    expect(usage).toContain("oompa usage auto status|on|off|inherit");
     for (const help of [usageForGroup("usage"), usageForGroup("usage", "auto")]) {
       expect(help).toContain("--revision <n> --idempotency-key <uuid>");
       expect(help).toContain(key);
@@ -110,7 +110,7 @@ describe("usage auto CLI contract", () => {
         `Automatic usage policy ${command.kind === "usage.auto.set" ? "receipt" : "status"}, revision 7.\n`
         + "Inherited default: off. Provider overrides take precedence.\n"
         + "codex: on (override on).\nclaude: off (inherits default).\n"
-        + (command.kind === "usage.auto.set" ? "This is the saved receipt. Run `hra usage auto status` for the current policy.\n" : ""),
+        + (command.kind === "usage.auto.set" ? "This is the saved receipt. Run `oompa usage auto status` for the current policy.\n" : ""),
       ]);
       expect(human.stderr).toEqual([]);
     }

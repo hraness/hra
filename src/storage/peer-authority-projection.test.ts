@@ -21,7 +21,7 @@ afterEach(async () => {
 // Real current StateStore APIs, synthetic cached provider facts, no provider
 // runtime or historical producer claim. Only the peer journal begins here.
 async function fixture(provider: "codex" | "claude") {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-peer-authority-projection-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-peer-authority-projection-")));
   roots.push(root);
   const paths = resolveStatePaths({ homeDirectory: root, platform: "darwin" });
   await initializeStatePaths(paths);

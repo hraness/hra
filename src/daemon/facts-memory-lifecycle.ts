@@ -34,7 +34,7 @@ export const factsMemoryBrokerInspectionSchema = z.discriminatedUnion("status", 
 export type FactsMemoryBrokerInspection = z.infer<typeof factsMemoryBrokerInspectionSchema>;
 
 /**
- * Host-only semantic-store boundary. Implementations may use Oh, but HRA never
+ * Host-only semantic-store boundary. Implementations may use Oh, but Oompa never
  * receives facts, rules, projections, credentials, database paths, or raw handles.
  */
 export interface FactsMemoryBrokerPort {
@@ -90,7 +90,7 @@ export interface FactsMemoryAttestationLifecyclePort {
   }>): number;
 }
 
-export type HraFactsMemoryLifecycleReceipt = Readonly<{
+export type OompaFactsMemoryLifecycleReceipt = Readonly<{
   bindingDigest: string;
   epoch: number;
   handleHash: string | null;
@@ -100,28 +100,28 @@ export type HraFactsMemoryLifecycleReceipt = Readonly<{
   state: FactsMemoryControlRecord["state"];
 }>;
 
-export interface HraFactsMemoryLifecyclePort {
+export interface OompaFactsMemoryLifecyclePort {
   cleanupSession(input: Readonly<{
     ownerId: string;
     reason: FactsMemoryCleanupReason;
     sessionId: string;
-  }>): Promise<HraFactsMemoryLifecycleReceipt | null>;
+  }>): Promise<OompaFactsMemoryLifecycleReceipt | null>;
   ensureSession(input: Readonly<{
     expiresAt: number;
     ownerId: string;
     sessionId: string;
-  }>): Promise<HraFactsMemoryLifecycleReceipt>;
+  }>): Promise<OompaFactsMemoryLifecycleReceipt>;
   forkSession(input: Readonly<{
     childExpiresAt: number;
     childSessionId: string;
     ownerId: string;
     parentSessionId: string;
-  }>): Promise<HraFactsMemoryLifecycleReceipt>;
-  readSession(sessionId: string): HraFactsMemoryLifecycleReceipt | null;
+  }>): Promise<OompaFactsMemoryLifecycleReceipt>;
+  readSession(sessionId: string): OompaFactsMemoryLifecycleReceipt | null;
   resumeSession(input: Readonly<{
     ownerId: string;
     sessionId: string;
-  }>): Promise<HraFactsMemoryLifecycleReceipt>;
+  }>): Promise<OompaFactsMemoryLifecycleReceipt>;
   sweepExpired(
     now: number,
     /** Evaluated under the session lifecycle lock after the expiry record is revalidated. */
@@ -133,10 +133,10 @@ export interface HraFactsMemoryLifecyclePort {
     operationKey: string;
     sessionId: string;
     toOwnerId: string;
-  }>): Promise<HraFactsMemoryLifecycleReceipt>;
+  }>): Promise<OompaFactsMemoryLifecycleReceipt>;
 }
 
-const lifecycleReceipt = (record: FactsMemoryControlRecord): HraFactsMemoryLifecycleReceipt => ({
+const lifecycleReceipt = (record: FactsMemoryControlRecord): OompaFactsMemoryLifecycleReceipt => ({
   bindingDigest: record.binding.bindingDigest,
   epoch: record.binding.epoch,
   handleHash: record.handleHash,
@@ -202,7 +202,7 @@ const assertPurgeReceipt = (
   return receipt;
 };
 
-export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
+export class OompaFactsMemoryLifecycle implements OompaFactsMemoryLifecyclePort {
   readonly #broker: FactsMemoryBrokerPort;
   readonly #control: FactsMemoryControlStore;
   readonly #attestations: FactsMemoryAttestationLifecyclePort | undefined;
@@ -221,7 +221,7 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
     this.#control = input.control;
   }
 
-  readSession(sessionId: string): HraFactsMemoryLifecycleReceipt | null {
+  readSession(sessionId: string): OompaFactsMemoryLifecycleReceipt | null {
     const record = this.#control.get(sessionId);
     return record === null ? null : lifecycleReceipt(record);
   }
@@ -230,7 +230,7 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
     expiresAt: number;
     ownerId: string;
     sessionId: string;
-  }>): Promise<HraFactsMemoryLifecycleReceipt> {
+  }>): Promise<OompaFactsMemoryLifecycleReceipt> {
     return this.#serialize(input.sessionId, async () => {
       return lifecycleReceipt(await this.#ensureSessionLocked(input));
     });
@@ -242,7 +242,7 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
     operationKey: string;
     sessionId: string;
     toOwnerId: string;
-  }>): Promise<HraFactsMemoryLifecycleReceipt> {
+  }>): Promise<OompaFactsMemoryLifecycleReceipt> {
     const expiresAt = unixMillisecondsSchema.parse(input.expiresAt);
     const fromOwnerId = profileIdSchema.parse(input.fromOwnerId);
     const operationKey = z.string().min(1).max(200).parse(input.operationKey);
@@ -335,7 +335,7 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
     childSessionId: string;
     ownerId: string;
     parentSessionId: string;
-  }>): Promise<HraFactsMemoryLifecycleReceipt> {
+  }>): Promise<OompaFactsMemoryLifecycleReceipt> {
     const childExpiresAt = unixMillisecondsSchema.parse(input.childExpiresAt);
     if (input.childSessionId === input.parentSessionId) throw new Error("FACTS_MEMORY_SELF_FORK");
     const existingChild = this.#control.get(input.childSessionId);
@@ -421,7 +421,7 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
   resumeSession(input: Readonly<{
     ownerId: string;
     sessionId: string;
-  }>): Promise<HraFactsMemoryLifecycleReceipt> {
+  }>): Promise<OompaFactsMemoryLifecycleReceipt> {
     return this.#serialize(input.sessionId, async () => {
       const current = this.#control.get(input.sessionId);
       if (current === null) throw new Error("FACTS_MEMORY_NOT_FOUND");
@@ -465,7 +465,7 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
     ownerId: string;
     reason: FactsMemoryCleanupReason;
     sessionId: string;
-  }>): Promise<HraFactsMemoryLifecycleReceipt | null> {
+  }>): Promise<OompaFactsMemoryLifecycleReceipt | null> {
     const requestedReason = factsMemoryCleanupReasonSchema.parse(input.reason);
     return this.#serialize(input.sessionId, async () => {
       const existing = this.#control.get(input.sessionId);

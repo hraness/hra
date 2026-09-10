@@ -68,7 +68,7 @@ validation remains pending. This is not an aggregate or deployment claim.
 The frozen, script-disabled dependency install completed with Bun 1.3.14 and
 513 packages. Manifest and lockfile bytes are unchanged. Repository-context
 and bounded percolation commands are blocked by main's existing invalid YAML
-frontmatter in `plans/hra-web-v1.md`; that unrelated file is not modified here.
+frontmatter in `plans/oompa-web-v1.md`; that unrelated file is not modified here.
 The applicable root, Convex and plan guides were read directly. No generated
 catalog was rewritten or whole-vault validation claimed.
 

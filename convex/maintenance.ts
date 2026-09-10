@@ -1029,7 +1029,7 @@ async function closeUnsettledAttentionNotifications(
     if (now <= settlementSafeAfter) continue;
     const outcomeCode = "unsettled_effect" as const;
     const outcomeDigest = await sha256Hex([
-      "hra-attention-settlement:v1",
+      "oompa-attention-settlement:v1",
       seedDelivery.id,
       String(seedDelivery.generation),
       outcomeCode,

@@ -12,7 +12,7 @@ import {
   tokenizeShellCommand,
 } from "./shell";
 
-describe("HRA line shell", () => {
+describe("Oompa line shell", () => {
   test("sends ordinary text faithfully to the selected session", () => {
     expect(compileShellLine("keep  both spaces", { session: "Release work" })).toEqual({
       argv: ["session", "send", "Release work", "--", "keep  both spaces"],
@@ -212,7 +212,7 @@ describe("HRA line shell", () => {
 
   test("keeps initialization outside the daemon-owned persistent shell", () => {
     for (const line of ["/init", "/init --json", "/init --yes"]) {
-      expect(() => compileShellLine(line)).toThrow("Exit the shell, then run `hra init --yes`.");
+      expect(() => compileShellLine(line)).toThrow("Exit the shell, then run `oompa init --yes`.");
     }
   });
 
@@ -224,7 +224,7 @@ describe("HRA line shell", () => {
       "/account login personal --handoff-file /private/login.json --json",
     ]) {
       expect(() => compileShellLine(line)).toThrow(
-        "Exit the shell, then run `hra account login <profile> [--device-code]`.",
+        "Exit the shell, then run `oompa account login <profile> [--device-code]`.",
       );
     }
   });
@@ -234,7 +234,7 @@ describe("HRA line shell", () => {
       account: "work\u001b]0;owned\u0007",
       session: "a very long selected session whose rest should be omitted",
     });
-    expect(prompt).toStartWith("hra[");
+    expect(prompt).toStartWith("oompa[");
     expect(prompt).toEndWith("]> ");
     expect(prompt).not.toContain("\u001b");
     expect(prompt).not.toContain("\u0007");

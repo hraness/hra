@@ -55,7 +55,7 @@ import type {
   CanonicalMemoryHostedSpace,
   CanonicalMemorySyncReason,
   CanonicalMemorySyncResult,
-  HraCanonicalMemorySyncPort,
+  OompaCanonicalMemorySyncPort,
 } from "../daemon/canonical-memory-sync.ts";
 import type { ProjectMemorySerialExecutor } from "../daemon/project-memory-serial.ts";
 import {
@@ -243,7 +243,7 @@ const headToken = async (
   : await deriveCanonicalMemoryHeadToken({ authority: binding, head, spaceKey });
 
 const proofDigest = (value: unknown): string => canonicalSha256({
-  contract: "hra.canonical-memory.encrypted-head-proof.v1",
+  contract: "oompa.canonical-memory.encrypted-head-proof.v1",
   envelope: value,
 });
 
@@ -324,7 +324,7 @@ const validatePortableAdoptionProof = (
   return portable;
 };
 
-export class HraCanonicalMemorySynchronizer implements HraCanonicalMemorySyncPort {
+export class OompaCanonicalMemorySynchronizer implements OompaCanonicalMemorySyncPort {
   readonly #authoritySource: CanonicalMemoryCloudAuthoritySource;
   readonly #backgroundBackoffMaxMs: number;
   readonly #backgroundIntervalMs: number;

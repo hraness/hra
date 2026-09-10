@@ -131,7 +131,7 @@ function classify(scope: Scope, format: EffectEvidenceProvenanceFormat, meta: Me
 
 const provenanceDigest = (scope: Scope, meta: Metadata, format: EffectEvidenceProvenanceFormat,
   projection: string | null, reason: EffectEvidenceOpaqueReason | null): string => hash(JSON.stringify({
-  domain: "hra:effect-evidence-provenance:v1", scope, ...meta, format,
+  domain: "oompa:effect-evidence-provenance:v1", scope, ...meta, format,
   projection_json: projection, opaque_reason: reason,
 }));
 const makeProvenance = (scope: Scope, meta: Metadata, format: EffectEvidenceProvenanceFormat,

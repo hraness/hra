@@ -4,7 +4,7 @@
 - Transport owns one app-server process and bounded JSONL.
 - `session-program.ts` owns typed Effect session programs; `session-effects.ts` is the sole native callback and runtime boundary for each connection.
 - Protocol schemas and operation descriptors form the only app-server boundary.
-- Projection converts provider facts into HRA session and usage data.
+- Projection converts provider facts into Oompa session and usage data.
 - Automations is a read-only, tolerant reader for Codex Desktop's on-disk scheduled tasks.
 
 # Guidelines

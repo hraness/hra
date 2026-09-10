@@ -24,7 +24,7 @@ afterEach(() => {
 const capability = `hrac1_${"A".repeat(43)}`;
 
 async function fixture() {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-pointer-boundaries-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-pointer-boundaries-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const clock = { now: 1_800_000_000_000 };

@@ -275,7 +275,7 @@ describe("historical runtime-profile admission remains closed", () => {
   test("refuses unshipped primary models with the same private and public diagnostic", () => {
     const models = ["claude-opus-5", "gpt-6-astra", "claude-fable-5-1-next", "CLAUDE-FABLE-5-1"];
     const expectedIssues = [{
-      code: "custom" as const, path: [], message: "The effective model must match the exact HRA preset.",
+      code: "custom" as const, path: [], message: "The effective model must match the exact Oompa preset.",
     }];
     for (const fixture of privateFixtures) {
       const parsed = reviewedRuntimeProfileSchema.parse(JSON.parse(fixture.json));

@@ -1,13 +1,13 @@
 import { describe, expect, test } from "bun:test";
 
-import { hraAttentionResendApiKeyEnvironmentName } from "../convex/resendApiKey";
+import { oompaAttentionResendApiKeyEnvironmentName } from "../convex/resendApiKey";
 import { createAttentionKeyInstallTransport } from "./attention-key-install-transport";
-import { HRA_CONVEX_PROJECT_ID, HRA_CONVEX_TEAM_ID, type ConvexTarget } from "./convex-target";
+import { OOMPA_CONVEX_PROJECT_ID, OOMPA_CONVEX_TEAM_ID, type ConvexTarget } from "./convex-target";
 
 const target: ConvexTarget = {
   deploymentId: 7_654_321, deploymentName: "steady-otter-321",
   deploymentUrl: "https://steady-otter-321.convex.cloud",
-  projectId: HRA_CONVEX_PROJECT_ID, teamId: HRA_CONVEX_TEAM_ID,
+  projectId: OOMPA_CONVEX_PROJECT_ID, teamId: OOMPA_CONVEX_TEAM_ID,
 };
 const credentials = { adminKey: "synthetic-admin", attentionKey: "re_synthetic_attention", target };
 
@@ -20,11 +20,11 @@ describe("bounded attention key provider transport", () => {
         const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
         calls.push({ input: url, init });
         return url.endsWith("/api/query")
-          ? Response.json({ status: "success", value: [{ name: "HRA_TEST", value: "private" }], logLines: [] })
+          ? Response.json({ status: "success", value: [{ name: "OOMPA_TEST", value: "private" }], logLines: [] })
           : new Response("", { status: 200 });
       },
     });
-    expect(await transport.readEnvironment()).toEqual([{ name: "HRA_TEST", value: "private" }]);
+    expect(await transport.readEnvironment()).toEqual([{ name: "OOMPA_TEST", value: "private" }]);
     await transport.installAttentionKey();
     expect(calls).toHaveLength(2);
     expect(calls[0]?.input).toBe(`${target.deploymentUrl}/api/query`);
@@ -33,7 +33,7 @@ describe("bounded attention key provider transport", () => {
     }));
     expect(calls[1]?.input).toBe(`${target.deploymentUrl}/api/update_environment_variables`);
     expect(calls[1]?.init?.body).toBe(JSON.stringify({
-      changes: [{ name: hraAttentionResendApiKeyEnvironmentName, value: credentials.attentionKey }],
+      changes: [{ name: oompaAttentionResendApiKeyEnvironmentName, value: credentials.attentionKey }],
     }));
     for (const call of calls) {
       expect(call.init?.method).toBe("POST");

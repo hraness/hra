@@ -14,10 +14,10 @@ import {
   type PinnedClaudeRuntime,
   type ResolvePinnedClaudeRuntimeOptions,
 } from "../src/claude/index";
-import type { HraHostToolCall } from "../src/codex/protocol";
+import type { OompaHostToolCall } from "../src/codex/protocol";
 import type { ProfileId, SessionId } from "../src/domain/values";
 import { profilePaths, resolveStatePaths } from "../src/storage/paths";
-import { HRA_VERSION } from "../src/version";
+import { OOMPA_VERSION } from "../src/version";
 import { BoundedProcessCleanupUnprovenError } from "./bounded-process";
 import {
   ClaudeLiveAcceptanceProofCollector,
@@ -90,7 +90,7 @@ type Harness = Readonly<{
 }>;
 
 const createHarness = async (): Promise<Harness> => {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-claude-logout-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-claude-logout-")));
   cleanupRoots.add(root);
   const runId = randomUUID();
   const runRoot = join(root, `hra-live-acceptance-${runId}-fixture`);
@@ -105,7 +105,7 @@ const createHarness = async (): Promise<Harness> => {
   await mkdir(configDir, { mode: 0o700, recursive: true });
   const candidate: LiveAcceptanceCandidate = {
     cloudTargetDigest: "3".repeat(64),
-    packageVersion: HRA_VERSION,
+    packageVersion: OOMPA_VERSION,
     sourceRevision: "4".repeat(40),
   };
   return {
@@ -186,7 +186,7 @@ const privateReceipt = async (
   const callId = "acceptance-call-one";
   const request = { input: memory, tool: "memory_remember" } as const;
   const requestDigest = digestClaudeHostToolInvocation(callId, request);
-  const call: HraHostToolCall = {
+  const call: OompaHostToolCall = {
     authority: { processGeneration: 7, profileId, provider: "claude", providerAccountId, bindingGeneration: 1 },
     callId,
     connectionId: "acceptance-connection-one",
@@ -237,8 +237,8 @@ const privateReceipt = async (
   } as const;
   await collector.handleManagedHostToolCall({
     authority: {
-      codexHome: join(tmpdir(), "hra-logout-proof-codex-home"),
-      desktopUserData: join(tmpdir(), "hra-logout-proof-desktop-data"),
+      codexHome: join(tmpdir(), "oompa-logout-proof-codex-home"),
+      desktopUserData: join(tmpdir(), "oompa-logout-proof-desktop-data"),
       generation: 7,
       id: profileId,
       provider: "claude",

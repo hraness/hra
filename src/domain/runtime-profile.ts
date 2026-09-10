@@ -54,7 +54,7 @@ export const effectiveRuntimeProfileV1Schema = z.object({
     model: value.model,
     effort: value.reasoningEffort,
   })) {
-    context.addIssue({ code: "custom", message: "The effective model and reasoning effort must match an admitted exact HRA preset." });
+    context.addIssue({ code: "custom", message: "The effective model and reasoning effort must match an admitted exact Oompa preset." });
   }
   if ((value.fast && value.serviceTier !== "priority") || (!value.fast && value.serviceTier !== null)) {
     context.addIssue({ code: "custom", message: "Fast mode and the effective service tier are incoherent." });
@@ -71,10 +71,10 @@ export type EffectiveRuntimeAppV1 = z.infer<typeof effectiveRuntimeAppV1Schema>;
 export type EffectiveRuntimeProfileV1 = z.infer<typeof effectiveRuntimeProfileV1Schema>;
 
 /**
- * The reviewed profile HRA proves before it lets the pinned Claude Code
+ * The reviewed profile Oompa proves before it lets the pinned Claude Code
  * runtime start a session or a turn. Claude Code owns its own permission
  * engine, so the profile pins the interactive permission mode (every tool use
- * reaches HRA as a `can_use_tool` control request), the exact pinned CLI
+ * reaches Oompa as a `can_use_tool` control request), the exact pinned CLI
  * version, and which reviewed `CLAUDE_CONFIG_DIR` authority it uses. Managed
  * sessions use an isolated account home; adopted sessions use the explicitly
  * bound personal home without pretending that it is isolated.
@@ -134,7 +134,7 @@ export const effectiveClaudeRuntimeProfileV1Schema = z.union([
     model: value.model,
     effort: value.reasoningEffort,
   })) {
-    context.addIssue({ code: "custom", message: "The effective model must match the exact HRA preset." });
+    context.addIssue({ code: "custom", message: "The effective model must match the exact Oompa preset." });
   }
 });
 
@@ -166,7 +166,7 @@ export const effectiveDevinRuntimeProfileV1Schema = z.object({
   })) {
     context.addIssue({
       code: "custom",
-      message: "The effective model and reasoning effort must match Devin's exact current HRA preset.",
+      message: "The effective model and reasoning effort must match Devin's exact current Oompa preset.",
     });
   }
 });
@@ -215,7 +215,7 @@ export const publicEffectiveClaudeRuntimeProfileV1Schema = z.object({
     model: value.model,
     effort: value.reasoningEffort,
   })) {
-    context.addIssue({ code: "custom", message: "The effective model must match the exact HRA preset." });
+    context.addIssue({ code: "custom", message: "The effective model must match the exact Oompa preset." });
   }
 });
 
@@ -229,7 +229,7 @@ export const publicEffectiveDevinRuntimeProfileV1Schema = z.object({
   })) {
     context.addIssue({
       code: "custom",
-      message: "The effective model and reasoning effort must match Devin's exact current HRA preset.",
+      message: "The effective model and reasoning effort must match Devin's exact current Oompa preset.",
     });
   }
 });

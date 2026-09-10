@@ -22,15 +22,15 @@ import { z } from "zod";
 import { assertSafeDarwinInstallAcl } from "../src/install-normalizer";
 import { openOwnedPrivateStateDirectory } from "./bounded-process";
 
-export const HRA_RELEASE_VERSION = "0.1.0" as const;
-export const HRA_RELEASE_TAG = `v${HRA_RELEASE_VERSION}` as const;
-export const HRA_REPOSITORY = "hraness/hra" as const;
-export const HRA_REPOSITORY_ID = 1_343_008_607 as const;
-export const HRA_CONVEX_TEAM_ID = 513_923 as const;
-export const HRA_CONVEX_PROJECT_ID = 2_854_545 as const;
-export const HRA_VERCEL_TEAM_ID = "team_UAd1iD2XogJlbFg4h14mRaPM" as const;
-export const HRA_VERCEL_PROJECT_ID = "prj_8ciIt9t9foE3utG45frRN7cxckjS" as const;
-export const HRA_V0_VERCEL_PROJECT_ID = "prj_eRfUBHdHkEbvIaB8x7dyyZhBc3wr" as const;
+export const OOMPA_RELEASE_VERSION = "0.1.0" as const;
+export const OOMPA_RELEASE_TAG = `v${OOMPA_RELEASE_VERSION}` as const;
+export const OOMPA_REPOSITORY = "hraness/oompa" as const;
+export const OOMPA_REPOSITORY_ID = 1_343_008_607 as const;
+export const OOMPA_CONVEX_TEAM_ID = 513_923 as const;
+export const OOMPA_CONVEX_PROJECT_ID = 2_854_545 as const;
+export const OOMPA_VERCEL_TEAM_ID = "team_UAd1iD2XogJlbFg4h14mRaPM" as const;
+export const OOMPA_VERCEL_PROJECT_ID = "prj_8ciIt9t9foE3utG45frRN7cxckjS" as const;
+export const OOMPA_V0_VERCEL_PROJECT_ID = "prj_eRfUBHdHkEbvIaB8x7dyyZhBc3wr" as const;
 
 const maximumEvidenceBytes = 256 * 1024;
 export const PROTECTED_EVIDENCE_DESCRIPTOR_MAXIMUM = 0x7fff_ffff;
@@ -63,8 +63,8 @@ export const convexTargetEvidenceSchema = z.object({
   deploymentId: positiveIntegerSchema,
   deploymentName: deploymentNameSchema,
   deploymentUrl: convexUrlSchema,
-  projectId: z.literal(HRA_CONVEX_PROJECT_ID),
-  teamId: z.literal(HRA_CONVEX_TEAM_ID),
+  projectId: z.literal(OOMPA_CONVEX_PROJECT_ID),
+  teamId: z.literal(OOMPA_CONVEX_TEAM_ID),
 }).strict();
 
 export const runtimeReleaseAttestationSchema = z.object({
@@ -198,8 +198,8 @@ const ciJobSchema = z.object({
 export const vercelEndpointEvidenceSchema = z.object({
   deploymentId: vercelDeploymentIdSchema,
   deploymentUrl: vercelDeploymentUrlSchema,
-  projectId: z.enum([HRA_VERCEL_PROJECT_ID, HRA_V0_VERCEL_PROJECT_ID]),
-  repositoryId: z.union([z.literal(HRA_REPOSITORY_ID), z.literal(1_334_876_494)]),
+  projectId: z.enum([OOMPA_VERCEL_PROJECT_ID, OOMPA_V0_VERCEL_PROJECT_ID]),
+  repositoryId: z.union([z.literal(OOMPA_REPOSITORY_ID), z.literal(1_334_876_494)]),
   sourceCommit: commitSchema,
   version: z.string().regex(/^0\.[0-9]+\.[0-9]+$/u),
 }).strict();
@@ -212,7 +212,7 @@ export const releaseCandidateReceiptSchema = z.object({
       completedAt: timestampSchema,
       deployEvidenceDigest: digestSchema,
       digest: digestSchema,
-      packageVersion: z.literal(HRA_RELEASE_VERSION),
+      packageVersion: z.literal(OOMPA_RELEASE_VERSION),
       sourceCommit: commitSchema,
       startedAt: timestampSchema,
       targetDigest: digestSchema,
@@ -224,7 +224,7 @@ export const releaseCandidateReceiptSchema = z.object({
       completedAt: timestampSchema,
       deployEvidenceDigest: digestSchema,
       digest: digestSchema,
-      packageVersion: z.literal(HRA_RELEASE_VERSION),
+      packageVersion: z.literal(OOMPA_RELEASE_VERSION),
       sourceCommit: commitSchema,
       startedAt: timestampSchema,
       targetDigest: digestSchema,
@@ -240,22 +240,22 @@ export const releaseCandidateReceiptSchema = z.object({
     reverseDigest: digestSchema,
   }).strict(),
   kind: z.literal("release-candidate"),
-  releaseVersion: z.literal(HRA_RELEASE_VERSION),
+  releaseVersion: z.literal(OOMPA_RELEASE_VERSION),
   repository: z.object({
-    id: z.literal(HRA_REPOSITORY_ID),
-    name: z.literal(HRA_REPOSITORY),
+    id: z.literal(OOMPA_REPOSITORY_ID),
+    name: z.literal(OOMPA_REPOSITORY),
   }).strict(),
   schemaVersion: z.literal(1),
   sealedAt: timestampSchema,
   selfDigest: digestSchema,
   sourceCommit: commitSchema,
   surfaceDigest: digestSchema,
-  tag: z.literal(HRA_RELEASE_TAG),
+  tag: z.literal(OOMPA_RELEASE_TAG),
   vercel: z.object({
     authorityDigest: digestSchema,
     candidate: vercelEndpointEvidenceSchema,
     fallback: vercelEndpointEvidenceSchema,
-    teamId: z.literal(HRA_VERCEL_TEAM_ID),
+    teamId: z.literal(OOMPA_VERCEL_TEAM_ID),
   }).strict(),
 }).strict().superRefine((value, context) => {
   const names = value.ci.map((job) => job.name).sort();
@@ -288,11 +288,11 @@ export const releaseCandidateReceiptSchema = z.object({
     || value.ci.some((job) => Date.parse(job.completedAt) > value.sealedAt)
     || value.sealedAt < value.convex.bootstrapLive.completedAt
     || value.sealedAt < value.convex.candidateLive.completedAt
-    || value.vercel.candidate.projectId !== HRA_VERCEL_PROJECT_ID
-    || value.vercel.candidate.repositoryId !== HRA_REPOSITORY_ID
+    || value.vercel.candidate.projectId !== OOMPA_VERCEL_PROJECT_ID
+    || value.vercel.candidate.repositoryId !== OOMPA_REPOSITORY_ID
     || value.vercel.candidate.sourceCommit !== value.sourceCommit
-    || value.vercel.candidate.version !== HRA_RELEASE_VERSION
-    || value.vercel.fallback.projectId !== HRA_V0_VERCEL_PROJECT_ID
+    || value.vercel.candidate.version !== OOMPA_RELEASE_VERSION
+    || value.vercel.fallback.projectId !== OOMPA_V0_VERCEL_PROJECT_ID
     || value.vercel.fallback.repositoryId !== 1_334_876_494
   ) context.addIssue({ code: "custom", message: "release_candidate_binding_invalid" });
 });
@@ -840,7 +840,7 @@ export const defaultReleaseCandidateDirectory = (): string => {
     || account.uid !== uid
     || !isAbsolute(account.homedir)
   ) throw new ReleaseEvidenceError("custody_unsupported");
-  return join(account.homedir, ".local", "state", "hra", "release-candidates");
+  return join(account.homedir, ".local", "state", "oompa", "release-candidates");
 };
 
 export const defaultReleaseCandidatePath = (
@@ -851,7 +851,7 @@ export const defaultReleaseCandidatePath = (
   }
   return join(
     defaultReleaseCandidateDirectory(),
-    `${HRA_RELEASE_TAG}-${sourceCommit}.json`,
+    `${OOMPA_RELEASE_TAG}-${sourceCommit}.json`,
   );
 };
 

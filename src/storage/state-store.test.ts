@@ -446,7 +446,7 @@ async function fixture(
     securityScrubCheckpoint?: SecurityScrubCheckpointPolicy;
   }> = {},
 ): Promise<{ store: StateStore; home: string }> {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const store = new StateStore(paths, {
@@ -459,7 +459,7 @@ async function fixture(
 }
 
 async function canonical40QueueArchive() {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-canonical40-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-canonical40-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   await writeFile(paths.database, canonical40QueuesDatabaseBytes(), { mode: 0o600 });
@@ -467,7 +467,7 @@ async function canonical40QueueArchive() {
 }
 
 async function canonical34StorageArchive() {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-canonical34-storage-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-canonical34-storage-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   await writeFile(paths.database, canonical34StorageDatabaseBytes(), { mode: 0o600, flag: "wx" });
@@ -475,7 +475,7 @@ async function canonical34StorageArchive() {
 }
 
 async function syntheticAdoption36ContractFixture(scenario: "launch" | "quarantine") {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-synthetic-adoption36-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-synthetic-adoption36-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const database = new Database(paths.database, { create: true, strict: true });
@@ -526,7 +526,7 @@ function expectSyntheticAdoption36Maintenance(
 }
 
 async function canonicalEarlyMigrationArchive(version: 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17) {
-  const home = await realpath(await mkdtemp(join(tmpdir(), `hra-store-canonical-early-${version}-`)));
+  const home = await realpath(await mkdtemp(join(tmpdir(), `oompa-store-canonical-early-${version}-`)));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   await writeFile(paths.database, canonicalEarlyMigrationDatabaseBytes(version), { mode: 0o600, flag: "wx" });
@@ -534,7 +534,7 @@ async function canonicalEarlyMigrationArchive(version: 10 | 11 | 12 | 13 | 14 | 
 }
 
 async function canonical35To38Archive(scenario: Canonical35To38Scenario) {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-canonical35-38-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-canonical35-38-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const bytes = canonical35To38DatabaseBytes(scenario);
@@ -568,7 +568,7 @@ function expectCanonical35To38InertReopens(paths: StateStore["paths"], database:
 }
 
 async function canonicalAdoption35Archive() {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-adoption35-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-adoption35-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const bytes = canonicalAdoption35DatabaseBytes();
@@ -578,7 +578,7 @@ async function canonicalAdoption35Archive() {
 }
 
 async function canonicalIdentityAttentionArchive(scenario: CanonicalIdentityAttentionScenario) {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-identity-attention-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-identity-attention-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const source = canonicalIdentityAttentionFixtures[scenario];
@@ -605,7 +605,7 @@ async function canonicalIdentityAttentionArchive(scenario: CanonicalIdentityAtte
 }
 
 async function canonical38RuntimeArchive() {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-canonical38-runtime-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-canonical38-runtime-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const bytes = canonical38RuntimeDatabaseBytes();
@@ -628,7 +628,7 @@ async function canonical38RuntimeArchive() {
 }
 
 async function canonicalResetPolicyArchive(version: 27 | 28) {
-  const home = await realpath(await mkdtemp(join(tmpdir(), `hra-store-reset-policy-${version}-`)));
+  const home = await realpath(await mkdtemp(join(tmpdir(), `oompa-store-reset-policy-${version}-`)));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   await writeFile(paths.database, canonicalResetPolicyDatabaseBytes(version), { mode: 0o600, flag: "wx" });
@@ -636,7 +636,7 @@ async function canonicalResetPolicyArchive(version: 27 | 28) {
 }
 
 async function canonicalLabelPresetArchive(scenario: CanonicalLabelPresetScenario) {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-canonical-label-preset-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-canonical-label-preset-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const bytes = canonicalLabelPresetDatabaseBytes(scenario);
@@ -657,7 +657,7 @@ async function canonicalLabelPresetArchive(scenario: CanonicalLabelPresetScenari
 }
 
 async function canonical39DevinArchive() {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-canonical39-devin-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-canonical39-devin-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   await writeFile(paths.database, canonical39DevinDatabaseBytes(), { mode: 0o600 });
@@ -665,7 +665,7 @@ async function canonical39DevinArchive() {
 }
 
 async function canonical39RetiredArchive(kind: Canonical39RetiredKind) {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-canonical39-retired-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-canonical39-retired-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   await writeFile(paths.database, canonical39RetiredDatabaseBytes(kind), { mode: 0o600 });
@@ -673,7 +673,7 @@ async function canonical39RetiredArchive(kind: Canonical39RetiredKind) {
 }
 
 async function retiredSuccessorArchive(version: 41 | 42) {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-retired-successor-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-retired-successor-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   await writeFile(paths.database, retiredSuccessorDatabaseBytes(version), { mode: 0o600 });
@@ -681,7 +681,7 @@ async function retiredSuccessorArchive(version: 41 | 42) {
 }
 
 async function canonicalBudgetArchive(version: 43 | 45) {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-canonical-budget-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-canonical-budget-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const bytes = canonicalBudgetDatabaseBytes(version);
@@ -691,7 +691,7 @@ async function canonicalBudgetArchive(version: 43 | 45) {
 }
 
 async function canonicalAuthBudgetArchive(version: 44 | 45 | 46) {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-canonical-auth-budget-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-canonical-auth-budget-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const bytes = canonicalAuthBudgetDatabaseBytes(version);
@@ -701,7 +701,7 @@ async function canonicalAuthBudgetArchive(version: 44 | 45 | 46) {
 }
 
 async function canonical50LedgerArchive() {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-ledger-canonical50-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-ledger-canonical50-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const bytes = canonicalLoginLedgerDatabaseBytes(50);
@@ -712,7 +712,7 @@ async function canonical50LedgerArchive() {
 }
 
 async function canonical20To40Archive(scenario: Canonical20To40Scenario) {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-canonical20-40-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-canonical20-40-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const bytes = canonical20To40DatabaseBytes(scenario);
@@ -1463,7 +1463,7 @@ const providerSwitchSchemaObjectCount = (database: Database): number =>
   ).get()).count;
 
 async function canonical30AutorespondArchive() {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-canonical30-autorespond-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-canonical30-autorespond-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   await writeFile(paths.database, canonical30WorkDatabaseBytes(), { mode: 0o600, flag: "wx" });
@@ -1471,7 +1471,7 @@ async function canonical30AutorespondArchive() {
 }
 
 async function canonical48WorkArchive() {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-canonical48-work-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-canonical48-work-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   await writeFile(paths.database, canonical48WorkDatabaseBytes(), { mode: 0o600, flag: "wx" });
@@ -1557,7 +1557,7 @@ const shortScrubCheckpoint: SecurityScrubCheckpointPolicy = {
 };
 
 // Runs readonly reads in a second Bun process so the main thread's synchronous
-// settlement meets a concurrent reader, as the daemon does when `hra status`
+// settlement meets a concurrent reader, as the daemon does when `oompa status`
 // opens the same state directory. The script is written into the fixture home
 // and reports one line per event on stdout.
 type ReaderProcess = Readonly<{
@@ -1620,7 +1620,7 @@ writeSync(1, "released\\n");
 // Repeats readonly StateStore opens plus status-shaped reads until the stop
 // file exists. A readonly open that lands between the writer's scrub marker
 // and its checkpoint is refused by design; the loop retries it like a user
-// rerunning hra status.
+// rerunning oompa status.
 const statusReaderSource = `
 import { existsSync, writeSync } from "node:fs";
 import { resolveStatePaths } from ${JSON.stringify(join(import.meta.dir, "paths.ts"))};
@@ -1746,7 +1746,7 @@ const snapshotSwitchContainmentForTest = (database: Database) => {
 };
 
 const combined49SwitchArchiveForTest = async () => {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-combined49-switch-history-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-combined49-switch-history-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const bytes = combined49SwitchDatabaseBytes();
@@ -1772,7 +1772,7 @@ const expectInertSwitchReopenForTest = (
 };
 
 const canonicalTimestampArchiveForTest = async (version: 40 | 41) => {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-canonical-timestamp-history-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-canonical-timestamp-history-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const bytes = version === 40 ? canonical40UsageDatabaseBytes() : canonical41TimestampsDatabaseBytes();
@@ -1874,7 +1874,7 @@ const prepareDedicatedSessionSwitch = (
   const pendingQueue = options.pendingQueueMessage === undefined ? null : store.enqueue(session.id, options.pendingQueueMessage);
   const seedText = `Provider switch seed ${sequence}`;
   const seedDigest = createHash("sha256")
-    .update("hra:session-transcript-seed:v1\0", "utf8")
+    .update("oompa:session-transcript-seed:v1\0", "utf8")
     .update(seedText, "utf8")
     .digest("hex");
   const prepared = store.prepareSessionSwitch({
@@ -3404,7 +3404,7 @@ describe("StateStore", () => {
   });
 
   const archivedRetired49 = async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-retired49-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-retired49-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     await writeFile(paths.database, combined49RetiredDatabaseBytes(), { mode: 0o600 });
@@ -3426,7 +3426,7 @@ describe("StateStore", () => {
   test("retains authentic combined49 unused Devin close, sealed input and runtime history without new execution", async () => {
     const paths = await archivedRetired49();
     // A fresh archived WAL database has no local WAL/SHM files yet. A raw
-    // writable handle may initialize them without running any HRA migration;
+    // writable handle may initialize them without running any Oompa migration;
     // query_only then keeps the baseline inspector nonmutating.
     const database = new Database(paths.database, { create: false, strict: true });
     database.exec("PRAGMA query_only=ON");
@@ -3805,7 +3805,7 @@ describe("StateStore", () => {
     const dispatching = advanceDedicatedSessionSwitch(store, prepared, "seed_dispatching");
     const seedAuthority = store.requireSessionProviderAuthority(prepared.session.id);
     const receiptInput = {
-      domain: "hra:session-switch-seed-accepted:v1",
+      domain: "oompa:session-switch-seed-accepted:v1",
       turnId: "seed-turn-701",
       turnStatus: "completed",
       runtimeProfile: prepared.targetRuntime,
@@ -3996,7 +3996,7 @@ describe("StateStore", () => {
         turnStatus: "completed",
         runtimeProfile: prepared.targetRuntime,
         receiptDigest: sessionSwitchDigest({
-          domain: "hra:session-switch-seed-accepted:v1",
+          domain: "oompa:session-switch-seed-accepted:v1",
           turnId: "seed-turn-763",
           turnStatus: "completed",
           runtimeProfile: prepared.targetRuntime,
@@ -4095,13 +4095,13 @@ describe("StateStore", () => {
         outcome: "rejected",
         failureCode: "SEED_REJECTED",
         receiptDigest: createHash("sha256")
-          .update("hra:session-switch-seed-rejected:v1\0DIFFERENT_REJECTION")
+          .update("oompa:session-switch-seed-rejected:v1\0DIFFERENT_REJECTION")
           .digest("hex"),
       },
     })).toThrow("SESSION_SWITCH_REQUEST_CONFLICT");
     expect(store.requireSessionSwitch(rejected.switch.attemptId).phase).toBe("seed_dispatching");
     const rejectedDigest = createHash("sha256")
-      .update("hra:session-switch-seed-rejected:v1\0SEED_REJECTED")
+      .update("oompa:session-switch-seed-rejected:v1\0SEED_REJECTED")
       .digest("hex");
     const settled = store.completeSessionSwitchSeed({
       ...rejected.cas,
@@ -4424,7 +4424,7 @@ describe("StateStore", () => {
         outcome: "rejected",
         failureCode,
         receiptDigest: createHash("sha256")
-          .update(`hra:session-switch-seed-rejected:v1\0${failureCode}`)
+          .update(`oompa:session-switch-seed-rejected:v1\0${failureCode}`)
           .digest("hex"),
       },
     });
@@ -4558,7 +4558,7 @@ describe("StateStore", () => {
             turnStatus: "completed",
             runtimeProfile: prepared.targetRuntime,
             receiptDigest: sessionSwitchDigest({
-              domain: "hra:session-switch-seed-accepted:v1",
+              domain: "oompa:session-switch-seed-accepted:v1",
               turnId: "terminal-seed-turn",
               turnStatus: "completed",
               runtimeProfile: prepared.targetRuntime,
@@ -4897,7 +4897,7 @@ describe("StateStore", () => {
       seedAuthority: prepared.cas.targetAuthority,
       seedAuthorityRevision: store.requireCapturedSessionProviderAuthority(prepared.session.id).authorityRevision,
       settlement: { outcome: "rejected", failureCode: "SEED_REJECTED",
-        receiptDigest: createHash("sha256").update("hra:session-switch-seed-rejected:v1\0SEED_REJECTED").digest("hex") },
+        receiptDigest: createHash("sha256").update("oompa:session-switch-seed-rejected:v1\0SEED_REJECTED").digest("hex") },
     });
     const firstTerminal = reject(first);
     const session = store.requireSession(first.session.id);
@@ -5029,7 +5029,7 @@ describe("StateStore", () => {
         outcome: "rejected",
         failureCode: "SEED_REJECTED",
         receiptDigest: createHash("sha256")
-          .update("hra:session-switch-seed-rejected:v1\0SEED_REJECTED")
+          .update("oompa:session-switch-seed-rejected:v1\0SEED_REJECTED")
           .digest("hex"),
       },
     });
@@ -6023,7 +6023,7 @@ describe("StateStore", () => {
   });
 
   test("refuses a symlink at the main database boundary before SQLite opens it", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-link-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-link-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const target = join(paths.root, "database-target");
@@ -8351,7 +8351,7 @@ describe("StateStore", () => {
   });
 
   test("round-trips Claude source identity and applies exact-probe liveness with a strict CAS", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-claude-probe-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-claude-probe-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const store = new StateStore(paths, { now: () => 1_000 });
@@ -8590,7 +8590,7 @@ describe("StateStore", () => {
   });
 
   test("fairly bounds recent retained Claude candidates eligible for exact reprobe", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-claude-fair-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-claude-fair-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const store = new StateStore(paths, { now: () => 1_000 });
@@ -8655,8 +8655,8 @@ describe("StateStore", () => {
     ]);
   });
 
-  test("retains HRA live time only for an exact-pinned Claude process identity", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-claude-live-time-")));
+  test("retains Oompa live time only for an exact-pinned Claude process identity", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-claude-live-time-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     let now = 1_000;
@@ -8787,7 +8787,7 @@ describe("StateStore", () => {
   });
 
   test("excludes current Claude discoveries before bounding retained reprobes", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-claude-retained-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-claude-retained-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const store = new StateStore(paths, { now: () => 2_000 });
@@ -8863,8 +8863,8 @@ describe("StateStore", () => {
     })).toThrow();
   });
 
-  test("orders retained Claude reprobes by attempt age then HRA live age", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-claude-order-")));
+  test("orders retained Claude reprobes by attempt age then Oompa live age", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-claude-order-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     let now = 1_000;
@@ -13696,7 +13696,7 @@ describe("StateStore", () => {
     }
     const personalSourceSeedText = "personal Claude source seed";
     const personalSourceSeed = createHash("sha256")
-      .update("hra:session-transcript-seed:v1\0", "utf8")
+      .update("oompa:session-transcript-seed:v1\0", "utf8")
       .update(personalSourceSeedText, "utf8")
       .digest("hex");
     const sourceSwitch = store.prepareMutation({
@@ -15693,7 +15693,7 @@ describe("StateStore", () => {
         throw new Error("Expected a provider thread for switch alias testing.");
       }
       const seedDigest = createHash("sha256")
-        .update("hra:session-transcript-seed:v1\0", "utf8")
+        .update("oompa:session-transcript-seed:v1\0", "utf8")
         .update(seedName, "utf8")
         .digest("hex");
       const mutation = store.prepareMutation({
@@ -15923,7 +15923,7 @@ describe("StateStore", () => {
       const runtimeProfile = reviewedClaudeProfile({ id: target.id, processGeneration: targetAuthority.processGeneration });
       const key = "00000000-0000-4000-8000-0000000006e0";
       const seedText = "Continue the retained switch.";
-      const seedDigest = createHash("sha256").update("hra:session-transcript-seed:v1\0")
+      const seedDigest = createHash("sha256").update("oompa:session-transcript-seed:v1\0")
         .update(seedText).digest("hex");
       const attempt = store.prepareMutation({
         kind: "session.switch", authorityId: session.id,
@@ -16101,7 +16101,7 @@ describe("StateStore", () => {
 
     const seedText = "Continue this session after switching providers.";
     const seedDigest = createHash("sha256")
-      .update("hra:session-transcript-seed:v1\0", "utf8")
+      .update("oompa:session-transcript-seed:v1\0", "utf8")
       .update(seedText, "utf8")
       .digest("hex");
     const switchAttempt = store.prepareMutation({
@@ -16495,7 +16495,7 @@ describe("StateStore", () => {
       const runtimeProfile = reviewedClaudeProfile({ id: targetAccount.id,
         processGeneration: targetAuthority.processGeneration });
       const seedText = "Keep the captured target profile generation fenced.";
-      const seedDigest = createHash("sha256").update("hra:session-transcript-seed:v1\0")
+      const seedDigest = createHash("sha256").update("oompa:session-transcript-seed:v1\0")
         .update(seedText).digest("hex");
       const attempt = store.prepareMutation({
         authorityGeneration: targetAuthority.processGeneration,
@@ -16655,7 +16655,7 @@ describe("StateStore", () => {
     const claudeProfile = reviewedClaudeProfile({ id: claudeAccount.id, processGeneration: claudeAuthority.processGeneration });
     const seedText = "Continue the adopted session on Claude.";
     const seedDigest = createHash("sha256")
-      .update("hra:session-transcript-seed:v1\0", "utf8")
+      .update("oompa:session-transcript-seed:v1\0", "utf8")
       .update(seedText, "utf8")
       .digest("hex");
     const transcriptDigest = createHash("sha256")
@@ -17050,7 +17050,7 @@ describe("StateStore", () => {
         state: "idle",
       });
       const seedDigest = createHash("sha256")
-        .update("hra:session-transcript-seed:v1\0", "utf8")
+        .update("oompa:session-transcript-seed:v1\0", "utf8")
         .update(seedText, "utf8")
         .digest("hex");
       const attempt = store.prepareMutation({
@@ -18170,7 +18170,7 @@ describe("StateStore", () => {
       let profileId: string;
       let sessionId: string;
       if (version === 49) {
-        const home = await realpath(await mkdtemp(join(tmpdir(), "hra-ledger-canonical49-")));
+        const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-ledger-canonical49-")));
         paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
         await initializeStatePaths(paths);
         await writeFile(paths.database, canonical49WorkDatabaseBytes(), { mode: 0o600 });
@@ -18401,7 +18401,7 @@ describe("StateStore", () => {
   });
 
   test("preserves enqueue FIFO when queue timestamps are identical", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-fifo-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-fifo-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const store = new StateStore(paths, { now: () => 1_000 });
@@ -19692,7 +19692,7 @@ describe("StateStore", () => {
   });
 
   test("enforces the original deadline before resolving a switch as not applied", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-desktop-deadline-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-desktop-deadline-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     let now = 10_000;
@@ -20684,7 +20684,7 @@ describe("StateStore", () => {
   });
 
   test("stores an exact 64 KiB public event and reads a maximally expanded legacy row", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-event-bound-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-event-bound-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const now = 1_700_000_000_000;
@@ -22120,7 +22120,7 @@ describe("StateStore", () => {
   });
 
   test("evicts a deterministic contiguous event prefix by age and reports the exact floor gap", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-event-retention-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-event-retention-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     let currentTime = 1_000;
@@ -22168,7 +22168,7 @@ describe("StateStore", () => {
   });
 
   test("maintains the age bound while reading an idle stream with no new append", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-event-read-retention-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-event-read-retention-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     let currentTime = 1_000;
@@ -22463,7 +22463,7 @@ describe("StateStore", () => {
   });
 
   test("paginates tied interactions exactly once in descending-time ascending-id order", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-interaction-page-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-interaction-page-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const store = new StateStore(paths, { now: () => 20_000 });
@@ -22535,7 +22535,7 @@ describe("StateStore", () => {
   });
 
   test("reads only linked, pending, unexpired attention in deterministic deadline order", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-attention-snapshot-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-attention-snapshot-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const now = 50_000;
@@ -22642,7 +22642,7 @@ describe("StateStore", () => {
   });
 
   test("returns no partial attention candidates on linked overflow", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-attention-overflow-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-attention-overflow-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const now = 80_000;
@@ -22711,7 +22711,7 @@ describe("StateStore", () => {
   });
 
   test("anchors immutable interaction deadlines and terminal intent across delayed admission", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-deadline-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-deadline-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     let now = 10_000;
@@ -22810,7 +22810,7 @@ describe("StateStore", () => {
   });
 
   test("supersedes only the exact elapsed prepared response with a durable timeout intent", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-timeout-cas-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-timeout-cas-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     let now = 15_000;
@@ -24158,7 +24158,7 @@ describe("StateStore", () => {
   });
 
   test("persists reset-policy reconciliation until the suppressed boundary has elapsed", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-policy-boundary-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-policy-boundary-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     let now = 1_000;
@@ -24750,7 +24750,7 @@ describe("StateStore", () => {
   });
 
   test("refuses to begin a reset after its authorized window expires", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-reset-expired-begin-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-reset-expired-begin-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     let now = 1_000;
@@ -24776,7 +24776,7 @@ describe("StateStore", () => {
   });
 
   test("orders the most recent reset attempt by a durable sequence across clock rollback and vacuum", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-reset-sequence-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-reset-sequence-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     let now = 10_000;
@@ -24890,7 +24890,7 @@ describe("StateStore", () => {
   });
 
   test("rebinds and retries an ambiguous key only after a later policy window activates", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-reset-later-recovery-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-reset-later-recovery-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     let now = 1_000;
@@ -25041,7 +25041,7 @@ describe("StateStore", () => {
   });
 
   test("cascades rebind evidence when expired parent history is pruned", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-reset-rebind-prune-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-reset-rebind-prune-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     let now = 1_000;
@@ -25178,7 +25178,7 @@ describe("StateStore", () => {
   });
 
   test("retains every live-window latch while bounding expired reset history", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-reset-retention-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-reset-retention-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     let now = 1_000;
@@ -25579,7 +25579,7 @@ describe("StateStore", () => {
   });
 
   test("keeps daily upload cadence when the uploaded payload row is byte-pruned", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-usage-anchor-retention-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-usage-anchor-retention-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "linux" });
     await initializeStatePaths(paths);
     let now = 100_000;
@@ -25640,7 +25640,7 @@ describe("StateStore", () => {
   });
 
   test("bounds compact upload anchors independently of payload retention", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-usage-anchor-bound-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-usage-anchor-bound-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "linux" });
     await initializeStatePaths(paths);
     let now = 1_000;
@@ -25669,7 +25669,7 @@ describe("StateStore", () => {
   });
 
   test("bounds local usage bytes while preserving the live velocity window", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-usage-retention-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-usage-retention-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "linux" });
     await initializeStatePaths(paths);
     let now = 1_000;
@@ -25710,7 +25710,7 @@ describe("StateStore", () => {
   });
 
   test("bounds local usage rows and removes observations past the age contract", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-usage-row-retention-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-usage-row-retention-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "linux" });
     await initializeStatePaths(paths);
     let now = 1_000;
@@ -26033,7 +26033,7 @@ describe("StateStore", () => {
   );
 
   test("stores Claude quota and accounting against immutable turn authority", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-provider-usage-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-provider-usage-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "linux" });
     await initializeStatePaths(paths);
     const store = new StateStore(paths, { now: () => 20_000 });
@@ -26212,7 +26212,7 @@ describe("StateStore", () => {
   });
 
   test("replays retained Claude evidence before expiry and prunes components independently", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-provider-usage-prune-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-provider-usage-prune-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "linux" });
     await initializeStatePaths(paths);
     let now = 1_000;
@@ -26260,7 +26260,7 @@ describe("StateStore", () => {
   });
 
   test("bounds Claude provider usage independently by component count and bytes", async () => {
-    const countHome = await realpath(await mkdtemp(join(tmpdir(), "hra-provider-usage-count-")));
+    const countHome = await realpath(await mkdtemp(join(tmpdir(), "oompa-provider-usage-count-")));
     const countPaths = resolveStatePaths({ homeDirectory: countHome, platform: "linux" });
     await initializeStatePaths(countPaths);
     let countNow = 10_000;
@@ -26306,7 +26306,7 @@ describe("StateStore", () => {
       countInspector.close(false);
     }
 
-    const bytesHome = await realpath(await mkdtemp(join(tmpdir(), "hra-provider-usage-bytes-")));
+    const bytesHome = await realpath(await mkdtemp(join(tmpdir(), "oompa-provider-usage-bytes-")));
     const bytesPaths = resolveStatePaths({ homeDirectory: bytesHome, platform: "linux" });
     await initializeStatePaths(bytesPaths);
     let bytesNow = 20_000;
@@ -26381,7 +26381,7 @@ describe("StateStore", () => {
   }, 30_000);
 
   test("migrates authentic canonical40 Codex usage bytes as display-only authority and reopens current49", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-canonical40-usage-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-canonical40-usage-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     await writeFile(paths.database, canonical40UsageDatabaseBytes(), { mode: 0o600 });
@@ -27116,7 +27116,7 @@ describe("StateStore", () => {
   test("preserves authentic canonical39 Devin runtime and login bytes without borrowing a later Codex generation", async () => {
     const paths = await canonical39DevinArchive();
     // A copied WAL-mode main image needs SQLite to establish its local shared
-    // memory files. This raw query-only observer never runs HRA migrations.
+    // memory files. This raw query-only observer never runs Oompa migrations.
     const database = new Database(paths.database, { create: false, strict: true });
     database.exec("PRAGMA query_only=ON");
     try {
@@ -27263,7 +27263,7 @@ describe("StateStore", () => {
   });
 
   test("creates a fresh database before newer SQLite revalidates Work authority triggers", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-newer-sqlite-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-newer-sqlite-")));
     const repositoryRoot = join(import.meta.dir, "..", "..");
     const customSqliteCandidate = process.arch === "arm64"
       ? "/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib"
@@ -28268,7 +28268,7 @@ describe("StateStore", () => {
   });
 
   test("preserves authentic canonical50 colliding mutation and queue finalizations independently", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-canonical50-source-collision-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-canonical50-source-collision-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const bytes = canonical50CollisionDatabaseBytes();
@@ -29673,7 +29673,7 @@ describe("StateStore", () => {
   });
 
   test("captures the fresh notification-hours default from the machine zone exactly once", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-hours-fresh-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-hours-fresh-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     let resolutions = 0;
@@ -30049,7 +30049,7 @@ describe("StateStore", () => {
   });
 
   test("updates notification hours by independent revision CAS across clock rollback", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-hours-cas-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-hours-cas-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     let now = 10_000;
@@ -30272,7 +30272,7 @@ describe("StateStore", () => {
   });
 
   test("migrates authentic canonical30 Work and protocol autorespond history before reopening current49", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-canonical30-work-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-canonical30-work-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     await writeFile(paths.database, canonical30WorkDatabaseBytes(), { mode: 0o600 });
@@ -30907,7 +30907,7 @@ describe("StateStore", () => {
   });
 
   test("opens and transactionally migrates a real v1 database without losing sessions", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-v1-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-v1-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const legacy = new Database(paths.database, { create: true, strict: true });
@@ -31035,7 +31035,7 @@ describe("StateStore", () => {
   });
 
   test("upgrades a synthetically populated archived v2 migration stage without losing authority data", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-observed2-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-observed2-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const bytes = observed2DatabaseBytes();
@@ -32888,7 +32888,7 @@ describe("StateStore", () => {
 
   test("pages only actor-authorized visible same-project peers in stable creation order", async () => {
     const captured = canonical39RetiredRecoveryFixtures.inflight_start;
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-peer-directory-history-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-peer-directory-history-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const bytes = canonical39RetiredRecoveryDatabaseBytes("inflight_start");
@@ -33468,7 +33468,7 @@ describe("StateStore", () => {
   });
 
   test("peer finalization on a pre-v44 session preserves the human-only after-hours barrier and counter", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-peer-canonical43-runtime-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-peer-canonical43-runtime-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const bytes = canonicalBudgetRuntimeDatabaseBytes(43);
@@ -33491,7 +33491,7 @@ describe("StateStore", () => {
     // operations after real migration, not forged historical authority.
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     expect(inspector.query("SELECT * FROM session_runtime_profiles ORDER BY session_id,revision").all()).toEqual(runtimeRows);
-    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-peer-after-hours-history-")));
+    const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-peer-after-hours-history-")));
     const project = await migrated.createProject("Peer after-hours history", root);
     const profile = migrated.requireProfile(captured.profile.id);
     const actorBase = migrated.requireSession(captured.limitedSession.id);
@@ -36302,7 +36302,7 @@ describe("StateStore", () => {
   });
 
   test("rejects databases written by a newer schema version", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-newer-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-store-newer-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const newer = new Database(paths.database, { create: true, strict: true });

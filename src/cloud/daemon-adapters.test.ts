@@ -213,7 +213,7 @@ async function fixture(
   setNow: (now: number) => void;
   store: StateStore;
 }>> {
-  const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-cloud-adapter-")));
+  const temporary = await realpath(await mkdtemp(join(tmpdir(), "oompa-cloud-adapter-")));
   temporaryDirectories.push(temporary);
   const paths = resolveStatePaths({ homeDirectory: temporary, platform: "linux" });
   await initializeStatePaths(paths);
@@ -3358,7 +3358,7 @@ describe("state-backed cloud daemon adapter", () => {
       await chmod(cachePath, 0o600);
 
       await expect(adapter.activateCompactProjectionRecovery(installation))
-        .rejects.toThrow("newer HRA version");
+        .rejects.toThrow("newer Oompa version");
       const preserved = new Database(cachePath, { strict: true });
       expect((preserved.query("PRAGMA user_version").get() as { user_version: number })
         .user_version).toBe(6);
@@ -5636,11 +5636,11 @@ describe("settings commands and the device registry", () => {
     });
     value.store.detachPersonalSession({ sessionId: fencedAdoption.session.id });
     expect(pending.status).toBe("pending");
-    const hraTask = value.store.createSessionTaskStore().create({
+    const oompaTask = value.store.createSessionTaskStore().create({
       idempotencyKey: "00000000-0000-4000-8000-000000000711",
       minutes: 60,
-      name: "Public HRA conversation task",
-      prompt: "Continue the ordinary HRA conversation.",
+      name: "Public Oompa conversation task",
+      prompt: "Continue the ordinary Oompa conversation.",
       sessionId: activeAdoption.session.id,
       status: "paused",
     });
@@ -5702,9 +5702,9 @@ describe("settings commands and the device registry", () => {
       expect(registry.scheduledTasks).toEqual([
         {
           cadence: "every 60 minutes",
-          id: hraTask.id,
+          id: oompaTask.id,
           kind: "hra_conversation",
-          label: "Public HRA conversation task",
+          label: "Public Oompa conversation task",
           nextRunAt: null,
           sessionPublicId: activeAdoption.session.id,
         },
@@ -5772,7 +5772,7 @@ describe("settings commands and the device registry", () => {
     }
   });
 
-  test("projects native and adopted HRA tasks with the same public shape", async () => {
+  test("projects native and adopted Oompa tasks with the same public shape", async () => {
     const value = await fixture();
     const nativeSession = value.store.requireSession(value.sessionId);
     const adopted = adoptPersonalCodexSession(value, "old-personal-codex-thread");
@@ -5912,7 +5912,7 @@ describe("settings commands and the device registry", () => {
 
 /*
  * Device command guards. Every one of them is decided locally, before any
- * effect: the two `hra remote allow|deny` switches, the requesting device's
+ * effect: the two `oompa remote allow|deny` switches, the requesting device's
  * day bucket, and the account and project the registry projected. Each refusal
  * has its own closed code so the browser can name the operator switch.
  */
@@ -6592,7 +6592,7 @@ describe("device command execution", () => {
       expect(world.value.store.readSessionApprovalMode(world.value.sessionId as SessionId))
         .toEqual({ mode: "auto:workspace", source: "session" });
       // The desktop notice fires on the first session start from this device.
-      expect(world.notices).toEqual(["HRA: new device started a session"]);
+      expect(world.notices).toEqual(["Oompa: new device started a session"]);
     } finally {
       await world.adapter.close();
       world.value.store.close();
@@ -6895,7 +6895,7 @@ describe("device command execution", () => {
         signal: new AbortController().signal,
       });
       expect(siblingStatus.result).toEqual({
-        instruction: `A login is in progress for this account. Finish its existing browser or device-code handoff, or cancel it with \`hra account login-cancel ${sibling.id}\`.`,
+        instruction: `A login is in progress for this account. Finish its existing browser or device-code handoff, or cancel it with \`oompa account login-cancel ${sibling.id}\`.`,
         kind: "account_login_status",
         status: "pending",
       });

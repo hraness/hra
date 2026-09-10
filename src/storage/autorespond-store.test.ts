@@ -23,7 +23,7 @@ afterEach(() => {
 });
 
 async function fixture(): Promise<{ store: StateStore; sessionId: string; clock: { now: number } }> {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-autorespond-store-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-autorespond-store-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const clock = { now: 1_000_000 };
@@ -37,7 +37,7 @@ async function fixture(): Promise<{ store: StateStore; sessionId: string; clock:
 }
 
 async function canonicalBudgetArchive(version: 43 | 45) {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-autorespond-canonical-budget-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-autorespond-canonical-budget-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const bytes = canonicalBudgetDatabaseBytes(version);
@@ -48,7 +48,7 @@ async function canonicalBudgetArchive(version: 43 | 45) {
 }
 
 async function canonicalBudgetRuntimeArchive(version: 43 | 45) {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-autorespond-canonical-runtime-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-autorespond-canonical-runtime-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const bytes = canonicalBudgetRuntimeDatabaseBytes(version);
@@ -408,7 +408,7 @@ describe("durable autorespond admission", () => {
     let paths: StateStore["paths"];
     if (version === 45) ({ paths } = await canonicalBudgetArchive(45));
     else if (version === 49) {
-      const home = await realpath(await mkdtemp(join(tmpdir(), "hra-autorespond-canonical49-")));
+      const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-autorespond-canonical49-")));
       paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
       await initializeStatePaths(paths);
       const bytes = canonical49WorkDatabaseBytes();

@@ -648,7 +648,7 @@ describe("local daemon transport", () => {
       writeStderr: (value) => { stderr.push(value); },
     })).toBe(5);
     expect(stdout).toEqual([]);
-    expect(stderr.join("")).toContain("hra: The local daemon has no free command slot.");
+    expect(stderr.join("")).toContain("oompa: The local daemon has no free command slot.");
     expect(stderr.join("")).not.toContain("uncertain");
     expect(stderr.join("")).not.toContain("replay");
 
@@ -904,7 +904,7 @@ describe("local daemon transport", () => {
           details: {
             accountSelector: "acct_11111111111111111111111111111111",
             accountState: "signed_out",
-            nextCommand: "hra account login acct_11111111111111111111111111111111",
+            nextCommand: "oompa account login acct_11111111111111111111111111111111",
           },
         });
       },
@@ -918,7 +918,7 @@ describe("local daemon transport", () => {
         details: {
           accountSelector: "acct_11111111111111111111111111111111",
           accountState: "signed_out",
-          nextCommand: "hra account login acct_11111111111111111111111111111111",
+          nextCommand: "oompa account login acct_11111111111111111111111111111111",
         },
         message: "The local command requires an explicit interaction.",
       },
@@ -931,8 +931,8 @@ describe("local daemon transport", () => {
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const privateDiagnostics = [
-      "personal-home account mismatch at /opt/hra-fixture/personal/.codex runtimeScope=personal",
-      "managed account revocation pending at /opt/hra-fixture/managed/.hra runtimeScope=managed",
+      "personal-home account mismatch at /opt/oompa-fixture/personal/.codex runtimeScope=personal",
+      "managed account revocation pending at /opt/oompa-fixture/managed/.oompa runtimeScope=managed",
     ];
     let calls = 0;
     const server = await LocalDaemonServer.start({
@@ -1028,7 +1028,7 @@ describe("local daemon transport", () => {
     })).toBe(5);
     expect(stdout).toEqual([]);
     expect(stderr.join("")).toContain(
-      "hra: Codex rejected the provider request. That request has settled; inspect current state before deciding whether a fresh attempt is appropriate.\n",
+      "oompa: Codex rejected the provider request. That request has settled; inspect current state before deciding whether a fresh attempt is appropriate.\n",
     );
   });
 

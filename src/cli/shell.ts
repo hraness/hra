@@ -182,7 +182,7 @@ export const compileShellLine = (line: string, selection: ShellSelection = {}): 
     const first = rest[0];
     if (first === "login") {
       throw new ShellUsageError(
-        "Account login is a dedicated one-shot command. Exit the shell, then run `hra account login <profile> [--device-code]`.",
+        "Account login is a dedicated one-shot command. Exit the shell, then run `oompa account login <profile> [--device-code]`.",
       );
     }
     if (first !== undefined && accountActions.has(first)) {
@@ -290,7 +290,7 @@ export const compileShellLine = (line: string, selection: ShellSelection = {}): 
     };
   }
   if (name === "init") {
-    throw new ShellUsageError("Initialization is a one-shot maintenance command. Exit the shell, then run `hra init --yes`.");
+    throw new ShellUsageError("Initialization is a one-shot maintenance command. Exit the shell, then run `oompa init --yes`.");
   }
   return { argv: [name, ...rest], kind: "dispatch" };
 };
@@ -306,7 +306,7 @@ export const formatShellPrompt = (selection: ShellSelection = {}): string => {
   const account = promptLabel(selection.account);
   const session = promptLabel(selection.session);
   const context = [account, session].filter((value): value is string => value !== null).join("/");
-  return context.length === 0 ? "hra> " : `hra[${context}]> `;
+  return context.length === 0 ? "oompa> " : `oompa[${context}]> `;
 };
 
 export const shellHelp = `Shell commands
@@ -332,7 +332,7 @@ export const shellHelp = `Shell commands
   /submit ID --revision N   Resolve an MCP elicitation
   /auth login               Read protected cloud credentials without terminal echo
   /auth delete --acknowledge-erasure
-                            Permanently erase the hosted HRA identity
+                            Permanently erase the hosted Oompa identity
   /interrupt                Interrupt the selected session
   /send MESSAGE             Send MESSAGE; // sends a leading slash
   /help                     Show this help

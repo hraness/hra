@@ -69,7 +69,7 @@ function replaceFixtureProvenance(db: Database, id: string, format: EffectEviden
     "SELECT projection_json,opaque_reason FROM mutation_effect_evidence_provenance WHERE attempt_id=?",
   ).get(id);
   if (meta === null || value === null) throw new Error("Missing provenance fixture.");
-  const digest = hash({ domain: "hra:effect-evidence-provenance:v1", scope: "mutation", ...meta, format, ...value });
+  const digest = hash({ domain: "oompa:effect-evidence-provenance:v1", scope: "mutation", ...meta, format, ...value });
   db.query("UPDATE mutation_effect_evidence_provenance SET format=?,provenance_digest=? WHERE attempt_id=?").run(format, digest, id);
   db.query("UPDATE mutation_effect_evidence_provenance_anchors SET provenance_digest=? WHERE attempt_id=?").run(digest, id);
 }
@@ -81,7 +81,7 @@ afterEach(async () => {
 // Real StateStore state machines with synthetic provider receipts. No provider
 // process runs, and these current rows are not historical capture evidence.
 async function fixture() {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-login-binding-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-login-binding-")));
   roots.push(root);
   const paths = resolveStatePaths({ homeDirectory: root, platform: "darwin" });
   await initializeStatePaths(paths);
@@ -124,7 +124,7 @@ async function fixture() {
 // captured by that source. All subsequent operations are explicitly current
 // integration behavior, never evidence of an old binding-transition writer.
 async function historical45Fixture() {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-login-binding-auth45-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-login-binding-auth45-")));
   roots.push(root);
   const paths = resolveStatePaths({ homeDirectory: root, platform: "darwin" });
   await initializeStatePaths(paths);

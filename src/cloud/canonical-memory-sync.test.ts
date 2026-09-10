@@ -72,7 +72,7 @@ import {
 import { StateStore, type ProjectMemoryHeadRef } from "../storage/state-store.ts";
 import {
   CANONICAL_MEMORY_BACKGROUND_SYNC_INTERVAL_MS,
-  HraCanonicalMemorySynchronizer,
+  OompaCanonicalMemorySynchronizer,
   type CanonicalMemoryBackgroundFailure,
 } from "./canonical-memory-sync.ts";
 import { ProjectMemorySerialExecutor } from "../daemon/project-memory-serial.ts";
@@ -86,7 +86,7 @@ type DeviceFixture = Readonly<{
   paths: StatePaths;
   projectId: string;
   store: StateStore;
-  sync: HraCanonicalMemorySynchronizer;
+  sync: OompaCanonicalMemorySynchronizer;
 }>;
 
 afterEach(async () => {
@@ -349,7 +349,7 @@ async function createRemote() {
   const accountKey = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
   const spaceKey = Uint8Array.from({ length: 32 }, (_, index) => 255 - index);
   const accountBindingDigest = canonicalSha256({ account: "test-owner", v: 1 });
-  const canonicalSpaceId = "hra:project:space-0123456789abcdef0123456789abcdef";
+  const canonicalSpaceId = "oompa:project:space-0123456789abcdef0123456789abcdef";
   const hostedSpaceId = `memory_${encodeBase64Url(new Uint8Array(24).fill(19))}`;
   const binding = {
     bindingDigest: canonicalMemoryBindingDigest(canonicalSpaceId),
@@ -413,7 +413,7 @@ async function createDevice(
   label: string,
   source: CanonicalMemoryCloudAuthoritySource,
   background: Pick<
-    ConstructorParameters<typeof HraCanonicalMemorySynchronizer>[0],
+    ConstructorParameters<typeof OompaCanonicalMemorySynchronizer>[0],
     | "backgroundBackoffMaxMs"
     | "backgroundIntervalMs"
     | "backgroundNow"
@@ -422,7 +422,7 @@ async function createDevice(
   > = {},
   registerStore?: (store: StateStore) => void,
 ): Promise<DeviceFixture> {
-  const root = await realpath(await mkdtemp(join(tmpdir(), `hra-memory-sync-${label}-`)));
+  const root = await realpath(await mkdtemp(join(tmpdir(), `oompa-memory-sync-${label}-`)));
   roots.push(root);
   const paths = resolveStatePaths({ homeDirectory: root, platform: "darwin" });
   await initializeStatePaths(paths);
@@ -433,7 +433,7 @@ async function createDevice(
   const project = await store.createProject(`Project ${label}`, projectRoot, true);
   const engine = new OhSqliteFactsMemoryEngine({ forkAttestations: store });
   const projectSerial = new ProjectMemorySerialExecutor();
-  const sync = new HraCanonicalMemorySynchronizer({
+  const sync = new OompaCanonicalMemorySynchronizer({
     authoritySource: source,
     ...background,
     engine,
@@ -695,7 +695,7 @@ async function advancePortableMemoryPage(
     format: "oh.memory-page.v1",
     language: "en",
     provenance: {
-      actorId: "hra.session.sess-portable-proof",
+      actorId: "oompa.session.sess-portable-proof",
       attestationSha256: canonicalSha256({ attestation: key, v: 1 }),
       attestedAt: instant,
       kind: "host-attested",
@@ -784,7 +784,7 @@ async function advancePortableMemoryPage(
   };
 }
 
-describe("HraCanonicalMemorySynchronizer", () => {
+describe("OompaCanonicalMemorySynchronizer", () => {
   test("creates one encrypted hosted owner space and returns only redacted ownership data", async () => {
     const remote = createEmptyRemote();
     const device = await createDevice("create-owner", remote.source);
@@ -801,7 +801,7 @@ describe("HraCanonicalMemorySynchronizer", () => {
         projectId: device.projectId,
         state: "attached",
       }),
-      canonicalSpaceId: expect.stringMatching(/^hra:project:space-[a-f0-9]{32}$/u),
+      canonicalSpaceId: expect.stringMatching(/^oompa:project:space-[a-f0-9]{32}$/u),
       hostedSpaceId: expect.stringMatching(/^memory_[A-Za-z0-9_-]{32}$/u),
       projectId: device.projectId,
       replay: false,

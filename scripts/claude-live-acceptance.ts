@@ -38,7 +38,7 @@ import {
   publicInteractionSchema,
   type PublicInteraction,
 } from "../src/domain/interactions";
-import { hraMemoryRememberInputSchema, type HraMemoryRememberInput } from "../src/domain/host-tools";
+import { oompaMemoryRememberInputSchema, type OompaMemoryRememberInput } from "../src/domain/host-tools";
 import { publicSessionListItemSchema } from "../src/domain/contracts";
 import { publicEffectiveClaudeRuntimeProfileSchema } from "../src/domain/runtime-profile";
 import {
@@ -48,7 +48,7 @@ import {
 } from "../src/domain/values";
 import { DEFAULT_CLOUD_DEPLOYMENT_URL } from "../src/cloud/identity-custody";
 import { profilePaths, resolveStatePaths } from "../src/storage/paths";
-import { HRA_VERSION } from "../src/version";
+import { OOMPA_VERSION } from "../src/version";
 import {
   createClaudeLiveAcceptanceLogout,
   createClaudeLiveAcceptanceCleanupStoppedCustody,
@@ -125,7 +125,7 @@ const resourceSchema = z.object({
 }).strict();
 const candidateSchema = z.object({
   cloudTargetDigest: digestSchema,
-  packageVersion: z.literal(HRA_VERSION),
+  packageVersion: z.literal(OOMPA_VERSION),
   sourceRevision: z.string().regex(/^[0-9a-f]{40}$/u),
 }).strict();
 const parsedUnknown = <T>(parse: (value: unknown) => T): z.ZodType<T> =>
@@ -182,7 +182,7 @@ const cleanupAuthorizationSchema = cleanupAuthorizationBaseSchema.extend({
   const { bindingDigest, ...base } = value;
   if (canonicalDigest({
     ...base,
-    domain: "hra.claude.live-acceptance.cleanup-authorization.v1",
+    domain: "oompa.claude.live-acceptance.cleanup-authorization.v1",
   }) !== bindingDigest) {
     context.addIssue({ code: "custom", path: ["bindingDigest"], message: "digest_invalid" });
   }
@@ -211,7 +211,7 @@ const cleanupAuthorizationSchema = cleanupAuthorizationBaseSchema.extend({
 type CleanupAuthorization = z.infer<typeof cleanupAuthorizationSchema>;
 
 export const claudeLiveAcceptanceRecoveryReceiptSchema = z.object({
-  accountLabel: z.string().regex(/^hra-claude-live-[0-9a-f]{12}$/u),
+  accountLabel: z.string().regex(/^oompa-claude-live-[0-9a-f]{12}$/u),
   candidate: candidateSchema,
   checkpoint: checkpointSchema,
   cleanupAuthorization: cleanupAuthorizationSchema.optional(),
@@ -231,7 +231,7 @@ export const claudeLiveAcceptanceRecoveryReceiptSchema = z.object({
   profileGeneration: z.number().int().positive().safe().optional(),
   profileId: profileIdSchema.optional(),
   projectId: projectIdSchema.optional(),
-  projectLabel: z.string().regex(/^hra-claude-live-[0-9a-f]{12}$/u),
+  projectLabel: z.string().regex(/^oompa-claude-live-[0-9a-f]{12}$/u),
   project: resourceSchema,
   receiptPath: normalizedPathSchema,
   runId: z.string().uuid(),
@@ -297,7 +297,7 @@ export const claudeLiveAcceptanceRecoveryReceiptSchema = z.object({
       value.profileId === undefined
         ? undefined
         : canonicalDigest({
-            domain: "hra.claude.cleanup-readback.v1",
+            domain: "oompa.claude.cleanup-readback.v1",
             profileId: value.profileId,
             profileGeneration: value.profileGeneration ?? null,
             sessionId: value.sessionId ?? null,
@@ -407,7 +407,7 @@ export const assertClaudeLiveAcceptanceLayout = async (
     process.env.HOME !== receipt.expectedHomeDirectory
     || homedir() !== receipt.expectedHomeDirectory
     || dirname(receipt.receiptPath) !== dirname(receipt.runRoot.path)
-    || basename(receipt.receiptPath) !== `.hra-live-claude-acceptance-${receipt.runId}.recovery.json`
+    || basename(receipt.receiptPath) !== `.oompa-live-claude-acceptance-${receipt.runId}.recovery.json`
     || !basename(receipt.runRoot.path).startsWith(`hra-live-acceptance-${receipt.runId}-`)
     || !isPrivateDirectChild(receipt.runRoot.path, receipt.state.identity.path)
     || !isPrivateDirectChild(receipt.runRoot.path, receipt.project.identity.path)
@@ -427,7 +427,7 @@ export const assertClaudeLiveAcceptanceLayout = async (
       quarantinePath !== undefined
       && (
         !isPrivateDirectChild(receipt.runRoot.path, quarantinePath)
-        || !basename(quarantinePath).startsWith(".hra-claude-quarantine-")
+        || !basename(quarantinePath).startsWith(".oompa-claude-quarantine-")
       )
     ) throw invalid();
     const sourceExists = await privatePathExists(resource.identity.path);
@@ -513,7 +513,7 @@ async function createLayout(candidate: LiveAcceptanceCandidate): Promise<ClaudeL
     return {
       descriptor,
       project,
-      receiptPath: join(base, `.hra-live-claude-acceptance-${runId}.recovery.json`),
+      receiptPath: join(base, `.oompa-live-claude-acceptance-${runId}.recovery.json`),
       runRoot,
       state,
     };
@@ -542,14 +542,14 @@ const initialReceipt = (
   layout: ClaudeLayout,
   now: number,
 ): ClaudeLiveAcceptanceRecoveryReceipt => claudeLiveAcceptanceRecoveryReceiptSchema.parse({
-  accountLabel: `hra-claude-live-${layout.descriptor.runId.replaceAll("-", "").slice(0, 12)}`,
+  accountLabel: `oompa-claude-live-${layout.descriptor.runId.replaceAll("-", "").slice(0, 12)}`,
   candidate: layout.descriptor.candidate,
   checkpoint: "prepared",
   createdAt: now,
   expectedHomeDirectory: layout.descriptor.expectedHomeDirectory,
   loginIdempotencyKey: randomUUID(),
   project: { identity: layout.project, state: "active" },
-  projectLabel: `hra-claude-live-${layout.descriptor.runId.replaceAll("-", "").slice(-12)}`,
+  projectLabel: `oompa-claude-live-${layout.descriptor.runId.replaceAll("-", "").slice(-12)}`,
   receiptPath: layout.receiptPath,
   runId: layout.descriptor.runId,
   runRoot: layout.runRoot,
@@ -1059,7 +1059,7 @@ async function quarantineAndDeleteResource(
   if (resource.state === "active") {
     const quarantinePath = join(
       receipt.value.runRoot.path,
-      `.hra-claude-quarantine-${key}-${randomUUID()}`,
+      `.oompa-claude-quarantine-${key}-${randomUUID()}`,
     );
     if (
       !isPrivateDirectChild(receipt.value.runRoot.path, quarantinePath)
@@ -1386,12 +1386,12 @@ const executeOwnedJson = async (
 };
 
 const makeMemoryTask = (runId: string): Readonly<{
-  memory: HraMemoryRememberInput;
+  memory: OompaMemoryRememberInput;
   nonce: string;
   prompt: string;
 }> => {
   const nonce = `claude-live-${randomUUID().replaceAll("-", "")}`;
-  const memory = hraMemoryRememberInputSchema.parse({
+  const memory = oompaMemoryRememberInputSchema.parse({
     body: `Bounded Claude live acceptance receipt nonce: ${nonce}`,
     key: `acceptance.claude.${runId.replaceAll("-", "")}`,
     language: "en",
@@ -1572,7 +1572,7 @@ const exactProvisionalProof = (
     candidate: LiveAcceptanceCandidate;
     connectionId: string;
     daemonGeneration: number;
-    memory: HraMemoryRememberInput;
+    memory: OompaMemoryRememberInput;
     profileGeneration: number;
     profileId: z.infer<typeof profileIdSchema>;
     runId: string;
@@ -1678,7 +1678,7 @@ const discardProtectedInteractionFile = async (
 const cleanupScopeDigest = (
   value: ClaudeLiveAcceptanceRecoveryReceipt,
 ): string => canonicalDigest({
-  domain: "hra.claude.cleanup-readback.v1",
+  domain: "oompa.claude.cleanup-readback.v1",
   profileId: value.profileId,
   profileGeneration: value.profileGeneration ?? null,
   sessionId: value.sessionId ?? null,
@@ -1714,7 +1714,7 @@ const createCleanupAuthorization = (
     ...base,
     bindingDigest: canonicalDigest({
       ...base,
-      domain: "hra.claude.live-acceptance.cleanup-authorization.v1",
+      domain: "oompa.claude.live-acceptance.cleanup-authorization.v1",
     }),
   });
 };
@@ -2478,12 +2478,12 @@ export async function claudeLiveAcceptanceMain(
   try {
     const result = await runClaudeLiveAcceptance(arguments_, options);
     process.stdout.write(result === null
-      ? "hra: Claude live acceptance cleanup completed.\n"
-      : "hra: Claude live acceptance passed.\n");
+      ? "oompa: Claude live acceptance cleanup completed.\n"
+      : "oompa: Claude live acceptance passed.\n");
     return 0;
   } catch (error: unknown) {
     const failure = normalizeRunFailure(error);
-    process.stderr.write(`hra: Claude live acceptance failed (${failure.code}).\n`);
+    process.stderr.write(`oompa: Claude live acceptance failed (${failure.code}).\n`);
     if (failure.recoveryReceiptPath !== undefined) {
       process.stderr.write(`Recovery receipt: ${failure.recoveryReceiptPath}\n`);
     }

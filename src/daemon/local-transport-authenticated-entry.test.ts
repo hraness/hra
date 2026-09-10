@@ -10,7 +10,7 @@ import { initializeStatePaths, resolveStatePaths } from "../storage/paths";
 import { StateStore } from "../storage/state-store";
 import { LocalDaemonServer } from "./local-transport";
 import type { ClaudeRuntimePort, CloudControlPort, CodexRuntimePort } from "./ports";
-import { HraService } from "./service";
+import { OompaService } from "./service";
 
 const rawRequest = async (socketPath: string, envelope: unknown) => await new Promise<unknown>((resolve, reject) => {
   const socket = createConnection(socketPath);
@@ -44,7 +44,7 @@ test("only an authenticated local frame can invoke the retained service composit
   const root = await realpath(await mkdtemp(join(tmpdir(), "hra-local-composition-")));
   const paths = resolveStatePaths({ homeDirectory: root, platform: "darwin" });
   let store: StateStore | undefined;
-  let composition: ReturnType<typeof HraService.createLocalComposition> | undefined;
+  let composition: ReturnType<typeof OompaService.createLocalComposition> | undefined;
   const closed: string[] = [];
   const forbidden: string[] = [];
   const port = (name: string): unknown => new Proxy({}, {
@@ -58,7 +58,7 @@ test("only an authenticated local frame can invoke the retained service composit
   try {
     await initializeStatePaths(paths);
     store = new StateStore(paths, { resolveMachineTimeZone: () => "UTC" });
-    const activeComposition = HraService.createLocalComposition({ store, paths,
+    const activeComposition = OompaService.createLocalComposition({ store, paths,
       codex: port("codex") as CodexRuntimePort, claude: port("claude") as ClaudeRuntimePort,
       cloud: port("cloud") as CloudControlPort,
       daemonAuthority: { assertCurrent: async () => undefined, close: () => undefined }, requestStop: () => undefined });
@@ -113,7 +113,7 @@ test("only an authenticated local frame can invoke the retained service composit
 
 test("CLI retains the composition entry only in the authenticated handler after exact daemon-stop admission", async () => {
   const source = await readFile(new URL("../cli.ts", import.meta.url), "utf8");
-  expect(source).toContain("const { service: activeService, executeAuthenticatedLocal } = HraService.createLocalComposition({");
+  expect(source).toContain("const { service: activeService, executeAuthenticatedLocal } = OompaService.createLocalComposition({");
   expect([...source.matchAll(/\bexecuteAuthenticatedLocal\b/gu)]).toHaveLength(2);
   const start = source.indexOf("server = await LocalDaemonServer.start({");
   const end = source.indexOf("    checkpointBoot();", start);

@@ -17,10 +17,10 @@ import {
 } from "../src/domain/remote-interaction-contract";
 import { createCloudUuidV7 } from "../src/domain/uuid-v7";
 import {
-  buildHraAttentionEmailBody,
-  isHraAttentionEmailDocumentedRefusal,
-  parseHraAttentionEmailBody,
-  type HraAttentionEmailBody,
+  buildOompaAttentionEmailBody,
+  isOompaAttentionEmailDocumentedRefusal,
+  parseOompaAttentionEmailBody,
+  type OompaAttentionEmailBody,
 } from "./attentionEmail";
 import {
   completeAttentionNotificationSafetyFaultQuarantine,
@@ -674,7 +674,7 @@ async function rowAuthorityFailure(
 }
 
 type ClaimedEffect = Readonly<{
-  body: HraAttentionEmailBody;
+  body: OompaAttentionEmailBody;
   deliveryId: string;
   generation: number;
   globalNotificationGeneration: number;
@@ -694,8 +694,8 @@ function sortedRows(rows: readonly OutboxRow[]): OutboxRow[] {
   return [...rows].sort((left, right) => String(left._id).localeCompare(String(right._id)));
 }
 
-async function bodyDigest(body: HraAttentionEmailBody): Promise<string> {
-  return await sha256Hex(`hra-attention-body:v1\u0000${body.text}`);
+async function bodyDigest(body: OompaAttentionEmailBody): Promise<string> {
+  return await sha256Hex(`oompa-attention-body:v1\u0000${body.text}`);
 }
 
 async function deliveryKey(
@@ -704,7 +704,7 @@ async function deliveryKey(
   digest: string,
 ): Promise<string> {
   return await sha256Hex(
-    `hra-attention-resend:v1\u0000${deliveryId}\u0000${recipientDigest}\u0000${digest}`,
+    `oompa-attention-resend:v1\u0000${deliveryId}\u0000${recipientDigest}\u0000${digest}`,
   );
 }
 
@@ -869,7 +869,7 @@ async function startPendingGroup(
     row.claimCapacityReservation !== attentionNotificationQuotaReservations.pending)) {
     corrupt();
   }
-  const body = buildHraAttentionEmailBody(ordered.map((row) => ({
+  const body = buildOompaAttentionEmailBody(ordered.map((row) => ({
     interactionKind: row.interactionKind,
     sessionPublicId: row.sessionPublicId,
   })));
@@ -1183,7 +1183,7 @@ export async function deleteAttentionNotificationsForAccountDeletion(
 export async function validatedStartedAttentionNotificationGroup(
   ctx: MutationCtx,
   deliveryId: string,
-): Promise<Readonly<{ body: HraAttentionEmailBody; rows: OutboxRow[] }> | null> {
+): Promise<Readonly<{ body: OompaAttentionEmailBody; rows: OutboxRow[] }> | null> {
   const rows = await deliveryRows(ctx, deliveryId);
   if (rows.length < 1 || rows.length > attentionNotificationGroupLimit) return null;
   const first = rows[0] ?? corrupt();
@@ -1194,7 +1194,7 @@ export async function validatedStartedAttentionNotificationGroup(
   if (
     leader === undefined
     || body === undefined
-    || parseHraAttentionEmailBody(body) === null
+    || parseOompaAttentionEmailBody(body) === null
     || rows.some((row) => {
       const candidate = row.delivery;
       return row.userId !== first.userId
@@ -1224,10 +1224,10 @@ export async function validatedStartedAttentionNotificationGroup(
         || candidate.outcomeDigest !== undefined;
     })
   ) return null;
-  const rebuilt = buildHraAttentionEmailBody(rows.map((row) => ({
+  const rebuilt = buildOompaAttentionEmailBody(rows.map((row) => ({
     interactionKind: row.interactionKind,
     sessionPublicId: row.sessionPublicId,
-  })));
+  })), body.version);
   const rebuiltDigest = await bodyDigest(rebuilt);
   if (
     rebuilt.text !== body.text
@@ -1261,7 +1261,7 @@ async function validRetainedIdempotencyAmbiguity(
   if (
     leader === undefined
     || body === undefined
-    || parseHraAttentionEmailBody(body) === null
+    || parseOompaAttentionEmailBody(body) === null
     || rows.some((row) => {
       const candidate = row.delivery;
       return row.userId !== first.userId
@@ -1292,10 +1292,10 @@ async function validRetainedIdempotencyAmbiguity(
         || candidate.settledAt !== settledAt;
     })
   ) return false;
-  const rebuilt = buildHraAttentionEmailBody(rows.map((row) => ({
+  const rebuilt = buildOompaAttentionEmailBody(rows.map((row) => ({
     interactionKind: row.interactionKind,
     sessionPublicId: row.sessionPublicId,
-  })));
+  })), body.version);
   return rebuilt.text === body.text
     && await bodyDigest(rebuilt) === delivery.bodyDigest
     && await deliveryKey(delivery.id, delivery.recipientDigest, delivery.bodyDigest)
@@ -1579,7 +1579,7 @@ function validSettlementResult(result: SettlementResult): boolean {
       && result.status >= 400
       && result.status < 500
       && refusalTypes.has(result.providerErrorType)
-      && isHraAttentionEmailDocumentedRefusal(
+      && isOompaAttentionEmailDocumentedRefusal(
         result.status,
         result.providerErrorType,
       );

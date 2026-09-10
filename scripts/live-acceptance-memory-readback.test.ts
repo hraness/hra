@@ -3,13 +3,13 @@ import { resolve } from "node:path";
 
 import { describe, expect, test } from "bun:test";
 
-import { HRA_VERSION } from "../src/version";
+import { OOMPA_VERSION } from "../src/version";
 import {
   BoundedProcessCleanupUnprovenError,
   BoundedProcessContainmentUnavailableError,
 } from "./bounded-process";
 import type { CommandRequest, CommandResult } from "./configure-hosted-sync";
-import { HRA_CONVEX_PROJECT_ID, HRA_CONVEX_TEAM_ID, type ConvexTarget } from "./convex-target";
+import { OOMPA_CONVEX_PROJECT_ID, OOMPA_CONVEX_TEAM_ID, type ConvexTarget } from "./convex-target";
 import {
   MEMORY_READBACK_INPUT_MAXIMUM_BYTES,
   memoryReadbackCliArguments,
@@ -27,12 +27,12 @@ const target: ConvexTarget = {
   deploymentId: 7_654_321,
   deploymentName: "steady-otter-321",
   deploymentUrl: "https://steady-otter-321.convex.cloud",
-  projectId: HRA_CONVEX_PROJECT_ID,
-  teamId: HRA_CONVEX_TEAM_ID,
+  projectId: OOMPA_CONVEX_PROJECT_ID,
+  teamId: OOMPA_CONVEX_TEAM_ID,
 };
 const candidate = {
   cloudTargetDigest: createHash("sha256").update(target.deploymentUrl).digest("hex"),
-  packageVersion: HRA_VERSION,
+  packageVersion: OOMPA_VERSION,
   sourceRevision: "a".repeat(40),
 };
 const devices = ["018bcfe5-6800-7000-8000-000000000931", "018bcfe5-6800-7000-8000-000000000932"] as const;

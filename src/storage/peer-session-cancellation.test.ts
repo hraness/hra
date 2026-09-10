@@ -27,7 +27,7 @@ const code = "PEER_SESSION_PROVIDER_EFFECT_NOT_STARTED";
 // Current public APIs, synthetic identities, and no provider process: this is
 // cancellation/retention evidence, not a historical capture or provider effect.
 async function fixture(delivery: "send" | "steer" = "send") {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-peer-cancellation-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-peer-cancellation-")));
   roots.push(home);
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);

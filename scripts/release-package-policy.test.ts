@@ -3,30 +3,30 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import {
-  HRA_RELEASE_OH_VERSION,
+  OOMPA_RELEASE_OH_VERSION,
   assertReleasePackageReady,
   inspectReleasePackage,
   releaseArchiveName,
 } from "./release-package-policy";
 
 const readyManifest = {
-  bin: { hra: "./src/cli.ts" },
+  bin: { oompa: "./src/cli.ts" },
   dependencies: { "@hraness/oh": "0.4.1", zod: "4.4.3" },
   license: "MIT",
-  name: "@hraness/hra",
+  name: "@hraness/oompa",
   publishConfig: { access: "public", registry: "https://registry.npmjs.org" },
   version: "1.2.3",
 };
 
-describe("HRA public release package policy", () => {
+describe("Oompa public release package policy", () => {
   test("accepts one public MIT scoped package with the exact public Oh release", () => {
-    expect(HRA_RELEASE_OH_VERSION).toBe("0.4.1");
+    expect(OOMPA_RELEASE_OH_VERSION).toBe("0.4.1");
     expect(assertReleasePackageReady(readyManifest)).toEqual({
       blockers: [],
-      name: "@hraness/hra",
+      name: "@hraness/oompa",
       version: "1.2.3",
     });
-    expect(releaseArchiveName("1.2.3")).toBe("hraness-hra-1.2.3.tgz");
+    expect(releaseArchiveName("1.2.3")).toBe("hraness-oompa-1.2.3.tgz");
   });
 
   test("fails closed on GitHub, URL, workspace, range, moving, and wrong exact Oh dependencies", () => {
@@ -59,7 +59,7 @@ describe("HRA public release package policy", () => {
     ) as unknown;
     expect(inspectReleasePackage(manifest)).toEqual({
       blockers: [],
-      name: "@hraness/hra",
+      name: "@hraness/oompa",
       version: "0.8.0",
     });
     expect(assertReleasePackageReady(manifest).blockers).toEqual([]);

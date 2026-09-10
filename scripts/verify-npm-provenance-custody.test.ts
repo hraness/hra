@@ -18,15 +18,15 @@ function provenance(tufCachePath = "/fixture/tuf") {
   const statement = {
     _type: "https://in-toto.io/Statement/v1",
     predicateType: "https://slsa.dev/provenance/v1",
-    subject: [{ name: "pkg:npm/%40hraness/hra@0.6.0", digest: { sha512: digest.toString("hex") } }],
+    subject: [{ name: "pkg:npm/%40hraness/oompa@0.6.0", digest: { sha512: digest.toString("hex") } }],
     predicate: {
       buildDefinition: {
         buildType: "https://slsa-framework.github.io/github-actions-buildtypes/workflow/v1",
         externalParameters: { workflow: {
-          repository: "https://github.com/hraness/hra", path: ".github/workflows/release.yml", ref: "refs/tags/v0.6.0",
+          repository: "https://github.com/hraness/oompa", path: ".github/workflows/release.yml", ref: "refs/tags/v0.6.0",
         } },
         internalParameters: { github: { event_name: "push", repository_id: "1343008607", repository_owner_id: "307125679" } },
-        resolvedDependencies: [{ uri: "git+https://github.com/hraness/hra@refs/tags/v0.6.0", digest: { gitCommit: sha } }],
+        resolvedDependencies: [{ uri: "git+https://github.com/hraness/oompa@refs/tags/v0.6.0", digest: { gitCommit: sha } }],
       },
       runDetails: {
         builder: { id: "https://github.com/actions/runner/github-hosted" },
@@ -261,7 +261,7 @@ for (const [caller, purpose] of [["publish-npm-release.ts", "publish"], ["check-
 }
 
 test("real overflow kills and collects the Node helper before returning", async () => {
-  const cache = await mkdtemp(join(tmpdir(), "hra-crypto-custody-"));
+  const cache = await mkdtemp(join(tmpdir(), "oompa-crypto-custody-"));
   const originalSpawn = Bun.spawn;
   let child: Bun.Subprocess<"pipe", "pipe", "pipe"> | undefined;
   const observation = { exited: false };

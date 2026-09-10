@@ -27,7 +27,7 @@ async function fixture(run: (input: Readonly<{
   initial: Receipt;
   policy: AtomicPrivateJsonPolicy<Receipt>;
 }>) => Promise<void>): Promise<void> {
-  const directory = await mkdtemp(join(await realpath(tmpdir()), "hra-receipt-custody-"));
+  const directory = await mkdtemp(join(await realpath(tmpdir()), "oompa-receipt-custody-"));
   await chmod(directory, 0o700);
   const initial: Receipt = {
     path: join(directory, "receipt.json"),
@@ -52,7 +52,7 @@ async function fixture(run: (input: Readonly<{
 
 describe("private acceptance receipt custody", () => {
   test("dotted descendant names still overlap their parent in both directions", () => {
-    const parent = join(tmpdir(), "hra-custody-parent");
+    const parent = join(tmpdir(), "oompa-custody-parent");
     for (const child of [join(parent, "child"), join(parent, "..child"), join(parent, "..child", "nested")]) {
       expect(privatePathsOverlap(parent, child)).toBe(true);
       expect(privatePathsOverlap(child, parent)).toBe(true);
@@ -63,7 +63,7 @@ describe("private acceptance receipt custody", () => {
   });
 
   test("installation admission refuses a run hidden below a dotted home descendant", () => {
-    const expectedHomeDirectory = join(tmpdir(), "hra-custody-home");
+    const expectedHomeDirectory = join(tmpdir(), "oompa-custody-home");
     const runId = "00000000-0000-4000-8000-000000000001";
     const root = join(expectedHomeDirectory, "..acceptance", `hra-live-acceptance-${runId}-test`);
     expect(() => createAcceptanceInstallation({

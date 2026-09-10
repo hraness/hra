@@ -4,10 +4,10 @@ import { chmod, link, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { hraAttentionResendApiKeyEnvironmentName, hraResendApiKeyEnvironmentName } from "../convex/resendApiKey";
+import { oompaAttentionResendApiKeyEnvironmentName, oompaResendApiKeyEnvironmentName } from "../convex/resendApiKey";
 import { BoundedProcessCleanupUnprovenError } from "./bounded-process";
 import { HOSTED_ENVIRONMENT_NAMES, type CommandRequest, type CommandRunner } from "./configure-hosted-sync";
-import { HRA_CONVEX_PROJECT_ID, HRA_CONVEX_TEAM_ID, type ConvexTarget } from "./convex-target";
+import { OOMPA_CONVEX_PROJECT_ID, OOMPA_CONVEX_TEAM_ID, type ConvexTarget } from "./convex-target";
 import {
   attentionKeyInstallCustodySchema,
   attentionKeyInstallIntentSchema,
@@ -30,7 +30,7 @@ const otpKey = "re_otp_synthetic";
 const target: ConvexTarget = {
   deploymentId: 7_654_321, deploymentName: "steady-otter-321",
   deploymentUrl: "https://steady-otter-321.convex.cloud",
-  projectId: HRA_CONVEX_PROJECT_ID, teamId: HRA_CONVEX_TEAM_ID,
+  projectId: OOMPA_CONVEX_PROJECT_ID, teamId: OOMPA_CONVEX_TEAM_ID,
 };
 const adminKey = `prod:${target.deploymentName}|${"synthetic_admin_".repeat(3)}`;
 const inputDocument = JSON.stringify({ attentionResendApiKey: intendedKey, convexDeploymentAdminKey: adminKey });
@@ -47,7 +47,7 @@ afterEach(async () => {
 });
 
 const harness = async () => {
-  const directory = await realpath(await mkdtemp(join(tmpdir(), "hra-attention-install-")));
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "oompa-attention-install-")));
   directories.push(directory);
   await chmod(directory, 0o700);
   const deployEvidencePath = join(directory, "candidate.json");
@@ -61,8 +61,8 @@ const harness = async () => {
     target, targetDigest: canonicalDigest(target),
   }));
   writeProtectedJsonNoReplace(deployEvidencePath, candidate, deployEvidenceSchema);
-  const environment = new Map<string, string>(HOSTED_ENVIRONMENT_NAMES.filter((name) => name !== hraAttentionResendApiKeyEnvironmentName)
-    .map((name) => [name, name === hraResendApiKeyEnvironmentName ? otpKey : `synthetic_${name}`]));
+  const environment = new Map<string, string>(HOSTED_ENVIRONMENT_NAMES.filter((name) => name !== oompaAttentionResendApiKeyEnvironmentName)
+    .map((name) => [name, name === oompaResendApiKeyEnvironmentName ? otpKey : `synthetic_${name}`]));
   const state = {
     environment, head: sourceCommit, status: "", now: 10_000, attestation,
     inactive: { generation: 0, globalState: "absent", outboxOccupancy: 0, safetyFaultOccupancy: 0 },
@@ -99,7 +99,7 @@ const harness = async () => {
     competingWritersQuiesced: { ci: true, cli: true, dashboard: true, delegated: true },
     evidenceDirectory: directory, evidenceDirectorySharedAndRetained: true,
     expiresAtMs: 800_000, issuedAtMs: 0,
-    intendedKeyDigest: createHash("sha256").update("hra-attention-key-observation-v1\0").update(intendedKey).digest("hex"),
+    intendedKeyDigest: createHash("sha256").update("oompa-attention-key-observation-v1\0").update(intendedKey).digest("hex"),
     kind: "hosted-attention-key-custody", operationId: "00000000-0000-4000-8000-000000000003",
     preparationDigest: preparation.evidence.selfDigest, schemaVersion: 1, sourceCommit,
     target, targetDigest: canonicalDigest(target),
@@ -120,7 +120,7 @@ const harness = async () => {
         const intent = readProtectedJson(join(directory, attentionKeyInstallSlot(target)), attentionKeyInstallIntentSchema);
         expect(intent.intendedKeyDigest).toBe(custody.intendedKeyDigest);
         dispatchHook?.();
-        environment.set(hraAttentionResendApiKeyEnvironmentName, intendedKey);
+        environment.set(oompaAttentionResendApiKeyEnvironmentName, intendedKey);
       },
     },
   };
@@ -141,7 +141,7 @@ const harness = async () => {
 describe("custody-scoped attention installation", () => {
   test("fixed intent slot exposes only its public name and exact target digest", () => {
     expect(attentionKeyInstallSlot(target)).toBe(
-      `attention-key-HRA_ATTENTION_RESEND_API_KEY-${canonicalDigest(target)}.intent.json`,
+      `attention-key-OOMPA_ATTENTION_RESEND_API_KEY-${canonicalDigest(target)}.intent.json`,
     );
     expect(attentionKeyInstallSlot({ ...target, deploymentId: target.deploymentId + 1 }))
       .not.toBe(attentionKeyInstallSlot(target));
@@ -152,7 +152,7 @@ describe("custody-scoped attention installation", () => {
     const entries = [{ name: "SECOND", value: "second-secret" }, { name: "FIRST", value: "first-secret" }];
     const fingerprint = attentionEnvironmentFingerprint(entries, target, intendedKey);
     const expected = createHmac("sha256", intendedKey)
-      .update("hra-attention-environment-fingerprint-v1\0", "utf8")
+      .update("oompa-attention-environment-fingerprint-v1\0", "utf8")
       .update(canonicalJson({ entries: entries.toReversed(), target }), "utf8").digest("hex");
     expect(fingerprint).toBe(expected);
     expect(attentionEnvironmentFingerprint(entries.toReversed(), target, intendedKey)).toBe(fingerprint);
@@ -168,7 +168,7 @@ describe("custody-scoped attention installation", () => {
     const entries = [{ name: "A", value: "bc" }];
     const fingerprint = attentionEnvironmentFingerprint(entries, target, intendedKey);
     for (const value of [intendedKey, "re_other_synthetic"]) {
-      expect(attentionEnvironmentFingerprint([...entries, { name: hraAttentionResendApiKeyEnvironmentName, value }], target, intendedKey))
+      expect(attentionEnvironmentFingerprint([...entries, { name: oompaAttentionResendApiKeyEnvironmentName, value }], target, intendedKey))
         .toBe(fingerprint);
     }
     for (const changed of [
@@ -201,7 +201,7 @@ describe("custody-scoped attention installation", () => {
     expect(result.status).toBe("provider_acknowledged_and_observed_equal");
     expect(result.nonAttentionEnvironmentUnchanged).toBe(true);
     expect(value.state.dispatches).toBe(1);
-    expect(value.state.environment.get(hraResendApiKeyEnvironmentName)).toBe(otpKey);
+    expect(value.state.environment.get(oompaResendApiKeyEnvironmentName)).toBe(otpKey);
     for (const request of value.requests) {
       expect(request.stdin).toBe("");
       for (const secret of [intendedKey, adminKey, otpKey]) {
@@ -224,8 +224,8 @@ describe("custody-scoped attention installation", () => {
       if (failure === "runtime") value.state.attestation = { ...attestation, deployedAtMs: 3_000 };
       if (failure === "inactive") value.state.inactive.generation = 1;
       if (failure === "prerequisite") value.state.environment.delete("JWT_PRIVATE_KEY");
-      if (failure === "otp") value.state.environment.set(hraResendApiKeyEnvironmentName, intendedKey);
-      if (failure === "occupied") value.state.environment.set(hraAttentionResendApiKeyEnvironmentName, "re_other_synthetic");
+      if (failure === "otp") value.state.environment.set(oompaResendApiKeyEnvironmentName, intendedKey);
+      if (failure === "occupied") value.state.environment.set(oompaAttentionResendApiKeyEnvironmentName, "re_other_synthetic");
       await expect(installHostedAttentionKey(value.options)).rejects.toThrow();
       expect(value.state.dispatches).toBe(0);
       expect((await readdir(value.directory)).includes(attentionKeyInstallSlot(target))).toBe(false);
@@ -282,7 +282,7 @@ describe("custody-scoped attention installation", () => {
     const intentPath = join(value.directory, attentionKeyInstallSlot(target));
     expect(readProtectedJson(intentPath, attentionKeyInstallIntentSchema).intendedKeyDigest).toBe(value.custody.intendedKeyDigest);
     const otherKey = "re_another_synthetic";
-    const otherKeyDigest = createHash("sha256").update("hra-attention-key-observation-v1\0").update(otherKey).digest("hex");
+    const otherKeyDigest = createHash("sha256").update("oompa-attention-key-observation-v1\0").update(otherKey).digest("hex");
     const originalPreparation = readProtectedJson(value.options.preparationEvidencePath, hostedAttentionKeyObservationSchema);
     const unsignedPreparation = Object.fromEntries(Object.entries(originalPreparation).filter(([name]) => name !== "selfDigest"));
     const otherPreparation = hostedAttentionKeyObservationSchema.parse(withSelfDigest({ ...unsignedPreparation, intendedKeyDigest: otherKeyDigest }));
@@ -325,7 +325,7 @@ describe("custody-scoped attention installation", () => {
         if (failure === "dirty") value.state.status = " M source.ts\n";
         if (failure === "runtime") value.state.attestation = { ...attestation, deployedAtMs: 9_000 };
         if (failure === "other-env") value.state.environment.set("JWT_PRIVATE_KEY", "changed-private");
-        if (failure === "attention") value.setReadHook(() => value.state.environment.delete(hraAttentionResendApiKeyEnvironmentName));
+        if (failure === "attention") value.setReadHook(() => value.state.environment.delete(oompaAttentionResendApiKeyEnvironmentName));
       });
       expect((await installHostedAttentionKey(value.options)).status).toBe("dispatch_outcome_unknown");
       expect(value.state.dispatches).toBe(1);
@@ -349,8 +349,8 @@ describe("custody-scoped attention installation", () => {
       value.setDispatchHook(() => { throw new Error("uncertain"); });
       await installHostedAttentionKey(value.options);
       value.state.now = 900_000;
-      if (state === "equal") value.state.environment.set(hraAttentionResendApiKeyEnvironmentName, intendedKey);
-      if (state === "conflict") value.state.environment.set(hraAttentionResendApiKeyEnvironmentName, "re_other_synthetic");
+      if (state === "equal") value.state.environment.set(oompaAttentionResendApiKeyEnvironmentName, intendedKey);
+      if (state === "conflict") value.state.environment.set(oompaAttentionResendApiKeyEnvironmentName, "re_other_synthetic");
       if (state === "other-env") value.state.environment.set("JWT_PRIVATE_KEY", "changed-private");
       const result = await installHostedAttentionKey({ ...value.options, phase: "reconcile" });
       expect(result.status).toBe(state === "equal" ? "observed_equal" : state === "absent" ? "observed_absent" : "observed_conflict");
@@ -363,7 +363,7 @@ describe("custody-scoped attention installation", () => {
     value.setDispatchHook(() => { throw new Error("uncertain"); });
     await installHostedAttentionKey(value.options);
     expect((await installHostedAttentionKey({ ...value.options, phase: "reconcile" })).status).toBe("observed_absent");
-    value.state.environment.set(hraAttentionResendApiKeyEnvironmentName, intendedKey);
+    value.state.environment.set(oompaAttentionResendApiKeyEnvironmentName, intendedKey);
     expect((await installHostedAttentionKey({ ...value.options, phase: "reconcile" })).status).toBe("observed_equal");
     expect((await installHostedAttentionKey({ ...value.options, phase: "reconcile" })).status).toBe("observed_equal");
     expect((await readdir(value.directory)).filter((name) => name.includes(".reconcile.")).length).toBe(3);
@@ -374,7 +374,7 @@ describe("custody-scoped attention installation", () => {
     const value = await harness();
     value.setDispatchHook(() => { throw new Error("uncertain"); });
     await installHostedAttentionKey(value.options);
-    value.state.environment.set(hraAttentionResendApiKeyEnvironmentName, intendedKey);
+    value.state.environment.set(oompaAttentionResendApiKeyEnvironmentName, intendedKey);
     const input = JSON.stringify({ attentionResendApiKey: intendedKey,
       convexDeploymentAdminKey: `prod:${target.deploymentName}|${"rotated_admin_".repeat(3)}` });
     expect((await installHostedAttentionKey({ ...value.options, inputDocument: input, phase: "reconcile" })).status)

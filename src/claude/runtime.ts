@@ -1,7 +1,7 @@
 import { lstat, realpath } from "node:fs/promises";
 import { delimiter, isAbsolute, join } from "node:path";
 
-import { HRA_SESSION_PREAMBLE } from "../domain/hra-preamble.ts";
+import { OOMPA_SESSION_PREAMBLE } from "../domain/oompa-preamble.ts";
 import { ClaudeError } from "./errors.ts";
 import {
   CLAUDE_NATIVE_FALLBACK_UNAVAILABLE_REASON,
@@ -252,7 +252,7 @@ const stopVersionProbe = async (
 /**
  * Binds one process invocation to one durable Claude session. Creation and
  * resume are deliberately distinct flags: a typo must never make Claude
- * allocate a new conversation while HRA believes it reclaimed an old one.
+ * allocate a new conversation while Oompa believes it reclaimed an old one.
  */
 export function claudeSessionArgv(
   runtime: PinnedClaudeRuntime,
@@ -413,7 +413,7 @@ export async function resolvePinnedClaudeRuntime(
 }
 
 /**
- * Adds the bound HRA preamble and session-specific MCP configuration together.
+ * Adds the bound Oompa preamble and session-specific MCP configuration together.
  * The configuration contains only a stdio bridge command and the path of a
  * private binding file; the capability itself never appears in argv.
  */
@@ -436,7 +436,7 @@ export function withClaudeHostToolRuntime(
     argv: [
       ...runtime.argv,
       "--append-system-prompt",
-      HRA_SESSION_PREAMBLE.text,
+      OOMPA_SESSION_PREAMBLE.text,
       "--mcp-config",
       options.mcpConfigPath,
       "--strict-mcp-config",

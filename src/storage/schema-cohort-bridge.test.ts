@@ -16,7 +16,7 @@ import { StateStore } from "./state-store";
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const dispose of cleanup.splice(0).reverse()) await dispose(); });
 const fixture = async (bytes = privateTask48DatabaseBytes()) => {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-cohort-bridge-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-cohort-bridge-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   await writeFile(paths.database, bytes);

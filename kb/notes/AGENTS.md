@@ -1,6 +1,6 @@
 # Contents
 
-- Current, reusable product decisions and seed material for HRA.
+- Current, reusable product decisions and seed material for Oompa.
 
 # Guidelines
 

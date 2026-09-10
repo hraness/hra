@@ -4,7 +4,7 @@ import { join } from "node:path";
 import fc from "fast-check";
 
 import { CodexError, CodexRemoteError, IndeterminateCodexEffectError } from "../codex/index";
-import { HRA_SESSION_PREAMBLE_TEXT } from "../domain/hra-preamble";
+import { OOMPA_SESSION_PREAMBLE_TEXT } from "../domain/oompa-preamble";
 import type {
   CodexAppServerClient,
   CodexCapabilitySnapshot,
@@ -13,7 +13,7 @@ import type {
   CodexThread,
   CodexTurn,
   ConversationAutomationToolCall,
-  HraHostToolCall,
+  OompaHostToolCall,
   LaunchPinnedCodexOptions,
 } from "../codex/index";
 import { presetRequirements } from "../domain/presets";
@@ -30,8 +30,8 @@ import type { CodexAccountProjection, CodexSessionObservationError, ProfileAutho
 const authority = {
   id: "acct_00000000000000000000000000000000",
   generation: 1,
-  codexHome: join(tmpdir(), "hra-fake"),
-  desktopUserData: join(tmpdir(), "hra-fake-desktop"),
+  codexHome: join(tmpdir(), "oompa-fake"),
+  desktopUserData: join(tmpdir(), "oompa-fake-desktop"),
   provider: "codex",
   providerAccountId: "acct_00000000000000000000000000000000",
   bindingGeneration: 1,
@@ -1366,7 +1366,7 @@ describe("PinnedCodexRuntimeManager", () => {
       },
       credentialStorePreflight: {
         cliAuth: "file",
-        cwd: "/private/tmp/hra-acceptance/project-a",
+        cwd: "/private/tmp/oompa-acceptance/project-a",
         mcpOauth: "file",
       },
       isCurrent: () => true,
@@ -1391,7 +1391,7 @@ describe("PinnedCodexRuntimeManager", () => {
     expect(launched).toMatchObject({
       credentialStorePreflight: {
         cliAuth: "file",
-        cwd: "/private/tmp/hra-acceptance/project-a",
+        cwd: "/private/tmp/oompa-acceptance/project-a",
         mcpOauth: "file",
       },
       environment: {
@@ -1404,16 +1404,16 @@ describe("PinnedCodexRuntimeManager", () => {
     await manager.close();
   });
 
-  test("binds the HRA host service and its post-response wake to the exact live connection", async () => {
+  test("binds the Oompa host service and its post-response wake to the exact live connection", async () => {
     const exactConnectionId = "70000000-0000-4000-8000-000000000777";
     let launched: LaunchPinnedCodexOptions | undefined;
-    let liveHostToolCall: HraHostToolCall | undefined;
+    let liveHostToolCall: OompaHostToolCall | undefined;
     let markHostToolEntered!: () => void;
     let releaseHostTool!: () => void;
     const hostToolEntered = new Promise<void>((resolve) => { markHostToolEntered = resolve; });
     const hostToolGate = new Promise<void>((resolve) => { releaseHostTool = resolve; });
-    const handled: HraHostToolCall[] = [];
-    const responseWritten: HraHostToolCall[] = [];
+    const handled: OompaHostToolCall[] = [];
+    const responseWritten: OompaHostToolCall[] = [];
     const fake = {
       state: "ready",
       connectionId: exactConnectionId,
@@ -1421,7 +1421,7 @@ describe("PinnedCodexRuntimeManager", () => {
         authority: clientAuthority(),
         value: { account: null, requiresOpenaiAuth: true },
       }),
-      hasLiveHraHostToolCall: (input: {
+      hasLiveOompaHostToolCall: (input: {
         authority: { profileId: string; processGeneration: number };
         callId: string;
         connectionId: string;
@@ -1446,7 +1446,7 @@ describe("PinnedCodexRuntimeManager", () => {
       },
       observer: {
         account: () => undefined,
-        hraHostTool: async (_authority, call) => {
+        oompaHostTool: async (_authority, call) => {
           handled.push(call);
           liveHostToolCall = call;
           markHostToolEntered();
@@ -1457,7 +1457,7 @@ describe("PinnedCodexRuntimeManager", () => {
             liveHostToolCall = undefined;
           }
         },
-        hraHostToolResponseWritten: (_authority, call) => {
+        oompaHostToolResponseWritten: (_authority, call) => {
           responseWritten.push(call);
         },
         fact: () => undefined,
@@ -1466,11 +1466,11 @@ describe("PinnedCodexRuntimeManager", () => {
 
     await manager.readAccount({ authority, signal: new AbortController().signal });
     if (launched === undefined) throw new Error("Missing launch fixture.");
-    if (launched.onHraHostToolCall === undefined) {
-      throw new Error("Missing HRA host-tool fixture.");
+    if (launched.onOompaHostToolCall === undefined) {
+      throw new Error("Missing Oompa host-tool fixture.");
     }
-    if (launched.onHraHostToolResponseWritten === undefined) {
-      throw new Error("Missing HRA host-tool post-response fixture.");
+    if (launched.onOompaHostToolResponseWritten === undefined) {
+      throw new Error("Missing Oompa host-tool post-response fixture.");
     }
     const connectionId = fake.connectionId;
     expect(connectionId).toBe(exactConnectionId);
@@ -1504,7 +1504,7 @@ describe("PinnedCodexRuntimeManager", () => {
       requestDigest: hostCall.requestDigest,
     };
     expect(manager.hasLiveHostToolCall(liveAuthority)).toBe(false);
-    const pending = Promise.resolve(launched.onHraHostToolCall(hostCall));
+    const pending = Promise.resolve(launched.onOompaHostToolCall(hostCall));
     void pending.catch(() => undefined);
     await hostToolEntered;
     try {
@@ -1534,7 +1534,7 @@ describe("PinnedCodexRuntimeManager", () => {
     expect(manager.hasLiveHostToolCall(liveAuthority)).toBe(false);
     expect(handled).toEqual([hostCall]);
     expect(responseWritten).toEqual([]);
-    await launched.onHraHostToolResponseWritten(hostCall);
+    await launched.onOompaHostToolResponseWritten(hostCall);
     expect(responseWritten).toEqual([hostCall]);
 
     const staleConnectionCall = {
@@ -1546,18 +1546,18 @@ describe("PinnedCodexRuntimeManager", () => {
       tool: "automation_update",
       input: staleConnectionCall.operation,
     } as const;
-    await expect(launched.onHraHostToolCall(staleHostCall))
+    await expect(launched.onOompaHostToolCall(staleHostCall))
       .rejects.toMatchObject({ code: "AUTHORITY_STALE" });
-    await launched.onHraHostToolResponseWritten(staleHostCall);
+    await launched.onOompaHostToolResponseWritten(staleHostCall);
     expect(handled).toEqual([hostCall]);
     expect(responseWritten).toEqual([hostCall]);
     const staleBindingCall = {
       ...hostCall,
       authority: { ...hostCall.authority, bindingGeneration: 2 },
     };
-    await expect(launched.onHraHostToolCall(staleBindingCall))
+    await expect(launched.onOompaHostToolCall(staleBindingCall))
       .rejects.toMatchObject({ code: "AUTHORITY_STALE" });
-    await launched.onHraHostToolResponseWritten(staleBindingCall);
+    await launched.onOompaHostToolResponseWritten(staleBindingCall);
     expect(handled).toEqual([hostCall]);
     expect(responseWritten).toEqual([hostCall]);
     const close = manager.close();
@@ -2523,7 +2523,7 @@ describe("PinnedCodexRuntimeManager", () => {
     expect(events[2]).toContain('"permissionProfile":":workspace"');
     expect(events[2]).toContain('"writableRoots":["/workspace/project"]');
     expect(JSON.parse(events[2]!.slice("thread:".length))).toMatchObject({
-      developerInstructions: HRA_SESSION_PREAMBLE_TEXT,
+      developerInstructions: OOMPA_SESSION_PREAMBLE_TEXT,
     });
     expect(events[13]).toContain('"review":"auto_review"');
     expect(started.effectiveRuntimeProfile).toMatchObject({ observedAt: 100, enabledApps: [{ id: "app-1", pluginDisplayNames: ["Plugin 1"] }] });
@@ -2539,7 +2539,7 @@ describe("PinnedCodexRuntimeManager", () => {
     });
     await expect(manager.observeSession({
       authority,
-      developerInstructions: HRA_SESSION_PREAMBLE_TEXT,
+      developerInstructions: OOMPA_SESSION_PREAMBLE_TEXT,
       providerThreadId: "thread-1",
       signal: new AbortController().signal,
     })).resolves.toMatchObject({ resumed: true });
@@ -2558,7 +2558,7 @@ describe("PinnedCodexRuntimeManager", () => {
     });
     await expect(manager.observeSession({
       authority,
-      developerInstructions: HRA_SESSION_PREAMBLE_TEXT,
+      developerInstructions: OOMPA_SESSION_PREAMBLE_TEXT,
       providerThreadId: "thread-1",
       signal: new AbortController().signal,
     })).resolves.toMatchObject({ resumed: true });
@@ -2568,8 +2568,8 @@ describe("PinnedCodexRuntimeManager", () => {
       turnListCalls: 3,
     });
     expect(resumeDeveloperInstructions).toEqual([
-      HRA_SESSION_PREAMBLE_TEXT,
-      HRA_SESSION_PREAMBLE_TEXT,
+      OOMPA_SESSION_PREAMBLE_TEXT,
+      OOMPA_SESSION_PREAMBLE_TEXT,
     ]);
     sandboxWritableRoots = [];
     const legacySandboxReview = await manager.reviewSessionStart({ authority, projectRoot: "/workspace/project", preset: "high", requirement: presetRequirements.high, fast: true, signal: new AbortController().signal });
@@ -2577,7 +2577,7 @@ describe("PinnedCodexRuntimeManager", () => {
     await expect(manager.startSession({ authority, projectRoot: "/workspace/project", review: legacySandboxReview, signal: new AbortController().signal })).rejects.toBeInstanceOf(IndeterminateCodexEffectError);
     await expect(manager.observeSession({
       authority,
-      developerInstructions: HRA_SESSION_PREAMBLE_TEXT,
+      developerInstructions: OOMPA_SESSION_PREAMBLE_TEXT,
       providerThreadId: "thread-1",
       signal: new AbortController().signal,
     })).resolves.toMatchObject({ resumed: true });
@@ -2595,9 +2595,9 @@ describe("PinnedCodexRuntimeManager", () => {
       signal: new AbortController().signal,
     })).rejects.toBeInstanceOf(IndeterminateCodexEffectError);
     expect(resumeDeveloperInstructions).toEqual([
-      HRA_SESSION_PREAMBLE_TEXT,
-      HRA_SESSION_PREAMBLE_TEXT,
-      HRA_SESSION_PREAMBLE_TEXT,
+      OOMPA_SESSION_PREAMBLE_TEXT,
+      OOMPA_SESSION_PREAMBLE_TEXT,
+      OOMPA_SESSION_PREAMBLE_TEXT,
     ]);
     sandboxWritableRoots = ["/"];
     const broadRootReview = await manager.reviewSessionStart({ authority, projectRoot: "/workspace/project", preset: "high", requirement: presetRequirements.high, fast: true, signal: new AbortController().signal });
@@ -3836,8 +3836,8 @@ describe("PinnedCodexRuntimeManager", () => {
     const providerAuthority = clientAuthority(authority);
     let onAccountAuthoritySignal: LaunchPinnedCodexOptions["onAccountAuthoritySignal"];
     let onFact: LaunchPinnedCodexOptions["onFact"];
-    let onHraHostToolCall:
-      | LaunchPinnedCodexOptions["onHraHostToolCall"]
+    let onOompaHostToolCall:
+      | LaunchPinnedCodexOptions["onOompaHostToolCall"]
       | undefined;
     let releaseRead!: () => void;
     let markReadStarted!: () => void;
@@ -3910,7 +3910,7 @@ describe("PinnedCodexRuntimeManager", () => {
           markObserverStarted();
           await observerGate;
         },
-        hraHostTool: () => {
+        oompaHostTool: () => {
           steps.push("dynamic:call");
           return { scope: "conversation", task: { id: "stask_barrier" } };
         },
@@ -3921,7 +3921,7 @@ describe("PinnedCodexRuntimeManager", () => {
       launchClient: async (options) => {
         onAccountAuthoritySignal = options.onAccountAuthoritySignal;
         onFact = options.onFact;
-        onHraHostToolCall = options.onHraHostToolCall;
+        onOompaHostToolCall = options.onOompaHostToolCall;
         return fake;
       },
     });
@@ -3957,7 +3957,7 @@ describe("PinnedCodexRuntimeManager", () => {
     if (
       onAccountAuthoritySignal === undefined
       || onFact === undefined
-      || onHraHostToolCall === undefined
+      || onOompaHostToolCall === undefined
     ) throw new Error("Missing account-barrier launch callbacks.");
 
     void onAccountAuthoritySignal(providerAuthority);
@@ -3993,7 +3993,7 @@ describe("PinnedCodexRuntimeManager", () => {
       kind: "command_approval",
       signal: new AbortController().signal,
     });
-    const dynamic = onHraHostToolCall({
+    const dynamic = onOompaHostToolCall({
       ...call,
       input: call.operation,
       tool: "automation_update",

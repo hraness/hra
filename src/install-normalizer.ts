@@ -25,12 +25,12 @@ import { Readable } from "node:stream";
 import { finished } from "node:stream/promises";
 import { createGunzip } from "node:zlib";
 
-export const HRA_INSTALL_BUN_VERSION = "1.3.14";
-export const HRA_INSTALL_CLI_SHA256 = "5c80f082c02e2026ec2ca8e592211b4906e6994b7196f9292013d0effc92b1f7";
+export const OOMPA_INSTALL_BUN_VERSION = "1.3.14";
+export const OOMPA_INSTALL_CLI_SHA256 = "5c80f082c02e2026ec2ca8e592211b4906e6994b7196f9292013d0effc92b1f7";
 
-const expectedPackageName = "@hraness/hra";
+const expectedPackageName = "@hraness/oompa";
 const expectedPackageVersion = "0.8.0";
-const expectedArchiveUrl = "https://github.com/hraness/hra/releases/download/v0.8.0/hraness-hra-0.8.0.tgz";
+const expectedArchiveUrl = "https://github.com/hraness/oompa/releases/download/v0.8.0/hraness-oompa-0.8.0.tgz";
 const cliRelativePath = join("src", "cli.ts");
 const cliMaximumBytes = 512 * 1024;
 const manifestMaximumBytes = 64 * 1024;
@@ -138,14 +138,14 @@ export const assertSafeDarwinInstallAcl = (
   const library = processDarwinAclLibrary;
   if (library === null) {
     throw new InstallNormalizationError(
-      `The HRA install could not inspect the Darwin ACL on ${label}; installation stopped.`,
+      `The Oompa install could not inspect the Darwin ACL on ${label}; installation stopped.`,
     );
   }
   const currentUserUuid = new Uint8Array(16);
   if (library.symbols.mbr_uid_to_uuid(uid, currentUserUuid) !== 0) {
     currentUserUuid.fill(0);
     throw new InstallNormalizationError(
-      `The HRA install could not resolve its current-user ACL identity for ${label}; installation stopped.`,
+      `The Oompa install could not resolve its current-user ACL identity for ${label}; installation stopped.`,
     );
   }
   const acl = library.symbols.acl_get_fd_np(descriptor, darwinAclTypeExtended);
@@ -155,26 +155,26 @@ export const assertSafeDarwinInstallAcl = (
     currentUserUuid.fill(0);
     if (errno === 2) return;
     throw new InstallNormalizationError(
-      `The HRA install could not retrieve the Darwin ACL on ${label} (errno ${errno === null ? "unavailable" : String(errno)}); installation stopped.`,
+      `The Oompa install could not retrieve the Darwin ACL on ${label} (errno ${errno === null ? "unavailable" : String(errno)}); installation stopped.`,
     );
   }
   if (library.symbols.acl_valid(acl) !== 0) {
     currentUserUuid.fill(0);
     const errors: Error[] = [new InstallNormalizationError(
-      `The HRA install retrieved an invalid Darwin ACL on ${label}; installation stopped.`,
+      `The Oompa install retrieved an invalid Darwin ACL on ${label}; installation stopped.`,
     )];
     if (library.symbols.acl_free(acl) !== 0) {
       errors.push(new InstallNormalizationError(
-        `The HRA install could not settle the invalid Darwin ACL on ${label}; installation stopped.`,
+        `The Oompa install could not settle the invalid Darwin ACL on ${label}; installation stopped.`,
       ));
     }
     if (errors.length > 1) {
-      throw new AggregateError(errors, `The HRA install could not validate and settle the Darwin ACL on ${label}.`);
+      throw new AggregateError(errors, `The Oompa install could not validate and settle the Darwin ACL on ${label}.`);
     }
     const [primaryError] = errors;
     if (primaryError === undefined) {
       throw new InstallNormalizationError(
-        `The HRA install could not validate the Darwin ACL on ${label}; installation stopped.`,
+        `The Oompa install could not validate the Darwin ACL on ${label}; installation stopped.`,
       );
     }
     throw primaryError;
@@ -187,7 +187,7 @@ export const assertSafeDarwinInstallAcl = (
       if (entryResult === -1) break;
       if (entryResult !== 0 || index === darwinAclEntryMaximum) {
         throw new InstallNormalizationError(
-          `The HRA install could not bound the Darwin ACL on ${label}; installation stopped.`,
+          `The Oompa install could not bound the Darwin ACL on ${label}; installation stopped.`,
         );
       }
       const entry = outPointer(entryStorage);
@@ -200,14 +200,14 @@ export const assertSafeDarwinInstallAcl = (
         || library.symbols.acl_get_flagset_np(entry, flagStorage) !== 0
       ) {
         throw new InstallNormalizationError(
-          `The HRA install could not inspect one Darwin ACL entry on ${label}; installation stopped.`,
+          `The Oompa install could not inspect one Darwin ACL entry on ${label}; installation stopped.`,
         );
       }
       if (tag[0] !== darwinAclExtendedAllow) continue;
       const qualifier = library.symbols.acl_get_qualifier(entry);
       if (qualifier === null) {
         throw new InstallNormalizationError(
-          `The HRA install could not identify one Darwin ACL principal on ${label}; installation stopped.`,
+          `The Oompa install could not identify one Darwin ACL principal on ${label}; installation stopped.`,
         );
       }
       let currentPrincipal = false;
@@ -222,15 +222,15 @@ export const assertSafeDarwinInstallAcl = (
       if (qualifierOperationError !== undefined) {
         qualifierErrors.push(qualifierOperationError instanceof Error
           ? qualifierOperationError
-          : new InstallNormalizationError(`The HRA install could not read one Darwin ACL principal on ${label}.`));
+          : new InstallNormalizationError(`The Oompa install could not read one Darwin ACL principal on ${label}.`));
       }
       if (library.symbols.acl_free(qualifier) !== 0) {
         qualifierErrors.push(new InstallNormalizationError(
-          `The HRA install could not settle one Darwin ACL principal on ${label}; installation stopped.`,
+          `The Oompa install could not settle one Darwin ACL principal on ${label}; installation stopped.`,
         ));
       }
       if (qualifierErrors.length > 1) {
-        throw new AggregateError(qualifierErrors, `The HRA install could not settle one Darwin ACL principal on ${label}.`);
+        throw new AggregateError(qualifierErrors, `The Oompa install could not settle one Darwin ACL principal on ${label}.`);
       }
       if (qualifierErrors[0] !== undefined) {
         throw qualifierErrors[0];
@@ -241,12 +241,12 @@ export const assertSafeDarwinInstallAcl = (
         const result = library.symbols.acl_get_perm_np(permissions, permission);
         if (result === -1) {
           throw new InstallNormalizationError(
-            `The HRA install could not inspect Darwin ACL mutation rights on ${label}; installation stopped.`,
+            `The Oompa install could not inspect Darwin ACL mutation rights on ${label}; installation stopped.`,
           );
         }
         if (result === 1) {
           throw new InstallNormalizationError(
-            `The HRA install path has a dangerous non-owner Darwin ALLOW ACL on ${label}; remove that ALLOW entry and retry.`,
+            `The Oompa install path has a dangerous non-owner Darwin ALLOW ACL on ${label}; remove that ALLOW entry and retry.`,
           );
         }
       }
@@ -259,15 +259,15 @@ export const assertSafeDarwinInstallAcl = (
   if (aclOperationError !== undefined) {
     aclErrors.push(aclOperationError instanceof Error
       ? aclOperationError
-      : new InstallNormalizationError(`The HRA install could not inspect the Darwin ACL on ${label}.`));
+      : new InstallNormalizationError(`The Oompa install could not inspect the Darwin ACL on ${label}.`));
   }
   if (library.symbols.acl_free(acl) !== 0) {
     aclErrors.push(new InstallNormalizationError(
-      `The HRA install could not settle the Darwin ACL on ${label}; installation stopped.`,
+      `The Oompa install could not settle the Darwin ACL on ${label}; installation stopped.`,
     ));
   }
   if (aclErrors.length > 1) {
-    throw new AggregateError(aclErrors, `The HRA install could not inspect and settle the Darwin ACL on ${label}.`);
+    throw new AggregateError(aclErrors, `The Oompa install could not inspect and settle the Darwin ACL on ${label}.`);
   }
   if (aclErrors[0] !== undefined) {
     throw aclErrors[0];
@@ -385,7 +385,7 @@ const loadNativeDirectoryOperations = (): NativeDirectoryOperations => {
     }
   }
   throw new InstallNormalizationError(
-    `The HRA install normalizer could not load descriptor-relative filesystem primitives: ${lastError instanceof Error ? lastError.message : "unknown loader failure"}`,
+    `The Oompa install normalizer could not load descriptor-relative filesystem primitives: ${lastError instanceof Error ? lastError.message : "unknown loader failure"}`,
   );
 };
 
@@ -397,7 +397,7 @@ const nativeDirectoryOperations = (): NativeDirectoryOperations => {
 
 const nativeName = (name: string): Buffer => {
   if (basename(name) !== name || name === "." || name === ".." || name.includes("\0")) {
-    throw new InstallNormalizationError("A descriptor-relative HRA install name is invalid.");
+    throw new InstallNormalizationError("A descriptor-relative Oompa install name is invalid.");
   }
   return Buffer.from(`${name}\0`, "utf8");
 };
@@ -477,7 +477,7 @@ const assertDirectoryMetadata = (
     || ((permissions & 0o022) !== 0 && !rootOwnedStickyBoundary)
   ) {
     throw new InstallNormalizationError(
-      `The HRA install path has an unsafe owner, type, or group/world-writable directory component: ${path}`,
+      `The Oompa install path has an unsafe owner, type, or group/world-writable directory component: ${path}`,
     );
   }
 };
@@ -485,7 +485,7 @@ const assertDirectoryMetadata = (
 const directoryPathsThrough = (path: string): readonly string[] => {
   const root = parse(path).root;
   if (root.length === 0 || !path.startsWith(root)) {
-    throw new InstallNormalizationError("The HRA install path is not absolute.");
+    throw new InstallNormalizationError("The Oompa install path is not absolute.");
   }
   const paths = [root];
   let current = root;
@@ -517,7 +517,7 @@ class DirectoryCustody {
       if (pathMetadata.uid === this.uid) currentUserBoundarySeen = true;
       if (currentUserBoundarySeen && pathMetadata.uid !== this.uid) {
         throw new InstallNormalizationError(
-          `The HRA install path returns to a non-current-user-owned directory below its user-owned boundary: ${directoryPath}`,
+          `The Oompa install path returns to a non-current-user-owned directory below its user-owned boundary: ${directoryPath}`,
         );
       }
       const handle = await open(
@@ -530,12 +530,12 @@ class DirectoryCustody {
         assertSafeDarwinInstallAcl(handle.fd, this.uid, directoryPath);
         if (currentUserBoundarySeen && descriptorMetadata.uid !== this.uid) {
           throw new InstallNormalizationError(
-            `The HRA install directory descriptor is not current-user-owned below its user-owned boundary: ${directoryPath}`,
+            `The Oompa install directory descriptor is not current-user-owned below its user-owned boundary: ${directoryPath}`,
           );
         }
         const expectedIdentity = directoryIdentity(pathMetadata);
         if (!sameDirectoryIdentity(expectedIdentity, directoryIdentity(descriptorMetadata))) {
-          throw new InstallNormalizationError("An HRA install directory changed while its custody descriptor was opened.");
+          throw new InstallNormalizationError("An Oompa install directory changed while its custody descriptor was opened.");
         }
         this.#directories.set(directoryPath, {
           handle,
@@ -557,7 +557,7 @@ class DirectoryCustody {
   async descriptorFor(path: string): Promise<number> {
     const held = this.#directories.get(resolve(path));
     if (held === undefined) {
-      throw new InstallNormalizationError("The HRA normalizer requested a directory descriptor outside held custody.");
+      throw new InstallNormalizationError("The Oompa normalizer requested a directory descriptor outside held custody.");
     }
     await this.#assertHeld(held);
     return held.handle.fd;
@@ -567,7 +567,7 @@ class DirectoryCustody {
     const previous = resolve(previousRoot);
     const next = resolve(nextRoot);
     if (previous === next || !this.#directories.has(previous)) {
-      throw new InstallNormalizationError("The HRA install rename does not have exact held source custody.");
+      throw new InstallNormalizationError("The Oompa install rename does not have exact held source custody.");
     }
     const rebound: Array<Readonly<{ held: HeldDirectory; nextPath: string; previousPath: string }>> = [];
     for (const [previousPath, held] of this.#directories) {
@@ -580,7 +580,7 @@ class DirectoryCustody {
       }
       const nextPath = relativePath === "" ? next : join(next, relativePath);
       if (this.#directories.has(nextPath)) {
-        throw new InstallNormalizationError("The HRA install rename collides with existing directory custody.");
+        throw new InstallNormalizationError("The Oompa install rename collides with existing directory custody.");
       }
       const [pathMetadata, descriptorMetadata] = await Promise.all([
         lstat(nextPath),
@@ -594,7 +594,7 @@ class DirectoryCustody {
         && (pathMetadata.uid !== this.uid || descriptorMetadata.uid !== this.uid)
       ) {
         throw new InstallNormalizationError(
-          "The renamed HRA install directory lost current-user ownership under held custody.",
+          "The renamed Oompa install directory lost current-user ownership under held custody.",
         );
       }
       if (
@@ -602,13 +602,13 @@ class DirectoryCustody {
         || !sameDirectoryIdentity(held.identity, directoryIdentity(descriptorMetadata))
       ) {
         throw new InstallNormalizationError(
-          "The complete HRA version path does not name its held staging directory after rename.",
+          "The complete Oompa version path does not name its held staging directory after rename.",
         );
       }
       rebound.push({ held, nextPath, previousPath });
     }
     if (!rebound.some(({ previousPath }) => previousPath === previous)) {
-      throw new InstallNormalizationError("The HRA install rename did not rebind its held staging root.");
+      throw new InstallNormalizationError("The Oompa install rename did not rebind its held staging root.");
     }
     for (const { held, nextPath, previousPath } of rebound) {
       this.#directories.delete(previousPath);
@@ -634,13 +634,13 @@ class DirectoryCustody {
       held.requiresCurrentOwner
       && (pathMetadata.uid !== this.uid || descriptorMetadata.uid !== this.uid)
     ) {
-      throw new InstallNormalizationError("An HRA install directory lost current-user ownership below its user-owned boundary.");
+      throw new InstallNormalizationError("An Oompa install directory lost current-user ownership below its user-owned boundary.");
     }
     if (
       !sameDirectoryIdentity(held.identity, directoryIdentity(pathMetadata))
       || !sameDirectoryIdentity(held.identity, directoryIdentity(descriptorMetadata))
     ) {
-      throw new InstallNormalizationError("An HRA install directory path no longer names its held custody descriptor.");
+      throw new InstallNormalizationError("An Oompa install directory path no longer names its held custody descriptor.");
     }
   }
 }
@@ -659,7 +659,7 @@ const unlinkHeldChild = async (
     const errno = nativeDirectoryOperations().unlinkAt(directoryDescriptor, encodedName, 0);
     if (errno !== 0 && !(missing && errno === noEntryErrno)) {
       throw new InstallNormalizationError(
-        `Descriptor-relative HRA install removal failed with errno ${String(errno)}.`,
+        `Descriptor-relative Oompa install removal failed with errno ${String(errno)}.`,
       );
     }
     fsyncSync(directoryDescriptor);
@@ -670,8 +670,8 @@ const unlinkHeldChild = async (
 };
 
 export const assertSupportedBunInstallerVersion = (version: unknown): void => {
-  if (version !== HRA_INSTALL_BUN_VERSION) {
-    throw new InstallNormalizationError("The HRA install normalizer requires its exact supported Bun installer version.");
+  if (version !== OOMPA_INSTALL_BUN_VERSION) {
+    throw new InstallNormalizationError("The Oompa install normalizer requires its exact supported Bun installer version.");
   }
 };
 
@@ -688,13 +688,13 @@ const assertOwnedRegularFile = async (
     || metadata.nlink !== 1
     || (mode !== 0o600 && mode !== 0o644)
   ) {
-    throw new InstallNormalizationError("The HRA install normalizer or package manifest is not a trusted single-link mode-0600 or mode-0644 regular file.");
+    throw new InstallNormalizationError("The Oompa install normalizer or package manifest is not a trusted single-link mode-0600 or mode-0644 regular file.");
   }
   const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const descriptorMetadata = await handle.stat();
     if (!sameFileIdentity(fileIdentity(metadata), fileIdentity(descriptorMetadata))) {
-      throw new InstallNormalizationError("An HRA install metadata file changed while its custody descriptor was opened.");
+      throw new InstallNormalizationError("An Oompa install metadata file changed while its custody descriptor was opened.");
     }
     assertSafeDarwinInstallAcl(handle.fd, uid, path);
   } finally {
@@ -708,7 +708,7 @@ const readExactBytes = async (
   maximumBytes: number,
 ): Promise<Buffer> => {
   if (!Number.isSafeInteger(expectedSize) || expectedSize < 1 || expectedSize > maximumBytes) {
-    throw new InstallNormalizationError("An installed HRA package file has an invalid byte length.");
+    throw new InstallNormalizationError("An installed Oompa package file has an invalid byte length.");
   }
   const bytes = Buffer.alloc(expectedSize);
   let offset = 0;
@@ -716,7 +716,7 @@ const readExactBytes = async (
     const result = await handle.read(bytes, offset, bytes.byteLength - offset, offset);
     if (result.bytesRead < 1) {
       bytes.fill(0);
-      throw new InstallNormalizationError("An installed HRA package file ended before its declared byte length.");
+      throw new InstallNormalizationError("An installed Oompa package file ended before its declared byte length.");
     }
     offset += result.bytesRead;
   }
@@ -725,7 +725,7 @@ const readExactBytes = async (
     const result = await handle.read(tail, 0, 1, bytes.byteLength);
     if (result.bytesRead !== 0) {
       bytes.fill(0);
-      throw new InstallNormalizationError("An installed HRA package file grew while it was being verified.");
+      throw new InstallNormalizationError("An installed Oompa package file grew while it was being verified.");
     }
   } finally {
     tail.fill(0);
@@ -745,20 +745,20 @@ const hasExactKeys = (value: Record<string, unknown>, expected: readonly string[
     && keys.every((key, index) => key === expectedKeys[index]);
 };
 
-export const assertHraInstallManifest = (value: unknown): void => {
+export const assertOompaInstallManifest = (value: unknown): void => {
   if (!isRecord(value) || value.name !== expectedPackageName || value.version !== expectedPackageVersion) {
-    throw new InstallNormalizationError("The installed HRA package identity does not match its install normalizer.");
+    throw new InstallNormalizationError("The installed Oompa package identity does not match its install normalizer.");
   }
   const bin = value.bin;
   const scripts = value.scripts;
   if (
     !isRecord(bin)
-    || !hasExactKeys(bin, ["hra"])
-    || bin.hra !== "./src/cli.ts"
+    || !hasExactKeys(bin, ["oompa"])
+    || bin.oompa !== "./src/cli.ts"
     || !isRecord(scripts)
     || Object.keys(scripts).some((name) => lifecycleScriptNames.has(name))
   ) {
-    throw new InstallNormalizationError("The installed HRA executable or zero-lifecycle contract does not match its install normalizer.");
+    throw new InstallNormalizationError("The installed Oompa executable or zero-lifecycle contract does not match its install normalizer.");
   }
 };
 
@@ -773,15 +773,15 @@ const readManifest = async (path: string, uid: number): Promise<void> => {
     const after = await handle.stat();
     assertSafeDarwinInstallAcl(handle.fd, uid, path);
     if (!sameFileIdentity(fileIdentity(before), fileIdentity(after))) {
-      throw new InstallNormalizationError("The installed HRA package manifest changed while it was being verified.");
+      throw new InstallNormalizationError("The installed Oompa package manifest changed while it was being verified.");
     }
     let value: unknown;
     try {
       value = JSON.parse(bytes.toString("utf8")) as unknown;
     } catch {
-      throw new InstallNormalizationError("The installed HRA package manifest is not valid JSON.");
+      throw new InstallNormalizationError("The installed Oompa package manifest is not valid JSON.");
     }
-    assertHraInstallManifest(value);
+    assertOompaInstallManifest(value);
   } finally {
     bytes?.fill(0);
     await handle.close();
@@ -802,7 +802,7 @@ const assertSourceMetadata = (
     || metadata.size < 1
     || metadata.size > cliMaximumBytes
   ) {
-    throw new InstallNormalizationError("The Bun-installed HRA entry point is not an expected current-user-owned single-link 0755 or 0777 regular file.");
+    throw new InstallNormalizationError("The Bun-installed Oompa entry point is not an expected current-user-owned single-link 0755 or 0777 regular file.");
   }
 };
 
@@ -821,7 +821,7 @@ const quarantineCli = async (
       || before.size < 1
       || before.size > cliMaximumBytes
     ) {
-      throw new InstallNormalizationError("The Bun-installed HRA entry point is not a quarantinable current-user-owned regular file.");
+      throw new InstallNormalizationError("The Bun-installed Oompa entry point is not a quarantinable current-user-owned regular file.");
     }
     await handle.chmod(0o600);
     await handle.sync();
@@ -832,7 +832,7 @@ const quarantineCli = async (
       || after.uid !== uid
       || (after.mode & 0o777) !== 0o600
     ) {
-      throw new InstallNormalizationError("The HRA entry point could not be quarantined on its exact installed inode.");
+      throw new InstallNormalizationError("The Oompa entry point could not be quarantined on its exact installed inode.");
     }
     assertSourceMetadata(before, uid);
     return { handle, identity: fileIdentity(after) };
@@ -852,7 +852,7 @@ const assertPathIdentity = async (
     || metadata.isSymbolicLink()
     || !sameFileIdentity(fileIdentity(metadata), expectedIdentity)
   ) {
-    throw new InstallNormalizationError("The HRA entry point path no longer names its quarantined installed inode.");
+    throw new InstallNormalizationError("The Oompa entry point path no longer names its quarantined installed inode.");
   }
 };
 
@@ -864,18 +864,18 @@ const readVerifiedCli = async (
   let bytes: Buffer | undefined;
   try {
     const before = await handle.stat();
-    assertSafeDarwinInstallAcl(handle.fd, uid, "the quarantined HRA entry point");
+    assertSafeDarwinInstallAcl(handle.fd, uid, "the quarantined Oompa entry point");
     if (!sameFileIdentity(fileIdentity(before), expectedIdentity) || (before.mode & 0o777) !== 0o600) {
-      throw new InstallNormalizationError("The quarantined HRA entry point changed before digest verification.");
+      throw new InstallNormalizationError("The quarantined Oompa entry point changed before digest verification.");
     }
     bytes = await readExactBytes(handle, before.size, cliMaximumBytes);
     const after = await handle.stat();
-    assertSafeDarwinInstallAcl(handle.fd, uid, "the quarantined HRA entry point");
+    assertSafeDarwinInstallAcl(handle.fd, uid, "the quarantined Oompa entry point");
     if (!sameFileIdentity(fileIdentity(before), fileIdentity(after)) || (after.mode & 0o777) !== 0o600) {
-      throw new InstallNormalizationError("The quarantined HRA entry point changed while it was being verified.");
+      throw new InstallNormalizationError("The quarantined Oompa entry point changed while it was being verified.");
     }
-    if (sha256(bytes) !== HRA_INSTALL_CLI_SHA256) {
-      throw new InstallNormalizationError("The Bun-installed HRA entry point does not match the reviewed package digest.");
+    if (sha256(bytes) !== OOMPA_INSTALL_CLI_SHA256) {
+      throw new InstallNormalizationError("The Bun-installed Oompa entry point does not match the reviewed package digest.");
     }
     return bytes;
   } catch (error: unknown) {
@@ -889,7 +889,7 @@ const writeAll = async (handle: FileHandle, bytes: Buffer): Promise<void> => {
   while (offset < bytes.byteLength) {
     const result = await handle.write(bytes, offset, bytes.byteLength - offset, offset);
     if (result.bytesWritten < 1) {
-      throw new InstallNormalizationError("The HRA install normalizer could not publish the complete reviewed entry point.");
+      throw new InstallNormalizationError("The Oompa install normalizer could not publish the complete reviewed entry point.");
     }
     offset += result.bytesWritten;
   }
@@ -902,7 +902,7 @@ const publishVerifiedCli = async (
   beforeRename: () => Promise<void>,
 ): Promise<FileIdentity> => {
   const directory = dirname(path);
-  const temporaryPath = join(directory, `.hra-cli-install-${randomUUID()}`);
+  const temporaryPath = join(directory, `.oompa-cli-install-${randomUUID()}`);
   const temporary = await open(
     temporaryPath,
     constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | constants.O_NOFOLLOW,
@@ -923,12 +923,12 @@ const publishVerifiedCli = async (
       || (metadata.mode & 0o777) !== 0o755
       || metadata.size !== bytes.byteLength
     ) {
-      throw new InstallNormalizationError("The fresh HRA entry point inode did not retain its exact ownership, links, mode, and byte length.");
+      throw new InstallNormalizationError("The fresh Oompa entry point inode did not retain its exact ownership, links, mode, and byte length.");
     }
     const readback = await readExactBytes(temporary, metadata.size, cliMaximumBytes);
     try {
-      if (sha256(readback) !== HRA_INSTALL_CLI_SHA256 || !readback.equals(bytes)) {
-        throw new InstallNormalizationError("The fresh HRA entry point inode did not retain the reviewed bytes.");
+      if (sha256(readback) !== OOMPA_INSTALL_CLI_SHA256 || !readback.equals(bytes)) {
+        throw new InstallNormalizationError("The fresh Oompa entry point inode did not retain the reviewed bytes.");
       }
     } finally {
       readback.fill(0);
@@ -953,8 +953,8 @@ const fsyncDirectory = async (path: string): Promise<void> => {
 };
 
 const binLinkCandidates = (packageRoot: string): readonly string[] => [
-  resolve(packageRoot, "..", "..", ".bin", "hra"),
-  resolve(packageRoot, "..", "..", "..", "..", "..", "bin", "hra"),
+  resolve(packageRoot, "..", "..", ".bin", "oompa"),
+  resolve(packageRoot, "..", "..", "..", "..", "..", "bin", "oompa"),
 ];
 
 const disableCurrentUserPath = async (
@@ -969,14 +969,14 @@ const disableCurrentUserPath = async (
     throw error;
   }
   if (pathMetadata.uid !== uid) {
-    throw new InstallNormalizationError("An HRA command path could not be disabled because it is not current-user-owned.");
+    throw new InstallNormalizationError("An Oompa command path could not be disabled because it is not current-user-owned.");
   }
   if (pathMetadata.isSymbolicLink()) {
     await rm(path);
     return;
   }
   if (!pathMetadata.isFile()) {
-    throw new InstallNormalizationError("An HRA command path could not be disabled because it is neither a file nor a symbolic link.");
+    throw new InstallNormalizationError("An Oompa command path could not be disabled because it is neither a file nor a symbolic link.");
   }
   const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
@@ -988,7 +988,7 @@ const disableCurrentUserPath = async (
       || before.dev !== pathMetadata.dev
       || before.ino !== pathMetadata.ino
     ) {
-      throw new InstallNormalizationError("An HRA command path changed before it could be disabled.");
+      throw new InstallNormalizationError("An Oompa command path changed before it could be disabled.");
     }
     await handle.chmod(0o600);
     await handle.sync();
@@ -1001,7 +1001,7 @@ const disableCurrentUserPath = async (
       || after.ino !== before.ino
       || (after.mode & 0o111) !== 0
     ) {
-      throw new InstallNormalizationError("An HRA command inode could not be proved non-executable.");
+      throw new InstallNormalizationError("An Oompa command inode could not be proved non-executable.");
     }
     const rebound = await lstat(path);
     if (
@@ -1012,14 +1012,14 @@ const disableCurrentUserPath = async (
       || rebound.ino !== after.ino
       || (rebound.mode & 0o111) !== 0
     ) {
-      throw new InstallNormalizationError("An HRA command path no longer names its disabled inode.");
+      throw new InstallNormalizationError("An Oompa command path no longer names its disabled inode.");
     }
   } finally {
     await handle.close();
   }
 };
 
-const disableReachableHraCommand = async (
+const disableReachableOompaCommand = async (
   packageRoot: string,
   cliPath: string,
   uid: number,
@@ -1039,7 +1039,7 @@ const disableReachableHraCommand = async (
     try {
       const parentMetadata = await lstat(parent);
       if (!parentMetadata.isDirectory() || parentMetadata.uid !== uid) {
-        throw new InstallNormalizationError("An existing HRA command path is outside a current-user-owned mutation parent.");
+        throw new InstallNormalizationError("An existing Oompa command path is outside a current-user-owned mutation parent.");
       }
       await custody.holdThrough(parent);
       await custody.assertAll();
@@ -1049,7 +1049,7 @@ const disableReachableHraCommand = async (
       try {
         const disabled = await lstat(path);
         if (disabled.isSymbolicLink() || !disabled.isFile() || (disabled.mode & 0o111) !== 0) {
-          throw new InstallNormalizationError("An HRA command path remained reachable and executable after refusal.");
+          throw new InstallNormalizationError("An Oompa command path remained reachable and executable after refusal.");
         }
       } catch (error: unknown) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -1059,7 +1059,7 @@ const disableReachableHraCommand = async (
     }
   }
   if (failures.length > 0) {
-    throw new AggregateError(failures, "The HRA install normalizer could not prove that every command path was disabled.");
+    throw new AggregateError(failures, "The Oompa install normalizer could not prove that every command path was disabled.");
   }
 };
 
@@ -1074,7 +1074,7 @@ const existingBinLink = async (packageRoot: string): Promise<string> => {
     }
   }
   if (candidates.length !== 1) {
-    throw new InstallNormalizationError("The HRA install normalizer could not identify exactly one Bun-installed hra command link.");
+    throw new InstallNormalizationError("The Oompa install normalizer could not identify exactly one Bun-installed oompa command link.");
   }
   return candidates[0] as string;
 };
@@ -1087,14 +1087,14 @@ const assertExactBinLink = async (
 ): Promise<FileIdentity> => {
   const metadata = await lstat(path);
   if (!metadata.isSymbolicLink() || metadata.uid !== uid || metadata.nlink !== 1) {
-    throw new InstallNormalizationError("The Bun-installed hra command is not an expected current-user-owned single-link symbolic link.");
+    throw new InstallNormalizationError("The Bun-installed oompa command is not an expected current-user-owned single-link symbolic link.");
   }
   const identity = fileIdentity(metadata);
   if (expectedIdentity !== undefined && !sameFileIdentity(identity, expectedIdentity)) {
-    throw new InstallNormalizationError("The Bun-installed hra command link changed during normalization.");
+    throw new InstallNormalizationError("The Bun-installed oompa command link changed during normalization.");
   }
   if (await realpath(path) !== cliPath) {
-    throw new InstallNormalizationError("The Bun-installed hra command does not resolve to its exact package entry point.");
+    throw new InstallNormalizationError("The Bun-installed oompa command does not resolve to its exact package entry point.");
   }
   return identity;
 };
@@ -1117,11 +1117,11 @@ const assertPublishedCli = async (
       || (metadata.mode & 0o777) !== 0o755
       || !sameFileIdentity(fileIdentity(metadata), expectedIdentity)
     ) {
-      throw new InstallNormalizationError("The published HRA entry point path does not retain the fresh reviewed inode.");
+      throw new InstallNormalizationError("The published Oompa entry point path does not retain the fresh reviewed inode.");
     }
     readback = await readExactBytes(handle, metadata.size, cliMaximumBytes);
-    if (sha256(readback) !== HRA_INSTALL_CLI_SHA256 || !readback.equals(bytes)) {
-      throw new InstallNormalizationError("The published HRA entry point path does not retain the reviewed bytes.");
+    if (sha256(readback) !== OOMPA_INSTALL_CLI_SHA256 || !readback.equals(bytes)) {
+      throw new InstallNormalizationError("The published Oompa entry point path does not retain the reviewed bytes.");
     }
   } finally {
     readback?.fill(0);
@@ -1168,7 +1168,7 @@ type InstallCompleteReceipt = InstallArchiveIdentity & Readonly<{
   entryCount: number;
   id: string;
   normalizerSha256: string;
-  packageName: "@hraness/hra";
+  packageName: "@hraness/oompa";
   packageVersion: "0.8.0";
   totalBytes: number;
   treeSha256: string;
@@ -1213,7 +1213,7 @@ const parseArchiveIdentity = (value: Record<string, unknown>): InstallArchiveIde
     || typeof value.archiveSha256 !== "string"
     || !/^[0-9a-f]{64}$/u.test(value.archiveSha256)
     || (value.archiveSource !== "official" && value.archiveSource !== "local")
-  ) throw new InstallNormalizationError("The durable HRA install archive identity is invalid.");
+  ) throw new InstallNormalizationError("The durable Oompa install archive identity is invalid.");
   if (value.archiveSource === "official") {
     if (
       typeof value.archiveAssetId !== "number"
@@ -1224,7 +1224,7 @@ const parseArchiveIdentity = (value: Record<string, unknown>): InstallArchiveIde
       || value.archiveReleaseId < 1
       || value.archiveReleaseTag !== "v0.8.0"
       || value.archiveRepositoryId !== 1_343_008_607
-    ) throw new InstallNormalizationError("The durable HRA official archive identity is invalid.");
+    ) throw new InstallNormalizationError("The durable Oompa official archive identity is invalid.");
     return {
       archiveAssetId: value.archiveAssetId,
       archiveBytes: value.archiveBytes,
@@ -1241,7 +1241,7 @@ const parseArchiveIdentity = (value: Record<string, unknown>): InstallArchiveIde
     || value.archiveReleaseTag !== null
     || value.archiveRepositoryId !== null
   ) {
-    throw new InstallNormalizationError("The durable HRA local archive identity is invalid.");
+    throw new InstallNormalizationError("The durable Oompa local archive identity is invalid.");
   }
   return {
     archiveAssetId: null,
@@ -1261,7 +1261,7 @@ const archivePackagePath = (path: string): string => {
     || path.length <= prefix.length
     || Buffer.byteLength(path, "utf8") > archivePackagePathMaximumBytes
     || !/^[A-Za-z0-9._/-]+$/u.test(path)
-  ) throw new InstallNormalizationError("The authenticated HRA archive contains an invalid package path.");
+  ) throw new InstallNormalizationError("The authenticated Oompa archive contains an invalid package path.");
   const relativePath = path.slice(prefix.length);
   const components = relativePath.split("/");
   if (
@@ -1269,7 +1269,7 @@ const archivePackagePath = (path: string): string => {
     || components.some((component) => component.length < 1 || component === "." || component === "..")
     || relativePath.startsWith("/")
     || relativePath.endsWith("/")
-  ) throw new InstallNormalizationError("The authenticated HRA archive contains an ambiguous package path.");
+  ) throw new InstallNormalizationError("The authenticated Oompa archive contains an ambiguous package path.");
   return relativePath;
 };
 
@@ -1290,7 +1290,7 @@ const tarHeaderText = (header: Buffer, offset: number, length: number): string =
   const terminator = field.indexOf(0);
   const bytes = terminator === -1 ? field : field.subarray(0, terminator);
   if (bytes.some((value) => value < 0x20 || value > 0x7e)) {
-    throw new InstallNormalizationError("The authenticated HRA archive contains non-ASCII tar metadata.");
+    throw new InstallNormalizationError("The authenticated Oompa archive contains non-ASCII tar metadata.");
   }
   return bytes.toString("ascii");
 };
@@ -1298,11 +1298,11 @@ const tarHeaderText = (header: Buffer, offset: number, length: number): string =
 const tarHeaderOctal = (header: Buffer, offset: number, length: number): number => {
   const value = tarHeaderText(header, offset, length).trim();
   if (!/^[0-7]+$/u.test(value)) {
-    throw new InstallNormalizationError("The authenticated HRA archive contains an invalid tar integer.");
+    throw new InstallNormalizationError("The authenticated Oompa archive contains an invalid tar integer.");
   }
   const parsed = Number.parseInt(value, 8);
   if (!Number.isSafeInteger(parsed) || parsed < 0) {
-    throw new InstallNormalizationError("The authenticated HRA archive tar integer exceeds its safe bound.");
+    throw new InstallNormalizationError("The authenticated Oompa archive tar integer exceeds its safe bound.");
   }
   return parsed;
 };
@@ -1314,11 +1314,11 @@ const assertTarHeaderChecksum = (header: Buffer): void => {
     actual += index >= 148 && index < 156 ? 0x20 : (header[index] ?? 0);
   }
   if (actual !== expected) {
-    throw new InstallNormalizationError("The authenticated HRA archive contains an invalid tar checksum.");
+    throw new InstallNormalizationError("The authenticated Oompa archive contains an invalid tar checksum.");
   }
 };
 
-export const parseAuthenticatedHraPackageArchive = async (
+export const parseAuthenticatedOompaPackageArchive = async (
   archiveBytes: Buffer,
 ): Promise<AuthenticatedPackageManifest> => {
   if (
@@ -1328,13 +1328,13 @@ export const parseAuthenticatedHraPackageArchive = async (
     || archiveBytes[0] !== 0x1f
     || archiveBytes[1] !== 0x8b
   ) {
-    throw new InstallNormalizationError("The authenticated HRA archive is not an exact gzip tarball.");
+    throw new InstallNormalizationError("The authenticated Oompa archive is not an exact gzip tarball.");
   }
   const directories = new Set<string>();
   const files = new Map<string, AuthenticatedPackageFile>();
   const archiveBuffer = archiveBytes.buffer;
   if (!(archiveBuffer instanceof ArrayBuffer)) {
-    throw new InstallNormalizationError("The authenticated HRA archive does not have an isolated byte buffer.");
+    throw new InstallNormalizationError("The authenticated Oompa archive does not have an isolated byte buffer.");
   }
   const compressedSlices = async function* (): AsyncGenerator<Buffer> {
     let offset = 0;
@@ -1383,11 +1383,11 @@ export const parseAuthenticatedHraPackageArchive = async (
       || result.value.byteLength < 1
       || result.value.byteLength > archiveGzipOutputChunkBytes
     ) {
-      throw new InstallNormalizationError("The authenticated HRA archive produced an invalid gzip chunk.");
+      throw new InstallNormalizationError("The authenticated Oompa archive produced an invalid gzip chunk.");
     }
     expandedBytes += result.value.byteLength;
     if (!Number.isSafeInteger(expandedBytes) || expandedBytes > archivePackageTarMaximumBytes) {
-      throw new InstallNormalizationError("The authenticated HRA archive exceeds its expanded tar-byte bound.");
+      throw new InstallNormalizationError("The authenticated Oompa archive exceeds its expanded tar-byte bound.");
     }
     current = result.value;
     currentOffset = 0;
@@ -1397,13 +1397,13 @@ export const parseAuthenticatedHraPackageArchive = async (
     onChunk?: (chunk: Uint8Array) => void,
   ): Promise<void> => {
     if (!Number.isSafeInteger(count) || count < 0) {
-      throw new InstallNormalizationError("The authenticated HRA archive requested an invalid tar span.");
+      throw new InstallNormalizationError("The authenticated Oompa archive requested an invalid tar span.");
     }
     let remaining = count;
     while (remaining > 0) {
       if (currentOffset === current.byteLength) await nextChunk();
       if (ended) {
-        throw new InstallNormalizationError("The authenticated HRA archive ended inside a tar entry.");
+        throw new InstallNormalizationError("The authenticated Oompa archive ended inside a tar entry.");
       }
       const length = Math.min(remaining, current.byteLength - currentOffset);
       const chunk = current.subarray(currentOffset, currentOffset + length);
@@ -1414,7 +1414,7 @@ export const parseAuthenticatedHraPackageArchive = async (
   };
   const consumeZeros = async (count: number): Promise<void> => await consume(count, (chunk) => {
     if (chunk.some((value) => value !== 0)) {
-      throw new InstallNormalizationError("The authenticated HRA archive contains nonzero tar padding.");
+      throw new InstallNormalizationError("The authenticated Oompa archive contains nonzero tar padding.");
     }
   });
   const drainZeros = async (): Promise<void> => {
@@ -1422,7 +1422,7 @@ export const parseAuthenticatedHraPackageArchive = async (
       if (currentOffset === current.byteLength) await nextChunk();
       if (ended) return;
       if (current.subarray(currentOffset).some((value) => value !== 0)) {
-        throw new InstallNormalizationError("The authenticated HRA archive contains data after its tar terminator.");
+        throw new InstallNormalizationError("The authenticated Oompa archive contains data after its tar terminator.");
       }
       currentOffset = current.byteLength;
     }
@@ -1444,33 +1444,33 @@ export const parseAuthenticatedHraPackageArchive = async (
         }
         assertTarHeaderChecksum(header);
         if (tarHeaderText(header, 257, 6) !== "ustar" || tarHeaderText(header, 263, 2) !== "00") {
-          throw new InstallNormalizationError("The authenticated HRA archive is not an exact ustar package.");
+          throw new InstallNormalizationError("The authenticated Oompa archive is not an exact ustar package.");
         }
         const type = header[156];
         if (type !== 0 && type !== 0x30) {
-          throw new InstallNormalizationError("The authenticated HRA archive contains a non-regular package entry.");
+          throw new InstallNormalizationError("The authenticated Oompa archive contains a non-regular package entry.");
         }
         const name = tarHeaderText(header, 0, 100);
         const prefix = tarHeaderText(header, 345, 155);
         const path = prefix.length === 0 ? name : `${prefix}/${name}`;
         const size = tarHeaderOctal(header, 124, 12);
         if (size > archivePackageFileMaximumBytes) {
-          throw new InstallNormalizationError("The authenticated HRA archive contains an oversized package file.");
+          throw new InstallNormalizationError("The authenticated Oompa archive contains an oversized package file.");
         }
         if (files.size >= archivePackageFileMaximumCount) {
-          throw new InstallNormalizationError("The authenticated HRA archive exceeds its package-file-count bound.");
+          throw new InstallNormalizationError("The authenticated Oompa archive exceeds its package-file-count bound.");
         }
         totalBytes += size;
         if (!Number.isSafeInteger(totalBytes) || totalBytes > archivePackageTotalMaximumBytes) {
-          throw new InstallNormalizationError("The authenticated HRA archive exceeds its package-file-byte bound.");
+          throw new InstallNormalizationError("The authenticated Oompa archive exceeds its package-file-byte bound.");
         }
         packagePathBytes += Buffer.byteLength(path, "utf8");
         if (!Number.isSafeInteger(packagePathBytes) || packagePathBytes > archivePackagePathByteMaximum) {
-          throw new InstallNormalizationError("The authenticated HRA archive exceeds its package-path-byte bound.");
+          throw new InstallNormalizationError("The authenticated Oompa archive exceeds its package-path-byte bound.");
         }
         const relativePath = archivePackagePath(path);
         if (files.has(relativePath)) {
-          throw new InstallNormalizationError("The authenticated HRA archive contains a duplicate package path.");
+          throw new InstallNormalizationError("The authenticated Oompa archive contains a duplicate package path.");
         }
         const fileHasher = createHash("sha256");
         await consume(size, (chunk) => { fileHasher.update(chunk); });
@@ -1480,7 +1480,7 @@ export const parseAuthenticatedHraPackageArchive = async (
         for (const directory of packageDirectoriesFor(relativePath)) {
           directories.add(directory);
           if (directories.size > archivePackageDirectoryMaximumCount) {
-            throw new InstallNormalizationError("The authenticated HRA archive exceeds its package-directory-count bound.");
+            throw new InstallNormalizationError("The authenticated Oompa archive exceeds its package-directory-count bound.");
           }
         }
       } finally {
@@ -1488,7 +1488,7 @@ export const parseAuthenticatedHraPackageArchive = async (
       }
     }
     if (files.size < 1) {
-      throw new InstallNormalizationError("The authenticated HRA archive contains no package files.");
+      throw new InstallNormalizationError("The authenticated Oompa archive contains no package files.");
     }
   } catch (error: unknown) {
     operationError = error;
@@ -1504,14 +1504,14 @@ export const parseAuthenticatedHraPackageArchive = async (
   ]);
   if (operationError !== undefined) {
     if (operationError instanceof InstallNormalizationError) throw operationError;
-    throw new InstallNormalizationError("The authenticated HRA archive could not be parsed as a bounded package tarball.");
+    throw new InstallNormalizationError("The authenticated Oompa archive could not be parsed as a bounded package tarball.");
   }
   if (inputSettlementFailed || outputSettlementFailed) {
-    throw new InstallNormalizationError("The authenticated HRA archive could not be parsed as a bounded package tarball.");
+    throw new InstallNormalizationError("The authenticated Oompa archive could not be parsed as a bounded package tarball.");
   }
   for (const required of ["package.json", cliRelativePath.replaceAll("\\", "/"), "src/install-normalizer.ts"]) {
     if (!files.has(required)) {
-      throw new InstallNormalizationError("The authenticated HRA archive omits a required package file.");
+      throw new InstallNormalizationError("The authenticated Oompa archive omits a required package file.");
     }
   }
   return { directories, files };
@@ -1535,7 +1535,7 @@ const verifyPrivateArchive = async (
       || (before.mode & 0o777) !== 0o600
       || before.size !== expected.archiveBytes
       || !sameArchiveFileIdentity(archiveFileIdentity(pathMetadata), archiveFileIdentity(before))
-    ) throw new InstallNormalizationError("The private HRA archive has invalid staged custody.");
+    ) throw new InstallNormalizationError("The private Oompa archive has invalid staged custody.");
     bytes = await readExactBytes(handle, before.size, archiveMaximumBytes);
     const after = await handle.stat();
     const finalPathMetadata = await lstat(path);
@@ -1544,8 +1544,8 @@ const verifyPrivateArchive = async (
       !sameArchiveFileIdentity(archiveFileIdentity(before), archiveFileIdentity(after))
       || !sameArchiveFileIdentity(archiveFileIdentity(before), archiveFileIdentity(finalPathMetadata))
       || sha256(bytes) !== expected.archiveSha256
-    ) throw new InstallNormalizationError("The private HRA archive changed or failed its receipt SHA-256 identity.");
-    return await parseAuthenticatedHraPackageArchive(bytes);
+    ) throw new InstallNormalizationError("The private Oompa archive changed or failed its receipt SHA-256 identity.");
+    return await parseAuthenticatedOompaPackageArchive(bytes);
   } finally {
     bytes?.fill(0);
     await handle.close();
@@ -1575,7 +1575,7 @@ const parseInstallIntent = (value: unknown): InstallIntent => {
     || typeof value.stagingRoot !== "string"
     || typeof value.versionRoot !== "string"
     || value.version !== 2
-  ) throw new InstallNormalizationError("The durable HRA install intent is invalid.");
+  ) throw new InstallNormalizationError("The durable Oompa install intent is invalid.");
   const archiveIdentity = parseArchiveIdentity(value);
   if (
     (archiveIdentity.archiveSource === "official" && value.archive !== expectedArchiveUrl)
@@ -1583,7 +1583,7 @@ const parseInstallIntent = (value: unknown): InstallIntent => {
       archiveIdentity.archiveSource === "local"
       && (!isAbsolute(value.archive) || resolve(value.archive) !== value.archive)
     )
-  ) throw new InstallNormalizationError("The durable HRA install archive path does not match its source class.");
+  ) throw new InstallNormalizationError("The durable Oompa install archive path does not match its source class.");
   return {
     archive: value.archive,
     ...archiveIdentity,
@@ -1612,13 +1612,13 @@ const readSmallJson = async (
       || metadata.uid !== uid
       || metadata.nlink !== 1
       || ((metadata.mode & 0o777) !== 0o600 && (metadata.mode & 0o777) !== 0o644)
-    ) throw new InstallNormalizationError("An HRA install authority document is not a trusted regular file.");
+    ) throw new InstallNormalizationError("An Oompa install authority document is not a trusted regular file.");
     assertSafeDarwinInstallAcl(handle.fd, uid, path);
     bytes = await readExactBytes(handle, metadata.size, maximumBytes);
     return JSON.parse(bytes.toString("utf8")) as unknown;
   } catch (error: unknown) {
     if (error instanceof InstallNormalizationError) throw error;
-    throw new InstallNormalizationError("An HRA install authority document is invalid.");
+    throw new InstallNormalizationError("An Oompa install authority document is invalid.");
   } finally {
     bytes?.fill(0);
     await handle.close();
@@ -1635,7 +1635,7 @@ const writeAtomicJson = async (
   await custody.holdThrough(directory);
   await custody.assertAll();
   const directoryDescriptor = await custody.descriptorFor(directory);
-  const temporaryName = `.hra-install-document-${randomUUID()}`;
+  const temporaryName = `.oompa-install-document-${randomUUID()}`;
   const encodedTemporaryName = nativeName(temporaryName);
   const encodedTargetName = nativeName(basename(path));
   const descriptor = nativeDirectoryOperations().openAt(
@@ -1652,7 +1652,7 @@ const writeAtomicJson = async (
     encodedTemporaryName.fill(0);
     encodedTargetName.fill(0);
     throw new InstallNormalizationError(
-      `Descriptor-relative HRA authority creation failed with errno ${String(-descriptor)}.`,
+      `Descriptor-relative Oompa authority creation failed with errno ${String(-descriptor)}.`,
     );
   }
   fchmodSync(descriptor, 0o600);
@@ -1665,7 +1665,7 @@ const writeAtomicJson = async (
       while (offset < bytes.byteLength) {
         const written = writeSync(descriptor, bytes, offset, bytes.byteLength - offset, offset);
         if (written < 1) {
-          throw new InstallNormalizationError("The HRA authority document stopped during descriptor-relative write.");
+          throw new InstallNormalizationError("The Oompa authority document stopped during descriptor-relative write.");
         }
         offset += written;
       }
@@ -1680,7 +1680,7 @@ const writeAtomicJson = async (
       || metadata.uid !== uid
       || metadata.nlink !== 1
       || (metadata.mode & 0o777) !== 0o600
-    ) throw new InstallNormalizationError("A fresh HRA install authority document is not private.");
+    ) throw new InstallNormalizationError("A fresh Oompa install authority document is not private.");
     await custody.assertAll();
     const renameErrno = nativeDirectoryOperations().renameAt(
       directoryDescriptor,
@@ -1690,7 +1690,7 @@ const writeAtomicJson = async (
     );
     if (renameErrno !== 0) {
       throw new InstallNormalizationError(
-        `Descriptor-relative HRA authority publication failed with errno ${String(renameErrno)}.`,
+        `Descriptor-relative Oompa authority publication failed with errno ${String(renameErrno)}.`,
       );
     }
     published = true;
@@ -1706,7 +1706,7 @@ const writeAtomicJson = async (
       const cleanupErrno = nativeDirectoryOperations().unlinkAt(directoryDescriptor, encodedTemporaryName, 0);
       if (cleanupErrno !== 0 && cleanupErrno !== noEntryErrno) {
         throw new InstallNormalizationError(
-          `Descriptor-relative HRA authority cleanup failed with errno ${String(cleanupErrno)}.`,
+          `Descriptor-relative Oompa authority cleanup failed with errno ${String(cleanupErrno)}.`,
         );
       }
     }
@@ -1719,16 +1719,16 @@ const writeAtomicJson = async (
   if (operationError !== undefined && cleanupError !== undefined) {
     throw new AggregateError(
       [operationError, cleanupError],
-      "HRA authority publication and descriptor-relative cleanup both failed.",
+      "Oompa authority publication and descriptor-relative cleanup both failed.",
     );
   }
   if (operationError instanceof Error) throw operationError;
   if (operationError !== undefined) {
-    throw new InstallNormalizationError("HRA authority publication failed with a non-Error value.");
+    throw new InstallNormalizationError("Oompa authority publication failed with a non-Error value.");
   }
   if (cleanupError instanceof Error) throw cleanupError;
   if (cleanupError !== undefined) {
-    throw new InstallNormalizationError("HRA authority cleanup failed with a non-Error value.");
+    throw new InstallNormalizationError("Oompa authority cleanup failed with a non-Error value.");
   }
 };
 
@@ -1754,7 +1754,7 @@ const normalizeInstallTree = async (
     treeHasher.update(`${JSON.stringify(value)}\n`, "utf8");
   };
   const cliPath = join(packageRoot, cliRelativePath);
-  const privateArchivePath = join(root, ".hra-release-archive.tgz");
+  const privateArchivePath = join(root, ".oompa-release-archive.tgz");
   const visit = async (directory: string): Promise<void> => {
     await custody.holdThrough(directory);
     const directoryHandle = await open(
@@ -1764,7 +1764,7 @@ const normalizeInstallTree = async (
     try {
       const before = await directoryHandle.stat();
       if (!before.isDirectory() || before.uid !== uid) {
-        throw new InstallNormalizationError("The staged HRA install contains a directory outside current-user custody.");
+        throw new InstallNormalizationError("The staged Oompa install contains a directory outside current-user custody.");
       }
       assertSafeDarwinInstallAcl(directoryHandle.fd, uid, directory);
       await directoryHandle.chmod(0o700);
@@ -1775,12 +1775,12 @@ const normalizeInstallTree = async (
         !sameDirectoryIdentity(directoryIdentity(before), directoryIdentity(after))
         || after.uid !== uid
         || (after.mode & 0o777) !== 0o700
-      ) throw new InstallNormalizationError("A staged HRA install directory did not retain its private mode and identity.");
+      ) throw new InstallNormalizationError("A staged Oompa install directory did not retain its private mode and identity.");
       if (pathWithin(packageRoot, directory)) {
         const relativePackageDirectory = relative(packageRoot, directory).replaceAll("\\", "/");
         if (!authenticatedPackage.directories.has(relativePackageDirectory)) {
           throw new InstallNormalizationError(
-            "The staged HRA package contains a directory absent from its authenticated release archive.",
+            "The staged Oompa package contains a directory absent from its authenticated release archive.",
           );
         }
         authenticatedDirectoriesSeen.add(relativePackageDirectory);
@@ -1796,11 +1796,11 @@ const normalizeInstallTree = async (
       if (path === privateArchivePath) continue;
       entryCount += 1;
       if (entryCount > installTreeEntryMaximum) {
-        throw new InstallNormalizationError("The staged HRA install exceeds its entry-count bound.");
+        throw new InstallNormalizationError("The staged Oompa install exceeds its entry-count bound.");
       }
       const metadata = await lstat(path);
       if (metadata.uid !== uid) {
-        throw new InstallNormalizationError("The staged HRA install contains an entry outside current-user custody.");
+        throw new InstallNormalizationError("The staged Oompa install contains an entry outside current-user custody.");
       }
       if (entry.isDirectory()) {
         await visit(path);
@@ -1809,11 +1809,11 @@ const normalizeInstallTree = async (
       if (entry.isSymbolicLink()) {
         if (pathWithin(packageRoot, path)) {
           throw new InstallNormalizationError(
-            "The staged HRA package contains a symbolic link absent from its authenticated release archive.",
+            "The staged Oompa package contains a symbolic link absent from its authenticated release archive.",
           );
         }
         if (metadata.nlink !== 1) {
-          throw new InstallNormalizationError("The staged HRA install contains a multiply linked symbolic link.");
+          throw new InstallNormalizationError("The staged Oompa install contains a multiply linked symbolic link.");
         }
         const target = await readlink(path);
         if (
@@ -1822,27 +1822,27 @@ const normalizeInstallTree = async (
           || target.includes("\0")
           || isAbsolute(target)
         ) {
-          throw new InstallNormalizationError("The staged HRA install contains an invalid symbolic-link target.");
+          throw new InstallNormalizationError("The staged Oompa install contains an invalid symbolic-link target.");
         }
         if (!pathWithin(root, resolve(dirname(path), target))) {
-          throw new InstallNormalizationError("The staged HRA install contains a lexically escaping symbolic link.");
+          throw new InstallNormalizationError("The staged Oompa install contains a lexically escaping symbolic link.");
         }
         const resolvedTarget = await realpath(path);
         if (!pathWithin(root, resolvedTarget)) {
-          throw new InstallNormalizationError("The staged HRA install contains a symbolic link outside its complete version tree.");
+          throw new InstallNormalizationError("The staged Oompa install contains a symbolic link outside its complete version tree.");
         }
         record(["symlink", relative(root, path).replaceAll("\\", "/"), target]);
         continue;
       }
       if (!entry.isFile() || !metadata.isFile() || metadata.isSymbolicLink()) {
-        throw new InstallNormalizationError("The staged HRA install contains a non-file runtime entry.");
+        throw new InstallNormalizationError("The staged Oompa install contains a non-file runtime entry.");
       }
       if (!Number.isSafeInteger(metadata.size) || metadata.size < 0) {
-        throw new InstallNormalizationError("The staged HRA install contains a file with an invalid byte length.");
+        throw new InstallNormalizationError("The staged Oompa install contains a file with an invalid byte length.");
       }
       totalBytes += metadata.size;
       if (!Number.isSafeInteger(totalBytes) || totalBytes > installTreeByteMaximum) {
-        throw new InstallNormalizationError("The staged HRA install exceeds its total-byte bound.");
+        throw new InstallNormalizationError("The staged Oompa install exceeds its total-byte bound.");
       }
       const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
       try {
@@ -1852,7 +1852,7 @@ const normalizeInstallTree = async (
           || before.uid !== uid
           || before.nlink !== 1
           || !sameFileIdentity(fileIdentity(metadata), fileIdentity(before))
-        ) throw new InstallNormalizationError("A staged HRA install file changed while its descriptor was opened.");
+        ) throw new InstallNormalizationError("A staged Oompa install file changed while its descriptor was opened.");
         assertSafeDarwinInstallAcl(handle.fd, uid, path);
         const desiredMode = path === cliPath
           ? 0o755
@@ -1873,7 +1873,7 @@ const normalizeInstallTree = async (
               offset,
             );
             if (result.bytesRead < 1) {
-              throw new InstallNormalizationError("A staged HRA install file ended during its tree digest.");
+              throw new InstallNormalizationError("A staged Oompa install file ended during its tree digest.");
             }
             fileHasher.update(chunk.subarray(0, result.bytesRead));
             offset += result.bytesRead;
@@ -1888,7 +1888,7 @@ const normalizeInstallTree = async (
           || after.uid !== uid
           || after.nlink !== 1
           || (after.mode & 0o777) !== desiredMode
-        ) throw new InstallNormalizationError("A staged HRA install file did not retain its normalized identity and mode.");
+        ) throw new InstallNormalizationError("A staged Oompa install file did not retain its normalized identity and mode.");
         const fileSha256 = fileHasher.digest("hex");
         if (pathWithin(packageRoot, path)) {
           const relativePackageFile = relative(packageRoot, path).replaceAll("\\", "/");
@@ -1899,7 +1899,7 @@ const normalizeInstallTree = async (
             || authenticatedFile.sha256 !== fileSha256
           ) {
             throw new InstallNormalizationError(
-              "The staged HRA package file does not match its authenticated release archive.",
+              "The staged Oompa package file does not match its authenticated release archive.",
             );
           }
           authenticatedFilesSeen.add(relativePackageFile);
@@ -1923,14 +1923,14 @@ const normalizeInstallTree = async (
     || authenticatedFilesSeen.size !== authenticatedPackage.files.size
   ) {
     throw new InstallNormalizationError(
-      "The staged HRA package is incomplete relative to its authenticated release archive.",
+      "The staged Oompa package is incomplete relative to its authenticated release archive.",
     );
   }
   await custody.assertAll();
   return { entryCount, totalBytes, treeSha256: treeHasher.digest("hex") };
 };
 
-export async function completeHraStagedInstall(input: InstallArchiveIdentity & Readonly<{
+export async function completeOompaStagedInstall(input: InstallArchiveIdentity & Readonly<{
   afterVersionRebind?: (() => Promise<void> | void) | undefined;
   afterVersionRename?: (() => Promise<void> | void) | undefined;
   authorityRoot: string;
@@ -1945,11 +1945,11 @@ export async function completeHraStagedInstall(input: InstallArchiveIdentity & R
   versionRoot: string;
 }>): Promise<Readonly<{ versionRoot: string }>> {
   if (process.platform !== "darwin" && process.platform !== "linux") {
-    throw new InstallNormalizationError("HRA's staged installer supports only macOS and Linux.");
+    throw new InstallNormalizationError("Oompa's staged installer supports only macOS and Linux.");
   }
   const uid = process.getuid?.();
   if (uid === undefined) {
-    throw new InstallNormalizationError("HRA's staged installer requires a current-user identity.");
+    throw new InstallNormalizationError("Oompa's staged installer requires a current-user identity.");
   }
   assertSupportedBunInstallerVersion(Bun.version);
   const authorityRoot = resolve(input.authorityRoot);
@@ -1960,23 +1960,23 @@ export async function completeHraStagedInstall(input: InstallArchiveIdentity & R
   const normalizerPath = resolve(input.normalizerPath);
   const archiveIdentity = parseArchiveIdentity(input);
   if (typeof input.normalizerSha256 !== "string" || !/^[0-9a-f]{64}$/u.test(input.normalizerSha256)) {
-    throw new InstallNormalizationError("The staged HRA normalizer identity is invalid.");
+    throw new InstallNormalizationError("The staged Oompa normalizer identity is invalid.");
   }
   const expectedVersionName = [
     "v0.8.0",
     archiveIdentity.archiveSource,
     archiveIdentity.archiveSha256,
     input.normalizerSha256,
-    HRA_INSTALL_CLI_SHA256,
+    OOMPA_INSTALL_CLI_SHA256,
   ].join("-");
   if (
     dirname(stagingRoot) !== authorityRoot
     || dirname(versionRoot) !== join(authorityRoot, "versions")
     || relative(join(authorityRoot, "versions"), versionRoot) !== expectedVersionName
     || intentPath !== join(authorityRoot, "install-intent.json")
-    || packageRoot !== join(stagingRoot, "install", "global", "node_modules", "@hraness", "hra")
+    || packageRoot !== join(stagingRoot, "install", "global", "node_modules", "@hraness", "oompa")
     || normalizerPath !== join(packageRoot, "src", "install-normalizer.ts")
-  ) throw new InstallNormalizationError("The staged HRA install paths do not match their exact authority layout.");
+  ) throw new InstallNormalizationError("The staged Oompa install paths do not match their exact authority layout.");
   const custody = new DirectoryCustody(uid);
   let custodyClosed = false;
   try {
@@ -1997,19 +1997,19 @@ export async function completeHraStagedInstall(input: InstallArchiveIdentity & R
       || intent.phase !== "installed"
       || intent.stagingRoot !== stagingRoot
       || intent.versionRoot !== versionRoot
-    ) throw new InstallNormalizationError("The staged HRA install no longer matches its durable installed-phase authority.");
-    const privateArchivePath = join(stagingRoot, ".hra-release-archive.tgz");
+    ) throw new InstallNormalizationError("The staged Oompa install no longer matches its durable installed-phase authority.");
+    const privateArchivePath = join(stagingRoot, ".oompa-release-archive.tgz");
     const authenticatedPackage = await verifyPrivateArchive(privateArchivePath, uid, archiveIdentity);
     const normalizerBytes = await readFile(normalizerPath);
     try {
       if (sha256(normalizerBytes) !== input.normalizerSha256) {
-        throw new InstallNormalizationError("The staged HRA normalizer changed after trusted-source verification.");
+        throw new InstallNormalizationError("The staged Oompa normalizer changed after trusted-source verification.");
       }
     } finally {
       normalizerBytes.fill(0);
     }
-    await unlinkHeldChild(custody, stagingRoot, ".hra-install-complete.json", true);
-    await normalizeHraBunInstall({ normalizerPath, packageRoot });
+    await unlinkHeldChild(custody, stagingRoot, ".oompa-install-complete.json", true);
+    await normalizeOompaBunInstall({ normalizerPath, packageRoot });
     const normalizedTree = await normalizeInstallTree(
       stagingRoot,
       packageRoot,
@@ -2019,20 +2019,20 @@ export async function completeHraStagedInstall(input: InstallArchiveIdentity & R
     );
     const receipt: InstallCompleteReceipt = {
       ...archiveIdentity,
-      cliSha256: HRA_INSTALL_CLI_SHA256,
+      cliSha256: OOMPA_INSTALL_CLI_SHA256,
       completedAt: input.completedAt,
       dependencyProvenance: "bun-registry-exact-versions",
       entryCount: normalizedTree.entryCount,
       id: input.intentId,
       normalizerSha256: input.normalizerSha256,
-      packageName: "@hraness/hra",
+      packageName: "@hraness/oompa",
       packageVersion: "0.8.0",
       totalBytes: normalizedTree.totalBytes,
       treeSha256: normalizedTree.treeSha256,
       version: 2,
     };
     await writeAtomicJson(
-      join(stagingRoot, ".hra-install-complete.json"),
+      join(stagingRoot, ".oompa-install-complete.json"),
       receipt,
       uid,
       custody,
@@ -2041,7 +2041,7 @@ export async function completeHraStagedInstall(input: InstallArchiveIdentity & R
     await custody.assertAll();
     try {
       await lstat(versionRoot);
-      throw new InstallNormalizationError("The complete HRA version destination already exists.");
+      throw new InstallNormalizationError("The complete Oompa version destination already exists.");
     } catch (error: unknown) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
@@ -2068,17 +2068,17 @@ export async function completeHraStagedInstall(input: InstallArchiveIdentity & R
   }
 }
 
-export async function normalizeHraBunInstall(input: Readonly<{
+export async function normalizeOompaBunInstall(input: Readonly<{
   normalizerPath: string;
   packageRoot: string;
   testHooks?: InstallNormalizerTestHooks;
 }>): Promise<void> {
   if (process.platform !== "darwin" && process.platform !== "linux") {
-    throw new InstallNormalizationError("HRA's Bun install normalizer supports only macOS and Linux.");
+    throw new InstallNormalizationError("Oompa's Bun install normalizer supports only macOS and Linux.");
   }
   const uid = process.getuid?.();
   if (uid === undefined) {
-    throw new InstallNormalizationError("HRA's Bun install normalizer requires a current-user identity.");
+    throw new InstallNormalizationError("Oompa's Bun install normalizer requires a current-user identity.");
   }
   const requestedPackageRoot = resolve(input.packageRoot);
   const requestedNormalizerPath = resolve(input.normalizerPath);
@@ -2101,11 +2101,11 @@ export async function normalizeHraBunInstall(input: Readonly<{
     assertSupportedBunInstallerVersion(Bun.version);
     const normalizerPath = await realpath(requestedNormalizerPath);
     if (packageRoot !== requestedPackageRoot || normalizerPath !== requestedNormalizerPath) {
-      throw new InstallNormalizationError("The HRA install normalizer refuses symlinked package or normalizer paths.");
+      throw new InstallNormalizationError("The Oompa install normalizer refuses symlinked package or normalizer paths.");
     }
     const expectedNormalizerPath = join(packageRoot, "src", "install-normalizer.ts");
     if (normalizerPath !== expectedNormalizerPath) {
-      throw new InstallNormalizationError("The HRA install normalizer is not inside its exact package root.");
+      throw new InstallNormalizationError("The Oompa install normalizer is not inside its exact package root.");
     }
 
     await input.testHooks?.afterQuarantine?.();
@@ -2140,7 +2140,7 @@ export async function normalizeHraBunInstall(input: Readonly<{
   if (operationError !== undefined) {
     let refusalError: unknown;
     try {
-      await disableReachableHraCommand(packageRoot, cliPath, uid, custody);
+      await disableReachableOompaCommand(packageRoot, cliPath, uid, custody);
     } catch (error: unknown) {
       refusalError = error;
     }
@@ -2155,14 +2155,14 @@ export async function normalizeHraBunInstall(input: Readonly<{
     if (refusalError !== undefined || cleanupErrors.length > 0) {
       const primaryMessage = operationError instanceof Error
         ? operationError.message
-        : "The HRA install operation failed.";
+        : "The Oompa install operation failed.";
       throw new AggregateError(
         [operationError, ...(refusalError === undefined ? [] : [refusalError]), ...cleanupErrors],
         `${primaryMessage} Complete command quarantine could not be proved.`,
       );
     }
     if (operationError instanceof Error) throw operationError;
-    throw new InstallNormalizationError("The HRA install operation failed with a non-Error refusal.");
+    throw new InstallNormalizationError("The Oompa install operation failed with a non-Error refusal.");
   }
 
   bytes?.fill(0);
@@ -2178,7 +2178,7 @@ export async function normalizeHraBunInstall(input: Readonly<{
     try {
       const refusalCustody = new DirectoryCustody(uid);
       try {
-        await disableReachableHraCommand(packageRoot, cliPath, uid, refusalCustody);
+        await disableReachableOompaCommand(packageRoot, cliPath, uid, refusalCustody);
       } finally {
         await refusalCustody.close();
       }
@@ -2188,20 +2188,20 @@ export async function normalizeHraBunInstall(input: Readonly<{
     throw new AggregateError(
       [...cleanupErrors, ...(refusalError === undefined ? [] : [refusalError])],
       refusalError === undefined
-        ? "The HRA install failed during descriptor settlement after its command was disabled."
-        : "The HRA install failed during descriptor settlement and command quarantine could not be proved.",
+        ? "The Oompa install failed during descriptor settlement after its command was disabled."
+        : "The Oompa install failed during descriptor settlement and command quarantine could not be proved.",
     );
   }
 }
 
 if (import.meta.main) {
   try {
-    await normalizeHraBunInstall({
+    await normalizeOompaBunInstall({
       normalizerPath: import.meta.path,
       packageRoot: resolve(import.meta.dir, ".."),
     });
   } catch {
-    process.stderr.write("hra install: the reviewed executable could not be normalized safely; installation stopped.\n");
+    process.stderr.write("oompa install: the reviewed executable could not be normalized safely; installation stopped.\n");
     process.exitCode = 1;
   }
 }

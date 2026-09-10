@@ -164,7 +164,7 @@ async function githubJson(url: string, label: string, token: string): Promise<un
       Accept: "application/vnd.github+json",
       Authorization: `Bearer ${token}`,
       "Cache-Control": "no-cache",
-      "User-Agent": "hra-release-ci-readback",
+      "User-Agent": "oompa-release-ci-readback",
       "X-GitHub-Api-Version": "2022-11-28",
     },
     redirect: "error",

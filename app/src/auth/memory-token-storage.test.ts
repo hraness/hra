@@ -3,7 +3,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { createMemoryTokenStorage, memoryTokenStorage } from "./memory-token-storage";
 
 /*
- * HRA v2 F5: no authentication token reaches `localStorage`.
+ * Oompa v2 F5: no authentication token reaches `localStorage`.
  *
  * Convex Auth writes exactly three keys through the `TokenStorage` object it is
  * handed: the JWT, the refresh token, and the OAuth verifier. This drives the

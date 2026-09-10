@@ -90,7 +90,7 @@ function corruption(variant: Variant) {
 }
 
 async function fixture(run: (database: Database, paths: ReturnType<typeof resolveStatePaths>) => void | Promise<void>) {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-historical-runtime-migration-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-historical-runtime-migration-")));
   let database: Database | undefined;
   try {
     const bytes = canonical39DevinDatabaseBytes();

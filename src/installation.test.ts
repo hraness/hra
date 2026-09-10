@@ -44,7 +44,7 @@ async function acceptanceDescriptor(
   };
 }
 
-describe("HRA installation composition", () => {
+describe("Oompa installation composition", () => {
   test("captures both cloud aliases without selecting authority or changing the production namespace", () => {
     const previousForward = process.env.OOMPA_CONVEX_URL;
     const previousLegacy = process.env.HRA_CONVEX_URL;

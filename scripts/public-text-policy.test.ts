@@ -26,7 +26,7 @@ function fixtureGit(root: string, args: readonly string[]): void {
 }
 
 async function withPublicCheckout(check: (root: string) => Promise<void>): Promise<void> {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-public-checkout-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-public-checkout-")));
   try {
     fixtureGit(root, ["init", "--quiet", "--template=", "--initial-branch=fixture"]);
     await writeFile(join(root, ".gitignore"), "tmp/\n");
@@ -51,8 +51,8 @@ describe("public text policy", () => {
       ["xoxb", "12345678901234567890"].join("-"),
       ["AI", "za"].join("") + "A".repeat(30),
       ["CONVEX", "DEPLOY", "KEY"].join("_") + "=" + "x".repeat(24),
-      ["HRA", "AUTH", "HMAC", "SECRET"].join("_") + "=" + "x".repeat(24),
-      ["HRA", "RESEND", "API", "KEY"].join("_") + "=" + "x".repeat(24),
+      ["Oompa", "AUTH", "HMAC", "SECRET"].join("_") + "=" + "x".repeat(24),
+      ["Oompa", "RESEND", "API", "KEY"].join("_") + "=" + "x".repeat(24),
       `@${["private", "scope"].join("-")}/example`,
       ["", "Users", "example", "Documents", "source.ts"].join("/"),
       ["", "home", "example", "source.ts"].join("/"),
@@ -92,7 +92,7 @@ describe("public text policy", () => {
   test("allows only the reviewed public Hraness packages", () => {
     expect(() => assertPublicText("@hraness/atet", "public dependency"))
       .not.toThrow();
-    expect(() => assertPublicText("@hraness/hra", "public dependency"))
+    expect(() => assertPublicText("@hraness/oompa", "public dependency"))
       .not.toThrow();
     expect(() => assertPublicText("@hraness/design-kit", "public dependency"))
       .not.toThrow();
@@ -138,7 +138,7 @@ describe("public text policy", () => {
     for (const value of [name, `${name}@0.8.0`, `package ${name} is not yet admitted`]) {
       expect(() => assertPublicText(value, "Oompa public identity")).not.toThrow();
     }
-    expect(() => assertPublicText("@hraness/hra", "immutable predecessor identity")).not.toThrow();
+    expect(() => assertPublicText("@hraness/oompa", "immutable predecessor identity")).not.toThrow();
     fc.assert(fc.property(fc.constantFrom("-", ".", "_", ""),
       fc.stringMatching(/^[a-z][a-z0-9]{0,12}$/u), (separator, suffix) => {
         expect(() => assertPublicText(`${name}${separator}${suffix}`, "unreviewed Oompa sibling"))
@@ -196,7 +196,7 @@ describe("public text policy", () => {
     for (const specifier of [name, `${name}@6.4.0`, `${name}/reviewed-subpath`]) {
       expect(() => assertPublicText(specifier, "public routing compiler")).not.toThrow();
     }
-    for (const path of ["package.json", "kb/plans/hra-v1.md", "scripts/vercel-site-routing.test.ts"]) {
+    for (const path of ["package.json", "kb/plans/oompa-v1.md", "scripts/vercel-site-routing.test.ts"]) {
       const source = await readFile(join(import.meta.dir, "..", path), "utf8");
       expect(source).toContain(name);
       expect(() => assertPublicText(source, path)).not.toThrow();
@@ -284,7 +284,7 @@ describe("public text policy", () => {
   });
 
   test("checkout admission rejects nonrepositories and subdirectories of a Git root", async () => {
-    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-public-no-git-")));
+    const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-public-no-git-")));
     try {
       await expect(assertPublicCheckout(root)).rejects.toThrow("Git evidence");
     } finally {
@@ -298,7 +298,7 @@ describe("public text policy", () => {
 
   test("distinguishes annotated Git tag references from package scopes", () => {
     expect(() => assertPublicText(
-      "https://github.com/hraness/hra@refs/tags/v0.1.1",
+      "https://github.com/hraness/oompa@refs/tags/v0.1.1",
       "Git tag reference",
     )).not.toThrow();
     expect(() => assertPublicText(["@refs", "tags"].join("/"), "unreviewed package"))
@@ -312,7 +312,7 @@ describe("public text policy", () => {
     expect(() => assertPublicText(subject, "certificate subject")).not.toThrow();
     expect(() => assertPublicText(`Subject: \`${subject}\`.`, "quoted certificate subject")).not.toThrow();
     for (const value of [
-      ["@307125679", "hra"].join("/"),
+      ["@307125679", "oompa"].join("/"),
       subject.replace("npm-release", "unreviewed"),
       subject.replace("1343008607", "1343008608"),
       `private-${subject}`,
@@ -333,7 +333,7 @@ describe("public text policy", () => {
 
   test("admits only the exact reviewed Fulcio repository subject", () => {
     const subject = "repo:hraness@307125679/hra@1343008607:environment:npm-release";
-    const numericPackageShape = ["@307125679", "hra"].join("/");
+    const numericPackageShape = ["@307125679", "oompa"].join("/");
     expect(() => assertPublicText(`OID .24 contains ${subject}.`, "provenance record"))
       .not.toThrow();
     for (const value of [
@@ -351,7 +351,7 @@ describe("public text policy", () => {
   });
 
   test("scans SVG and TOML text and rejects unreviewed file types", async () => {
-    const root = await mkdtemp(join(tmpdir(), "hra-public-policy-"));
+    const root = await mkdtemp(join(tmpdir(), "oompa-public-policy-"));
     const svg = join(root, "image.svg");
     const token = ["github", "pat"].join("_") + "_" + "abcdefghijklmnopqrstuvwxyz123456";
     try {
@@ -378,7 +378,7 @@ describe("public text policy", () => {
   });
 
   test("scans the exact GitHub CODEOWNERS control as public text", async () => {
-    const root = await mkdtemp(join(tmpdir(), "hra-public-policy-codeowners-"));
+    const root = await mkdtemp(join(tmpdir(), "oompa-public-policy-codeowners-"));
     try {
       await mkdir(join(root, ".github"));
       await writeFile(join(root, ".github", "CODEOWNERS"), "* @hraness\n", "utf8");
@@ -391,7 +391,7 @@ describe("public text policy", () => {
   });
 
   test("scans the reviewed released-state SQL fixture without admitting arbitrary SQL files", async () => {
-    const root = await mkdtemp(join(tmpdir(), "hra-public-policy-sql-"));
+    const root = await mkdtemp(join(tmpdir(), "oompa-public-policy-sql-"));
     const fixture = join(root, "scripts/fixtures/released-state/v0.5.0/control-plane.sql");
     try {
       await mkdir(dirname(fixture), { recursive: true });
@@ -419,7 +419,7 @@ describe("public text policy", () => {
   });
 
   test("admits only bounded, structurally valid editorial WebP files", async () => {
-    const root = await mkdtemp(join(tmpdir(), "hra-public-policy-webp-"));
+    const root = await mkdtemp(join(tmpdir(), "oompa-public-policy-webp-"));
     const editorialDirectory = join(root, "site", "images", "editorial");
     try {
       await mkdir(editorialDirectory, { recursive: true });
@@ -456,7 +456,7 @@ describe("public text policy", () => {
       .not.toThrow();
     expect(() => assertPublicText(`history ${emDash} patch`, "commit patch")).not.toThrow();
 
-    const root = await mkdtemp(join(tmpdir(), "hra-public-policy-em-dash-"));
+    const root = await mkdtemp(join(tmpdir(), "oompa-public-policy-em-dash-"));
     try {
       await mkdir(join(root, "kb"));
       await writeFile(join(root, "kb", "note.md"), `internal ${emDash} note\n`, "utf8");
@@ -481,7 +481,7 @@ describe("public text policy", () => {
   });
 
   test("ignores the regular .git pointer used by linked worktrees", async () => {
-    const root = await mkdtemp(join(tmpdir(), "hra-public-policy-worktree-"));
+    const root = await mkdtemp(join(tmpdir(), "oompa-public-policy-worktree-"));
     try {
       await writeFile(join(root, ".git"), "gitdir: /private/tmp/repository/.git/worktrees/review\n", "utf8");
       await writeFile(join(root, "README.md"), "# Public package\n", "utf8");
@@ -492,7 +492,7 @@ describe("public text policy", () => {
   });
 
   test("permits only the two verified authority-supervisor binary names", async () => {
-    const root = await mkdtemp(join(tmpdir(), "hra-public-policy-authority-artifacts-"));
+    const root = await mkdtemp(join(tmpdir(), "oompa-public-policy-authority-artifacts-"));
     const repositoryRoot = join(import.meta.dir, "..");
     const sourceRelativePath = join("scripts", "authority-supervisor.zig");
     const binaryDirectory = join("scripts", "authority-supervisor-bin");

@@ -227,7 +227,7 @@ describe("Claude child process identity", () => {
   test("exposes the spawned child identity and reaps an unprovable child", async () => {
     const child = spawnBunClaudeProcess({
       argv: [process.execPath, "-e", "setInterval(() => undefined, 1000)"],
-      configDir: "/tmp/hra-claude-process-identity-test",
+      configDir: "/tmp/oompa-claude-process-identity-test",
       inspectIdentity: async (pid) => Object.freeze({
         pid,
         pidDomain: "darwin",
@@ -245,7 +245,7 @@ describe("Claude child process identity", () => {
 
     const unprovable = spawnBunClaudeProcess({
       argv: [process.execPath, "-e", "setInterval(() => undefined, 1000)"],
-      configDir: "/tmp/hra-claude-process-identity-test",
+      configDir: "/tmp/oompa-claude-process-identity-test",
       inspectIdentity: async () => { throw new Error("inspection unavailable"); },
     });
     await expect(unprovable.identity).rejects.toThrow("identity could not be proven");

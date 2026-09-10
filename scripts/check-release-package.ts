@@ -11,7 +11,7 @@ const manifest = JSON.parse(
 ) as unknown;
 const inspection = assertReleasePackageReady(manifest);
 await assertPackageContentAt(repositoryRoot);
-console.log(`HRA release package is registry-ready: ${inspection.name}@${inspection.version}.`);
+console.log(`Oompa release package is registry-ready: ${inspection.name}@${inspection.version}.`);
 
 // Under a tag ref the public install command must name exactly the runtime
 // bytes being released; outside a tag ref the working-tree pins are covered

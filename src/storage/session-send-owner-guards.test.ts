@@ -20,7 +20,7 @@ afterEach(() => {
 });
 
 async function fixture(stage: "unclaimed" | "claimed" | "settled" = "unclaimed") {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-send-owner-guards-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-send-owner-guards-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const store = new StateStore(paths, { now: () => 10_000, resolveMachineTimeZone: () => "America/Puerto_Rico" });

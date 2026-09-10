@@ -2,9 +2,9 @@ import { describe, expect, test } from "bun:test";
 import * as fc from "fast-check";
 import { createHmac } from "node:crypto";
 
-import { hraAttentionResendApiKeyEnvironmentName } from "../convex/resendApiKey";
+import { oompaAttentionResendApiKeyEnvironmentName } from "../convex/resendApiKey";
 import { createAttentionKeyInstallTransport } from "./attention-key-install-transport";
-import { HRA_CONVEX_PROJECT_ID, HRA_CONVEX_TEAM_ID, type ConvexTarget } from "./convex-target";
+import { OOMPA_CONVEX_PROJECT_ID, OOMPA_CONVEX_TEAM_ID, type ConvexTarget } from "./convex-target";
 import {
   attentionEnvironmentFingerprint,
   attentionKeyInstallCustodySchema,
@@ -27,8 +27,8 @@ const targetArbitrary = fc.integer({ min: 7_000_000, max: 8_000_000 }).map((depl
   deploymentId,
   deploymentName: `synthetic-target-${deploymentId}`,
   deploymentUrl: `https://synthetic-target-${deploymentId}.convex.cloud`,
-  projectId: HRA_CONVEX_PROJECT_ID,
-  teamId: HRA_CONVEX_TEAM_ID,
+  projectId: OOMPA_CONVEX_PROJECT_ID,
+  teamId: OOMPA_CONVEX_TEAM_ID,
 }));
 const keyArbitrary = token.map((suffix) => `re_synthetic_${suffix}`);
 const whitespace = fc.array(fc.constantFrom(" ", "\t", "\r", "\n"), { maxLength: 8 })
@@ -177,12 +177,12 @@ describe("attention key installation synthetic property contracts", () => {
       const fingerprint = attentionEnvironmentFingerprint(entries, target, key);
       const ordered = [...entries].sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
       // Independently serialize the documented, lexically ordered field set.
-      const expected = createHmac("sha256", key).update("hra-attention-environment-fingerprint-v1\0", "utf8")
+      const expected = createHmac("sha256", key).update("oompa-attention-environment-fingerprint-v1\0", "utf8")
         .update(JSON.stringify({ entries: ordered.map(({ name, value }) => ({ name, value })), target }), "utf8").digest("hex");
       expect(fingerprint).toBe(expected);
       expect(attentionEnvironmentFingerprint(permutation, target, key)).toBe(fingerprint);
       expect(attentionEnvironmentFingerprint([...permutation, {
-        name: hraAttentionResendApiKeyEnvironmentName, value: `${key}_different`,
+        name: oompaAttentionResendApiKeyEnvironmentName, value: `${key}_different`,
       }], target, key)).toBe(fingerprint);
       expect(attentionEnvironmentFingerprint(entries.map((entry, index) => index === 0
         ? { ...entry, name: `${entry.name}_CHANGED` } : entry), target, key)).not.toBe(fingerprint);

@@ -10,10 +10,10 @@ import { runBrowserBootstrap } from "./app-browser-runner.ts";
 // program. These fixture-only variables are never read by production entries.
 assertBrowserNode(process.versions);
 assert.equal(process.argv.length, 2);
-const scenario = process.env.HRA_BROWSER_CUSTODY_CASE;
+const scenario = process.env.OOMPA_BROWSER_CUSTODY_CASE;
 assert.ok(scenario === "preparation-cancellation" || scenario === "connected-cancellation" || scenario === "partial-setup-failure");
 const root = await realpath(fileURLToPath(new URL("..", import.meta.url)));
-const evidencePath = process.env.HRA_BROWSER_CUSTODY_EVIDENCE;
+const evidencePath = process.env.OOMPA_BROWSER_CUSTODY_EVIDENCE;
 assert.ok(evidencePath !== undefined);
 const evidence = await realpath(evidencePath);
 assert.equal(evidence, evidencePath);
@@ -88,7 +88,7 @@ catch (error) {
 } finally {
   clearTimeout(expiry);
   publishBrowserTerminalJson(join(evidence, "fixture-terminal.json"), {
-    schemaVersion: 1, kind: "hra-browser-custody-fixture", scenario, node, pid: process.pid,
+    schemaVersion: 1, kind: "oompa-browser-custody-fixture", scenario, node, pid: process.pid,
     run: run ?? null, triggered, expired, expiryFailure, rejected, failureName: failureName ?? null,
     observations: observations.map(({ kind }) => kind),
   });

@@ -26,7 +26,7 @@ const collisionErrors = {
 } as const;
 
 async function fixture(kind: InputKind) {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-policy-input-key-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-policy-input-key-")));
   roots.push(root);
   const paths = resolveStatePaths({ rootDirectory: root });
   await initializeStatePaths(paths);

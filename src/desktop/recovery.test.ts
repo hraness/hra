@@ -10,7 +10,7 @@ import {
   type DesktopRecoveryStorePort,
 } from "./recovery.ts";
 
-const stateRoot = join(tmpdir(), "hra-recovery-test");
+const stateRoot = join(tmpdir(), "oompa-recovery-test");
 const targetProfileId = "acct_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const idempotencyKey = "11111111-1111-4111-8111-111111111111";
 const executablePath = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT";
@@ -231,7 +231,7 @@ describe("DesktopSwitchRecoveryController", () => {
     expect(await multiple.controller.recover(new AbortController().signal)).toMatchObject({
       status: "recovery_required",
       diagnostic: "MULTIPLE_EXACT_PROCESSES",
-      action: "hra account switch-recover",
+      action: "oompa account switch-recover",
     });
 
     const changing = fixture({

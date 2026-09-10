@@ -38,8 +38,8 @@ import {
   rethrowAuthorityContainmentUnavailable,
 } from "./authority-containment";
 import {
-  HRA_CONVEX_PROJECT_ID,
-  HRA_CONVEX_TEAM_ID,
+  OOMPA_CONVEX_PROJECT_ID,
+  OOMPA_CONVEX_TEAM_ID,
   parseConvexTarget,
   verifyConvexDefaultTarget,
   type ConvexTarget,
@@ -48,17 +48,17 @@ import {
 import {
   canonicalDigest,
   ensureProtectedDirectory,
-  HRA_RELEASE_VERSION,
-  HRA_REPOSITORY,
-  HRA_REPOSITORY_ID,
-  HRA_VERCEL_PROJECT_ID,
-  HRA_VERCEL_TEAM_ID,
+  OOMPA_RELEASE_VERSION,
+  OOMPA_REPOSITORY,
+  OOMPA_REPOSITORY_ID,
+  OOMPA_VERCEL_PROJECT_ID,
+  OOMPA_VERCEL_TEAM_ID,
   readProtectedJson,
   withSelfDigest,
   writeProtectedJsonNoReplace,
 } from "./release-evidence";
 
-const canonicalAlias = "hra.sh";
+const canonicalAlias = "oompa.app";
 const supportedBunVersion = "1.3.14";
 const supportedVercelVersion = "58.4.0";
 export const currentAliasReleaseReviewedLegacyOperatorProvenance = Object.freeze({
@@ -118,24 +118,24 @@ export const currentProjectAliasReleasePlanSchema = z.object({
       .max(160)
       .regex(/^[a-z][a-z0-9]*-[a-z][a-z0-9]*-[0-9]+$/u),
     deploymentUrl: z.string().url(),
-    projectId: z.literal(HRA_CONVEX_PROJECT_ID),
-    teamId: z.literal(HRA_CONVEX_TEAM_ID),
+    projectId: z.literal(OOMPA_CONVEX_PROJECT_ID),
+    teamId: z.literal(OOMPA_CONVEX_TEAM_ID),
   }).strict(),
   idempotencyKey: idempotencyKeySchema,
   kind: z.literal("current-project-canonical-alias"),
   repository: z.object({
-    id: z.literal(HRA_REPOSITORY_ID),
-    name: z.literal(HRA_REPOSITORY),
+    id: z.literal(OOMPA_REPOSITORY_ID),
+    name: z.literal(OOMPA_REPOSITORY),
   }).strict(),
   schemaVersion: z.literal(1),
   vercel: z.object({
-    projectId: z.literal(HRA_VERCEL_PROJECT_ID),
+    projectId: z.literal(OOMPA_VERCEL_PROJECT_ID),
     source: endpointSchema,
     sourceProvenance: currentCliSourceProvenanceSchema.optional(),
     target: endpointSchema,
-    teamId: z.literal(HRA_VERCEL_TEAM_ID),
+    teamId: z.literal(OOMPA_VERCEL_TEAM_ID),
   }).strict(),
-  version: z.literal(HRA_RELEASE_VERSION),
+  version: z.literal(OOMPA_RELEASE_VERSION),
 }).strict().superRefine((plan, context) => {
   try {
     parseConvexTarget(plan.convex);
@@ -161,7 +161,7 @@ const aliasReadbackSchema = z.object({
     url: deploymentUrlSchema,
   }),
   deploymentId: deploymentIdSchema,
-  projectId: z.literal(HRA_VERCEL_PROJECT_ID),
+  projectId: z.literal(OOMPA_VERCEL_PROJECT_ID),
 });
 
 const aliasMutationReadbackSchema = z.object({
@@ -213,7 +213,7 @@ const aliasActivityEventsSchema = z.object({
 
 const deploymentReadbackBaseSchema = z.object({
   id: deploymentIdSchema,
-  projectId: z.literal(HRA_VERCEL_PROJECT_ID),
+  projectId: z.literal(OOMPA_VERCEL_PROJECT_ID),
   readyState: z.literal("READY"),
   target: z.literal("production"),
   url: deploymentUrlSchema,
@@ -222,7 +222,7 @@ const deploymentReadbackBaseSchema = z.object({
 const githubDeploymentReadbackSchema = deploymentReadbackBaseSchema.extend({
   gitSource: z.object({
     ref: z.literal("main"),
-    repoId: z.literal(HRA_REPOSITORY_ID),
+    repoId: z.literal(OOMPA_REPOSITORY_ID),
     sha: commitSchema,
     type: z.literal("github"),
   }),
@@ -249,9 +249,9 @@ const deploymentReadbackSchema = z.union([
 ]);
 
 const projectReadbackSchema = z.object({
-  accountId: z.literal(HRA_VERCEL_TEAM_ID),
+  accountId: z.literal(OOMPA_VERCEL_TEAM_ID),
   autoAssignCustomDomains: z.literal(false),
-  id: z.literal(HRA_VERCEL_PROJECT_ID),
+  id: z.literal(OOMPA_VERCEL_PROJECT_ID),
 });
 
 const hasControlCharacter = (value: string): boolean => {
@@ -275,22 +275,22 @@ const vercelAuthSchema = z.object({
 
 const markerSchema = z.object({
   generation: z.literal(1),
-  product: z.literal("HRA"),
+  product: z.literal("Oompa"),
   repository: z.object({
-    id: z.literal(HRA_REPOSITORY_ID),
-    path: z.literal(HRA_REPOSITORY),
+    id: z.literal(OOMPA_REPOSITORY_ID),
+    path: z.literal(OOMPA_REPOSITORY),
   }).strict(),
   schemaVersion: z.literal(2),
   source: z.object({ commit: commitSchema }).strict(),
-  version: z.literal(HRA_RELEASE_VERSION),
+  version: z.literal(OOMPA_RELEASE_VERSION),
 }).strict();
 
 const recoveryTargetMarkerSchema = z.object({
   generation: z.literal(1),
-  product: z.literal("HRA"),
+  product: z.literal("Oompa"),
   repository: z.object({
-    id: z.literal(HRA_REPOSITORY_ID),
-    path: z.literal(HRA_REPOSITORY),
+    id: z.literal(OOMPA_REPOSITORY_ID),
+    path: z.literal(OOMPA_REPOSITORY),
   }).strict(),
   schemaVersion: z.literal(2),
   source: z.object({ commit: commitSchema }).strict(),
@@ -319,23 +319,23 @@ const normalizedAliasAuthoritySchema = z.object({
     deploymentId: z.number().int().positive().safe(),
     deploymentName: z.string(),
     deploymentUrl: z.string().url(),
-    projectId: z.literal(HRA_CONVEX_PROJECT_ID),
-    teamId: z.literal(HRA_CONVEX_TEAM_ID),
+    projectId: z.literal(OOMPA_CONVEX_PROJECT_ID),
+    teamId: z.literal(OOMPA_CONVEX_TEAM_ID),
   }).strict(),
   marker: z.object({ generation: z.literal(1), sourceCommit: commitSchema }).strict(),
   project: z.object({
-    accountId: z.literal(HRA_VERCEL_TEAM_ID),
+    accountId: z.literal(OOMPA_VERCEL_TEAM_ID),
     autoAssignCustomDomains: z.literal(false),
-    id: z.literal(HRA_VERCEL_PROJECT_ID),
+    id: z.literal(OOMPA_VERCEL_PROJECT_ID),
   }).strict(),
   repository: z.object({
-    id: z.literal(HRA_REPOSITORY_ID),
-    name: z.literal(HRA_REPOSITORY),
+    id: z.literal(OOMPA_REPOSITORY_ID),
+    name: z.literal(OOMPA_REPOSITORY),
   }).strict(),
   source: endpointSchema,
   sourceProvenance: currentCliSourceProvenanceSchema.optional(),
   target: endpointSchema,
-  version: z.literal(HRA_RELEASE_VERSION),
+  version: z.literal(OOMPA_RELEASE_VERSION),
 }).strict();
 
 export const currentAliasReleaseIntentSchema = z.object({
@@ -455,7 +455,7 @@ export const currentAliasReleaseProviderActivityEvidenceSchema = z.object({
     || value.activity.createdAtMs < value.alias.updatedAtMs
     || value.activity.createdAtMs - value.alias.updatedAtMs > 1_000
     || value.activity.createdAtMs - value.intentPublishedAtMs > 5_000
-    || value.observedTargetMarkerVersion === HRA_RELEASE_VERSION
+    || value.observedTargetMarkerVersion === OOMPA_RELEASE_VERSION
   ) context.addIssue({ code: "custom", message: "provider_activity_timeline_invalid" });
 });
 
@@ -893,7 +893,7 @@ export const currentAliasReleaseApiArguments = (
     "--header",
     `Idempotency-Key:${idempotencyKey}`,
     "--scope",
-    HRA_VERCEL_TEAM_ID,
+    OOMPA_VERCEL_TEAM_ID,
     "--raw",
   ];
 };
@@ -921,7 +921,7 @@ export const currentAliasReleaseVercelApiRequest = (
     `/v2/deployments/${parsedEndpoint.data.deploymentId}/aliases`,
     vercelApiOrigin,
   );
-  url.searchParams.set("teamId", HRA_VERCEL_TEAM_ID);
+  url.searchParams.set("teamId", OOMPA_VERCEL_TEAM_ID);
   return {
     body: JSON.stringify({ alias: canonicalAlias }),
     headers: {
@@ -1750,7 +1750,7 @@ const proveRecoveryTargetSample = async (
       || marker.data.source.commit !== plan.vercel.target.sourceCommit
       || expectedMarkerVersion !== undefined
         && marker.data.version !== expectedMarkerVersion
-      || marker.data.version === HRA_RELEASE_VERSION
+      || marker.data.version === OOMPA_RELEASE_VERSION
     ) throw new CurrentAliasReleaseError("recovery_not_permitted");
     return marker.data.version;
   } catch (error: unknown) {
@@ -2165,9 +2165,9 @@ implements CurrentProjectAliasReleaseProvider {
   async readProject(): Promise<CurrentProjectReadback> {
     return parseProviderJson(await this.#invoke([
       "api",
-      `/v9/projects/${HRA_VERCEL_PROJECT_ID}`,
+      `/v9/projects/${OOMPA_VERCEL_PROJECT_ID}`,
       "--scope",
-      HRA_VERCEL_TEAM_ID,
+      OOMPA_VERCEL_TEAM_ID,
       "--raw",
     ], "vercel-project-read"), projectReadbackSchema);
   }
@@ -2180,7 +2180,7 @@ implements CurrentProjectAliasReleaseProvider {
       "api",
       `/v13/deployments/${deploymentId}`,
       "--scope",
-      HRA_VERCEL_TEAM_ID,
+      OOMPA_VERCEL_TEAM_ID,
       "--raw",
     ], "vercel-deployment-read"), deploymentReadbackSchema);
   }
@@ -2190,7 +2190,7 @@ implements CurrentProjectAliasReleaseProvider {
       "api",
       `/v4/aliases/${canonicalAlias}`,
       "--scope",
-      HRA_VERCEL_TEAM_ID,
+      OOMPA_VERCEL_TEAM_ID,
       "--raw",
     ], "vercel-alias-read"), aliasReadbackSchema);
   }
@@ -2199,7 +2199,7 @@ implements CurrentProjectAliasReleaseProvider {
     try {
       this.#guard.assertMayProceed();
       const response = await this.#fetcher(
-        `https://${canonicalAlias}/.well-known/hra.json?release=${randomUUID()}`,
+        `https://${canonicalAlias}/.well-known/oompa.json?release=${randomUUID()}`,
         {
           cache: "no-store",
           headers: { accept: "application/json", "cache-control": "no-cache" },
@@ -2265,7 +2265,7 @@ implements CurrentProjectAliasReleaseProvider {
     if (url.origin !== vercelApiOrigin || !url.pathname.startsWith("/v")) {
       throw new CurrentAliasReleaseError("provider_readback_invalid");
     }
-    url.searchParams.set("teamId", HRA_VERCEL_TEAM_ID);
+    url.searchParams.set("teamId", OOMPA_VERCEL_TEAM_ID);
     return url;
   }
 
@@ -2311,7 +2311,7 @@ implements CurrentProjectAliasReleaseProvider {
 
   async readProject(): Promise<CurrentProjectReadback> {
     return await this.#read(
-      `/v9/projects/${HRA_VERCEL_PROJECT_ID}`,
+      `/v9/projects/${OOMPA_VERCEL_PROJECT_ID}`,
       projectReadbackSchema,
     );
   }
@@ -2330,7 +2330,7 @@ implements CurrentProjectAliasReleaseProvider {
   async readMarker(): Promise<unknown> {
     try {
       const response = await this.#fetcher(
-        `https://${canonicalAlias}/.well-known/hra.json?release=${randomUUID()}`,
+        `https://${canonicalAlias}/.well-known/oompa.json?release=${randomUUID()}`,
         {
           cache: "no-store",
           headers: { accept: "application/json", "cache-control": "no-cache" },

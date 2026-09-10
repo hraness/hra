@@ -11,9 +11,9 @@ import {
 } from "./paths";
 import { GenerationalSecretCustody } from "./secret-custody";
 
-describe("HRA v1 local namespace", () => {
-  test("initializes beside HRA v0 custody without reading or changing it", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-namespace-")));
+describe("Oompa v1 local namespace", () => {
+  test("initializes beside Oompa v0 custody without reading or changing it", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-namespace-")));
     const applicationSupport = join(home, "Library", "Application Support");
     const legacyState = join(applicationSupport, "OPRTE");
     const legacyWindowState = join(applicationSupport, "kitchen.hraness");
@@ -37,12 +37,12 @@ describe("HRA v1 local namespace", () => {
   });
 
   test("uses a versioned collision-proof Linux root", () => {
-    const paths = resolveStatePaths({ homeDirectory: "/workspace/hra-user", platform: "linux" });
-    expect(paths.root).toBe("/workspace/hra-user/.local/state/hra-control-plane-v1");
+    const paths = resolveStatePaths({ homeDirectory: "/workspace/oompa-user", platform: "linux" });
+    expect(paths.root).toBe("/workspace/oompa-user/.local/state/hra-control-plane-v1");
   });
 
   test("does not create retired provider directories or alter existing provider-owned files", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-devin-profile-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-devin-profile-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const profileId = `acct_${"a".repeat(32)}`;

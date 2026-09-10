@@ -1071,7 +1071,7 @@ export type SessionRecord = {
   updatedAt: number;
 };
 
-/** Private local policy assigning one personal provider home to one HRA account. */
+/** Private local policy assigning one personal provider home to one Oompa account. */
 export type SessionAdoptionPolicyRecord = Readonly<{
   provider: AdoptableProvider;
   enabled: boolean;
@@ -2834,7 +2834,7 @@ const parseCanonicalMemoryHostedCreateWinner = (
 const canonicalMemoryHostedCreateRequestDigest = (
   request: CanonicalMemoryHostedCreateRequest,
 ): string => digestJson({
-  contract: "hra.canonical-memory.hosted-create-request.v1",
+  contract: "oompa.canonical-memory.hosted-create-request.v1",
   request,
 });
 
@@ -2843,7 +2843,7 @@ const canonicalMemoryHostedCreateWinnerDigest = (
   revision: number,
   replay: boolean,
 ): string => digestJson({
-  contract: "hra.canonical-memory.hosted-create-winner.v1",
+  contract: "oompa.canonical-memory.hosted-create-winner.v1",
   replay,
   request,
   revision,
@@ -2852,7 +2852,7 @@ const canonicalMemoryHostedCreateWinnerDigest = (
 const canonicalMemoryHostedHeadProofDigest = (
   envelope: CanonicalMemoryEncryptedEnvelope,
 ): string => digestJson({
-  contract: "hra.canonical-memory.encrypted-head-proof.v1",
+  contract: "oompa.canonical-memory.encrypted-head-proof.v1",
   envelope,
 });
 
@@ -3025,7 +3025,7 @@ const parseCanonicalMemorySyncSpoolOperation = (
   return {
     ...normalized,
     operationDigest: digestJson({
-      contract: "hra.canonical-memory.operation-envelope.v1",
+      contract: "oompa.canonical-memory.operation-envelope.v1",
       operation: normalized,
     }),
   };
@@ -3099,7 +3099,7 @@ const canonicalMemorySyncRequestDigest = (input: Readonly<{
   requestOperation?: CanonicalMemorySyncSpoolOperation;
 }>): string => input.direction === "push" && input.requestOperation !== undefined
   ? digestJson({
-      contract: "hra.canonical-memory.push-request.v1",
+      contract: "oompa.canonical-memory.push-request.v1",
       expectedKeyVersion: input.remote.keyVersion,
       expectedRevision: input.remote.revision,
       operations: [canonicalMemoryWireOperation(input.requestOperation)],
@@ -3108,7 +3108,7 @@ const canonicalMemorySyncRequestDigest = (input: Readonly<{
   : digestJson({
       afterHeadToken: input.localHeadToken,
       afterSequence: input.localHead.sequence,
-      contract: "hra.canonical-memory.pull-request.v1",
+      contract: "oompa.canonical-memory.pull-request.v1",
       expectedGenesisToken: input.remote.genesisToken,
       expectedKeyVersion: input.remote.keyVersion,
       limit: 1,
@@ -3122,7 +3122,7 @@ const canonicalMemorySyncResponseDigest = (input: Readonly<{
   operation?: CanonicalMemorySyncSpoolOperation;
   remote: CanonicalMemoryHostedRemoteObservation;
 }>): string => digestJson({
-  contract: "hra.canonical-memory.response-observation.v1",
+  contract: "oompa.canonical-memory.response-observation.v1",
   direction: input.direction,
   operation: input.operation === undefined
     ? null
@@ -3249,7 +3249,7 @@ const mapCanonicalMemorySyncSpoolOperation = (
   const wireOperation = canonicalMemoryWireOperation(operation);
   const { operationDigest } = operation;
   if (operationDigest !== digestJson({
-    contract: "hra.canonical-memory.operation-envelope.v1",
+    contract: "oompa.canonical-memory.operation-envelope.v1",
     operation: wireOperation,
   })) throw new Error("CANONICAL_MEMORY_SYNC_SPOOL_INVALID");
   return operation;
@@ -4179,7 +4179,7 @@ const parseSessionSwitchCas = (input: SessionSwitchCas): SessionSwitchCas =>
   });
 const malformedSessionSwitchDiagnosticAttemptId = (switchRowId: number): AttemptId =>
   attemptIdSchema.parse(`attempt_${createHash("sha256")
-    .update("hra:malformed-session-switch-row:v1\0", "utf8")
+    .update("oompa:malformed-session-switch-row:v1\0", "utf8")
     .update(String(switchRowId), "utf8")
     .digest("hex")
     .slice(0, 32)}`);
@@ -6798,7 +6798,7 @@ const schemaVersion30DefaultApprovalModeColumn =
 const schemaVersion30ResolvedByColumn =
   "ALTER TABLE provider_interactions ADD COLUMN resolved_by TEXT "
   + "CHECK(resolved_by IS NULL OR resolved_by = 'autorespond')";
-/** Per-session evidence rows kept for `hra autorespond status`; oldest rows past this cap are pruned on insert. */
+/** Per-session evidence rows kept for `oompa autorespond status`; oldest rows past this cap are pruned on insert. */
 export const AUTORESPOND_EVIDENCE_PER_SESSION_CAP = 500;
 
 // Prose autorespond (W2). The evidence table gains a path discriminator, the
@@ -6806,7 +6806,7 @@ export const AUTORESPOND_EVIDENCE_PER_SESSION_CAP = 500;
 // optional because a prose approval has no provider interaction. SQLite cannot
 // relax a CHECK in place, so v31 rebuilds the table and copies the v30 rows
 // forward as `protocol` evidence. The message-source table records which
-// dispatched turns HRA authored, so the compact projection can mark their
+// dispatched turns Oompa authored, so the compact projection can mark their
 // `user_message` events with `actor: "autorespond"`.
 const schemaVersion31Statements = [`
 CREATE TABLE IF NOT EXISTS autorespond_evidence_next (
@@ -10251,7 +10251,7 @@ const devinCloseAuthority = (intent: z.infer<typeof devinCloseIntentSchema>) =>
     bindingGeneration: intent.binding_generation, processGeneration: intent.process_generation,
   });
 const devinCloseDigest = (kind: string, value: unknown): string =>
-  createHash("sha256").update(`hra:devin-joined-close:${kind}:v1\0`).update(JSON.stringify(value)).digest("hex");
+  createHash("sha256").update(`oompa:devin-joined-close:${kind}:v1\0`).update(JSON.stringify(value)).digest("hex");
 const devinCloseTables = [
   { name: "devin_joined_close_intents", sql: `CREATE TABLE IF NOT EXISTS devin_joined_close_intents(
     close_id TEXT PRIMARY KEY CHECK(length(close_id)=36),
@@ -12530,7 +12530,7 @@ const assertSchemaVersion39ProviderAuthority = (database: Database): void => {
  * tables instead of widening SessionRecord or any public projection.
  *
  * A provider policy is a single machine-local assignment: one personal home
- * can feed at most one HRA account for that provider. Candidates are bounded
+ * can feed at most one Oompa account for that provider. Candidates are bounded
  * observations, not execution authority. A binding is the sole-controller
  * routing decision and its provider/thread identity never changes.
  */
@@ -14341,12 +14341,12 @@ CREATE TABLE IF NOT EXISTS project_memory_authorities (
     (
       identity_contract=1
       AND length(canonical_space_id)=76
-      AND canonical_space_id GLOB 'hra:project:*'
+      AND canonical_space_id GLOB 'oompa:project:*'
       AND substr(canonical_space_id,13) NOT GLOB '*[^a-f0-9]*'
     ) OR (
       identity_contract=2
       AND length(canonical_space_id)=50
-      AND canonical_space_id GLOB 'hra:project:space-*'
+      AND canonical_space_id GLOB 'oompa:project:space-*'
       AND substr(canonical_space_id,19) NOT GLOB '*[^a-f0-9]*'
     )
   ),
@@ -15713,7 +15713,7 @@ CREATE TABLE IF NOT EXISTS project_memory_portable_adoption_proofs (
   project_id TEXT NOT NULL REFERENCES project_memory_authorities(project_id),
   canonical_space_id TEXT NOT NULL CHECK(
     length(canonical_space_id)=50
-    AND canonical_space_id GLOB 'hra:project:space-*'
+    AND canonical_space_id GLOB 'oompa:project:space-*'
     AND substr(canonical_space_id,19) NOT GLOB '*[^a-f0-9]*'
   ),
   canonical_binding_digest TEXT NOT NULL CHECK(length(canonical_binding_digest)=64 AND canonical_binding_digest NOT GLOB '*[^a-f0-9]*'),
@@ -21408,7 +21408,7 @@ const sessionSwitchTargetStartResultDigest = (input: Readonly<{
   providerUpdatedAt: number | null;
   runtimeProfile: ReviewedRuntimeProfile;
 }>): string => digestJson({
-  domain: "hra:session-switch-target-start-result:v1",
+  domain: "oompa:session-switch-target-start-result:v1",
   providerThreadId: input.providerThreadId,
   state: input.state,
   activeTurnId: input.activeTurnId,
@@ -21453,7 +21453,7 @@ const sessionSwitchReconciliationEvidenceDigest = (input: Readonly<{
   attemptId: AttemptId;
   reconciliation: SessionSwitchReconciliationEvidence;
 }>): string => digestJson({
-  domain: "hra:session-switch-reconciliation-evidence:v1",
+  domain: "oompa:session-switch-reconciliation-evidence:v1",
   attemptId: input.attemptId,
   reconciliation: input.reconciliation,
 });
@@ -21469,7 +21469,7 @@ const sessionSwitchAbandonEvidenceDigest = (input: Readonly<{
   session: SessionRecord;
   recordedAt: number;
 }>): string => digestJson({
-  domain: "hra:session-switch-abandon-evidence:v1",
+  domain: "oompa:session-switch-abandon-evidence:v1",
   attemptId: input.attemptId,
   planDigest: input.planDigest,
   reconciliation: input.reconciliation,
@@ -21534,7 +21534,7 @@ const sessionSwitchPlanDigest = (input: Readonly<{
   transcript: SessionSwitchTranscriptPin;
   createdAt: number;
 }>): string => digestJson({
-  domain: "hra:session-switch-prepared-plan:v1",
+  domain: "oompa:session-switch-prepared-plan:v1",
   attemptId: input.attemptId,
   requestKey: input.requestKey,
   requestDigest: input.requestDigest,
@@ -21565,7 +21565,7 @@ const sessionSwitchTargetNoEffectEvidenceDigest = (input: Readonly<{
   targetAuthority: ProviderAccountAuthority;
   diagnosticCode: string;
 }>): string => digestJson({
-  domain: "hra:session-switch-target-no-effect:v2",
+  domain: "oompa:session-switch-target-no-effect:v2",
   attemptId: input.attemptId,
   requestDigest: input.requestDigest,
   planDigest: input.planDigest,
@@ -21582,7 +21582,7 @@ const sessionSwitchTargetNoEffectAnchorDigest = (input: Readonly<{
   evidenceDigest: string;
   recordedAt: number;
 }>): string => digestJson({
-  domain: "hra:session-switch-target-no-effect-anchor:v1",
+  domain: "oompa:session-switch-target-no-effect-anchor:v1",
   attemptId: input.attemptId,
   requestDigest: input.requestDigest,
   planDigest: input.planDigest,
@@ -21602,7 +21602,7 @@ const sessionSwitchSourceReleaseEvidenceDigest = (input: Readonly<{
   status: "released" | "already_released";
   recordedAt: number;
 }>): string => digestJson({
-  domain: "hra:session-switch-source-release-evidence:v1",
+  domain: "oompa:session-switch-source-release-evidence:v1",
   attemptId: input.attemptId,
   requestDigest: input.requestDigest,
   planDigest: input.planDigest,
@@ -21644,7 +21644,7 @@ const sessionSwitchRebindEvidenceDigest = (input: Readonly<{
   transcript: SessionSwitchTranscriptPin;
   rebind: NonNullable<SessionSwitchRecord["rebind"]>;
 }>): string => digestJson({
-  domain: "hra:session-switch-rebind-evidence:v2",
+  domain: "oompa:session-switch-rebind-evidence:v2",
   attemptId: input.attemptId,
   planDigest: input.planDigest,
   sourceAuthority: input.sourceAuthority,
@@ -21676,7 +21676,7 @@ const sessionSwitchSeedEvidenceDigest = (input: Readonly<{
   messageEventSequence: number | null;
   messageEventDigest: string | null;
 }>): string => digestJson({
-  domain: "hra:session-switch-seed-evidence:v1",
+  domain: "oompa:session-switch-seed-evidence:v1",
   ...input,
 });
 
@@ -22549,7 +22549,7 @@ const mapSessionSwitch = (
         || reviewedRuntimeProfileProvider(runtimeProfile) !== seedAuthority.authority.provider
       ) throw new Error("SESSION_SWITCH_SEED_RUNTIME_PROFILE_AUTHORITY_MISMATCH");
       expectedReceiptDigest = digestJson({
-        domain: "hra:session-switch-seed-accepted:v1",
+        domain: "oompa:session-switch-seed-accepted:v1",
         turnId: row.seed_turn_id,
         turnStatus: row.seed_turn_status,
         runtimeProfile,
@@ -22568,7 +22568,7 @@ const mapSessionSwitch = (
         || publicSession.activeTurnId !== undefined
       ) throw new Error("SESSION_SWITCH_SEED_PUBLIC_RECEIPT_MISMATCH");
       expectedReceiptDigest = createHash("sha256")
-        .update("hra:session-switch-seed-rejected:v1\0", "utf8")
+        .update("oompa:session-switch-seed-rejected:v1\0", "utf8")
         .update(row.seed_failure_code, "utf8")
         .digest("hex");
     }
@@ -23204,7 +23204,7 @@ export class StateStore {
       assertSchemaVersion40AdoptionObjects(this.#database, { useExactProviderProcessCustody: true });
       assertExactSchemaVersion40AdoptionSurface(this.#database);
       assertJoinedStateSchema(this.#database);
-      // A readonly open skips the O(rows) foreign_key_check so `hra status`
+      // A readonly open skips the O(rows) foreign_key_check so `oompa status`
       // never pins a WAL snapshot long enough to block the writer's scrub.
       if (this.#readonly) assertReadonlyWorkSchema(this.#database);
       else assertWorkSchema(this.#database);
@@ -23298,7 +23298,7 @@ export class StateStore {
   }
 
   /**
-   * Proves that the current automation row descends from an HRA-native start
+   * Proves that the current automation row descends from an Oompa-native start
    * whose completed receipt and immutable evidence explicitly carried the
    * automation capability. Managed-home location alone is not capability
    * evidence: listing can import arbitrary provider-owned threads there. A
@@ -27623,19 +27623,19 @@ export class StateStore {
       if (
         settlement.outcome === "accepted"
         && createHash("sha256")
-          .update("hra:session-transcript-seed:v1\0", "utf8")
+          .update("oompa:session-transcript-seed:v1\0", "utf8")
           .update(settlement.seedText, "utf8")
           .digest("hex") !== record.transcript.seedDigest
       ) throw new SessionSwitchStoreError("SESSION_SWITCH_REQUEST_CONFLICT");
       const expectedReceiptDigest = settlement.outcome === "accepted"
         ? digestJson({
-            domain: "hra:session-switch-seed-accepted:v1",
+            domain: "oompa:session-switch-seed-accepted:v1",
             turnId: settlement.turnId,
             turnStatus: settlement.turnStatus,
             runtimeProfile: settlement.runtimeProfile,
           })
         : createHash("sha256")
-            .update("hra:session-switch-seed-rejected:v1\0", "utf8")
+            .update("oompa:session-switch-seed-rejected:v1\0", "utf8")
             .update(settlement.failureCode, "utf8")
             .digest("hex");
       if (settlement.receiptDigest !== expectedReceiptDigest) {
@@ -30095,7 +30095,7 @@ export class StateStore {
       this.#assertSessionRuntimeProfileContract(session.id, parsed.runtimeProfile);
 
       // A personal session resumed from provider-owned history has no proof
-      // that HRA's host-tool preamble or manifest reached that thread. Never
+      // that Oompa's host-tool preamble or manifest reached that thread. Never
       // mint or inherit a capability binding while adopting it.
       if (this.readSessionHostCapabilityBinding(session.id) !== null) {
         throw new Error("SESSION_ADOPTION_HOST_CAPABILITY_BINDING_CONFLICT");
@@ -31485,7 +31485,7 @@ export class StateStore {
 
   /**
    * Fences only the sessions whose exact provider home no longer names their
-   * immutable account key. The selected HRA profile remains signed in: a
+   * immutable account key. The selected Oompa profile remains signed in: a
    * personal Codex home or either Claude home is separate authority from the
    * managed Codex account that owns the profile.
    */
@@ -33144,7 +33144,7 @@ export class StateStore {
   // --- Device commands: local switches, day ledger, project approval mode ---
 
   /**
-   * The two local switches a browser can never change. `hra remote deny
+   * The two local switches a browser can never change. `oompa remote deny
    * device-commands` closes the machine to every device command; account
    * linking is opt-in because relaying a provider login URL is the one command
    * that hands a credential path to another surface.
@@ -33566,7 +33566,7 @@ export class StateStore {
 
   /*
    * Prose-path evidence. Every attempt writes one row, including a refusal by
-   * the positive gate, so `hra autorespond status` shows exactly why a turn was
+   * the positive gate, so `oompa autorespond status` shows exactly why a turn was
    * left to the human. No message text, literal, or key ever enters this row.
    */
   recordProseAutorespondEvidence(input: {
@@ -33639,7 +33639,7 @@ export class StateStore {
   }
 
   /*
-   * Records that HRA, not the human, authored the turn dispatched under this
+   * Records that Oompa, not the human, authored the turn dispatched under this
    * client message id. The compact projection reads it back to label the
    * `user_message` event with `actor: "autorespond"`.
    */
@@ -34304,7 +34304,7 @@ export class StateStore {
     return finalize.immediate();
   }
 
-  /** Whether this HRA operation already finalized its neutral user message. */
+  /** Whether this Oompa operation already finalized its neutral user message. */
   hasSessionUserMessageSource(
     sessionId: SessionId,
     sourceKind: "mutation" | "queue",
@@ -35401,7 +35401,7 @@ export class StateStore {
   }
 
   /**
-   * Release only HRA's local custody for legacy session/queue evidence whose
+   * Release only Oompa's local custody for legacy session/queue evidence whose
    * provider authority could not be proved during migration. No provider
    * projection is consulted and no provider effect may be replayed.
    */
@@ -51355,7 +51355,7 @@ export class StateStore {
              )
            )`,
       ).run(now);
-      // Codex can prove a native thread resubscription after an HRA daemon
+      // Codex can prove a native thread resubscription after an Oompa daemon
       // restart. Advance only the session's process fence to the new mirrored
       // Codex generation; its provider-account identity and binding generation
       // remain immutable. The latest exact old-authority gap is mandatory:

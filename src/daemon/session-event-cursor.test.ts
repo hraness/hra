@@ -7,7 +7,7 @@ import { sessionEventCursorWireSchema } from "../domain/session-events";
 import { createWorkId, createWorkTaskId, workEventCursorWireSchema } from "../domain/work";
 import { createProjectId, createSessionId } from "../domain/values";
 import {
-  HRA_CURSOR_MAX_BYTES,
+  OOMPA_CURSOR_MAX_BYTES,
   SessionEventCursorCodec,
   SessionEventCursorError,
   type SessionEventCursorErrorReason,
@@ -134,7 +134,7 @@ describe("SessionEventCursorCodec", () => {
     const cursor = codec.encodeWorkEvent(payload);
     expect(codec.decodeWorkEvent(cursor, payload.workId)).toEqual(payload);
     expect(workEventCursorWireSchema.parse(cursor)).toBe(cursor);
-    expect(Buffer.byteLength(cursor, "utf8")).toBeLessThanOrEqual(HRA_CURSOR_MAX_BYTES);
+    expect(Buffer.byteLength(cursor, "utf8")).toBeLessThanOrEqual(OOMPA_CURSOR_MAX_BYTES);
   });
 
   test("binds work cursors to their exact work plan, cursor type, and signing key", () => {
@@ -236,7 +236,7 @@ describe("SessionEventCursorCodec", () => {
     const cursor = codec.encodeWorkTaskHistory(payload);
     expect(codec.decodeWorkTaskHistory(cursor, taskId)).toEqual(payload);
     expect(workEventCursorWireSchema.parse(cursor)).toBe(cursor);
-    expect(Buffer.byteLength(cursor, "utf8")).toBeLessThanOrEqual(HRA_CURSOR_MAX_BYTES);
+    expect(Buffer.byteLength(cursor, "utf8")).toBeLessThanOrEqual(OOMPA_CURSOR_MAX_BYTES);
     expectCursorRejection(
       () => codec.decodeWorkTaskHistory(cursor, createWorkTaskId()),
       "filter_mismatch",
@@ -283,7 +283,7 @@ describe("SessionEventCursorCodec", () => {
       scope: sessionPayload.scope,
       pending: false,
     })).toEqual(sessionPayload);
-    expect(Buffer.byteLength(sessionCursor, "utf8")).toBeLessThanOrEqual(HRA_CURSOR_MAX_BYTES);
+    expect(Buffer.byteLength(sessionCursor, "utf8")).toBeLessThanOrEqual(OOMPA_CURSOR_MAX_BYTES);
   });
 
   test("rejects interaction cursor tampering and foreign signing keys", () => {
@@ -407,8 +407,8 @@ describe("SessionEventCursorCodec", () => {
 
   test("enforces the shared 2048-byte cursor decode bound before parsing", () => {
     const codec = new SessionEventCursorCodec(SessionEventCursorCodec.generateKey());
-    const oversized = `hra1.${"a".repeat(HRA_CURSOR_MAX_BYTES)}.x`;
-    expect(Buffer.byteLength(oversized, "utf8")).toBeGreaterThan(HRA_CURSOR_MAX_BYTES);
+    const oversized = `hra1.${"a".repeat(OOMPA_CURSOR_MAX_BYTES)}.x`;
+    expect(Buffer.byteLength(oversized, "utf8")).toBeGreaterThan(OOMPA_CURSOR_MAX_BYTES);
     expectCursorRejection(
       () => codec.decodeInteraction(oversized, {
         scope: { type: "global" },
@@ -458,7 +458,7 @@ describe("SessionEventCursorCodec", () => {
       span: 0,
       pageCount: 2,
     });
-    expect(Buffer.byteLength(second, "utf8")).toBeLessThanOrEqual(HRA_CURSOR_MAX_BYTES);
+    expect(Buffer.byteLength(second, "utf8")).toBeLessThanOrEqual(OOMPA_CURSOR_MAX_BYTES);
     expectCursorRejection(
       () => codec.advanceSessionList({
         ...filter,
@@ -509,7 +509,7 @@ describe("SessionEventCursorCodec", () => {
       afterCreatedAt: 12_345,
       afterSessionId: "sess_11111111111111111111111111111111",
     });
-    expect(Buffer.byteLength(cursor, "utf8")).toBeLessThanOrEqual(HRA_CURSOR_MAX_BYTES);
+    expect(Buffer.byteLength(cursor, "utf8")).toBeLessThanOrEqual(OOMPA_CURSOR_MAX_BYTES);
 
     for (const mismatch of [
       { ...filter, accountId: "acct_22222222222222222222222222222222" as const },
@@ -738,7 +738,7 @@ describe("SessionEventCursorCodec", () => {
       span: 1_808,
     });
     expect(prior).not.toHaveProperty("seen");
-    expect(maximumCursorBytes).toBeLessThanOrEqual(HRA_CURSOR_MAX_BYTES);
+    expect(maximumCursorBytes).toBeLessThanOrEqual(OOMPA_CURSOR_MAX_BYTES);
     expect(Buffer.byteLength(codec.advanceSessionList({
       ...filter,
       providerCursor: "provider-10001",

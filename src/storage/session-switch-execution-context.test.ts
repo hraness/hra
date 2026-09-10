@@ -163,7 +163,7 @@ describe("dedicated switch execution context", () => {
       expect(output).not.toBe(value.context);
       expect(output.targetAuthority).not.toBe(value.context.targetAuthority);
       expect(database.query("SELECT context_digest FROM session_switch_execution_contexts").get()).toEqual({
-        context_digest: digest(JSON.stringify({ domain: "hra:session-switch-execution-context:v2", ...value.context })),
+        context_digest: digest(JSON.stringify({ domain: "oompa:session-switch-execution-context:v2", ...value.context })),
       });
       audit(database);
       expect(snapshot(database)).toEqual(before);
@@ -405,7 +405,7 @@ describe("dedicated switch execution context", () => {
   });
 
   test("read-only reopen preserves all schema, rows and change counters", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "hra-switch-context-")); directories.push(directory);
+    const directory = await mkdtemp(join(tmpdir(), "oompa-switch-context-")); directories.push(directory);
     const path = join(directory, "state.sqlite");
     const database = fixture(path); install(database); prepare(database);
     const readonly = new Database(path, { readonly: true, strict: true }); databases.push(readonly);

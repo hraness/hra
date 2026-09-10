@@ -36,7 +36,7 @@ export type ClaudeDisposition = "routed" | "reduced" | "ignored";
 
 /**
  * Every `type` (or `type/subtype`) the pinned build emits on the stream-json
- * stdout stream. `routed` becomes a closed HRA fact, `reduced` keeps only
+ * stdout stream. `routed` becomes a closed Oompa fact, `reduced` keeps only
  * bounded reviewed metadata, `ignored` is discarded after its envelope is
  * validated. Anything absent here is a drift notice, never a silent accept.
  */
@@ -58,7 +58,7 @@ export const PINNED_CLAUDE_STREAM_MATRIX = Object.freeze({
   user: "ignored",
 } as const satisfies Readonly<Record<string, ClaudeDisposition>>);
 
-/** Every `control_request.request.subtype` the pinned build sends to HRA. */
+/** Every `control_request.request.subtype` the pinned build sends to Oompa. */
 export const PINNED_CLAUDE_CONTROL_REQUEST_MATRIX = Object.freeze({
   can_use_tool: "routed",
   hook_callback: "ignored",
@@ -86,7 +86,7 @@ export function assertPinnedClaudeVersion(version: string): void {
   if (version !== CLAUDE_PIN) {
     throw new ClaudeError(
       "RUNTIME_MISMATCH",
-      `HRA requires Claude Code ${CLAUDE_PIN}`,
+      `Oompa requires Claude Code ${CLAUDE_PIN}`,
     );
   }
 }
@@ -95,13 +95,13 @@ export function assertPinnedClaudeModel(model: string, effort: string): void {
   if (model !== CLAUDE_PIN_MODEL) {
     throw new ClaudeError(
       "RUNTIME_MISMATCH",
-      `HRA requires the pinned Claude model ${CLAUDE_PIN_MODEL}`,
+      `Oompa requires the pinned Claude model ${CLAUDE_PIN_MODEL}`,
     );
   }
   if ((CLAUDE_PIN_REFUSED_EFFORTS as readonly string[]).includes(effort)) {
     throw new ClaudeError(
       "UNSUPPORTED_CAPABILITY",
-      `HRA never requests the \`${effort}\` reasoning effort`,
+      `Oompa never requests the \`${effort}\` reasoning effort`,
     );
   }
   if (effort !== CLAUDE_PIN_EFFORT) {
@@ -940,7 +940,7 @@ export function parseClaudeStreamLine(value: unknown): ClaudeStreamEvent {
 }
 
 // ---------------------------------------------------------------------------
-// can_use_tool -> HRA interaction.
+// can_use_tool -> Oompa interaction.
 // ---------------------------------------------------------------------------
 
 export const CLAUDE_COMMAND_TOOLS: ReadonlySet<string> = new Set(["Bash"]);
@@ -1040,7 +1040,7 @@ export const claudeInteractionDisplay = (request: ClaudeCanUseTool): Interaction
             id: `q${String(index)}`,
             options: renderedOptions.map(({ option }) => option),
             question: prompt.text,
-            // Claude's question tool has no secret-answer mode; HRA still marks
+            // Claude's question tool has no secret-answer mode; Oompa still marks
             // every projected answer field as non-secret explicitly.
             secret: false,
             ...(remoteAnswerable ? { remoteAnswerable: true as const } : {}),
@@ -1068,8 +1068,8 @@ export const claudeInteractionDisplay = (request: ClaudeCanUseTool): Interaction
 
 /**
  * Claude's `AskUserQuestion` answers are keyed by the literal question text.
- * HRA projects opaque `q<index>` ids instead, so this rebuilds the wire map
- * from the request HRA still holds in memory.
+ * Oompa projects opaque `q<index>` ids instead, so this rebuilds the wire map
+ * from the request Oompa still holds in memory.
  */
 export const claudeAnswerMap = (
   request: ClaudeCanUseTool,
@@ -1118,7 +1118,7 @@ export type ClaudeControlResponse =
 /**
  * Builds the `control_response` body. An allow echoes the request's own input
  * verbatim (plus the answer map for a question) and never adds a
- * `permission_suggestions` rule, so HRA can only ever grant `once` scope.
+ * `permission_suggestions` rule, so Oompa can only ever grant `once` scope.
  */
 export const claudeControlResponse = (
   request: ClaudeCanUseTool,
@@ -1157,7 +1157,7 @@ export const claudeControlResponseLine = (
  * `image` block carrying its own base64 bytes and a text-ish attachment is a
  * further `text` block with a header naming the file. The message text is
  * always the first block, and with no attachment the emitted line is byte for
- * byte what HRA sent before attachments existed.
+ * byte what Oompa sent before attachments existed.
  */
 export const claudeUserLine = (
   text: string,
@@ -1192,7 +1192,7 @@ export const claudeInterruptLine = (requestId: string): string =>
 
 export const claudeRequestDigest = (requestId: string, request: ClaudeCanUseTool): string =>
   createHash("sha256")
-    .update("hra:claude-control-request:v1\0", "utf8")
+    .update("oompa:claude-control-request:v1\0", "utf8")
     .update(
       JSON.stringify({
         requestId,
@@ -1205,6 +1205,6 @@ export const claudeRequestDigest = (requestId: string, request: ClaudeCanUseTool
 
 export const claudeResponseDigest = (response: ClaudeControlResponse): string =>
   createHash("sha256")
-    .update("hra:claude-control-response:v1\0", "utf8")
+    .update("oompa:claude-control-response:v1\0", "utf8")
     .update(JSON.stringify(response), "utf8")
     .digest("hex");

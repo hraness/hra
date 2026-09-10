@@ -6,7 +6,7 @@ import { profileIdSchema } from "./values";
 
 /**
  * Codex keeps the established public profile id. Isolated Claude and Devin
- * accounts receive distinct HRA-owned opaque ids, never inferred subscription
+ * accounts receive distinct Oompa-owned opaque ids, never inferred subscription
  * identities that could join profiles or machines.
  */
 export const codexProviderAccountIdSchema = z.string().regex(/^acct_[0-9a-f]{32}$/u);

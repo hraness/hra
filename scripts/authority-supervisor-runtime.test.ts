@@ -85,7 +85,7 @@ const isSupportedLinux = (): boolean =>
   process.platform === "linux" && (process.arch === "x64" || process.arch === "arm64");
 
 const makeRoot = async (): Promise<string> => {
-  const root = await mkdtemp(join(tmpdir(), "hra-authority-runtime-"));
+  const root = await mkdtemp(join(tmpdir(), "oompa-authority-runtime-"));
   await chmod(root, 0o700);
   roots.push(root);
   return root;
@@ -1139,12 +1139,12 @@ const { createServer } = require("node:net");
 const { join } = require("node:path");
 
 void (async () => {
-  const root = process.env.HRA_DRIVER_ROOT;
-  const mode = process.env.HRA_DRIVER_STOP_MODE;
-  const startedMarker = process.env.HRA_DRIVER_STARTED_MARKER;
-  const delayedMarker = process.env.HRA_DRIVER_DELAYED_MARKER;
-  const goMarker = process.env.HRA_DRIVER_GO_MARKER;
-  const resultMarker = process.env.HRA_DRIVER_RESULT_MARKER;
+  const root = process.env.OOMPA_DRIVER_ROOT;
+  const mode = process.env.OOMPA_DRIVER_STOP_MODE;
+  const startedMarker = process.env.OOMPA_DRIVER_STARTED_MARKER;
+  const delayedMarker = process.env.OOMPA_DRIVER_DELAYED_MARKER;
+  const goMarker = process.env.OOMPA_DRIVER_GO_MARKER;
+  const resultMarker = process.env.OOMPA_DRIVER_RESULT_MARKER;
   if (!root || !mode || !startedMarker || !delayedMarker || !goMarker || !resultMarker) throw new Error("driver_environment_missing");
   const recovery = join(root, "process-recovery");
   mkdirSync(recovery, { mode: 0o700 });
@@ -1197,7 +1197,7 @@ void (async () => {
   const outerPid = Number(readyMatch[1]);
   const deadline = BigInt(readyMatch[2]) + 1500n;
   await new Promise((resolve, reject) => accepted.write(
-    "HRA_AUTHORITY_SUPERVISOR/1 GO nonce=" + nonce + " deadline_monotonic_ms=" + deadline + "\\n",
+    "OOMPA_AUTHORITY_SUPERVISOR/1 GO nonce=" + nonce + " deadline_monotonic_ms=" + deadline + "\\n",
     (error) => {
       if (error) { reject(error); return; }
       writeFileSync(goMarker, String(outerPid));
@@ -1231,10 +1231,10 @@ const { createServer } = require("node:net");
 const { join } = require("node:path");
 
 void (async () => {
-  const root = process.env.HRA_BIND_ROOT;
-  const marker = process.env.HRA_BIND_MARKER;
-  const resultMarker = process.env.HRA_BIND_RESULT;
-  const parentMountNamespace = process.env.HRA_BIND_PARENT_MNT_NS;
+  const root = process.env.OOMPA_BIND_ROOT;
+  const marker = process.env.OOMPA_BIND_MARKER;
+  const resultMarker = process.env.OOMPA_BIND_RESULT;
+  const parentMountNamespace = process.env.OOMPA_BIND_PARENT_MNT_NS;
   if (!root || !marker || !resultMarker || !parentMountNamespace) throw new Error("bind_driver_environment_missing");
   if (readlinkSync("/proc/self/ns/mnt") === parentMountNamespace) throw new Error("bind_driver_mount_namespace_not_private");
   const recovery = join(root, "process-recovery");
@@ -1310,12 +1310,12 @@ const spawnDeadlineDriver = (
   cwd: root,
   env: {
     ...process.env,
-    HRA_DRIVER_DELAYED_MARKER: markers.delayed,
-    HRA_DRIVER_GO_MARKER: markers.go,
-    HRA_DRIVER_RESULT_MARKER: markers.result,
-    HRA_DRIVER_ROOT: root,
-    HRA_DRIVER_STARTED_MARKER: markers.started,
-    HRA_DRIVER_STOP_MODE: stopMode,
+    OOMPA_DRIVER_DELAYED_MARKER: markers.delayed,
+    OOMPA_DRIVER_GO_MARKER: markers.go,
+    OOMPA_DRIVER_RESULT_MARKER: markers.result,
+    OOMPA_DRIVER_ROOT: root,
+    OOMPA_DRIVER_STARTED_MARKER: markers.started,
+    OOMPA_DRIVER_STOP_MODE: stopMode,
   },
   shell: false,
   stdio: ["pipe", "pipe", "pipe"],
@@ -1339,10 +1339,10 @@ const spawnBindAliasDriver = async (
   cwd: root,
   env: {
     ...process.env,
-    HRA_BIND_MARKER: marker,
-    HRA_BIND_PARENT_MNT_NS: await readlink("/proc/self/ns/mnt"),
-    HRA_BIND_RESULT: result,
-    HRA_BIND_ROOT: root,
+    OOMPA_BIND_MARKER: marker,
+    OOMPA_BIND_PARENT_MNT_NS: await readlink("/proc/self/ns/mnt"),
+    OOMPA_BIND_RESULT: result,
+    OOMPA_BIND_ROOT: root,
   },
   shell: false,
   stdio: ["pipe", "pipe", "pipe"],
@@ -1425,7 +1425,7 @@ test("authority supervisor holds a target behind GO", async () => {
     } catch { /* Diagnostic inability cannot replace the original failure. */ }
   };
   const fixture = createOwnedRuntimeFixture(async (scope) => {
-    const root = await mkdtemp(join(tmpdir(), "hra-authority-runtime-"));
+    const root = await mkdtemp(join(tmpdir(), "oompa-authority-runtime-"));
     // Register even a late root before any further await or cancellation check.
     roots.push(root);
     ownedFixtureCleanups.set(root, fixture.collect);
@@ -1495,7 +1495,7 @@ test("authority supervisor holds a target behind GO", async () => {
     scope.assertActive();
     output = consumeOwnedChildOutput(child);
     const ready = await control.nextLine();
-    expect(ready).toMatch(new RegExp(`^HRA_AUTHORITY_SUPERVISOR/1 READY nonce=${nonce} `));
+    expect(ready).toMatch(new RegExp(`^OOMPA_AUTHORITY_SUPERVISOR/1 READY nonce=${nonce} `));
     const monotonicMatch = ready.match(/ monotonic_ms=([1-9][0-9]*)$/u);
     const namespaceMatch = ready.match(/ init_pid_namespace_inode=([1-9][0-9]*) /u);
     expect(monotonicMatch).not.toBeNull();
@@ -1504,12 +1504,12 @@ test("authority supervisor holds a target behind GO", async () => {
     expect(await Bun.file(marker).exists()).toBeFalse();
     scope.assertActive();
     control.write(
-      `HRA_AUTHORITY_SUPERVISOR/1 GO nonce=${nonce} deadline_monotonic_ms=${BigInt(monotonicMatch?.[1] ?? "0") + 5_000n}\n`,
+      `OOMPA_AUTHORITY_SUPERVISOR/1 GO nonce=${nonce} deadline_monotonic_ms=${BigInt(monotonicMatch?.[1] ?? "0") + 5_000n}\n`,
     );
     child.stdin.end();
     const clean = await control.nextLine();
     scope.assertActive();
-    expect(clean).toBe(`HRA_AUTHORITY_SUPERVISOR/1 CLEAN nonce=${nonce} exit=0`);
+    expect(clean).toBe(`OOMPA_AUTHORITY_SUPERVISOR/1 CLEAN nonce=${nonce} exit=0`);
     streamsAtClean = snapshotChildStreamState(child);
     outputAtClean = output.snapshot();
     // The close observer starts before READY; this 15-second deadline starts
@@ -1538,7 +1538,7 @@ test("authority supervisor holds a target behind GO", async () => {
   finally { lifecycle.dispose(); }
 }, 20_000);
 
-test("native deadline kills custody while the HRA parent is stopped after GO", async () => {
+test("native deadline kills custody while the Oompa parent is stopped after GO", async () => {
   if (!isSupportedLinux()) return;
   const root = await makeRoot();
   const markers = {
@@ -1567,7 +1567,7 @@ test("native deadline kills custody while the HRA parent is stopped after GO", a
     driver.kill("SIGCONT");
     await expect(closed).resolves.toEqual({ code: 0, signal: null });
     expect(JSON.parse(await readFile(markers.result, "utf8"))).toEqual({
-      clean: `HRA_AUTHORITY_SUPERVISOR/1 CLEAN nonce=${"2".repeat(32)} exit=124`,
+      clean: `OOMPA_AUTHORITY_SUPERVISOR/1 CLEAN nonce=${"2".repeat(32)} exit=124`,
       closed: { code: 124, signal: null },
     });
   } catch (error) {
@@ -1608,7 +1608,7 @@ test("namespace PID 1 enforces the deadline while the outer supervisor is stoppe
     expect(await Bun.file(markers.delayed).exists()).toBeFalse();
     await expect(closed).resolves.toEqual({ code: 0, signal: null });
     expect(JSON.parse(await readFile(markers.result, "utf8"))).toEqual({
-      clean: `HRA_AUTHORITY_SUPERVISOR/1 CLEAN nonce=${"2".repeat(32)} exit=124`,
+      clean: `OOMPA_AUTHORITY_SUPERVISOR/1 CLEAN nonce=${"2".repeat(32)} exit=124`,
       closed: { code: 124, signal: null },
     });
   } catch (error) {
@@ -1632,7 +1632,7 @@ test("authority supervisor rejects an inherited bind alias of its recovery direc
   try {
     await expect(closed).resolves.toEqual({ code: 0, signal: null });
     expect(JSON.parse(await readFile(result, "utf8"))).toEqual({
-      firstLine: `HRA_AUTHORITY_SUPERVISOR/1 FAIL nonce=${"3".repeat(32)} code=init_not_ready`,
+      firstLine: `OOMPA_AUTHORITY_SUPERVISOR/1 FAIL nonce=${"3".repeat(32)} code=init_not_ready`,
       closed: { code: 1, signal: null },
     });
     expect(await Bun.file(marker).exists()).toBeFalse();

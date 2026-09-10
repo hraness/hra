@@ -23,8 +23,8 @@ import {
 import { readPngDimensions } from "../site/social-card-raster.ts";
 import { buildSiteStylex } from "./build-site-stylex.ts";
 import { buildProductPreview } from "./build-product-preview.ts";
-import { HRA_RELEASE_VERSION } from "./release-evidence";
-import { buildHraAppearance } from "./build-appearance";
+import { OOMPA_RELEASE_VERSION } from "./release-evidence";
+import { buildOompaAppearance } from "./build-appearance";
 
 interface BuildOptions {
   readonly check: boolean;
@@ -63,25 +63,25 @@ export const readPackageVersion = async (
   return packageManifestSchema.parse(manifest).version;
 };
 
-export const HRA_POSTHOG_PROJECT_TOKEN_ENV =
+export const OOMPA_POSTHOG_PROJECT_TOKEN_ENV =
   "NEXT_PUBLIC_POSTHOG_KEY" as const;
 
 const postHogProjectTokenPattern = /^phc_[A-Za-z0-9_-]{8,512}$/u;
 
-export function resolveHraAnalyticsProjectToken(
+export function resolveOompaAnalyticsProjectToken(
   environment: Readonly<Record<string, string | undefined>>,
 ): string {
   if (environment.VERCEL_ENV !== "production") return "";
 
-  const projectToken = environment[HRA_POSTHOG_PROJECT_TOKEN_ENV]?.trim();
+  const projectToken = environment[OOMPA_POSTHOG_PROJECT_TOKEN_ENV]?.trim();
   if (projectToken === undefined || projectToken.length === 0) {
     throw new Error(
-      `${HRA_POSTHOG_PROJECT_TOKEN_ENV} must be configured for Vercel Production.`,
+      `${OOMPA_POSTHOG_PROJECT_TOKEN_ENV} must be configured for Vercel Production.`,
     );
   }
   if (!postHogProjectTokenPattern.test(projectToken)) {
     throw new Error(
-      `${HRA_POSTHOG_PROJECT_TOKEN_ENV} must be a valid public phc_ project token.`,
+      `${OOMPA_POSTHOG_PROJECT_TOKEN_ENV} must be a valid public phc_ project token.`,
     );
   }
   return projectToken;
@@ -123,19 +123,19 @@ const siteTextOutputs = (
     content: `Contact: ${publicContent.links.privateSecurityReport}\nCanonical: ${publicContent.siteUrl}/.well-known/security.txt\nPolicy: ${publicContent.links.security}\nExpires: 2027-08-22T23:59:59Z\nPreferred-Languages: en\n`,
   },
   {
-    path: join(repositoryRoot, "dist/site/.well-known/hra.json"),
+    path: join(repositoryRoot, "dist/site/.well-known/oompa.json"),
     content: JSON.stringify({
       generation: 1,
-      product: "HRA",
+      product: "Oompa",
       repository: {
         id: 1_343_008_607,
-        path: "hraness/hra",
+        path: "hraness/oompa",
       },
       schemaVersion: 2,
       source: {
         commit: releaseCommit,
       },
-      version: HRA_RELEASE_VERSION,
+      version: OOMPA_RELEASE_VERSION,
     }, null, 2),
   },
 ];
@@ -315,7 +315,7 @@ async function buildAnalyticsBundle(
 ): Promise<void> {
   const result = await Bun.build({
     define: {
-      __HRA_POSTHOG_PROJECT_TOKEN__: JSON.stringify(projectToken),
+      __OOMPA_POSTHOG_PROJECT_TOKEN__: JSON.stringify(projectToken),
       "process.env.NODE_ENV": JSON.stringify("production"),
     },
     entrypoints: [analyticsEntryPath],
@@ -328,7 +328,7 @@ async function buildAnalyticsBundle(
   });
   if (!result.success) {
     const details = result.logs.map((log) => log.message).join("\n");
-    throw new Error(`HRA analytics bundle failed.${details.length > 0 ? `\n${details}` : ""}`);
+    throw new Error(`Oompa analytics bundle failed.${details.length > 0 ? `\n${details}` : ""}`);
   }
 }
 
@@ -340,7 +340,7 @@ async function buildSiteBrowserBundle(repositoryRoot: string): Promise<void> {
   });
   if (!result.success) {
     const details = result.logs.map((log) => log.message).join("\n");
-    throw new Error(`HRA site browser bundle failed.${details.length > 0 ? `\n${details}` : ""}`);
+    throw new Error(`Oompa site browser bundle failed.${details.length > 0 ? `\n${details}` : ""}`);
   }
   assert.equal(result.outputs.length, 1, "The parent site must have one self-contained browser entry");
   const output = result.outputs[0];
@@ -374,7 +374,7 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
     throw new Error("Release commit must be a lowercase 40-character Git SHA.");
   }
   const environment = options.environment ?? emptyBuildEnvironment;
-  const analyticsProjectToken = resolveHraAnalyticsProjectToken(environment);
+  const analyticsProjectToken = resolveOompaAnalyticsProjectToken(environment);
   const fonts = await snapshotSiteFonts(dirname(designKitFontsStylesPath));
   const sourceRoot = await realpath(options.sourceRoot ?? options.repositoryRoot);
   const compiled = await buildSiteStylex({
@@ -424,7 +424,7 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
   await buildAnalyticsBundle(options.repositoryRoot, analyticsProjectToken);
   assertSiteBrowserBundle(await readFile(join(options.repositoryRoot, "dist/site/analytics.js"), "utf8"));
   await buildSiteBrowserBundle(options.repositoryRoot);
-  const appearance = await buildHraAppearance();
+  const appearance = await buildOompaAppearance();
   assertSiteBrowserBundle(appearance);
   await writeFile(join(options.repositoryRoot, "dist/site/appearance.js"), appearance, "utf8");
   await cp(previewDirectory, join(options.repositoryRoot, "dist/site/examples/app"), {
@@ -444,7 +444,7 @@ if (import.meta.main) {
   const repositoryRoot = resolve(import.meta.dir, "..");
   const check = Bun.argv.slice(2).includes("--check");
   const providerCommit = process.env.VERCEL_GIT_COMMIT_SHA
-    ?? process.env.HRA_RELEASE_COMMIT;
+    ?? process.env.OOMPA_RELEASE_COMMIT;
   if (
     process.env.VERCEL === "1"
     && (providerCommit === undefined || !/^[0-9a-f]{40}$/u.test(providerCommit))

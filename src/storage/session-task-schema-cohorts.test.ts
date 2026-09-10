@@ -26,7 +26,7 @@ const cohorts = [
   { name: "combined49", bytes: combined49DatabaseBytes, assert: assertCombined49SessionTaskSchema },
 ] as const;
 const openFixture = async (bytes: Uint8Array, readonly = false): Promise<Database> => {
-  const root = await mkdtemp(join(tmpdir(), "hra-task-schema-cohort-"));
+  const root = await mkdtemp(join(tmpdir(), "oompa-task-schema-cohort-"));
   roots.push(root);
   const path = join(root, "state.sqlite");
   await writeFile(path, bytes, { mode: 0o600 });

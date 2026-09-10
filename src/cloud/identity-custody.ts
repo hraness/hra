@@ -425,21 +425,21 @@ export class IdentityScopedCloudSecretCustody implements CloudSecretCustodyPort 
   async assertCurrentIdentity(expectedUserPublicId: string | null): Promise<void> {
     if (expectedUserPublicId === null) {
       if (this.#activeIdentity !== null || await this.#custody.read(activeIdentitySlot) !== null) {
-        throw new Error("Cloud identity selection changed; restart HRA.");
+        throw new Error("Cloud identity selection changed; restart Oompa.");
       }
       return;
     }
     if (
       !isOpaqueIdentifier(expectedUserPublicId)
       || this.#activeIdentity?.userPublicId !== expectedUserPublicId
-    ) throw new Error("Cloud identity selection changed; restart HRA.");
+    ) throw new Error("Cloud identity selection changed; restart Oompa.");
     const current = await this.#custody.read(activeIdentitySlot);
     if (
       current === null
       || current.generation !== this.#activeIdentity.generation
       || current.value !== this.#activeIdentity.serialized
       || parseActiveIdentity(current.value).userPublicId !== expectedUserPublicId
-    ) throw new Error("Cloud identity selection changed; restart HRA.");
+    ) throw new Error("Cloud identity selection changed; restart Oompa.");
   }
 
   get cacheNamespace(): string | null {

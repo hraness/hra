@@ -66,7 +66,7 @@ function corrupt(path: string, tables: readonly string[], change: (db: Database)
 }
 
 async function fixture() {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-terminal-ack-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-terminal-ack-")));
   roots.push(root);
   const paths = resolveStatePaths({ homeDirectory: root, platform: "darwin" });
   await initializeStatePaths(paths);
@@ -310,7 +310,7 @@ describe("explicit terminal attachment acknowledgments", () => {
       fc.assert(fc.property(fc.integer({ min: -30, max: 30 }), (delta) => {
         const changed = { ...record, createdAt: 1_800_000_000_001 + delta };
         const raw = JSON.stringify(changed);
-        const digest = hash(`hra:attachment-terminal-acknowledgment:v1\0${raw}`);
+        const digest = hash(`oompa:attachment-terminal-acknowledgment:v1\0${raw}`);
         const rollback = new Error("rollback accepted control");
         expect(() => db.transaction(() => {
           db.query("INSERT INTO attachment_terminal_acknowledgments VALUES(?,?,?)").run(attempt.id, raw, digest);
@@ -377,7 +377,7 @@ describe("explicit terminal attachment acknowledgments", () => {
         expect(authority[key]).not.toBe(original);
       } else record[field] = replacement;
       const raw = JSON.stringify(record);
-      const digest = hash(`hra:attachment-terminal-acknowledgment:v1\0${raw}`);
+      const digest = hash(`oompa:attachment-terminal-acknowledgment:v1\0${raw}`);
       corrupt(f.paths.database, ["attachment_terminal_acknowledgments", "attachment_terminal_acknowledgment_anchors"], (db) => {
         for (const name of ["attachment_terminal_acknowledgments", "attachment_terminal_acknowledgment_anchors"]) {
           expect(db.query(`UPDATE ${name} SET acknowledgment_json=?,acknowledgment_digest=? WHERE attempt_id=?`)

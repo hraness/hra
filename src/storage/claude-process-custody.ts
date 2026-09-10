@@ -37,7 +37,7 @@ const proofSchema = z.object({
   }
 });
 type Proof = z.infer<typeof proofSchema>;
-const digest = (json: string): string => createHash("sha256").update(`hra.claude-process-custody.v1\n${json}`).digest("hex");
+const digest = (json: string): string => createHash("sha256").update(`oompa.claude-process-custody.v1\n${json}`).digest("hex");
 const tables = { launch: "session_claude_process_launch_intents", process: "session_claude_process_authorities" } as const;
 const marker = "provider_authority_digest";
 export const CLAUDE_PROCESS_CUSTODY_COLUMN = `${marker} TEXT REFERENCES session_claude_process_provider_authorities(digest) DEFERRABLE INITIALLY DEFERRED CHECK(${marker} IS NULL OR (length(${marker})=64 AND ${marker} NOT GLOB '*[^a-f0-9]*'))`;

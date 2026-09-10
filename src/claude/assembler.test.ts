@@ -35,7 +35,7 @@ const bootstrap = (assembler: ClaudeDeltaAssembler, sessionId = "s"): void => {
 };
 
 describe("Claude delta assembler", () => {
-  test("assembles the captured single turn into HRA facts", async () => {
+  test("assembles the captured single turn into Oompa facts", async () => {
     const assembler = new ClaudeDeltaAssembler();
     const started = assembler.beginTurn("turn-1");
     expect(started).toEqual([{ turnId: "turn-1", type: "turnStarted" }]);

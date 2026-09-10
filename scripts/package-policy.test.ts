@@ -25,7 +25,7 @@ const fixture = async (): Promise<string> => {
   await chmod(join(root, "src", "install-preflight.ts"), 0o644);
   await writeFile(join(root, "src", "install-preflight-runtime.ts"), "export {};\n", { mode: 0o644 });
   await chmod(join(root, "src", "install-preflight-runtime.ts"), 0o644);
-  await writeFile(join(root, "README.md"), "# HRA\n");
+  await writeFile(join(root, "README.md"), "# Oompa\n");
   await chmod(join(root, "README.md"), 0o644);
   return root;
 };
@@ -55,7 +55,7 @@ describe("production package policy", () => {
       [".github", "workflows", "release.yml"],
       ["convex", "schema.ts"],
       ["docs", "live-acceptance.md"],
-      ["kb", "plans", "hra-v1.md"],
+      ["kb", "plans", "oompa-v1.md"],
       ["scripts", "live-acceptance.ts"],
       ["site", "content.ts"],
       ["src", "AGENTS.md"],
@@ -119,7 +119,7 @@ describe("production package policy", () => {
     await chmod(join(root, "src", "install-preflight.ts"), 0o644);
     await writeFile(join(root, "src", "install-preflight-runtime.ts"), "export {};\n", { mode: 0o644 });
     await chmod(join(root, "src", "install-preflight-runtime.ts"), 0o644);
-    await writeFile(join(root, "README.md"), "# HRA\n");
+    await writeFile(join(root, "README.md"), "# Oompa\n");
     await chmod(join(root, "README.md"), 0o644);
     await expect(assertProductionPackageOnly(root)).rejects.toThrow("exactly one CLI entry point");
   });

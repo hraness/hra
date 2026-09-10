@@ -10,8 +10,8 @@ const SEMVER = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u;
 const OIDC_CONFIGURATION = /^oidc:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const GITHUB_BRANCH = /^[A-Za-z0-9._/-]+$/u;
 
-export const publicPackageName = "@hraness/hra";
-export const publicRepository = "hraness/hra";
+export const publicPackageName = "@hraness/oompa";
+export const publicRepository = "hraness/oompa";
 
 function record(value: unknown, label: string): JsonRecord {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -148,7 +148,7 @@ export function parseNpmRelease(value: unknown, version: string): NpmReleaseCoor
     throw new Error(`npm ${publicPackageName}@${version} has the wrong identity or license.`);
   }
   const dist = record(release.dist, "npm release dist");
-  const expectedTarball = `https://registry.npmjs.org/@hraness/hra/-/hra-${version}.tgz`;
+  const expectedTarball = `https://registry.npmjs.org/@hraness/oompa/-/oompa-${version}.tgz`;
   if (dist.tarball !== expectedTarball) throw new Error("npm release tarball URL is not canonical.");
   const npmUser = record(release._npmUser, "npm trusted publisher identity");
   const trustedPublisher = record(npmUser.trustedPublisher, "npm trusted publisher");

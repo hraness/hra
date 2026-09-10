@@ -26,7 +26,7 @@ function inlineContent(content: readonly InlineContent[], styleLinks: boolean): 
   return content.map((part, index) => {
     switch (part.kind) {
       case "code":
-        return <code className={classes("hra-inline-code", "inlineCode")} key={index}>{part.value}</code>;
+        return <code className={classes("oompa-inline-code", "inlineCode")} key={index}>{part.value}</code>;
       case "link":
         return <a className={styleLinks ? sitePresentationClasses("proseLink") : undefined} href={part.href} key={index}>{part.label}</a>;
       case "text":
@@ -40,7 +40,7 @@ export function renderMarketingHeader(content: PublicContent, currentPath: strin
     <MarketingSiteHeader
       className={mobileHeaderFlowClassName()}
       trailing={<SiteAppearanceMenu />}
-      action={{ emphasis: "primary", href: content.links.app, label: "Open HRA" }}
+      action={{ emphasis: "primary", href: content.links.app, label: "Open Oompa" }}
       brand={content.productName}
       brandHref="/"
       links={[
@@ -69,7 +69,7 @@ export function renderMarketingPage(content: PublicContent): string {
         eyebrow={content.hero.eyebrow}
         frame={<ProductPreview />}
         heading={content.hero.heading}
-        headingId="hra-title"
+        headingId="oompa-title"
         name={content.productName}
         notice={<p className={sitePresentationClasses("installNote")}>New machine setup is temporarily paused. This release candidate is not yet admitted, and current daemon and hosted command-writer rollout remains blocked on capacity. <a href="/docs/status/">Check current availability →</a></p>}
         summary={content.hero.summary}
@@ -118,7 +118,7 @@ export function renderMarketingPage(content: PublicContent): string {
       <MarketingCallToAction
         actions={[
           { emphasis: "primary", href: "/docs/start/", label: "Set up your first machine" },
-          { emphasis: "secondary", href: content.links.app, label: "Open HRA" },
+          { emphasis: "secondary", href: content.links.app, label: "Open Oompa" },
         ]}
         footnote={content.hero.boundary}
         heading="Keep the work in view."

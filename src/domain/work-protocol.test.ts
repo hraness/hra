@@ -82,7 +82,7 @@ const resultOf = (query: WorkProtocolQuery): Readonly<Record<string, unknown>> =
 const definitionOf = (name: typeof WORK_PROTOCOL_TYPE_NAMES[number]): TypeDefinition =>
   resultOf({ kind: "type", name }).definition as TypeDefinition;
 
-describe("queryable HRA work protocol", () => {
+describe("queryable Oompa work protocol", () => {
   test("escapes Unicode line separators without folding safe join controls", () => {
     const value = `before${String.fromCodePoint(0x2028)}middle${String.fromCodePoint(0x2029)}after`;
     const joiners = `a${String.fromCodePoint(0x200c)}b${String.fromCodePoint(0x200d)}c`;

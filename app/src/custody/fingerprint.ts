@@ -1,6 +1,6 @@
 /**
  * The device key fingerprint an operator compares before approving a browser
- * device from a machine that has hra installed.
+ * device from a machine that has oompa installed.
  *
  * Definition (shared with the daemon-side `deviceKeyFingerprint` landing in the
  * browser-devices package): SHA-256 over
@@ -16,7 +16,7 @@ import {
   canonicalDevicePublicKeyJson,
   parseDevicePublicKeyJson,
   sha256Hex,
-} from "../hra/cloud";
+} from "../oompa/cloud";
 
 export const fingerprintGroupCount = 8;
 export const fingerprintGroupSize = 4;

@@ -60,7 +60,7 @@
       ]
     },
     {
-      "source": "/.well-known/hra-app.json",
+      "source": "/.well-known/oompa-app.json",
       "headers": [
         {
           "key": "Cache-Control",

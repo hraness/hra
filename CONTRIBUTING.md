@@ -1,6 +1,6 @@
 # Contributing
 
-HRA is in public beta development. Open an issue before a large change so the authority and compatibility boundary can be agreed first.
+Oompa is in public beta development. Open an issue before a large change so the authority and compatibility boundary can be agreed first.
 
 ## Local setup
 

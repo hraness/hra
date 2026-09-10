@@ -9,7 +9,7 @@ import { readAliasInputBuffer } from "./alias-input-buffer";
 
 const directories: string[] = [];
 const fixture = () => {
-  const directory = realpathSync(mkdtempSync(join(tmpdir(), "hra-alias-input-")));
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), "oompa-alias-input-")));
   directories.push(directory);
   return directory;
 };
@@ -24,13 +24,13 @@ afterEach(() => {
 });
 
 const plan = {
-  schemaVersion: 1, kind: "current-project-canonical-alias", alias: "hra.sh", version: "0.1.0",
+  schemaVersion: 1, kind: "current-project-canonical-alias", alias: "oompa.app", version: "0.1.0",
   idempotencyKey: "00000000-0000-4000-8000-000000000001",
-  repository: { id: 1343008607, name: "hraness/hra" },
+  repository: { id: 1343008607, name: "hraness/oompa" },
   vercel: {
     projectId: "prj_8ciIt9t9foE3utG45frRN7cxckjS", teamId: "team_UAd1iD2XogJlbFg4h14mRaPM",
-    source: { deploymentId: `dpl_${"a".repeat(24)}`, deploymentUrl: "hra-source.vercel.app", sourceCommit: "a".repeat(40) },
-    target: { deploymentId: `dpl_${"b".repeat(24)}`, deploymentUrl: "hra-target.vercel.app", sourceCommit: "b".repeat(40) },
+    source: { deploymentId: `dpl_${"a".repeat(24)}`, deploymentUrl: "oompa-source.vercel.app", sourceCommit: "a".repeat(40) },
+    target: { deploymentId: `dpl_${"b".repeat(24)}`, deploymentUrl: "oompa-target.vercel.app", sourceCommit: "b".repeat(40) },
   },
   convex: { teamId: 513923, projectId: 2854545, deploymentId: 5089017,
     deploymentName: "qualified-hummingbird-537", deploymentUrl: "https://qualified-hummingbird-537.convex.cloud" },

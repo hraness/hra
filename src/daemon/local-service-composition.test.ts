@@ -6,13 +6,13 @@ import { join } from "node:path";
 
 import { initializeStatePaths, resolveStatePaths } from "../storage/paths";
 import { StateSecurityScrubRequiredError, StateStore } from "../storage/state-store";
-import type { HraFactsMemoryLifecyclePort } from "./facts-memory-lifecycle";
+import type { OompaFactsMemoryLifecyclePort } from "./facts-memory-lifecycle";
 import { UnavailableCloudControl, UnavailableCodexRuntime } from "./ports";
-import { CommandFailure, HraService } from "./service";
+import { CommandFailure, OompaService } from "./service";
 
 const roots: string[] = [];
 const stores: StateStore[] = [];
-const services: HraService[] = [];
+const services: OompaService[] = [];
 const signal = new AbortController().signal;
 afterEach(async () => {
   for (const service of services.splice(0)) await service.close();
@@ -46,7 +46,7 @@ async function fixture() {
     fence: async (): Promise<void> => {},
     sweep: async (): Promise<void> => {},
   };
-  const factsMemory: HraFactsMemoryLifecyclePort = {
+  const factsMemory: OompaFactsMemoryLifecyclePort = {
     cleanupSession: async () => { throw new Error("Unexpected memory cleanup."); },
     ensureSession: async () => { throw new Error("Unexpected memory creation."); },
     forkSession: async () => { throw new Error("Unexpected memory fork."); },
@@ -71,7 +71,7 @@ async function fixture() {
     supersedeCompactProjectionRecoveryForProviderDeletion: unexpectedProjectionRecovery,
     supersedeTerminalCompactProjectionRecoveries: unexpectedProjectionRecovery,
   });
-  const input: ConstructorParameters<typeof HraService>[0] = {
+  const input: ConstructorParameters<typeof OompaService>[0] = {
     store, paths, codex, cloud, factsMemory,
     daemonAuthority: {
       assertCurrent: async () => { trace.push("fence"); await controls.fence(); },
@@ -80,7 +80,7 @@ async function fixture() {
     now: () => now,
     requestStop: () => { trace.push("requestStop"); },
   };
-  const composition = HraService.createLocalComposition(input);
+  const composition = OompaService.createLocalComposition(input);
   services.push(composition.service);
   const snapshot = () => {
     const db = new Database(paths.database, { readonly: true, strict: true });
@@ -109,7 +109,7 @@ describe("local service composition", () => {
     expect(Reflect.set(first.composition, "service", second.service)).toBe(false);
     expect(Reflect.set(first.composition, "executeAuthenticatedLocal", second.executeAuthenticatedLocal)).toBe(false);
     expect("executeAuthenticatedLocal" in first.service).toBe(false);
-    const legacy = new HraService(second.input);
+    const legacy = new OompaService(second.input);
     services.push(legacy);
     expect(legacy).not.toBe(second.service);
     await expect(legacy.execute({ kind: "daemon.status" }, { signal })).resolves.toEqual({ running: true, pid: process.pid });
@@ -217,8 +217,8 @@ describe("local service composition", () => {
         expect(error).toBeInstanceOf(CommandFailure);
         expect(error).toMatchObject({ code: "UNAVAILABLE", details: { operationCommitted: committed },
           message: committed
-            ? "The local transition committed, but its security scrub could not finish. HRA is stopping and will complete the scrub before the next startup."
-            : "A required local security scrub could not finish. HRA is stopping and will retry it before the next startup.",
+            ? "The local transition committed, but its security scrub could not finish. Oompa is stopping and will complete the scrub before the next startup."
+            : "A required local security scrub could not finish. Oompa is stopping and will retry it before the next startup.",
         });
         if (!(error instanceof Error)) throw new Error("Expected sanitized command failure.");
         expect(error.cause).toBeUndefined();

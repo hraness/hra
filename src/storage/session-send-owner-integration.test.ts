@@ -19,7 +19,7 @@ afterEach(async () => {
 });
 
 async function fixture() {
-  const directory = await realpath(await mkdtemp(join(tmpdir(), "hra-send-owner-integration-")));
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "oompa-send-owner-integration-")));
   directories.push(directory);
   const paths = resolveStatePaths({ homeDirectory: directory, platform: "darwin" });
   await initializeStatePaths(paths);

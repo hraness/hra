@@ -89,7 +89,7 @@ describe("social card", () => {
     // palette change. Pin this literal candidate's geometry independently of
     // its colors, then compare the actual row against the same coverage.
     const mask = new Canvas(1200, 630, parseHexColor("#000000"));
-    drawText(mask, socialCardFonts().book, "CLI candidate v0.8.0 · hra.sh", 88, 520, 30, parseHexColor("#ffffff"));
+    drawText(mask, socialCardFonts().book, "CLI candidate v0.8.0 · oompa.app", 88, 520, 30, parseHexColor("#ffffff"));
     const coverage = new Uint8Array((940 - 88) * (525 - 495));
     const background = parseHexColor(paletteColors.catppuccin.dark.background);
     const foreground = parseHexColor(paletteColors.catppuccin.dark.muted);
@@ -123,12 +123,12 @@ describe("social card", () => {
 
   test("keeps every card line inside its row and states the exact positioning text", () => {
     const lines = socialCardLines();
-    expect(lines.tagline).toBe("CLI candidate v0.8.0 · hra.sh");
-    expect(lines.title).toBe("HRA");
+    expect(lines.tagline).toBe("CLI candidate v0.8.0 · oompa.app");
+    expect(lines.title).toBe("Oompa");
     expect(lines.comment).toBe("# Daemon rollout blocked on capacity");
     expect(lines.commands).toEqual([
       `$ ${publicContent.doctorCommand}`,
-      "$ hra status --json",
+      "$ oompa status --json",
     ]);
     for (const width of socialCardLineWidths()) {
       expect(width).toBeGreaterThan(0);
@@ -142,14 +142,14 @@ describe("social card", () => {
   test("renders the legacy SVG from the same composition", () => {
     const svg = renderSocialCardSvg();
     expect(svg).toStartWith('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630"');
-    expect(svg).toContain("<title id=\"title\">HRA</title>");
+    expect(svg).toContain("<title id=\"title\">Oompa</title>");
     expect(svg).toContain(`<desc id="description">${publicContent.socialCard.alt}</desc>`);
-    expect(svg).toContain("$ hra status --json");
+    expect(svg).toContain("$ oompa status --json");
     expect(svg.indexOf("# Daemon rollout blocked on capacity")).toBeLessThan(
-      svg.indexOf("$ hra doctor --offline"),
+      svg.indexOf("$ oompa doctor --offline"),
     );
     expect(svg).toMatch(/<text x="128" y="302"[^>]*># Daemon rollout blocked on capacity<\/text>/u);
-    expect(svg).toMatch(/<text x="128" y="350"[^>]*>\$ hra doctor --offline/u);
+    expect(svg).toMatch(/<text x="128" y="350"[^>]*>\$ oompa doctor --offline/u);
     expect(svg).toContain('font-family="Nebula Sans, ui-sans-serif, system-ui, sans-serif"');
     expect(svg).not.toContain("<script");
     expect(svg).not.toContain("url(");
@@ -170,7 +170,7 @@ describe("social card", () => {
       expect(space?.advance).toBeGreaterThan(0);
       expect(space?.commands).toEqual([]);
     }
-    expect(measureText(fonts.bold, "HRA", 116)).toBeGreaterThan(measureText(fonts.book, "HRA", 116));
+    expect(measureText(fonts.bold, "Oompa", 116)).toBeGreaterThan(measureText(fonts.book, "Oompa", 116));
     expect(measureText(fonts.book, "", 30)).toBe(0);
   });
 

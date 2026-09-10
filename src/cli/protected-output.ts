@@ -544,7 +544,7 @@ export const parseAccountLoginResponse = (
   }
   if (
     account.state !== "login_pending"
-    || login.next !== `hra account login-cancel ${expected.accountId}`
+    || login.next !== `oompa account login-cancel ${expected.accountId}`
   ) throw new ProtectedOutputError("document_invalid");
   if (!("verificationUrl" in login)) {
     return { account, idempotencyKey, kind: "pending_replay" };

@@ -25,10 +25,10 @@ import {
 import type { CommandRequest, CommandRunner } from "./configure-hosted-sync";
 import {
   ConvexTargetError,
-  HRA_CONVEX_PROJECT_ID,
-  HRA_CONVEX_TEAM_ID,
-  HRA_V0_CONVEX_DEPLOYMENT_ID,
-  HRA_V0_CONVEX_PROJECT_ID,
+  OOMPA_CONVEX_PROJECT_ID,
+  OOMPA_CONVEX_TEAM_ID,
+  OOMPA_V0_CONVEX_DEPLOYMENT_ID,
+  OOMPA_V0_CONVEX_PROJECT_ID,
   type ConvexTarget,
   type ConvexTargetVerifier,
 } from "./convex-target";
@@ -41,8 +41,8 @@ const target: ConvexTarget = {
   deploymentId: 7_654_321,
   deploymentName: "steady-otter-321",
   deploymentUrl: "https://steady-otter-321.convex.cloud",
-  projectId: HRA_CONVEX_PROJECT_ID,
-  teamId: HRA_CONVEX_TEAM_ID,
+  projectId: OOMPA_CONVEX_PROJECT_ID,
+  teamId: OOMPA_CONVEX_TEAM_ID,
 };
 
 const targetArguments = [
@@ -97,7 +97,7 @@ afterEach(async () => {
 });
 
 const makeTemporaryDirectory = async (): Promise<string> => {
-  const directory = await mkdtemp(join(tmpdir(), "hra-hosted-invite-test-"));
+  const directory = await mkdtemp(join(tmpdir(), "oompa-hosted-invite-test-"));
   temporaryDirectories.push(directory);
   return directory;
 };
@@ -134,7 +134,7 @@ const makeFakeSink = (): FakeSink => {
 };
 
 describe("hosted friend-beta invitation operator", () => {
-  test("parses only one checked operation and refuses HRA v0 numeric identities", () => {
+  test("parses only one checked operation and refuses Oompa v0 numeric identities", () => {
     expect(parseHostedInviteArguments([
       "issue",
       ...targetArguments,
@@ -188,7 +188,7 @@ describe("hosted friend-beta invitation operator", () => {
       "status",
       ...targetArguments.slice(0, 4),
       "--project-id",
-      String(HRA_V0_CONVEX_PROJECT_ID),
+      String(OOMPA_V0_CONVEX_PROJECT_ID),
       ...targetArguments.slice(6),
       "--public-id",
       publicId,
@@ -197,7 +197,7 @@ describe("hosted friend-beta invitation operator", () => {
       "status",
       ...targetArguments.slice(0, 6),
       "--deployment-id",
-      String(HRA_V0_CONVEX_DEPLOYMENT_ID),
+      String(OOMPA_V0_CONVEX_DEPLOYMENT_ID),
       ...targetArguments.slice(8),
       "--public-id",
       publicId,
@@ -226,7 +226,7 @@ describe("hosted friend-beta invitation operator", () => {
       environment: {
         CONVEX_DEPLOY_KEY: capability,
         HOME: "/safe/operator",
-        HRA_AUTH_HMAC_SECRET: capability,
+        OOMPA_AUTH_HMAC_SECRET: capability,
         PATH: "/safe/bin",
         TMPDIR: `/safe/${capability}`,
       },
@@ -301,7 +301,7 @@ describe("hosted friend-beta invitation operator", () => {
 
     expect(await executeHostedInviteOperator({
       arguments: ["recover", ...targetArguments, "--invite-file", inviteFile],
-      environment: { HRA_AUTH_HMAC_SECRET: capability, PATH: "/safe/bin" },
+      environment: { OOMPA_AUTH_HMAC_SECRET: capability, PATH: "/safe/bin" },
       runner: async (request) => {
         requests.push(request);
         const result = results[requests.length - 1];

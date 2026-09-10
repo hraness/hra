@@ -1,14 +1,14 @@
 # Hosted sync deployment
 
-Hosted operations run the official Convex CLI as an ordinary bounded child process and work from macOS or Linux with only Bun and an authenticated Convex CLI session. The Linux-only authority supervisor requirement and the separate authorization phrase were retired on 2026-09-03 by the owner's decision to run hosted sync as a beta; every identity guard, readback proof, and denylist below still applies. DNS records, domain assignments, and the production alias are separate procedures (see `docs/domain-cutover.md`). This runbook targets current HRA only. The retired HRA v0 Vercel and Convex resources are not fallback or rollback authorities.
+Hosted operations run the official Convex CLI as an ordinary bounded child process and work from macOS or Linux with only Bun and an authenticated Convex CLI session. The Linux-only authority supervisor requirement and the separate authorization phrase were retired on 2026-09-03 by the owner's decision to run hosted sync as a beta; every identity guard, readback proof, and denylist below still applies. DNS records, domain assignments, and the production alias are separate procedures (see `docs/domain-cutover.md`). This runbook targets current Oompa only. The retired Oompa v0 Vercel and Convex resources are not fallback or rollback authorities.
 
-Use this sequence only in the existing current HRA Convex project. A recovery creates one distinct, non-default production deployment in that project; it never creates a replacement project. The setup helper refuses an existing HRA environment by default and does not support overwrite.
+Use this sequence only in the existing current Oompa Convex project. A recovery creates one distinct, non-default production deployment in that project; it never creates a replacement project. The setup helper refuses an existing Oompa environment by default and does not support overwrite.
 
-Never copy retired HRA v0 data, deployment URLs, deploy keys, authentication keys, HMAC material, Resend credentials, environment values, or backups into the current project. Do not recreate or select a retired resource.
+Never copy retired Oompa v0 data, deployment URLs, deploy keys, authentication keys, HMAC material, Resend credentials, environment values, or backups into the current project. Do not recreate or select a retired resource.
 
-The provider identity guard pins the intended Convex team to numeric ID `513923` and provider slug `cclrte`. Retired HRA v0 Convex project ID `2680173` and production deployment ID `4677913` remain permanent denylisted safety tombstones; neither may be recreated, renamed into, or selected by this runbook. The current source repository has GitHub repository ID `1343008607`, and the current web project has Vercel project ID `prj_8ciIt9t9foE3utG45frRN7cxckjS`. Provider names may change. The team identity and numeric resource IDs do not.
+The provider identity guard pins the intended Convex team to numeric ID `513923` and provider slug `cclrte`. Retired Oompa v0 Convex project ID `2680173` and production deployment ID `4677913` remain permanent denylisted safety tombstones; neither may be recreated, renamed into, or selected by this runbook. The current source repository has GitHub repository ID `1343008607`, and the current web project has Vercel project ID `prj_8ciIt9t9foE3utG45frRN7cxckjS`. Provider names may change. The team identity and numeric resource IDs do not.
 
-Browser app project. The web app at `app.hra.sh` is a second Vercel project in the same team, separate from the website project above so the two never share an origin, a cache policy, or a Content Security Policy. It has no framework preset, root directory `app`, build command `cd .. && bun install --frozen-lockfile --ignore-scripts && bun run build:app`, install command `true`, and output directory `dist`; source files outside the root directory are enabled because that exact build intentionally enters the repository root. Its tracked ignore command is exactly `test "$VERCEL_ENV" != "production"`, so Vercel builds production and ignores previews. The app requires no deployment-secret input: its Convex deployment origin is pinned in source at `app/src/env.ts` and in the `connect-src` allowlist of `app/vercel.json`. It was created on 2026-09-04 as Vercel project `prj_3olYDT29BrwKO9PLByVq9HlgRkdA` (name `hra-app`, team `team_UAd1iD2XogJlbFg4h14mRaPM`, production branch `main`, domain `app.hra.sh`), alongside the website project `prj_8ciIt9t9foE3utG45frRN7cxckjS`. Every production build must receive Vercel's exact lowercase 40-character `VERCEL_GIT_COMMIT_SHA`; a missing or malformed value stops the build. The bundle publishes that commit, repository identity, and package version at the no-store path `/.well-known/hra-app.json`, which is excluded from the SPA fallback.
+Browser app project. The web app at `app.oompa.app` is a second Vercel project in the same team, separate from the website project above so the two never share an origin, a cache policy, or a Content Security Policy. It has no framework preset, root directory `app`, build command `cd .. && bun install --frozen-lockfile --ignore-scripts && bun run build:app`, install command `true`, and output directory `dist`; source files outside the root directory are enabled because that exact build intentionally enters the repository root. Its tracked ignore command is exactly `test "$VERCEL_ENV" != "production"`, so Vercel builds production and ignores previews. The app requires no deployment-secret input: its Convex deployment origin is pinned in source at `app/src/env.ts` and in the `connect-src` allowlist of `app/vercel.json`. It was created on 2026-09-04 as Vercel project `prj_3olYDT29BrwKO9PLByVq9HlgRkdA` (name `oompa-app`, team `team_UAd1iD2XogJlbFg4h14mRaPM`, production branch `main`, domain `app.oompa.app`), alongside the website project `prj_8ciIt9t9foE3utG45frRN7cxckjS`. Every production build must receive Vercel's exact lowercase 40-character `VERCEL_GIT_COMMIT_SHA`; a missing or malformed value stops the build. The bundle publishes that commit, repository identity, and package version at the no-store path `/.well-known/oompa-app.json`, which is excluded from the SPA fallback.
 
 Live projection. Besides the compact stream of completed turns, the daemon streams the current turn's assistant text (and reasoning summaries only when show-thinking is enabled for the session, default off) to the `detail` stream about once per second in redacted, encrypted batches of at most 8 KiB. Detail chunks carry the `live_tail` retention class: each row expires six hours after it is written, a session keeps at most 200 rows, and the `live_tail_chunks` maintenance category sweeps expired rows behind a detail stream epoch so digest-chain verification of the surviving tail stays valid and both the chunk quota and the per-user `live_chunk` resource counter are released. Raw reasoning is never uploaded.
 
@@ -16,13 +16,13 @@ Interaction detail. Version 2 compact `interaction_state` detail carries a `labe
 
 Every projected string is bounded, checked for absolute paths, terminal controls, projection markers, and secret-shaped content, then re-checked by the compact parser before it is written or read. A failure drops the whole detail block and therefore every remote control. The projection never carries exact command text, affected paths or diffs, requested permission values, the MCP server name, protected answers, or a secret question's text. Command, permission, and file-change requests can only be declined remotely. `answer` is available only for a complete non-secret closed-choice user question set whose provider adapter proves that every decision-relevant field crossed without sanitization or truncation and that the response translation is exact. Free-text and Other responses and every MCP form answer stay on the execution machine. The execution daemon recomputes the same policy from the live interaction and injected clock immediately before dispatch, after the separate session, revision, lease, and device checks.
 
-Push wake and sync cadence. Besides its poll timer, the daemon holds one websocket subscription to the pending commands addressed to its own device, presenting the same bearer token from the same custody slot as the HTTP transport and refusing under the same deployment fence. A change to that set wakes the sync cycle immediately, so steering, declines, and eligible closed-choice answers from another device apply in well under a second instead of waiting out the interval. The subscription carries no authority: every command it announces is still claimed, bound to the exact authority generation, and settled by the ordinary cycle under its idempotency key, so a wake that races the timer costs one extra cycle and never a second execution. When the socket fails, one diagnostic is reported through the ordinary cycle diagnostics that `hra sync now` prints, the daemon falls back to polling, and it reconnects with a doubling backoff from one second capped at thirty. The timer itself is adaptive: one second while another device is present in presence or a local session is mid-turn, fifteen seconds otherwise. The device-presence probe is cached for ten seconds so the fast cadence does not list devices every second. `hra sync status` reports the current interval, why it was chosen, and the push-wake state.
+Push wake and sync cadence. Besides its poll timer, the daemon holds one websocket subscription to the pending commands addressed to its own device, presenting the same bearer token from the same custody slot as the HTTP transport and refusing under the same deployment fence. A change to that set wakes the sync cycle immediately, so steering, declines, and eligible closed-choice answers from another device apply in well under a second instead of waiting out the interval. The subscription carries no authority: every command it announces is still claimed, bound to the exact authority generation, and settled by the ordinary cycle under its idempotency key, so a wake that races the timer costs one extra cycle and never a second execution. When the socket fails, one diagnostic is reported through the ordinary cycle diagnostics that `oompa sync now` prints, the daemon falls back to polling, and it reconnects with a doubling backoff from one second capped at thirty. The timer itself is adaptive: one second while another device is present in presence or a local session is mid-turn, fifteen seconds otherwise. The device-presence probe is cached for ten seconds so the fast cadence does not list devices every second. `oompa sync status` reports the current interval, why it was chosen, and the push-wake state.
 
 Each Convex CLI invocation is bounded in runtime and output and receives only an allowlisted child environment. A timeout reports exit 124 and an output overflow reports exit 1; both are ordinary command failures that the helpers classify without a provider retry. Hosted bootstrap and invitation results retain the protected invite file after capability commit, and attested deploy results retain the final evidence path and its `.intent`. Durable intents and receipts, provider idempotency, and exact reconciliation remain mandatory for every ambiguous Convex result; no local custody claim proves that a remote effect did not occur.
 
 ## Migrate staged prerelease secret pointers
 
-This compatibility operator is only for repository checkouts that ran an unpublished prerelease HRA v1 build on macOS when the default secret backend was Keychain. No HRA v1 beta containing that default was published. This command is therefore a repository-operator migration for staged prerelease state, not an installed-product feature, a daemon fallback, or a reason to make the daemon read Keychain.
+This compatibility operator is only for repository checkouts that ran an unpublished prerelease Oompa v1 build on macOS when the default secret backend was Keychain. No Oompa v1 beta containing that default was published. This command is therefore a repository-operator migration for staged prerelease state, not an installed-product feature, a daemon fallback, or a reason to make the daemon read Keychain.
 
 Run the read-only inspection from the exact source checkout first:
 
@@ -32,15 +32,15 @@ bun run operator:migrate-legacy-secrets preflight
 
 Preflight reads the private pointer metadata and current `secret-values` files only. It does not acquire daemon authority, create a directory or file, read Keychain, copy a value, delete an entry, or perform another mutation. `ready` with `nextAction: "execute_migration"` means at least one current pointer still lacks its exact file-backed value. `already_complete` and `not_required` need no migration. Unsafe, unknown, locked, malformed, non-owned, multiply linked, permission-inexact, oversized, replaced, or digest-conflicting metadata is a refusal. Output contains counts and a closed status only. It never contains a secret value, digest, slot, Keychain account, nonce, or local path.
 
-Stop every HRA process, then run the explicit foreground mutation:
+Stop every Oompa process, then run the explicit foreground mutation:
 
 ```sh
 bun run operator:migrate-legacy-secrets --execute
 ```
 
-Execution first acquires and holds HRA's exact daemon lifecycle authority in maintenance state. A live or starting daemon causes `daemon_running` before any Keychain access. While that authority remains held, the operator re-reads every current pointer, reads only missing values from Bun's legacy `sh.hra.control-plane.v1` service, checks each value against the pointer digest, and validates all missing values before copying any. It publishes each value at the unchanged immutable account name through the current `FileSecretBackend`, then reopens every required file through the protected descriptor boundary and proves all pointer digests again before releasing authority and reporting success.
+Execution first acquires and holds Oompa's exact daemon lifecycle authority in maintenance state. A live or starting daemon causes `daemon_running` before any Keychain access. While that authority remains held, the operator re-reads every current pointer, reads only missing values from Bun's legacy `sh.oompa.control-plane.v1` service, checks each value against the pointer digest, and validates all missing values before copying any. It publishes each value at the unchanged immutable account name through the current `FileSecretBackend`, then reopens every required file through the protected descriptor boundary and proves all pointer digests again before releasing authority and reporting success.
 
-The operation is safe to replay after a crash or refusal. Exact copies are accepted without another Keychain read, missing copies resume, and an existing conflicting or unsafe file stops the run without overwrite. A pointer change during execution is a refusal even when an earlier copy succeeded; stop HRA and replay so the current complete pointer set can be proved. The operator never deletes or changes an entry in the legacy Keychain service. Keep those entries as recovery evidence until the prerelease installation is no longer needed, then review any manual cleanup separately.
+The operation is safe to replay after a crash or refusal. Exact copies are accepted without another Keychain read, missing copies resume, and an existing conflicting or unsafe file stops the run without overwrite. A pointer change during execution is a refusal even when an earlier copy succeeded; stop Oompa and replay so the current complete pointer set can be proved. The operator never deletes or changes an entry in the legacy Keychain service. Keep those entries as recovery evidence until the prerelease installation is no longer needed, then review any manual cleanup separately.
 
 ## Replace a quarantined current target
 
@@ -61,7 +61,7 @@ bun run hosted:replace-target -- create --execute \
   --deployment-url <CURRENT_DEFAULT_DEPLOYMENT_URL>
 ```
 
-The operator first proves that supplied tuple is the current default, writes a protected create intent and dispatch receipt, creates only a production deployment with a unique `hra-replace-…` reference and `isDefault: false`, then reads the reference, new target, and old default back. It emits one closed JSON record. A `created_receipted` result means the new target is distinct and non-default while the supplied target remains default; record only the returned target tuple in the private release record.
+The operator first proves that supplied tuple is the current default, writes a protected create intent and dispatch receipt, creates only a production deployment with a unique `oompa-replace-…` reference and `isDefault: false`, then reads the reference, new target, and old default back. It emits one closed JSON record. A `created_receipted` result means the new target is distinct and non-default while the supplied target remains default; record only the returned target tuple in the private release record.
 
 Read durable replacement state with the same tuple, replacement ID, and evidence path:
 
@@ -93,7 +93,7 @@ bun run hosted:replace-target -- switch --execute \
 
 Convex requires the former default to be demoted before another production deployment can be promoted. The operator persists separate demote and promote dispatches, verifies the deliberate no-default intermediate state, and then promotes the replacement. It never promotes after an indeterminate demotion and never demotes again after an indeterminate promotion; a resumed switch reconciles the recorded phase first. Do not run deploy, configure, bootstrap, invitations, a DNS change, or an alias change while the project has no default. `complete` is emitted only after the replacement is read back as default and the former target as non-default.
 
-This changes Convex default selection only. It does not change HRA's checked source target, release evidence, site environment, user deployment custody, DNS, domain assignment, or production alias. Bind the returned target tuple into a separately reviewed source release before treating it as HRA's hosted-sync endpoint.
+This changes Convex default selection only. It does not change Oompa's checked source target, release evidence, site environment, user deployment custody, DNS, domain assignment, or production alias. Bind the returned target tuple into a separately reviewed source release before treating it as Oompa's hosted-sync endpoint.
 
 ## Create fresh state
 
@@ -109,9 +109,9 @@ bun run hosted:deploy -- \
   --source-commit 0123456789abcdef0123456789abcdef01234567
 ```
 
-The helper requires `HEAD` to equal that commit and the entire checkout, including untracked files, to be clean before and after deployment. It refuses any caller team ID except `513923`, then reads the authenticated Convex management API before and after the mutation and requires team slug `cclrte`, team ID `513923`, the exact project, deployment, production type, generated deployment name, URL, and two matching default-production facts: the deployment reports `isDefault: true` and the project names that deployment as `prodDeploymentName`. It rejects selectors such as `prod`, `local`, and `team:project:prod`, and rejects the retired HRA v0 numeric IDs.
+The helper requires `HEAD` to equal that commit and the entire checkout, including untracked files, to be clean before and after deployment. It refuses any caller team ID except `513923`, then reads the authenticated Convex management API before and after the mutation and requires team slug `cclrte`, team ID `513923`, the exact project, deployment, production type, generated deployment name, URL, and two matching default-production facts: the deployment reports `isDefault: true` and the project names that deployment as `prodDeploymentName`. It rejects selectors such as `prod`, `local`, and `team:project:prod`, and rejects the retired Oompa v0 numeric IDs.
 
-The helper creates a private exclusive environment file containing only `CONVEX_DEPLOYMENT=prod:<generated-name>`. Convex uses that value as project context and deploys to the project's current default production deployment, so the matching default-production readbacks are part of the target guard rather than an informational check. After Convex resolves the actual deployment credentials and before it pushes, its mandatory `--cmd` exposes the resolved canonical cloud URL only to a silent local assertion. That assertion must match the exact expected deployment URL or the deploy stops before `runPush`; a later default change cannot redirect the already-resolved credentials. The helper disables Convex's optional pre-command WorkOS provisioning because HRA does not use Convex AuthKit and no provider mutation may precede this assertion. It otherwise invokes `convex deploy --env-file` with confirmation disabled, strict typechecking, code generation disabled, sanitized inherited environment variables, bounded provider output, and a ten-minute deadline. Provider output is suppressed. A failure, changed default, resolved-target mismatch, or dirty postflight leaves the deployment quarantined for inspection; do not retry it.
+The helper creates a private exclusive environment file containing only `CONVEX_DEPLOYMENT=prod:<generated-name>`. Convex uses that value as project context and deploys to the project's current default production deployment, so the matching default-production readbacks are part of the target guard rather than an informational check. After Convex resolves the actual deployment credentials and before it pushes, its mandatory `--cmd` exposes the resolved canonical cloud URL only to a silent local assertion. That assertion must match the exact expected deployment URL or the deploy stops before `runPush`; a later default change cannot redirect the already-resolved credentials. The helper disables Convex's optional pre-command WorkOS provisioning because Oompa does not use Convex AuthKit and no provider mutation may precede this assertion. It otherwise invokes `convex deploy --env-file` with confirmation disabled, strict typechecking, code generation disabled, sanitized inherited environment variables, bounded provider output, and a ten-minute deadline. Provider output is suppressed. A failure, changed default, resolved-target mismatch, or dirty postflight leaves the deployment quarantined for inspection; do not retry it.
 
 ## Release deployment evidence
 
@@ -131,7 +131,7 @@ bun run hosted:deploy -- \
   --evidence-path /protected/release/bootstrap-deploy.json
 ```
 
-The bootstrap pre-read must positively return the tracked unbound attestation. HRA records a protected intent before deployment. It creates a private temporary tree with `git archive` from the exact clean commit and refuses an archive that already contains `node_modules`, a symlink in any package, assertion, or CLI ancestor, or an unsafe lockfile. Inside that tree, the pinned Bun 1.3.14 runtime runs `install --frozen-lockfile --ignore-scripts --backend=copyfile` as an ordinary child with explicit runtime and output limits. The explicit copyfile backend prevents installed package bytes from sharing hard links with Bun's cache or another dependency tree. The install must finish successfully, leave `bun.lock` and `package.json` byte-identical, and produce a local Convex CLI beneath the private source root. HRA captures type, device, inode, and link-count identities for the private archive root, source and package inputs, assertion path, installed Convex package ancestry, manifest, and CLI; every captured regular file must have exactly one link. It rechecks the complete identity set immediately before launching the ordinary bounded provider child. A detected symlink, hard-linked file, ancestor replacement, or file substitution refuses before launch. Provider execution uses that archived CLI and assertion rather than the operator checkout's mutable dependency tree. HRA then overlays only `convex/releaseAttestation.ts` with the bound source commit, fresh runtime revision, deployment time, and null predecessor, and deploys from that tree. An install refusal cannot reach provider execution. Reported process-cleanup failures retain the private source root; failed filesystem removal retains the affected recovery paths. The operator checkout remains unchanged. The postflight query must return that exact attestation on the same fixed numeric target tuple before final evidence is published.
+The bootstrap pre-read must positively return the tracked unbound attestation. Oompa records a protected intent before deployment. It creates a private temporary tree with `git archive` from the exact clean commit and refuses an archive that already contains `node_modules`, a symlink in any package, assertion, or CLI ancestor, or an unsafe lockfile. Inside that tree, the pinned Bun 1.3.14 runtime runs `install --frozen-lockfile --ignore-scripts --backend=copyfile` as an ordinary child with explicit runtime and output limits. The explicit copyfile backend prevents installed package bytes from sharing hard links with Bun's cache or another dependency tree. The install must finish successfully, leave `bun.lock` and `package.json` byte-identical, and produce a local Convex CLI beneath the private source root. Oompa captures type, device, inode, and link-count identities for the private archive root, source and package inputs, assertion path, installed Convex package ancestry, manifest, and CLI; every captured regular file must have exactly one link. It rechecks the complete identity set immediately before launching the ordinary bounded provider child. A detected symlink, hard-linked file, ancestor replacement, or file substitution refuses before launch. Provider execution uses that archived CLI and assertion rather than the operator checkout's mutable dependency tree. Oompa then overlays only `convex/releaseAttestation.ts` with the bound source commit, fresh runtime revision, deployment time, and null predecessor, and deploys from that tree. An install refusal cannot reach provider execution. Reported process-cleanup failures retain the private source root; failed filesystem removal retains the affected recovery paths. The operator checkout remains unchanged. The postflight query must return that exact attestation on the same fixed numeric target tuple before final evidence is published.
 
 These identity checks detect substitutions visible at their explicit checkpoints. They are not a filesystem sandbox against hostile code already running as the same operating-system user, which could race pathname access after a check or modify an inode in place. Do not run the release operator beside untrusted same-UID code. The ordinary child runner does not prove the lifetime or cleanup of install or provider descendants. Its exit status is not evidence that a remote effect did not occur; durable intents and exact target and attestation reconciliation remain required.
 
@@ -312,7 +312,7 @@ Handle each closed result separately:
 - For `authority_reduction_hard_quota`, reclaim ordinary data only through an
   already-supported, separately authorized product path. The aggregate result
   neither identifies an identity nor authorizes erasure. Use
-  `hra auth delete --acknowledge-erasure` only while deliberately signed in as
+  `oompa auth delete --acknowledge-erasure` only while deliberately signed in as
   the current identity whose account the owner intends to delete. Never use it
   to guess which identity caused an aggregate blocker.
 - For `authority_reduction_orphan_cleanup_pending`, leave the candidate live
@@ -349,7 +349,7 @@ before enabling a current executor or treating an ordinary current writer as
 effect-capable; the capacity evidence alone, a Vercel deployment, stdout
 status, or one clean pass is never rollout authority.
 
-The current HRA credential store also binds the unique active unverified auth
+The current Oompa credential store also binds the unique active unverified auth
 subject to a newly inserted user in the same mutation that creates the user,
 account, and deletion pair. A predecessor interruption that committed an
 unverified user/account without that binding remains authority-reduction debt
@@ -448,7 +448,7 @@ digest and executable mode to equal that commit. A `git status` result by itself
 is never source proof. The exact fetch and push origin must also match, and a
 public HTTPS readback must show that `refs/heads/main` still names
 `--source-commit`. Both the fetch and push origin must be the literal canonical
-`https://github.com/hraness/hra.git`; SSH and alternate spellings are refused.
+`https://github.com/hraness/oompa.git`; SSH and alternate spellings are refused.
 
 The launcher then creates a new private detached worktree, installs the
 committed lockfile with `--frozen-lockfile --ignore-scripts --backend=copyfile`,
@@ -527,7 +527,7 @@ The command uses authenticated Vercel readbacks to require team
 `team_UAd1iD2XogJlbFg4h14mRaPM`, project
 `prj_3olYDT29BrwKO9PLByVq9HlgRkdA`, its GitHub link to repository ID
 `1343008607` on production branch `main`, a `READY` production Git deployment
-at the exact commit, and the `app.hra.sh` alias attached to that deployment. A
+at the exact commit, and the `app.oompa.app` alias attached to that deployment. A
 project name, automatic hostname, or successful HTTP response is not a
 substitute for those stable identities. The deployment must not be prebuilt,
 and its best-effort provider `source` field must still say `git` as a
@@ -555,16 +555,16 @@ even while the production alias points at the candidate, so the verifier
 refuses that state.
 
 Between two complete provider samples, the command fetches a freshly
-cache-busted `https://app.hra.sh/.well-known/hra-app.json` without Vercel
+cache-busted `https://app.oompa.app/.well-known/oompa-app.json` without Vercel
 authentication and parses it as strict JSON. It requires exactly this document:
 
 ```json
 {
   "generation": 1,
-  "product": "HRA App",
+  "product": "Oompa App",
   "repository": {
     "id": 1343008607,
-    "path": "hraness/hra"
+    "path": "hraness/oompa"
   },
   "schemaVersion": 1,
   "source": {
@@ -629,10 +629,10 @@ credential, under the evidence boundary.
 `bun run hosted:configure` accepts one strict JSON object with exactly these fields:
 
 ```json
-{"attentionResendApiKey":"<attention-secret>","authEmailReplyTo":"ben@substrate.run","resendApiKey":"<sign-in-secret>","siteUrl":"https://hra.sh"}
+{"attentionResendApiKey":"<attention-secret>","authEmailReplyTo":"ben@substrate.run","resendApiKey":"<sign-in-secret>","siteUrl":"https://oompa.app"}
 ```
 
-`siteUrl` must be one HTTPS origin. For the HRA `v0.1.0` authority it is exactly `https://hra.sh`, the final canonical origin. Do not substitute `https://try-hra.vercel.app` or an automatic deployment hostname: configuration is one-shot, while staging aliases move and rehearsal may replace candidate deployments. `resendApiKey` must be a Resend sending key. HRA pins every OTP sender to `HRA sign-in <hra@auth.hraness.com>` in source; the operator cannot replace it with an environment value. `authEmailReplyTo` must be one lowercase canonical mailbox without an apostrophe that is monitored and verified to receive mail. The sending-only `auth.hraness.com` and `news.hraness.com` domains are rejected. If the runtime variable is absent, HRA falls back to the receive-capable `ben@substrate.run` mailbox. The helper generates a fresh 2048-bit RS256 private key, its matching public JWKS, and a 256-bit HMAC secret locally with WebCrypto.
+`siteUrl` must be one HTTPS origin. For the Oompa `v0.1.0` authority it is exactly `https://oompa.app`, the final canonical origin. Do not substitute `https://oompa.vercel.app` or an automatic deployment hostname: configuration is one-shot, while staging aliases move and rehearsal may replace candidate deployments. `resendApiKey` must be a Resend sending key. Oompa pins every OTP sender to `Oompa sign-in <oompa@auth.hraness.com>` in source; the operator cannot replace it with an environment value. `authEmailReplyTo` must be one lowercase canonical mailbox without an apostrophe that is monitored and verified to receive mail. The sending-only `auth.hraness.com` and `news.hraness.com` domains are rejected. If the runtime variable is absent, Oompa falls back to the receive-capable `ben@substrate.run` mailbox. The helper generates a fresh 2048-bit RS256 private key, its matching public JWKS, and a 256-bit HMAC secret locally with WebCrypto.
 
 `attentionResendApiKey` is a separate sending key for attention email. Both
 keys must use the strict `re_` token format, be 8 to 512 characters long, and
@@ -640,8 +640,8 @@ have different values. Keep the sign-in key scoped to `auth.hraness.com` and
 the attention key scoped to `news.hraness.com` in the intended Resend account.
 Local syntax and inequality checks do not prove provider account identity,
 domain scope, verification, deliverability, or permission to activate sending.
-Attention email retains `HRA attention <notifications@news.hraness.com>` and
-the subject `HRA needs your attention`. Its body version 1 and idempotency
+Attention email retains `Oompa attention <notifications@news.hraness.com>` and
+the subject `Oompa needs your attention`. Its body version 1 and idempotency
 contract are unchanged. A missing, malformed, or shared attention key stops
 the production drain before it claims an attempt; it does not fall back to
 the sign-in key or consume a network retry. Configuring these secrets does not
@@ -673,21 +673,21 @@ bun ./scripts/configure-hosted-sync.ts \
 
 Replace `protected-json-source` with a password manager or equivalent process that emits the complete JSON document only into the pipe. Do not put any value in an argument, environment variable, shell assignment, temporary file, clipboard transcript, `tee`, or traced shell. Do not paste the document into a shell command. Keep shell tracing disabled.
 
-The helper reads at most 8 KiB, rejects a terminal descriptor, and ignores inherited credential variables. Before and after the provider commands, it performs the same numeric management-API identity proof used by deployment. The only setup datum it gives Convex in argv is the exact generated deployment name. It first reads environment names with `convex env list --names-only`. It then sends one in-memory dotenv document to `convex env set` over a pipe without `--force`, and reads names again. Provider stdout and stderr are never forwarded. Success means all and only these HRA values were submitted:
+The helper reads at most 8 KiB, rejects a terminal descriptor, and ignores inherited credential variables. Before and after the provider commands, it performs the same numeric management-API identity proof used by deployment. The only setup datum it gives Convex in argv is the exact generated deployment name. It first reads environment names with `convex env list --names-only`. It then sends one in-memory dotenv document to `convex env set` over a pipe without `--force`, and reads names again. Provider stdout and stderr are never forwarded. Success means all and only these Oompa values were submitted:
 
 - `SITE_URL`
 - `JWT_PRIVATE_KEY`
 - `JWKS`
-- `HRA_AUTH_HMAC_SECRET`
-- `HRA_RESEND_API_KEY`
-- `HRA_ATTENTION_RESEND_API_KEY`
-- `HRA_AUTH_EMAIL_REPLY_TO`
+- `OOMPA_AUTH_HMAC_SECRET`
+- `OOMPA_RESEND_API_KEY`
+- `OOMPA_ATTENTION_RESEND_API_KEY`
+- `OOMPA_AUTH_EMAIL_REPLY_TO`
 
 If any target name already exists, the names response is ambiguous, Convex refuses the batch, or the final names readback is incomplete, the helper closes with a generic error. A failure after the batch may have left a complete or partial provider write. Do not retry or overwrite. Inspect names only, then replace the still-unused deployment if the result is uncertain.
 
 ### Migrate the Reply-To name on an existing deployment
 
-Deployments configured before `HRA_AUTH_EMAIL_REPLY_TO` became required continue
+Deployments configured before `OOMPA_AUTH_EMAIL_REPLY_TO` became required continue
 to send with the source-pinned `ben@substrate.run` fallback, but hosted preflight
 requires the replacement name to be present explicitly. Run this checkout-only
 package entry from the exact clean candidate commit, after its attested candidate
@@ -713,9 +713,9 @@ publishing its own protected receipt. Keep the candidate deploy, this migration,
 and then `hosted:status --require-passed` in that order.
 
 The ordinary write preflight requires the exact predecessor name set:
-`SITE_URL`, `JWT_PRIVATE_KEY`, `JWKS`, `HRA_AUTH_HMAC_SECRET`,
-`HRA_RESEND_API_KEY`, and the retired `HRA_AUTH_EMAIL_FROM`; it also requires
-`HRA_AUTH_EMAIL_REPLY_TO` to be absent. A missing old From name signals drift
+`SITE_URL`, `JWT_PRIVATE_KEY`, `JWKS`, `OOMPA_AUTH_HMAC_SECRET`,
+`OOMPA_RESEND_API_KEY`, and the retired `OOMPA_AUTH_EMAIL_FROM`; it also requires
+`OOMPA_AUTH_EMAIL_REPLY_TO` to be absent. A missing old From name signals drift
 from the known predecessor configuration and refuses before an intent or effect.
 The migration never reads, sets, or removes the old value, so it remains
 available to the predecessor runtime for immediate rollback. Unrelated provider
@@ -723,13 +723,13 @@ names are also left alone. This migration is additive and preserves that known
 rollback configuration; it does not establish rollback readiness for any other
 source or manually altered environment.
 
-Before the only permitted write, HRA publishes a mode-`0600`, single-link intent
+Before the only permitted write, Oompa publishes a mode-`0600`, single-link intent
 beside the requested receipt path. It then sends only the source-pinned default
 as one in-memory dotenv line to `convex env set` through standard input. It never
 puts the mailbox in argv, the child environment, or output, and it never reads or
 replaces JWT, JWKS, HMAC, or Resend values. Whether the set command returns zero,
 nonzero, or loses its ordinary response after cleanup and target identity remain
-proved, HRA does not set again: it reads `HRA_AUTH_EMAIL_REPLY_TO` from the exact
+proved, Oompa does not set again: it reads `OOMPA_AUTH_EMAIL_REPLY_TO` from the exact
 target and requires byte-exact `ben@substrate.run` plus one newline, then reads
 names and requires all seven names: the six-name predecessor set plus the new
 Reply-To name. Only that proof, a fresh matching
@@ -871,7 +871,7 @@ protected-json-source | bun ./scripts/install-hosted-attention-key.ts \
 Installation revalidates exact source, candidate, target, runtime attestation,
 absent attention key, prerequisite configuration and untouched inactive state.
 It records a durable intent before making one application-level update attempt
-for `HRA_ATTENTION_RESEND_API_KEY` only. The direct transport has no CLI or SDK
+for `OOMPA_ATTENTION_RESEND_API_KEY` only. The direct transport has no CLI or SDK
 retry, redirect fallback or arbitrary environment patch. It bounds both the
 response size and deadline. One application call is not an exactly-once network
 guarantee. The other environment values, including the sign-in key, are compared
@@ -948,7 +948,7 @@ Malformed, unavailable, or ambiguous provider reads exit one; unresolved local
 custody exits 75.
 
 The record exposes only the release-attestation binding state, whether all seven
-HRA-managed environment *names* are present and which of those static names
+Oompa-managed environment *names* are present and which of those static names
 are missing, a capped count of occupied bootstrap tables plus a closed
 bootstrap classification, and the safe admission generation, state, and
 new-identity admission value. When the inactive gate is requested, it also
@@ -960,7 +960,7 @@ control reports no value, which the operator reads as `invite_only` exactly as
 the authority does. It never
 emits environment values, unrelated environment names, invitation material,
 quota totals, user counts, or database rows. `CONVEX_SITE_URL` is
-Convex-owned runtime configuration, not an HRA-managed protected value, so it
+Convex-owned runtime configuration, not an Oompa-managed protected value, so it
 is intentionally neither required nor reported by this command.
 
 `preflight_passed` means the bound release attestation names the supplied
@@ -974,7 +974,7 @@ accepted deployment with frozen admission is `preflight_incomplete` with
 invitation is unaccepted but no longer in the exact first frame, for example
 after a reissue or an admission transition, is `preflight_inconsistent`; the
 reissue section describes the only reviewed recovery.
-The JSON `releaseAttestation.state` is `current`, `other`, or `unbound`; HRA
+The JSON `releaseAttestation.state` is `current`, `other`, or `unbound`; Oompa
 does not print the deployed commit. Its closed `nextAction` is guidance only,
 not authorization for a mutation. This does not validate environment values or
 sender verification, acquire a provider lock, send an OTP, or prove a live
@@ -1046,9 +1046,9 @@ Any other state is an incident and must remain quarantined for inspection.
 
 ## Accept the first invite
 
-Read the capability file only into HRA's protected authentication JSON input. Never print it, substitute it into argv, copy it into an environment variable, or route it through a log. Complete the verified-email code flow and confirm the identity and first device are active. Consuming this specific bound invitation atomically records a durable bootstrap-accepted timestamp in service control. Later friend invitation issuance depends on that durable fact, so maintenance may remove the terminal invitation receipt without relocking the service. Then remove the one-time capability file.
+Read the capability file only into Oompa's protected authentication JSON input. Never print it, substitute it into argv, copy it into an environment variable, or route it through a log. Complete the verified-email code flow and confirm the identity and first device are active. Consuming this specific bound invitation atomically records a durable bootstrap-accepted timestamp in service control. Later friend invitation issuance depends on that durable fact, so maintenance may remove the terminal invitation receipt without relocking the service. Then remove the one-time capability file.
 
-Continue launch acceptance with a second pending device approved by the active device against the key fingerprint that `hra device list` shows for it, encrypted projection sync in both directions, usage upload cadence, session streaming, command custody, interaction resolution, revocation, and account deletion. Keep hosted invitations disabled. Hosted acceptance does not authorize domain movement or publication. Those effects use their own separately gated operators: current-package publication now uses the owner-authenticated local `release:tag` command plus the protected tag-push workflow, while domain movement remains outside this hosted-acceptance scope. Retired HRA v0 resources cannot satisfy either operator's gates.
+Continue launch acceptance with a second pending device approved by the active device against the key fingerprint that `oompa device list` shows for it, encrypted projection sync in both directions, usage upload cadence, session streaming, command custody, interaction resolution, revocation, and account deletion. Keep hosted invitations disabled. Hosted acceptance does not authorize domain movement or publication. Those effects use their own separately gated operators: current-package publication now uses the owner-authenticated local `release:tag` command plus the protected tag-push workflow, while domain movement remains outside this hosted-acceptance scope. Retired Oompa v0 resources cannot satisfy either operator's gates.
 
 ## Operate friend-beta invitations
 
@@ -1106,7 +1106,7 @@ bun run hosted:invites -- revoke \
   --public-id invite_PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP
 ```
 
-Status and revoke accept only the public ID, never the bearer capability. Revoke reads and validates identity-invite status before mutation. Every operation performs authenticated numeric target readback before and after its bounded Convex call, requires the exact HRA team, project, production deployment, generated name, and URL, and refuses retired HRA v0 project ID `2680173` and deployment ID `4677913`. Provider stdout and stderr are suppressed; failures return only a static refusal code.
+Status and revoke accept only the public ID, never the bearer capability. Revoke reads and validates identity-invite status before mutation. Every operation performs authenticated numeric target readback before and after its bounded Convex call, requires the exact Oompa team, project, production deployment, generated name, and URL, and refuses retired Oompa v0 project ID `2680173` and deployment ID `4677913`. Provider stdout and stderr are suppressed; failures return only a static refusal code.
 
 If issuance is refused after protected custody commits, do not repeat `issue` with a new path. Reconcile the exact default deployment, then use `recover` with the preserved file. Keep the file until a strict result returns its deterministic public ID or the deployment is formally quarantined.
 
@@ -1354,7 +1354,7 @@ the forward-only boundary described below.
 3. Upgrade daemons independently only after capacity evidence and activation
    receipts are accepted.
    After starting the current daemon on each
-   intended target, run `hra sync now --json` on that machine. Do not declare
+   intended target, run `oompa sync now --json` on that machine. Do not declare
    current hosted command availability until every
    intended target's result has `ok: true`, `data.online: true`,
    `data.errorCount: 0`, and
@@ -1377,7 +1377,7 @@ the forward-only boundary described below.
    intended-target requirements, and does not authorize a daemon upgrade.
 5. Let current daemons automatically classify and reconcile pre-existing
    legacy journals, outboxes, and hosted rows through the recovery-only paths
-   above. Observe the result with `hra sync now --json`, retained local command
+   above. Observe the result with `oompa sync now --json`, retained local command
    IDs, and the hosted command queries. Ordinary reconciliation never needs a
    manual close. The exceptional hard-ceiling cases identified by the protected
    capacity status may use only its typed, source/runtime-bound retirement flow
@@ -1396,7 +1396,7 @@ deployed current client can create or call those recovery surfaces.
 Hosted rollback is unavailable once the additive capacity candidate admits any
 command or capacity-backed deletion/revocation job, or creates or repairs any
 command reservation. Waiting for a marker-2 client or daemon is not a rollback
-boundary. HRA has no global writer-freeze command or drain receipt, and a
+boundary. Oompa has no global writer-freeze command or drain receipt, and a
 retained browser tab or CLI can still enqueue a request even after a visible
 writer deployment is replaced. Never redeploy a predecessor commit or reuse a
 predecessor deployment receipt. Instead, prepare a reviewed forward repair that
@@ -1454,7 +1454,7 @@ Every guard is local. Nothing hosted and no browser can change one.
 
 | Guard | Refusal code |
 | --- | --- |
-| Per-device kill switch (`hra remote deny device-commands`) | `DEVICE_COMMANDS_DENIED` |
+| Per-device kill switch (`oompa remote deny device-commands`) | `DEVICE_COMMANDS_DENIED` |
 | Requesting device revoked after enqueue | `REQUESTING_DEVICE_INACTIVE` |
 | Account linking without the local opt-in | `ACCOUNT_LINKING_DENIED` |
 | Account login start while the account is not exactly signed out | `ACCOUNT_LOGIN_NOT_AVAILABLE` |
@@ -1472,7 +1472,7 @@ day's budget. A browser device can never be a device command target
 
 Two further guards are not refusals. The first `session_start` from each device
 raises a local notice on the machine, written once and never repeated for that
-device; HRA has no desktop notification facility today, so the default notice
+device; Oompa has no desktop notification facility today, so the default notice
 is a daemon diagnostic and the CLI injects a real notifier when one exists. And
 a browser-started session inherits its project's approval mode, applied before
 the prompt is sent, so the first turn is already governed by it.
@@ -1480,7 +1480,7 @@ the prompt is sent, so the first turn is already governed by it.
 For Codex, a current browser sends `account_login_start` with
 `handoffVersion: 2`, which dispatches the local `account.login` command in
 device-code mode. The current web lane never requests browser mode. A
-browser-mode loopback callback cannot be completed on another device, so HRA
+browser-mode loopback callback cannot be completed on another device, so Oompa
 does not relay it.
 
 The pending Codex response must carry both the verification URL and its
@@ -1491,7 +1491,7 @@ lookalike hosts fail closed. The user code must match the closed device-code
 grammar. A missing or malformed value fails closed with
 `ACCOUNT_LOGIN_RELAY_UNAVAILABLE`.
 
-HRA encrypts the URL and user code together under the account key in one
+Oompa encrypts the URL and user code together under the account key in one
 result. The hosted deployment stores only that ciphertext. The result expires
 five minutes after hosted settlement and `deviceCommands:consumeResult`
 releases it only to the requesting browser, exactly once, while erasing the
@@ -1507,7 +1507,7 @@ supersede it. Once safely consumed and displayed, the code remains in memory
 until its expiry or until the user starts a later action.
 
 Both local gates still apply: device commands must be enabled and the machine
-must have `hra remote allow account-linking` set. Settings offers the flow only
+must have `oompa remote allow account-linking` set. Settings offers the flow only
 for an account in that machine's encrypted registry after the registry reports
 the opt-in. The daemon rechecks the requesting device, account public id, local
 switches, and daily cap before starting the provider effect.
@@ -1525,11 +1525,11 @@ or in a live two-device Codex login.
 ### Operator switches
 
 ```sh
-hra remote policy                      # what this machine currently allows
-hra remote deny device-commands        # stop accepting commands from other devices
-hra remote allow device-commands       # accept them again (the shipped default)
-hra remote allow account-linking       # permit relaying a provider login
-hra remote deny account-linking        # refuse it again (the shipped default)
+oompa remote policy                      # what this machine currently allows
+oompa remote deny device-commands        # stop accepting commands from other devices
+oompa remote allow device-commands       # accept them again (the shipped default)
+oompa remote allow account-linking       # permit relaying a provider login
+oompa remote deny account-linking        # refuse it again (the shipped default)
 ```
 
 Both switches are stored in `daemon_state` on the machine and published into

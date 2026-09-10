@@ -1,10 +1,10 @@
 import { initializePostHogBrowser } from "@hraness/posthog/client";
 
-import { hraPostHogSite } from "./analytics-site.ts";
+import { oompaPostHogSite } from "./analytics-site.ts";
 
-declare const __HRA_POSTHOG_PROJECT_TOKEN__: string;
+declare const __OOMPA_POSTHOG_PROJECT_TOKEN__: string;
 
 initializePostHogBrowser({
-  apiKey: __HRA_POSTHOG_PROJECT_TOKEN__,
-  site: hraPostHogSite,
+  apiKey: __OOMPA_POSTHOG_PROJECT_TOKEN__,
+  site: oompaPostHogSite,
 });

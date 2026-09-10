@@ -35,7 +35,7 @@ const text: PreparedAttachment = {
 };
 
 describe("codexTurnInput", () => {
-  test("is the exact single text item HRA sent before attachments existed", () => {
+  test("is the exact single text item Oompa sent before attachments existed", () => {
     expect(codexTurnInput("run the tests")).toEqual([
       { type: "text", text: "run the tests" },
     ]);

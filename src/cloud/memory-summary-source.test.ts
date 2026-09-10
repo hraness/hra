@@ -24,7 +24,7 @@ import {
   resolveStatePaths,
 } from "../storage/paths.ts";
 import { StateStore } from "../storage/state-store.ts";
-import { HraMemorySummarySource } from "./memory-summary-source.ts";
+import { OompaMemorySummarySource } from "./memory-summary-source.ts";
 import { memorySummaryFitsEncryptedEnvelope } from "./payloads.ts";
 
 const roots: string[] = [];
@@ -62,7 +62,7 @@ const page = (key: string, body: string, updatedAt: string) =>
 
 describe("hosted memory summary source", () => {
   test("projects exact Oh metadata with device-scoped peer refs and fails a drifting space closed", async () => {
-    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-memory-summary-")));
+    const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-memory-summary-")));
     roots.push(root);
     const paths = resolveStatePaths({ homeDirectory: root, platform: "darwin" });
     await initializeStatePaths(paths);
@@ -72,7 +72,7 @@ describe("hosted memory summary source", () => {
     const observedAt = now - 1_000;
     const store = new StateStore(paths, { now: () => now });
     stores.push(store);
-    const project = await store.createProject("HRA", projectRoot, true);
+    const project = await store.createProject("Oompa", projectRoot, true);
     const profile = store.createProfile("Personal");
     const session = store.createSession({
       fastEnabled: false,
@@ -124,7 +124,7 @@ describe("hosted memory summary source", () => {
         { kind: "put", record: futureRecord, v: 1 },
       ],
       expectedHead: await canonical.store.head(),
-      operationId: "hra.memory.test.summary-first",
+      operationId: "oompa.memory.test.summary-first",
     });
     const firstHead = await canonical.store.head();
     await canonical.store.close();
@@ -147,7 +147,7 @@ describe("hosted memory summary source", () => {
       projectSerial: new ProjectMemorySerialExecutor(),
       store,
     };
-    const first = await new HraMemorySummarySource({
+    const first = await new OompaMemorySummarySource({
       ...options,
       identityNamespace: "a".repeat(24),
     }).read({
@@ -181,7 +181,7 @@ describe("hosted memory summary source", () => {
     })]);
     expect(first.peerPolicies).toEqual([expect.objectContaining({
       mode: "coordinate",
-      projectLabel: "HRA",
+      projectLabel: "Oompa",
       session: expect.objectContaining({ label: "Planner" }),
       updatedAt: observedAt,
     })]);
@@ -191,7 +191,7 @@ describe("hosted memory summary source", () => {
     expect(encoded).not.toContain(projectRoot);
     expect(encoded).not.toContain("private body");
 
-    const secondNamespace = await new HraMemorySummarySource({
+    const secondNamespace = await new OompaMemorySummarySource({
       ...options,
       identityNamespace: "b".repeat(24),
     }).read({
@@ -200,7 +200,7 @@ describe("hosted memory summary source", () => {
     });
     expect(secondNamespace.peerPolicies[0]?.session.ref)
       .not.toBe(first.peerPolicies[0]?.session.ref);
-    const secondDevice = await new HraMemorySummarySource({
+    const secondDevice = await new OompaMemorySummarySource({
       ...options,
       identityNamespace: "a".repeat(24),
     }).read({
@@ -224,10 +224,10 @@ describe("hosted memory summary source", () => {
         v: 1,
       }],
       expectedHead: await advanced.store.head(),
-      operationId: "hra.memory.test.summary-unsettled",
+      operationId: "oompa.memory.test.summary-unsettled",
     });
     await advanced.store.close();
-    const drifted = await new HraMemorySummarySource({
+    const drifted = await new OompaMemorySummarySource({
       ...options,
       identityNamespace: "a".repeat(24),
     }).read({
@@ -243,7 +243,7 @@ describe("hosted memory summary source", () => {
   });
 
   test("keeps the portable-space projection useful and deterministic at 100 then 101 spaces", async () => {
-    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-memory-summary-spaces-")));
+    const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-memory-summary-spaces-")));
     roots.push(root);
     const paths = resolveStatePaths({ homeDirectory: root, platform: "darwin" });
     await initializeStatePaths(paths);
@@ -264,7 +264,7 @@ describe("hosted memory summary source", () => {
       });
     };
     for (let index = 0; index < 100; index += 1) await addProject(index);
-    const source = new HraMemorySummarySource({
+    const source = new OompaMemorySummarySource({
       engine: new OhSqliteFactsMemoryEngine({ forkAttestations: store }),
       identityNamespace: "e".repeat(24),
       now: () => 1_800_000_000_000,
@@ -295,7 +295,7 @@ describe("hosted memory summary source", () => {
   }, 20_000);
 
   test("keeps the effective-policy projection useful and deterministic at 200 then 201 policies", async () => {
-    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-memory-summary-policies-")));
+    const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-memory-summary-policies-")));
     roots.push(root);
     const paths = resolveStatePaths({ homeDirectory: root, platform: "darwin" });
     await initializeStatePaths(paths);
@@ -303,7 +303,7 @@ describe("hosted memory summary source", () => {
     await mkdir(projectRoot);
     const store = new StateStore(paths, { now: () => 1_800_000_000_000 });
     stores.push(store);
-    const project = await store.createProject("HRA", projectRoot, true);
+    const project = await store.createProject("Oompa", projectRoot, true);
     const profile = store.createProfile("Personal");
     const addSession = (index: number) => store.createSession({
       fastEnabled: false,
@@ -313,7 +313,7 @@ describe("hosted memory summary source", () => {
       title: `Session ${index.toString().padStart(3, "0")}`,
     });
     for (let index = 0; index < 200; index += 1) addSession(index);
-    const source = new HraMemorySummarySource({
+    const source = new OompaMemorySummarySource({
       engine: new OhSqliteFactsMemoryEngine({ forkAttestations: store }),
       identityNamespace: "f".repeat(24),
       now: () => 1_800_000_000_000,
@@ -342,7 +342,7 @@ describe("hosted memory summary source", () => {
   }, 20_000);
 
   test("byte-bounds maximum-length policy labels without clearing the whole projection", async () => {
-    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-memory-summary-wire-limit-")));
+    const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-memory-summary-wire-limit-")));
     roots.push(root);
     const paths = resolveStatePaths({ homeDirectory: root, platform: "darwin" });
     await initializeStatePaths(paths);
@@ -361,7 +361,7 @@ describe("hosted memory summary source", () => {
         title: `${index.toString().padStart(3, "0")}${"S".repeat(197)}`,
       });
     }
-    const source = new HraMemorySummarySource({
+    const source = new OompaMemorySummarySource({
       engine: new OhSqliteFactsMemoryEngine({ forkAttestations: store }),
       identityNamespace: "1".repeat(24),
       now: () => 1_800_000_000_000,

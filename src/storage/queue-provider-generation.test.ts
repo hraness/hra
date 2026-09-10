@@ -24,7 +24,7 @@ const quote = (value: string) => `"${value.replaceAll('"', '""')}"`;
 // at generation one. Advancing only Codex then makes the prior scalar-profile
 // lookup observably wrong. No provider process or network call is performed.
 async function fixture() {
-  const directory = await realpath(await mkdtemp(join(tmpdir(), "hra-queue-provider-generation-")));
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "oompa-queue-provider-generation-")));
   directories.push(directory);
   const paths = resolveStatePaths({ homeDirectory: directory, platform: "darwin" });
   await initializeStatePaths(paths);

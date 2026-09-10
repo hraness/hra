@@ -76,7 +76,7 @@ describe("Claude pin", () => {
     expect(() => { assertPinnedClaudeVersion("2.1.259"); }).toThrow(ClaudeError);
     expect(() => { assertPinnedClaudeModel(CLAUDE_PIN_MODEL, "max"); }).not.toThrow();
     expect(() => { assertPinnedClaudeModel("claude-fable-5", "max"); }).toThrow(ClaudeError);
-    // "max without ultracode": ultracode is a real effort HRA never requests.
+    // "max without ultracode": ultracode is a real effort Oompa never requests.
     expect(() => { assertPinnedClaudeModel(CLAUDE_PIN_MODEL, "ultracode"); }).toThrow(
       "never requests the `ultracode` reasoning effort",
     );
@@ -530,7 +530,7 @@ describe("Claude usage observation parsing", () => {
 });
 
 describe("Claude event admission", () => {
-  test("keeps Claude's own plumbing out of the HRA model", () => {
+  test("keeps Claude's own plumbing out of the Oompa model", () => {
     for (const subtype of ["hook_callback", "mcp_message", "set_permission_mode", "initialize"]) {
       expect(parseClaudeStreamLine({
         request: { subtype },
@@ -733,7 +733,7 @@ describe("control responses", () => {
       toolUseID: "toolu_1",
       updatedInput: { command: "/bin/echo hi" },
     });
-    // No `permission_suggestions` rule is ever echoed back, so HRA can grant
+    // No `permission_suggestions` rule is ever echoed back, so Oompa can grant
     // nothing beyond this one tool use.
     expect(JSON.stringify(allow)).not.toContain("permission_suggestions");
   });

@@ -12,8 +12,8 @@ import {
 import { sha256Hex } from "../src/cloud/crypto";
 import { createCloudUuidV7 } from "../src/domain/uuid-v7";
 import {
-  buildHraAttentionEmailBody,
-  parseHraAttentionEmailBody,
+  buildOompaAttentionEmailBody,
+  parseOompaAttentionEmailBody,
 } from "./attentionEmail";
 import { ATTENTION_NOTIFICATION_TERMINAL_RETENTION_MS } from "./lifecyclePolicy";
 import {
@@ -27,7 +27,7 @@ import {
   type MutationCtx,
   type QueryCtx,
 } from "./server";
-import { requireHraAttentionResendApiKey } from "./resendApiKey";
+import { requireOompaAttentionResendApiKey } from "./resendApiKey";
 
 type ControlContext = MutationCtx | QueryCtx;
 
@@ -352,7 +352,7 @@ export const sendingKeyReadiness = internalQuery({
   args: {},
   handler: () => {
     try {
-      requireHraAttentionResendApiKey();
+      requireOompaAttentionResendApiKey();
       return { dedicatedKeyReady: true };
     } catch {
       return { dedicatedKeyReady: false };
@@ -713,7 +713,7 @@ async function safetyFaultEvidenceAllowsReview(
     const body = leader?.delivery?.body;
     if (
       body === undefined
-      || parseHraAttentionEmailBody(body) === null
+      || parseOompaAttentionEmailBody(body) === null
       || first.userId !== fault.userId
       || delivery.leaderRowId !== fault.anchorRowId
       || !isSafePositiveInteger(delivery.attemptCount)
@@ -755,13 +755,13 @@ async function safetyFaultEvidenceAllowsReview(
           && candidate.nextAttemptAt === undefined;
       })
     ) return false;
-    const rebuilt = buildHraAttentionEmailBody(rows.map((row) => ({
+    const rebuilt = buildOompaAttentionEmailBody(rows.map((row) => ({
       interactionKind: row.interactionKind,
       sessionPublicId: row.sessionPublicId,
     })));
-    const bodyDigest = await sha256Hex(`hra-attention-body:v1\u0000${rebuilt.text}`);
+    const bodyDigest = await sha256Hex(`oompa-attention-body:v1\u0000${rebuilt.text}`);
     const idempotencyKey = await sha256Hex([
-      "hra-attention-resend:v1",
+      "oompa-attention-resend:v1",
       delivery.id,
       delivery.recipientDigest,
       delivery.bodyDigest,

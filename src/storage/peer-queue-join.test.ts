@@ -22,7 +22,7 @@ const quote = (value: string) => `"${value.replaceAll('"', '""')}"`;
 // The fixture uses real authority/session/peer APIs. It is not an archived
 // canonical peer producer and makes no migration or historical-byte claim.
 async function fixture() {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-peer-queue-join-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-peer-queue-join-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   let now = 10_000;

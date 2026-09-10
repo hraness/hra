@@ -9,7 +9,7 @@ export type ProviderV1 = z.infer<typeof providerV1Schema>;
 export const providerSchema = providerV1Schema;
 export type Provider = ProviderV1;
 
-/** Providers whose existing personal-home sessions HRA can adopt. */
+/** Providers whose existing personal-home sessions Oompa can adopt. */
 export const adoptableProviderSchema = z.enum(["codex", "claude"]);
 export type AdoptableProvider = z.infer<typeof adoptableProviderSchema>;
 
@@ -213,7 +213,7 @@ export const presetRequirementForContract = <P extends Preset, C extends PresetC
 
 /**
  * Historical runtime documents remain admissible only when they carry one of
- * the exact tuples HRA has shipped for that alias.
+ * the exact tuples Oompa has shipped for that alias.
  */
 export const isAdmittedPresetRequirementV1 = (
   preset: PresetV1,

@@ -62,7 +62,7 @@ const makeComplete = () => {
 
 describe("static site compiler projection", () => {
   test("captures the three original renderers and six exact documentation paths with one environment", () => {
-    const environment = { HRA_PUBLIC_BUILD: "fixture" };
+    const environment = { OOMPA_PUBLIC_BUILD: "fixture" };
     const exports = renderersFor();
     const captured = captureSiteDocuments({
       ...exports,

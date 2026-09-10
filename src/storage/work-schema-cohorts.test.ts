@@ -30,7 +30,7 @@ const cohorts = [
 ] as const;
 
 const openFixture = async (bytes: Uint8Array, readonly = false): Promise<Database> => {
-  const root = await mkdtemp(join(tmpdir(), "hra-work-cohort-"));
+  const root = await mkdtemp(join(tmpdir(), "oompa-work-cohort-"));
   roots.push(root);
   const path = join(root, "state.sqlite");
   await writeFile(path, bytes, { mode: 0o600 });

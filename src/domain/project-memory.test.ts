@@ -6,7 +6,7 @@ import { cloudEnvelopeLimits } from "./cloud-envelope-contract";
 import {
   createPortableProjectMemoryCanonicalIdentity,
   deriveProjectMemoryCanonicalIdentity,
-  HRA_CANONICAL_MEMORY_OPERATION_MAX_BYTES,
+  OOMPA_CANONICAL_MEMORY_OPERATION_MAX_BYTES,
   legacyProjectMemorySpaceId,
   PROJECT_MEMORY_DESTINATION_PURPOSE,
 } from "./project-memory";
@@ -15,7 +15,7 @@ const projectId = "proj_0123456789abcdef0123456789abcdef" as const;
 
 describe("project memory canonical identity", () => {
   test("keeps one encrypted canonical operation inside the hosted envelope", () => {
-    const encryptedBytes = HRA_CANONICAL_MEMORY_OPERATION_MAX_BYTES + 16;
+    const encryptedBytes = OOMPA_CANONICAL_MEMORY_OPERATION_MAX_BYTES + 16;
     const unpaddedBase64UrlCharacters = Math.floor((4 * encryptedBytes + 2) / 3);
     expect(unpaddedBase64UrlCharacters).toBeLessThan(
       cloudEnvelopeLimits.ciphertextCharacters,
@@ -33,10 +33,10 @@ describe("project memory canonical identity", () => {
     });
 
     expect(identity.canonicalRealmId).toBe(
-      `hra:project-memory:${canonicalSpaceId.slice("hra:project:".length)}`,
+      `oompa:project-memory:${canonicalSpaceId.slice("oompa:project:".length)}`,
     );
     expect(identity.canonicalAuthorityId).toBe(
-      `hra.memory.canonical.${canonicalSpaceId.slice("hra:project:".length)}`,
+      `oompa.memory.canonical.${canonicalSpaceId.slice("oompa:project:".length)}`,
     );
     expect(identity.authorityDigest).toBe(canonicalSha256({
       bindingDigest: identity.bindingDigest,
@@ -49,7 +49,7 @@ describe("project memory canonical identity", () => {
   test("creates a portable identity independent of the local project id", () => {
     const identity = createPortableProjectMemoryCanonicalIdentity(projectId);
     expect(identity.identityContract).toBe(2);
-    expect(identity.canonicalSpaceId).toMatch(/^hra:project:space-[a-f0-9]{32}$/u);
+    expect(identity.canonicalSpaceId).toMatch(/^oompa:project:space-[a-f0-9]{32}$/u);
     expect(identity.authorityDigest).toBe(canonicalSha256({
       bindingDigest: identity.bindingDigest,
       purpose: PROJECT_MEMORY_DESTINATION_PURPOSE,

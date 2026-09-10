@@ -16,7 +16,7 @@ function task(overrides: Partial<ScheduledTaskView> = {}): ScheduledTaskView {
     cadence: "every day at 09:00",
     id: "task-1",
     kind: "hra_conversation",
-    kindLabel: "HRA",
+    kindLabel: "Oompa",
     label: "Morning sweep",
     machineLabel: "workshop",
     nextRunAt: now + hour,
@@ -66,9 +66,9 @@ describe("formatting", () => {
     expect(scheduledTaskNextRun(null, now)).toBe("not scheduled");
   });
 
-  test("the line names HRA, the cadence, and the next run", () => {
+  test("the line names Oompa, the cadence, and the next run", () => {
     expect(scheduledTaskLine(task(), now))
-      .toBe("HRA · every day at 09:00 · next run in 1 hour");
+      .toBe("Oompa · every day at 09:00 · next run in 1 hour");
   });
 
   test("the badge counts in words a reader can read at a glance", () => {
@@ -128,7 +128,7 @@ describe("sessionScheduledTasks", () => {
       "session-a",
       now,
     );
-    expect(view.rows[0]?.line).toBe("HRA · hourly · next run in 2 hours");
+    expect(view.rows[0]?.line).toBe("Oompa · hourly · next run in 2 hours");
   });
 
   test("no machine, no match, and no session all render nothing", () => {

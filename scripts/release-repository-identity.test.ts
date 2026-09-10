@@ -4,7 +4,7 @@ import { assertLiveReleaseRepository } from "./release-repository-identity";
 
 const exact = Object.freeze({
   default_branch: "main",
-  full_name: "hraness/hra",
+  full_name: "hraness/oompa",
   id: 1_343_008_607,
   owner: { id: 307_125_679 },
   private: false,
@@ -19,10 +19,10 @@ describe("live release repository identity", () => {
       { id: 7 },
       { owner: { id: 7 } },
       { default_branch: "release" },
-      { full_name: "attacker/hra" },
+      { full_name: "attacker/oompa" },
     ]) {
       expect(() => assertLiveReleaseRepository({ ...exact, ...drift }))
-        .toThrow("exact live public HRA repository identity");
+        .toThrow("exact live public Oompa repository identity");
     }
   });
 });

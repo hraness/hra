@@ -229,7 +229,7 @@ describe("hosted attachment materialization", () => {
   };
 
   const fixture = async (): Promise<AttachmentBlobStore> => {
-    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-hosted-attachments-")));
+    const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-hosted-attachments-")));
     materializationRoots.push(root);
     return new AttachmentBlobStore(join(root, "attachments"));
   };

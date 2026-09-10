@@ -1,5 +1,5 @@
 /**
- * Social card composition for hra.sh.
+ * Social card composition for oompa.app.
  *
  * Link unfurlers on X, LinkedIn, Slack, iMessage, and Discord render PNG
  * previews but not SVG, so the build rasterizes this card to a 1200x630 PNG
@@ -53,9 +53,9 @@ export interface SocialCardLines {
 
 export const socialCardLines = (content: PublicContent = publicContent): SocialCardLines => {
   return {
-    commands: [`$ ${content.doctorCommand}`, "$ hra status --json"],
+    commands: [`$ ${content.doctorCommand}`, "$ oompa status --json"],
     comment: "# Daemon rollout blocked on capacity",
-    tagline: `CLI candidate v${content.releaseVersion} · hra.sh`,
+    tagline: `CLI candidate v${content.releaseVersion} · oompa.app`,
     title: content.productName,
   };
 };

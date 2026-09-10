@@ -69,11 +69,11 @@ describe("cached provider account listing CLI contract", () => {
   });
 
   test("help documents the cached-only boundary and both provider examples", () => {
-    expect(usage).toContain("hra account list --provider codex|claude");
+    expect(usage).toContain("oompa account list --provider codex|claude");
     const help = usageForGroup("account");
-    expect(help).toContain("hra account list [--provider <codex|claude>] [--json]");
-    expect(help).toContain("hra account list --provider codex");
-    expect(help).toContain("hra account list --provider claude --json");
+    expect(help).toContain("oompa account list [--provider <codex|claude>] [--json]");
+    expect(help).toContain("oompa account list --provider codex");
+    expect(help).toContain("oompa account list --provider claude --json");
     expect(help).toContain("not current usage or quota");
     expect(help).toContain("does not refresh providers, sign in, or change the active account");
     expect(help).toContain("Without --provider");

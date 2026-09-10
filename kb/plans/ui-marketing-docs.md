@@ -1,20 +1,20 @@
-# HRA product website and documentation
+# Oompa product website and documentation
 
 Status: implemented; final integration and delivery pending. Owner: Hraness. Source checked: 2026-09-08. Reassess: 2026-10-20.
 
 ## Scope and decision
 
-Present HRA as the web workspace and local CLI it now is. Replace the homepage's complete reference dump with a bounded product explanation and real UI examples. Split public documentation by reader task, retain canonical detailed contracts, and make the README an entry point rather than a second manual.
+Present Oompa as the web workspace and local CLI it now is. Replace the homepage's complete reference dump with a bounded product explanation and real UI examples. Split public documentation by reader task, retain canonical detailed contracts, and make the README an entry point rather than a second manual.
 
-The user explicitly requested Sponge as a reference and actual Direct-powered UI mockups. Reference: Sponge main `9c1ea788fa6dea9b312799dc4b6194b9606e1d72`. The useful pattern is a static, separately built fixture app using production components, not the authenticated app or an invented dashboard. HRA retains its own Bun, Vite, StyleX, CSP, and deployment architecture.
+The user explicitly requested Sponge as a reference and actual Direct-powered UI mockups. Reference: Sponge main `9c1ea788fa6dea9b312799dc4b6194b9606e1d72`. The useful pattern is a static, separately built fixture app using production components, not the authenticated app or an invented dashboard. Oompa retains its own Bun, Vite, StyleX, CSP, and deployment architecture.
 
 No provider, account authority, routing, operational activation, or release-version changes are in scope. The admitted v0.7.0 artifact and the current daemon/hosted-writer capacity gate remain separate facts. This work does not grant rollout permission or re-publish that immutable artifact. Shared semantic-theme work remains independently owned.
 
 ## Content admission
 
-The six authored per-page admission records live in `site/docs-content.ts`. Each names its reader job, original HRA-specific contribution, overlap decision, checked source, owner, reassessment date, and six scores. These are agent-authored records, not a human editorial approval. Independent agent source/claim-risk review accepted all six after correcting the Claude first-run command and putting the current setup notice before the web guide's local-effect commands.
+The six authored per-page admission records live in `site/docs-content.ts`. Each names its reader job, original Oompa-specific contribution, overlap decision, checked source, owner, reassessment date, and six scores. These are agent-authored records, not a human editorial approval. Independent agent source/claim-risk review accepted all six after correcting the Claude first-run command and putting the current setup notice before the web guide's local-effect commands.
 
-Homepage decision: revise. Reader job: understand what HRA does and choose a next step. Original contribution: actual HRA screens connect local execution, session supervision, account separation, and browser use. Canonical host: hra.sh owns the product. Nearest URLs: `/docs/` routes readers, `/docs/start/` gives a procedure, `/docs/web/` explains browser tasks. The homepage introduces the product without duplicating those jobs. Scores: utility 2, evidence 2, confidence 2, host fit 2, voice 2, maintenance 1. Human voice is limited to the existing supplied maker biography; no new experience or endorsement is invented.
+Homepage decision: revise. Reader job: understand what Oompa does and choose a next step. Original contribution: actual Oompa screens connect local execution, session supervision, account separation, and browser use. Canonical host: oompa.app owns the product. Nearest URLs: `/docs/` routes readers, `/docs/start/` gives a procedure, `/docs/web/` explains browser tasks. The homepage introduces the product without duplicating those jobs. Scores: utility 2, evidence 2, confidence 2, host fit 2, voice 2, maintenance 1. Human voice is limited to the existing supplied maker biography; no new experience or endorsement is invented.
 
 Privacy decision: keep its canonical `/privacy/` route and full policy; correct heading hierarchy and shared navigation only. README decision: revise to shared product claims, exact installation, adjacent startup restriction, and canonical guide links. Legacy homepage fragments redirect to their owning detailed sections with a native link fallback. Detailed reference remains available without JavaScript and in canonical Markdown exports.
 
@@ -39,7 +39,7 @@ Direct is a pinned development dependency and is absent from production applicat
 
 ## Evidence
 
-Research and source audit used HRA `3da9744acad51faf898f4d35c78bbe5f5be5dd2e` and the Sponge revision above. The later current-main integration incorporates `5027d21d8e4a128f87f2a78810b3f23929404061`, the separately reviewed attention-key installer from PR #154, without conflicts or operational activation. Parallel semantic-theme PR #158 remains independently owned; no theme source or dependency pin was copied into this change.
+Research and source audit used Oompa `3da9744acad51faf898f4d35c78bbe5f5be5dd2e` and the Sponge revision above. The later current-main integration incorporates `5027d21d8e4a128f87f2a78810b3f23929404061`, the separately reviewed attention-key installer from PR #154, without conflicts or operational activation. Parallel semantic-theme PR #158 remains independently owned; no theme source or dependency pin was copied into this change.
 
 Independent review covered public claims and source behavior separately. The docs reviewer accepted the six distinct reader jobs, first-party authority, individual admission records, and bounded maintenance dates. The implementation reviewer accepted the isolated build projection, exact CSP/CORS separation, docs routing, and browser-driver integration. A second source pass accepted the independent enlarged-frame loading lifecycle. The integration owner separately reviewed the worker-owned fixtures, parsed observations, real reducers, IO-only aliases, and private-to-public compiler projection. These are agent reviews, not human approval or live-provider evidence.
 

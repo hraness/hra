@@ -18,7 +18,7 @@ import {
 import { FactsMemoryControlStore } from "../storage/facts-memory-control";
 import { initializeStatePaths, resolveStatePaths } from "../storage/paths";
 import {
-  HraFactsMemoryLifecycle,
+  OompaFactsMemoryLifecycle,
   type FactsMemoryAttestationLifecyclePort,
   type FactsMemoryBrokerInspection,
   type FactsMemoryBrokerPort,
@@ -260,19 +260,19 @@ afterEach(async () => {
 });
 
 const fixture = async () => {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-facts-memory-")));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-facts-memory-")));
   roots.push(home);
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const control = new FactsMemoryControlStore(paths.factsMemoryControl, { now: () => 50 });
   controls.push(control);
   const broker = new FakeBroker();
-  return { broker, control, lifecycle: new HraFactsMemoryLifecycle({ broker, control }), paths };
+  return { broker, control, lifecycle: new OompaFactsMemoryLifecycle({ broker, control }), paths };
 };
 
-describe("HRA facts-memory lifecycle", () => {
+describe("Oompa facts-memory lifecycle", () => {
   test("refuses a control database containing any semantic table", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-facts-memory-schema-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-facts-memory-schema-")));
     roots.push(home);
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
@@ -284,7 +284,7 @@ describe("HRA facts-memory lifecycle", () => {
   });
 
   test("migrates v1 custody and quarantines a nonempty legacy head until exact reproof", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-facts-memory-v1-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-facts-memory-v1-")));
     roots.push(home);
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
@@ -340,7 +340,7 @@ describe("HRA facts-memory lifecycle", () => {
   });
 
   test("migrates v2 custody to v3 without changing its active authority", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-facts-memory-v2-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-facts-memory-v2-")));
     roots.push(home);
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
@@ -1052,7 +1052,7 @@ describe("HRA facts-memory lifecycle", () => {
   test("reconciles durable attestation clone and post-purge cleanup independently of Oh effects", async () => {
     const { broker, control } = await fixture();
     const attestations = new FakeAttestations();
-    const lifecycle = new HraFactsMemoryLifecycle({ attestations, broker, control });
+    const lifecycle = new OompaFactsMemoryLifecycle({ attestations, broker, control });
     const parent = await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 1_000 });
     attestations.failFinalizeOnce = true;
     await expect(lifecycle.forkSession({
@@ -1105,7 +1105,7 @@ describe("HRA facts-memory lifecycle", () => {
   test("resume finalizes a lost child attestation fork before releasing its parent", async () => {
     const { broker, control } = await fixture();
     const attestations = new FakeAttestations();
-    const lifecycle = new HraFactsMemoryLifecycle({ attestations, broker, control });
+    const lifecycle = new OompaFactsMemoryLifecycle({ attestations, broker, control });
     const parent = await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 1_000 });
     attestations.failFinalizeOnce = true;
     await expect(lifecycle.forkSession({
@@ -1136,7 +1136,7 @@ describe("HRA facts-memory lifecycle", () => {
   test("resume finalizes a crash-left attestation reservation for an active child", async () => {
     const { broker, control } = await fixture();
     const attestations = new FakeAttestations();
-    const lifecycle = new HraFactsMemoryLifecycle({ attestations, broker, control });
+    const lifecycle = new OompaFactsMemoryLifecycle({ attestations, broker, control });
     const parent = await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 1_000 });
     const child = await lifecycle.forkSession({
       childExpiresAt: 2_000,
@@ -1171,7 +1171,7 @@ describe("HRA facts-memory lifecycle", () => {
   test("treats a pre-control attestation fork reservation as a parent cleanup fence", async () => {
     const { broker, control } = await fixture();
     const attestations = new FakeAttestations();
-    const lifecycle = new HraFactsMemoryLifecycle({ attestations, broker, control });
+    const lifecycle = new OompaFactsMemoryLifecycle({ attestations, broker, control });
     const parent = await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 1_000 });
     attestations.pendingParents.add(parent.bindingDigest);
 
@@ -1194,7 +1194,7 @@ describe("HRA facts-memory lifecycle", () => {
   test("sweeps a crash-left pre-control fork reservation before releasing its parent", async () => {
     const { broker, control } = await fixture();
     const attestations = new FakeAttestations();
-    const lifecycle = new HraFactsMemoryLifecycle({ attestations, broker, control });
+    const lifecycle = new OompaFactsMemoryLifecycle({ attestations, broker, control });
     const parent = await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 1_000 });
     if (parent.head === null) throw new Error("Expected an active parent checkpoint.");
     const child = createFactsMemoryBinding({ ownerId, sessionId: childSessionId });

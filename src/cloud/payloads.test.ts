@@ -732,17 +732,17 @@ describe("memory summary payloads", () => {
     }],
     peerPolicies: [{
       mode: "coordinate",
-      projectLabel: "HRA",
+      projectLabel: "Oompa",
       session: { label: "Planner", ref: digest("a") },
       updatedAt: 1_699_999_997_000,
     }],
     spaces: [{
       bindingDigest: digest("c"),
-      canonicalSpaceId: `hra:project:space-${"d".repeat(32)}`,
+      canonicalSpaceId: `oompa:project:space-${"d".repeat(32)}`,
       enrollment: "attached",
       head: { digest: digest("e"), operationSha256: digest("f"), sequence: 7 },
       lastExchangeAt: 1_699_999_999_500,
-      projectLabel: "HRA",
+      projectLabel: "Oompa",
       recentRecords: [{
         key: "release-policy",
         kind: "memory_page",

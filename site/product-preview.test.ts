@@ -26,11 +26,11 @@ describe("public real-UI examples", () => {
       const frameWindow = {
         postMessage(request: unknown, targetOrigin: string) {
           requests.push(request);
-          expect(request).toEqual({ type: "hra-preview-status", view });
+          expect(request).toEqual({ type: "oompa-preview-status", view });
           expect(targetOrigin).toBe("*");
           expect(messageListeners).toHaveLength(1);
           // A real postMessage clones data into the receiving window's realm.
-          const data: unknown = runInContext(`(${JSON.stringify({ type: "hra-preview-ready", view })})`, context);
+          const data: unknown = runInContext(`(${JSON.stringify({ type: "oompa-preview-ready", view })})`, context);
           for (const listener of messageListeners) listener({ data, source: frameWindow, origin: "null" });
         },
       };
@@ -42,7 +42,7 @@ describe("public real-UI examples", () => {
         IntersectionObserver: class { observe(target: Element) { observers.push(target); } disconnect() {} },
         setTimeout: () => 1, clearTimeout() {} });
       runInContext(code, context);
-      expect(requests).toEqual([{ type: "hra-preview-status", view }]);
+      expect(requests).toEqual([{ type: "oompa-preview-status", view }]);
       expect(document.querySelector("[data-preview-status]")?.textContent).toBe("");
       expect(navigations).toEqual([]);
       expect(observers).toEqual([frame]);
@@ -58,17 +58,17 @@ describe("public real-UI examples", () => {
   test("parses only exact status requests without evaluating accessors", () => {
     for (const view of Object.keys(productScenes)) {
       if (!isProductScene(view)) throw new Error("Unregistered test scene");
-      expect(parsePreviewStatusRequest({ type: "hra-preview-status", view })).toEqual({ type: "hra-preview-status", view });
+      expect(parsePreviewStatusRequest({ type: "oompa-preview-status", view })).toEqual({ type: "oompa-preview-status", view });
     }
     let reads = 0;
-    const accessor = { get type() { reads += 1; return "hra-preview-status"; }, view: "overview" };
-    const hiddenField = Object.defineProperty({ type: "hra-preview-status" }, "view", { value: "overview", enumerable: false });
-    const extraSymbol = { type: "hra-preview-status", view: "overview", [Symbol("extra")]: true };
+    const accessor = { get type() { reads += 1; return "oompa-preview-status"; }, view: "overview" };
+    const hiddenField = Object.defineProperty({ type: "oompa-preview-status" }, "view", { value: "overview", enumerable: false });
+    const extraSymbol = { type: "oompa-preview-status", view: "overview", [Symbol("extra")]: true };
     for (const request of [
-      null, undefined, "hra-preview-status", [], {},
-      { type: "hra-preview-ready", view: "overview" }, { type: "hra-preview-status", view: "constructor" },
-      { type: "hra-preview-status", view: "overview", account: "real" },
-      Object.create({ type: "hra-preview-status", view: "overview" }), accessor, hiddenField, extraSymbol,
+      null, undefined, "oompa-preview-status", [], {},
+      { type: "oompa-preview-ready", view: "overview" }, { type: "oompa-preview-status", view: "constructor" },
+      { type: "oompa-preview-status", view: "overview", account: "real" },
+      Object.create({ type: "oompa-preview-status", view: "overview" }), accessor, hiddenField, extraSymbol,
     ]) expect(parsePreviewStatusRequest(request)).toBeUndefined();
     expect(reads).toBe(0);
   });
@@ -76,49 +76,49 @@ describe("public real-UI examples", () => {
   test("replays readiness settled before the parent requested it", () => {
     const sent: unknown[] = [];
     const relay = createPreviewStatusRelay("overview", (message) => { sent.push(message); });
-    relay.publish("hra-preview-ready");
-    expect(sent).toEqual([{ type: "hra-preview-ready", view: "overview" }]);
+    relay.publish("oompa-preview-ready");
+    expect(sent).toEqual([{ type: "oompa-preview-ready", view: "overview" }]);
     sent.length = 0;
-    relay.replay({ type: "hra-preview-status", view: "overview" });
-    expect(sent).toEqual([{ type: "hra-preview-ready", view: "overview" }]);
+    relay.replay({ type: "oompa-preview-status", view: "overview" });
+    expect(sent).toEqual([{ type: "oompa-preview-ready", view: "overview" }]);
   });
 
   test("does not invent readiness when the parent requests it before the scene settles", () => {
     const sent: unknown[] = [];
     const relay = createPreviewStatusRelay("conversation", (message) => { sent.push(message); });
-    relay.replay({ type: "hra-preview-status", view: "conversation" });
+    relay.replay({ type: "oompa-preview-status", view: "conversation" });
     expect(sent).toEqual([]);
-    relay.publish("hra-preview-ready");
-    expect(sent).toEqual([{ type: "hra-preview-ready", view: "conversation" }]);
+    relay.publish("oompa-preview-ready");
+    expect(sent).toEqual([{ type: "oompa-preview-ready", view: "conversation" }]);
   });
 
   test("keeps failure authoritative after an earlier ready or a later ready callback", () => {
     const sent: unknown[] = [];
     const relay = createPreviewStatusRelay("settings", (message) => { sent.push(message); });
-    relay.publish("hra-preview-ready");
-    relay.publish("hra-preview-failed");
-    expect(sent.at(-1)).toEqual({ type: "hra-preview-failed", view: "settings" });
+    relay.publish("oompa-preview-ready");
+    relay.publish("oompa-preview-failed");
+    expect(sent.at(-1)).toEqual({ type: "oompa-preview-failed", view: "settings" });
     sent.length = 0;
-    relay.publish("hra-preview-ready");
-    expect(sent.every((message) => parsePreviewMessage(message)?.type === "hra-preview-failed")).toBe(true);
+    relay.publish("oompa-preview-ready");
+    expect(sent.every((message) => parsePreviewMessage(message)?.type === "oompa-preview-failed")).toBe(true);
     sent.length = 0;
-    relay.replay({ type: "hra-preview-status", view: "settings" });
-    expect(sent).toEqual([{ type: "hra-preview-failed", view: "settings" }]);
+    relay.replay({ type: "oompa-preview-status", view: "settings" });
+    expect(sent).toEqual([{ type: "oompa-preview-failed", view: "settings" }]);
   });
 
   test("refuses malformed, cross-scene, extended, inherited and accessor replay requests", () => {
     const sent: unknown[] = [];
     const relay = createPreviewStatusRelay("question", (message) => { sent.push(message); });
-    relay.publish("hra-preview-ready");
+    relay.publish("oompa-preview-ready");
     sent.length = 0;
     let reads = 0;
     for (const request of [
-      null, [], {}, { type: "hra-preview-ready", view: "question" },
-      { type: "hra-preview-status", view: "overview" },
-      { type: "hra-preview-status", view: "question", extra: true },
-      Object.create({ type: "hra-preview-status", view: "question" }),
-      { type: "hra-preview-status", get view() { reads += 1; return "question"; } },
-      Object.defineProperty({ view: "question" }, "type", { value: "hra-preview-status", enumerable: false }),
+      null, [], {}, { type: "oompa-preview-ready", view: "question" },
+      { type: "oompa-preview-status", view: "overview" },
+      { type: "oompa-preview-status", view: "question", extra: true },
+      Object.create({ type: "oompa-preview-status", view: "question" }),
+      { type: "oompa-preview-status", get view() { reads += 1; return "question"; } },
+      Object.defineProperty({ view: "question" }, "type", { value: "oompa-preview-status", enumerable: false }),
     ]) relay.replay(request);
     expect(sent).toEqual([]);
     expect(reads).toBe(0);
@@ -126,11 +126,11 @@ describe("public real-UI examples", () => {
 
   test("status-envelope laws accept only exact public data fields under arbitrary input", () => {
     const view = fc.constantFrom("overview", "conversation", "question", "settings");
-    const type = fc.constantFrom("hra-preview-status", "hra-preview-ready", "hra-preview-failed");
+    const type = fc.constantFrom("oompa-preview-status", "oompa-preview-ready", "oompa-preview-failed");
     fc.assert(fc.property(view, type, fc.anything({ maxDepth: 2, maxKeys: 4 }), (scene, kind, foreign: unknown) => {
       const envelope = { type: kind, view: scene };
-      expect(parsePreviewStatusRequest(envelope)).toEqual(kind === "hra-preview-status" ? { type: kind, view: scene } : undefined);
-      expect(parsePreviewMessage(envelope)).toEqual(kind === "hra-preview-status" ? undefined : { type: kind, view: scene });
+      expect(parsePreviewStatusRequest(envelope)).toEqual(kind === "oompa-preview-status" ? { type: kind, view: scene } : undefined);
+      expect(parsePreviewMessage(envelope)).toEqual(kind === "oompa-preview-status" ? undefined : { type: kind, view: scene });
       for (const parsed of [parsePreviewStatusRequest(foreign), parsePreviewMessage(foreign)]) {
         if (parsed === undefined) continue;
         expect(Object.getPrototypeOf(foreign)).toBe(Object.prototype);
@@ -168,25 +168,25 @@ describe("public real-UI examples", () => {
     fc.assert(fc.property(view, fc.array(step, { maxLength: 25 }), (scene, steps) => {
       const sent: unknown[] = [];
       const relay = createPreviewStatusRelay(scene, (message) => { sent.push(message); });
-      let latest: "hra-preview-ready" | "hra-preview-failed" | undefined;
+      let latest: "oompa-preview-ready" | "oompa-preview-failed" | undefined;
       let reads = 0;
       for (const action of steps) {
         const before = sent.length;
         if (action.operation === "ready" || action.operation === "failed") {
-          const published = action.operation === "ready" ? "hra-preview-ready" : "hra-preview-failed";
-          const alreadyFailed = latest === "hra-preview-failed";
+          const published = action.operation === "ready" ? "oompa-preview-ready" : "oompa-preview-failed";
+          const alreadyFailed = latest === "oompa-preview-failed";
           relay.publish(published);
           if (!alreadyFailed) latest = published;
           expect(sent.slice(before)).toEqual(alreadyFailed ? [] : [{ type: published, view: scene }]);
           continue;
         }
-        const matching = { type: "hra-preview-status", view: scene };
+        const matching = { type: "oompa-preview-status", view: scene };
         let request: unknown;
         switch (action.operation) {
           case "match": request = matching; break;
           case "cross": request = { ...matching, view: scene === "overview" ? "settings" : "overview" }; break;
           case "extra": request = { ...matching, extra: action.payload }; break;
-          case "accessor": request = { view: scene, get type() { reads += 1; return "hra-preview-status"; } }; break;
+          case "accessor": request = { view: scene, get type() { reads += 1; return "oompa-preview-status"; } }; break;
           case "inherited": request = Object.create(matching); break;
           case "malformed": request = [action.payload]; break;
         }
@@ -194,20 +194,20 @@ describe("public real-UI examples", () => {
         expect(sent.slice(before)).toEqual(action.operation === "match" && latest !== undefined ? [{ type: latest, view: scene }] : []);
       }
       const before = sent.length;
-      relay.replay({ type: "hra-preview-status", view: scene });
+      relay.replay({ type: "oompa-preview-status", view: scene });
       expect(sent.slice(before)).toEqual(latest === undefined ? [] : [{ type: latest, view: scene }]);
       expect(reads).toBe(0);
     }), { seed: 20260910, numRuns: 100 });
   });
 
   test("parses only exact public readiness messages without evaluating accessors", () => {
-    for (const type of ["hra-preview-ready", "hra-preview-failed"] as const) for (const view of Object.keys(productScenes)) {
+    for (const type of ["oompa-preview-ready", "oompa-preview-failed"] as const) for (const view of Object.keys(productScenes)) {
       if (!isProductScene(view)) throw new Error("Unregistered test scene");
       expect(parsePreviewMessage({ type, view })).toEqual({ type, view });
     }
-    for (const input of [null, [], {}, { type: "login", view: "overview" }, { type: "hra-preview-ready", view: "constructor" }, { type: "hra-preview-ready", view: "overview", account: "real" }, Object.create({ type: "hra-preview-ready", view: "overview" })]) expect(parsePreviewMessage(input)).toBeUndefined();
+    for (const input of [null, [], {}, { type: "login", view: "overview" }, { type: "oompa-preview-ready", view: "constructor" }, { type: "oompa-preview-ready", view: "overview", account: "real" }, Object.create({ type: "oompa-preview-ready", view: "overview" })]) expect(parsePreviewMessage(input)).toBeUndefined();
     let reads = 0;
-    expect(parsePreviewMessage({ get type() { reads += 1; return "hra-preview-ready"; }, view: "overview" })).toBeUndefined();
+    expect(parsePreviewMessage({ get type() { reads += 1; return "oompa-preview-ready"; }, view: "overview" })).toBeUndefined();
     expect(reads).toBe(0);
   });
   test("admits only the four published scene keys, not object prototype names", () => {

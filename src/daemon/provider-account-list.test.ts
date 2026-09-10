@@ -9,7 +9,7 @@ import type { ProviderAccountListResult } from "../domain/provider-account-list"
 import { initializeStatePaths, resolveStatePaths } from "../storage/paths";
 import { ProviderAccountListingError, StateStore } from "../storage/state-store";
 import type { ClaudeRuntimePort, CloudControlPort, CodexRuntimePort } from "./ports";
-import { CommandFailure, HraService } from "./service";
+import { CommandFailure, OompaService } from "./service";
 
 const roots: string[] = [];
 const stores: StateStore[] = [];
@@ -21,7 +21,7 @@ afterEach(async () => {
 });
 
 async function fixture() {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-account-list-service-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-account-list-service-")));
   roots.push(root);
   const paths = resolveStatePaths({ homeDirectory: root, platform: "darwin" });
   await initializeStatePaths(paths);
@@ -43,7 +43,7 @@ async function fixture() {
     },
   });
   let authorityChecks = 0;
-  const service = new HraService({ store, paths,
+  const service = new OompaService({ store, paths,
     codex: forbiddenPort("codex") as CodexRuntimePort, claude: forbiddenPort("claude") as ClaudeRuntimePort,
     cloud: forbiddenPort("cloud") as CloudControlPort,
     daemonAuthority: { assertCurrent: async () => { authorityChecks += 1; }, close: () => {} },

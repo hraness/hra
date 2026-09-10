@@ -87,7 +87,7 @@ function proveHeaders(value: Configuration, pathname: string, policyIndex: numbe
 }
 
 const pages = ["/", "/docs/", "/docs/start/", "/docs/web/", "/docs/sessions/", "/docs/reference/", "/docs/status/", "/privacy/", "/preview/"] as const;
-const wellKnown = ["/.well-known/security.txt", "/.well-known/hra.json"] as const;
+const wellKnown = ["/.well-known/security.txt", "/.well-known/oompa.json"] as const;
 
 describe("compiled Vercel site routing", () => {
   test("well-known data files reach the complete declared headers without redirects", () => {

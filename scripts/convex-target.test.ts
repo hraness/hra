@@ -4,11 +4,11 @@ import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 
 import {
-  HRA_CONVEX_PROJECT_ID,
-  HRA_CONVEX_TEAM_ID,
-  HRA_CONVEX_TEAM_SLUG,
-  HRA_V0_CONVEX_DEPLOYMENT_ID,
-  HRA_V0_CONVEX_PROJECT_ID,
+  OOMPA_CONVEX_PROJECT_ID,
+  OOMPA_CONVEX_TEAM_ID,
+  OOMPA_CONVEX_TEAM_SLUG,
+  OOMPA_V0_CONVEX_DEPLOYMENT_ID,
+  OOMPA_V0_CONVEX_PROJECT_ID,
   defaultConvexConfigPath,
   parseConvexTarget,
   parseConvexTargetArguments,
@@ -23,8 +23,8 @@ const target: ConvexTarget = {
   deploymentId: 7_654_321,
   deploymentName: "steady-otter-321",
   deploymentUrl: "https://steady-otter-321.convex.cloud",
-  projectId: HRA_CONVEX_PROJECT_ID,
-  teamId: HRA_CONVEX_TEAM_ID,
+  projectId: OOMPA_CONVEX_PROJECT_ID,
+  teamId: OOMPA_CONVEX_TEAM_ID,
 };
 
 const targetArguments = [
@@ -52,7 +52,7 @@ const makeConfig = async (mode = 0o600): Promise<Readonly<{
   configPath: string;
   token: string;
 }>> => {
-  const directory = await mkdtemp(join(tmpdir(), "hra-convex-target-test-"));
+  const directory = await mkdtemp(join(tmpdir(), "oompa-convex-target-test-"));
   temporaryDirectories.push(directory);
   const configPath = join(directory, "config.json");
   const token = ["fixture", "access", "token"].join("-");
@@ -69,9 +69,9 @@ describe("numeric Convex target guard", () => {
       requests.push({ init, url });
       if (url.includes("/team_and_project")) {
         return new Response(JSON.stringify({
-          project: "hra",
+          project: "oompa",
           projectId: target.projectId,
-          team: HRA_CONVEX_TEAM_SLUG,
+          team: OOMPA_CONVEX_TEAM_SLUG,
           teamId: target.teamId,
         }), { status: 200 });
       }
@@ -103,26 +103,26 @@ describe("numeric Convex target guard", () => {
     const { configPath } = await makeConfig();
     const scenarios: readonly unknown[] = [
       {
-        project: "hra",
+        project: "oompa",
         projectId: target.projectId,
         team: "wrong-team",
         teamId: target.teamId,
       },
       {
-        project: "hra",
+        project: "oompa",
         projectId: target.projectId,
         teamId: target.teamId,
       },
       {
-        project: "hra",
+        project: "oompa",
         projectId: target.projectId,
-        team: HRA_CONVEX_TEAM_SLUG,
+        team: OOMPA_CONVEX_TEAM_SLUG,
         teamId: target.teamId + 1,
       },
       {
-        project: "hra",
+        project: "oompa",
         projectId: target.projectId,
-        team: HRA_CONVEX_TEAM_SLUG,
+        team: OOMPA_CONVEX_TEAM_SLUG,
       },
     ];
 
@@ -180,9 +180,9 @@ describe("numeric Convex target guard", () => {
       const fetcher: ConvexManagementFetch = async (input) => {
         if (String(input).includes("/team_and_project")) {
           return new Response(JSON.stringify({
-            project: "hra",
+            project: "oompa",
             projectId: target.projectId,
-            team: HRA_CONVEX_TEAM_SLUG,
+            team: OOMPA_CONVEX_TEAM_SLUG,
             teamId: target.teamId,
           }), { status: 200 });
         }
@@ -208,9 +208,9 @@ describe("numeric Convex target guard", () => {
       requests.push(url);
       if (url.includes("/team_and_project")) {
         return new Response(JSON.stringify({
-          project: "hra",
+          project: "oompa",
           projectId: target.projectId,
-          team: HRA_CONVEX_TEAM_SLUG,
+          team: OOMPA_CONVEX_TEAM_SLUG,
           teamId: target.teamId,
         }), { status: 200 });
       }
@@ -303,25 +303,25 @@ describe("numeric Convex target guard", () => {
       .toThrow("target_invalid");
     expect(() => parseConvexTarget({
       ...target,
-      teamId: HRA_CONVEX_TEAM_ID + 1,
+      teamId: OOMPA_CONVEX_TEAM_ID + 1,
     })).toThrow("target_invalid");
     expect(() => parseConvexTarget({
       ...target,
-      projectId: HRA_CONVEX_PROJECT_ID + 1,
+      projectId: OOMPA_CONVEX_PROJECT_ID + 1,
     })).toThrow("target_invalid");
     expect(() => parseConvexTargetArguments([
       ...targetArguments.slice(0, 3),
-      String(HRA_CONVEX_TEAM_ID + 1),
+      String(OOMPA_CONVEX_TEAM_ID + 1),
       ...targetArguments.slice(4),
     ])).toThrow("target_invalid");
     expect(() => parseConvexTargetArguments([
       ...targetArguments.slice(0, 5),
-      String(HRA_V0_CONVEX_PROJECT_ID),
+      String(OOMPA_V0_CONVEX_PROJECT_ID),
       ...targetArguments.slice(6),
     ])).toThrow("target_invalid");
     expect(() => parseConvexTargetArguments([
       ...targetArguments.slice(0, 7),
-      String(HRA_V0_CONVEX_DEPLOYMENT_ID),
+      String(OOMPA_V0_CONVEX_DEPLOYMENT_ID),
       ...targetArguments.slice(8),
     ])).toThrow("target_invalid");
   });

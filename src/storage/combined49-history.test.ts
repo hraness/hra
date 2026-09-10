@@ -154,7 +154,7 @@ const preserveHistory = async (
   }
   expect(/[A-Za-z]:\\Users\\/u.test(Buffer.from(bytes).toString("latin1"))).toBe(false);
 
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-combined49-history-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-combined49-history-")));
   let initializer: Database | undefined;
   try {
     const paths = resolveStatePaths({ rootDirectory: root });

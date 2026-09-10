@@ -199,7 +199,7 @@ describe("PidBoundDesktopAccountRuntime", () => {
 
 describe("parseDarwinProcArgs", () => {
   test("preserves spaces and duplicate reviewed environment bindings", () => {
-    const profileHome = ["", "Users", "person", "Library", "Application Support", "HRA", "profile"].join("/");
+    const profileHome = ["", "Users", "person", "Library", "Application Support", "Oompa", "profile"].join("/");
     const bytes = procArgsFixture({
       executablePath: instance.executablePath,
       arguments: [instance.executablePath],

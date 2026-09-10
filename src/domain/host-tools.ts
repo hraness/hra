@@ -10,17 +10,17 @@ import {
   utf8Bytes,
 } from "./values.ts";
 
-export const HRA_HOST_TOOL_MANIFEST_VERSION = 1 as const;
-export const HRA_HOST_TOOL_MANIFEST_ID = "hra.host-tools.v1" as const;
-export const HRA_HOST_TOOL_NAMESPACE = "hra" as const;
+export const OOMPA_HOST_TOOL_MANIFEST_VERSION = 1 as const;
+export const OOMPA_HOST_TOOL_MANIFEST_ID = "oompa.host-tools.v1" as const;
+export const OOMPA_HOST_TOOL_NAMESPACE = "oompa" as const;
 /** Exact UTF-8 ceiling shared by every provider transport and result paginator. */
-export const HRA_HOST_TOOL_PUBLIC_RESULT_MAX_BYTES = 64 * 1_024;
-/** Reserve space for HRA's immutable provenance and untrusted-input wrapper. */
-export const HRA_PEER_MESSAGE_MAX_BYTES = MESSAGE_MAX_BYTES - 4_096;
+export const OOMPA_HOST_TOOL_PUBLIC_RESULT_MAX_BYTES = 64 * 1_024;
+/** Reserve space for Oompa's immutable provenance and untrusted-input wrapper. */
+export const OOMPA_PEER_MESSAGE_MAX_BYTES = MESSAGE_MAX_BYTES - 4_096;
 /** Leaves room for Oh's physical `edition:` key prefix within its 512-character limit. */
-export const HRA_MEMORY_LOGICAL_KEY_MAX_LENGTH = 504;
+export const OOMPA_MEMORY_LOGICAL_KEY_MAX_LENGTH = 504;
 
-export const HRA_HOST_TOOL_NAMES = Object.freeze([
+export const OOMPA_HOST_TOOL_NAMES = Object.freeze([
   "automation_update",
   "sessions_list",
   "session_inspect",
@@ -31,7 +31,7 @@ export const HRA_HOST_TOOL_NAMES = Object.freeze([
   "memory_share",
 ] as const);
 
-export type HraHostToolName = (typeof HRA_HOST_TOOL_NAMES)[number];
+export type OompaHostToolName = (typeof OOMPA_HOST_TOOL_NAMES)[number];
 
 export type ConversationAutomationSchedule = Readonly<{
   kind: "interval_minutes";
@@ -59,19 +59,19 @@ export type ConversationAutomationOperation =
   | Readonly<{ mode: "list" }>
   | Readonly<{ mode: "delete"; id: string; revision: number }>;
 
-export type HraSessionsListInput = Readonly<{
+export type OompaSessionsListInput = Readonly<{
   cursor?: string;
   limit?: number;
 }>;
 
-export type HraSessionInspectInput = Readonly<{
+export type OompaSessionInspectInput = Readonly<{
   cursor?: string;
   expectedRevision: number;
   limit?: number;
   sessionId: string;
 }>;
 
-export type HraSessionMessageInput = Readonly<{
+export type OompaSessionMessageInput = Readonly<{
   delivery: "queue" | "send" | "steer";
   expectedRevision: number;
   message: string;
@@ -79,7 +79,7 @@ export type HraSessionMessageInput = Readonly<{
   sessionId: string;
 }>;
 
-export type HraMemoryRememberInput = Readonly<{
+export type OompaMemoryRememberInput = Readonly<{
   body: string;
   key: string;
   language?: string | undefined;
@@ -87,7 +87,7 @@ export type HraMemoryRememberInput = Readonly<{
   title: string;
 }>;
 
-export type HraMemoryQueryInput =
+export type OompaMemoryQueryInput =
   | Readonly<{
       continuation?: string | undefined;
       mode: "list";
@@ -106,32 +106,32 @@ export type HraMemoryQueryInput =
       text: string;
     }>;
 
-export type HraMemoryExplainInput = Readonly<{
+export type OompaMemoryExplainInput = Readonly<{
   queryId: string;
   row: number;
 }>;
 
-export type HraMemoryShareInput = Readonly<{
+export type OompaMemoryShareInput = Readonly<{
   key: string;
   reason: string;
 }>;
 
-export type HraHostToolRequest =
+export type OompaHostToolRequest =
   | Readonly<{ input: ConversationAutomationOperation; tool: "automation_update" }>
-  | Readonly<{ input: HraSessionsListInput; tool: "sessions_list" }>
-  | Readonly<{ input: HraSessionInspectInput; tool: "session_inspect" }>
-  | Readonly<{ input: HraSessionMessageInput; tool: "session_message" }>
-  | Readonly<{ input: HraMemoryRememberInput; tool: "memory_remember" }>
-  | Readonly<{ input: HraMemoryQueryInput; tool: "memory_query" }>
-  | Readonly<{ input: HraMemoryExplainInput; tool: "memory_explain" }>
-  | Readonly<{ input: HraMemoryShareInput; tool: "memory_share" }>;
+  | Readonly<{ input: OompaSessionsListInput; tool: "sessions_list" }>
+  | Readonly<{ input: OompaSessionInspectInput; tool: "session_inspect" }>
+  | Readonly<{ input: OompaSessionMessageInput; tool: "session_message" }>
+  | Readonly<{ input: OompaMemoryRememberInput; tool: "memory_remember" }>
+  | Readonly<{ input: OompaMemoryQueryInput; tool: "memory_query" }>
+  | Readonly<{ input: OompaMemoryExplainInput; tool: "memory_explain" }>
+  | Readonly<{ input: OompaMemoryShareInput; tool: "memory_share" }>;
 
-export type HraHostToolJsonSchema = Readonly<Record<string, unknown>>;
+export type OompaHostToolJsonSchema = Readonly<Record<string, unknown>>;
 
-export type HraHostToolDefinition = Readonly<{
+export type OompaHostToolDefinition = Readonly<{
   description: string;
-  inputSchema: HraHostToolJsonSchema;
-  name: HraHostToolName;
+  inputSchema: OompaHostToolJsonSchema;
+  name: OompaHostToolName;
 }>;
 
 const intervalMinutesJsonSchema = {
@@ -147,7 +147,7 @@ const intervalMinutesJsonSchema = {
 const memoryKeyJsonSchema = {
   type: "string",
   minLength: 1,
-  maxLength: HRA_MEMORY_LOGICAL_KEY_MAX_LENGTH,
+  maxLength: OOMPA_MEMORY_LOGICAL_KEY_MAX_LENGTH,
   pattern: "^[a-z][a-z0-9]*(?:[._:/-][a-z0-9]+)*$",
 } as const;
 
@@ -227,7 +227,7 @@ const hostToolDefinitions = [
   },
   {
     name: "sessions_list",
-    description: "List a bounded page of other HRA sessions in this session's current project.",
+    description: "List a bounded page of other Oompa sessions in this session's current project.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -239,7 +239,7 @@ const hostToolDefinitions = [
   },
   {
     name: "session_inspect",
-    description: "Read bounded provider-neutral state and transcript records for one current-project HRA session.",
+    description: "Read bounded provider-neutral state and transcript records for one current-project Oompa session.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -254,7 +254,7 @@ const hostToolDefinitions = [
   },
   {
     name: "session_message",
-    description: "Send or queue a message for, or steer the active turn of, one current-project HRA session.",
+    description: "Send or queue a message for, or steer the active turn of, one current-project Oompa session.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -263,7 +263,7 @@ const hostToolDefinitions = [
         sessionId: { type: "string", pattern: "^sess_[0-9a-f]{32}$" },
         expectedRevision: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
         delivery: { enum: ["send", "queue", "steer"] },
-        message: { type: "string", minLength: 1, maxLength: HRA_PEER_MESSAGE_MAX_BYTES },
+        message: { type: "string", minLength: 1, maxLength: OOMPA_PEER_MESSAGE_MAX_BYTES },
         reason: { type: "string", minLength: 1, maxLength: 1_024 },
       },
     },
@@ -354,7 +354,7 @@ const hostToolDefinitions = [
       },
     },
   },
-] as const satisfies readonly HraHostToolDefinition[];
+] as const satisfies readonly OompaHostToolDefinition[];
 
 const deepFreeze = <T>(value: T): Readonly<T> => {
   if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
@@ -364,12 +364,12 @@ const deepFreeze = <T>(value: T): Readonly<T> => {
   return value;
 };
 
-export const HRA_HOST_TOOL_MANIFEST = deepFreeze({
-  description: "Use HRA's session-bound coordination, memory, and scheduled-work services.",
-  id: HRA_HOST_TOOL_MANIFEST_ID,
-  namespace: HRA_HOST_TOOL_NAMESPACE,
+export const OOMPA_HOST_TOOL_MANIFEST = deepFreeze({
+  description: "Use Oompa's session-bound coordination, memory, and scheduled-work services.",
+  id: OOMPA_HOST_TOOL_MANIFEST_ID,
+  namespace: OOMPA_HOST_TOOL_NAMESPACE,
   tools: hostToolDefinitions,
-  version: HRA_HOST_TOOL_MANIFEST_VERSION,
+  version: OOMPA_HOST_TOOL_MANIFEST_VERSION,
 });
 
 const canonicalJson = (value: unknown): string => {
@@ -387,14 +387,14 @@ const canonicalJson = (value: unknown): string => {
 };
 
 /** Measure the exact provider-visible body using the shared canonical encoding. */
-export const hraHostToolPublicResultBytes = (value: unknown): number =>
+export const oompaHostToolPublicResultBytes = (value: unknown): number =>
   utf8Bytes(typeof value === "string" ? value : canonicalJson(value));
 
-export const digestHraHostToolManifest = (value: unknown): string =>
+export const digestOompaHostToolManifest = (value: unknown): string =>
   createHash("sha256").update(canonicalJson(value), "utf8").digest("hex");
 
-export const HRA_HOST_TOOL_MANIFEST_DIGEST = digestHraHostToolManifest(
-  HRA_HOST_TOOL_MANIFEST,
+export const OOMPA_HOST_TOOL_MANIFEST_DIGEST = digestOompaHostToolManifest(
+  OOMPA_HOST_TOOL_MANIFEST,
 );
 
 const automationNameSchema = z.string().min(1).max(160)
@@ -464,7 +464,7 @@ const modelText = (maximumBytes: number) => z.string().min(1).max(maximumBytes)
   .refine((value) => utf8Bytes(value) <= maximumBytes)
   .refine((value) => value.normalize("NFC") === value)
   .refine((value) => !hasDisallowedModelScalar(value) && !/\p{Cs}/u.test(value));
-const memoryKeySchema = z.string().min(1).max(HRA_MEMORY_LOGICAL_KEY_MAX_LENGTH)
+const memoryKeySchema = z.string().min(1).max(OOMPA_MEMORY_LOGICAL_KEY_MAX_LENGTH)
   .regex(/^[a-z][a-z0-9]*(?:[._:/-][a-z0-9]+)*$/u);
 const memoryContinuationSchema = z.string().min(1).max(4_096)
   .refine((value) => utf8Bytes(value) <= 4_096)
@@ -486,7 +486,7 @@ const inputSchemas = {
     sessionId: sessionIdSchema,
     expectedRevision: positiveRevisionSchema,
     delivery: z.enum(["send", "queue", "steer"]),
-    message: modelText(HRA_PEER_MESSAGE_MAX_BYTES),
+    message: modelText(OOMPA_PEER_MESSAGE_MAX_BYTES),
     reason: peerReasonSchema,
   }).strict(),
   memory_remember: z.object({
@@ -532,18 +532,18 @@ const inputSchemas = {
  * page, query, explanation, or nomination shape at one ingress would make the
  * coordinator's closed policy depend on which client called it.
  */
-export const hraMemoryRememberInputSchema = inputSchemas.memory_remember;
-export const hraMemoryQueryInputSchema = inputSchemas.memory_query;
-export const hraMemoryExplainInputSchema = inputSchemas.memory_explain;
-export const hraMemoryShareInputSchema = inputSchemas.memory_share;
+export const oompaMemoryRememberInputSchema = inputSchemas.memory_remember;
+export const oompaMemoryQueryInputSchema = inputSchemas.memory_query;
+export const oompaMemoryExplainInputSchema = inputSchemas.memory_explain;
+export const oompaMemoryShareInputSchema = inputSchemas.memory_share;
 
-export const isHraHostToolName = (value: unknown): value is HraHostToolName =>
-  typeof value === "string" && (HRA_HOST_TOOL_NAMES as readonly string[]).includes(value);
+export const isOompaHostToolName = (value: unknown): value is OompaHostToolName =>
+  typeof value === "string" && (OOMPA_HOST_TOOL_NAMES as readonly string[]).includes(value);
 
 /** Parse one provider-supplied call against the same closed contract that is advertised. */
-export function parseHraHostToolRequest(tool: unknown, value: unknown): HraHostToolRequest {
-  if (!isHraHostToolName(tool)) throw new TypeError("Unknown HRA host tool.");
+export function parseOompaHostToolRequest(tool: unknown, value: unknown): OompaHostToolRequest {
+  if (!isOompaHostToolName(tool)) throw new TypeError("Unknown Oompa host tool.");
   const parsed = inputSchemas[tool].safeParse(value);
-  if (!parsed.success) throw new TypeError("Invalid HRA host-tool input.");
-  return { tool, input: parsed.data } as HraHostToolRequest;
+  if (!parsed.success) throw new TypeError("Invalid Oompa host-tool input.");
+  return { tool, input: parsed.data } as OompaHostToolRequest;
 }

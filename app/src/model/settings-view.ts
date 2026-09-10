@@ -23,7 +23,7 @@ import {
   type MemorySummarySpace,
   type NotificationHoursPolicy,
   type ProfileBindingPayload,
-} from "../hra/cloud";
+} from "../oompa/cloud";
 import type { ApprovalMode, PresetChoice } from "./settings-commands";
 
 /**
@@ -46,8 +46,8 @@ export function personalSessionAdoptionCommand(
   enabled: boolean,
 ): string {
   return enabled
-    ? `hra session adoption disable --provider ${provider}`
-    : `hra session adoption enable <account> --provider ${provider}`;
+    ? `oompa session adoption disable --provider ${provider}`
+    : `oompa session adoption enable <account> --provider ${provider}`;
 }
 
 export type MachineDeviceState = Readonly<{
@@ -81,11 +81,11 @@ export function isMachineOnline(input: MachineOnlineInput): boolean {
   return age >= 0 && age <= registryHeartbeatToleranceMs;
 }
 
-export type ScheduledTaskKindLabel = "HRA";
+export type ScheduledTaskKindLabel = "Oompa";
 
 const scheduledTaskKindLabels: Readonly<
   Record<DeviceRegistryScheduledTask["kind"], ScheduledTaskKindLabel>
-> = { hra_conversation: "HRA" };
+> = { hra_conversation: "Oompa" };
 
 export function scheduledTaskKindLabel(
   kind: DeviceRegistryScheduledTask["kind"],
@@ -534,7 +534,7 @@ export function archivedSessionRows(
 }
 
 export type AccountRowView = Readonly<{
-  /** The machine's local opt-in: `hra remote allow account-linking`. */
+  /** The machine's local opt-in: `oompa remote allow account-linking`. */
   accountLinkingAllowed: boolean;
   /** The machine-wide device-command kill switch. */
   deviceCommandsAllowed: boolean;

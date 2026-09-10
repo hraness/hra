@@ -137,7 +137,7 @@ function corrupt(path: string, table: string, change: (db: Database) => void) {
 }
 
 async function fixture(kind: SourceKind, restarts = 1, resources: LineageResources = { roots, stores }) {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-message-lineage-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-message-lineage-")));
   resources.roots.push(root);
   const paths = resolveStatePaths({ homeDirectory: root, platform: "darwin" });
   await initializeStatePaths(paths);

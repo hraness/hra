@@ -1,14 +1,14 @@
-# HRA
+# Oompa
 
-`@hraness/hra` supplies the `hra` command and local daemon. It manages isolated Codex and Claude Code profiles, durable sessions and command records, and optional encrypted sync. Provider tools own authentication and execution; HRA does not broker model access.
+`@hraness/oompa` supplies the `oompa` command and local daemon. It manages isolated Codex and Claude Code profiles, durable sessions and command records, and optional encrypted sync. Provider tools own authentication and execution; Oompa does not broker model access.
 
 Local CLI v0.8.0 is a release candidate, not an admitted artifact; v0.7.1 remains the fully admitted public artifact. Current daemon and hosted command-writer rollout remains blocked on capacity.
 
-[CLI reference](https://hra.sh/docs/reference/) · [Availability](https://hra.sh/docs/status/)
+[CLI reference](https://oompa.app/docs/reference/) · [Availability](https://oompa.app/docs/status/)
 
 ## Requirements
 
-Use Bun 1.3.14. Codex execution supports macOS and Linux; Claude Code execution supports Linux. The pinned provider runtimes are Codex 0.153.2 and Claude Code 2.1.260. The local CLI does not need an HRA cloud identity. Optional encrypted sync requires a paired machine and browser; its open-beta availability does not authorize daemon startup or hosted command writers.
+Use Bun 1.3.14. Codex execution supports macOS and Linux; Claude Code execution supports Linux. The pinned provider runtimes are Codex 0.153.2 and Claude Code 2.1.260. The local CLI does not need an Oompa cloud identity. Optional encrypted sync requires a paired machine and browser; its open-beta availability does not authorize daemon startup or hosted command writers.
 
 ## Get started
 
@@ -21,42 +21,42 @@ The v0.8.0 candidate is not yet admitted. For the admitted v0.7.1 artifact, use 
 Only after immutable GitHub release admission, install and verify the v0.8.0 candidate CLI artifact. This does not start the daemon:
 
 ```sh
-test "$(unset BUN_OPTIONS NODE_OPTIONS LD_AUDIT LD_LIBRARY_PATH LD_ORIGIN_PATH LD_PRELOAD DYLD_FALLBACK_FRAMEWORK_PATH DYLD_FALLBACK_LIBRARY_PATH DYLD_FRAMEWORK_PATH DYLD_IMAGE_SUFFIX DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_ROOT_PATH DYLD_VERSIONED_FRAMEWORK_PATH DYLD_VERSIONED_LIBRARY_PATH && curl -fsSL --connect-timeout 10 --max-time 60 --max-filesize 524288 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.8.0/src/install-preflight-runtime.ts | command bun --no-env-file --config=/dev/null -e 'const n=["BUN_OPTIONS","NODE_OPTIONS","LD_AUDIT","LD_LIBRARY_PATH","LD_ORIGIN_PATH","LD_PRELOAD","DYLD_FALLBACK_FRAMEWORK_PATH","DYLD_FALLBACK_LIBRARY_PATH","DYLD_FRAMEWORK_PATH","DYLD_IMAGE_SUFFIX","DYLD_INSERT_LIBRARIES","DYLD_LIBRARY_PATH","DYLD_ROOT_PATH","DYLD_VERSIONED_FRAMEWORK_PATH","DYLD_VERSIONED_LIBRARY_PATH"],x=process.execArgv;const c=x.filter(v=>v==="-c"||v.startsWith("--config"));if(n.some(k=>process.env[k]!==undefined)||x.filter(v=>v==="--no-env-file").length!==1||c.length!==1||c[0]!=="--config=/dev/null"||x.some(v=>v.startsWith("-r")||v==="--preload"||v.startsWith("--preload=")||v==="--require"||v.startsWith("--require=")||v==="--import"||v.startsWith("--import=")||v==="--env-file"||v.startsWith("--env-file=")))throw new Error("The tagged HRA preflight requires a neutral Bun stage zero.");const[a,h]=process.argv.slice(1);const r=Bun.stdin.stream().getReader(),q=[];let z=0;try{for(;;){const o=await r.read();if(o.done)break;z+=o.value.byteLength;if(z>524288)throw new Error("The tagged HRA preflight exceeds its byte limit.");q.push(o.value)}}finally{r.releaseLock()}const b=new Uint8Array(z);let p=0;for(const v of q){b.set(v,p);p+=v.byteLength}const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.8.0/hraness-hra-0.8.0.tgz 77ec0042b78e5014d11fe044867c41e3818553e85be78d61bbc9671e0b980f7a)" = hra-install-safe
+test "$(unset BUN_OPTIONS NODE_OPTIONS LD_AUDIT LD_LIBRARY_PATH LD_ORIGIN_PATH LD_PRELOAD DYLD_FALLBACK_FRAMEWORK_PATH DYLD_FALLBACK_LIBRARY_PATH DYLD_FRAMEWORK_PATH DYLD_IMAGE_SUFFIX DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_ROOT_PATH DYLD_VERSIONED_FRAMEWORK_PATH DYLD_VERSIONED_LIBRARY_PATH && curl -fsSL --connect-timeout 10 --max-time 60 --max-filesize 524288 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/oompa/v0.8.0/src/install-preflight-runtime.ts | command bun --no-env-file --config=/dev/null -e 'const n=["BUN_OPTIONS","NODE_OPTIONS","LD_AUDIT","LD_LIBRARY_PATH","LD_ORIGIN_PATH","LD_PRELOAD","DYLD_FALLBACK_FRAMEWORK_PATH","DYLD_FALLBACK_LIBRARY_PATH","DYLD_FRAMEWORK_PATH","DYLD_IMAGE_SUFFIX","DYLD_INSERT_LIBRARIES","DYLD_LIBRARY_PATH","DYLD_ROOT_PATH","DYLD_VERSIONED_FRAMEWORK_PATH","DYLD_VERSIONED_LIBRARY_PATH"],x=process.execArgv;const c=x.filter(v=>v==="-c"||v.startsWith("--config"));if(n.some(k=>process.env[k]!==undefined)||x.filter(v=>v==="--no-env-file").length!==1||c.length!==1||c[0]!=="--config=/dev/null"||x.some(v=>v.startsWith("-r")||v==="--preload"||v.startsWith("--preload=")||v==="--require"||v.startsWith("--require=")||v==="--import"||v.startsWith("--import=")||v==="--env-file"||v.startsWith("--env-file=")))throw new Error("The tagged Oompa preflight requires a neutral Bun stage zero.");const[a,h]=process.argv.slice(1);const r=Bun.stdin.stream().getReader(),q=[];let z=0;try{for(;;){const o=await r.read();if(o.done)break;z+=o.value.byteLength;if(z>524288)throw new Error("The tagged Oompa preflight exceeds its byte limit.");q.push(o.value)}}finally{r.releaseLock()}const b=new Uint8Array(z);let p=0;for(const v of q){b.set(v,p);p+=v.byteLength}const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged Oompa preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installOompaRelease(a);process.stdout.write(`${m.OOMPA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/oompa/releases/download/v0.8.0/hraness-oompa-0.8.0.tgz 77ec0042b78e5014d11fe044867c41e3818553e85be78d61bbc9671e0b980f7a)" = hra-install-safe
 ```
 
 ```sh
-hra doctor --offline
+oompa doctor --offline
 ```
 
 > **Before initialization:** Current daemon and hosted command-writer rollout remains blocked on capacity. Do not initialize, start, or autostart either the admitted v0.7.1 daemon or the v0.8.0 candidate until the hosted operator records protected two-pass zero-debt capacity evidence and its exact .activated readback receipt. Artifact availability and the live sync service do not clear this gate. After activation, complete the update runbook's daemon and target marker-2 proofs before globally enabling hosted writers.
 
-Continue with the [setup guide](https://hra.sh/docs/start/). For an existing installation, use the [ordered update runbook](https://hra.sh/docs/status/#install-and-update).
+Continue with the [setup guide](https://oompa.app/docs/start/). For an existing installation, use the [ordered update runbook](https://oompa.app/docs/status/#install-and-update).
 
 ## CLI usage
 
 These examples require a machine whose setup and rollout prerequisites are satisfied.
 
-- `hra session start personal --provider codex --json` starts a session under the selected account profile.
-- `hra session status <session-id> --json` reads session status and its event cursor.
-- `hra session switch <session-id> --provider claude --preset fable-max` requests a provider switch using retained conversation history. It requires a signed-in Claude Code profile and reports missing history.
-- `hra session send <session-id> -- "Review this project."` sends a request to the session's current provider.
+- `oompa session start personal --provider codex --json` starts a session under the selected account profile.
+- `oompa session status <session-id> --json` reads session status and its event cursor.
+- `oompa session switch <session-id> --provider claude --preset fable-max` requests a provider switch using retained conversation history. It requires a signed-in Claude Code profile and reports missing history.
+- `oompa session send <session-id> -- "Review this project."` sends a request to the session's current provider.
 
-Use `hra --help` for command groups and `--json` for structured output. Inspect an uncertain mutation before retrying it; do not replay a failed or ambiguous request under another account.
+Use `oompa --help` for command groups and `--json` for structured output. Inspect an uncertain mutation before retrying it; do not replay a failed or ambiguous request under another account.
 
 ## Local execution, optional encrypted sync
 
 The local daemon owns session execution on one machine. Managed profiles have separate configuration. Synced session content is encrypted for paired devices; the service still receives account and delivery metadata. Provider credentials and raw reasoning are not sync payloads.
 
-Read the [privacy policy](https://github.com/hraness/hra/blob/main/PRIVACY.md) for the local, synced, and website data boundaries.
+Read the [privacy policy](https://github.com/hraness/oompa/blob/main/PRIVACY.md) for the local, synced, and website data boundaries.
 
 ## Package contents
 
 The npm archive contains CLI and daemon source, this package README, the license, and third-party notices. Website assets and website-authored content are not package inputs. The package has no install lifecycle scripts; runtime dependencies are exact public registry versions.
 
-An interrupted installer must be recovered using its exact originating release. Do not edit or delete its durable intent, receipt, staging directory, or previous installation. Follow the [ordered update runbook](https://hra.sh/docs/status/#install-and-update) and stop if exact recovery cannot be established.
+An interrupted installer must be recovered using its exact originating release. Do not edit or delete its durable intent, receipt, staging directory, or previous installation. Follow the [ordered update runbook](https://oompa.app/docs/status/#install-and-update) and stop if exact recovery cannot be established.
 
 ## Project
 
-HRA is maintained by [Hraness](https://hraness.com/) and published under the MIT license.
+Oompa is maintained by [Hraness](https://hraness.com/) and published under the MIT license.
 
-[Contributing](https://github.com/hraness/hra/blob/main/CONTRIBUTING.md) · [Security policy](https://github.com/hraness/hra/blob/main/SECURITY.md) · [Release notes](https://github.com/hraness/hra/blob/main/docs/beta-release-notes.md)
+[Contributing](https://github.com/hraness/oompa/blob/main/CONTRIBUTING.md) · [Security policy](https://github.com/hraness/oompa/blob/main/SECURITY.md) · [Release notes](https://github.com/hraness/oompa/blob/main/docs/beta-release-notes.md)

@@ -50,7 +50,7 @@ type CapsuleRow = z.infer<typeof rowSchema>;
 const fail: () => never = () => { throw new Error("SESSION_SWITCH_ADOPTION_CUSTODY_CORRUPT"); };
 const digest = (kind: CapsuleRow["kind"], origin: string, capsule: string | null): string =>
   createHash("sha256").update(JSON.stringify([
-    "hra:session-switch-adoption:v1", kind, origin, capsule,
+    "oompa:session-switch-adoption:v1", kind, origin, capsule,
   ])).digest("hex");
 
 // These are immutable parent fields. Malformed private-cohort journals retain

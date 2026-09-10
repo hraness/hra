@@ -115,7 +115,7 @@ import {
   type PinnedClaudeRuntime,
   type ResolvePinnedClaudeRuntimeOptions,
 } from "./claude/index";
-import type { HraHostToolCall } from "./codex/protocol";
+import type { OompaHostToolCall } from "./codex/protocol";
 import { localCommandSchema, type CommandResponse, type LocalCommand } from "./domain/contracts";
 import { adoptableProviderSchema, type Provider } from "./domain/presets";
 import {
@@ -187,7 +187,7 @@ import {
   createPersonalClaudeDiscoveryAdapters,
   type ClaudeProcessLivenessProbe,
 } from "./daemon/personal-session-discovery";
-import { HraFactsMemoryLifecycle } from "./daemon/facts-memory-lifecycle";
+import { OompaFactsMemoryLifecycle } from "./daemon/facts-memory-lifecycle";
 import {
   UnavailableCloudControl,
   type CloudControlPort,
@@ -195,14 +195,14 @@ import {
   type ProfileAuthority,
 } from "./daemon/ports";
 import { SessionEventCursorCodec } from "./daemon/session-event-cursor";
-import { CommandFailure, HraService } from "./daemon/service";
+import { CommandFailure, OompaService } from "./daemon/service";
 import { AccountUsagePoller } from "./daemon/usage-poller";
 import { UsageHistoryCursorCodec } from "./daemon/usage-history-cursor";
 import { ExactChatGptBundlePort, LocalDesktopSwitchPort, PidBoundDesktopAccountRuntime } from "./desktop/index";
 import {
   assertInstallationHome,
   createProductionInstallation,
-  type HraInstallation,
+  type OompaInstallation,
 } from "./installation";
 import {
   initializeStatePaths,
@@ -220,7 +220,7 @@ import { AiGatewayProseResponder } from "./daemon/prose-responder";
 import type { GenerationalSecretCustody } from "./storage/secret-custody";
 import { StateStore } from "./storage/state-store";
 import { WorkCapabilityCodec } from "./storage/work-capability";
-import { HRA_VERSION } from "./version";
+import { OOMPA_VERSION } from "./version";
 import { ClaudeLaunchIntentLivenessProbe } from "./claude/process";
 
 const writeProcessStdoutAsync = (value: string, signal: AbortSignal): Promise<void> =>
@@ -693,7 +693,7 @@ export const readHiddenProtectedLineFromTerminal = async (
     discardReadableNow(input);
   } catch {
     const noticeVisible = bestEffortStderr(output,
-      "Protected input cannot prove an empty terminal queue. HRA will discard input until EOF; press Ctrl-D to return safely.\n",
+      "Protected input cannot prove an empty terminal queue. Oompa will discard input until EOF; press Ctrl-D to return safely.\n",
     );
     if (!noticeVisible || await discardReadableUntilEnd(input, signal) === "aborted") {
       input.pause();
@@ -775,7 +775,7 @@ export const readHiddenProtectedLineFromTerminal = async (
       // Fencing the stream below does not depend on a successful final flush.
     }
     bestEffortStderr(output,
-      "Protected terminal input could not disable echo. HRA closed this shell input before reading protected bytes.\n");
+      "Protected terminal input could not disable echo. Oompa closed this shell input before reading protected bytes.\n");
     input.pause();
     (input as NodeJS.ReadableStream & { destroy?: () => void }).destroy?.();
     throw new CliUsageError("Protected terminal input could not establish raw no-echo mode.");
@@ -801,7 +801,7 @@ export const readHiddenProtectedLineFromTerminal = async (
         if (readinessAttempts >= 8 || readinessBytes > 8 * 1_024) {
           beginPhraseBytes.fill(0);
           bestEffortStderr(output,
-            "\nhra: Protected-input readiness could not prove a human handoff. HRA will discard input until EOF; press Ctrl-D to return safely.\n");
+            "\nhra: Protected-input readiness could not prove a human handoff. Oompa will discard input until EOF; press Ctrl-D to return safely.\n");
           throw new CliUsageError("Protected terminal input could not establish a bounded readiness handoff.");
         }
         writeRequiredPrompt(`\nhra: Queued input was discarded. Type ${beginPhrase} and press Enter: `);
@@ -816,7 +816,7 @@ export const readHiddenProtectedLineFromTerminal = async (
         throw new CliUsageError("Protected terminal input ended before a document was received.");
       }
       bestEffortStderr(output,
-        "\nhra: Protected-input readiness exceeded its bound. HRA will discard input until EOF; press Ctrl-D to return safely.\n");
+        "\nhra: Protected-input readiness exceeded its bound. Oompa will discard input until EOF; press Ctrl-D to return safely.\n");
       throw new CliUsageError("Protected-input readiness exceeded its bounded line size.");
     }
     beginPhraseBytes.fill(0);
@@ -829,7 +829,7 @@ export const readHiddenProtectedLineFromTerminal = async (
     }
     if (quiet === "continuous") {
       bestEffortStderr(output,
-        "\nhra: Protected input did not become quiet. HRA will discard input until EOF; press Ctrl-D to return safely.\n");
+        "\nhra: Protected input did not become quiet. Oompa will discard input until EOF; press Ctrl-D to return safely.\n");
       throw new CliUsageError("Protected terminal input could not establish a quiet input boundary.");
     }
     discardReadableNow(input);
@@ -838,7 +838,7 @@ export const readHiddenProtectedLineFromTerminal = async (
       discardReadableNow(input);
     } catch {
       bestEffortStderr(output,
-        "\nhra: Protected input cannot prove an empty terminal queue. HRA will discard input until EOF; press Ctrl-D to return safely.\n");
+        "\nhra: Protected input cannot prove an empty terminal queue. Oompa will discard input until EOF; press Ctrl-D to return safely.\n");
       throw new CliUsageError("Protected terminal input could not establish an empty input queue.");
     }
     writeRequiredPrompt("\nProtected JSON input (hidden): ");
@@ -848,7 +848,7 @@ export const readHiddenProtectedLineFromTerminal = async (
       const resumePhrase = `RESUME-${randomUUID().slice(0, 6).toUpperCase()}`;
       const resumePhraseBytes = Buffer.from(resumePhrase, "utf8");
       writeRequiredPrompt(
-        `\nProtected input captured. Type ${resumePhrase} and press Enter to return to HRA (input remains hidden): `,
+        `\nProtected input captured. Type ${resumePhrase} and press Enter to return to Oompa (input remains hidden): `,
       );
       let handoffAttempts = 0;
       let handoffBytes = 0;
@@ -864,7 +864,7 @@ export const readHiddenProtectedLineFromTerminal = async (
             resumePhraseBytes.fill(0);
             answer.bytes.fill(0);
             bestEffortStderr(output,
-              "\nhra: Protected-input return could not prove a human handoff. HRA will discard input until EOF; press Ctrl-D to return safely.\n");
+              "\nhra: Protected-input return could not prove a human handoff. Oompa will discard input until EOF; press Ctrl-D to return safely.\n");
             throw new CliUsageError("Protected terminal input could not establish a bounded return handoff.");
           }
           writeRequiredPrompt(`\nhra: Trailing input was discarded. Type ${resumePhrase} and press Enter: `);
@@ -880,7 +880,7 @@ export const readHiddenProtectedLineFromTerminal = async (
           throw new CliUsageError("Protected terminal input ended before custody was returned.");
         }
         bestEffortStderr(output,
-          "\nhra: Protected-input handoff exceeded its bound. HRA will discard input until EOF; press Ctrl-D to return safely.\n");
+          "\nhra: Protected-input handoff exceeded its bound. Oompa will discard input until EOF; press Ctrl-D to return safely.\n");
         throw new CliUsageError("Protected terminal input could not establish a bounded handoff.");
       }
       resumePhraseBytes.fill(0);
@@ -904,7 +904,7 @@ export const readHiddenProtectedLineFromTerminal = async (
       if (trailing === "continuous") {
         answer.bytes.fill(0);
         bestEffortStderr(output,
-          "\nhra: Protected input retained a continuing tail. HRA will discard input until EOF; press Ctrl-D to return safely.\n");
+          "\nhra: Protected input retained a continuing tail. Oompa will discard input until EOF; press Ctrl-D to return safely.\n");
         throw new CliUsageError("Protected terminal input could not establish a quiet trailing boundary.");
       }
       discardReadableNow(input);
@@ -914,7 +914,7 @@ export const readHiddenProtectedLineFromTerminal = async (
       } catch {
         answer.bytes.fill(0);
         bestEffortStderr(output,
-          "\nhra: Protected input cannot prove an empty trailing queue. HRA will discard input until EOF; press Ctrl-D to return safely.\n");
+          "\nhra: Protected input cannot prove an empty trailing queue. Oompa will discard input until EOF; press Ctrl-D to return safely.\n");
         throw new CliUsageError("Protected terminal input could not establish an empty trailing queue.");
       }
       releaseAnswer = true;
@@ -929,7 +929,7 @@ export const readHiddenProtectedLineFromTerminal = async (
       throw new CliUsageError("Protected terminal input ended before a document was received.");
     }
     bestEffortStderr(output,
-      "\nhra: Protected input exceeded its bound. HRA will discard input until EOF; press Ctrl-D to return safely.\n");
+      "\nhra: Protected input exceeded its bound. Oompa will discard input until EOF; press Ctrl-D to return safely.\n");
     throw new CliUsageError(`Protected input exceeds ${String(protectedInputMaximumBytes)} UTF-8 bytes.`);
   } catch (error: unknown) {
     const state = input as NodeJS.ReadableStream & { destroyed?: unknown; readableEnded?: unknown };
@@ -955,7 +955,7 @@ export const readHiddenProtectedLineFromTerminal = async (
       }
       if (!boundaryProved) {
         bestEffortStderr(output,
-          "\nhra: Protected input could not prove a quiet signal boundary. HRA closed this shell input without re-signalling.\n");
+          "\nhra: Protected input could not prove a quiet signal boundary. Oompa closed this shell input without re-signalling.\n");
         failure = new CliUsageError(
           "Protected terminal input could not establish a quiet signal boundary.",
         );
@@ -968,7 +968,7 @@ export const readHiddenProtectedLineFromTerminal = async (
       const immediateFence = !displayState.requiredAvailable || abortRequested(signal);
       if (!immediateFence) {
         bestEffortStderr(output,
-          "\nhra: Protected input remains hidden while HRA discards its tail. Press Ctrl-D or Ctrl-C; HRA will then close this shell input safely.\n");
+          "\nhra: Protected input remains hidden while Oompa discards its tail. Press Ctrl-D or Ctrl-C; Oompa will then close this shell input safely.\n");
         const exit = await discardRawTerminalUntilExit(input, signal);
         if (exit === "suspended") {
           failure = new ProtectedTerminalRawSignalRequest("SIGTSTP");
@@ -1118,7 +1118,7 @@ export const withProtectedTerminalLifecycle = async <T>(
 class CursorAuthorityMissingError extends Error {
   constructor() {
     super(
-      "Session event cursor authority is missing for existing HRA state. Restore the original local secret before starting the daemon.",
+      "Session event cursor authority is missing for existing Oompa state. Restore the original local secret before starting the daemon.",
     );
     this.name = "CursorAuthorityMissingError";
   }
@@ -1215,7 +1215,7 @@ type ProjectionRecoverySummary =
     }>
   | Readonly<{
       idempotencyKey: string;
-      nextCommand: "hra sync status --json";
+      nextCommand: "oompa sync status --json";
       phase: "rejected";
       rejectionCode: string;
       sameKeyReplay: Readonly<{
@@ -1257,8 +1257,8 @@ export type DaemonReadyStatus = Readonly<{
 }>;
 
 export type CliMainInput = Readonly<{
-  installation?: HraInstallation;
-  startDaemon?: (installation: HraInstallation) => Promise<DaemonReadyStatus>;
+  installation?: OompaInstallation;
+  startDaemon?: (installation: OompaInstallation) => Promise<DaemonReadyStatus>;
   statePaths?: StatePaths;
   callDaemon?: (command: LocalCommand, signal?: AbortSignal) => Promise<CommandResponse>;
   daemonStopDependencies?: DaemonStopDependencies;
@@ -1322,8 +1322,8 @@ const daemonStopRecovery = (
       kind: "failure",
       error: {
         code: "RECOVERY_REQUIRED",
-        message: "The daemon released authority in a failed state. Run `hra doctor --offline` before restarting it.",
-        details: { nextCommand: "hra doctor --offline" },
+        message: "The daemon released authority in a failed state. Run `oompa doctor --offline` before restarting it.",
+        details: { nextCommand: "oompa doctor --offline" },
       },
     };
   }
@@ -1332,8 +1332,8 @@ const daemonStopRecovery = (
       kind: "failure",
       error: {
         code: "RECOVERY_REQUIRED",
-        message: "The daemon authority changed while HRA was confirming shutdown. The replacement was not stopped; inspect `hra daemon status --json` before retrying.",
-        details: { nextCommand: "hra daemon status --json" },
+        message: "The daemon authority changed while Oompa was confirming shutdown. The replacement was not stopped; inspect `oompa daemon status --json` before retrying.",
+        details: { nextCommand: "oompa daemon status --json" },
       },
     };
   }
@@ -1341,8 +1341,8 @@ const daemonStopRecovery = (
     kind: "failure",
     error: {
       code: "RECOVERY_REQUIRED",
-      message: "HRA could not prove that the exact daemon authority stopped and released. Inspect `hra daemon status --json` before retrying.",
-      details: { nextCommand: "hra daemon status --json" },
+      message: "Oompa could not prove that the exact daemon authority stopped and released. Inspect `oompa daemon status --json` before retrying.",
+      details: { nextCommand: "oompa daemon status --json" },
     },
   };
 };
@@ -1358,9 +1358,9 @@ const daemonStopAuthorityRecovery = (
   kind: "failure",
   error: {
     code: "RECOVERY_REQUIRED",
-    message: "The local daemon authority could not be safely verified. Run `hra doctor --offline` before taking further action.",
+    message: "The local daemon authority could not be safely verified. Run `oompa doctor --offline` before taking further action.",
     details: {
-      nextCommand: "hra doctor --offline",
+      nextCommand: "oompa doctor --offline",
       authorityPhase: progress.authorityPhase,
       stopRequestState: progress.stopRequestState,
     },
@@ -2081,7 +2081,7 @@ function parseProjectionRecoverySummary(
   ) return null;
   return {
     idempotencyKey: invocation.command.idempotencyKey,
-    nextCommand: "hra sync status --json",
+    nextCommand: "oompa sync status --json",
     phase: "rejected",
     rejectionCode: boundedUtf8Text(sanitizeSyncDiagnostic(value.rejectionCode), 128),
     sameKeyReplay,
@@ -2139,8 +2139,8 @@ function renderProjectionRecoveryFailure(
   const nextCommand = (() => {
     if (!isRecord(error.details)) return null;
     try {
-      return error.details.nextCommand === "hra sync status --json"
-        ? "hra sync status --json" as const
+      return error.details.nextCommand === "oompa sync status --json"
+        ? "oompa sync status --json" as const
         : null;
     } catch {
       return null;
@@ -2184,7 +2184,7 @@ export const daemonRunProcessOptions = (
   };
 };
 
-async function startDaemonProcess(installation: HraInstallation): Promise<DaemonReadyStatus> {
+async function startDaemonProcess(installation: OompaInstallation): Promise<DaemonReadyStatus> {
   assertInstallationHome(installation);
   if (installation.kind !== "production") {
     throw new Error("A live-acceptance daemon must be started by its source-only worker.");
@@ -2238,18 +2238,18 @@ const initializationRequired = (
 ): CommandFailure => new CommandFailure(
   "INTERACTION_REQUIRED",
   operation === "daemon"
-    ? "Initialize HRA before starting its daemon."
-    : "Initialize HRA before reading local status.",
-  { nextCommand: "hra init --yes" },
+    ? "Initialize Oompa before starting its daemon."
+    : "Initialize Oompa before reading local status.",
+  { nextCommand: "oompa init --yes" },
 );
 
 const unprovenLocalState = (operation: "daemon" | "local_status"): CommandFailure =>
   new CommandFailure(
     "RECOVERY_REQUIRED",
     operation === "daemon"
-      ? "HRA could not prove that local state is initialized. Inspect it before starting the daemon."
-      : "HRA could not prove that local state is initialized. Inspect it before reading local status.",
-    { nextCommand: "hra doctor --offline" },
+      ? "Oompa could not prove that local state is initialized. Inspect it before starting the daemon."
+      : "Oompa could not prove that local state is initialized. Inspect it before reading local status.",
+    { nextCommand: "oompa doctor --offline" },
   );
 
 // A store opened read-only reports a schema difference instead of migrating it.
@@ -2285,14 +2285,14 @@ const stateErrorShortCode = (error: unknown): string | null => {
 const stateSchemaNewerFailure = (mismatch: StateSchemaMismatch): CommandFailure =>
   new CommandFailure(
     "RECOVERY_REQUIRED",
-    `This HRA build is older than the local state schema (${mismatch.found} vs ${mismatch.expected}); install the newer HRA.`,
+    `This Oompa build is older than the local state schema (${mismatch.found} vs ${mismatch.expected}); install the newer Oompa.`,
   );
 
 const stateSchemaMigrationPending = (mismatch: StateSchemaMismatch): CommandFailure =>
   new CommandFailure(
     "RECOVERY_REQUIRED",
     `The local state schema needs a migration (${mismatch.found} to ${mismatch.expected}); start the daemon to migrate it.`,
-    { nextCommand: "hra daemon start" },
+    { nextCommand: "oompa daemon start" },
   );
 
 // One read-only initialization proof. A schema difference is returned as data so
@@ -2321,9 +2321,9 @@ function proveInitializedStateOnce(
     throw new CommandFailure(
       "RECOVERY_REQUIRED",
       operation === "daemon"
-        ? "HRA could not close its initialization inspection safely. Inspect local state before starting the daemon."
-        : "HRA could not close its initialization inspection safely. Inspect local state before reading local status.",
-      { nextCommand: "hra doctor --offline" },
+        ? "Oompa could not close its initialization inspection safely. Inspect local state before starting the daemon."
+        : "Oompa could not close its initialization inspection safely. Inspect local state before reading local status.",
+      { nextCommand: "oompa doctor --offline" },
     );
   }
   if (inspectionFailure !== undefined) throw inspectionFailure;
@@ -2342,8 +2342,8 @@ function migrateLocalStateSchema(paths: StatePaths): void {
     if (mismatch !== null && mismatch.kind === "newer") throw stateSchemaNewerFailure(mismatch);
     throw new CommandFailure(
       "RECOVERY_REQUIRED",
-      "HRA could not migrate local state to the schema this build requires. Inspect it before starting the daemon.",
-      { nextCommand: "hra doctor --offline" },
+      "Oompa could not migrate local state to the schema this build requires. Inspect it before starting the daemon.",
+      { nextCommand: "oompa doctor --offline" },
     );
   }
   try {
@@ -2351,8 +2351,8 @@ function migrateLocalStateSchema(paths: StatePaths): void {
   } catch {
     throw new CommandFailure(
       "RECOVERY_REQUIRED",
-      "HRA could not close its local state migration safely. Inspect local state before starting the daemon.",
-      { nextCommand: "hra doctor --offline" },
+      "Oompa could not close its local state migration safely. Inspect local state before starting the daemon.",
+      { nextCommand: "oompa doctor --offline" },
     );
   }
 }
@@ -2384,10 +2384,10 @@ async function requireInitializedDaemonState(
 }
 
 async function callWithAutostart(
-  installation: HraInstallation,
+  installation: OompaInstallation,
   command: LocalCommand,
   signal?: AbortSignal,
-  injectedStart?: (installation: HraInstallation) => Promise<DaemonReadyStatus>,
+  injectedStart?: (installation: OompaInstallation) => Promise<DaemonReadyStatus>,
 ): Promise<Awaited<ReturnType<typeof callLocalDaemon>>> {
   assertInstallationHome(installation);
   const paths = installation.paths;
@@ -2416,7 +2416,7 @@ export async function initialize(
   if (!yes) {
     return renderFailure({
       code: "INTERACTION_REQUIRED",
-      message: "Confirm the default Documents project with `hra init --yes`.",
+      message: "Confirm the default Documents project with `oompa init --yes`.",
     }, json, output);
   }
   await initializeStatePaths(paths);
@@ -2431,14 +2431,14 @@ export async function initialize(
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
           return renderFailure({
             code: "UNAVAILABLE",
-            message: "The default Documents project could not be created. Create a readable, writable, and traversable canonical Documents directory, then run `hra init --yes` again.",
+            message: "The default Documents project could not be created. Create a readable, writable, and traversable canonical Documents directory, then run `oompa init --yes` again.",
           }, json, output);
         }
       }
       if (await resolveUsableCanonicalProjectDirectory(documents) === null) {
         return renderFailure({
           code: "UNAVAILABLE",
-          message: "The default Documents project is not a readable, writable, and traversable canonical directory. Repair it, then run `hra init --yes` again.",
+          message: "The default Documents project is not a readable, writable, and traversable canonical directory. Repair it, then run `oompa init --yes` again.",
         }, json, output);
       }
       return null;
@@ -2466,9 +2466,9 @@ export async function initialize(
       await store.createProject("Documents", documents, true);
       projectCreated = true;
     }
-    const data = { initialized: true, stateRoot: paths.root, defaultProjectCreated: projectCreated, next: "hra account add Personal" };
+    const data = { initialized: true, stateRoot: paths.root, defaultProjectCreated: projectCreated, next: "oompa account add Personal" };
     if (json) output.writeStdout(`${safeJson({ ok: true, version: 1, data })}\n`);
-    else output.writeStdout(`HRA is ready.\n\nNext: ${data.next}\n`);
+    else output.writeStdout(`Oompa is ready.\n\nNext: ${data.next}\n`);
     return 0;
   } finally {
     try { store?.close(); } finally { await authority.release(); }
@@ -2483,8 +2483,8 @@ const localDatabaseProblem = (error: unknown): string => {
   const mismatch = stateSchemaMismatch(error);
   if (mismatch !== null) {
     return mismatch.kind === "migration_required"
-      ? `The local state schema needs a migration (${mismatch.found} to ${mismatch.expected}). Run \`hra daemon start\` to migrate it.`
-      : `This HRA build is older than the local state schema (${mismatch.found} vs ${mismatch.expected}). Install the newer HRA.`;
+      ? `The local state schema needs a migration (${mismatch.found} to ${mismatch.expected}). Run \`oompa daemon start\` to migrate it.`
+      : `This Oompa build is older than the local state schema (${mismatch.found} vs ${mismatch.expected}). Install the newer Oompa.`;
   }
   const code = stateErrorShortCode(error);
   return code === null
@@ -2542,16 +2542,16 @@ async function offlineDoctor(
     daemonAuthority = await inspectDaemonAuthority(paths);
     switch (daemonAuthority.state) {
       case "unsafe_receipt":
-        problems.push("The daemon authority receipt has unsafe file custody. Verify that no HRA daemon is running, restore it as a current-user-owned single-link mode-0600 regular file, then rerun `hra doctor --offline`.");
+        problems.push("The daemon authority receipt has unsafe file custody. Verify that no Oompa daemon is running, restore it as a current-user-owned single-link mode-0600 regular file, then rerun `oompa doctor --offline`.");
         break;
       case "unsafe_database":
-        problems.push("The daemon authority database has unsafe file custody. Verify that no HRA daemon is running, restore it as a current-user-owned single-link mode-0600 regular file, then rerun `hra doctor --offline`.");
+        problems.push("The daemon authority database has unsafe file custody. Verify that no Oompa daemon is running, restore it as a current-user-owned single-link mode-0600 regular file, then rerun `oompa doctor --offline`.");
         break;
       case "invalid_database":
-        problems.push("The daemon authority database is invalid. Stop every HRA process, preserve the invalid authority file for recovery, then repair its SQLite state before restarting HRA.");
+        problems.push("The daemon authority database is invalid. Stop every Oompa process, preserve the invalid authority file for recovery, then repair its SQLite state before restarting Oompa.");
         break;
       case "indeterminate":
-        problems.push("The daemon authority changed or could not be proved safe during inspection. Do not change authority files; wait for any daemon transition to settle, then rerun `hra doctor --offline`.");
+        problems.push("The daemon authority changed or could not be proved safe during inspection. Do not change authority files; wait for any daemon transition to settle, then rerun `oompa doctor --offline`.");
         break;
       case "absent":
       case "held":
@@ -2599,8 +2599,8 @@ async function offlineDoctor(
     if (projectCount === 0) {
       problems.push(
         daemonAuthority.state === "held" || daemonAuthority.state === "releasing"
-          ? "No project directory is configured. Stop the daemon with `hra daemon stop`, then run `hra init --yes`."
-          : "No project directory is configured. Run `hra init --yes`.",
+          ? "No project directory is configured. Stop the daemon with `oompa daemon stop`, then run `oompa init --yes`."
+          : "No project directory is configured. Run `oompa init --yes`.",
       );
     }
     let unusableProjectRoots = 0;
@@ -2610,7 +2610,7 @@ async function offlineDoctor(
       }
     }
     if (unusableProjectRoots > 0) {
-      problems.push("A configured project directory is missing or unsafe. Run `hra project list`, then restore or repair every listed directory so it is readable, writable, traversable, and canonical.");
+      problems.push("A configured project directory is missing or unsafe. Run `oompa project list`, then restore or repair every listed directory so it is readable, writable, traversable, and canonical.");
     }
   }
   let codexRuntime: { status: "ready"; version: string } | { status: "invalid"; diagnostic: string };
@@ -2623,7 +2623,7 @@ async function offlineDoctor(
     problems.push(diagnostic);
   }
   const bunReady = Bun.version === "1.3.14";
-  if (!bunReady) problems.push(`HRA requires Bun 1.3.14, but ${Bun.version} is running.`);
+  if (!bunReady) problems.push(`Oompa requires Bun 1.3.14, but ${Bun.version} is running.`);
   const data = {
     healthy: problems.length === 0,
     offline: true,
@@ -2641,7 +2641,7 @@ async function offlineDoctor(
     const daemonAuthoritySummary = (() => {
       switch (daemonAuthority.state) {
         case "absent": return "not initialized";
-        case "held": return "held by a running HRA process";
+        case "held": return "held by a running Oompa process";
         case "releasing": return "release in progress; wait before restarting";
         case "released":
           return daemonAuthority.receipt.custody === "safe"
@@ -2655,9 +2655,9 @@ async function offlineDoctor(
         case "indeterminate": return "indeterminate";
       }
     })();
-    output.writeStdout(`HRA offline checks passed. Bun ${Bun.version}; Codex ${codexRuntime.status}; ${process.platform} ${process.arch}; state ${initialized ? database : "not initialized"}; daemon authority ${daemonAuthoritySummary}.\n`);
+    output.writeStdout(`Oompa offline checks passed. Bun ${Bun.version}; Codex ${codexRuntime.status}; ${process.platform} ${process.arch}; state ${initialized ? database : "not initialized"}; daemon authority ${daemonAuthoritySummary}.\n`);
   }
-  else output.writeStderr(`hra: offline checks failed\n${problems.map((problem) => `- ${problem}`).join("\n")}\n`);
+  else output.writeStderr(`oompa: offline checks failed\n${problems.map((problem) => `- ${problem}`).join("\n")}\n`);
   return data.healthy ? 0 : 1;
 }
 
@@ -2687,7 +2687,7 @@ async function editSessionNote(
   const current = await callDaemon({ kind: "session.note.get", session });
   if (!current.ok) return renderFailure(current.error, false, output);
   const note = typeof current.data === "object" && current.data !== null && "note" in current.data && typeof current.data.note === "string" ? current.data.note : "";
-  const directory = await mkdtemp(join(tmpdir(), "hra-note-"));
+  const directory = await mkdtemp(join(tmpdir(), "oompa-note-"));
   const file = join(directory, "note.md");
   try {
     await writeFile(file, note, { encoding: "utf8", mode: 0o600, flag: "wx" });
@@ -2714,11 +2714,11 @@ async function editSessionNote(
 }
 
 /**
- * `hra session export` reads the provider-neutral retained tail
+ * `oompa session export` reads the provider-neutral retained tail
  * and writes one document: the letta-ai trajectory v1 shape by default, or
- * HRA's own neutral record shape with `--format json`.
+ * Oompa's own neutral record shape with `--format json`.
  *
- * Everything written comes from HRA's own storage. No provider is asked, so a
+ * Everything written comes from Oompa's own storage. No provider is asked, so a
  * session whose provider thread is gone still exports.
  */
 async function exportSessionTranscript(
@@ -2737,7 +2737,7 @@ async function exportSessionTranscript(
   if (!parsed.success || parsed.data.provider === undefined) {
     return renderFailure({
       code: "INTERNAL",
-      message: "The daemon returned a transcript tail HRA could not validate.",
+      message: "The daemon returned a transcript tail Oompa could not validate.",
     }, invocation.json, output);
   }
   const transcript = parsed.data;
@@ -2895,10 +2895,10 @@ const remoteInteractionGuidance = (
 
   const rows: string[] = [];
   if (policy.actions.includes("decline")) {
-    rows.push(`  Decline remotely with \`hra remote resolve <session> --interaction ${event.interactionId} --revision ${String(event.revision)} --decision decline\`, or resolve this interaction on the execution device.`);
+    rows.push(`  Decline remotely with \`oompa remote resolve <session> --interaction ${event.interactionId} --revision ${String(event.revision)} --decision decline\`, or resolve this interaction on the execution device.`);
   }
   if (policy.actions.includes("answer")) {
-    rows.push("  Answer remotely in the HRA app, or resolve this interaction on the execution device.");
+    rows.push("  Answer remotely in the Oompa app, or resolve this interaction on the execution device.");
   }
   if (rows.length === 0) {
     rows.push("  No remote action is available. Resolve this interaction on the execution device.");
@@ -3065,7 +3065,7 @@ async function executeRemoteInvocation(
     if (control === null && injectedStatus === undefined) {
       return renderFailure({
         code: "UNAVAILABLE",
-        message: "Cloud sync is disabled. Unset both OOMPA_CONVEX_URL and HRA_CONVEX_URL to use hosted sync; for a custom deployment, set only OOMPA_CONVEX_URL. Then run `hra auth login`.",
+        message: "Cloud sync is disabled. Unset both OOMPA_CONVEX_URL and HRA_CONVEX_URL to use hosted sync; for a custom deployment, set only OOMPA_CONVEX_URL. Then run `oompa auth login`.",
       }, invocation.json, output);
     }
     if (invocation.command.kind === "remote.list") {
@@ -3181,7 +3181,7 @@ export function admitExactDaemonStop(input: Readonly<{
     throw new CommandFailure(
       "CONFLICT",
       "The daemon stop authority changed before dispatch. No daemon was stopped.",
-      { nextCommand: "hra daemon status --json" },
+      { nextCommand: "oompa daemon status --json" },
     );
   }
   input.afterResponse(input.requestStop);
@@ -3236,7 +3236,7 @@ export function isExactProviderRuntimeAuthorityCurrent(
  * Production preserves Claude's real default-home semantics.
  */
 export function personalClaudeConfigHomeForInstallation(
-  installation: Pick<HraInstallation, "kind">,
+  installation: Pick<OompaInstallation, "kind">,
 ): "isolated" | "personal" {
   return installation.kind === "live_acceptance" ? "isolated" : "personal";
 }
@@ -3266,7 +3266,7 @@ export async function releaseProvenDeadClaudeAuthoritiesBeforeDaemonGeneration(
       if (liveness !== "not_live") {
         throw new CommandFailure(
           "RECOVERY_REQUIRED",
-          "A prior Claude launch did not finish recording exact process custody. Exit any Claude process for that session, then retry `hra daemon start`; HRA will not advance account authority around it.",
+          "A prior Claude launch did not finish recording exact process custody. Exit any Claude process for that session, then retry `oompa daemon start`; Oompa will not advance account authority around it.",
         );
       }
       store.cancelClaudeProcessLaunchIntent({
@@ -3287,7 +3287,7 @@ export async function releaseProvenDeadClaudeAuthoritiesBeforeDaemonGeneration(
       if (liveness !== "not_live") {
         throw new CommandFailure(
           "RECOVERY_REQUIRED",
-          "A prior HRA-owned Claude controller is still live or cannot be proven stopped. Exit it, then retry `hra daemon start`; HRA will not advance account authority around it.",
+          "A prior Oompa-owned Claude controller is still live or cannot be proven stopped. Exit it, then retry `oompa daemon start`; Oompa will not advance account authority around it.",
         );
       }
       const releasing = authority.state === "releasing"
@@ -3332,7 +3332,7 @@ export type LiveAcceptanceClaudeProofPort = Readonly<{
   beginDaemonGeneration(generation: number): void;
   handleManagedHostToolCall(input: Readonly<{
     authority: ProfileAuthority;
-    call: HraHostToolCall;
+    call: OompaHostToolCall;
     dispatch: () => Promise<ClaudeHostToolPublicResult>;
   }>): Promise<ClaudeHostToolPublicResult>;
   handleManagedHostToolResponseWritten(receipt: ClaudeHostToolResponseWritten): void;
@@ -3341,7 +3341,7 @@ export type LiveAcceptanceClaudeProofPort = Readonly<{
 }>;
 
 async function runDaemonLifecycle(
-  installation: HraInstallation,
+  installation: OompaInstallation,
   stopLatch: DaemonStopLatch,
   liveAcceptanceCanonicalMemoryTransportDecorator?: (
     transport: CanonicalMemoryTransport,
@@ -3362,7 +3362,7 @@ async function runDaemonLifecycle(
   let personalClaude: PinnedClaudeRuntimeManager | undefined;
   let claudeHostToolAuthority: ClaudeHostToolBindingAuthority | undefined;
   let claudeHostToolServer: ClaudeHostToolCallbackServer | undefined;
-  let service: HraService | undefined;
+  let service: OompaService | undefined;
   let server: LocalDaemonServer | undefined;
   let cloudAdapter: StateBackedCloudDaemonAdapter | undefined;
   let cloudLifecycle: CloudDaemonLifecycle | undefined;
@@ -3448,7 +3448,7 @@ async function runDaemonLifecycle(
     daemonAuthority = new DaemonAuthorityFence(daemonLock, { generation, bootId });
     const activeDaemonAuthority = daemonAuthority;
     checkpointBoot();
-    const serviceReference: { current?: HraService } = {};
+    const serviceReference: { current?: OompaService } = {};
     claudeHostToolAuthority = new ClaudeHostToolBindingAuthority();
     const activeClaudeHostToolAuthority = claudeHostToolAuthority;
     claudeHostToolServer = await ClaudeHostToolCallbackServer.start({
@@ -3504,18 +3504,18 @@ async function runDaemonLifecycle(
         account: async (authority, account) => {
           await serviceReference.current?.observeCodexAccount(authority, account);
         },
-        hraHostTool: async (authority, call) => {
+        oompaHostTool: async (authority, call) => {
           const current = serviceReference.current;
           if (current === undefined) {
-            throw new Error("The HRA service is unavailable during host-tool execution.");
+            throw new Error("The Oompa service is unavailable during host-tool execution.");
           }
-          return await current.handleHraHostToolCall(authority, call, {
+          return await current.handleOompaHostToolCall(authority, call, {
             provider: "codex",
             source: "managed",
           });
         },
-        hraHostToolResponseWritten: (authority, call) => {
-          serviceReference.current?.notifyHraHostToolResponseWritten(
+        oompaHostToolResponseWritten: (authority, call) => {
+          serviceReference.current?.notifyOompaHostToolResponseWritten(
             authority,
             call,
             { provider: "codex", source: "managed" },
@@ -3536,13 +3536,13 @@ async function runDaemonLifecycle(
       isCurrent: (authority) =>
         isExactProviderRuntimeAuthorityCurrent(activeStore, "claude", authority),
       observer: {
-        hraHostTool: async (authority, call) => {
+        oompaHostTool: async (authority, call) => {
           const current = serviceReference.current;
           if (current === undefined) {
-            throw new Error("The HRA service is unavailable during host-tool execution.");
+            throw new Error("The Oompa service is unavailable during host-tool execution.");
           }
           if (liveAcceptanceClaudeProof === undefined) {
-            return await current.handleHraHostToolCall(authority, call, {
+            return await current.handleOompaHostToolCall(authority, call, {
               provider: "claude",
               source: "managed",
             });
@@ -3550,15 +3550,15 @@ async function runDaemonLifecycle(
           return await liveAcceptanceClaudeProof.handleManagedHostToolCall({
             authority,
             call,
-            dispatch: async () => await current.handleHraHostToolCall(
+            dispatch: async () => await current.handleOompaHostToolCall(
               authority,
               call,
               { provider: "claude", source: "managed" },
             ),
           });
         },
-        hraHostToolResponseWritten: (authority, call) => {
-          serviceReference.current?.notifyHraHostToolResponseWritten(
+        oompaHostToolResponseWritten: (authority, call) => {
+          serviceReference.current?.notifyOompaHostToolResponseWritten(
             authority,
             call,
             { provider: "claude", source: "managed" },
@@ -3582,7 +3582,7 @@ async function runDaemonLifecycle(
         : {}),
       credentialStorePreflight: {
         ...installation.credentialStorePreflight,
-        // Bootstrap against an HRA-owned neutral directory. Project-scoped
+        // Bootstrap against an Oompa-owned neutral directory. Project-scoped
         // operations perform their own effective-config preflight later.
         cwd: installation.paths.root,
       },
@@ -3594,18 +3594,18 @@ async function runDaemonLifecycle(
         account: async (authority, account) => {
           await serviceReference.current?.observePersonalCodexAccount(authority, account);
         },
-        hraHostTool: async (authority, call) => {
+        oompaHostTool: async (authority, call) => {
           const current = serviceReference.current;
           if (current === undefined) {
-            throw new Error("The HRA service is unavailable during host-tool execution.");
+            throw new Error("The Oompa service is unavailable during host-tool execution.");
           }
-          return await current.handleHraHostToolCall(authority, call, {
+          return await current.handleOompaHostToolCall(authority, call, {
             provider: "codex",
             source: "personal",
           });
         },
-        hraHostToolResponseWritten: (authority, call) => {
-          serviceReference.current?.notifyHraHostToolResponseWritten(
+        oompaHostToolResponseWritten: (authority, call) => {
+          serviceReference.current?.notifyOompaHostToolResponseWritten(
             authority,
             call,
             { provider: "codex", source: "personal" },
@@ -3622,18 +3622,18 @@ async function runDaemonLifecycle(
       isCurrent: (authority) =>
         isExactProviderRuntimeAuthorityCurrent(activeStore, "claude", authority),
       observer: {
-        hraHostTool: async (authority, call) => {
+        oompaHostTool: async (authority, call) => {
           const current = serviceReference.current;
           if (current === undefined) {
-            throw new Error("The HRA service is unavailable during host-tool execution.");
+            throw new Error("The Oompa service is unavailable during host-tool execution.");
           }
-          return await current.handleHraHostToolCall(authority, call, {
+          return await current.handleOompaHostToolCall(authority, call, {
             provider: "claude",
             source: "personal",
           });
         },
-        hraHostToolResponseWritten: (authority, call) => {
-          serviceReference.current?.notifyHraHostToolResponseWritten(
+        oompaHostToolResponseWritten: (authority, call) => {
+          serviceReference.current?.notifyOompaHostToolResponseWritten(
             authority,
             call,
             { provider: "claude", source: "personal" },
@@ -3880,9 +3880,9 @@ async function runDaemonLifecycle(
     factsMemoryControl = new FactsMemoryControlStore(paths.factsMemoryControl);
     const [
       { OhSqliteFactsMemoryEngine },
-      { HraOhMemoryCoordinator },
-      { HraCanonicalMemorySynchronizer },
-      { HraMemorySummarySource },
+      { OompaOhMemoryCoordinator },
+      { OompaCanonicalMemorySynchronizer },
+      { OompaMemorySummarySource },
       { ProjectMemorySerialExecutor },
     ] = await Promise.all([
       import("./storage/oh-facts-memory-engine"),
@@ -3894,7 +3894,7 @@ async function runDaemonLifecycle(
     const memoryEngine = new OhSqliteFactsMemoryEngine({
       forkAttestations: activeStore,
     });
-    const factsMemory = new HraFactsMemoryLifecycle({
+    const factsMemory = new OompaFactsMemoryLifecycle({
       attestations: activeStore,
       broker: new LocalFactsMemoryBroker({
         engine: memoryEngine,
@@ -3905,7 +3905,7 @@ async function runDaemonLifecycle(
     const projectMemorySerial = new ProjectMemorySerialExecutor();
     const canonicalMemorySync = canonicalMemoryAuthoritySource === undefined
       ? undefined
-      : new HraCanonicalMemorySynchronizer({
+      : new OompaCanonicalMemorySynchronizer({
           authoritySource: canonicalMemoryAuthoritySource,
           engine: memoryEngine,
           onBackgroundFailure: () => {
@@ -3915,7 +3915,7 @@ async function runDaemonLifecycle(
           projectSerial: projectMemorySerial,
           store: activeStore,
         });
-    const memory = new HraOhMemoryCoordinator({
+    const memory = new OompaOhMemoryCoordinator({
       engine: memoryEngine,
       factsMemory,
       paths,
@@ -3926,9 +3926,9 @@ async function runDaemonLifecycle(
     // A configured daemon may legitimately start before its first cloud
     // identity is selected. Authentication requires a restart into the newly
     // bound identity, so keep this optional projection absent until that boot
-    // instead of making cloud enrollment or local HRA unavailable.
+    // instead of making cloud enrollment or local Oompa unavailable.
     if (cloudAdapter !== undefined && cloudIdentityNamespace !== null) {
-      const memorySummary = new HraMemorySummarySource({
+      const memorySummary = new OompaMemorySummarySource({
         engine: memoryEngine,
         identityNamespace: cloudIdentityNamespace,
         paths,
@@ -3949,7 +3949,7 @@ async function runDaemonLifecycle(
           });
         })()
       : undefined;
-    const { service: activeService, executeAuthenticatedLocal } = HraService.createLocalComposition({
+    const { service: activeService, executeAuthenticatedLocal } = OompaService.createLocalComposition({
       store: activeStore,
       paths,
       codex,
@@ -4174,7 +4174,7 @@ async function runDaemonLifecycle(
         ...(generation === undefined || bootId === undefined ? {} : { generation, bootId }),
         failure: diagnostic,
       }).catch(() => undefined);
-      process.stderr.write(`hra: ${diagnostic}\n`);
+      process.stderr.write(`oompa: ${diagnostic}\n`);
       process.exit(70);
     }
 
@@ -4197,15 +4197,15 @@ async function runDaemonLifecycle(
       : { state: "failed", failure: normalizedRunError }).catch((error: unknown) => cleanupErrors.push(error));
   }
   if (runError !== undefined) {
-    const normalized = runError instanceof Error ? runError : new Error("HRA daemon failed with a non-Error value.");
-    throw cleanupErrors.length === 0 ? normalized : new AggregateError([normalized, ...cleanupErrors], "HRA daemon failed and cleanup was incomplete.");
+    const normalized = runError instanceof Error ? runError : new Error("Oompa daemon failed with a non-Error value.");
+    throw cleanupErrors.length === 0 ? normalized : new AggregateError([normalized, ...cleanupErrors], "Oompa daemon failed and cleanup was incomplete.");
   }
-  if (cleanupErrors.length > 0) throw new AggregateError(cleanupErrors, "HRA daemon cleanup failed.");
+  if (cleanupErrors.length > 0) throw new AggregateError(cleanupErrors, "Oompa daemon cleanup failed.");
   return 0;
 }
 
 export async function runDaemon(
-  installation: HraInstallation = createProductionInstallation(),
+  installation: OompaInstallation = createProductionInstallation(),
   options: RunDaemonOptions = {},
 ): Promise<number> {
   const cloud = requireCloudDeploymentEnvironment(installation.cloudEnvironment);
@@ -4266,19 +4266,19 @@ const protectedInputReplayCommand = (
   }>,
 ): string => {
   if (invocation.kind === "auth.login-protected") {
-    return "hra auth login --input-stdin --json < /path/to/protected.json";
+    return "oompa auth login --input-stdin --json < /path/to/protected.json";
   }
   const common = `${invocation.interaction} --revision ${String(invocation.expectedRevision)}`;
   if (invocation.resolution.kind === "user_answers") {
-    return `hra interaction answer ${common} --input-stdin --json < /path/to/protected.json`;
+    return `oompa interaction answer ${common} --input-stdin --json < /path/to/protected.json`;
   }
   if (invocation.resolution.kind === "permission_grant") {
     const scope = invocation.resolution.scope === null
       ? ""
       : ` --scope ${invocation.resolution.scope}`;
-    return `hra interaction grant ${common}${scope} --input-stdin --json < /path/to/protected.json`;
+    return `oompa interaction grant ${common}${scope} --input-stdin --json < /path/to/protected.json`;
   }
-  return `hra interaction submit ${common} --action accept --input-stdin --json < /path/to/protected.json`;
+  return `oompa interaction submit ${common} --action accept --input-stdin --json < /path/to/protected.json`;
 };
 
 const rejectJsonTerminalProtectedInput = (
@@ -4621,7 +4621,7 @@ async function executeWorkApply(
     const correlation = admittedWorkRequestCorrelation(document);
     writeWorkProtocolFailure(correlation?.requestId ?? null, {
       code: "invalid_request",
-      message: "The work request document does not match the strict versioned HRA work protocol.",
+      message: "The work request document does not match the strict versioned Oompa work protocol.",
       recovery: "none",
       retryable: false,
       exitCode: 2,
@@ -4716,7 +4716,7 @@ const renderProtectedForegroundLogin = (
 
 const protectedInteractionInspectCommand = (
   invocation: Extract<CliInvocation, { kind: "interaction.inspect-protected" }>,
-): string => `hra interaction inspect ${invocation.command.interaction} --revision ${String(invocation.command.expectedRevision)} --handoff-file /absolute/path/to/empty-protected-approval.json${invocation.json ? " --json" : ""}`;
+): string => `oompa interaction inspect ${invocation.command.interaction} --revision ${String(invocation.command.expectedRevision)} --handoff-file /absolute/path/to/empty-protected-approval.json${invocation.json ? " --json" : ""}`;
 
 async function executeProtectedInteractionInspect(
   invocation: Extract<CliInvocation, { kind: "interaction.inspect-protected" }>,
@@ -4817,7 +4817,7 @@ async function executeProtectedInteractionInspect(
         if (!(error instanceof ProtectedOutputError)) throw error;
         return renderFailure({
           code: "RECOVERY_REQUIRED",
-          message: "Protected approval detail may have reached the caller-owned file, but HRA could not prove the completed write. Treat the file as private material and remove it before retrying.",
+          message: "Protected approval detail may have reached the caller-owned file, but Oompa could not prove the completed write. Treat the file as private material and remove it before retrying.",
         }, invocation.json, output);
       }
     }
@@ -4890,7 +4890,7 @@ async function executeAccountLogin(
           nextCommand: invocation.replayCommand,
           providerEffectDispatched: false,
         },
-        message: "HRA could not resolve the exact account authority. No provider login was dispatched; retry the same command.",
+        message: "Oompa could not resolve the exact account authority. No provider login was dispatched; retry the same command.",
         trustedLocalPaths: true,
       }, invocation.json, output);
     }
@@ -4988,7 +4988,7 @@ async function executeAccountLogin(
           idempotencyKey: command.idempotencyKey,
           sameKeyReplayCommand: replayCommand,
         },
-        message: "The provider login effect may be pending, but HRA could not prove the protected handoff. Cancel the pending login before starting a fresh login; a same-key replay cannot recover one-time instructions.",
+        message: "The provider login effect may be pending, but Oompa could not prove the protected handoff. Cancel the pending login before starting a fresh login; a same-key replay cannot recover one-time instructions.",
         trustedLocalPaths: true,
       }, invocation.json, output);
     }
@@ -5033,7 +5033,7 @@ const claudeAccountStatusResponseSchema = z.object({
   // Null can also be the strict status parser's unverified observation. It
   // never implies signed-out state or permits the foreground launch path.
   if (value.recovery === undefined) return;
-  if (value.recovery.statusCommand !== `hra account show ${value.account.id} --provider claude`) {
+  if (value.recovery.statusCommand !== `oompa account show ${value.account.id} --provider claude`) {
     context.addIssue({ code: "custom", path: ["recovery", "statusCommand"], message: "Claude recovery status command is not exact." });
   }
   if (value.recovery.sameKeyReplayCommand !== claudeAccountLoginCommand(value.account.id, value.recovery.idempotencyKey)) {
@@ -5119,7 +5119,7 @@ const claudeLoginRecovery = (
   details: {
     ...(input.accountId === undefined ? {} : {
       accountSelector: input.accountId,
-      statusCommand: `hra account show ${input.accountId} --provider claude`,
+      statusCommand: `oompa account show ${input.accountId} --provider claude`,
     }),
     ...(input.attemptId === undefined ? {} : { attemptId: input.attemptId }),
     idempotencyKey: input.idempotencyKey,
@@ -5140,7 +5140,7 @@ const claudeLoginRecovery = (
           }
     ),
   },
-  message: "Claude login may have started, but HRA could not prove its terminal result. The same-key command identifies this attempt and will never relaunch Claude. If its HRA parent is gone, confirm the Claude child exited before using the exact acknowledged local abandon command; abandon does not stop Claude or change or delete credentials.",
+  message: "Claude login may have started, but Oompa could not prove its terminal result. The same-key command identifies this attempt and will never relaunch Claude. If its Oompa parent is gone, confirm the Claude child exited before using the exact acknowledged local abandon command; abandon does not stop Claude or change or delete credentials.",
 }, json, output);
 
 async function executeClaudeAccountAuthentication(
@@ -5175,7 +5175,7 @@ async function executeClaudeAccountAuthentication(
     if (!(error instanceof LocalDaemonIndeterminateError)) throw error;
     return renderFailure({
       code: "UNAVAILABLE",
-      message: "HRA could not preflight the exact Claude account. No login launch was granted.",
+      message: "Oompa could not preflight the exact Claude account. No login launch was granted.",
     }, invocation.json, output);
   }
   if (!statusResponse.ok) return renderFailure(statusResponse.error, invocation.json, output);
@@ -5198,7 +5198,7 @@ async function executeClaudeAccountAuthentication(
       code: "UNAVAILABLE",
       message: "Claude authentication status could not be verified. "
         + `Ensure Claude Code ${CLAUDE_PIN} is on this daemon's PATH and its isolated configuration is readable, `
-        + `then retry \`hra account show ${status.data.account.id} --provider claude\`. No login launch was granted.`,
+        + `then retry \`oompa account show ${status.data.account.id} --provider claude\`. No login launch was granted.`,
     }, invocation.json, output);
   }
   const controller = new AbortController();
@@ -5381,8 +5381,8 @@ async function executeClaudeAccountAuthentication(
         : null) ?? signalCustody.interruptedBy;
     if (interruptedBy !== null) {
       output.writeStderr(completed.data.authentication.signedIn
-        ? "hra: Claude login was interrupted after authentication completed.\n"
-        : "hra: Claude login was canceled; the isolated profile remains signed out.\n");
+        ? "oompa: Claude login was interrupted after authentication completed.\n"
+        : "oompa: Claude login was canceled; the isolated profile remains signed out.\n");
       return interruptedBy === "SIGINT" ? 130 : 143;
     }
     if (!completed.data.authentication.signedIn) {
@@ -5791,7 +5791,7 @@ export async function runPersistentShell(
             const discarded = await terminal.establishProtectedInputBoundary();
             if (discarded > 0) {
               throw new CliUsageError(
-                "Protected input cannot consume pretyped shell lines. HRA discarded the buffered lines; retry and enter the protected document only after its hidden prompt appears.",
+                "Protected input cannot consume pretyped shell lines. Oompa discarded the buffered lines; retry and enter the protected document only after its hidden prompt appears.",
               );
             }
           }
@@ -5844,7 +5844,7 @@ export async function runPersistentShell(
         });
         if (!response.ok) {
           output.writeStderr(
-            "hra: Live updates remain paused because HRA could not refresh the exact selected session. Reselect it to resume.\n",
+            "oompa: Live updates remain paused because Oompa could not refresh the exact selected session. Reselect it to resume.\n",
           );
           return;
         }
@@ -5855,7 +5855,7 @@ export async function runPersistentShell(
           || identity.account !== selection.account
         ) {
           output.writeStderr(
-            "hra: Live updates remain paused because HRA could not refresh the exact selected session. Reselect it to resume.\n",
+            "oompa: Live updates remain paused because Oompa could not refresh the exact selected session. Reselect it to resume.\n",
           );
           return;
         }
@@ -5874,17 +5874,17 @@ export async function runPersistentShell(
       } catch {
         liveOutputEnabled = false;
         output.writeStderr(
-          "hra: Live updates remain paused because HRA could not refresh the exact selected session. Reselect it to resume.\n",
+          "oompa: Live updates remain paused because Oompa could not refresh the exact selected session. Reselect it to resume.\n",
         );
       }
     };
-    output.writeStderr("HRA shell. /help lists commands; /exit leaves the daemon running.\n");
+    output.writeStderr("Oompa shell. /help lists commands; /exit leaves the daemon running.\n");
     for (;;) {
       let line: string | null;
       try {
         line = await readLine(formatShellPrompt(selection));
       } catch {
-        output.writeStderr("hra: Shell input is unavailable.\n");
+        output.writeStderr("oompa: Shell input is unavailable.\n");
         return 1;
       }
       if (line === null) return 0;
@@ -5980,7 +5980,7 @@ export async function runPersistentShell(
         else await terminal.withLiveOutputHeld(runForeground);
       } catch (error: unknown) {
         const message = error instanceof Error ? error.message : "Shell command failed.";
-        output.writeStderr(`hra: ${safeDiagnostic(message)}\n`);
+        output.writeStderr(`oompa: ${safeDiagnostic(message)}\n`);
       }
     }
   } catch (error: unknown) {
@@ -5991,7 +5991,7 @@ export async function runPersistentShell(
         ...(error.details === undefined ? {} : { details: error.details }),
       }, false, output);
     }
-    bestEffortStderr(output, "hra: HRA could not start or continue the shell safely.\n");
+    bestEffortStderr(output, "oompa: Oompa could not start or continue the shell safely.\n");
     return 1;
   } finally {
     liveOutputEnabled = false;
@@ -6115,7 +6115,7 @@ async function executeUsageRefreshAll(
       details: {
         accountCount: accounts.length,
         accountLimit: usageRefreshAllAccountLimit,
-        nextCommand: "hra account usage <account> --refresh",
+        nextCommand: "oompa account usage <account> --refresh",
       },
       message: "Refresh-all exceeds the bounded account limit. Refresh one explicit account instead.",
     }, json, output);
@@ -6206,8 +6206,8 @@ function renderHelp(invocation: Extract<CliInvocation, { kind: "help" }>, output
 
 function renderVersion(invocation: Extract<CliInvocation, { kind: "version" }>, output: Output): number {
   output.writeStdout(invocation.json
-    ? `${safeJson({ ok: true, version: 1, command: "version", data: { version: HRA_VERSION } })}\n`
-    : `hra ${HRA_VERSION}\n`);
+    ? `${safeJson({ ok: true, version: 1, command: "version", data: { version: OOMPA_VERSION } })}\n`
+    : `oompa ${OOMPA_VERSION}\n`);
   return 0;
 }
 
@@ -6221,15 +6221,15 @@ function doctorVerdict(data: unknown): Readonly<{ healthy: boolean; message: str
     ? (doctor.problems as readonly string[])
     : null;
   if (doctor === null || typeof doctor.healthy !== "boolean" || problems === null) {
-    return { healthy: false, message: "HRA checks returned an invalid local result." };
+    return { healthy: false, message: "Oompa checks returned an invalid local result." };
   }
-  if (doctor.healthy && problems.length === 0) return { healthy: true, message: "HRA checks passed." };
+  if (doctor.healthy && problems.length === 0) return { healthy: true, message: "Oompa checks passed." };
   const count = problems.length;
   return {
     healthy: false,
     message: count === 0
-      ? "HRA checks did not pass, but no safe diagnostic was available."
-      : `HRA checks found ${String(count)} problem${count === 1 ? "" : "s"}.`,
+      ? "Oompa checks did not pass, but no safe diagnostic was available."
+      : `Oompa checks found ${String(count)} problem${count === 1 ? "" : "s"}.`,
   };
 }
 
@@ -6541,13 +6541,13 @@ export async function main(
       }
       if (jsonl) return renderJsonlFailure({ code: "INVALID_INPUT", message: error.message }, output);
       if (json) return renderFailure({ code: "INVALID_INPUT", message: error.message }, true, output);
-      output.writeStderr(`hra: ${safeDiagnostic(error.message)}\n\n${usageForGroup(undefined)}\n`);
+      output.writeStderr(`oompa: ${safeDiagnostic(error.message)}\n\n${usageForGroup(undefined)}\n`);
       return 2;
     }
     if (error instanceof InvalidCommandResponseError) {
       return renderFailure({
         code: "INVALID_RESPONSE",
-        message: "The HRA daemon returned an invalid response for this command.",
+        message: "The Oompa daemon returned an invalid response for this command.",
       }, json, output);
     }
     if (error instanceof LocalDaemonIndeterminateError) {
@@ -6559,7 +6559,7 @@ export async function main(
             nextCommand: projectionRecovery.replayCommand,
             sameKeyReplay: true,
           },
-          message: `${sanitizeSyncDiagnostic(error.message)} The response is uncertain. Reuse the exact same-key command; HRA did not create a different recovery authority.`,
+          message: `${sanitizeSyncDiagnostic(error.message)} The response is uncertain. Reuse the exact same-key command; Oompa did not create a different recovery authority.`,
         }, json, output);
       }
       if (deviceMutation !== undefined) {
@@ -6570,7 +6570,7 @@ export async function main(
             nextCommand: deviceMutationReplayCommand(deviceMutation, json),
             sameKeyReplay: true,
           },
-          message: "The device mutation response is uncertain. Reuse the exact same-key command; HRA did not create a second device-mutation authority.",
+          message: "The device mutation response is uncertain. Reuse the exact same-key command; Oompa did not create a second device-mutation authority.",
         }, json, output);
       }
       if (replayableLocalMutation !== undefined) {
@@ -6593,12 +6593,12 @@ export async function main(
             replayPlacement: "before_double_dash",
             sameKeyReplay: true,
           },
-          message: "The mutation response is uncertain. Re-run the original command unchanged with the supplied same-key replay arguments before any double-dash delimiter. HRA did not create a second mutation authority.",
+          message: "The mutation response is uncertain. Re-run the original command unchanged with the supplied same-key replay arguments before any double-dash delimiter. Oompa did not create a second mutation authority.",
         }, json, output);
       }
       return renderFailure({
         code: "RECOVERY_REQUIRED",
-        message: `${sanitizeDaemonDiagnostic(error.message)} HRA did not replay the command. Inspect its durable result before issuing another mutation.`,
+        message: `${sanitizeDaemonDiagnostic(error.message)} Oompa did not replay the command. Inspect its durable result before issuing another mutation.`,
       }, json, output);
     }
     if (error instanceof DaemonAuthorityBusyError) {
@@ -6620,10 +6620,10 @@ export async function main(
     if (json) {
       return renderFailure({
         code: "INTERNAL",
-        message: "HRA failed before a safe command response was available.",
+        message: "Oompa failed before a safe command response was available.",
       }, true, output);
     }
-    output.writeStderr("hra: HRA failed before a safe command response was available.\n");
+    output.writeStderr("oompa: Oompa failed before a safe command response was available.\n");
     return 1;
   }
 }

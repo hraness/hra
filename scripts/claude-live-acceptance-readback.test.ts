@@ -11,7 +11,7 @@ import { digestClaudeHostToolInvocation } from "../src/claude/host-tool-protocol
 import { CLAUDE_PIN, CLAUDE_PIN_MODEL } from "../src/claude/pin";
 import { claudeHostToolCallbackSocketPath } from "../src/daemon/claude-host-tool-transport";
 import type { ClaudeProcessLivenessProbe } from "../src/daemon/personal-session-discovery";
-import { HRA_SESSION_PREAMBLE } from "../src/domain/hra-preamble";
+import { OOMPA_SESSION_PREAMBLE } from "../src/domain/oompa-preamble";
 import { createFactsMemoryBinding } from "../src/domain/facts-memory";
 import { memoryPageContentDigest, memoryPageKeyDigest } from "../src/domain/memory-page";
 import { claudeProviderAccountAuthoritySchema } from "../src/domain/provider-accounts";
@@ -19,7 +19,7 @@ import { PROJECT_MEMORY_EMPTY_HEAD } from "../src/domain/project-memory";
 import { SESSION_CONVERSATION_AUTOMATION_CAPABILITY } from "../src/domain/session-tasks";
 import { initializeStatePaths, profilePaths, resolveStatePaths } from "../src/storage/paths";
 import { StateStore, MEMORY_SUBMISSION_RETAIN_AGE_MS } from "../src/storage/state-store";
-import { HRA_VERSION } from "../src/version";
+import { OOMPA_VERSION } from "../src/version";
 import { ClaudeLiveAcceptanceProofCollector } from "./claude-live-acceptance-proof";
 import { createClaudeLiveAcceptanceReadback, type ClaudeLiveAcceptanceProcessInspectionInput } from "./claude-live-acceptance-readback";
 
@@ -314,7 +314,7 @@ const admitClaude = (store: StateStore, profileId: Parameters<StateStore["requir
 // OS liveness and argv observations are typed deterministic fixtures; no provider is launched.
 const fixture = async (registerCleanup: (cleanup: ReadbackCleanup) => void = (cleanup) => { cleanups.push(cleanup); }) => {
   // A short Unix temporary root keeps the real callback socket below sun_path's bound.
-  const temporaryRoot = await mkdtemp("/tmp/hra-clrb-");
+  const temporaryRoot = await mkdtemp("/tmp/oompa-clrb-");
   registerCleanup(async () => { await rm(temporaryRoot, { recursive: true }); });
   const root = await realpath(temporaryRoot);
   const paths = resolveStatePaths({ rootDirectory: root });
@@ -355,8 +355,8 @@ const fixture = async (registerCleanup: (cleanup: ReadbackCleanup) => void = (cl
     providerAuthentication: { profileId: profile.id, processGeneration: providerAuthority.processGeneration, provider: "claude", signedIn: true },
     evidence: { kind: "session.start", projectId: project.id, clientMessageId: null, messageDigest: null,
       runtimeProfile: runtime, conversationAutomationCapability: SESSION_CONVERSATION_AUTOMATION_CAPABILITY },
-    hostCapabilities: { preambleVersion: HRA_SESSION_PREAMBLE.version, preambleDigest: HRA_SESSION_PREAMBLE.digest,
-      manifestVersion: HRA_SESSION_PREAMBLE.manifestVersion, manifestDigest: HRA_SESSION_PREAMBLE.manifestDigest },
+    hostCapabilities: { preambleVersion: OOMPA_SESSION_PREAMBLE.version, preambleDigest: OOMPA_SESSION_PREAMBLE.digest,
+      manifestVersion: OOMPA_SESSION_PREAMBLE.manifestVersion, manifestDigest: OOMPA_SESSION_PREAMBLE.manifestDigest },
   });
   const threadId = randomUUID();
   const turnId = randomUUID();
@@ -392,7 +392,7 @@ const fixture = async (registerCleanup: (cleanup: ReadbackCleanup) => void = (cl
   const request = { tool: "memory_remember", input: memory } as const;
   const requestDigest = digestClaudeHostToolInvocation(callId, request);
   const keyBytes = createHash("sha256").update([
-    "hra:host-tool-call:v1", profile.id, threadId, turnId, callId, "memory_remember",
+    "oompa:host-tool-call:v1", profile.id, threadId, turnId, callId, "memory_remember",
   ].join("\0")).digest();
   keyBytes[6] = (keyBytes[6] ?? 0) & 15 | 80;
   keyBytes[8] = (keyBytes[8] ?? 0) & 63 | 128;
@@ -426,7 +426,7 @@ const fixture = async (registerCleanup: (cleanup: ReadbackCleanup) => void = (cl
     page: { key: memory.key, recordSha256, operationSha256 }, receiptSha256,
     workingHead: { digest: headDigest, operationSha256, sequence: 1 } } as const;
   const collector = new ClaudeLiveAcceptanceProofCollector({ runId,
-    candidate: { cloudTargetDigest: sha("test cloud"), packageVersion: HRA_VERSION, sourceRevision: "1".repeat(40) } });
+    candidate: { cloudTargetDigest: sha("test cloud"), packageVersion: OOMPA_VERSION, sourceRevision: "1".repeat(40) } });
   collector.beginDaemonGeneration(daemonGeneration);
   collector.armFreshSession({ daemonGeneration, memory, profileGeneration: providerAuthority.processGeneration, profileId: profile.id,
     providerThreadId: threadId, sendIdempotencyKey, sessionId: session.id });
@@ -441,12 +441,12 @@ const fixture = async (registerCleanup: (cleanup: ReadbackCleanup) => void = (cl
   collector.handleManagedHostToolResponseWritten({ bindingId, callId, profileId: profile.id,
     processGeneration: providerAuthority.processGeneration, provider: "claude", providerThreadId: threadId, request, requestDigest });
   const receipt = collector.readProvisionalPrivateReceipt();
-  const directory = await mkdtemp(join(paths.runtime, ".hra-claude-host-tools-"));
+  const directory = await mkdtemp(join(paths.runtime, ".oompa-claude-host-tools-"));
   const bindingPath = join(directory, "binding.json");
   const configPath = join(directory, "mcp.json");
   const binding = { bindingId, callbackSocketPath: socketPath, capability: "a".repeat(43), version: 1 };
   await writeFile(bindingPath, JSON.stringify(binding), { mode: 0o600 });
-  const config = { mcpServers: { hra: { args: [CLAUDE_HOST_TOOL_BRIDGE_ENTRYPOINT, "--binding", bindingPath],
+  const config = { mcpServers: { oompa: { args: [CLAUDE_HOST_TOOL_BRIDGE_ENTRYPOINT, "--binding", bindingPath],
     command: process.execPath, type: "stdio" } } };
   await writeFile(configPath, JSON.stringify(config), { mode: 0o600 });
   await new Promise<void>((ready, reject) => { server.once("error", reject); server.listen(socketPath, ready); });
@@ -502,7 +502,7 @@ const fixture = async (registerCleanup: (cleanup: ReadbackCleanup) => void = (cl
 };
 
 const startOnlyFixture = async () => {
-  const root = await realpath(await mkdtemp("/tmp/hra-clrb-start-"));
+  const root = await realpath(await mkdtemp("/tmp/oompa-clrb-start-"));
   const paths = resolveStatePaths({ rootDirectory: root });
   await initializeStatePaths(paths);
   const store = new StateStore(paths);
@@ -529,8 +529,8 @@ const startOnlyFixture = async () => {
       providerAuthentication: { profileId: profile.id, processGeneration: providerAuthority.processGeneration, provider: "claude", signedIn: true },
       evidence: { kind: "session.start", projectId: project.id, clientMessageId: null, messageDigest: null,
         runtimeProfile: runtime, conversationAutomationCapability: SESSION_CONVERSATION_AUTOMATION_CAPABILITY },
-      hostCapabilities: { preambleVersion: HRA_SESSION_PREAMBLE.version, preambleDigest: HRA_SESSION_PREAMBLE.digest,
-        manifestVersion: HRA_SESSION_PREAMBLE.manifestVersion, manifestDigest: HRA_SESSION_PREAMBLE.manifestDigest } });
+      hostCapabilities: { preambleVersion: OOMPA_SESSION_PREAMBLE.version, preambleDigest: OOMPA_SESSION_PREAMBLE.digest,
+        manifestVersion: OOMPA_SESSION_PREAMBLE.manifestVersion, manifestDigest: OOMPA_SESSION_PREAMBLE.manifestDigest } });
     const providerThreadId = randomUUID();
     const identity = { pid: 40002, pidDomain: "linux" as const, procStart: "synthetic-start-recovery" };
     store.recordClaimedClaudeProcessAuthority({ providerAuthority, providerThreadId, profileId: profile.id,
@@ -799,7 +799,7 @@ describe("independent Claude private readback", () => {
         const evidence = await owner.request(async () => await oracle.verifyCleanupStoppedCustody(input));
         expect(evidence).toMatchObject({ source: "independent_cleanup_readback", phase: "cleanup_stopped",
           retainedSessionProcess: "released_not_live", unreleasedProcessesAbsent: true, privateArtifactsAbsent: true,
-          scopeBindingDigest: canonicalSha256({ domain: "hra.claude.cleanup-readback.v1", ...input }) });
+          scopeBindingDigest: canonicalSha256({ domain: "oompa.claude.cleanup-readback.v1", ...input }) });
         expect(evidence).not.toHaveProperty("soleRemember");
         expect(JSON.stringify(evidence)).not.toContain(f.session.id);
         await owner.request(async () => {
@@ -960,7 +960,7 @@ describe("independent Claude private readback", () => {
       if (kind === "binding") await writeFile(f.bindingPath, JSON.stringify({ ...f.binding, bindingId: `clhb_${"0".repeat(32)}` }));
       if (kind === "config") await writeFile(f.configPath, JSON.stringify({ ...f.config, extra: "private" }));
       if (kind === "mode") await chmod(f.configPath, 0o644);
-      if (kind === "extra-binding") await mkdtemp(join(f.paths.runtime, ".hra-claude-host-tools-"));
+      if (kind === "extra-binding") await mkdtemp(join(f.paths.runtime, ".oompa-claude-host-tools-"));
       if (kind === "extra-file") await writeFile(join(f.directory, "extra.json"), "{}", { mode: 0o600 });
       if (kind === "invalid-utf8") await writeFile(f.bindingPath, new Uint8Array([0x22, 0xff, 0x22]));
       await expect(f.oracle().captureLive(f.input)).rejects.toThrow("claude_live_acceptance_readback_refused");
@@ -974,7 +974,7 @@ describe("independent Claude private readback", () => {
 
 
   test("cleanup before native start proves no sessions or unsettled start, not provider receipt consumption", async () => {
-    const root = await realpath(await mkdtemp("/tmp/hra-clrb-empty-"));
+    const root = await realpath(await mkdtemp("/tmp/oompa-clrb-empty-"));
     const paths = resolveStatePaths({ rootDirectory: root });
     await initializeStatePaths(paths);
     const store = new StateStore(paths);

@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { chmod, lstat, mkdtemp, realpath, rm } from "node:fs/promises";
 import { join } from "node:path";
 
-import { HRA_HOST_TOOL_NAMES } from "../domain/host-tools.ts";
+import { OOMPA_HOST_TOOL_NAMES } from "../domain/host-tools.ts";
 import { ClaudeError } from "./errors.ts";
 import {
   CLAUDE_HOST_TOOL_CALLBACK_VERSION,
@@ -25,7 +25,7 @@ const roots: string[] = [];
 const scratch = async (): Promise<string> => {
   const root = await realpath(await mkdtemp(join(
     await realpath(process.cwd()),
-    ".hra-claude-host-tools-",
+    ".oompa-claude-host-tools-",
   )));
   await chmod(root, 0o700);
   roots.push(root);
@@ -39,7 +39,7 @@ afterAll(async () => {
 
 const deterministicAuthority = (): ClaudeHostToolBindingAuthority =>
   new ClaudeHostToolBindingAuthority({
-    bridgeArguments: ["/private/hra/host-tool-bridge-main.ts"],
+    bridgeArguments: ["/private/oompa/host-tool-bridge-main.ts"],
     bridgeCommand: process.execPath,
     newBindingId: () => `clhb_${"1".repeat(32)}`,
     newCapability: () => "A".repeat(43),
@@ -81,9 +81,9 @@ describe("Claude host-tool binding authority", () => {
     const config = JSON.parse(configText) as {
       mcpServers: Record<string, { args: string[]; command: string; type: string }>;
     };
-    expect(Object.keys(config.mcpServers)).toEqual(["hra"]);
-    expect(config.mcpServers.hra).toEqual({
-      args: ["/private/hra/host-tool-bridge-main.ts", "--binding", lease.bindingPath],
+    expect(Object.keys(config.mcpServers)).toEqual(["oompa"]);
+    expect(config.mcpServers.oompa).toEqual({
+      args: ["/private/oompa/host-tool-bridge-main.ts", "--binding", lease.bindingPath],
       command: process.execPath,
       type: "stdio",
     });
@@ -97,7 +97,7 @@ describe("Claude host-tool binding authority", () => {
   test("accepts the initial nonnegative profile generation", async () => {
     const root = await scratch();
     const authority = new ClaudeHostToolBindingAuthority({
-      bridgeArguments: ["/private/hra/host-tool-bridge-main.ts"],
+      bridgeArguments: ["/private/oompa/host-tool-bridge-main.ts"],
       bridgeCommand: process.execPath,
       newBindingId: () => `clhb_${"0".repeat(32)}`,
       newCapability: () => "Z".repeat(43),
@@ -115,7 +115,7 @@ describe("Claude host-tool binding authority", () => {
     const root = await scratch();
     let bindingIdsMinted = 0;
     const authority = new ClaudeHostToolBindingAuthority({
-      bridgeArguments: ["/private/hra/host-tool-bridge-main.ts"],
+      bridgeArguments: ["/private/oompa/host-tool-bridge-main.ts"],
       bridgeCommand: process.execPath,
       newBindingId: () => {
         bindingIdsMinted += 1;
@@ -156,7 +156,7 @@ describe("Claude host-tool binding authority", () => {
     const retryStarted = new Promise<void>((resolve) => { announceRetry = resolve; });
     const retryGate = new Promise<void>((resolve) => { releaseRetry = resolve; });
     const authority = new ClaudeHostToolBindingAuthority({
-      bridgeArguments: ["/private/hra/host-tool-bridge-main.ts"],
+      bridgeArguments: ["/private/oompa/host-tool-bridge-main.ts"],
       bridgeCommand: process.execPath,
       newBindingId: () => `clhb_${"4".repeat(32)}`,
       newCapability: () => {
@@ -359,7 +359,7 @@ describe("Claude host-tool binding authority", () => {
     let releaseRetry!: () => void;
     const retryGate = new Promise<void>((resolve) => { releaseRetry = resolve; });
     const authority = new ClaudeHostToolBindingAuthority({
-      bridgeArguments: ["/private/hra/host-tool-bridge-main.ts"],
+      bridgeArguments: ["/private/oompa/host-tool-bridge-main.ts"],
       bridgeCommand: process.execPath,
       newBindingId: () => `clhb_${"3".repeat(32)}`,
       newCapability: () => "C".repeat(43),
@@ -548,7 +548,7 @@ describe("Claude host-tool stdio bridge", () => {
     const responses = output.map((line) => JSON.parse(line) as Record<string, unknown>);
     expect(responses).toHaveLength(3);
     const listed = (responses[1]?.result as { tools: { name: string }[] }).tools;
-    expect(listed.map((tool) => tool.name)).toEqual([...HRA_HOST_TOOL_NAMES]);
+    expect(listed.map((tool) => tool.name)).toEqual([...OOMPA_HOST_TOOL_NAMES]);
     expect(responses[2]).toMatchObject({
       id: 2,
       result: { content: [{ text: "done", type: "text" }], isError: false },

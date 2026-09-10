@@ -18,7 +18,7 @@ import type {
   CompactSessionEvent,
   DetailSessionEvent,
   SessionStateValue,
-} from "../hra/cloud";
+} from "../oompa/cloud";
 
 /**
  * One open interaction, as the projection describes it. Every optional field

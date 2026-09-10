@@ -30,7 +30,7 @@ const memory = () => {
   return database;
 };
 const archive = async (bytes: Uint8Array) => {
-  const root = await mkdtemp(join(tmpdir(), "hra-canonical-work-install-"));
+  const root = await mkdtemp(join(tmpdir(), "oompa-canonical-work-install-"));
   roots.push(root);
   const path = join(root, "state.sqlite");
   await writeFile(path, bytes, { mode: 0o600 });

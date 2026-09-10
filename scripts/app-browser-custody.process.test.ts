@@ -15,7 +15,7 @@ import { assertConnectedCancellationProof, assertPreparationCancellationProof } 
 
 // Native proof is an explicit exclusive gate, not an implicit browser launch
 // from the ordinary scripts test sweep. A skipped invocation proves nothing.
-const native = test.skipIf(process.env.HRA_BROWSER_CUSTODY_NATIVE !== "1");
+const native = test.skipIf(process.env.OOMPA_BROWSER_CUSTODY_NATIVE !== "1");
 const root = fileURLToPath(new URL("..", import.meta.url)).replace(/\/$/u, "");
 function record(value: unknown): Record<string, unknown> {
   assert.ok(value !== null && typeof value === "object" && !Array.isArray(value));
@@ -76,7 +76,7 @@ for (const scenario of ["preparation-cancellation", "connected-cancellation", "p
       env: {
         PATH: `${dirname(node.path)}:${dirname(bun.path)}:/usr/bin:/bin`, NODE_ENV: "production", TZ: "UTC",
         BUN_EXECUTABLE_PATH: bun.path, CHROMIUM_EXECUTABLE_PATH: chromium.path,
-        HRA_BROWSER_CUSTODY_CASE: scenario, HRA_BROWSER_CUSTODY_EVIDENCE: evidence,
+        OOMPA_BROWSER_CUSTODY_CASE: scenario, OOMPA_BROWSER_CUSTODY_EVIDENCE: evidence,
       },
     });
     const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((done) => {
@@ -114,7 +114,7 @@ for (const scenario of ["preparation-cancellation", "connected-cancellation", "p
       expect(outputBytes).toBeLessThanOrEqual(1024 * 1024);
       requireAbsent(pid); requireAbsent(-identity.group);
       const terminal = await json(join(evidence, "fixture-terminal.json"));
-      expect(terminal.schemaVersion).toBe(1); expect(terminal.kind).toBe("hra-browser-custody-fixture");
+      expect(terminal.schemaVersion).toBe(1); expect(terminal.kind).toBe("oompa-browser-custody-fixture");
       expect(terminal.scenario).toBe(scenario); expect(terminal.pid).toBe(pid); expect(terminal.node).toEqual(node);
       expect(terminal.triggered).toBe(true); expect(terminal.expired).toBe(false); expect(terminal.rejected).toBe(true);
       expect(terminal.expiryFailure).toBe(false);

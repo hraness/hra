@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 
 import { z } from "zod";
 
-import { HRA_VERSION } from "../src/version";
+import { OOMPA_VERSION } from "../src/version";
 import {
   BoundedProcessInvocationGuard,
   isBoundedProcessCleanupUnprovenError,
@@ -92,7 +92,7 @@ export function createLiveAcceptanceMemoryReadback(options: ReadbackOptions): Li
   const target = parseConvexTarget(options.target);
   const candidate = z.object({
     cloudTargetDigest: digestSchema,
-    packageVersion: z.literal(HRA_VERSION),
+    packageVersion: z.literal(OOMPA_VERSION),
     sourceRevision: z.string().regex(/^[a-f0-9]{40}$/u),
   }).strict().parse(options.candidate);
   if (candidate.cloudTargetDigest !== createHash("sha256").update(target.deploymentUrl).digest("hex")) {

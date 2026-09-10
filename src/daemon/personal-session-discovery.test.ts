@@ -1238,7 +1238,7 @@ describe("BoundedPersonalSessionDiscovery", () => {
 
 describe("createClaudeRegistrySource", () => {
   test("reads only bounded pid JSON files and projects a scalar allowlist", async () => {
-    const root = await mkdtemp(join(tmpdir(), "hra-session-registry-"));
+    const root = await mkdtemp(join(tmpdir(), "oompa-session-registry-"));
     roots.push(root);
     await writeFile(join(root, "8123.json"), JSON.stringify({
       sessionId: "session-one",
@@ -1283,7 +1283,7 @@ describe("createClaudeRegistrySource", () => {
   });
 
   test("rejects a registry record whose filename PID does not match its process authority", async () => {
-    const root = await mkdtemp(join(tmpdir(), "hra-session-registry-pid-mismatch-"));
+    const root = await mkdtemp(join(tmpdir(), "oompa-session-registry-pid-mismatch-"));
     roots.push(root);
     const now = 1_900_000_000_000;
     await writeFile(join(root, "123.json"), JSON.stringify({
@@ -1323,7 +1323,7 @@ describe("createClaudeRegistrySource", () => {
       ["001.json", 1],
       ["9007199254740992.json", 1],
     ] as const) {
-      const root = await mkdtemp(join(tmpdir(), "hra-session-registry-invalid-pid-name-"));
+      const root = await mkdtemp(join(tmpdir(), "oompa-session-registry-invalid-pid-name-"));
       roots.push(root);
       await writeFile(join(root, filename), JSON.stringify(validClaudeRegistryRecord(filename, pid)));
       const source = createClaudeRegistrySource(root, () => 1_000);
@@ -1337,7 +1337,7 @@ describe("createClaudeRegistrySource", () => {
   });
 
   test("honors file-count, byte, abort, and deadline bounds", async () => {
-    const root = await mkdtemp(join(tmpdir(), "hra-session-registry-bounds-"));
+    const root = await mkdtemp(join(tmpdir(), "oompa-session-registry-bounds-"));
     roots.push(root);
     await writeFile(join(root, "1.json"), JSON.stringify(validClaudeRegistryRecord("one", 1)));
     await writeFile(join(root, "2.json"), JSON.stringify(validClaudeRegistryRecord("two", 2)));
@@ -1369,7 +1369,7 @@ describe("createClaudeRegistrySource", () => {
   });
 
   test("marks malformed pid records incomplete instead of asserting EOF proof", async () => {
-    const root = await mkdtemp(join(tmpdir(), "hra-session-registry-malformed-"));
+    const root = await mkdtemp(join(tmpdir(), "oompa-session-registry-malformed-"));
     roots.push(root);
     await writeFile(join(root, "1.json"), JSON.stringify(validClaudeRegistryRecord("one", 1)));
     await writeFile(join(root, "2.json"), "{malformed");
@@ -1386,7 +1386,7 @@ describe("createClaudeRegistrySource", () => {
   });
 
   test("rejects non-UTF-8, multiply-linked, and writable registry records", async () => {
-    const root = await mkdtemp(join(tmpdir(), "hra-session-registry-untrusted-file-"));
+    const root = await mkdtemp(join(tmpdir(), "oompa-session-registry-untrusted-file-"));
     roots.push(root);
     const invalidUtf8 = join(root, "1.json");
     const validJson = JSON.stringify(validClaudeRegistryRecord("invalid-utf8", 1));
@@ -1418,7 +1418,7 @@ describe("createClaudeRegistrySource", () => {
 
   test("fails closed promptly when a regular PID record is swapped to a FIFO", async () => {
     if (!registryFifoTestsSupported()) return;
-    const root = await mkdtemp(join(tmpdir(), "hra-session-registry-fifo-swap-"));
+    const root = await mkdtemp(join(tmpdir(), "oompa-session-registry-fifo-swap-"));
     roots.push(root);
     const recordPath = join(root, "8123.json");
     await writeFile(recordPath, JSON.stringify(validClaudeRegistryRecord("swapped", 8123)));
@@ -1445,7 +1445,7 @@ describe("createClaudeRegistrySource", () => {
   });
 
   test("marks pid records with missing authority fields incomplete", async () => {
-    const root = await mkdtemp(join(tmpdir(), "hra-session-registry-incomplete-record-"));
+    const root = await mkdtemp(join(tmpdir(), "oompa-session-registry-incomplete-record-"));
     roots.push(root);
     await writeFile(join(root, "1.json"), JSON.stringify({ sessionId: "missing-authority" }));
     const source = createClaudeRegistrySource(root, () => 1_000);
@@ -1459,7 +1459,7 @@ describe("createClaudeRegistrySource", () => {
   });
 
   test("reads at most 200 pid records and detects registry overflow", async () => {
-    const root = await mkdtemp(join(tmpdir(), "hra-session-registry-overflow-"));
+    const root = await mkdtemp(join(tmpdir(), "oompa-session-registry-overflow-"));
     roots.push(root);
     await Promise.all(Array.from({ length: CLAUDE_REGISTRY_MAX_RECORDS + 1 }, async (_, index) => {
       await writeFile(
@@ -1626,7 +1626,7 @@ describe("createLocalClaudeProcessLivenessProbe", () => {
 
 describe("createPersonalClaudeDiscoveryAdapters", () => {
   test("binds the registry under the supplied personal config directory", async () => {
-    const configDir = await mkdtemp(join(tmpdir(), "hra-personal-claude-adapters-"));
+    const configDir = await mkdtemp(join(tmpdir(), "oompa-personal-claude-adapters-"));
     roots.push(configDir);
     await mkdir(join(configDir, "sessions"));
     await writeFile(join(configDir, "sessions", "8123.json"), JSON.stringify({

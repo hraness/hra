@@ -10,7 +10,7 @@ import {
   type CodexAppServerClient,
   type CodexAuthority,
   type CodexFact,
-  type HraHostToolCall,
+  type OompaHostToolCall,
   type CodexThread,
   type CodexThreadItem,
   type CodexTurn,
@@ -27,7 +27,7 @@ import {
 } from "../domain/codex-heartbeat-envelope";
 import type { PreparedAttachment } from "../domain/attachments";
 import { codexProviderAccountIdSchema } from "../domain/provider-accounts";
-import { HRA_SESSION_PREAMBLE_TEXT } from "../domain/hra-preamble";
+import { OOMPA_SESSION_PREAMBLE_TEXT } from "../domain/oompa-preamble";
 import {
   assertPresetSupportedByProvider,
   type Preset,
@@ -209,13 +209,13 @@ const assertReviewedThreadRuntime = (
 
 export type CodexRuntimeObserver = {
   account(authority: ProfileAuthority, account: CodexAccountProjection): void | Promise<void>;
-  hraHostTool?(
+  oompaHostTool?(
     authority: ProfileAuthority,
-    call: HraHostToolCall,
+    call: OompaHostToolCall,
   ): DynamicToolPublicResult | Promise<DynamicToolPublicResult>;
-  hraHostToolResponseWritten?(
+  oompaHostToolResponseWritten?(
     authority: ProfileAuthority,
-    call: HraHostToolCall,
+    call: OompaHostToolCall,
   ): void | Promise<void>;
   fact(authority: ProfileAuthority, fact: CodexFact): void | Promise<void>;
 };
@@ -1083,7 +1083,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
         cwd: input.projectRoot,
         ...(input.hostCapabilities === "historical_v1"
           ? { hostCapabilities: "historical_v1" as const }
-          : { developerInstructions: HRA_SESSION_PREAMBLE_TEXT }),
+          : { developerInstructions: OOMPA_SESSION_PREAMBLE_TEXT }),
         preset,
         policy: this.#policy(input.projectRoot),
       })).value;
@@ -1163,7 +1163,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
       && running.client.state === "ready"
       && running.client.connectionId === input.connectionId
       && this.#isCurrent(input.authority)
-      && running.client.hasLiveHraHostToolCall({
+      && running.client.hasLiveOompaHostToolCall({
         authority: codexAuthorityOf(input.authority),
         callId: input.callId,
         connectionId: input.connectionId,
@@ -1195,10 +1195,10 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
         input.providerThreadId,
         input.signal,
       );
-      // Claiming is deliberately non-mutating. HRA applies its reviewed
+      // Claiming is deliberately non-mutating. Oompa applies its reviewed
       // approval and permission policy on every turn after the durable
       // adoption commit, so a failed commit cannot leave provider policy
-      // changed on a thread HRA does not own.
+      // changed on a thread Oompa does not own.
       let resumedThreadId: string | undefined;
       try {
         await this.#invalidateRetainedResumeUnavailable(running, input.providerThreadId);
@@ -2750,7 +2750,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
           }
           return this.#scheduleAccountRefresh(authority, runningReady);
         },
-        onHraHostToolCall: async (call) => await this.#admit(async () => {
+        onOompaHostToolCall: async (call) => await this.#admit(async () => {
           const current = this.#clients.get(authority.id);
           if (
             !sameCodexAuthority(call.authority, clientAuthority)
@@ -2762,18 +2762,18 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
           ) {
             throw new CodexError(
               "AUTHORITY_STALE",
-              "The HRA host-tool call belongs to a stale Codex account generation",
+              "The Oompa host-tool call belongs to a stale Codex account generation",
             );
           }
-          if (this.#observer.hraHostTool === undefined) {
+          if (this.#observer.oompaHostTool === undefined) {
             throw new CodexError(
               "UNSUPPORTED_CAPABILITY",
-              "The HRA host-tool service is unavailable",
+              "The Oompa host-tool service is unavailable",
             );
           }
-          return await this.#observer.hraHostTool(authority, call);
+          return await this.#observer.oompaHostTool(authority, call);
         }),
-        onHraHostToolResponseWritten: (call) => {
+        onOompaHostToolResponseWritten: (call) => {
           const current = this.#clients.get(authority.id);
           if (
             !sameCodexAuthority(call.authority, clientAuthority)
@@ -2783,7 +2783,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
             || launchedClient.current.state !== "ready"
             || launchedClient.current.connectionId !== call.connectionId
           ) return;
-          return this.#observer.hraHostToolResponseWritten?.(authority, call);
+          return this.#observer.oompaHostToolResponseWritten?.(authority, call);
         },
         onFact: async (value: FencedCodexValue<CodexFact>) => {
           if (!sameCodexAuthority(value.authority, clientAuthority)) return;

@@ -15,7 +15,7 @@ import {
   snapshotForeignJson,
   type CompactRemoteInteractionQuestion,
   type RemoteCommandPayload,
-} from "../hra/cloud";
+} from "../oompa/cloud";
 import { StaticMarkdown } from "../markdown/markdown";
 import {
   interactionAffordance,

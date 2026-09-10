@@ -20,7 +20,7 @@ function Fingerprint({ value }: Readonly<{ value: string }>) {
  *
  * A browser is never the first device on an account and never approves another
  * device: it registers, shows its public key fingerprint, and waits for a
- * machine with hra installed to approve it against that exact fingerprint.
+ * machine with oompa installed to approve it against that exact fingerprint.
  */
 export function EnrollmentScreen() {
   const custody = useCustody();
@@ -33,7 +33,7 @@ export function EnrollmentScreen() {
           <>
             <CardTitle>This account has no approved machine yet</CardTitle>
             <CardDescription>
-              A browser is never the first device on an account. Install hra on the machine that
+              A browser is never the first device on an account. Install oompa on the machine that
               runs your sessions, sign in there, and come back.
             </CardDescription>
           </>
@@ -53,13 +53,13 @@ export function EnrollmentScreen() {
           <>
             <CardTitle>Waiting for approval</CardTitle>
             <CardDescription>
-              Approve this device from a machine with hra installed, and compare this fingerprint
+              Approve this device from a machine with oompa installed, and compare this fingerprint
               before you do.
             </CardDescription>
             {custody.fingerprint === null ? null : <Fingerprint value={custody.fingerprint} />}
             <CardDescription>
-              Run <span {...stylex.props(enrollmentStyles.mono)}>hra device list</span> and then{" "}
-              <span {...stylex.props(enrollmentStyles.mono)}>hra device approve</span> on that machine.
+              Run <span {...stylex.props(enrollmentStyles.mono)}>oompa device list</span> and then{" "}
+              <span {...stylex.props(enrollmentStyles.mono)}>oompa device approve</span> on that machine.
             </CardDescription>
           </>
         );

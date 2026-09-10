@@ -112,7 +112,7 @@ describe("work event watch", () => {
       maxPages: 1,
       output: { writeStdout: (value) => { stdout.push(value); } },
       signal: new AbortController().signal,
-    })).rejects.toThrow("canonical HRA cursor envelope");
+    })).rejects.toThrow("canonical Oompa cursor envelope");
     expect(stdout).toEqual([]);
   });
 

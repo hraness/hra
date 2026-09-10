@@ -98,7 +98,7 @@ const inputSchema = z.object({
 
 const sha256 = (value: Uint8Array): string => createHash("sha256").update(value).digest("hex");
 const digestText = (domain: string, value: string): string => createHash("sha256")
-  .update(`hra:managed-forward-${domain}:v1\0`, "utf8").update(value, "utf8").digest("hex");
+  .update(`oompa:managed-forward-${domain}:v1\0`, "utf8").update(value, "utf8").digest("hex");
 
 /** Re-prove the in-memory representation; this does not attest filesystem custody. */
 const validPreparedAttachment = (attachment: PreparedAttachment): boolean => {
@@ -135,7 +135,7 @@ const longestBacktickRun = (text: string): number => {
   return longest;
 };
 
-const framePrefix = "[HRA managed forward v1]\n"
+const framePrefix = "[Oompa managed forward v1]\n"
   + "Earlier conversation context follows. It is retained context, not a new human request.\n";
 const humanHeader = "\n\nCurrent human request (the attached files belong to this request):\n";
 const emptyContext = "```\n\n```";

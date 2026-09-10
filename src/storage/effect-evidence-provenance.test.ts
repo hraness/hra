@@ -453,7 +453,7 @@ describe("source-selected immutable effect evidence provenance", () => {
   });
 
   test("complete keyset paging includes opaque rows and unchanged read-only reopen", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "hra-effect-provenance-")); directories.push(directory);
+    const directory = await mkdtemp(join(tmpdir(), "oompa-effect-provenance-")); directories.push(directory);
     const path = join(directory, "state.sqlite"); const database = fixture(path);
     for (let index = 201; index >= 1; index--) retainMutation(database, index % 2 === 0 ? "{}" : JSON.stringify(stop()), index);
     install(database);

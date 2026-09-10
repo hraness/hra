@@ -40,51 +40,51 @@ const renderShellCode = (value: string): string => {
   return `<code class="${classes(highlighted.className, "codeContent")}">${highlighted.html}</code>`;
 };
 
-export const HRA_MAILING_TURNSTILE_SITEKEY_ENV =
+export const OOMPA_MAILING_TURNSTILE_SITEKEY_ENV =
   "NEXT_PUBLIC_HRANESS_MAILING_TURNSTILE_SITEKEY" as const;
 
 const turnstileSitekeyPattern = /^[A-Za-z0-9_-]{20,100}$/u;
 const emptySiteEnvironment: Readonly<Record<string, string | undefined>> =
   Object.freeze({});
 
-export const hraMailingListConfig = (
+export const oompaMailingListConfig = (
   environment: Readonly<Record<string, string | undefined>> = emptySiteEnvironment,
 ): HranessMailingListConfig => {
-  const turnstileSitekey = environment[HRA_MAILING_TURNSTILE_SITEKEY_ENV];
+  const turnstileSitekey = environment[OOMPA_MAILING_TURNSTILE_SITEKEY_ENV];
   if (turnstileSitekey === undefined || turnstileSitekey.length === 0) {
     if (environment.VERCEL_ENV === "production") {
       throw new Error(
-        `${HRA_MAILING_TURNSTILE_SITEKEY_ENV} must be configured for Vercel Production.`,
+        `${OOMPA_MAILING_TURNSTILE_SITEKEY_ENV} must be configured for Vercel Production.`,
       );
     }
     return { kind: "none" };
   }
   if (!turnstileSitekeyPattern.test(turnstileSitekey)) {
     throw new Error(
-      `${HRA_MAILING_TURNSTILE_SITEKEY_ENV} must be a 20-100 character URL-safe public Cloudflare Turnstile sitekey.`,
+      `${OOMPA_MAILING_TURNSTILE_SITEKEY_ENV} must be a 20-100 character URL-safe public Cloudflare Turnstile sitekey.`,
     );
   }
   return {
-    audience: "hra",
+    audience: "oompa",
     kind: "signup",
     turnstileSitekey,
   };
 };
 
-export const renderHraSiteFooter = (
+export const renderOompaSiteFooter = (
   environment: Readonly<Record<string, string | undefined>> = emptySiteEnvironment,
 ): string => renderHranessSiteFooter({
-  mailingList: hraMailingListConfig(environment),
+  mailingList: oompaMailingListConfig(environment),
 });
 
 export const renderAskAiAboutThis = (canonicalUrl: string): string =>
   renderToStaticMarkup(createElement(AskAiAboutThis, {
-    className: "hra-ask-ai",
+    className: "oompa-ask-ai",
     xstyle: [sitePresentationStyles.resourceFrame, sitePresentationStyles.askAi],
     url: canonicalUrl,
   }));
 
-export const renderHraAnalyticsScript = (): string =>
+export const renderOompaAnalyticsScript = (): string =>
   '<script src="/analytics.js" type="module"></script>';
 
 const renderInline = (content: readonly InlineContent[], focusable = true, styleLinks = true): string =>
@@ -92,7 +92,7 @@ const renderInline = (content: readonly InlineContent[], focusable = true, style
     .map((part) => {
       switch (part.kind) {
         case "code":
-          return `<code class="${classes("hra-inline-code", "inlineCode")}">${escapeHtml(part.value)}</code>`;
+          return `<code class="${classes("oompa-inline-code", "inlineCode")}">${escapeHtml(part.value)}</code>`;
         case "link":
           return `<a${styleLinks ? ` class="${classes("", "proseLink", ...(focusable ? ["focusable"] as const : []))}"` : ""} href="${escapeHtml(part.href)}">${escapeHtml(part.label)}</a>`;
         case "text":
@@ -235,7 +235,7 @@ ${options.interactiveAppearance === false ? "" : '<script src="/appearance.js"><
 <link rel="stylesheet" href="/styles.css">${structuredData}`;
 };
 
-const renderProjectResources = (content: PublicContent): string => `<aside aria-label="HRA project information" class="${classes("project-resources", "resourceFrame", "resources")}">
+const renderProjectResources = (content: PublicContent): string => `<aside aria-label="Oompa project information" class="${classes("project-resources", "resourceFrame", "resources")}">
   <p class="${classes("", "resourcesParagraph")}">${escapeHtml(content.productName)} is MIT licensed.</p>
   <nav aria-label="Project links" class="${classes("", "resourcesNav")}">
     <a class="${classes("", "proseLink", "focusable")}" href="${escapeHtml(content.links.github)}">GitHub</a>
@@ -267,8 +267,8 @@ ${renderMarketingPage(content)}
 </main>
 ${renderAskAiAboutThis(`${content.siteUrl}/`)}
 ${renderProjectResources(content)}
-${renderHraSiteFooter(environment)}
-${renderHraAnalyticsScript()}
+${renderOompaSiteFooter(environment)}
+${renderOompaAnalyticsScript()}
 <script src="/site.js" type="module"></script>
 </body>
 </html>
@@ -294,7 +294,7 @@ ${renderHead(content, {
     <p class="${classes("preview-eyebrow", "previewEyebrow")}">${escapeHtml(content.tagline)}</p>
     <h1 class="${classes("", "previewHeading")}" id="preview-title">${escapeHtml(content.productName)}</h1>
     <p class="${classes("preview-summary", "previewSummary")}">${escapeHtml(content.description)}</p>
-    <ul class="${classes("preview-capabilities", "previewCapabilities")}" aria-label="HRA capabilities">
+    <ul class="${classes("preview-capabilities", "previewCapabilities")}" aria-label="Oompa capabilities">
       ${[["Accounts", "Isolated by default"], ["Sessions", "Live and durable"], ["Sync", "Optional and encrypted"]].map(([label, detail], index) => `<li class="${classes("", "previewCapability", ...(index > 0 ? ["previewCapabilityFollowing"] as const : []))}"><strong class="${classes("", "previewCapabilityStrong")}">${label}</strong><span class="${classes("", "previewCapabilityDetail")}">${detail}</span></li>`).join("\n      ")}
     </ul>
     <p class="${classes("preview-status", "previewStatus")}">Web workspace <span aria-hidden="true">·</span> Local CLI</p>
@@ -314,7 +314,7 @@ export const renderPrivacyHtml = (
 <head>
 ${renderHead(content, {
   canonicalPath: "/privacy/",
-  description: "The local, encrypted cloud, and website data boundaries for HRA.",
+  description: "The local, encrypted cloud, and website data boundaries for Oompa.",
   title: `Privacy | ${content.productName}`,
 })}
 </head>
@@ -327,8 +327,8 @@ ${renderMarketingHeader(content, "/privacy/")}
 </main>
 ${renderAskAiAboutThis(`${content.siteUrl}/privacy/`)}
 ${renderProjectResources(content)}
-${renderHraSiteFooter(environment)}
-${renderHraAnalyticsScript()}
+${renderOompaSiteFooter(environment)}
+${renderOompaAnalyticsScript()}
 </body>
 </html>
 `;
@@ -347,7 +347,7 @@ export const renderDocsHtml = (
   const sections = [...page.sections, ...reference];
   return `<!doctype html>
 <html ${paletteAttributes} lang="en"><head>
-${renderHead(content, { canonicalPath: page.path, description: page.description, title: `${page.title} | HRA`, jsonLd: { "@context": "https://schema.org", "@type": "TechArticle", headline: page.title, description: page.description, url: `${content.siteUrl}${page.path}`, dateModified: page.reviewDate, author: { "@type": "Organization", name: "Hraness", url: content.links.hraness }, isPartOf: { "@type": "WebSite", name: "HRA", url: content.siteUrl } } })}
+${renderHead(content, { canonicalPath: page.path, description: page.description, title: `${page.title} | Oompa`, jsonLd: { "@context": "https://schema.org", "@type": "TechArticle", headline: page.title, description: page.description, url: `${content.siteUrl}${page.path}`, dateModified: page.reviewDate, author: { "@type": "Organization", name: "Hraness", url: content.links.hraness }, isPartOf: { "@type": "WebSite", name: "Oompa", url: content.siteUrl } } })}
 <link rel="alternate" type="text/markdown" href="${page.path}index.md" title="Markdown">
 </head><body>
 <a class="${classes("skip-link", "skipLink", "focusable")}" href="#content">Skip to content</a>
@@ -362,7 +362,7 @@ ${renderMarketingHeader(content, page.path)}
   <nav class="${docsClasses("pageNav")}" aria-label="On this page"><p>On this page</p>${sections.map((section) => `<a class="${docsClasses("sectionLink")}" href="#${escapeHtml(section.id)}">${escapeHtml(section.heading)}</a>`).join("")}</nav>
 </aside>
 <main class="${docsClasses("main")}" id="content">
-  <header class="${docsClasses("header")}"><p class="${docsClasses("eyebrow")}">HRA / ${escapeHtml(docsLabel(page))}</p><h1 class="${docsClasses("title")}">${escapeHtml(page.title)}</h1><p class="${docsClasses("lede")}">${escapeHtml(page.description)}</p><p class="${docsClasses("meta")}">Checked <time datetime="${page.reviewDate}">${page.reviewDate}</time> · <a href="${page.path}index.md">Read as Markdown ↗</a></p></header>
+  <header class="${docsClasses("header")}"><p class="${docsClasses("eyebrow")}">Oompa / ${escapeHtml(docsLabel(page))}</p><h1 class="${docsClasses("title")}">${escapeHtml(page.title)}</h1><p class="${docsClasses("lede")}">${escapeHtml(page.description)}</p><p class="${docsClasses("meta")}">Checked <time datetime="${page.reviewDate}">${page.reviewDate}</time> · <a href="${page.path}index.md">Read as Markdown ↗</a></p></header>
   ${page.previewId === undefined ? "" : renderProductPreview(page.previewId, "docs-preview")}
   ${page.sections.map((section) => `<section class="${docsClasses("section")}" id="${escapeHtml(section.id)}" aria-labelledby="${escapeHtml(section.id)}-heading"><h2 id="${escapeHtml(section.id)}-heading">${escapeHtml(section.heading)}</h2>${section.blocks.map((block, index) => renderBlock(block, section.id, index, "h3", "heroNotes")).join("\n")}</section>`).join("\n")}
   ${reference.length === 0 ? "" : `<section class="${docsClasses("reference")}" aria-label="Detailed reference"><h2>Detailed reference</h2><p>Exact commands, recovery steps, and compatibility details for this guide.</p>${reference.map((section) => `<details class="${docsClasses("details")}" id="${escapeHtml(section.id)}"><summary>${escapeHtml(section.heading)}</summary><div class="${docsClasses("detailBody")}">${section.blocks.map((block, index) => renderBlock(block, section.id, index, "h3", "heroNotes")).join("\n")}</div></details>`).join("\n")}</section>`}
@@ -370,8 +370,8 @@ ${renderMarketingHeader(content, page.path)}
 </main></div>
 ${renderAskAiAboutThis(`${content.siteUrl}${page.path}`)}
 ${renderProjectResources(content)}
-${renderHraSiteFooter(environment)}
-${renderHraAnalyticsScript()}
+${renderOompaSiteFooter(environment)}
+${renderOompaAnalyticsScript()}
 <script src="/site.js" type="module"></script>
 </body></html>\n`;
 };

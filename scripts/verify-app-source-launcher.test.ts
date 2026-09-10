@@ -97,7 +97,7 @@ const launcherFixture = (overrides: Readonly<{
   events: string[];
   root: string;
 }> => {
-  const root = mkdtempSync(join(realpathSync(tmpdir()), "hra-app-launch-root-"));
+  const root = mkdtempSync(join(realpathSync(tmpdir()), "oompa-app-launch-root-"));
   const scratch = mkdtempSync(join(trustedScratchRoot, "hra-app-source-verifier-"));
   writeFileSync(join(root, "package.json"), trackedDocument);
   const events: string[] = [];
@@ -114,12 +114,12 @@ const launcherFixture = (overrides: Readonly<{
     if (key.includes("\0rev-parse\0--show-object-format")) return result("sha1\n");
     if (key.includes("\0config\0--null\0--list")) {
       return result(overrides.maskedOrigin === true
-        ? "core.repositoryformatversion\n0\0remote.origin.url\nhttps://attacker.invalid/hra.git\0url.https://github.com/hraness/hra.git.insteadof\nhttps://attacker.invalid/hra.git\0"
+        ? "core.repositoryformatversion\n0\0remote.origin.url\nhttps://attacker.invalid/oompa.git\0url.https://github.com/hraness/oompa.git.insteadof\nhttps://attacker.invalid/oompa.git\0"
         : `core.repositoryformatversion\n0\0remote.origin.url\n${overrides.wrongOrigin === true
-          ? "https://github.com/attacker/hra.git"
+          ? "https://github.com/attacker/oompa.git"
           : overrides.sshOrigin === true
-            ? "git@github.com:hraness/hra.git"
-            : "https://github.com/hraness/hra.git"}\0`);
+            ? "git@github.com:hraness/oompa.git"
+            : "https://github.com/hraness/oompa.git"}\0`);
     }
     if (key.includes("\0status\0--porcelain=v1\0--untracked-files=all")) return result();
     if (key.includes("\0ls-files\0-v\0-z")) {
@@ -133,17 +133,17 @@ const launcherFixture = (overrides: Readonly<{
     }
     if (key.includes("\0remote\0get-url\0--all\0origin")) {
       return result(overrides.wrongOrigin === true
-        ? "https://github.com/attacker/hra.git\n"
+        ? "https://github.com/attacker/oompa.git\n"
         : overrides.sshOrigin === true
-          ? "git@github.com:hraness/hra.git\n"
-          : "https://github.com/hraness/hra.git\n");
+          ? "git@github.com:hraness/oompa.git\n"
+          : "https://github.com/hraness/oompa.git\n");
     }
     if (key.includes("\0remote\0get-url\0--push\0--all\0origin")) {
       return result(overrides.sshOrigin === true
-        ? "git@github.com:hraness/hra.git\n"
-        : "https://github.com/hraness/hra.git\n");
+        ? "git@github.com:hraness/oompa.git\n"
+        : "https://github.com/hraness/oompa.git\n");
     }
-    if (key.includes("\0ls-remote\0--heads\0https://github.com/hraness/hra.git\0refs/heads/main")) {
+    if (key.includes("\0ls-remote\0--heads\0https://github.com/hraness/oompa.git\0refs/heads/main")) {
       mainReadCount += 1;
       const current = overrides.mainAdvancesAfterFirstRead === true && mainReadCount > 2
         ? "7".repeat(40)
@@ -236,14 +236,14 @@ const realRepositoryLauncherFixture = (
   git: (arguments_: readonly string[]) => string;
   root: string;
 }> => {
-  const root = mkdtempSync(join(realpathSync(tmpdir()), "hra-app-launch-real-root-"));
+  const root = mkdtempSync(join(realpathSync(tmpdir()), "oompa-app-launch-real-root-"));
   const scratch = mkdtempSync(join(trustedScratchRoot, "hra-app-source-verifier-"));
   const events: string[] = [];
   const git = (arguments_: readonly string[]): string => runFixtureGit(root, arguments_);
   git(["init", "--quiet"]);
-  git(["config", "user.email", "fixture@hra.invalid"]);
-  git(["config", "user.name", "HRA Fixture"]);
-  git(["remote", "add", "origin", "https://github.com/hraness/hra.git"]);
+  git(["config", "user.email", "fixture@oompa.invalid"]);
+  git(["config", "user.name", "Oompa Fixture"]);
+  git(["remote", "add", "origin", "https://github.com/hraness/oompa.git"]);
   for (const [path, document] of Object.entries(files)) {
     const absolute = join(root, path);
     mkdirSync(join(absolute, ".."), { recursive: true });
@@ -271,7 +271,7 @@ const realRepositoryLauncherFixture = (
   ) => {
     const key = command.join("\0");
     events.push(`command:${options.cwd}:${key}:${String(options.credentialDescriptor ?? "none")}`);
-    if (key.includes("\0ls-remote\0--heads\0https://github.com/hraness/hra.git\0refs/heads/main")) {
+    if (key.includes("\0ls-remote\0--heads\0https://github.com/hraness/oompa.git\0refs/heads/main")) {
       return result(`${commit}\trefs/heads/main\n`);
     }
     if (command[0] === "/trusted/bun") {
@@ -335,7 +335,7 @@ const realRepositoryLauncherFixture = (
   };
 };
 
-describe("HRA browser app source proof launcher", () => {
+describe("Oompa browser app source proof launcher", () => {
   test("parses exact stable proof and retained-verification inputs", () => {
     expect(parseAppSourceProofLauncherArguments(proveArguments)).toEqual({
       deploymentId,
@@ -467,7 +467,7 @@ describe("HRA browser app source proof launcher", () => {
     expect(readFileSync(join(import.meta.dir, "..", "package.json"), "utf8"))
       .not.toContain("hosted:command-capacity");
 
-    const root = mkdtempSync(join(realpathSync(tmpdir()), "hra-app-source-stage-zero-"));
+    const root = mkdtempSync(join(realpathSync(tmpdir()), "oompa-app-source-stage-zero-"));
     const preload = join(root, "ambient-preload.ts");
     const sentinel = join(root, "ambient-preload-ran");
     try {
@@ -500,7 +500,7 @@ describe("HRA browser app source proof launcher", () => {
 
   test("refuses a scratch directory selected through an unsafe ambient temporary parent", () => {
     const fixture = launcherFixture();
-    const unsafeParent = mkdtempSync(join(trustedScratchRoot, "hra-app-unsafe-tmpdir-"));
+    const unsafeParent = mkdtempSync(join(trustedScratchRoot, "oompa-app-unsafe-tmpdir-"));
     chmodSync(unsafeParent, 0o777);
     const unsafeScratch = mkdtempSync(join(unsafeParent, "hra-app-source-verifier-"));
     const stdout = output();
@@ -524,7 +524,7 @@ describe("HRA browser app source proof launcher", () => {
   });
 
   test("the default scratch creator ignores ambient TMPDIR", () => {
-    const unsafeParent = mkdtempSync(join(trustedScratchRoot, "hra-app-ambient-tmpdir-"));
+    const unsafeParent = mkdtempSync(join(trustedScratchRoot, "oompa-app-ambient-tmpdir-"));
     chmodSync(unsafeParent, 0o777);
     const previous = process.env.TMPDIR;
     let created: string | undefined;
@@ -572,15 +572,15 @@ describe("HRA browser app source proof launcher", () => {
 
   test("rejects a real Git-clean smudge-filter checkout before scratch or credential access", () => {
     const fixture = realRepositoryLauncherFixture({
-      ".gitattributes": "payload.txt filter=hra-proof\n",
+      ".gitattributes": "payload.txt filter=oompa-proof\n",
       "payload.txt": "canonical\n",
     });
     const stdout = output();
     const stderr = output();
     try {
-      fixture.git(["config", "filter.hra-proof.clean", "/usr/bin/sed s/transformed/canonical/g"]);
-      fixture.git(["config", "filter.hra-proof.required", "true"]);
-      fixture.git(["config", "filter.hra-proof.smudge", "/usr/bin/sed s/canonical/transformed/g"]);
+      fixture.git(["config", "filter.oompa-proof.clean", "/usr/bin/sed s/transformed/canonical/g"]);
+      fixture.git(["config", "filter.oompa-proof.required", "true"]);
+      fixture.git(["config", "filter.oompa-proof.smudge", "/usr/bin/sed s/canonical/transformed/g"]);
       rmSync(join(fixture.root, "payload.txt"));
       fixture.git(["checkout", "--", "payload.txt"]);
       expect(readFileSync(join(fixture.root, "payload.txt"), "utf8")).toBe("transformed\n");
@@ -643,7 +643,7 @@ describe("HRA browser app source proof launcher", () => {
       const opened = fixture.events.findIndex((event) => event.startsWith("credential:opened:"));
       const installed = fixture.events.findIndex((event) => event.includes("\0install\0--frozen-lockfile"));
       const mainReads = fixture.events
-        .map((event, index) => event.includes("\0ls-remote\0--heads\0https://github.com/hraness/hra.git") ? index : -1)
+        .map((event, index) => event.includes("\0ls-remote\0--heads\0https://github.com/hraness/oompa.git") ? index : -1)
         .filter((index) => index >= 0);
       const child = fixture.events.findIndex((event) => event.includes("/scripts/verify-app-source.ts\0"));
       expect(installed).toBeGreaterThan(-1);

@@ -13,8 +13,8 @@ import {
 } from "../src/claude/index";
 import { publicInteractionSchema, type PublicInteraction } from "../src/domain/interactions";
 import type { LocalCommand } from "../src/domain/contracts";
-import type { HraMemoryRememberInput } from "../src/domain/host-tools";
-import { HRA_VERSION } from "../src/version";
+import type { OompaMemoryRememberInput } from "../src/domain/host-tools";
+import { OOMPA_VERSION } from "../src/version";
 import { projectPublicProviderIdentifier } from "../src/public-provider-identifier";
 import {
   ClaudeLiveAcceptanceProofCollector,
@@ -84,7 +84,7 @@ const workingDigest = "7".repeat(64);
 const submissionId = `memsub_${"8".repeat(32)}`;
 const candidate: LiveAcceptanceCandidate = {
   cloudTargetDigest: "9".repeat(64),
-  packageVersion: HRA_VERSION,
+  packageVersion: OOMPA_VERSION,
   sourceRevision: "a".repeat(40),
 };
 
@@ -135,7 +135,7 @@ function pendingInteraction(): PublicInteraction {
       kind: "permission_approval",
       reason: null,
       requested: [{ name: "mcp__hra__memory_remember" }],
-      summary: "Allow one exact HRA memory receipt",
+      summary: "Allow one exact Oompa memory receipt",
     },
     id: "00000000-0000-4000-8000-000000000442",
     kind: "permission_approval",
@@ -215,7 +215,7 @@ class FakeClaudeWorker implements ClaudeLiveAcceptanceWorker {
   readonly #runId: string;
   readonly interaction = pendingInteraction();
   collector: ClaudeLiveAcceptanceProofCollector | undefined;
-  memory: HraMemoryRememberInput | undefined;
+  memory: OompaMemoryRememberInput | undefined;
   prompt = "";
   stopCalls = 0;
   stopWithProofCalls = 0;
@@ -254,12 +254,12 @@ class FakeClaudeWorker implements ClaudeLiveAcceptanceWorker {
           state: "signed_out",
           updatedAt: 1_000,
         },
-        next: `hra account login ${profileId}`,
+        next: `oompa account login ${profileId}`,
       });
     }
     if (key === "account.show") {
       return envelope("account.show", {
-        account: { id: profileId, label: `hra-claude-live-${this.#runId.replaceAll("-", "").slice(0, 12)}` },
+        account: { id: profileId, label: `oompa-claude-live-${this.#runId.replaceAll("-", "").slice(0, 12)}` },
         authentication: { provider: "claude", signedIn: true },
         providerGeneration: 3,
       });
@@ -493,7 +493,7 @@ const stoppedReadback = (
 async function withPrivateDirectory(
   operation: (directory: string) => Promise<void>,
 ): Promise<void> {
-  const directory = await mkdtemp(join(await realpath(tmpdir()), "hra-claude-runner-test-"));
+  const directory = await mkdtemp(join(await realpath(tmpdir()), "oompa-claude-runner-test-"));
   await chmod(directory, 0o700);
   try {
     await operation(directory);
@@ -521,7 +521,7 @@ async function testLayout(directory: string, value: LiveAcceptanceCandidate) {
       version: 1 as const,
     },
     project: await observePrivateDirectory(projectPath, () => new Error("project_invalid")),
-    receiptPath: join(directory, `.hra-live-claude-acceptance-${runId}.recovery.json`),
+    receiptPath: join(directory, `.oompa-live-claude-acceptance-${runId}.recovery.json`),
     runRoot: await observePrivateDirectory(runRootPath, () => new Error("root_invalid")),
     state: await observePrivateDirectory(statePath, () => new Error("state_invalid")),
   };
@@ -561,7 +561,7 @@ const cleanupEvidence = (input: Readonly<{
   privateArtifactsAbsent: true,
   retainedSessionProcess: "released_not_live",
   scopeBindingDigest: canonicalDigest({
-    domain: "hra.claude.cleanup-readback.v1",
+    domain: "oompa.claude.cleanup-readback.v1",
     profileGeneration: input.profileGeneration ?? null,
     profileId: input.profileId,
     sessionId: input.sessionId ?? null,
@@ -863,7 +863,7 @@ describe("Claude cleanup-only recovery", () => {
       ...base,
       bindingDigest: canonicalDigest({
         ...base,
-        domain: "hra.claude.live-acceptance.cleanup-authorization.v1",
+        domain: "oompa.claude.live-acceptance.cleanup-authorization.v1",
       }),
     };
   };
@@ -871,7 +871,7 @@ describe("Claude cleanup-only recovery", () => {
   async function recoveryFixture(directory: string, rootExists: boolean) {
     const layout = await testLayout(directory, candidate);
     const initial = claudeLiveAcceptanceRecoveryReceiptSchema.parse({
-      accountLabel: `hra-claude-live-${layout.descriptor.runId.replaceAll("-", "").slice(0, 12)}`,
+      accountLabel: `oompa-claude-live-${layout.descriptor.runId.replaceAll("-", "").slice(0, 12)}`,
       candidate,
       checkpoint: "cleanup_authorized",
       createdAt: 1,
@@ -879,10 +879,10 @@ describe("Claude cleanup-only recovery", () => {
       loginIdempotencyKey: randomUUID(),
       project: {
         identity: layout.project,
-        quarantinePath: join(layout.runRoot.path, ".hra-claude-quarantine-project-test"),
+        quarantinePath: join(layout.runRoot.path, ".oompa-claude-quarantine-project-test"),
         state: "deleted",
       },
-      projectLabel: `hra-claude-live-${layout.descriptor.runId.replaceAll("-", "").slice(-12)}`,
+      projectLabel: `oompa-claude-live-${layout.descriptor.runId.replaceAll("-", "").slice(-12)}`,
       receiptPath: layout.receiptPath,
       runId: layout.descriptor.runId,
       runRoot: layout.runRoot,
@@ -890,7 +890,7 @@ describe("Claude cleanup-only recovery", () => {
       startIdempotencyKey: randomUUID(),
       state: {
         identity: layout.state,
-        quarantinePath: join(layout.runRoot.path, ".hra-claude-quarantine-state-test"),
+        quarantinePath: join(layout.runRoot.path, ".oompa-claude-quarantine-state-test"),
         state: "deleted",
       },
       updatedAt: 1,
@@ -937,7 +937,7 @@ describe("Claude cleanup-only recovery", () => {
               ...readyAuthorizationBase,
               bindingDigest: canonicalDigest({
                 ...readyAuthorizationBase,
-                domain: "hra.claude.live-acceptance.cleanup-authorization.v1",
+                domain: "oompa.claude.live-acceptance.cleanup-authorization.v1",
               }),
             },
             worker: { pid: 91_002, state: "ready" },

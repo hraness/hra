@@ -27,7 +27,7 @@ export const SAFE_ENVIRONMENT_KEYS: ReadonlySet<string> = new Set([
   "USER",
 ]);
 
-// Every child HRA spawns receives this allowlist plus the caller's named
+// Every child Oompa spawns receives this allowlist plus the caller's named
 // extra keys. Nothing else from the parent environment crosses the boundary.
 export function allowlistedEnvironment(
   environment: Readonly<Record<string, string | undefined>>,

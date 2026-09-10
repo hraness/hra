@@ -40,7 +40,7 @@ import {
   type CodexAutomationAuthorityRequest,
   type CodexAutomationAuthorityScan,
   type CodexFact,
-  type HraHostToolCall,
+  type OompaHostToolCall,
   type CodexPluginCatalog,
 } from "../codex";
 import { parseFact, parseThreadMetadataRead } from "../codex/protocol";
@@ -63,7 +63,7 @@ import {
   type LocalCommand,
   type NotificationEmailHostedAuthority,
 } from "../domain/contracts";
-import { HRA_HOST_TOOL_PUBLIC_RESULT_MAX_BYTES } from "../domain/host-tools";
+import { OOMPA_HOST_TOOL_PUBLIC_RESULT_MAX_BYTES } from "../domain/host-tools";
 import { PROJECT_MEMORY_EMPTY_HEAD } from "../domain/project-memory";
 import {
   PROTECTED_INTERACTION_DETAIL_MAXIMUM_BYTES,
@@ -119,8 +119,8 @@ import {
 } from "./prose-responder";
 import { DaemonAuthoritySafetyError } from "./daemon-lock";
 import type {
-  HraFactsMemoryLifecyclePort,
-  HraFactsMemoryLifecycleReceipt,
+  OompaFactsMemoryLifecyclePort,
+  OompaFactsMemoryLifecycleReceipt,
 } from "./facts-memory-lifecycle";
 import { ClaudeProcessExitUnprovenError, ClaudeSessionObservationError, CodexClaimReleaseUnprovenError, CodexSessionObservationError, UnavailableClaudeRuntime, UnavailableCloudControl, type ClaudeProcessIdentity, type ClaudeRuntimePort, type ClaudeRuntimeStartReview, type CloudControlPort, type CodexAccountProjection, type CodexLoginOutcome, type CodexRuntimePort, type CodexSessionObservation, type CodexSessionProjection, type CompactProjectionRecoveryBlocker, type DesktopSwitchPort, type ProfileAuthority, type RuntimeStartReview } from "./ports";
 import {
@@ -134,11 +134,11 @@ import {
   type PersonalSessionDiscoveryPort,
 } from "./personal-session-discovery";
 import type {
-  HraMemoryPort,
-  HraMemoryRefusalCode,
+  OompaMemoryPort,
+  OompaMemoryRefusalCode,
 } from "./memory-coordinator";
 import { SessionEventCursorCodec } from "./session-event-cursor";
-import { CommandFailure, FACTS_MEMORY_SESSION_TTL_MS, HraService } from "./service";
+import { CommandFailure, FACTS_MEMORY_SESSION_TTL_MS, OompaService } from "./service";
 import { USAGE_HISTORY_CURSOR_TTL_MS } from "./usage-history-cursor";
 
 const privatePathRoot = ["", "Users", "private"].join("/");
@@ -1260,11 +1260,11 @@ class FakeDesktop implements DesktopSwitchPort {
   }
 }
 
-class FakeFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
-  readonly cleanups: Array<Parameters<HraFactsMemoryLifecyclePort["cleanupSession"]>[0]> = [];
-  readonly ensures: Array<Parameters<HraFactsMemoryLifecyclePort["ensureSession"]>[0]> = [];
+class FakeFactsMemoryLifecycle implements OompaFactsMemoryLifecyclePort {
+  readonly cleanups: Array<Parameters<OompaFactsMemoryLifecyclePort["cleanupSession"]>[0]> = [];
+  readonly ensures: Array<Parameters<OompaFactsMemoryLifecyclePort["ensureSession"]>[0]> = [];
   readonly sweeps: number[] = [];
-  readonly transfers: Array<Parameters<HraFactsMemoryLifecyclePort["transferSessionOwner"]>[0]> = [];
+  readonly transfers: Array<Parameters<OompaFactsMemoryLifecyclePort["transferSessionOwner"]>[0]> = [];
   readonly epochs = new Map<string, number>();
   readonly expiries = new Map<string, number>();
   readonly owners = new Map<string, string>();
@@ -1274,7 +1274,7 @@ class FakeFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
   transferErrorOnce: Error | undefined;
   simulateExpiry = false;
 
-  #receipt(sessionId: string, state: HraFactsMemoryLifecycleReceipt["state"] = "active"): HraFactsMemoryLifecycleReceipt {
+  #receipt(sessionId: string, state: OompaFactsMemoryLifecycleReceipt["state"] = "active"): OompaFactsMemoryLifecycleReceipt {
     return {
       bindingDigest: "a".repeat(64),
       epoch: this.epochs.get(sessionId) ?? 1,
@@ -1290,19 +1290,19 @@ class FakeFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
     };
   }
 
-  readSession(sessionId: string): HraFactsMemoryLifecycleReceipt | null {
+  readSession(sessionId: string): OompaFactsMemoryLifecycleReceipt | null {
     const state = this.states.get(sessionId);
     return state === undefined ? null : this.#receipt(sessionId, state);
   }
 
-  async cleanupSession(input: Parameters<HraFactsMemoryLifecyclePort["cleanupSession"]>[0]) {
+  async cleanupSession(input: Parameters<OompaFactsMemoryLifecyclePort["cleanupSession"]>[0]) {
     this.cleanups.push(input);
     if (this.cleanupErrors.has(input.sessionId)) throw new Error("poisoned terminal cleanup");
     this.states.set(input.sessionId, "purged");
     return this.#receipt(input.sessionId, "purged");
   }
 
-  async ensureSession(input: Parameters<HraFactsMemoryLifecyclePort["ensureSession"]>[0]) {
+  async ensureSession(input: Parameters<OompaFactsMemoryLifecyclePort["ensureSession"]>[0]) {
     this.ensures.push(input);
     const error = this.ensureErrorOnce;
     this.ensureErrorOnce = undefined;
@@ -1322,7 +1322,7 @@ class FakeFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
   }
 
   async transferSessionOwner(
-    input: Parameters<HraFactsMemoryLifecyclePort["transferSessionOwner"]>[0],
+    input: Parameters<OompaFactsMemoryLifecyclePort["transferSessionOwner"]>[0],
   ) {
     this.transfers.push(input);
     const error = this.transferErrorOnce;
@@ -1351,17 +1351,17 @@ class FakeFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
     return this.#receipt(input.sessionId);
   }
 
-  async forkSession(input: Parameters<HraFactsMemoryLifecyclePort["forkSession"]>[0]) {
+  async forkSession(input: Parameters<OompaFactsMemoryLifecyclePort["forkSession"]>[0]) {
     return this.#receipt(input.childSessionId);
   }
 
-  async resumeSession(input: Parameters<HraFactsMemoryLifecyclePort["resumeSession"]>[0]) {
+  async resumeSession(input: Parameters<OompaFactsMemoryLifecyclePort["resumeSession"]>[0]) {
     return this.#receipt(input.sessionId);
   }
 
   async sweepExpired(
     now: number,
-    policy?: Parameters<HraFactsMemoryLifecyclePort["sweepExpired"]>[1],
+    policy?: Parameters<OompaFactsMemoryLifecyclePort["sweepExpired"]>[1],
   ) {
     this.sweeps.push(now);
     let purged = 0;
@@ -1378,41 +1378,41 @@ class FakeFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
   }
 }
 
-class FakeMemory implements HraMemoryPort {
-  readonly statuses: Array<Parameters<HraMemoryPort["status"]>[0]> = [];
-  readonly remembers: Array<Parameters<HraMemoryPort["remember"]>[0]> = [];
-  readonly queries: Array<Parameters<HraMemoryPort["query"]>[0]> = [];
-  readonly explanations: Array<Parameters<HraMemoryPort["explain"]>[0]> = [];
-  readonly shares: Array<Parameters<HraMemoryPort["share"]>[0]> = [];
+class FakeMemory implements OompaMemoryPort {
+  readonly statuses: Array<Parameters<OompaMemoryPort["status"]>[0]> = [];
+  readonly remembers: Array<Parameters<OompaMemoryPort["remember"]>[0]> = [];
+  readonly queries: Array<Parameters<OompaMemoryPort["query"]>[0]> = [];
+  readonly explanations: Array<Parameters<OompaMemoryPort["explain"]>[0]> = [];
+  readonly shares: Array<Parameters<OompaMemoryPort["share"]>[0]> = [];
   readonly forgottenSessions: string[] = [];
   queryError: Error | undefined;
   beforeRememberReturn: (() => Promise<void>) | undefined;
   closeCalls = 0;
   recoverCalls = 0;
 
-  async status(input: Parameters<HraMemoryPort["status"]>[0]) {
+  async status(input: Parameters<OompaMemoryPort["status"]>[0]) {
     this.statuses.push(input);
     return { version: 1, ok: true, kind: "status", sessionId: input.actorSessionId };
   }
 
-  async remember(input: Parameters<HraMemoryPort["remember"]>[0]) {
+  async remember(input: Parameters<OompaMemoryPort["remember"]>[0]) {
     this.remembers.push(input);
     await this.beforeRememberReturn?.();
     return { version: 1, ok: true, kind: "remember" };
   }
 
-  async query(input: Parameters<HraMemoryPort["query"]>[0]) {
+  async query(input: Parameters<OompaMemoryPort["query"]>[0]) {
     this.queries.push(input);
     if (this.queryError !== undefined) throw this.queryError;
     return { version: 1, ok: true, kind: "query" };
   }
 
-  async explain(input: Parameters<HraMemoryPort["explain"]>[0]) {
+  async explain(input: Parameters<OompaMemoryPort["explain"]>[0]) {
     this.explanations.push(input);
     return { version: 1, ok: true, kind: "explain" };
   }
 
-  async share(input: Parameters<HraMemoryPort["share"]>[0]) {
+  async share(input: Parameters<OompaMemoryPort["share"]>[0]) {
     this.shares.push(input);
     return { version: 1, ok: true, kind: "share" };
   }
@@ -1431,9 +1431,9 @@ class FakeMemory implements HraMemoryPort {
 }
 
 class FakeMemoryRefusalError extends Error {
-  override readonly name = "HraMemoryRefusalError";
+  override readonly name = "OompaMemoryRefusalError";
 
-  constructor(readonly code: HraMemoryRefusalCode) {
+  constructor(readonly code: OompaMemoryRefusalCode) {
     super(code);
   }
 }
@@ -1469,7 +1469,7 @@ const ownedFixtureTeardowns: Array<() => Promise<void>> = [];
 type ServiceCaseResources = {
   stores: Array<Pick<StateStore, "close">>;
   roots: string[];
-  services: Array<Pick<HraService, "close">>;
+  services: Array<Pick<OompaService, "close">>;
 };
 const ownedServiceCaseTeardowns: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -1497,7 +1497,7 @@ type FixtureAdoptionOptions = Readonly<{
   canonicalSessionStart?: CanonicalSessionStartScenario;
   canonical39Attachments?: Canonical39AttachmentScenario;
   managedClaude?: ClaudeRuntimePort;
-  memory?: HraMemoryPort;
+  memory?: OompaMemoryPort;
   personalCodex?: CodexRuntimePort;
   personalClaude?: ClaudeRuntimePort;
   personalDiscovery?: PersonalSessionDiscoveryPort;
@@ -1517,11 +1517,11 @@ const shortScrubCheckpoint: SecurityScrubCheckpointPolicy = {
   backoffMs: 10,
 };
 
-const isHraMemoryPort = (
-  value: FixtureAdoptionOptions | HraMemoryPort | NodeJS.Platform | undefined,
-): value is HraMemoryPort => typeof value === "object"
-  && typeof (value as Partial<HraMemoryPort>).status === "function"
-  && typeof (value as Partial<HraMemoryPort>).remember === "function";
+const isOompaMemoryPort = (
+  value: FixtureAdoptionOptions | OompaMemoryPort | NodeJS.Platform | undefined,
+): value is OompaMemoryPort => typeof value === "object"
+  && typeof (value as Partial<OompaMemoryPort>).status === "function"
+  && typeof (value as Partial<OompaMemoryPort>).remember === "function";
 
 const expectHistoricalValue = (actual: unknown, expected: unknown): void => {
   expect(actual).toEqual(expected);
@@ -1549,7 +1549,7 @@ async function fixture(
   cloud = new FakeCloud(),
   requestStop: () => void = () => undefined,
   now: () => number = Date.now,
-  factsMemory?: HraFactsMemoryLifecyclePort,
+  factsMemory?: OompaFactsMemoryLifecyclePort,
   autorespond: Readonly<{
     beforeMemoryClose?: () => Promise<void>;
     claude?: ClaudeRuntimePort;
@@ -1557,19 +1557,19 @@ async function fixture(
     proseResponder?: ProseResponder;
     securityScrubCheckpoint?: SecurityScrubCheckpointPolicy;
   }> = {},
-  adoptionOrMemoryOrPlatform: FixtureAdoptionOptions | HraMemoryPort | NodeJS.Platform = {},
+  adoptionOrMemoryOrPlatform: FixtureAdoptionOptions | OompaMemoryPort | NodeJS.Platform = {},
   platformOrClaude?: NodeJS.Platform | ClaudeRuntimePort,
   platformOverride: NodeJS.Platform = "linux",
   resources?: ServiceCaseResources,
-): Promise<{ service: HraService; store: StateStore; codex: FakeCodex; cloud: FakeCloud; daemonAuthority: FakeDaemonAuthority; daemonGeneration: number; daemonBootId: string; documents: string; eventCursors: SessionEventCursorCodec; paths: ReturnType<typeof resolveStatePaths> }> {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-service-")));
+): Promise<{ service: OompaService; store: StateStore; codex: FakeCodex; cloud: FakeCloud; daemonAuthority: FakeDaemonAuthority; daemonGeneration: number; daemonBootId: string; documents: string; eventCursors: SessionEventCursorCodec; paths: ReturnType<typeof resolveStatePaths> }> {
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-service-")));
   (resources?.roots ?? serviceRoots).push(home);
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   const documents = join(home, "Documents");
   await mkdir(documents, { recursive: true });
   await initializeStatePaths(paths);
   const adoption: FixtureAdoptionOptions = typeof adoptionOrMemoryOrPlatform === "object"
-    && !isHraMemoryPort(adoptionOrMemoryOrPlatform)
+    && !isOompaMemoryPort(adoptionOrMemoryOrPlatform)
     ? adoptionOrMemoryOrPlatform
     : {};
   if (adoption.canonical40Queues === true) {
@@ -1630,7 +1630,7 @@ async function fixture(
   const codex = new FakeCodex();
   const daemonAuthority = new FakeDaemonAuthority();
   const eventCursors = new SessionEventCursorCodec(SessionEventCursorCodec.generateKey());
-  const memory = isHraMemoryPort(adoptionOrMemoryOrPlatform)
+  const memory = isOompaMemoryPort(adoptionOrMemoryOrPlatform)
     ? adoptionOrMemoryOrPlatform
     : adoption.memory;
   const explicitClaude = typeof platformOrClaude === "string"
@@ -1642,7 +1642,7 @@ async function fixture(
       ? platformOrClaude
       : platformOverride;
   const managedClaude = adoption.managedClaude ?? explicitClaude ?? autorespond.claude;
-  const service = new HraService({
+  const service = new OompaService({
     store,
     paths,
     codex,
@@ -1691,8 +1691,8 @@ async function fixture(
 }
 
 async function archivedDevinFixture(cloud = new FakeCloud(), options: Readonly<{
-  factsMemory?: HraFactsMemoryLifecyclePort;
-  memory?: HraMemoryPort;
+  factsMemory?: OompaFactsMemoryLifecyclePort;
+  memory?: OompaMemoryPort;
 }> = {}) {
   const value = await fixture(undefined, cloud, () => undefined, Date.now,
     options.factsMemory, {}, {
@@ -2082,7 +2082,7 @@ class FakePersonalSessionDiscovery implements PersonalSessionDiscoveryPort {
 async function adoptedCodexFixture(
   label: string,
   providerThreadId: string,
-  factsMemory?: HraFactsMemoryLifecyclePort,
+  factsMemory?: OompaFactsMemoryLifecyclePort,
   createFixture: ServiceFixtureFactory = fixture,
 ) {
   const personalCodex = new FakeCodex();
@@ -2110,7 +2110,7 @@ async function adoptedCodexFixture(
     status: "idle",
     projectRoot: value.documents,
     providerUpdatedAt: personalAdoptionNow - 11 * 60_000,
-    messages: [{ role: "user", text: "Started outside HRA" }],
+    messages: [{ role: "user", text: "Started outside Oompa" }],
   };
   discovery.candidates = [{
     provider: "codex",
@@ -2226,7 +2226,7 @@ async function adoptedClaudeFixture(
   platform: NodeJS.Platform = "linux",
   signInCodex = true,
   now: () => number = () => personalAdoptionNow,
-  memory?: HraMemoryPort,
+  memory?: OompaMemoryPort,
   createFixture: ServiceFixtureFactory = fixture,
 ) {
   const personalIdentity: ClaudeProcessIdentity = {
@@ -2571,7 +2571,7 @@ function codexInteractionBinding(
   };
 }
 
-function hostToolAuthorityFor(authority: ProfileAuthority): HraHostToolCall["authority"] {
+function hostToolAuthorityFor(authority: ProfileAuthority): OompaHostToolCall["authority"] {
   if (authority.provider === "devin") throw new Error("A retired provider cannot originate a host-tool fixture.");
   return {
     provider: authority.provider,
@@ -2660,7 +2660,7 @@ async function createPeerMessageBoundaryFixture(delivery: "send" | "steer") {
     },
   };
   const authority = liveAuthorityFor(value.store, profile.id);
-  const callFor = (index: number): Extract<HraHostToolCall, { tool: "session_message" }> => {
+  const callFor = (index: number): Extract<OompaHostToolCall, { tool: "session_message" }> => {
     const callId = `peer-boundary-${delivery}-${String(index)}`;
     const input = {
       sessionId: target.id,
@@ -2830,9 +2830,9 @@ const renderJson = (command: LocalCommand, data: unknown): string => {
   return stdout;
 };
 
-describe("HraService personal-session adoption", () => {
+describe("OompaService personal-session adoption", () => {
   const expectUnprovedLaunchCloseRefused = async (value: {
-    service: HraService;
+    service: OompaService;
     store: StateStore;
   }): Promise<void> => {
     const intents = value.store.listClaudeProcessLaunchIntents(500);
@@ -3232,7 +3232,7 @@ describe("HraService personal-session adoption", () => {
       providerThreadId,
       status: "idle",
     };
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store: value.store,
       paths: value.paths,
       codex: new FakeCodex(),
@@ -3348,7 +3348,7 @@ describe("HraService personal-session adoption", () => {
         ...value.personalCodex.readProjection,
         providerThreadId,
       };
-      const restarted = new HraService({
+      const restarted = new OompaService({
         store: value.store,
         paths: value.paths,
         codex: new FakeCodex(),
@@ -3427,7 +3427,7 @@ describe("HraService personal-session adoption", () => {
         status: "idle",
         providerUpdatedAt: personalAdoptionNow - 24 * 60 * 60_000,
       };
-      const restarted = new HraService({
+      const restarted = new OompaService({
         store: value.store,
         paths: value.paths,
         codex: new FakeCodex(),
@@ -4641,7 +4641,7 @@ describe("HraService personal-session adoption", () => {
   });
 
   test("adopts an old exact target from a real paused Desktop heartbeat without projecting task metadata", async () => {
-    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-scheduled-adoption-chain-")));
+    const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-scheduled-adoption-chain-")));
     serviceRoots.push(root);
     const codexHome = join(root, "codex-home");
     const automationsDirectory = join(codexHome, "automations");
@@ -5051,7 +5051,7 @@ describe("HraService personal-session adoption", () => {
   });
 
   test("rotates the first scheduled-target page by daemon generation across reader restarts", async () => {
-    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-automation-restart-")));
+    const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-automation-restart-")));
     serviceRoots.push(root);
     const automationsDirectory = join(root, "automations");
     await mkdir(automationsDirectory);
@@ -5156,7 +5156,7 @@ describe("HraService personal-session adoption", () => {
     // at the next dense page instead of returning to the first fifty forever.
     const restartedReader = (request: CodexAutomationAuthorityRequest) =>
       readCodexAutomationAuthority({ ...request, automationsDirectory });
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store: value.store,
       paths: value.paths,
       codex: new FakeCodex(),
@@ -6518,7 +6518,7 @@ describe("HraService personal-session adoption", () => {
     await expect(value.service.execute({
       kind: "session.send",
       session: value.session.id,
-      message: "Continue under HRA",
+      message: "Continue under Oompa",
       idempotencyKey: "00000000-0000-4000-8000-00000000a001",
     }, { signal })).resolves.toMatchObject({
       session: { id: value.session.id, state: "active" },
@@ -7120,7 +7120,7 @@ describe("HraService personal-session adoption", () => {
     expect(value.store.listSessionAdoptionCandidates({ provider: "claude" })[0])
       .toMatchObject({ liveness: "live", status: "pending", sourceProcessIdentity });
 
-    // Once a later proven-complete snapshot contains no row for the id, HRA
+    // Once a later proven-complete snapshot contains no row for the id, Oompa
     // can prove the retained PID/start tuple is gone and admit the candidate.
     discovery.candidates = [];
     await expect(value.service.execute({
@@ -7661,7 +7661,7 @@ describe("HraService personal-session adoption", () => {
       );
       expect(withoutAccountIdentity(adoptedMismatch)).toEqual({
         code: "RECOVERY_REQUIRED",
-        message: "The provider account changed. HRA refused stale controller authority and is releasing the affected sessions.",
+        message: "The provider account changed. Oompa refused stale controller authority and is releasing the affected sessions.",
         details: { accountId: "<account>", provider: "codex" },
       });
       expectPrivateDetailsAbsent([adoptedMismatch, nativeMismatch]);
@@ -8258,7 +8258,7 @@ describe("HraService personal-session adoption", () => {
 
   test("quarantines a real canonical-40 target-bound personal-source switch without inventing Claude authority", async () => {
     const origin = canonicalAdoption40Fixture;
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-canonical40-switch-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-canonical40-switch-")));
     serviceRoots.push(home);
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
@@ -8299,7 +8299,7 @@ describe("HraService personal-session adoption", () => {
     const personalClaude = new FakeClaude("personal", {
       pid: 63040, pidDomain: "darwin", procStart: "canonical40-fixture-process",
     });
-    const service = new HraService({
+    const service = new OompaService({
       store, paths, codex, personalClaude, cloud: new FakeCloud(),
       daemonAuthority: new FakeDaemonAuthority(), daemonGeneration: 1,
       daemonBootId: `boot_${"6".repeat(32)}`,
@@ -8425,7 +8425,7 @@ describe("HraService personal-session adoption", () => {
       procStart: "managed-claude-restarted",
     });
     const livenessChecks: Array<Parameters<ClaudeProcessLivenessProbe>[0]> = [];
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store: value.store,
       daemonGeneration,
       daemonBootId,
@@ -8575,7 +8575,7 @@ describe("HraService personal-session adoption", () => {
     };
     restartedPersonal.readIdentityErrorOnce = new Error("prior child is gone");
     restartedPersonal.observeErrorOnce = new ClaudeSessionObservationError();
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store: value.store,
       daemonGeneration,
       daemonBootId,
@@ -8683,7 +8683,7 @@ describe("HraService personal-session adoption", () => {
     const personalCodex = new FakeCodex();
     personalCodex.readProjection = { ...value.personalCodex.readProjection };
     const managedCodex = new FakeCodex();
-    const restarted = new HraService({ store: value.store, paths: value.paths,
+    const restarted = new OompaService({ store: value.store, paths: value.paths,
       daemonGeneration, daemonBootId, codex: managedCodex, personalCodex, personalCodexHome,
       cloud: new FakeCloud(), daemonAuthority: new FakeDaemonAuthority(),
       eventCursors: value.eventCursors, now: () => personalAdoptionNow,
@@ -10028,7 +10028,7 @@ describe("HraService personal-session adoption", () => {
     // Simulate process loss after the sign-out fact was staged but before the
     // asynchronous controller release began. Recovery must finish from the
     // durable revocation row before it admits any session resubscriptions.
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store: value.store,
       paths: value.paths,
       codex: new FakeCodex(),
@@ -10152,7 +10152,7 @@ describe("HraService personal-session adoption", () => {
     await value.service.close();
 
     const personalCodex = new FakeCodex();
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store: value.store,
       paths: value.paths,
       codex: new FakeCodex(),
@@ -10175,7 +10175,7 @@ describe("HraService personal-session adoption", () => {
   });
 });
 
-describe("HraService", () => {
+describe("OompaService", () => {
   test("original send ambiguity stays visible to doctor and cannot enter generic session recovery", async () => {
     const value = await fixture();
     const bootId = `boot_${"d".repeat(32)}`;
@@ -10223,7 +10223,7 @@ describe("HraService", () => {
     const initial: Configuration = { version: 1, defaultEnabled: true,
       overrides: { codex: "inherit", claude: "inherit" }, automaticPolicyRevision: 1 };
     const recoveryMessage = "Automatic usage policy could not be verified. No automatic setting was reinitialized; inspect local recovery before retrying.";
-    const revisionMessage = "Automatic usage policy changed since that revision. Run `hra usage auto status` before submitting a new change.";
+    const revisionMessage = "Automatic usage policy changed since that revision. Run `oompa usage auto status` before submitting a new change.";
     const keyMessage = "The automatic usage policy key belongs to a different request. Replay the original request or use a new key for a new change.";
     const projection = (configuration: Configuration, providers: readonly ("codex" | "claude")[] = ["codex", "claude"]) => ({
       version: 1, configuration,
@@ -10236,7 +10236,7 @@ describe("HraService", () => {
     const request = (expectedAutomaticPolicyRevision = 1, change: Change = { kind: "set_default", enabled: false }) => ({
       kind: "usage.auto.set", idempotencyKey: crypto.randomUUID(), expectedAutomaticPolicyRevision, change,
     });
-    const execute = (service: HraService, command: unknown) => service.execute(localCommandSchema.parse(command), { signal });
+    const execute = (service: OompaService, command: unknown) => service.execute(localCommandSchema.parse(command), { signal });
     const setup = async () => {
       const now = 1_800_000_000_000;
       const claude = new FakeClaude("isolated", {
@@ -10402,7 +10402,7 @@ describe("HraService", () => {
       const value = await setup();
       const contenderStore = new StateStore(value.paths, { now: () => value.now });
       stores.push(contenderStore);
-      const contender = new HraService({ store: contenderStore, paths: value.paths,
+      const contender = new OompaService({ store: contenderStore, paths: value.paths,
         codex: value.codex, claude: value.claude, desktop: value.desktop, cloud: value.cloud,
         daemonAuthority: new FakeDaemonAuthority(), daemonGeneration: value.daemonGeneration,
         daemonBootId: value.daemonBootId, eventCursors: value.eventCursors, now: () => value.now,
@@ -10960,7 +10960,7 @@ describe("HraService", () => {
     expect(value.store.readMutation(idempotencyKey)).toBeNull();
 
     await value.service.close();
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store: value.store,
       paths: value.paths,
       codex: new FakeCodex(),
@@ -11059,7 +11059,7 @@ describe("HraService", () => {
 
       await value.service.close();
       const restartedCodex = new FakeCodex();
-      const restarted = new HraService({
+      const restarted = new OompaService({
         store: value.store,
         paths: value.paths,
         codex: restartedCodex,
@@ -11149,7 +11149,7 @@ describe("HraService", () => {
       threadId: actor.providerThreadId,
       tool: "session_message" as const,
       turnId: actor.activeTurnId,
-    } satisfies HraHostToolCall;
+    } satisfies OompaHostToolCall;
     const originalBegin = value.store.beginSessionMutationEffect.bind(value.store);
     let injected = false;
     (value.store as unknown as {
@@ -11166,7 +11166,7 @@ describe("HraService", () => {
     };
     const providerWritesBefore = providerMutationCalls(value.codex);
 
-    await expect(value.service.handleHraHostToolCall(
+    await expect(value.service.handleOompaHostToolCall(
       authority,
       call,
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -11181,7 +11181,7 @@ describe("HraService", () => {
     (value.store as unknown as {
       beginSessionMutationEffect: StateStore["beginSessionMutationEffect"];
     }).beginSessionMutationEffect = originalBegin;
-    const replayed = await value.service.handleHraHostToolCall(
+    const replayed = await value.service.handleOompaHostToolCall(
       authority,
       call,
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -11259,7 +11259,7 @@ describe("HraService", () => {
       threadId: actor.providerThreadId,
       tool: "session_message" as const,
       turnId: actor.activeTurnId,
-    } satisfies HraHostToolCall;
+    } satisfies OompaHostToolCall;
     const originalSettle = value.store.settlePeerSessionAction.bind(value.store);
     let injectedSettlements = 0;
     (value.store as unknown as {
@@ -11273,7 +11273,7 @@ describe("HraService", () => {
     };
     const providerWritesBefore = providerMutationCalls(value.codex);
     try {
-      await expect(value.service.handleHraHostToolCall(
+      await expect(value.service.handleOompaHostToolCall(
         authority,
         call,
         MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -11312,7 +11312,7 @@ describe("HraService", () => {
       activeTurnId: actor.activeTurnId,
       providerUpdatedAt: 100,
     };
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store: restartedStore,
       paths: value.paths,
       codex: restartedCodex,
@@ -11340,8 +11340,8 @@ describe("HraService", () => {
         processGeneration: restartedProfile.processGeneration,
       },
       connectionId: restartedCodex.observationConnectionId,
-    } satisfies HraHostToolCall;
-    const replayed = await restarted.handleHraHostToolCall(
+    } satisfies OompaHostToolCall;
+    const replayed = await restarted.handleOompaHostToolCall(
       replayAuthority,
       replayCall,
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -11361,7 +11361,7 @@ describe("HraService", () => {
     for (let index = 0; index < 32; index += 1) {
       const call = callFor(index);
       lastAcceptedCall = call;
-      await expect(value.service.handleHraHostToolCall(
+      await expect(value.service.handleOompaHostToolCall(
         authority,
         call,
         MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -11382,7 +11382,7 @@ describe("HraService", () => {
     expect(value.codex.calls.filter((call) => call === "steer")).toHaveLength(32);
     const writesBeforeRefusal = providerMutationCalls(value.codex);
 
-    const refused = await value.service.handleHraHostToolCall(
+    const refused = await value.service.handleOompaHostToolCall(
       authority,
       callFor(32),
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -11399,7 +11399,7 @@ describe("HraService", () => {
       turnId: "turn-peer-boundary-target",
     })).toHaveLength(32);
     if (lastAcceptedCall === undefined) throw new Error("Expected a retained successful peer call.");
-    await expect(value.service.handleHraHostToolCall(
+    await expect(value.service.handleOompaHostToolCall(
       authority,
       lastAcceptedCall,
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -11426,7 +11426,7 @@ describe("HraService", () => {
           if (delivery === "send") value.codex.startTurnError = lostResponse;
           else value.codex.steerError = lostResponse;
           const writesBeforeEffect = providerMutationCalls(value.codex);
-          await expect(value.service.handleHraHostToolCall(
+          await expect(value.service.handleOompaHostToolCall(
             authority,
             call,
             MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -11585,7 +11585,7 @@ describe("HraService", () => {
             destination: SessionRecord,
             messageDelivery: "send" | "steer" | "queue",
             callId: string,
-          ): Extract<HraHostToolCall, { tool: "session_message" }> => {
+          ): Extract<OompaHostToolCall, { tool: "session_message" }> => {
             if (source.providerThreadId === undefined) throw new Error("Expected a bound provider thread.");
             const authority = authorityFor(source);
             const input = {
@@ -11615,7 +11615,7 @@ describe("HraService", () => {
           );
           if (delivery === "steer") value.codex.steerError = lostResponse;
           else value.codex.startTurnError = lostResponse;
-          const firstResult = await value.service.handleHraHostToolCall(
+          const firstResult = await value.service.handleOompaHostToolCall(
             authorityFor(actor), firstCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE,
           );
           if (delivery === "queue") {
@@ -11670,7 +11670,7 @@ describe("HraService", () => {
           value.codex.readProjection = actorProjection;
           const returnCall = messageCall(target, targetTurnId, actor, "steer", `abandoned-${delivery}-return`);
           const writesBeforeReturn = providerMutationCalls(value.codex);
-          const returned = await value.service.handleHraHostToolCall(
+          const returned = await value.service.handleOompaHostToolCall(
             authorityFor(target), returnCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE,
           );
           expect({
@@ -11686,7 +11686,7 @@ describe("HraService", () => {
             limit: 10,
           };
           const inspectionCallId = `abandoned-${delivery}-inspect`;
-          await expect(value.service.handleHraHostToolCall(authorityFor(target), {
+          await expect(value.service.handleOompaHostToolCall(authorityFor(target), {
             ...returnCall,
             callId: inspectionCallId,
             input: inspectionInput,
@@ -11726,7 +11726,7 @@ describe("HraService", () => {
             freshTarget, freshTargetTurnId, actor, "steer", `abandoned-${delivery}-fresh-turn`,
           );
           const writesBeforeFreshCoordination = providerMutationCalls(value.codex);
-          await expect(value.service.handleHraHostToolCall(
+          await expect(value.service.handleOompaHostToolCall(
             authorityFor(freshTarget), freshCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE,
           )).resolves.toMatchObject({ ok: true, action: { state: "applied" } });
           expect(providerMutationCalls(value.codex)).toEqual([...writesBeforeFreshCoordination, "steer"]);
@@ -11823,7 +11823,7 @@ describe("HraService", () => {
         turnId: actor.activeTurnId,
       } as const;
       for (const delivery of ["send", "queue"] as const) {
-        const result = await value.service.handleHraHostToolCall(authority, {
+        const result = await value.service.handleOompaHostToolCall(authority, {
           ...base,
           callId: `${provider}-${fence}-peer-${delivery}`,
           input: {
@@ -11835,7 +11835,7 @@ describe("HraService", () => {
           },
           requestDigest: createHash("sha256")
             .update(`${provider}-${fence}-peer-${delivery}`).digest("hex"),
-        } satisfies HraHostToolCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE);
+        } satisfies OompaHostToolCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE);
         signal.throwIfAborted();
         expect(result).toEqual({
           version: 1,
@@ -11900,7 +11900,7 @@ describe("HraService", () => {
       threadId: actor.providerThreadId,
       tool: "session_message" as const,
       turnId: actor.activeTurnId,
-    } satisfies HraHostToolCall;
+    } satisfies OompaHostToolCall;
     const originalAdmission = value.store.admitPeerSessionAction.bind(value.store);
     let admissionCalls = 0;
     (value.store as unknown as {
@@ -11921,12 +11921,12 @@ describe("HraService", () => {
     };
     const providerWritesBefore = providerMutationCalls(value.codex);
 
-    await expect(value.service.handleHraHostToolCall(
+    await expect(value.service.handleOompaHostToolCall(
       authority,
       call,
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
     ))
-      .rejects.toThrow("HRA_HOST_TOOL_AUTHORITY_STALE");
+      .rejects.toThrow("OOMPA_HOST_TOOL_AUTHORITY_STALE");
     expect(authorityInvalidated).toBe(true);
     expect(admissionCalls).toBe(0);
     expect(value.store.listUnsettledPeerSessionActions(10)).toEqual([]);
@@ -11992,7 +11992,7 @@ describe("HraService", () => {
       threadId: actor.providerThreadId,
       tool: "session_message" as const,
       turnId: actor.activeTurnId,
-    } satisfies HraHostToolCall;
+    } satisfies OompaHostToolCall;
     const originalRequireSession = value.store.requireSession.bind(value.store);
     let targetMoved = false;
     (value.store as unknown as {
@@ -12016,7 +12016,7 @@ describe("HraService", () => {
     };
     const providerWritesBefore = providerMutationCalls(value.codex);
 
-    await expect(value.service.handleHraHostToolCall(
+    await expect(value.service.handleOompaHostToolCall(
       authority,
       call,
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -12108,12 +12108,12 @@ describe("HraService", () => {
       turnId: actor.activeTurnId,
     } as const;
 
-    const listed = await value.service.handleHraHostToolCall(authority, {
+    const listed = await value.service.handleOompaHostToolCall(authority, {
       ...base,
       callId: "peer-list",
       tool: "sessions_list",
       input: { limit: 10 },
-    } satisfies HraHostToolCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE) as {
+    } satisfies OompaHostToolCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE) as {
       ok: boolean;
       sessions: readonly Record<string, unknown>[];
     };
@@ -12137,12 +12137,12 @@ describe("HraService", () => {
       "title",
     ]);
 
-    const inspected = await value.service.handleHraHostToolCall(authority, {
+    const inspected = await value.service.handleOompaHostToolCall(authority, {
       ...base,
       callId: "peer-inspect",
       tool: "session_inspect",
       input: { sessionId: target.id, expectedRevision: target.revision, limit: 10 },
-    } satisfies HraHostToolCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE) as {
+    } satisfies OompaHostToolCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE) as {
       ok: boolean;
       transcript: { records: readonly { kind: string; text?: string }[] };
     };
@@ -12170,17 +12170,17 @@ describe("HraService", () => {
         },
       });
     }
-    const boundedInspection = await value.service.handleHraHostToolCall(authority, {
+    const boundedInspection = await value.service.handleOompaHostToolCall(authority, {
       ...base,
       callId: "peer-inspect-budgeted",
       tool: "session_inspect",
       input: { sessionId: target.id, expectedRevision: target.revision, limit: 50 },
-    } satisfies HraHostToolCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE) as {
+    } satisfies OompaHostToolCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE) as {
       nextCursor: string | null;
       transcript: { records: readonly { sequence: number }[] };
     };
     expect(new TextEncoder().encode(JSON.stringify(boundedInspection)).byteLength)
-      .toBeLessThanOrEqual(HRA_HOST_TOOL_PUBLIC_RESULT_MAX_BYTES);
+      .toBeLessThanOrEqual(OOMPA_HOST_TOOL_PUBLIC_RESULT_MAX_BYTES);
     expect(boundedInspection.transcript.records.length).toBeLessThan(50);
     expect(boundedInspection.nextCursor).toMatch(/^hra1\./u);
     const seenSequences = new Set(
@@ -12188,7 +12188,7 @@ describe("HraService", () => {
     );
     let budgetCursor = boundedInspection.nextCursor;
     for (let pageIndex = 1; budgetCursor !== null && pageIndex < 10; pageIndex += 1) {
-      const continuation = await value.service.handleHraHostToolCall(authority, {
+      const continuation = await value.service.handleOompaHostToolCall(authority, {
         ...base,
         callId: `peer-inspect-budgeted-${String(pageIndex)}`,
         tool: "session_inspect",
@@ -12198,12 +12198,12 @@ describe("HraService", () => {
           limit: 50,
           cursor: budgetCursor,
         },
-      } satisfies HraHostToolCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE) as {
+      } satisfies OompaHostToolCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE) as {
         nextCursor: string | null;
         transcript: { records: readonly { sequence: number }[] };
       };
       expect(new TextEncoder().encode(JSON.stringify(continuation)).byteLength)
-        .toBeLessThanOrEqual(HRA_HOST_TOOL_PUBLIC_RESULT_MAX_BYTES);
+        .toBeLessThanOrEqual(OOMPA_HOST_TOOL_PUBLIC_RESULT_MAX_BYTES);
       for (const record of continuation.transcript.records) {
         expect(seenSequences.has(record.sequence)).toBe(false);
         seenSequences.add(record.sequence);
@@ -12232,8 +12232,8 @@ describe("HraService", () => {
         message: "Review the authority boundary and report findings.",
         reason: "Independent peer review",
       },
-    } satisfies HraHostToolCall;
-    const messaged = await value.service.handleHraHostToolCall(
+    } satisfies OompaHostToolCall;
+    const messaged = await value.service.handleOompaHostToolCall(
       authority,
       messageCall,
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -12256,7 +12256,7 @@ describe("HraService", () => {
       actor: "peer_session",
     });
     expect(peerEvent?.body.type === "user_message" ? peerEvent.body.text : "")
-      .toContain("HRA peer-session message");
+      .toContain("Oompa peer-session message");
     const projectedActorTurnId = value.eventCursors.projectPublicProviderIdentifier(
       actor.activeTurnId,
     );
@@ -12269,7 +12269,7 @@ describe("HraService", () => {
 
     const activeTarget = value.store.requireSession(target.id);
     expect(activeTarget.state).toBe("active");
-    const steered = await value.service.handleHraHostToolCall(authority, {
+    const steered = await value.service.handleOompaHostToolCall(authority, {
       ...base,
       callId: "peer-steer",
       requestDigest: createHash("sha256").update("peer-steer").digest("hex"),
@@ -12281,7 +12281,7 @@ describe("HraService", () => {
         message: "Also check the exact in-turn authority.",
         reason: "Independent peer follow-up",
       },
-    } satisfies HraHostToolCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE) as {
+    } satisfies OompaHostToolCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE) as {
       ok: boolean;
       action: { state: string; targetSessionId: string };
       replay: boolean;
@@ -12293,7 +12293,7 @@ describe("HraService", () => {
     });
     expect(value.codex.calls.filter((call) => call === "steer")).toHaveLength(1);
 
-    const replayed = await value.service.handleHraHostToolCall(
+    const replayed = await value.service.handleOompaHostToolCall(
       authority,
       messageCall,
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -12325,18 +12325,18 @@ describe("HraService", () => {
       threadId: actor.providerThreadId,
       tool: "sessions_list" as const,
       turnId: actor.activeTurnId,
-    } satisfies HraHostToolCall;
+    } satisfies OompaHostToolCall;
     const authority: ProfileAuthority = liveAuthorityFor(value.store, profile.id, "codex");
 
-    await expect(value.service.handleHraHostToolCall(authority, call, {
+    await expect(value.service.handleOompaHostToolCall(authority, call, {
       provider: "claude",
       source: "managed",
-    })).rejects.toThrow("HRA_HOST_TOOL_AUTHORITY_STALE");
-    await expect(value.service.handleHraHostToolCall(authority, call, {
+    })).rejects.toThrow("OOMPA_HOST_TOOL_AUTHORITY_STALE");
+    await expect(value.service.handleOompaHostToolCall(authority, call, {
       provider: "codex",
       source: "personal",
-    })).rejects.toThrow("HRA_HOST_TOOL_AUTHORITY_STALE");
-    await expect(value.service.handleHraHostToolCall(authority, call, {
+    })).rejects.toThrow("OOMPA_HOST_TOOL_AUTHORITY_STALE");
+    await expect(value.service.handleOompaHostToolCall(authority, call, {
       provider: "codex",
       source: "managed",
     })).resolves.toMatchObject({ ok: true, version: 1 });
@@ -12390,8 +12390,8 @@ describe("HraService", () => {
       threadId: actor.providerThreadId,
       tool: "automation_update" as const,
       turnId: actor.activeTurnId,
-    } satisfies HraHostToolCall;
-    await expect(value.service.handleHraHostToolCall(liveAuthorityFor(value.store, profile.id, "codex"), call, MANAGED_CODEX_HOST_TOOL_PROVENANCE)).resolves.toMatchObject({
+    } satisfies OompaHostToolCall;
+    await expect(value.service.handleOompaHostToolCall(liveAuthorityFor(value.store, profile.id, "codex"), call, MANAGED_CODEX_HOST_TOOL_PROVENANCE)).resolves.toMatchObject({
       name: operation.name,
       sessionId: actor.id,
       status: "paused",
@@ -12400,7 +12400,7 @@ describe("HraService", () => {
       expect.objectContaining({ name: operation.name, status: "paused" }),
     ]);
 
-    await expect(value.service.handleHraHostToolCall(liveAuthorityFor(value.store, profile.id, "codex"), {
+    await expect(value.service.handleOompaHostToolCall(liveAuthorityFor(value.store, profile.id, "codex"), {
       ...call,
       callId: "native-legacy-automation-stale-connection",
       connectionId: "30000000-0000-4000-8000-999999999999",
@@ -12441,8 +12441,8 @@ describe("HraService", () => {
         type: "string" as const,
         value: "native-legacy-automation-incompatible-binding",
       },
-    } satisfies HraHostToolCall;
-    await expect(value.service.handleHraHostToolCall(liveAuthorityFor(value.store, profile.id, "codex"), incompatibleCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE)).rejects.toThrow(
+    } satisfies OompaHostToolCall;
+    await expect(value.service.handleOompaHostToolCall(liveAuthorityFor(value.store, profile.id, "codex"), incompatibleCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE)).rejects.toThrow(
       "CONVERSATION_AUTOMATION_SESSION_UNAVAILABLE",
     );
     expect(value.store.createSessionTaskStore().list(actor.id)).toHaveLength(1);
@@ -12502,20 +12502,20 @@ describe("HraService", () => {
         .update("darwin-personal-claude-list")
         .digest("hex"),
       tool: "sessions_list" as const,
-    } satisfies HraHostToolCall;
+    } satisfies OompaHostToolCall;
 
-    await expect(value.service.handleHraHostToolCall(authority, listCall, {
+    await expect(value.service.handleOompaHostToolCall(authority, listCall, {
       provider: "claude",
       source: "personal",
     })).rejects.toThrow("SESSION_HOST_CAPABILITY_BINDING_MISSING");
-    await expect(value.service.handleHraHostToolCall(authority, listCall, {
+    await expect(value.service.handleOompaHostToolCall(authority, listCall, {
       provider: "claude",
       source: "managed",
-    })).rejects.toThrow("HRA_HOST_TOOL_AUTHORITY_STALE");
-    await expect(value.service.handleHraHostToolCall(authority, listCall, {
+    })).rejects.toThrow("OOMPA_HOST_TOOL_AUTHORITY_STALE");
+    await expect(value.service.handleOompaHostToolCall(authority, listCall, {
       provider: "codex",
       source: "personal",
-    })).rejects.toThrow("HRA_HOST_TOOL_AUTHORITY_STALE");
+    })).rejects.toThrow("OOMPA_HOST_TOOL_AUTHORITY_STALE");
 
     const operation = {
       mode: "create" as const,
@@ -12534,7 +12534,7 @@ describe("HraService", () => {
         .digest("hex"),
       requestId: { type: "string" as const, value: "darwin-personal-claude-automation" },
       tool: "automation_update" as const,
-    } satisfies HraHostToolCall;
+    } satisfies OompaHostToolCall;
     const forgedAutomation = new Database(value.paths.database, { strict: true });
     try {
       forgedAutomation.query(
@@ -12547,11 +12547,11 @@ describe("HraService", () => {
       .toBe(true);
     expect(value.store.hasNativeConversationAutomationAuthority(actor.id, actor.providerThreadId))
       .toBe(false);
-    await expect(value.service.handleHraHostToolCall(authority, automationCall, {
+    await expect(value.service.handleOompaHostToolCall(authority, automationCall, {
       provider: "claude",
       source: "personal",
     })).rejects.toThrow("CONVERSATION_AUTOMATION_SESSION_UNAVAILABLE");
-    await expect(value.service.handleHraHostToolCall(authority, {
+    await expect(value.service.handleOompaHostToolCall(authority, {
       ...automationCall,
       callId: "darwin-personal-claude-automation-wrong-source",
       requestDigest: createHash("sha256")
@@ -12576,7 +12576,7 @@ describe("HraService", () => {
         key: "adopted.custody",
         title: "Adopted custody",
         summary: "Owner memory remains available without provider host tools.",
-        body: "The adopted provider snapshot grants no HRA callback capability.",
+        body: "The adopted provider snapshot grants no Oompa callback capability.",
       },
     }, { signal })).resolves.toMatchObject({ idempotencyKey: "00000000-0000-4000-8000-000000000606" });
     expect(memory.statuses).toEqual([{ actorSessionId: actor.id }]);
@@ -12666,7 +12666,7 @@ describe("HraService", () => {
       const requestLabel = `peer-durable-projection-${recoverySide}`;
       const authority: ProfileAuthority = liveAuthorityFor(value.store, actorProfile.id, "codex");
 
-      await expect(value.service.handleHraHostToolCall(authority, {
+      await expect(value.service.handleOompaHostToolCall(authority, {
         authority: hostToolAuthorityFor(liveAuthorityFor(value.store, actorProfile.id)),
         callId: requestLabel,
         connectionId: value.codex.observationConnectionId,
@@ -12682,7 +12682,7 @@ describe("HraService", () => {
         threadId: actor.providerThreadId,
         tool: "session_message",
         turnId: actor.activeTurnId,
-      } satisfies HraHostToolCall, {
+      } satisfies OompaHostToolCall, {
         provider: "codex",
         source: "managed",
       })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
@@ -12803,7 +12803,7 @@ describe("HraService", () => {
         const providerWritesBefore = providerMutationCalls(value.codex);
         const requestLabel = `peer-in-flight-projection-${recoverySide}`;
         const authority: ProfileAuthority = liveAuthorityFor(value.store, actorProfile.id, "codex");
-        await expect(value.service.handleHraHostToolCall(authority, {
+        await expect(value.service.handleOompaHostToolCall(authority, {
           authority: hostToolAuthorityFor(liveAuthorityFor(value.store, actorProfile.id)),
           callId: requestLabel,
           connectionId: value.codex.observationConnectionId,
@@ -12819,7 +12819,7 @@ describe("HraService", () => {
           threadId: actor.providerThreadId,
           tool: "session_message",
           turnId: actor.activeTurnId,
-        } satisfies HraHostToolCall, {
+        } satisfies OompaHostToolCall, {
           provider: "codex",
           source: "managed",
         })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
@@ -12874,14 +12874,14 @@ describe("HraService", () => {
         summary: "The service revalidates actor authority under its lock.",
         body: "Memory mutations are attributed to the current actor session.",
       },
-    } satisfies HraHostToolCall;
-    expect(await value.service.handleHraHostToolCall(
+    } satisfies OompaHostToolCall;
+    expect(await value.service.handleOompaHostToolCall(
       authority,
       rememberCall,
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
     ))
       .toMatchObject({ ok: true, kind: "remember" });
-    expect(await value.service.handleHraHostToolCall(
+    expect(await value.service.handleOompaHostToolCall(
       authority,
       rememberCall,
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -12903,8 +12903,8 @@ describe("HraService", () => {
       requestDigest: createHash("sha256").update("memory-query").digest("hex"),
       tool: "memory_query" as const,
       input: { mode: "list" as const },
-    } satisfies HraHostToolCall;
-    expect(await value.service.handleHraHostToolCall(
+    } satisfies OompaHostToolCall;
+    expect(await value.service.handleOompaHostToolCall(
       authority,
       queryCall,
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -12918,8 +12918,8 @@ describe("HraService", () => {
       requestDigest: createHash("sha256").update("memory-explain").digest("hex"),
       tool: "memory_explain" as const,
       input: { queryId: `memq_${"1".repeat(32)}`, row: 0 },
-    } satisfies HraHostToolCall;
-    expect(await value.service.handleHraHostToolCall(
+    } satisfies OompaHostToolCall;
+    expect(await value.service.handleOompaHostToolCall(
       authority,
       explainCall,
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -12933,8 +12933,8 @@ describe("HraService", () => {
       requestDigest: createHash("sha256").update("memory-share").digest("hex"),
       tool: "memory_share" as const,
       input: { key: "architecture.boundary", reason: "Durable project context" },
-    } satisfies HraHostToolCall;
-    expect(await value.service.handleHraHostToolCall(
+    } satisfies OompaHostToolCall;
+    expect(await value.service.handleOompaHostToolCall(
       authority,
       shareCall,
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -12948,7 +12948,7 @@ describe("HraService", () => {
     expect(memory.shares.at(-1)?.idempotencyKey).not.toBe(memory.remembers[0]?.idempotencyKey);
 
     memory.queryError = new FakeMemoryRefusalError("MEMORY_QUERY_EXPIRED");
-    expect(await value.service.handleHraHostToolCall(authority, {
+    expect(await value.service.handleOompaHostToolCall(authority, {
       ...queryCall,
       callId: "memory-query-refusal",
     }, MANAGED_CODEX_HOST_TOOL_PROVENANCE)).toEqual({
@@ -13134,7 +13134,7 @@ describe("HraService", () => {
       enteredCheck?.();
       await blocked;
     };
-    const pending = value.service.handleHraHostToolCall(liveAuthorityFor(value.store, profile.id, "codex"), {
+    const pending = value.service.handleOompaHostToolCall(liveAuthorityFor(value.store, profile.id, "codex"), {
       authority: hostToolAuthorityFor(liveAuthorityFor(value.store, profile.id)),
       callId: "memory-query-stale-actor",
       connectionId: value.codex.observationConnectionId,
@@ -13209,7 +13209,7 @@ describe("HraService", () => {
       await blocked;
     };
     const providerWritesBefore = providerMutationCalls(value.codex);
-    const pending = value.service.handleHraHostToolCall(liveAuthorityFor(value.store, profile.id, "codex"), {
+    const pending = value.service.handleOompaHostToolCall(liveAuthorityFor(value.store, profile.id, "codex"), {
       authority: hostToolAuthorityFor(liveAuthorityFor(value.store, profile.id)),
       callId: "peer-actor-account-authority-stale",
       connectionId: value.codex.observationConnectionId,
@@ -13238,7 +13238,7 @@ describe("HraService", () => {
     }
     expect(value.store.sessionAccountAuthorityMatches(actor.id, profile.id)).toBe(false);
     releaseCheck?.();
-    await expect(pending).rejects.toThrow("HRA_HOST_TOOL_AUTHORITY_STALE");
+    await expect(pending).rejects.toThrow("OOMPA_HOST_TOOL_AUTHORITY_STALE");
     expect(value.store.listRecentPeerSessionActions()).toEqual([]);
     expect(providerMutationCalls(value.codex)).toEqual(providerWritesBefore);
   });
@@ -13279,7 +13279,7 @@ describe("HraService", () => {
       threadId: actor.providerThreadId,
       tool: "memory_query" as const,
       turnId: actor.activeTurnId,
-    } satisfies HraHostToolCall;
+    } satisfies OompaHostToolCall;
     let releaseCheck: (() => void) | undefined;
     let enteredCheck: (() => void) | undefined;
     const entered = new Promise<void>((resolve) => { enteredCheck = resolve; });
@@ -13288,7 +13288,7 @@ describe("HraService", () => {
       enteredCheck?.();
       await blocked;
     };
-    const pending = value.service.handleHraHostToolCall(
+    const pending = value.service.handleOompaHostToolCall(
       authority,
       call,
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -13296,7 +13296,7 @@ describe("HraService", () => {
     await entered;
     value.codex.liveHostToolCall = false;
     releaseCheck?.();
-    await expect(pending).rejects.toThrow("HRA_HOST_TOOL_RUNTIME_AUTHORITY_STALE");
+    await expect(pending).rejects.toThrow("OOMPA_HOST_TOOL_RUNTIME_AUTHORITY_STALE");
     expect(memory.queries).toEqual([]);
     expect(value.codex.liveHostToolCallRequests).toEqual([
       {
@@ -13322,20 +13322,20 @@ describe("HraService", () => {
     const liveProbe = value.codex.hasLiveHostToolCall.bind(value.codex);
     (value.codex as { hasLiveHostToolCall?: CodexRuntimePort["hasLiveHostToolCall"] })
       .hasLiveHostToolCall = undefined;
-    await expect(value.service.handleHraHostToolCall(authority, {
+    await expect(value.service.handleOompaHostToolCall(authority, {
       ...call,
       callId: "memory-query-runtime-authority-missing",
       requestDigest: createHash("sha256")
         .update("memory-query-runtime-authority-missing")
         .digest("hex"),
     }, MANAGED_CODEX_HOST_TOOL_PROVENANCE)).rejects.toThrow(
-      "HRA_HOST_TOOL_RUNTIME_AUTHORITY_STALE",
+      "OOMPA_HOST_TOOL_RUNTIME_AUTHORITY_STALE",
     );
     expect(memory.queries).toEqual([]);
 
     (value.codex as { hasLiveHostToolCall?: CodexRuntimePort["hasLiveHostToolCall"] })
       .hasLiveHostToolCall = liveProbe;
-    await expect(value.service.handleHraHostToolCall(authority, {
+    await expect(value.service.handleOompaHostToolCall(authority, {
       ...call,
       callId: "memory-query-runtime-authority-current",
       requestDigest: createHash("sha256")
@@ -13437,32 +13437,32 @@ describe("HraService", () => {
       {
         failure: "signed_out",
         code: "INTERACTION_REQUIRED",
-        nextCommand: "hra auth login --input-stdin",
+        nextCommand: "oompa auth login --input-stdin",
       },
       {
         failure: "device_unregistered",
         code: "INTERACTION_REQUIRED",
-        nextCommand: "hra device pair",
+        nextCommand: "oompa device pair",
       },
       {
         failure: "observation_missing",
         code: "INTERACTION_REQUIRED",
-        nextCommand: "hra auth status",
+        nextCommand: "oompa auth status",
       },
       {
         failure: "already_ready",
         code: "CONFLICT",
-        nextCommand: "hra auth status",
+        nextCommand: "oompa auth status",
       },
       {
         failure: "auth_identity_unbound",
         code: "RECOVERY_REQUIRED",
-        nextCommand: "hra auth status",
+        nextCommand: "oompa auth status",
       },
       {
         failure: "authority_changed",
         code: "RECOVERY_REQUIRED",
-        nextCommand: "hra auth status",
+        nextCommand: "oompa auth status",
       },
     ] as const;
     const cloud = new FakeCloud();
@@ -13532,7 +13532,7 @@ describe("HraService", () => {
       switchGeneration: 1,
       targetProfileId: "acct_00000000000000000000000000000000",
       diagnostic: "PROCESS_SET_CHANGED",
-      action: "hra account switch-recover",
+      action: "oompa account switch-recover",
     };
     const { service } = await fixture(desktop);
 
@@ -13543,7 +13543,7 @@ describe("HraService", () => {
     };
     expect(desktop.calls).toEqual(["recover", "current"]);
     expect(doctor.desktop.recovery).toBe(desktop.current);
-    expect(doctor.problems).toContain("A desktop switch is unresolved. Run `hra account switch-recover`.");
+    expect(doctor.problems).toContain("A desktop switch is unresolved. Run `oompa account switch-recover`.");
   });
 
   test("does not claim the active provider default is the running desktop source", async () => {
@@ -13816,7 +13816,7 @@ describe("HraService", () => {
         required: true,
         attemptId: prepared.login.attemptId,
         idempotencyKey: key,
-        abandonCommand: `hra account login-cancel ${added.account.id} --provider claude --attempt-id ${prepared.login.attemptId} --provider-generation 0 --idempotency-key ${key} --acknowledge-child-exited`,
+        abandonCommand: `oompa account login-cancel ${added.account.id} --provider claude --attempt-id ${prepared.login.attemptId} --provider-generation 0 --idempotency-key ${key} --acknowledge-child-exited`,
       },
     });
     expect(value.claudeReadCalls()).toBe(readsBeforeRecoveryStatus);
@@ -14324,7 +14324,7 @@ describe("HraService", () => {
       profileGeneration: claudeAuthority.processGeneration,
       profileId: profile.id,
     });
-    const abandonCommand = `hra account login-cancel ${profile.id} --provider claude --attempt-id ${attempt.id} --provider-generation ${String(claudeAuthority.processGeneration)} --idempotency-key ${recoveryKey} --acknowledge-child-exited`;
+    const abandonCommand = `oompa account login-cancel ${profile.id} --provider claude --attempt-id ${attempt.id} --provider-generation ${String(claudeAuthority.processGeneration)} --idempotency-key ${recoveryKey} --acknowledge-child-exited`;
     await expect(value.service.execute({
       account: profile.id,
       kind: "account.show",
@@ -14620,7 +14620,7 @@ describe("HraService", () => {
       details: {
         accountSelector: added.account.id,
         accountState: "signed_out",
-        nextCommand: `hra account login ${added.account.id}`,
+        nextCommand: `oompa account login ${added.account.id}`,
       },
       name: "CommandFailure",
     });
@@ -14953,7 +14953,7 @@ describe("HraService", () => {
         localCompleteness: "complete",
         providerAccess: "not_attempted",
         providerCompleteness: "unknown",
-        nextCommand: `hra account login ${added.account.id}`,
+        nextCommand: `oompa account login ${added.account.id}`,
       },
     });
     expect(selected).toMatchObject({ sessions: [{ id: started.session.id }] });
@@ -15009,7 +15009,7 @@ describe("HraService", () => {
       localCompleteness: "complete",
       providerAccess: "not_attempted",
       providerCompleteness: "unknown",
-      nextCommand: `hra account login ${added.account.id}`,
+      nextCommand: `oompa account login ${added.account.id}`,
     });
     expect(codex.calls).toEqual([]);
 
@@ -15171,7 +15171,7 @@ describe("HraService", () => {
     }, { signal })).rejects.toMatchObject({
       code: "UNAVAILABLE",
       details: {
-        nextCommand: "hra doctor",
+        nextCommand: "oompa doctor",
         repair: "repair_or_select_project",
       },
       message: "The project directory is missing, unsafe, or not readable, writable, traversable, and canonical. Repair it or choose another directory before retrying.",
@@ -15208,7 +15208,7 @@ describe("HraService", () => {
     }, { signal })).rejects.toMatchObject({
       code: "UNAVAILABLE",
       details: {
-        nextCommand: "hra doctor",
+        nextCommand: "oompa doctor",
         repair: "repair_or_select_project",
       },
     });
@@ -15217,7 +15217,7 @@ describe("HraService", () => {
     expect(codex.calls.filter((call) => call.startsWith("start:"))).toHaveLength(0);
     expect(store.listSessions()).toHaveLength(0);
 
-    const expectedProblem = "A configured project directory is missing or unsafe. Run `hra project list`, then restore or repair every listed directory so it is readable, writable, traversable, and canonical.";
+    const expectedProblem = "A configured project directory is missing or unsafe. Run `oompa project list`, then restore or repair every listed directory so it is readable, writable, traversable, and canonical.";
     for (const offline of [true, false]) {
       const doctor = await service.execute({ kind: "doctor", offline }, { signal }) as {
         healthy: boolean;
@@ -15253,7 +15253,7 @@ describe("HraService", () => {
     };
     expect(unavailable.healthy).toBe(false);
     expect(unavailable.problems).toContain(
-      "The cloud projection cache is corrupt or unreadable. Run `hra session list`, choose each affected local session, then explicitly run `hra sync projection recover <session> --acknowledge-gap`.",
+      "The cloud projection cache is corrupt or unreadable. Run `oompa session list`, choose each affected local session, then explicitly run `oompa sync projection recover <session> --acknowledge-gap`.",
     );
 
     const affectedSession = `sess_${"3".repeat(32)}`;
@@ -15284,10 +15284,10 @@ describe("HraService", () => {
     };
     expect(unsettled.healthy).toBe(false);
     expect(unsettled.problems).not.toContain(
-      `Cloud transcript projection requires recovery for 1 session(s). Run \`hra sync projection recover ${affectedSession} --acknowledge-gap\`.`,
+      `Cloud transcript projection requires recovery for 1 session(s). Run \`oompa sync projection recover ${affectedSession} --acknowledge-gap\`.`,
     );
     expect(unsettled.problems).toContain(
-      `Cloud projection recovery is unsettled. Retry \`hra sync projection recover ${affectedSession} --acknowledge-gap --idempotency-key ${idempotencyKey}\`.`,
+      `Cloud projection recovery is unsettled. Retry \`oompa sync projection recover ${affectedSession} --acknowledge-gap --idempotency-key ${idempotencyKey}\`.`,
     );
 
     cloud.statusResult = {
@@ -15324,7 +15324,7 @@ describe("HraService", () => {
     };
     expect(impossibleShortPage.healthy).toBe(false);
     expect(impossibleShortPage.problems).toContain(
-      "Cloud projection recovery status is invalid or exceeds its local bound. Restart the daemon, then rerun `hra doctor`.",
+      "Cloud projection recovery status is invalid or exceeds its local bound. Restart the daemon, then rerun `oompa doctor`.",
     );
 
     cloud.statusResult = {
@@ -15350,7 +15350,7 @@ describe("HraService", () => {
     };
     expect(disabledRecovery.healthy).toBe(false);
     expect(disabledRecovery.problems).toContain(
-      `Cloud projection recovery is unsettled. Unset OOMPA_CONVEX_URL and HRA_CONVEX_URL and restart the daemon first. After restart, retry \`hra sync projection recover ${affectedSession} --acknowledge-gap --idempotency-key ${idempotencyKey}\`.`,
+      `Cloud projection recovery is unsettled. Unset OOMPA_CONVEX_URL and HRA_CONVEX_URL and restart the daemon first. After restart, retry \`oompa sync projection recover ${affectedSession} --acknowledge-gap --idempotency-key ${idempotencyKey}\`.`,
     );
 
     cloud.statusResult = {
@@ -15367,7 +15367,7 @@ describe("HraService", () => {
     };
     expect(selfManagedRecovery.healthy).toBe(false);
     expect(selfManagedRecovery.problems).toContain(
-      `Cloud projection recovery is unsettled. Set OOMPA_CONVEX_URL to https://bound.convex.cloud, unset HRA_CONVEX_URL, and restart the daemon first. After restart, retry \`hra sync projection recover ${affectedSession} --acknowledge-gap --idempotency-key ${idempotencyKey}\`.`,
+      `Cloud projection recovery is unsettled. Set OOMPA_CONVEX_URL to https://bound.convex.cloud, unset HRA_CONVEX_URL, and restart the daemon first. After restart, retry \`oompa sync projection recover ${affectedSession} --acknowledge-gap --idempotency-key ${idempotencyKey}\`.`,
     );
 
     cloud.statusResult = {
@@ -15393,7 +15393,7 @@ describe("HraService", () => {
     };
     expect(custody.healthy).toBe(false);
     expect(custody.problems).toContain(
-      "Cloud deployment custody is unavailable. Run `hra sync status --json`, correct the reported deployment configuration or custody state, then restart the daemon.",
+      "Cloud deployment custody is unavailable. Run `oompa sync status --json`, correct the reported deployment configuration or custody state, then restart the daemon.",
     );
   });
 
@@ -16178,7 +16178,7 @@ describe("HraService", () => {
     // A separate service has separate ranked locks, but the same persisted
     // boot and exact runtime authority. It can complete while this caller is
     // suspended in its first attachment read without a same-lock deadlock.
-    const winner = new HraService({ store: other, paths, codex, cloud: value.cloud,
+    const winner = new OompaService({ store: other, paths, codex, cloud: value.cloud,
       daemonAuthority: value.daemonAuthority, daemonGeneration: value.daemonGeneration,
       daemonBootId: value.daemonBootId, eventCursors: value.eventCursors, platform: "linux", requestStop: () => undefined });
     const readReplay = store.readSessionInputReplay.bind(store);
@@ -16677,7 +16677,7 @@ describe("HraService", () => {
       const record = value.store.readSessionSwitchByIdempotencyKey(key);
       if (record === null) throw new Error("Expected the committed switch journal.");
       const digest = createHash("sha256").update(JSON.stringify({
-        domain: "hra:session-switch-facts-memory-owner:v1", attemptId: record.attemptId,
+        domain: "oompa:session-switch-facts-memory-owner:v1", attemptId: record.attemptId,
         sourceAuthority: record.sourceAuthority, targetAuthority: record.targetAuthority,
       })).digest("hex");
       expect(factsMemory.transfers).toHaveLength(1);
@@ -17168,7 +17168,7 @@ describe("HraService", () => {
       state: "terminal",
       title: otherSession.title,
     });
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store: value.store,
       paths: value.paths,
       codex: new FakeCodex(),
@@ -17398,7 +17398,7 @@ describe("HraService", () => {
     });
     const restartMemory = new FakeFactsMemoryLifecycle();
     restartMemory.cleanupErrors.add(poisoned.id);
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store: value.store,
       paths: value.paths,
       codex: new FakeCodex(),
@@ -17480,7 +17480,7 @@ describe("HraService", () => {
     }
     expect(details).toBeDefined();
     if (details === undefined) throw new Error("Expected memory recovery details.");
-    expect(details.nextCommand).toBe(`hra session show ${details.sessionId}`);
+    expect(details.nextCommand).toBe(`oompa session show ${details.sessionId}`);
     await expect(value.service.execute({
       kind: "session.show",
       session: details.sessionId,
@@ -18563,7 +18563,7 @@ describe("HraService", () => {
   test("migrates a signed-in v24 profile and suppresses its first valid window across restart and notification", async () => {
     const now = canonical24ResetFixture.now;
     const firstWindow = now + 3 * 24 * 60 * 60 * 1_000;
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-service-v24-reset-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-service-v24-reset-")));
     serviceRoots.push(home);
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
@@ -18596,7 +18596,7 @@ describe("HraService", () => {
     const daemonBootId = `boot_${"3".repeat(32)}`;
     const daemonGeneration = store.nextDaemonGeneration(daemonBootId);
     const codex = new FakeCodex();
-    const migrated = new HraService({
+    const migrated = new OompaService({
       store,
       paths,
       codex,
@@ -18660,7 +18660,7 @@ describe("HraService", () => {
       observedAt: 4_000,
       payload: eligiblePayload,
     };
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store,
       paths,
       codex: restartedCodex,
@@ -19302,7 +19302,7 @@ describe("HraService", () => {
     const replacementCodex = new FakeCodex();
     replacementCodex.usageResult = { revision: 2, observedAt: 3_000, payload };
     replacementCodex.resetOutcome = "alreadyRedeemed";
-    const replacement = new HraService({
+    const replacement = new OompaService({
       store: value.store,
       paths: value.paths,
       codex: replacementCodex,
@@ -20994,7 +20994,7 @@ describe("HraService", () => {
     );
     await expect(value.service.execute(command, { signal })).rejects.toMatchObject({
       code: "RECOVERY_REQUIRED",
-      details: { nextCommand: "hra sync status --json" },
+      details: { nextCommand: "oompa sync status --json" },
       message: expect.stringContaining("replay the exact idempotency key"),
     });
     expect(cloud.projectionRecoveries).toEqual([]);
@@ -21351,7 +21351,7 @@ describe("HraService", () => {
       isSessionTerminal: (sessionPublicId) =>
         value.store.requireSession(sessionPublicId).state === "terminal",
     });
-    const reopened = new HraService({
+    const reopened = new OompaService({
       cloud: new UnavailableCloudControl(blocker),
       codex: value.codex,
       daemonAuthority: new FakeDaemonAuthority(),
@@ -21467,7 +21467,7 @@ describe("HraService", () => {
     );
 
     const offlineAuthority = new FakeDaemonAuthority();
-    const offlineService = new HraService({
+    const offlineService = new OompaService({
       cloud: new UnavailableCloudControl(blocker),
       codex: value.codex,
       daemonAuthority: offlineAuthority,
@@ -21549,7 +21549,7 @@ describe("HraService", () => {
       );
       if (committed === null) throw new Error("Recovery journal authority changed.");
     };
-    const restoredService = new HraService({
+    const restoredService = new OompaService({
       cloud: configuredCloud,
       codex: value.codex,
       daemonAuthority: new FakeDaemonAuthority(),
@@ -21903,7 +21903,7 @@ describe("HraService", () => {
       {
         code: "HOME_MISMATCH",
         reason: "codex_home_mismatch",
-        message: "The Codex home does not match this account's isolated runtime. Run `hra doctor --json` and repair the reported configuration before retrying.",
+        message: "The Codex home does not match this account's isolated runtime. Run `oompa doctor --json` and repair the reported configuration before retrying.",
       },
       {
         code: "PROCESS_EXITED",
@@ -21913,12 +21913,12 @@ describe("HraService", () => {
       {
         code: "PROTOCOL_ERROR",
         reason: "codex_protocol_error",
-        message: "Codex returned data that violates HRA's pinned protocol. Run `hra doctor --json` and repair or update HRA before retrying.",
+        message: "Codex returned data that violates Oompa's pinned protocol. Run `oompa doctor --json` and repair or update Oompa before retrying.",
       },
       {
         code: "PROTOCOL_LIMIT",
         reason: "codex_protocol_limit",
-        message: "Codex data exceeded HRA's bounded protocol limits. Narrow the request where possible or update HRA before trying again.",
+        message: "Codex data exceeded Oompa's bounded protocol limits. Narrow the request where possible or update Oompa before trying again.",
       },
       {
         code: "REMOTE_ERROR",
@@ -21928,17 +21928,17 @@ describe("HraService", () => {
       {
         code: "RUNTIME_MISMATCH",
         reason: "codex_runtime_mismatch",
-        message: "HRA's pinned Codex runtime is missing or incompatible. Run `hra doctor --json` and repair or reinstall HRA before retrying.",
+        message: "Oompa's pinned Codex runtime is missing or incompatible. Run `oompa doctor --json` and repair or reinstall Oompa before retrying.",
       },
       {
         code: "TIMEOUT",
         reason: "codex_timeout",
-        message: "Codex did not complete the operation within HRA's bounded deadline. Inspect current state before deciding whether to start a fresh attempt.",
+        message: "Codex did not complete the operation within Oompa's bounded deadline. Inspect current state before deciding whether to start a fresh attempt.",
       },
       {
         code: "UNSUPPORTED_CAPABILITY",
         reason: "codex_capability_unsupported",
-        message: "The pinned Codex runtime does not support a capability required for this operation. Run `hra doctor --json` and update or reconfigure HRA before retrying.",
+        message: "The pinned Codex runtime does not support a capability required for this operation. Run `oompa doctor --json` and update or reconfigure Oompa before retrying.",
       },
     ] as const;
     for (const [index, failure] of failures.entries()) {
@@ -22138,7 +22138,7 @@ describe("HraService", () => {
     expect(replay.login).toEqual({
       status: "pending",
       loginId: "provider-login-1",
-      next: `hra account login-cancel ${added.account.id}`,
+      next: `oompa account login-cancel ${added.account.id}`,
     });
     expect(replay.account.processGeneration).toBe(1);
     expect(codex.calls.filter((call) => call.startsWith("login:"))).toHaveLength(1);
@@ -22605,7 +22605,7 @@ describe("HraService", () => {
     const generation = store.nextDaemonGeneration(bootId);
     const currentCodex = new FakeCodex();
     currentCodex.accountProjection = { signedIn: false };
-    const restarted = new HraService({ store, paths, codex: currentCodex,
+    const restarted = new OompaService({ store, paths, codex: currentCodex,
       cloud: new FakeCloud(), daemonAuthority: new FakeDaemonAuthority(),
       daemonGeneration: generation, daemonBootId: bootId, requestStop: () => undefined });
     await restarted.recover();
@@ -22734,7 +22734,7 @@ describe("HraService", () => {
     const daemonGeneration = store.nextDaemonGeneration(`boot_${"c".repeat(32)}`);
     const restartedCodex = new FakeCodex();
     restartedCodex.accountProjection = { signedIn: false };
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store,
       paths: value.paths,
       codex: restartedCodex,
@@ -22849,7 +22849,7 @@ describe("HraService", () => {
 
     const daemonGeneration = store.nextDaemonGeneration(`boot_${"f".repeat(32)}`);
     const restartedCodex = new FakeCodex();
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store,
       paths: value.paths,
       codex: restartedCodex,
@@ -22927,7 +22927,7 @@ describe("HraService", () => {
     store.nextDaemonGeneration(`boot_${"b".repeat(32)}`);
     const restartedCodex = new FakeCodex();
     restartedCodex.accountProjection = { signedIn: false };
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store, paths, codex: restartedCodex, cloud: new FakeCloud(),
       daemonAuthority: new FakeDaemonAuthority(), requestStop: () => undefined,
     });
@@ -22937,7 +22937,7 @@ describe("HraService", () => {
     // A second crash before status reconciliation must preserve the same
     // immutable cancellation instead of rejecting its retained login fence.
     store.nextDaemonGeneration(`boot_${"c".repeat(32)}`);
-    const again = new HraService({
+    const again = new OompaService({
       store, paths, codex: restartedCodex, cloud: new FakeCloud(),
       daemonAuthority: new FakeDaemonAuthority(), requestStop: () => undefined,
     });
@@ -22983,7 +22983,7 @@ describe("HraService", () => {
     store.nextDaemonGeneration(`boot_${"d".repeat(32)}`);
     const restartedCodex = new FakeCodex();
     restartedCodex.accountProjection = { signedIn: false };
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store, paths, codex: restartedCodex, cloud: new FakeCloud(),
       daemonAuthority: new FakeDaemonAuthority(), requestStop: () => undefined,
     });
@@ -23034,7 +23034,7 @@ describe("HraService", () => {
     const added = { account: captured.retained.loginProfile };
     const other = { account: captured.retained.profile };
     const idempotencyKey = captured.retained.loginKey;
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-service-canonical43-login-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-service-canonical43-login-")));
     serviceRoots.push(home);
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
@@ -23063,7 +23063,7 @@ describe("HraService", () => {
       email: other.account.providerEmail,
       plan: other.account.providerPlan,
     };
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store: upgraded, paths, codex: restartedCodex, cloud: new FakeCloud(),
       daemonAuthority: new FakeDaemonAuthority(), requestStop: () => undefined,
     });
@@ -24249,7 +24249,7 @@ describe("HraService", () => {
     const restartedCodex = new FakeCodex();
     restartedCodex.accountProjection = { signedIn: false };
     restartedCodex.cancelLoginResult = { status: "not_found" };
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store,
       paths,
       codex: restartedCodex,
@@ -24267,7 +24267,7 @@ describe("HraService", () => {
       login: {
         status: "pending",
         loginId: "provider-login-restart",
-        next: `hra account login-cancel ${added.account.id}`,
+        next: `oompa account login-cancel ${added.account.id}`,
       },
     });
     const replay = await restarted.execute({
@@ -24280,7 +24280,7 @@ describe("HraService", () => {
     expect(replay.login).toEqual({
       status: "pending",
       loginId: "provider-login-restart",
-      next: `hra account login-cancel ${added.account.id}`,
+      next: `oompa account login-cancel ${added.account.id}`,
     });
     expect(JSON.stringify(replay)).not.toContain("PRIVATE-CODE");
     expect(JSON.stringify(replay)).not.toContain("private=handoff");
@@ -24576,7 +24576,7 @@ describe("HraService", () => {
       .toBeGreaterThan(authority.processGeneration);
     const cloud = new FakeCloud();
     const codex = new FakeCodex();
-    const restarted = new HraService({ store, paths, codex, cloud, daemonGeneration, daemonBootId: bootId,
+    const restarted = new OompaService({ store, paths, codex, cloud, daemonGeneration, daemonBootId: bootId,
       daemonAuthority: new FakeDaemonAuthority(), requestStop: () => undefined });
     const before = serviceFixtureDatabaseSnapshot(paths.database);
     cloud.beforeProjectionUnsettledSessionReturn = () => {
@@ -25017,7 +25017,7 @@ describe("HraService", () => {
         ]) {
           await expect(service.execute(requested, { signal })).rejects.toMatchObject({
             code: "UNAVAILABLE",
-            details: { nextCommand: "hra doctor", repair: "repair_or_select_project" },
+            details: { nextCommand: "oompa doctor", repair: "repair_or_select_project" },
           });
         }
       }
@@ -25045,7 +25045,7 @@ describe("HraService", () => {
         ...(presetContract === undefined ? {} : { presetContract }),
       }, { signal })).rejects.toMatchObject({
         code: "UNAVAILABLE",
-        details: { nextCommand: "hra doctor", repair: "repair_or_select_project" },
+        details: { nextCommand: "oompa doctor", repair: "repair_or_select_project" },
       });
     }
     expect(serviceFixtureDatabaseSnapshot(paths.database)).toEqual(before);
@@ -25268,7 +25268,7 @@ describe("HraService", () => {
     const daemonAuthority = new FakeDaemonAuthority();
     const afterResponse: Array<() => void> = [];
     let stopCalls = 0;
-    const local = new HraService({
+    const local = new OompaService({
       store: value.store, paths: value.paths, codex: value.codex, cloud: value.cloud,
       daemonAuthority, daemonGeneration: value.daemonGeneration, daemonBootId: value.daemonBootId,
       factsMemory, memory, now: () => 1_800_000_000_000, requestStop: () => { stopCalls++; },
@@ -25585,7 +25585,7 @@ describe("HraService", () => {
     expect(store.readMutationProviderAuthorities(attempt.id)).toEqual(capturedAttemptAuthority);
     const restartedCodex = new FakeCodex();
     restartedCodex.readProjection = { ...providerProjection, providerUpdatedAt: 10 };
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store,
       paths: value.paths,
       codex: restartedCodex,
@@ -25635,7 +25635,7 @@ describe("HraService", () => {
       const daemonGeneration = store.nextDaemonGeneration(`boot_${"e".repeat(32)}`);
       const restartedCodex = new FakeCodex();
       restartedCodex.readProjection = codex.readProjection;
-      const restarted = new HraService({
+      const restarted = new OompaService({
         store,
         paths: value.paths,
         codex: restartedCodex,
@@ -26326,7 +26326,7 @@ describe("HraService", () => {
     expect(store.readQueueProviderAuthority(queued.queued.id)).toEqual(capturedQueueAuthority);
     const restartedCodex = new FakeCodex();
     restartedCodex.readProjection = { ...providerProjection, providerUpdatedAt: 10 };
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store,
       paths: value.paths,
       codex: restartedCodex,
@@ -26501,7 +26501,7 @@ describe("HraService", () => {
       email: "person@example.com",
       plan: "Pro",
     };
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store,
       paths,
       codex: restartedCodex,
@@ -26580,7 +26580,7 @@ describe("HraService", () => {
     store.nextDaemonGeneration(`boot_${"8".repeat(32)}`);
     const restartedCodex = new FakeCodex();
     restartedCodex.accountProjection = { signedIn: false };
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store,
       paths,
       codex: restartedCodex,
@@ -30176,7 +30176,7 @@ describe("HraService", () => {
       });
 
     const restartedCodex = new FakeCodex();
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store: value.store,
       paths: value.paths,
       codex: restartedCodex,
@@ -30390,7 +30390,7 @@ describe("HraService", () => {
     expect(restartedStore.listInteractions({ sessionId, pendingOnly: true })).toEqual([]);
 
     const restartedCodex = new FakeCodex();
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store: restartedStore,
       paths: value.paths,
       codex: restartedCodex,
@@ -30523,7 +30523,7 @@ describe("HraService", () => {
   });
 });
 
-describe("HraService autorespond", () => {
+describe("OompaService autorespond", () => {
   const waitFor = async (predicate: () => boolean, timeoutMs = 2_000): Promise<void> => {
     const startedAt = Date.now();
     while (!predicate()) {
@@ -31233,7 +31233,7 @@ describe("HraService autorespond", () => {
   });
 });
 
-describe("HraService prose autorespond", () => {
+describe("OompaService prose autorespond", () => {
   // Twenty-four printable characters, built rather than written, so no
   // credential-shaped literal enters the repository.
   const testGatewayKey = ["gw", "k".repeat(22)].join("");

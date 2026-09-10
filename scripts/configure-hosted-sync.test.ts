@@ -11,7 +11,7 @@ import {
   executeHostedSetup,
   generateHostedSecrets,
   HOSTED_ENVIRONMENT_NAMES,
-  HRA_SITE_URL,
+  OOMPA_SITE_URL,
   parseHostedArguments,
   parseHostedInput,
   readProtectedInput,
@@ -28,8 +28,8 @@ import {
   BoundedProcessRecoveryJournalError,
 } from "./bounded-process";
 import {
-  HRA_CONVEX_PROJECT_ID,
-  HRA_CONVEX_TEAM_ID,
+  OOMPA_CONVEX_PROJECT_ID,
+  OOMPA_CONVEX_TEAM_ID,
   type ConvexTarget,
   type ConvexTargetVerifier,
 } from "./convex-target";
@@ -38,8 +38,8 @@ const target: ConvexTarget = {
   deploymentId: 7_654_321,
   deploymentName: "steady-otter-321",
   deploymentUrl: "https://steady-otter-321.convex.cloud",
-  projectId: HRA_CONVEX_PROJECT_ID,
-  teamId: HRA_CONVEX_TEAM_ID,
+  projectId: OOMPA_CONVEX_PROJECT_ID,
+  teamId: OOMPA_CONVEX_TEAM_ID,
 };
 
 const targetArguments = [
@@ -66,7 +66,7 @@ const validInput = {
   attentionResendApiKey: ["re", "hostile", "attention", "sentinel", "35b8c2"].join("_"),
   authEmailReplyTo: "ben@substrate.run",
   resendApiKey: ["re", "hostile", "resend", "sentinel", "7d48f4"].join("_"),
-  siteUrl: HRA_SITE_URL,
+  siteUrl: OOMPA_SITE_URL,
 } as const;
 
 const generatedSentinels: GeneratedHostedSecrets = {
@@ -101,7 +101,7 @@ const observeWithin = async <Value>(pending: Promise<Value>, timeoutMs: number):
 // This trusted fixture witnesses closure of its inherited descriptors and
 // control channel. It is not waitpid custody or proof about arbitrary descendants.
 const inheritedPipeFixture = async (overflow?: "stdout" | "stderr") => {
-  const root = await mkdtemp(join(tmpdir(), "hra-hosted-pipes-"));
+  const root = await mkdtemp(join(tmpdir(), "oompa-hosted-pipes-"));
   const socketPath = join(root, "control.sock");
   const expiresAt = Date.now() + 3_500;
   const server = createServer();
@@ -265,7 +265,7 @@ describe("fresh hosted configuration", () => {
       false,
       ["verify"],
     );
-    const message = new TextEncoder().encode("hra-hosted-key-match-v1");
+    const message = new TextEncoder().encode("oompa-hosted-key-match-v1");
     const signature = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", privateKey, message);
 
     expect(jwks.keys).toHaveLength(1);
@@ -302,8 +302,8 @@ describe("fresh hosted configuration", () => {
       arguments: targetArguments,
       environment: {
         HOME: "/safe/operator",
-        HRA_ATTENTION_RESEND_API_KEY: validInput.attentionResendApiKey,
-        HRA_RESEND_API_KEY: resendEnv,
+        OOMPA_ATTENTION_RESEND_API_KEY: validInput.attentionResendApiKey,
+        OOMPA_RESEND_API_KEY: resendEnv,
         TMPDIR: `/unsafe/${validInput.attentionResendApiKey}`,
         PATH: `/safe/bin:${generatedSentinels.hmacSecret}`,
       },
@@ -328,10 +328,10 @@ describe("fresh hosted configuration", () => {
     const hmac = generatedSentinels.hmacSecret;
     const resend = validInput.resendApiKey;
     expect(Object.fromEntries(configured)).toEqual({
-      HRA_ATTENTION_RESEND_API_KEY: validInput.attentionResendApiKey,
-      HRA_AUTH_EMAIL_REPLY_TO: validInput.authEmailReplyTo,
-      HRA_AUTH_HMAC_SECRET: hmac,
-      HRA_RESEND_API_KEY: resend,
+      OOMPA_ATTENTION_RESEND_API_KEY: validInput.attentionResendApiKey,
+      OOMPA_AUTH_EMAIL_REPLY_TO: validInput.authEmailReplyTo,
+      OOMPA_AUTH_HMAC_SECRET: hmac,
+      OOMPA_RESEND_API_KEY: resend,
       JWKS: generatedSentinels.jwks,
       JWT_PRIVATE_KEY: generatedSentinels.jwtPrivateKey,
       SITE_URL: validInput.siteUrl,
@@ -378,7 +378,7 @@ describe("fresh hosted configuration", () => {
       input: validInput,
       runner: async (request) => {
         requests.push(request);
-        return { exitCode: 0, stderr: "", stdout: "HRA_ATTENTION_RESEND_API_KEY\n" };
+        return { exitCode: 0, stderr: "", stdout: "OOMPA_ATTENTION_RESEND_API_KEY\n" };
       },
       target,
       verifyTarget: exactTargetVerifier,
@@ -590,7 +590,7 @@ describe("fresh hosted configuration", () => {
     ])).toThrow("usage_invalid");
     expect(() => parseHostedArguments([
       ...targetArguments.slice(0, 3),
-      String(HRA_CONVEX_TEAM_ID + 1),
+      String(OOMPA_CONVEX_TEAM_ID + 1),
       ...targetArguments.slice(4),
     ])).toThrow("usage_invalid");
     expect(() => parseHostedArguments([...targetArguments, "--input-fd", "1"]))
@@ -598,19 +598,19 @@ describe("fresh hosted configuration", () => {
     expect(() => parseHostedInput(`${protectedDocument}\n{}`)).toThrow("input_invalid");
     expect(() => parseHostedInput(JSON.stringify({ ...validInput, unexpected: true })))
       .toThrow("input_invalid");
-    expect(() => parseHostedInput(JSON.stringify({ ...validInput, siteUrl: "http://hra.sh" })))
+    expect(() => parseHostedInput(JSON.stringify({ ...validInput, siteUrl: "http://oompa.app" })))
       .toThrow("input_invalid");
     expect(() => parseHostedInput(JSON.stringify({
       ...validInput,
-      siteUrl: "https://try-hra.vercel.app",
+      siteUrl: "https://oompa.vercel.app",
     }))).toThrow("input_invalid");
-    expect(() => parseHostedInput(JSON.stringify({ ...validInput, siteUrl: "https://hra.sh/" })))
+    expect(() => parseHostedInput(JSON.stringify({ ...validInput, siteUrl: "https://oompa.app/" })))
       .toThrow("input_invalid");
     expect(() => parseHostedInput(JSON.stringify({ ...validInput, resendApiKey: "not-a-key" })))
       .toThrow("input_invalid");
     expect(() => parseHostedInput(JSON.stringify({
       ...validInput,
-      authEmailReplyTo: "HRA <hra@auth.hraness.com>",
+      authEmailReplyTo: "Oompa <oompa@auth.hraness.com>",
     }))).toThrow("input_invalid");
     expect(() => parseHostedInput(JSON.stringify({
       ...validInput,
@@ -627,7 +627,7 @@ describe("fresh hosted configuration", () => {
     expect(buildConvexChildEnvironment({
       CONVEX_DEPLOY_KEY: "deploy-secret",
       HOME: "/safe/home",
-      HRA_AUTH_HMAC_SECRET: hmac,
+      OOMPA_AUTH_HMAC_SECRET: hmac,
       PATH: generatedSentinels.hmacSecret,
     }, Object.values(generatedSentinels))).toEqual({
       HOME: "/safe/home",
