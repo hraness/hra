@@ -8,6 +8,8 @@ import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Switch } from "../components/ui/switch";
 import { AccountLoginRelay } from "../components/account-login-relay";
+import { UsageBreakdown } from "../components/usage-breakdown";
+import type { SettingsSection as SettingsSectionId } from "../routing/route";
 import {
   BackIcon,
   ChoiceGroup,
@@ -18,6 +20,7 @@ import {
   SettingsSection,
 } from "../components/settings-list";
 import { useArchivedSessions } from "../data/archived-sessions";
+import { useAutomaticEffort } from "../data/automatic-effort";
 import { useCommandState, useSubmitCommand } from "../data/commands";
 import {
   deviceCommandCommittedRowUnavailableMessage,
@@ -1132,9 +1135,18 @@ function DeviceRow({ device, now }: Readonly<{ device: DeviceView; now: number }
  * Self contained on purpose: it takes only `onBack`, so the router that owns
  * `#/settings` decides where back goes without this screen knowing about it.
  */
-export function SettingsScreen({ onBack }: Readonly<{ onBack: () => void }>) {
+export function SettingsScreen({ onBack, section = null }: Readonly<{
+  onBack: () => void;
+  /** A section to scroll into view on arrival, e.g. from the grid's usage meter. */
+  section?: SettingsSectionId | null;
+}>) {
   const { signOut } = useAuthActions();
+  useEffect(() => {
+    if (section === null) return;
+    document.getElementById(section)?.scrollIntoView({ block: "start" });
+  }, [section]);
   const registries = useDeviceRegistries();
+  const automaticEffort = useAutomaticEffort();
   const { devices, loading: devicesLoading } = useDevices();
   // Readiness and `now` must come from one hosted-clock instance. Otherwise
   // one hook can be ready while another still exposes its local-time fallback.
@@ -1160,6 +1172,19 @@ export function SettingsScreen({ onBack }: Readonly<{ onBack: () => void }>) {
       </header>
 
       <main {...stylex.props(styles.main)}>
+        <UsageBreakdown />
+
+        <SettingsSection title="New conversations" description="This preference applies to new conversations started from this browser.">
+          <SettingsCard>
+            <SettingsRow
+              title="Automatic effort"
+              description="Use Max effort for clearly bounded Codex prompts and Ultra for everything else. Turn off to always start with Ultra. Claude stays on Fable Max."
+              control={<Switch label="Automatic effort" checked={automaticEffort.enabled} onCheckedChange={automaticEffort.setEnabled} />}
+            >
+              {automaticEffort.notice === null ? null : <p role="status">{automaticEffort.notice}</p>}
+            </SettingsRow>
+          </SettingsCard>
+        </SettingsSection>
         <SettingsSection
           description="Each machine publishes its own defaults. A change is sent as a durable command and applies when the daemon picks it up."
           title="Machines"

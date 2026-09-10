@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { IndeterminateCodexEffectError } from "../codex";
-import { legacyPresetContract } from "../domain/presets";
+import { currentPresetContract } from "../domain/presets";
 import type { EffectiveRuntimeProfile } from "../domain/runtime-profile";
 import {
   WORK_APPLY_REQUEST_VERSION,
@@ -57,7 +57,7 @@ const effectiveRuntimeProfile = (
   processGeneration: authority.generation,
   observedAt: 10_000,
   preset,
-  model: preset === "low" ? "gpt-5.6-luna" : "gpt-5.6-sol",
+  model: preset === "low" ? "gpt-5.6-luna" : "gpt-6-astra",
   reasoningEffort: preset === "ultra" ? "ultra" : "max",
   serviceTier: fast ? "priority" : null,
   fast,
@@ -454,7 +454,7 @@ async function createActor(value: Fixture): Promise<Actor> {
     project: project.project.id,
     preset: "high",
     fast: false,
-    presetContract: 1,
+    presetContract: 2,
   }, { signal }) as { session: { id: SessionId } };
   return {
     accountId: added.account.id,
@@ -470,7 +470,7 @@ async function createSiblingActor(value: Fixture, actor: Actor): Promise<Actor> 
     project: actor.projectId,
     preset: "high",
     fast: false,
-    presetContract: 1,
+    presetContract: 2,
   }, { signal }) as { session: { id: SessionId } };
   return { ...actor, sessionId: started.session.id };
 }
@@ -505,7 +505,7 @@ async function createAndJoin(value: Fixture, actor: Actor) {
     kind: "work.apply",
     requestId: crypto.randomUUID(),
     requestVersion: WORK_APPLY_REQUEST_VERSION,
-    presetContract: 1,
+    presetContract: 2,
     operation: {
       kind: "work.create",
       idempotencyKey: nextKey(),
@@ -738,7 +738,7 @@ describe("OompaService work protocol", () => {
       kind: "work.apply",
       requestId: crypto.randomUUID(),
       requestVersion: WORK_APPLY_REQUEST_VERSION,
-      presetContract: 2,
+      presetContract: 1,
       operation: reboundOperation,
     }, { signal })).rejects.toMatchObject({
       code: "CONFLICT",
@@ -748,7 +748,7 @@ describe("OompaService work protocol", () => {
       kind: "work.apply",
       requestId: crypto.randomUUID(),
       requestVersion: WORK_APPLY_REQUEST_VERSION,
-      presetContract: 1,
+      presetContract: 2,
       operation: reboundOperation,
     }, { signal }));
     expect(admitted.kind).toBe("work.create");
@@ -756,7 +756,7 @@ describe("OompaService work protocol", () => {
       kind: "work.apply",
       requestId: crypto.randomUUID(),
       requestVersion: WORK_APPLY_REQUEST_VERSION,
-      presetContract: 1,
+      presetContract: 2,
       operation: structuredClone(reboundOperation),
     }, { signal }))).toEqual(admitted);
   });
@@ -1161,7 +1161,7 @@ describe("OompaService work protocol", () => {
       kind: "work.apply",
       requestId: crypto.randomUUID(),
       requestVersion: WORK_APPLY_REQUEST_VERSION,
-      presetContract: 1,
+      presetContract: 2,
       operation: {
         kind: "work.create",
         idempotencyKey: nextKey(),
@@ -1354,7 +1354,7 @@ describe("OompaService work protocol", () => {
       kind: "session.switch",
       account: target.account.id,
       idempotencyKey: switchKey,
-      presetContract: legacyPresetContract,
+      presetContract: currentPresetContract,
       provider: "codex",
       session: actor.sessionId,
     }, { signal })).rejects.toMatchObject({
@@ -1477,7 +1477,7 @@ describe("OompaService work protocol", () => {
       kind: "session.switch",
       account: target.account.id,
       idempotencyKey: switchKey,
-      presetContract: legacyPresetContract,
+      presetContract: currentPresetContract,
       provider: "codex",
       session: actor.sessionId,
     }, { signal });

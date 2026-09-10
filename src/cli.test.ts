@@ -3656,7 +3656,6 @@ describe("CLI entry point", () => {
     const privatePayload = "message-private-sentinel";
     const commands = [
       ["account", "logout", "personal", "--json"],
-      ["account", "switch", "personal", "--json"],
       ["session", "start", "personal", "--json"],
       ["session", "start", "personal", "--provider", "claude", "--json"],
       ["session", "send", "session-1", privatePayload, "--json"],

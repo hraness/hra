@@ -2,6 +2,27 @@
 
 Every entry names the release or the plan wave it belongs to. Unreleased work sits under the wave that produced it until a version ships.
 
+## Desktop switching removed (unreleased)
+
+- The macOS ChatGPT desktop account switch is removed: `oompa account switch`, `oompa account switch-recover`, the `src/desktop` state machine, its daemon port and the doctor's `desktop` recovery block are gone, and the website no longer documents it. The `desktop_switches`, `desktop_switch_authority` and `desktop_switch_resolutions` tables, their migrations and the retained journal decoders stay, so an existing state root opens unchanged. Plan: `kb/plans/oompa-app-simplification.md`, Phase 5.
+
+## Astra binding (unreleased)
+
+Codex `high` and `ultra` bind to Astra again. Plan: `kb/plans/oompa-app-simplification.md`, Phases 4a–4b.
+
+- New and explicitly reselected Codex `high` and `ultra` sessions, Work plans and provider switches use contract 2: `gpt-6-astra` at `max` and `ultra` reasoning. Established contract 1 Sol sessions keep their exact route until a preset is explicitly reselected; same-alias reselection moves the session to Astra. Existing Works retain their frozen contract and may settle their existing tasks; a new Astra task graph needs a new Work. No stored contract is renumbered or reinterpreted.
+- Remote and local writes that name either rebound alias, and preset-omitted Codex switches, now carry contract 2. A browser or CLI built before this change targeting a current daemon, or the reverse, fails closed before any provider effect, as the `presetContract` fence was designed to do.
+- The CLI help, website preset copy, release notes and routing contract name Astra Max and Astra Ultra as the active Codex mapping. Browser labels stay `Codex High` and `Codex Ultra`; registry version 1 still projects only the alias.
+
+## Automatic effort (unreleased)
+
+- New browser conversations use Astra Max for conservatively bounded prompts and Ultra otherwise, with an Automatic effort off switch in Settings. The choice is fixed in the ordinary command before submission. Existing sessions, explicit CLI choices and the shadow router remain unchanged.
+
+## Usage history (unreleased)
+
+- The grid links to Codex daily usage history in Settings (`#/settings/usage`). Recent, unexpired reports show their last reported remaining percentage; missing, unreadable, stale or expired reports show unknown. Historical window values and reset instants remain available in dated expandable reports.
+- The existing v1 payload, 24-hour upload cadence and quota bounds are unchanged. Live usage, Claude observations, reset credits, throughput and runway remain unfinished work under `kb/plans/oompa-app-simplification.md` Phase 6 and `kb/plans/provider-usage-management.md` Phases 8–9.
+
 ## Inline conversations (unreleased)
 
 The web app keeps every conversation in its grid card and asks only for a prompt and a machine. Plan: `kb/plans/oompa-app-simplification.md`.
@@ -25,7 +46,7 @@ Provider account visibility, local automatic usage policy controls, and recovery
 - `oompa usage auto status|on|off|inherit` reads or changes the inherited default and per-provider overrides. Changes require an observed revision and caller-owned idempotency key. Effective Codex disable suppresses new reset-credit dispatches, including retries, while preserving uncertain attempts and already admitted operations.
 - Provider recovery preserves exact historical account, profile, effect and timestamp evidence. Terminal attachment acknowledgement, queued-input settlement and Claude launch-reservation cleanup fail closed when authority or prior-process custody cannot be proved.
 - Additive local storage migrations retain the admitted schema 50 predecessor and append the provider-usage and custody foundation through schema 60. Genuine historical fixtures and explicitly identified synthetic compatibility cases verify migration and refusal boundaries; they do not prove live provider acceptance.
-- Automatic account movement, managed-send forwarding, account order and activation commands, Claude native fallback, and the planned hosted/browser usage view remain unavailable. Existing explicit account selection and provider-specific platform limits are unchanged.
+- Automatic account movement, managed-send forwarding, account order and activation commands, Claude native fallback, and the planned live usage meter remain unavailable. Existing explicit account selection and provider-specific platform limits are unchanged.
 
 ## Release reliability follow-up (unreleased)
 

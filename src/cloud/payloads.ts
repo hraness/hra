@@ -61,6 +61,17 @@ import {
   type UsageProjection,
 } from "./usage";
 
+// The browser facade reaches the exact legacy usage decoder through this
+// existing payload boundary; it gains no generic cloud-module import authority.
+export {
+  parseUsageEncryptedEnvelope,
+  USAGE_CLOUD_PROJECTION_MAX_LIMITS,
+  type UsageLimit,
+  type UsageProjection,
+  type UsageReady,
+  type UsageWindow,
+} from "./usage";
+
 // Interaction identifiers are provider-brokered UUIDs (see
 // `src/domain/interactions.ts`, `z.string().uuid()`) that are not necessarily
 // UUIDv7, so this checks the generic RFC 4122 shape rather than reusing the

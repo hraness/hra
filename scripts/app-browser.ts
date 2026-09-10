@@ -769,7 +769,7 @@ async function verifyDocsSearch(page: Page, origin: string): Promise<void> {
 
 async function verifyLegacyDocsRedirects(page: Page, origin: string): Promise<unknown[]> {
   const observations: unknown[] = [];
-  for (const [id, destination] of [["install-and-update", "/docs/status/"], ["first-account", "/docs/sessions/"]] as const) {
+  for (const [id, destination] of [["install-and-update", "/docs/status/"], ["first-account", "/docs/start/"], ["first-session", "/docs/start/"]] as const) {
     await page.goto(`${origin}/#${id}`);
     await page.waitForURL(`${origin}${destination}#${id}`);
     const section = page.locator(`details#${id}`);
@@ -1613,6 +1613,11 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
           await cleanDocument(page);
           await defaultPalette(page, profile.forced);
           if (view === "grid") {
+            const usage = page.getByRole("button", { name: "Codex usage unknown. Open usage history.", exact: true });
+            assert.ok(await usage.isVisible(), "Partial historical usage must remain unknown on the grid");
+            assert.equal(await usage.locator("meter").count(), 0);
+            await usage.click();
+            assert.equal(new URL(page.url()).hash, "#/settings/usage");
             const cards = page.locator("[data-session-id]");
             assert.equal(await cards.count(), 3);
             const before = await cards.evaluateAll((elements) => elements.map((element) => element.getAttribute("data-session-id")));
@@ -1622,8 +1627,11 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
             assert.deepEqual(await cards.evaluateAll((elements) => elements.map((element) => element.getAttribute("data-session-id"))), [before[1], before[0], before[2]], "Keyboard card ordering did not preserve the displayed permutation");
             assert.ok(await page.getByLabel("Start a new session").isEnabled());
             assert.ok(await page.getByRole("button", { name: "Start", exact: true }).isDisabled());
+            await page.getByLabel("Start a new session").fill("Run `bun test src/value.test.ts` and report the exit status.");
+            assert.ok(await page.getByText(/Automatic effort: Max for this simple prompt\./u).isVisible());
             await page.getByLabel("Start a new session").fill("Fixture prompt only");
             assert.ok(await page.getByRole("button", { name: "Start", exact: true }).isEnabled());
+            assert.ok(await page.getByText(/Automatic effort: Ultra\./u).isVisible());
           }
           if (view === "session" || view === "session-long" || view === "retired") {
             assert.ok(await page.getByRole("heading", { name: "Browser fixture session", exact: true }).isVisible());
@@ -1682,10 +1690,33 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
           }
           if (view === "settings") {
             assert.ok(await page.getByRole("heading", { name: "Settings", exact: true }).isVisible());
+            const usageHistory = page.locator("#usage");
+            assert.ok(await usageHistory.getByRole("heading", { name: "Usage history", exact: true }).isVisible());
+            assert.ok(await usageHistory.getByText("62% left in the last daily report.", { exact: true }).isVisible());
+            assert.ok(await usageHistory.getByText("The latest report is stale, expired or incomplete; usage unknown.", { exact: true }).isVisible());
+            const report = usageHistory.locator("details").first();
+            await report.locator("summary").click();
+            assert.ok(await report.getByText(/38% used when reported · reset scheduled for/u).isVisible());
+            const automaticEffort = page.getByRole("switch", { name: "Automatic effort", exact: true });
+            assert.equal(await automaticEffort.getAttribute("aria-checked"), "true");
+            await automaticEffort.click();
+            assert.equal(await automaticEffort.getAttribute("aria-checked"), "false");
+            await page.reload();
+            await automaticEffort.waitFor();
+            assert.equal(await automaticEffort.getAttribute("aria-checked"), "false", "Automatic effort disable did not survive reload");
+            await page.goto(`${fixture.origin}/?view=grid`);
+            await page.getByLabel("Start a new session").fill("Run `bun test src/value.test.ts` and report the exit status.");
+            assert.ok(await page.getByText(/Automatic effort is off: Ultra\./u).isVisible());
+            await page.goto(`${fixture.origin}/?view=settings`);
+            await automaticEffort.waitFor();
+            await automaticEffort.click();
+            assert.equal(await automaticEffort.getAttribute("aria-checked"), "true");
+            await page.evaluate((direction) => { document.documentElement.dir = direction; }, profile.rtl ? "rtl" : "ltr");
+            await settle(page);
             assert.ok((await page.getByText("Fixture machine", { exact: true }).count()) > 0);
             assert.ok(await page.getByText("Last reported Codex default", { exact: true }).isVisible());
             assert.ok(await page.getByText(
-              "gpt-5.6-sol / ultra. Reported configuration only, not session state or runtime capability.",
+              "gpt-6-astra / ultra. Reported configuration only, not session state or runtime capability.",
               { exact: true },
             ).isVisible());
           }

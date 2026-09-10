@@ -512,7 +512,7 @@ describe("CLI parser", () => {
       command: {
         kind: "session.start",
         preset: "high",
-        presetContract: 1,
+        presetContract: 2,
       },
     });
     if (generated.kind !== "command" || generated.command.kind !== "session.start") {
@@ -524,7 +524,7 @@ describe("CLI parser", () => {
 
     const idempotencyKey = "00000000-0000-4000-8000-000000000204";
     expect(parseCli([
-      "--preset-contract", "2",
+      "--preset-contract", "1",
       "session", "start", "work", "--preset", "ultra",
       "--idempotency-key", idempotencyKey,
     ])).toMatchObject({
@@ -533,7 +533,7 @@ describe("CLI parser", () => {
         idempotencyKey,
         kind: "session.start",
         preset: "ultra",
-        presetContract: 2,
+        presetContract: 1,
       },
     });
     expect(() => parseCli([
@@ -541,7 +541,7 @@ describe("CLI parser", () => {
       "--idempotency-key", idempotencyKey,
     ])).toThrow("also requires --preset-contract");
     expect(() => parseCli([
-      "session", "start", "work", "--preset", "high", "--preset-contract", "2",
+      "session", "start", "work", "--preset", "high", "--preset-contract", "1",
     ])).toThrow("requires an explicit --idempotency-key");
   });
 
@@ -562,9 +562,9 @@ describe("CLI parser", () => {
     };
     expect(JSON.stringify(stable.command)).toBe(JSON.stringify(priorByteShape));
     for (const argv of [
-      ["session", "start", "work", "--provider", "claude", "--preset-contract", "1", "--idempotency-key", idempotencyKey],
-      ["session", "status", "session", "--preset-contract", "1"],
-      ["status", "--preset-contract", "1"],
+      ["session", "start", "work", "--provider", "claude", "--preset-contract", "2", "--idempotency-key", idempotencyKey],
+      ["session", "status", "session", "--preset-contract", "2"],
+      ["status", "--preset-contract", "2"],
       ["session", "start", "work", "--preset-contract", "3", "--idempotency-key", idempotencyKey],
     ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
   });
@@ -588,7 +588,7 @@ describe("CLI parser", () => {
         account: "work",
         kind: "session.switch",
         preset: "ultra",
-        presetContract: 1,
+        presetContract: 2,
         provider: "codex",
       },
     });
@@ -600,16 +600,16 @@ describe("CLI parser", () => {
       /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
     );
     expect(parseCli(["session", "switch", "s", "--provider", "codex"]))
-      .toMatchObject({ command: { presetContract: 1, provider: "codex" } });
+      .toMatchObject({ command: { presetContract: 2, provider: "codex" } });
     const switchReplayKey = "00000000-0000-4000-8000-000000000206";
     expect(parseCli([
       "session", "switch", "s", "--provider", "codex", "--preset", "high",
-      "--idempotency-key", switchReplayKey, "--preset-contract", "2",
+      "--idempotency-key", switchReplayKey, "--preset-contract", "1",
     ])).toMatchObject({
       command: {
         idempotencyKey: switchReplayKey,
         preset: "high",
-        presetContract: 2,
+        presetContract: 1,
         provider: "codex",
       },
     });
@@ -618,7 +618,7 @@ describe("CLI parser", () => {
       "--idempotency-key", switchReplayKey,
     ])).toThrow("also requires --preset-contract");
     expect(() => parseCli([
-      "session", "switch", "s", "--provider", "codex", "--preset-contract", "2",
+      "session", "switch", "s", "--provider", "codex", "--preset-contract", "1",
     ])).toThrow("requires an explicit --idempotency-key");
     expect(parseCli([
       "session", "switch", "s", "--provider", "claude",
@@ -631,7 +631,7 @@ describe("CLI parser", () => {
     });
     expect(() => parseCli([
       "session", "switch", "s", "--provider", "claude",
-      "--idempotency-key", switchReplayKey, "--preset-contract", "1",
+      "--idempotency-key", switchReplayKey, "--preset-contract", "2",
     ])).toThrow("supported only for a source-sensitive Codex provider switch");
     expect(() => parseCli(["session", "switch", "s"]))
       .toThrow("Missing value for --provider.");
@@ -1036,6 +1036,18 @@ describe("CLI parser", () => {
     }
   });
 
+  test("rejects retired desktop account switching and recovery commands", () => {
+    for (const argv of [
+      ["account", "switch", "personal"],
+      ["account", "switch", "personal", "--json"],
+      ["account", "switch-recover"],
+      ["account", "switch-recover", "--json"],
+    ]) {
+      expect(() => parseCli(argv)).toThrow(CliUsageError);
+      expect(() => parseCli(argv)).toThrow("Unknown account action");
+    }
+  });
+
   test("keeps destructive local profile and project deletion out of the beta surface", () => {
     expect(() => parseCli(["account", "remove", "work"])).toThrow(CliUsageError);
     expect(() => parseCli(["project", "remove", "workspace"])).toThrow(CliUsageError);
@@ -1155,30 +1167,10 @@ describe("CLI parser", () => {
     expect(parseCli(["session", "send", "session", "--idempotency-key", idempotencyKey, "--", "use", "--help"])).toMatchObject({
       command: { kind: "session.send", idempotencyKey, message: "use --help" },
     });
-    expect(parseCli(["account", "switch", "personal", "--idempotency-key", idempotencyKey])).toMatchObject({
-      command: { kind: "account.switch", account: "personal", idempotencyKey },
+    expect(parseCli(["account", "logout", "personal", "--idempotency-key", idempotencyKey])).toMatchObject({
+      command: { kind: "account.logout", account: "personal", idempotencyKey },
     });
     expect(() => parseCli(["account", "list", "--idempotency-key", idempotencyKey])).toThrow(CliUsageError);
-  });
-
-  test("generates a discoverable desktop-switch key before transport and parses recovery", () => {
-    const invocation = parseCli(["account", "switch", "personal"]);
-    expect(invocation).toMatchObject({
-      kind: "command",
-      command: { kind: "account.switch", account: "personal" },
-      json: false,
-    });
-    if (invocation.kind !== "command" || invocation.command.kind !== "account.switch") {
-      throw new Error("Expected an account switch command.");
-    }
-    expect(invocation.command.idempotencyKey).toMatch(
-      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
-    );
-    expect(parseCli(["account", "switch-recover", "--json"])).toEqual({
-      kind: "command",
-      command: { kind: "account.switch-recover" },
-      json: true,
-    });
   });
 
   test("generates discoverable keys at the CLI boundary for every provider-effect command", () => {
@@ -2052,10 +2044,10 @@ describe("CLI help", () => {
     expect(usage).toContain("Run `oompa <group> --help` or `oompa help <group> [<command>]` for command examples.");
     expect(usage).toContain("Codex provider commands run on macOS and Linux");
     expect(usage).toContain("Claude login, status,\n  sessions, and provider switches require Linux");
-    expect(usage).toContain("high        Sol Max         (codex)");
-    expect(usage).toContain("ultra       Sol Ultra       (codex)");
-    expect(usage).not.toContain("Astra Max       (codex)");
-    expect(usage).not.toContain("Astra Ultra     (codex)");
+    expect(usage).toContain("high        Astra Max       (codex)");
+    expect(usage).toContain("ultra       Astra Ultra     (codex)");
+    expect(usage).not.toContain("Sol Max         (codex)");
+    expect(usage).not.toContain("Sol Ultra       (codex)");
     for (const group of helpGroupNames) expect(usage).toContain(`oompa ${group}`);
   });
 

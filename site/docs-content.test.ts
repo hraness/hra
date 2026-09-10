@@ -94,6 +94,9 @@ describe("task-oriented documentation content", () => {
     }
     expect(docsPathForSection("privacy")).toBe("/privacy/");
     expect(() => docsPathForSection("missing-section")).toThrow("No documentation page owns section");
+    expect(pageAt("/docs/").referenceSectionIds).toEqual([]);
+    expect(pageAt("/docs/start/").referenceSectionIds).toEqual(["first-account", "first-session"]);
+    expect(docsPathForSection("project")).toBe("/docs/status/#project");
     expect(pageAt("/docs/reference/").referenceSectionIds).toContain("command-reference");
     expect(pageAt("/docs/status/").referenceSectionIds).toContain("install-and-update");
   });
@@ -184,8 +187,14 @@ describe("task-oriented documentation content", () => {
     expect(text).toContain("A browser cannot be the first device on an account or approve another device");
     expect(text).toContain("oompa device approve <pending-device-id-or-prefix> --fingerprint <value>");
     expect(text).toContain("Email access alone cannot recover encrypted history");
-    expect(text).toContain("With no session selected");
-    expect(text).toContain("With a session selected");
+    expect(text).toContain("write a prompt in the start box and choose a machine");
+    expect(text).toContain("Follow-up prompts belong in the conversation card");
+    expect(text).toContain("Earlier completed responses start collapsed");
+    expect(text).toContain("Shift+Enter adds a line");
+    expect(text).toContain("opens your synchronized sessions automatically");
+    for (const retired of ["Open a card", "approved and unlocked", "With a session selected", "offers model presets"]) {
+      expect(text).not.toContain(retired);
+    }
     expect(text).toContain("multiple-choice question can be answered here");
     expect(text).toContain("accepting them, granting permission, typing a free-text or Other answer, and completing MCP forms stay on the execution machine");
     expect(text).toContain("Scheduled tasks are read-only here");
