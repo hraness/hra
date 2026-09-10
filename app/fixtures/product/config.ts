@@ -16,6 +16,7 @@ export const productIoModules = Object.freeze([
   "app/src/data/sent-attachments.ts",
   "app/src/data/session-heads.ts",
   "app/src/data/session-model-hook.ts",
+  "app/src/data/usage.ts",
   "app/src/routing/router.ts",
 ]);
 

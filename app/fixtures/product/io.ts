@@ -13,6 +13,8 @@ import type * as Attachments from "../../src/data/composer-attachments";
 import type * as CardOrder from "../../src/data/card-order";
 import type * as Auth from "@convex-dev/auth/react";
 import type * as Appearance from "../../src/appearance";
+import type * as Usage from "../../src/data/usage";
+import { usageOverview } from "./usage";
 import type { ProductPreviewHarness } from "./definition";
 
 let active: ProductPreviewHarness | null = null;
@@ -102,3 +104,6 @@ export const heldAttachmentUrl = (): null => null;
 export const releaseHeldAttachments = noop;
 export const navigate = refuse;
 export const navigateBack = refuse;
+
+/** Fictional, static usage: two Codex accounts, one comfortably ahead of its reset and one nearly spent. */
+export const useUsageOverview: typeof Usage.useUsageOverview = () => usageOverview(readProductPreviewHarness().now());

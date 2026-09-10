@@ -211,6 +211,7 @@ export default tseslint.config(
       "app/fixtures/browser/io.ts", "app/fixtures/browser/main.tsx",
       "app/fixtures/product/io.ts", "app/fixtures/product/main.tsx",
       "app/fixtures/product/fixtures.ts", "app/fixtures/product/definition.test.ts",
+      "app/fixtures/product/usage.ts",
     ],
     rules: layerRules([
       {

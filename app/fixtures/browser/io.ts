@@ -12,6 +12,8 @@ import type * as DeviceCommands from "../../src/data/device-commands";
 import type * as Devices from "../../src/data/devices";
 import type * as Archived from "../../src/data/archived-sessions";
 import type * as Auth from "@convex-dev/auth/react";
+import type * as Usage from "../../src/data/usage";
+import { usageOverview } from "../product/usage";
 
 const now = 1_780_000_000_000;
 const noop = () => undefined;
@@ -101,3 +103,4 @@ export function useCustody(): Custody {
     state: "unenrolled", unlock: refuse,
   };
 }
+export const useUsageOverview: typeof Usage.useUsageOverview = () => usageOverview(now);
