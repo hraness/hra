@@ -28,6 +28,7 @@ await mock.module("../data/device-commands", () => ({
   useSubmitDeviceCommand: () => refuseCommand,
 }));
 await mock.module("../components/session-card", () => ({ SessionCard: () => null }));
+await mock.module("../components/usage-meter", () => ({ UsageMeter: () => null }));
 
 const { GridScreen } = await import("./grid-screen");
 
@@ -87,7 +88,7 @@ describe("grid composer guidance", () => {
     expect(markup).toContain("No sessions yet. Type a prompt above to start one on a machine.");
     expect(markup).toContain('value="device_studio01"');
     expect(markup).toContain("Studio — Codex");
-    expect(markup).toContain("Starts on Studio as Work on Astra Ultra.");
+    expect(markup).toContain("Starts on Studio as Work on Codex Ultra.");
     expect(markup).not.toContain("Project");
     const submit = parseHTML(markup).document.querySelector('button[type="submit"]');
     expect(submit?.hasAttribute("disabled")).toBe(true);
@@ -104,7 +105,8 @@ describe("grid composer guidance", () => {
     expect(markup).not.toContain("<span>Project</span>");
     expect(markup).not.toContain('value="proj_');
     expect(markup).not.toContain('value="acct_');
-    expect(markup).not.toContain("Codex Ultra");
+    expect(markup).not.toContain('value="ultra"');
+    expect(markup).not.toContain('value="high"');
   });
 
   test("announces loading without prematurely declaring an empty workspace", () => {

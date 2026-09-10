@@ -230,7 +230,7 @@ Usage:
   oompa init [--yes] [--json]
   oompa doctor [--offline] [--json]
   oompa daemon start|status|stop|run
-  oompa account add|list|show|login|login-cancel|logout|usage|usage-history|switch|switch-recover
+  oompa account add|list|show|login|login-cancel|logout|usage|usage-history
   oompa account list --provider codex|claude
   oompa usage auto status|on|off|inherit
   oompa plugin list <account> [--project <project>] [--refresh]
@@ -279,8 +279,8 @@ Platform:
 
 Recommended profiles:
   low         Luna Max        (codex)
-  high        Sol Max         (codex)
-  ultra       Sol Ultra       (codex)
+  high        Astra Max       (codex)
+  ultra       Astra Ultra     (codex)
   fable-max   Claude Fable    (claude)
 
 Run \`oompa <group> --help\` or \`oompa help <group> [<command>]\` for command examples.`;
@@ -356,8 +356,6 @@ Usage:
   oompa account show <profile> --provider devin  (retired local history and cleanup only)
   oompa account usage [profile] [--refresh]
   oompa account usage-history <profile> [--from <UTC-RFC3339>] [--through <UTC-RFC3339>] [--limit <1..100>] [--cursor <cursor>]
-  oompa account switch <profile>
-  oompa account switch-recover
 
 Provider listing:
   --provider lists cached readiness, ordering, and the active pointer for Codex
@@ -741,7 +739,6 @@ const idempotentCommandKinds = new Set<LocalCommand["kind"]>([
   "account.claude-login.abandon",
   "account.devin-login.abandon",
   "account.logout",
-  "account.switch",
   "session.start",
   "session.send",
   "session.queue",
@@ -1312,8 +1309,6 @@ const parseAccount = (
         ...(historyCursor === undefined ? {} : { cursor: historyCursor }),
       });
     }
-    case "switch": { const account = take(cursor, "account"); finish(cursor); return { kind: "account.switch", account, idempotencyKey: randomUUID() }; }
-    case "switch-recover": finish(cursor); return { kind: "account.switch-recover" };
     default: throw new CliUsageError("Unknown account action. Run `oompa account --help` for supported actions.");
   }
 };

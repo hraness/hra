@@ -8,24 +8,29 @@
  * `#/session/<id>` link, resolves to the grid rather than rendering nothing.
  * Every conversation lives in its grid card.
  */
+export type SettingsSection = "usage";
+
 export type Route =
   | Readonly<{ kind: "grid" }>
-  | Readonly<{ kind: "settings" }>;
+  | Readonly<{ kind: "settings"; section: SettingsSection | null }>;
 
 export const gridRoute: Route = Object.freeze({ kind: "grid" });
-export const settingsRoute: Route = Object.freeze({ kind: "settings" });
+export const settingsRoute: Route = Object.freeze({ kind: "settings", section: null });
+/** Settings, scrolled to the usage breakdown; where the grid meter leads. */
+export const usageRoute: Route = Object.freeze({ kind: "settings", section: "usage" });
 
 export function parseRoute(hash: string): Route {
   const path = hash.startsWith("#") ? hash.slice(1) : hash;
   const segments = path.split("/").filter((segment) => segment.length > 0);
-  const [head] = segments;
-  if (segments.length === 1 && head === "settings") return settingsRoute;
+  const [head, tail] = segments;
+  if (head === "settings" && segments.length === 1) return settingsRoute;
+  if (head === "settings" && segments.length === 2 && tail === "usage") return usageRoute;
   return gridRoute;
 }
 
 export function routeHash(route: Route): string {
   switch (route.kind) {
-    case "settings": return "#/settings";
+    case "settings": return route.section === null ? "#/settings" : `#/settings/${route.section}`;
     case "grid": return "#/";
   }
 }

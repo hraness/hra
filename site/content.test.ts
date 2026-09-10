@@ -645,8 +645,8 @@ describe("public content contract", () => {
   });
 
   test("publishes exact lost-login recovery without retaining provider credentials", () => {
-    const markdown = renderDocumentationMarkdown("/docs/sessions/");
-    const html = htmlVisibleText(renderDocumentationHtml("/docs/sessions/"));
+    const markdown = renderDocumentationMarkdown("/docs/start/");
+    const html = htmlVisibleText(renderDocumentationHtml("/docs/start/"));
     for (const surface of [markdown, html]) {
       expect(surface).toContain("the daemon restarts before completion");
       expect(surface).toContain("oompa account show personal");
@@ -669,8 +669,8 @@ describe("public content contract", () => {
   });
 
   test("removes active Devin claims and documents preserved historical data", () => {
-    const markdown = renderDocumentationMarkdown("/docs/sessions/");
-    const html = htmlVisibleText(renderDocumentationHtml("/docs/sessions/"));
+    const markdown = renderDocumentationMarkdown("/docs/start/");
+    const html = htmlVisibleText(renderDocumentationHtml("/docs/start/"));
     for (const surface of [markdown, html]) {
       expect(surface).toContain("Devin support has been removed");
       expect(surface).toContain("Existing Devin history is read-only");
@@ -682,12 +682,10 @@ describe("public content contract", () => {
   });
 
   test("preserves the adopted provider-usage boundary in its owning guides' Markdown and HTML", () => {
-    for (const surface of [renderDocumentationMarkdown("/docs/sessions/", "/docs/status/"), htmlVisibleText(renderDocumentationHtml("/docs/sessions/", "/docs/status/"))]) {
+    for (const surface of [renderDocumentationMarkdown("/docs/start/", "/docs/sessions/", "/docs/status/"), htmlVisibleText(renderDocumentationHtml("/docs/start/", "/docs/sessions/", "/docs/status/"))]) {
       expect(surface).toContain("Automatic account movement is not exposed yet.");
       expect(surface).toContain("Explicit sessions and work tasks stay pinned to the account you selected.");
       expect(surface).toContain("Claude and Devin accounts never rotate automatically, and Oompa never replays a failed or ambiguous turn under another account.");
-      expect(surface).toContain("The experimental desktop switch never copies");
-      expect(surface).toContain("changes Keychain blindly, responds to a provider limit, or retries an uncertain switch.");
       expect(surface).toContain("The separately adopted provider-usage contract permits bounded managed Codex movement only under fresh local authority; explicit sessions, work tasks, Claude accounts, and cross-machine execution remain outside that boundary.");
       expect(surface).not.toContain("rotates accounts to evade a provider limit");
     }
@@ -843,6 +841,19 @@ describe("public content contract", () => {
       }
     }
     expect(parseHTML(home).document.querySelectorAll("section.documentation-section")).toHaveLength(0);
+  });
+
+  test.each([
+    ["/docs/", "project", "/docs/status/"],
+    ["/docs/sessions/", "first-account", "/docs/start/"],
+    ["/docs/sessions/", "first-session", "/docs/start/"],
+  ] as const)("preserves the moved public fragment %s#%s", (oldPath, id, newPath) => {
+    const source = renderDocumentationHtml(oldPath);
+    const link = oneElement(source, `a[data-moved-section="${id}"]`);
+    expect(link.getAttribute("href")).toBe(`${newPath}#${id}`);
+    expect(link.closest(`#${id}`)).not.toBeNull();
+    expect(oneElement(renderDocumentationHtml(newPath), `details#${id}`)).toBeDefined();
+    expect(oldPath).not.toBe(newPath);
   });
 
   test("keeps the full privacy boundary on its canonical HTML and Markdown surfaces", () => {
@@ -1093,9 +1104,9 @@ describe("public content contract", () => {
       ["The request version and any authored preset contract are part of changed-intent detection"],
       ["Each Work also freezes the meaning of its High and Ultra routes when it is created"],
       ["A fresh affected version 1 request is refused"],
-      ["An existing contract 2 Work whose coordinator and participating session authorities remain supported keeps Astra for already-declared tasks"],
+      ["An existing contract 1 Work whose coordinator and participating session authorities remain supported keeps Sol for already-declared tasks"],
       ["A Work associated with a retired Devin session remains readable but is fenced from mutation and execution"],
-      ["Current tooling does not append a new High or Ultra task to a historical contract 2 Work"],
+      ["Current tooling does not append a new High or Ultra task to a contract 1 Work"],
       ["Reusing that key with another version or contract is a conflict"],
       [
         "A source-sensitive Codex session start or provider-switch replay includes both --idempotency-key and its immutable --preset-contract",
@@ -1106,6 +1117,8 @@ describe("public content contract", () => {
       ["An older session-start release did not print the source contract"],
       ["--preset high --preset-contract 1", "`--preset high --preset-contract 1`"],
       ["Neither selector can resume a contractless prepared row"],
+      ["Contract 1 cannot authorize a fresh effect under the current Astra binding"],
+      ["contract 2 can authorize the exact Astra request when the key has no stored row"],
       ["If the originating meaning cannot be proved, use the retained old release rather than guessing"],
       ["A contractless prepared row has no supported cancellation or retirement command"],
       ["Do not use a fresh key or session abandon as a workaround", "Do not use a fresh key or `session abandon` as a workaround"],
@@ -1119,8 +1132,8 @@ describe("public content contract", () => {
   });
 
   test("publishes first-session walkthroughs for humans and agents", () => {
-    const markdown = renderDocumentationMarkdown("/docs/sessions/", "/docs/reference/");
-    const rawHtml = renderDocumentationHtml("/docs/sessions/", "/docs/reference/");
+    const markdown = renderDocumentationMarkdown("/docs/start/", "/docs/sessions/", "/docs/reference/");
+    const rawHtml = renderDocumentationHtml("/docs/start/", "/docs/sessions/", "/docs/reference/");
     const html = htmlVisibleText(rawHtml);
     const claims = [
       "Human terminal",
@@ -1176,8 +1189,8 @@ describe("public content contract", () => {
     expect(html).toContain("New Oompa-created Codex sessions that use high or ultra");
     expect(markdown).toContain("The `low` and `fable-max` bindings are unchanged");
     expect(markdown).not.toContain("every explicit preset selection use the Sol mapping");
-    expect(markdown).toContain("sessions already bound to historical contract 2 keep their exact Astra model and effort");
-    expect(html).toContain("sessions already bound to historical contract 2 keep their exact Astra model and effort");
+    expect(markdown).toContain("sessions already bound to contract 1 keep their exact Sol model and effort");
+    expect(html).toContain("sessions already bound to contract 1 keep their exact Sol model and effort");
     expect(markdown).not.toContain("session start personal --provider codex --preset high");
   });
 

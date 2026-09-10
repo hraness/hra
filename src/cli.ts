@@ -198,7 +198,6 @@ import { SessionEventCursorCodec } from "./daemon/session-event-cursor";
 import { CommandFailure, OompaService } from "./daemon/service";
 import { AccountUsagePoller } from "./daemon/usage-poller";
 import { UsageHistoryCursorCodec } from "./daemon/usage-history-cursor";
-import { ExactChatGptBundlePort, LocalDesktopSwitchPort, PidBoundDesktopAccountRuntime } from "./desktop/index";
 import {
   assertInstallationHome,
   createProductionInstallation,
@@ -3938,17 +3937,6 @@ async function runDaemonLifecycle(
       cloudAdapter.bindMemorySummarySource(async ({ devicePublicId, signal }) =>
         await memorySummary.read({ devicePublicId, signal }));
     }
-    const desktop = process.platform === "darwin" && installation.desktopSwitching
-      ? (() => {
-          const bundle = new ExactChatGptBundlePort("/Applications/ChatGPT.app");
-          return new LocalDesktopSwitchPort({
-            paths,
-            store: activeStore,
-            runtime: new PidBoundDesktopAccountRuntime({ codex, bundle }),
-            bundle,
-          });
-        })()
-      : undefined;
     const { service: activeService, executeAuthenticatedLocal } = OompaService.createLocalComposition({
       store: activeStore,
       paths,
@@ -3976,7 +3964,6 @@ async function runDaemonLifecycle(
       proseResponder: new AiGatewayProseResponder({
         readKey: async () => await gatewayKeys.read(),
       }),
-      ...(desktop === undefined ? {} : { desktop }),
       requestStop,
     });
     serviceReference.current = activeService;
@@ -6505,7 +6492,6 @@ export async function main(
     const replayableLocalMutation = invocation?.kind === "command"
       && (
         invocation.command.kind === "account.logout"
-        || invocation.command.kind === "account.switch"
         || invocation.command.kind === "usage.auto.set"
         || invocation.command.kind === "session.start"
         || invocation.command.kind === "session.send"

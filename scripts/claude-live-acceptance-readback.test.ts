@@ -586,15 +586,24 @@ describe("independent Claude private readback", () => {
     expect(scope).not.toHaveProperty("soleRemember");
   });
 
-  test("lost-start scope refuses foreign key/profile/project, extra fields, and changed generation", async () => {
-    const f = await startOnlyFixture(); const started = f.apply();
-    const otherProfile = f.store.createProfile("Other scope");
-    await mkdir(join(f.paths.root, "other-project"), { mode: 0o700 });
-    const otherProject = await f.store.createProject("Other project", join(f.paths.root, "other-project"), false);
-    for (const input of [{ ...f.input, startIdempotencyKey: randomUUID() },
-      { ...f.input, profileId: otherProfile.id }, { ...f.input, projectId: otherProject.id }, { ...f.input, extra: true }]) {
+  test.each(["foreign key", "foreign profile", "foreign project", "extra fields"] as const)(
+    "lost-start scope refuses %s", async (mismatch) => {
+      const f = await startOnlyFixture(); f.apply();
+      const otherProfile = f.store.createProfile("Other scope");
+      await mkdir(join(f.paths.root, "other-project"), { mode: 0o700 });
+      const otherProject = await f.store.createProject("Other project", join(f.paths.root, "other-project"), false);
+      const input = {
+        "foreign key": { ...f.input, startIdempotencyKey: randomUUID() },
+        "foreign profile": { ...f.input, profileId: otherProfile.id },
+        "foreign project": { ...f.input, projectId: otherProject.id },
+        "extra fields": { ...f.input, extra: true },
+      }[mismatch];
       await expect(f.oracle().recoverStartedSessionScope(input)).rejects.toThrow("claude_live_acceptance_readback_refused");
-    }
+    },
+  );
+
+  test("lost-start scope refuses changed generation after process release", async () => {
+    const f = await startOnlyFixture(); const started = f.apply();
     started.release();
     f.store.advanceProviderAccountProcessGeneration({ profileId: f.profile.id, provider: "claude",
       expectedProcessGeneration: f.providerAuthority.processGeneration + 1 });

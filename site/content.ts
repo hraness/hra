@@ -421,7 +421,7 @@ export const publicContent: PublicContent = {
     pillars: [
       {
         label: "See the whole workspace",
-        summary: "A grid of sessions shows what is running and what needs your attention. Open a card to read the conversation.",
+        summary: "A grid of sessions shows what is running and what needs your attention. Read and reply inside each card.",
       },
       {
         label: "Pick up the next turn",
@@ -519,7 +519,7 @@ export const publicContent: PublicContent = {
     },
     {
       question: "Which platforms are supported?",
-      answer: [text(`The CLI requires Bun ${publicPins.bun}. Codex execution supports macOS and Linux; Claude Code execution supports Linux. The web interface can follow paired machines from a browser. ChatGPT desktop account switching is macOS-only.`)],
+      answer: [text(`The CLI requires Bun ${publicPins.bun}. Codex execution supports macOS and Linux; Claude Code execution supports Linux. The web interface can follow paired machines from a browser.`)],
     },
   ],
   maker: {
@@ -564,7 +564,7 @@ export const publicContent: PublicContent = {
       blocks: [
         { kind: "notice", label: "Candidate installation unavailable", content: [text(installNotice), text(" Read the "), link(`v${admittedReleaseVersion} installation notes`, links.admittedInstall), text(".")] },
         paragraph(
-          text(`Oompa requires Bun 1.3.14 plus curl with HTTPS and TLS 1.2 support. The CLI and local daemon support macOS and Linux. Codex effects run on both platforms; Claude Code effects run on Linux only. Oompa refuses new Claude Code effects on macOS pending authenticated isolated-Keychain and detached-read acceptance. Supported ChatGPT desktop account switching is macOS-only. Native protected-input control loads only when a terminal prompt needs it and supports the standard macOS, glibc, and x64 or arm64 musl library names. ${isAdmittedRelease(releaseVersion) ? "Install the admitted release's reviewed immutable tag, then verify the binary before initialization:" : "Only after immutable GitHub release admission, install the candidate's reviewed immutable tag, then verify the binary before initialization:"}`),
+          text(`Oompa requires Bun 1.3.14 plus curl with HTTPS and TLS 1.2 support. The CLI and local daemon support macOS and Linux. Codex effects run on both platforms; Claude Code effects run on Linux only. Oompa refuses new Claude Code effects on macOS pending authenticated isolated-Keychain and detached-read acceptance. Native protected-input control loads only when a terminal prompt needs it and supports the standard macOS, glibc, and x64 or arm64 musl library names. ${isAdmittedRelease(releaseVersion) ? "Install the admitted release's reviewed immutable tag, then verify the binary before initialization:" : "Only after immutable GitHub release admission, install the candidate's reviewed immutable tag, then verify the binary before initialization:"}`),
         ),
         {
           kind: "commands",
@@ -1006,7 +1006,7 @@ export const publicContent: PublicContent = {
           text("Each task carries an exact account ID, project ID, preset, and Fast setting. Oompa never chooses another subscription from quota, availability, usage, or incidental ordering. A provider limit blocks or fails that attempt. It does not rotate the task to another account. Explicit tasks on separate accounts may run in parallel."),
         ),
         paragraph(
-          text("Each Work also freezes the meaning of its High and Ultra routes when it is created. A fresh affected version 2 request must name the current contract 1 Sol meaning. A fresh affected version 1 request is refused because that format does not identify whether its author meant Sol or Astra; stable version 1 requests remain admissible. An existing contract 2 Work whose coordinator and participating session authorities remain supported keeps Astra for already-declared tasks and remains readable, claimable, reviewable, and settleable. A Work associated with a retired Devin session remains readable but is fenced from mutation and execution. Current tooling does not append a new High or Ultra task to a historical contract 2 Work because the alias now means Sol; create a new Work for a new Sol task graph. Low has the same exact Luna Max meaning under both contracts and remains compatible. Exact same-key replay of an already-applied version 1 or version 2 mutation returns its historical result without adding a task or provider effect. Reusing that key with another version or contract is a conflict, not a request to reinterpret the historical operation."),
+          text("Each Work also freezes the meaning of its High and Ultra routes when it is created. A fresh affected version 2 request must name the current contract 2 Astra meaning. A fresh affected version 1 request is refused because that format does not identify whether its author meant Sol or Astra; stable version 1 requests remain admissible. An existing contract 1 Work whose coordinator and participating session authorities remain supported keeps Sol for already-declared tasks and remains readable, claimable, reviewable, and settleable. A Work associated with a retired Devin session remains readable but is fenced from mutation and execution. Current tooling does not append a new High or Ultra task to a contract 1 Work because the alias now means Astra; create a new Work for a new Astra task graph. Low has the same exact Luna Max meaning under both contracts and remains compatible. Exact same-key replay of an already-applied version 1 or version 2 mutation returns its historical result without adding a task or provider effect. Reusing that key with another version or contract is a conflict, not a request to reinterpret the historical operation."),
         ),
         paragraph(
           text("Readiness is derived from the open work state, time bounds, accepted dependency submissions, and absence of a live or ambiguous attempt. A final assistant message is not completion. The worker submits a bounded structured result and evidence; declared independent reviews and Oompa-owned completion gates must accept the exact submission revision."),
@@ -1406,8 +1406,8 @@ export const publicContent: PublicContent = {
         ),
         list(
           [code("low"), text(": Codex Luna Max, currently "), code("gpt-5.6-luna"), text(" with "), code("max"), text(" reasoning.")],
-          [code("high"), text(": Codex Sol Max, currently "), code("gpt-5.6-sol"), text(" with "), code("max"), text(" reasoning.")],
-          [code("ultra"), text(": Codex Sol Ultra, currently "), code("gpt-5.6-sol"), text(" with "), code("ultra"), text(" reasoning.")],
+          [code("high"), text(": Codex Astra Max, currently "), code("gpt-6-astra"), text(" with "), code("max"), text(" reasoning.")],
+          [code("ultra"), text(": Codex Astra Ultra, currently "), code("gpt-6-astra"), text(" with "), code("ultra"), text(" reasoning.")],
           [code("fable-max"), text(": Claude Code Fable, currently "), code("claude-fable-5-1"), text(" with "), code("max"), text(" reasoning.")],
           [code("fast on|off"), text(": a Codex-only, explicit per-turn Fast or Standard overlay. Claude Code refuses Fast instead of ignoring it. A prior Fast value cannot leak into the next turn.")],
         ),
@@ -1416,11 +1416,11 @@ export const publicContent: PublicContent = {
           code("high"),
           text(" or "),
           code("ultra"),
-          text(", and explicit selections of either preset, use the Sol mapping above. The "),
+          text(", and explicit selections of either preset, use the Astra mapping above (contract 2). The "),
           code("low"),
           text(" and "),
           code("fable-max"),
-          text(" bindings are unchanged. Codex sessions already bound to historical contract 2 keep their exact Astra model and effort until a preset is explicitly selected; unrelated metadata edits, restart recovery, and queued work do not reinterpret an established session."),
+          text(" bindings are unchanged. Codex sessions already bound to contract 1 keep their exact Sol model and effort until a preset is explicitly selected; unrelated metadata edits, restart recovery, and queued work do not reinterpret an established session."),
         ),
         paragraph(
           code("oompa init"),
@@ -1452,30 +1452,6 @@ export const publicContent: PublicContent = {
         ),
         paragraph(
           text("Pinned Codex 0.153.2 has no safely separated install, enablement, and OAuth lifecycle surface: its available lifecycle path can combine installation with enablement and may then open browser authorization. Oompa therefore does not expose plugin install, enable, disable, OAuth, or permission effects. The pinned tool-suggestion form that can invoke that compound plugin or connector lifecycle is also rejected before admission. Other standard MCP forms are brokered only when their pinned schema fits Oompa's closed primitive-field contract. The interaction exposes bounded field names, types, requiredness, constraints, and allowed choices; titles, descriptions, defaults, and answers stay off the public and durable display. Protected submissions are checked for exact required fields, types, bounds, formats, choices, and the absence of additional properties before response preparation. Opaque openai/form, unsupported schema constructs, and URL elicitation fail before durable admission and receive a safe unsupported-capability response with no schema, submitted value, or URL echo. The schema-11 security migration terminalizes and replaces any prerelease URL record before interaction reads. Oompa will keep extended-form and URL handoff unavailable until each has a closed protected path."),
-        ),
-      ],
-    },
-    {
-      id: "desktop-account-switching",
-      heading: "Desktop account switching",
-      blocks: [
-        paragraph(
-          code("oompa account switch <profile>"),
-          text(" is experimental and macOS-only in the first beta. The current compatibility gate accepts only the signed OpenAI ChatGPT application at "),
-          code("/Applications/ChatGPT.app"),
-          text(" with reviewed version, build, CDHash, and isolated-profile launch hooks. Unsupported or changed bundles fail before quit."),
-        ),
-        paragraph(
-          text("A switch requires a signed-in target with a verified provider email, takes one machine-global lock, rejects multiple exact app processes, and refuses an unsettled earlier switch. It journals the target generation, gracefully quits the exact process, waits for exit, relaunches once with the target's isolated Codex and desktop-data roots, and binds read-only account verification to that launched PID, executable, CDHash, and environment."),
-        ),
-        paragraph(
-          text("The experimental desktop switch never copies "),
-          code("auth.json"),
-          text(", swaps one token, changes Keychain blindly, responds to a provider limit, or retries an uncertain switch. An uncertain quit, transition, or relaunch becomes "),
-          code("recovery_required"),
-          text(" and preserves both profiles. Run "),
-          code("oompa account switch-recover"),
-          text(" to reconcile only the current attempt. Recovery performs bounded read-only bundle, process, environment, and account observations; it never quits or launches the app. It releases the switch authority only when those observations prove the target account is active or prove that no target instance remains."),
         ),
       ],
     },
@@ -1596,8 +1572,6 @@ export const publicContent: PublicContent = {
             "oompa account show <profile> --provider devin  (retired local history and cleanup only)",
             "oompa account usage [profile] [--refresh]",
             "oompa account usage-history <profile> [--from <UTC-RFC3339>] [--through <UTC-RFC3339>] [--limit <1..100>] [--cursor <cursor>]",
-            "oompa account switch <profile>",
-            "oompa account switch-recover",
             "oompa plugin list <account> [--project <project>] [--refresh]",
             "oompa plugin show <account> <plugin> [--project <project>] [--refresh]",
             "oompa project add --path <directory> [--name <name>]",
@@ -1703,7 +1677,7 @@ export const publicContent: PublicContent = {
           code("--preset high --preset-contract 1"),
           text("; v0.5.0 High and Ultra both meant Sol. Use "),
           code("--preset-contract 2"),
-          text(" only for an untagged Astra-era request whose original runtime evidence actually meant Astra. Neither selector can resume a contractless prepared row. Contract 2 cannot authorize a fresh effect under the current Sol binding; contract 1 can authorize the exact Sol request when the key has no stored row, just as a newly generated key can. If the originating meaning cannot be proved, use the retained old release rather than guessing. A contractless prepared row has no supported cancellation or retirement command. It must reach a terminal settlement through exact replay under the originating release, or the update remains blocked. Do not use a fresh key or "),
+          text(" for an untagged Astra-era request whose original runtime evidence actually meant Astra. Neither selector can resume a contractless prepared row. Contract 1 cannot authorize a fresh effect under the current Astra binding; contract 2 can authorize the exact Astra request when the key has no stored row, just as a newly generated key can. If the originating meaning cannot be proved, use the retained old release rather than guessing. A contractless prepared row has no supported cancellation or retirement command. It must reach a terminal settlement through exact replay under the originating release, or the update remains blocked. Do not use a fresh key or "),
           code("session abandon"),
           text(" as a workaround; that command applies only to an existing recovery-required session and never cancels prepared start or switch authority. "),
           code("session preset"),

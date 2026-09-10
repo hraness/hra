@@ -29,6 +29,7 @@ const convexClient = {
 
 await mock.module("convex/react", () => ({
   useConvex: () => convexClient,
+  useQueries: () => ({}),
   usePaginatedQuery: () => ({
     loadMore: () => undefined,
     results: [],

@@ -343,6 +343,10 @@ export const renderDocsHtml = (
 ): string => {
   const content = publicContent;
   const reference = docsReferenceSections(page);
+  // Published fragments remain navigable when a reference changes guide owner.
+  const movedReferenceIds = page.path === "/docs/" ? ["project"]
+    : page.path === "/docs/sessions/" ? ["first-account", "first-session"] : [];
+  const movedReferences = movedReferenceIds.map((id) => findSection(content, id));
   const nav = docsPages.map((item) => `<a class="${docsClasses("navLink")}" data-doc-search="${escapeHtml([item.title, item.description, ...item.keywords, ...item.sections.map(({ heading }) => heading)].join(" "))}" href="${item.path}"${item.path === page.path ? ' aria-current="page"' : ""}>${escapeHtml(docsLabel(item))}</a>`).join("");
   const sections = [...page.sections, ...reference];
   return `<!doctype html>
@@ -366,6 +370,7 @@ ${renderMarketingHeader(content, page.path)}
   ${page.previewId === undefined ? "" : renderProductPreview(page.previewId, "docs-preview")}
   ${page.sections.map((section) => `<section class="${docsClasses("section")}" id="${escapeHtml(section.id)}" aria-labelledby="${escapeHtml(section.id)}-heading"><h2 id="${escapeHtml(section.id)}-heading">${escapeHtml(section.heading)}</h2>${section.blocks.map((block, index) => renderBlock(block, section.id, index, "h3", "heroNotes")).join("\n")}</section>`).join("\n")}
   ${reference.length === 0 ? "" : `<section class="${docsClasses("reference")}" aria-label="Detailed reference"><h2>Detailed reference</h2><p>Exact commands, recovery steps, and compatibility details for this guide.</p>${reference.map((section) => `<details class="${docsClasses("details")}" id="${escapeHtml(section.id)}"><summary>${escapeHtml(section.heading)}</summary><div class="${docsClasses("detailBody")}">${section.blocks.map((block, index) => renderBlock(block, section.id, index, "h3", "heroNotes")).join("\n")}</div></details>`).join("\n")}</section>`}
+  ${movedReferences.length === 0 ? "" : `<details class="${docsClasses("legacyLinks")}"><summary>Moved reference sections</summary><nav aria-label="Moved reference sections">${movedReferences.map((section) => `<p id="${escapeHtml(section.id)}"><a data-moved-section="${escapeHtml(section.id)}" href="${escapeHtml(docsPathForSection(section.id))}">${escapeHtml(section.heading)} →</a></p>`).join("")}</nav></details>`}
   <nav class="${docsClasses("related")}" aria-label="Continue reading">${page.related.map((item) => `<a class="${docsClasses("relatedLink")}" href="${escapeHtml(item.path)}">${escapeHtml(item.label)} →</a>`).join("")}</nav>
 </main></div>
 ${renderAskAiAboutThis(`${content.siteUrl}${page.path}`)}

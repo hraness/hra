@@ -220,6 +220,8 @@ A project is a named canonical directory, not a Git repository. It may contain s
 
 ### Desktop application switching
 
+Removed on 2026-09-10 (`kb/plans/oompa-app-simplification.md`, Phase 5); the journal tables remain as retained history. The text below is the original design record.
+
 `oompa account switch <account>` is an explicit machine mutation with one global lock. It must:
 
 1. prove the exact supported desktop application and current profile authority;

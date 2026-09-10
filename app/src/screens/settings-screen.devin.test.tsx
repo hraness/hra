@@ -12,6 +12,7 @@ await mock.module("../custody/custody-context", () => ({
   useCustody: () => ({ lock: () => undefined }),
 }));
 
+await mock.module("../components/usage-breakdown", () => ({ UsageBreakdown: () => null }));
 await mock.module("../data/archived-sessions", () => ({
   useArchivedSessions: () => [
     {

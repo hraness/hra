@@ -103,8 +103,8 @@ describe("public server marketing composition", () => {
       .toContain(publicContent.daemonRolloutNotice);
     const firstSession = findSection(publicContent, "first-session").blocks.find((block) => block.kind === "commands");
     if (firstSession?.kind !== "commands") throw new Error("Missing public first-session commands.");
-    const sessions = guideDocument("/docs/sessions/");
-    expect([...sessions.querySelectorAll("#first-session pre")].map((node) => node.textContent))
+    const firstSessionGuide = guideDocument("/docs/start/");
+    expect([...firstSessionGuide.querySelectorAll("#first-session pre")].map((node) => node.textContent))
       .toContain(firstSession.commands.join("\n"));
     expect([...document.querySelectorAll(".hraness-marketing-flow__code")].map((node) => node.textContent))
       .toEqual(publicContent.hero.steps.map((step) => step.command));
