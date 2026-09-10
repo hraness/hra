@@ -37,7 +37,7 @@ describe("local-efficiency doctor", () => {
           codexHome: join(root, "codex"),
           json: true,
         },
-        { OOMPA_ATET_HOST_RESOURCES_MODULE: modulePath },
+        { OOMPA_SLOPCAMERA_HOST_RESOURCES_MODULE: modulePath },
       );
       expect(report.ok).toBe(false);
       expect(report.version).toBe(3);

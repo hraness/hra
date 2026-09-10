@@ -403,7 +403,7 @@ export function GridScreen({
       : sessionStartTargetHint(startTarget)
     : steerTarget === null
       ? "Nothing to send to yet."
-      : `Steers ${steerTarget.title}. Clear the selection to start a new session.`;
+      : `Sends to ${steerTarget.title}. Clear the selection to start a new session.`;
 
   return (
     <div {...stylex.props(gridScreenStyles.root)}>
@@ -448,11 +448,11 @@ export function GridScreen({
               </Button>
             )}
             <Input
-              aria-label="Start a new session"
+              aria-label={starting ? "Start a new session" : "Send a follow-up"}
               disabled={starting ? startTarget === null : steerTarget === null}
               onChange={(event) => { setMessage(event.target.value); }}
               onPaste={starting ? undefined : attach.onPaste}
-              placeholder="Start a new session"
+              placeholder={starting ? "Start a new session" : "Send a follow-up"}
               value={message}
             />
             <Button disabled={!canSubmit} type="submit">
@@ -529,11 +529,15 @@ export function GridScreen({
 
       <main {...stylex.props(gridScreenStyles.main)}>
         {isLoading && heads.length === 0 ? (
-          <p {...stylex.props(gridScreenStyles.quietBody)}>Loading sessions.</p>
+          <p {...stylex.props(gridScreenStyles.quietBody)} role="status">Loading sessions.</p>
         ) : null}
         {!isLoading && heads.length === 0 ? (
           <p {...stylex.props(gridScreenStyles.quietBody)}>
-            No sessions yet. Type a prompt above to start one on a machine.
+            {!starting
+              ? "No sessions are available for a follow-up. Check your machines and accounts in Settings."
+              : startTarget === null || project === null
+                ? "No sessions yet. Check your machines and accounts in Settings before starting a session."
+                : "No sessions yet. Type a prompt above to start one on a machine."}
           </p>
         ) : null}
         <div {...stylex.props(gridScreenStyles.cardGrid)}>

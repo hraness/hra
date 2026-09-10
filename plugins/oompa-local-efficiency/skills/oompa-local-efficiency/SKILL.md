@@ -63,9 +63,11 @@ preserving sandbox, provider, repository, and release gates.
 
 Run scripts from the installed skill directory when the convenience commands
 are unavailable. `bootstrap.ts` installs or refreshes those commands under the
-user's Bun bin directory. It verifies a minimal pinned Atet host-resource
-runtime in the user's local data directory; it never replaces a global Atet
-package or command.
+user's Bun bin directory. It verifies a minimal pinned Slopcamera host-resource
+runtime in a source-commit-specific directory under the user's local data directory;
+it never replaces a global Slopcamera package or command. Runtime upgrades keep
+the existing HRA state root, profile IDs and inherited lease protocol. Do not
+move or rewrite a live scheduler ledger to match a runtime's product name.
 
 This plugin was previously named `hra-local-efficiency`. `bootstrap.ts --apply`
 migrates that installation in place: it replaces exactly one well-formed
@@ -178,7 +180,7 @@ sharing the weighted compute capacity. A nested wrapper must be covered by the
 outer lane; choose the top-level lane correctly instead of escalating it inside
 an existing lease.
 
-For an indivisible aggregate that requires macOS, such as Atet `bun run check`,
+For an indivisible aggregate that requires macOS, such as Slopcamera `bun run check`,
 use `exclusive` mode on `mac-native` when its Chromium work is an owned fixture
 with a fresh profile and loopback server. Exclusive reserves all common compute
 capacity. This mapping admits no personal authenticated browser, shared fixed

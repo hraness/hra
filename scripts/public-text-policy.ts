@@ -23,6 +23,7 @@ const allowedPublicScopedPackages = new Set([
   "@anthropic-ai/claude-code",
   "@anthropic-ai/claude-code-darwin-arm64",
   "@babel/core",
+  // Historical public commit patches retain this exact predecessor package.
   "@hraness/atet",
   "@hraness/design-kit",
   "@hraness/direct",
@@ -31,6 +32,7 @@ const allowedPublicScopedPackages = new Set([
   "@hraness/oompa",
   "@hraness/posthog",
   "@hraness/site-footer",
+  "@hraness/slopcamera",
   "@hraness/ui",
   "@stylexjs/babel-plugin",
   "@stylexjs/stylex",

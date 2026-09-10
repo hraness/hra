@@ -530,7 +530,7 @@ export const selectReviewedGitHistoryPatchEvidence = (
   });
 };
 
-type ReviewedSyntheticPackageFixture = "other_ui" | "foreign_package";
+type ReviewedSyntheticPackageFixture = "other_ui" | "foreign_package" | "slopcamera_suffix";
 type ReviewedSyntheticPackageEvidence = Readonly<{
   fixtures: readonly ReviewedSyntheticPackageFixture[];
   patchSha256: string;
@@ -559,10 +559,19 @@ const reviewedSyntheticPackageHistoryEvidence: Readonly<Record<string, ReviewedS
     fixtures: Object.freeze(["other_ui"] as const),
     patchSha256: "6fc0a85da146a9a0ffc2b3f3407481e6e966e907e99db03e41a7dabb6d3bb749",
   }),
+  "47c8e1cf98eb61441b1fc6832eb6ae035d75278a": Object.freeze({
+    fixtures: Object.freeze(["slopcamera_suffix"] as const),
+    patchSha256: "e5ac6ac289bf4e93818d13ababd2eb965ef4b1e054fe7b85f0631b145692baf2",
+  }),
+  e6d707ed88d1cc93ed4ba5b30a940e7ed3a55e20: Object.freeze({
+    fixtures: Object.freeze(["slopcamera_suffix"] as const),
+    patchSha256: "2c3a452f10ae857876538ec8cf76c27fdddf458f92e344465ff042aa6f3a09a2",
+  }),
 });
 const reviewedSyntheticPackageTokens: Readonly<Record<ReviewedSyntheticPackageFixture, string>> = Object.freeze({
   other_ui: ["@other", "ui"].join("/"),
   foreign_package: ["@foreign", "package"].join("/"),
+  slopcamera_suffix: ["@hraness/slopcamera", "unreviewed"].join("-"),
 });
 
 export const selectReviewedGitHistoryPackageEvidence = (
