@@ -11,6 +11,8 @@ import { isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { performance } from "node:perf_hooks";
 
+import { slopcameraRuntimeDirectory } from "./runtime-pin";
+
 import {
   commandProgramLabel,
   containsControlCharacters,
@@ -174,7 +176,7 @@ export function resolveCapabilityStateRoot(hostResourceStateRoot: string): strin
   return join(resolve(hostResourceStateRoot, ".."), "capabilities-v1");
 }
 
-export function resolveAtetRuntimeRoot(
+export function resolveSlopcameraRuntimeRoot(
   environment: Readonly<NodeJS.ProcessEnv> = process.env,
   userHome = homedir(),
 ): string {
@@ -186,31 +188,31 @@ export function resolveAtetRuntimeRoot(
   const xdgData = environment.XDG_DATA_HOME;
   if (xdgData !== undefined && xdgData !== "") {
     if (!isAbsolute(xdgData)) throw new Error("XDG_DATA_HOME must be absolute");
-    return join(resolve(xdgData), "hra-local-efficiency", "runtime", "atet-v2.0.0");
+    return join(resolve(xdgData), "hra-local-efficiency", "runtime", slopcameraRuntimeDirectory);
   }
-  return join(resolve(userHome), ".local", "share", "hra-local-efficiency", "runtime", "atet-v2.0.0");
+  return join(resolve(userHome), ".local", "share", "hra-local-efficiency", "runtime", slopcameraRuntimeDirectory);
 }
 
-function atetCandidates(
+function slopcameraCandidates(
   environment: Readonly<NodeJS.ProcessEnv>,
   userHome = homedir(),
 ): string[] {
-  const configured = environment.HRA_ATET_HOST_RESOURCES_MODULE;
+  const configured = environment.HRA_SLOPCAMERA_HOST_RESOURCES_MODULE;
   return [
     ...(configured === undefined || configured === "" ? [] : [configured]),
-    join(resolveAtetRuntimeRoot(environment, userHome), "host-resources.js"),
+    join(resolveSlopcameraRuntimeRoot(environment, userHome), "host-resources.js"),
   ].map((candidate) => resolve(candidate));
 }
 
-export function resolveAtetHostResourceModule(
+export function resolveSlopcameraHostResourceModule(
   environment: Readonly<NodeJS.ProcessEnv> = process.env,
   userHome = homedir(),
 ): string {
-  const path = atetCandidates(environment, userHome)
+  const path = slopcameraCandidates(environment, userHome)
     .find((candidate) => existsSync(candidate));
   if (path === undefined) {
     throw new Error(
-      "the private Atet host-resource runtime is unavailable; run the hra-local-efficiency bootstrap",
+      "the private Slopcamera host-resource runtime is unavailable; run the hra-local-efficiency bootstrap",
     );
   }
   return path;
@@ -219,14 +221,14 @@ export function resolveAtetHostResourceModule(
 async function hostResourceModule(
   environment: Readonly<NodeJS.ProcessEnv>,
 ): Promise<HostResourceModule> {
-  const loaded: unknown = await import(pathToFileURL(resolveAtetHostResourceModule(environment)).href);
+  const loaded: unknown = await import(pathToFileURL(resolveSlopcameraHostResourceModule(environment)).href);
   if (
     typeof loaded !== "object"
     || loaded === null
     || !("createHostResourceCoordinator" in loaded)
     || typeof loaded.createHostResourceCoordinator !== "function"
   ) {
-    throw new Error("the installed Atet host-resource module is incompatible");
+    throw new Error("the installed Slopcamera host-resource module is incompatible");
   }
   return { createHostResourceCoordinator: loaded.createHostResourceCoordinator as HostResourceModule["createHostResourceCoordinator"] };
 }

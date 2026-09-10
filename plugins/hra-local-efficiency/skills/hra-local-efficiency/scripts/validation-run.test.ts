@@ -65,7 +65,7 @@ function validationEnvironment(): NodeJS.ProcessEnv {
   `);
   const environment: NodeJS.ProcessEnv = {
     ...process.env,
-    HRA_ATET_HOST_RESOURCES_MODULE: modulePath,
+    HRA_SLOPCAMERA_HOST_RESOURCES_MODULE: modulePath,
     HRA_LOCAL_EFFICIENCY_STATE_ROOT: join(root, "state", "host-resources-v1"),
     HRA_LOCAL_EFFICIENCY_TELEMETRY: "off",
   };

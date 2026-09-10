@@ -41,6 +41,7 @@ describe("reviewed historical synthetic package fixtures", () => {
   const fixtures = [
     { fixture: "other_ui", token: ["@other", "ui"].join("/") },
     { fixture: "foreign_package", token: ["@foreign", "package"].join("/") },
+    { fixture: "slopcamera_suffix", token: ["@hraness/slopcamera", "unreviewed"].join("-") },
   ] as const;
   const digest = (value: string): string => createHash("sha256").update(value, "utf8").digest("hex");
   const expected = [
@@ -54,6 +55,10 @@ describe("reviewed historical synthetic package fixtures", () => {
       patchSha256: "5d7b62c01ac47c3c74389d21b288c4526728c74d68d23c18719b00df09537ef4" },
     { commit: "21176e6ca34e58574376f54a9098856a90d6cd56", fixtures: ["other_ui"],
       patchSha256: "6fc0a85da146a9a0ffc2b3f3407481e6e966e907e99db03e41a7dabb6d3bb749" },
+    { commit: "47c8e1cf98eb61441b1fc6832eb6ae035d75278a", fixtures: ["slopcamera_suffix"],
+      patchSha256: "e5ac6ac289bf4e93818d13ababd2eb965ef4b1e054fe7b85f0631b145692baf2" },
+    { commit: "e6d707ed88d1cc93ed4ba5b30a940e7ed3a55e20", fixtures: ["slopcamera_suffix"],
+      patchSha256: "2c3a452f10ae857876538ec8cf76c27fdddf458f92e344465ff042aa6f3a09a2" },
   ] as const;
 
   test("binds the exact public-patch inventory without requiring branch ancestors in a squash clone", async () => {
@@ -102,8 +107,9 @@ describe("reviewed historical synthetic package fixtures", () => {
           .toThrow("synthetic-package evidence changed");
       }
     }
-    const patch = fixtures.map(({ token }) => `- "${token}"\n`).join("");
-    expect(normalizeReviewedSyntheticPackagePatch(patch, digest(patch), fixtures.map(({ fixture }) => fixture)))
+    const pairedFixtures = fixtures.slice(0, 2);
+    const patch = pairedFixtures.map(({ token }) => `- "${token}"\n`).join("");
+    expect(normalizeReviewedSyntheticPackagePatch(patch, digest(patch), pairedFixtures.map(({ fixture }) => fixture)))
       .toBe('- "[reviewed-synthetic-package]"\n- "[reviewed-synthetic-package]"\n');
     for (const selection of [[], ["other_ui", "other_ui"], ["other_ui", "foreign_package", "other_ui"]] as const) {
       expect(() => normalizeReviewedSyntheticPackagePatch(patch, digest(patch), selection))

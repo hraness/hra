@@ -20,11 +20,12 @@ import {
   permissionBoundaryDenied,
   permitCapacity,
   permitsForMode,
-  resolveAtetHostResourceModule,
-  resolveAtetRuntimeRoot,
+  resolveSlopcameraHostResourceModule,
+  resolveSlopcameraRuntimeRoot,
   resolveCapabilityStateRoot,
   resolveHostResourceStateRoot,
 } from "./host-run";
+import { slopcameraRuntimeDirectory } from "./runtime-pin";
 
 describe("host-wide resource wrapper", () => {
   test("uses the established 1/2/all weighted model", () => {
@@ -94,14 +95,14 @@ describe("host-wide resource wrapper", () => {
       { CODEX_HOME: "/profiles/three", XDG_STATE_HOME: "/state" },
       "/opt/tester",
     )).toBe("/state/hra-local-efficiency/host-resources-v1");
-    expect(resolveAtetRuntimeRoot(
+    expect(resolveSlopcameraRuntimeRoot(
       { CODEX_HOME: "/profiles/one" },
       "/opt/tester",
-    )).toBe("/opt/tester/.local/share/hra-local-efficiency/runtime/atet-v2.0.0");
-    expect(resolveAtetRuntimeRoot(
+    )).toBe(`/opt/tester/.local/share/hra-local-efficiency/runtime/${slopcameraRuntimeDirectory}`);
+    expect(resolveSlopcameraRuntimeRoot(
       { CODEX_HOME: "/profiles/two" },
       "/opt/tester",
-    )).toBe(resolveAtetRuntimeRoot({}, "/opt/tester"));
+    )).toBe(resolveSlopcameraRuntimeRoot({}, "/opt/tester"));
   });
 
   test("requires macOS for the mac-native lane", () => {
@@ -145,9 +146,9 @@ describe("host-wide resource wrapper", () => {
     expect(() => parseInheritedLease("not-json")).toThrow("malformed");
   });
 
-  test("accepts an explicit Atet module path for isolated installations", () => {
-    const modulePath = resolveAtetHostResourceModule(
-      { HRA_ATET_HOST_RESOURCES_MODULE: import.meta.path },
+  test("accepts an explicit Slopcamera module path for isolated installations", () => {
+    const modulePath = resolveSlopcameraHostResourceModule(
+      { HRA_SLOPCAMERA_HOST_RESOURCES_MODULE: import.meta.path },
       "/nonexistent-home",
     );
     expect(modulePath).toBe(import.meta.path);
@@ -193,7 +194,7 @@ describe("host-wide resource wrapper", () => {
       cwd: root,
       env: {
         ...process.env,
-        HRA_ATET_HOST_RESOURCES_MODULE: "/missing/atet-module.js",
+        HRA_SLOPCAMERA_HOST_RESOURCES_MODULE: "/missing/slopcamera-module.js",
         HRA_LOCAL_EFFICIENCY_LEASE: JSON.stringify({
           capacity: permitCapacity(),
           label: "forged",
@@ -269,7 +270,7 @@ describe("host-wide resource wrapper", () => {
         cwd: root,
         env: {
           ...environment,
-          HRA_ATET_HOST_RESOURCES_MODULE: modulePath,
+          HRA_SLOPCAMERA_HOST_RESOURCES_MODULE: modulePath,
           HRA_LOCAL_EFFICIENCY_STATE_ROOT: join(root, "state", "host-resources-v1"),
           HRA_LOCAL_EFFICIENCY_TELEMETRY: "off",
         },
@@ -323,7 +324,7 @@ describe("host-wide resource wrapper", () => {
         cwd: root,
         env: {
           ...environment,
-          HRA_ATET_HOST_RESOURCES_MODULE: modulePath,
+          HRA_SLOPCAMERA_HOST_RESOURCES_MODULE: modulePath,
           HRA_LOCAL_EFFICIENCY_STATE_ROOT: join(root, "state", "host-resources-v1"),
         },
         stderr: "pipe",
@@ -393,7 +394,7 @@ describe("host-wide resource wrapper", () => {
         cwd: root,
         env: {
           ...environment,
-          HRA_ATET_HOST_RESOURCES_MODULE: modulePath,
+          HRA_SLOPCAMERA_HOST_RESOURCES_MODULE: modulePath,
           HRA_LOCAL_EFFICIENCY_STATE_ROOT: join(root, "state", "host-resources-v1"),
           HRA_LOCAL_EFFICIENCY_TELEMETRY: "off",
         },
@@ -458,7 +459,7 @@ describe("host-wide resource wrapper", () => {
       cwd: root,
       env: {
         ...environment,
-        HRA_ATET_HOST_RESOURCES_MODULE: modulePath,
+        HRA_SLOPCAMERA_HOST_RESOURCES_MODULE: modulePath,
         HRA_LOCAL_EFFICIENCY_STATE_ROOT: join(root, "state", "host-resources-v1"),
         HRA_LOCAL_EFFICIENCY_TELEMETRY: "off",
       },
@@ -530,7 +531,7 @@ describe("host-wide resource wrapper", () => {
       cwd: root,
       env: {
         ...environment,
-        HRA_ATET_HOST_RESOURCES_MODULE: modulePath,
+        HRA_SLOPCAMERA_HOST_RESOURCES_MODULE: modulePath,
         HRA_LOCAL_EFFICIENCY_STATE_ROOT: join(root, "state", "host-resources-v1"),
         HRA_LOCAL_EFFICIENCY_TELEMETRY: "off",
       },
@@ -585,7 +586,7 @@ describe("host-wide resource wrapper", () => {
         cwd: root,
         env: {
           ...environment,
-          HRA_ATET_HOST_RESOURCES_MODULE: modulePath,
+          HRA_SLOPCAMERA_HOST_RESOURCES_MODULE: modulePath,
           HRA_LOCAL_EFFICIENCY_STATE_ROOT: join(root, "state"),
         },
         stderr: "pipe",

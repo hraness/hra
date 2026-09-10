@@ -9,7 +9,7 @@ import {
   type BootstrapOptions,
   type ClaudeAutoModeCapability,
 } from "./bootstrap";
-import { resolveAtetRuntimeRoot } from "./host-run";
+import { resolveSlopcameraRuntimeRoot } from "./host-run";
 import { resolvedBunBin, resolvedCodexHome } from "./shared";
 
 export type DoctorOptions = {
@@ -71,7 +71,7 @@ export function doctorReport(
     codexHome: options.codexHome,
     installDependency: false,
     mode: "check",
-    runtimeRoot: resolveAtetRuntimeRoot(environment),
+    runtimeRoot: resolveSlopcameraRuntimeRoot(environment),
   };
   let failures: readonly string[];
   try {

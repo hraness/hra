@@ -113,3 +113,26 @@ The bootstrap and audits are local operations. The read-only workspace audit rep
 When a repository is already in scope for a change, check its managed baseline and refresh drift with `scripts/repo-adoption.ts` in the same task-owned change and existing final gate, preserving unmanaged rules; do not open a separate rollout solely to repeat expensive checks.
 
 Session silence remains a review heuristic. The audit never writes the Codex database or infers completion from inactivity or support-task metadata. Verify terminal task state through the app, then archive a conclusively finished task so the app can snapshot and reclaim its managed checkout. Permanent worktrees and other registered checkouts still require the separate explicit cleanup operation with every approved absolute path.
+
+## Scheduler runtime identity
+
+Plugin 0.4.4 adopts the Slopcamera runtime name and an immutable source pin.
+The existing HRA ledger and inherited lease identities remain unchanged.
+
+The local plugin retains a minimal, checksum-verified Slopcamera host-resource
+module at an immutable source commit. The runtime cache directory includes that
+commit. This cache is separate from HRA's stable resource and capability ledgers.
+HRA passes its own state roots and profile IDs explicitly, so an upstream default
+namespace change does not create another HRA admission domain.
+
+Before changing the pin, qualify both library directions with the opt-in
+`host-runtime-compatibility.process.test.ts` against isolated temporary state.
+Set `HRA_PREVIOUS_HOST_RESOURCES_MODULE` and `HRA_SLOPCAMERA_HOST_RESOURCES_MODULE`
+to exact verified module files and use the installed host scheduler. The test
+proves an admitted holder excludes the other library until release, then verifies
+its later ticket, identical profile hash and complete lease cleanup. Ordinary
+tests skip this native qualification when those inputs are absent.
+
+A source change does not activate the installed plugin. Upgrade through the
+normal marketplace/bootstrap path after admission; never rewrite an active
+installed module or move live ledger files by hand.
