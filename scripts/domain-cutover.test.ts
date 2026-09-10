@@ -392,6 +392,21 @@ const immediateClock = () => {
 };
 
 describe("domain cutover runbook", () => {
+  test("bounds production-only scripts and preserves page-specific controllers", async () => {
+    const runbook = await readFile(
+      join(import.meta.dir, "..", "docs", "domain-cutover.md"),
+      "utf8",
+    );
+    expect(runbook).toContain("unconfigured local build omits the mailing footer's Turnstile script");
+    expect(runbook).toContain("Validate exactly the script emitted by the pinned `@hraness/site-footer`");
+    expect(runbook).toContain("one occurrence on each navigable page and none on `/preview/`");
+    expect(runbook).toContain("do not exempt arbitrary third-party scripts");
+    expect(runbook).toContain("Preserve exact owned stylesheet and script references");
+    expect(runbook).toContain("homepage and six documentation pages load `/site.js`");
+    expect(runbook).toContain("`/privacy/` uses `/appearance.js` without `/site.js`");
+    expect(runbook).toContain("`/preview/` remains inert");
+  });
+
   test("pins current provider authority and retired identities as one-way tombstones", async () => {
     const runbook = await readFile(
       join(import.meta.dir, "..", "docs", "domain-cutover.md"),

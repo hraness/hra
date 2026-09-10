@@ -92,7 +92,7 @@
     "redactCompleteSensitiveText": 1
   },
   "src/daemon/service.ts": {
-    "assertCurrent": 101
+    "assertCurrent": 102
   },
   "src/daemon/session-event-cursor.ts": {
     "timingSafeEqual": 1

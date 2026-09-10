@@ -15,7 +15,7 @@ import type {
   PinnedClaudeRuntime,
 } from "../claude/index";
 import { ClaudeDeltaAssembler } from "../claude/assembler";
-import { ClaudeError } from "../claude/errors";
+import { ClaudeError, IndeterminateClaudeEffectError } from "../claude/errors";
 import { CLAUDE_PIN, CLAUDE_PIN_EFFORT, CLAUDE_PIN_MODEL, CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY } from "../claude/pin";
 import { presetRequirements, PresetProviderMismatchError } from "../domain/presets";
 import {
@@ -67,7 +67,8 @@ class FakeClaudeProcess implements ClaudeProcess {
   readonly #ignoreTerm: boolean;
   readonly #ignoreKill: boolean;
   onTerminate: (() => void) | undefined;
-  onWrite: (() => void) | undefined;
+  onWrite: (() => void | Promise<void>) | undefined;
+  afterStdoutChunkRead: (() => void) | undefined;
   #push: ((chunk: Uint8Array) => void) | undefined;
   #finish: (() => void) | undefined;
   #resolveExit: ((code: number) => void) | undefined;
@@ -89,11 +90,12 @@ class FakeClaudeProcess implements ClaudeProcess {
     let done = false;
     this.#push = (chunk) => { queue.push(chunk); waiter?.(); waiter = undefined; };
     this.#finish = () => { done = true; waiter?.(); waiter = undefined; };
+    const chunkRead = (): void => { this.afterStdoutChunkRead?.(); };
     this.stdout = {
       async *[Symbol.asyncIterator]() {
         for (;;) {
           const chunk = queue.shift();
-          if (chunk !== undefined) { yield chunk; continue; }
+          if (chunk !== undefined) { yield chunk; chunkRead(); continue; }
           if (done) return;
           await new Promise<void>((resolve) => { waiter = resolve; });
         }
@@ -107,7 +109,8 @@ class FakeClaudeProcess implements ClaudeProcess {
 
   async write(bytes: Uint8Array): Promise<void> {
     this.written.push(new TextDecoder().decode(bytes));
-    this.onWrite?.();
+    const pending = this.onWrite?.();
+    if (pending !== undefined) await pending;
   }
 
   endOutput(): void {
@@ -397,6 +400,25 @@ const startTurn = async (
     signal: signal(),
   });
   return turn.turnId;
+};
+
+const expectFencedClaudeWrite = async (
+  manager: PinnedClaudeRuntimeManager,
+  providerThreadId: string,
+  process: FakeClaudeProcess,
+): Promise<void> => {
+  // A frame fence is not invented process exit: truthful local projection
+  // remains readable, but neither a fresh turn nor a correctly targeted steer
+  // may cross that same process's writer again.
+  const projection = await manager.readSession({ authority, providerThreadId, detail: false, signal: signal() });
+  const writes = [...process.written];
+  await expect(projection.activeTurnId === undefined
+    ? startTurn(manager, providerThreadId, "A fresh key cannot reopen the writer")
+    : manager.steer({
+        activeTurnId: projection.activeTurnId, authority, clientMessageId: "later-exact-steer",
+        message: "A fresh key cannot reopen the writer", providerThreadId, signal: signal(),
+      })).rejects.toMatchObject({ code: "INDETERMINATE_EFFECT" });
+  expect(process.written).toEqual(writes);
 };
 
 describe("pinned Claude runtime manager", () => {
@@ -1716,6 +1738,161 @@ describe("pinned Claude runtime manager", () => {
     })).rejects.toThrow("no longer active");
     await manager.close();
   });
+
+  test.each(([
+    "start", "steer", "interrupt", "resolve", "timeout",
+  ] as const).flatMap((method) => ([
+    "before_write", "write_rejected", "after_write_aborted",
+  ] as const).map((phase) => ({ method, phase }))))(
+    "classifies the exact Claude write boundary: $method / $phase", async ({ method, phase }) => {
+      let interactionObserved!: () => void;
+      const observed = new Promise<void>((resolve) => { interactionObserved = resolve; });
+      const value = harness({ onFact: (_authority, fact) => {
+        if (fact.type === "interactionRequested") interactionObserved();
+      } });
+      try {
+        const providerThreadId = await startSession(value.manager);
+        const process = value.processes[0];
+        if (process === undefined) throw new Error("expected the exact child");
+        const invoke: (writeSignal: AbortSignal) => Promise<unknown> = await (async () => {
+          if (method === "start") {
+            const review = await value.manager.reviewTurnStart({
+              authority, fast: false, preset: "fable-max", requirement: presetRequirements["fable-max"],
+              projectRoot: PROJECT_ROOT, providerThreadId, signal: signal(),
+            });
+            return async (writeSignal: AbortSignal) => await value.manager.startTurn({
+              authority, clientMessageId: "boundary-start", message: "Start once", providerThreadId,
+              review, signal: writeSignal,
+            });
+          }
+          const activeTurnId = await startTurn(value.manager, providerThreadId, "Initial accepted turn");
+          if (method === "steer") return async (writeSignal: AbortSignal) => await value.manager.steer({
+            activeTurnId, authority, clientMessageId: "boundary-steer", message: "Steer once",
+            providerThreadId, signal: writeSignal,
+          });
+          if (method === "interrupt") return async (writeSignal: AbortSignal) => await value.manager.interrupt({
+            activeTurnId, authority, providerThreadId, signal: writeSignal,
+          });
+          process.emit({
+            request: {
+              display_name: "Bash", input: { command: "true" }, subtype: "can_use_tool",
+              tool_name: "Bash", tool_use_id: "toolu_boundary",
+            },
+            request_id: "boundary-request", type: "control_request",
+          });
+          await observed;
+          const provider = value.manager.interactionAuthority(authority, providerThreadId, "boundary-request");
+          if (method === "resolve") return async (writeSignal: AbortSignal) => await value.manager.resolveInteraction({
+            authority, deadlineAt: 1_700_000_100_000, kind: "command_approval", provider,
+            resolution: { decision: "once", kind: "approval_decision" }, signal: writeSignal,
+          });
+          return async (writeSignal: AbortSignal) => await value.manager.timeoutInteraction({
+            authority, provider, signal: writeSignal,
+          });
+        })();
+        const before = [...process.written];
+        const controller = new AbortController();
+        const cause = new Error("test-only exact Claude write boundary failure");
+        if (phase === "before_write") controller.abort(cause);
+        process.onWrite = () => {
+          if (phase === "write_rejected") throw cause;
+          if (phase === "after_write_aborted") controller.abort(cause);
+        };
+        const outcome = await invoke(controller.signal).then(() => null, (error: unknown) => error);
+        if (phase === "before_write") {
+          expect(outcome).toBe(cause);
+          expect(outcome).not.toBeInstanceOf(IndeterminateClaudeEffectError);
+          expect(process.written).toEqual(before);
+          await expect(value.manager.observeSession({ authority, providerThreadId, signal: signal() }))
+            .resolves.toMatchObject({ projection: { providerThreadId } });
+        } else {
+          const operation = method === "start" ? "turn/start"
+            : method === "steer" ? "turn/steer"
+              : method === "interrupt" ? "turn/interrupt" : "interaction/resolve";
+          expect(outcome).toBeInstanceOf(IndeterminateClaudeEffectError);
+          if (!(outcome instanceof IndeterminateClaudeEffectError)) throw new Error("expected typed uncertainty");
+          expect(outcome.code).toBe("INDETERMINATE_EFFECT");
+          expect(outcome.operation).toBe(operation);
+          expect(outcome.cause).toBe(cause);
+          expect(process.written).toHaveLength(before.length + 1);
+          await expectFencedClaudeWrite(value.manager, providerThreadId, process);
+        }
+        expect(process.terminated).toBe(false);
+        expect(value.processes).toEqual([process]);
+      } finally {
+        await value.manager.close();
+      }
+    },
+  );
+
+  test("classifies observer failure after an accepted Claude write as indeterminate", async () => {
+    const cause = new Error("test-only admitted fact delivery failure");
+    const value = harness({ onFact: (_authority, fact) => {
+      if (fact.type === "turnStarted") throw cause;
+    } });
+    try {
+      const providerThreadId = await startSession(value.manager);
+      const outcome = await startTurn(value.manager, providerThreadId, "Accepted before observer failure")
+        .then(() => null, (error: unknown) => error);
+      expect(outcome).toBeInstanceOf(IndeterminateClaudeEffectError);
+      if (!(outcome instanceof IndeterminateClaudeEffectError)) throw new Error("expected typed uncertainty");
+      expect(outcome.cause).toBe(cause);
+      expect(outcome.operation).toBe("turn/start");
+      const process = value.processes[0];
+      if (process === undefined) throw new Error("expected the exact child");
+      expect(process.written).toHaveLength(1);
+      expect(value.facts.filter((fact) => fact.type === "turnStarted")).toHaveLength(1);
+      await expectFencedClaudeWrite(value.manager, providerThreadId, process);
+    } finally {
+      await value.manager.close();
+    }
+  });
+
+  test.each(["accepted", "rejected"] as const)(
+    "retains an actual early Claude result across adapter write settlement: %s", async (disposition) => {
+      const value = harness();
+      try {
+        const providerThreadId = await startSession(value.manager);
+        const process = value.processes[0];
+        if (process === undefined) throw new Error("expected the exact child");
+        const cause = new Error("test-only rejection after an actual result");
+        process.onWrite = async () => {
+          process.onWrite = undefined;
+          const consumed = new Promise<void>((resolve) => {
+            process.afterStdoutChunkRead = () => { process.afterStdoutChunkRead = undefined; resolve(); };
+          });
+          process.emit({
+            type: "result", session_id: providerThreadId, subtype: "success", is_error: false,
+            result: "Actual early result", duration_ms: 1, usage: { input_tokens: 1, output_tokens: 2 },
+          });
+          await consumed;
+          if (disposition === "rejected") throw cause;
+        };
+        const outcome = await startTurn(value.manager, providerThreadId, "Complete while write settles")
+          .then((turnId) => ({ turnId }), (error: unknown) => ({ error }));
+        expect(process.written).toHaveLength(1);
+        expect(value.facts.filter((fact) => fact.type === "turnSummary"))
+          .toMatchObject([{ status: "completed", resultText: "Actual early result" }]);
+        expect(value.facts.filter((fact) => fact.type === "turnCompleted")).toHaveLength(1);
+        expect(value.facts.filter((fact) => fact.type === "turnStarted"))
+          .toHaveLength(disposition === "accepted" ? 1 : 0);
+        if (disposition === "accepted") {
+          expect("turnId" in outcome).toBe(true);
+          await expect(value.manager.observeSession({ authority, providerThreadId, signal: signal() }))
+            .resolves.toMatchObject({ projection: { status: "idle" } });
+        } else {
+          expect("error" in outcome).toBe(true);
+          if (!("error" in outcome) || !(outcome.error instanceof IndeterminateClaudeEffectError)) {
+            throw new Error("expected typed uncertainty");
+          }
+          expect(outcome.error.cause).toBe(cause);
+          await expectFencedClaudeWrite(value.manager, providerThreadId, process);
+        }
+      } finally {
+        await value.manager.close();
+      }
+    },
+  );
 
   test("fences every operation on the exact account authority", async () => {
     let current = true;

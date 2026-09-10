@@ -39,24 +39,70 @@ previous inventory pin rejected this archive before the independently approved
 digest replacement; its count, canonical size and refusal predicates remain
 unchanged. This inspection is not fresh installation or release acceptance.
 
-Source review also identified a possible Claude write-outcome gap: a rejected
+Source review also identified a Claude write-outcome gap: a rejected
 user-frame write without a result can clear the client's active turn while the
 daemon records a failed mutation and retains an idle projection. A different
-request key may then reach the same open process. An independently reviewed
+request key can then reach the same open process. An independently reviewed
 isolated regression crosses the real client, adapter, service and storage with
-a fake process that records the first frame before throwing. Execution remains
-blocked before dispatch; neither a failing test nor live provider acceptance is
-claimed. A repair must distinguish proven pre-write refusal from a possibly
-escaped effect, preserve actual observed facts and forbid speculative replay.
-The regression and any required repair remain delivery blockers. No packaged
-production change has been selected from this finding.
+a fake process that records the first frame before throwing. After approved
+host-scheduled execution, the regression failed at its final safety oracle:
+the second request succeeded and wrote a second frame. No live provider
+acceptance is claimed.
+
+The independently reviewed repair is committed at
+`11fa006dd7da75369c1a5f3d2e99d71b9d16f166`, tree
+`14ff7a04e544555d35b7ed0a3c8c933c87120c77`, and joined locally into this
+candidate. It distinguishes proven pre-write refusal from a possibly escaped
+effect, synchronously fences later client frames and marks daemon effects
+indeterminate. Client tests pass 39 cases with 230 assertions; adapter tests
+pass 83 cases with 498 assertions. The complete real-client cross-layer
+session suite passes 34 cases with 283 assertions, including unknown approval
+resolution, same-key and different-key refusal, queue admission, steering,
+stopping and truthful early completion. These are synthetic provider seams,
+not live provider qualification.
+
+Two failed intermediate repairs remain recorded. The first quarantined before
+recording an already observed completion. The second treated an immutable
+accounting publication as a state-changing ordering barrier and lost a queued
+completion. The corrected queue cases preserve both actual completions and
+the original accounting publication order, retain only the previously bound
+turn's accounting, and refuse accounting for the ambiguous queued turn.
+
+The reviewed ordering repair preserves successful FIFO slots and allows only
+an exact input owner's bounded observed-fact prefix to drain before failure
+quarantine. Earlier account, session and interaction facts form a barrier;
+immutable accounting publication retains its original FIFO and never grants
+authority or a turn binding. Exact durable authority, connection, ownership and
+cumulative bounds remain mandatory. Twenty focused retention and ordering
+cases are covered by passing gates, including eight seeded cases, an explicit
+leading barrier, reentrant count exhaustion and byte overflow after an actual
+successful provider return. The accepted-result case preserves the user
+message before the single start and completion. A throwing diagnostic
+callback cannot replace the original error or prevent local turn abandonment.
+
+Independent runtime, client and test review passed. Typecheck, scoped lint and
+the existing effect-boundary check pass. Security inventory review confirms
+one added daemon-authority assertion, from 101 to 102, with no removed guard;
+the unchanged scanner passes. Recovery can reconcile durable evidence but
+does not reopen a fenced client for writes; automatic same-process writability
+is not claimed. No schema, provider pin, process-custody or activation policy
+changed. These local changes are not published and invalidate the earlier
+package measurement for final delivery. Fresh package, installation and
+integration gates remain required after the next main join.
 
 [PR 170](https://github.com/hraness/hra/pull/170) independently merged the
 protected site-operator input repair at
 `32cf432247843a3c5dbf3ec1a1dc9e75ce5c236a`. Its exact candidate passed
 [CI 34422315527](https://github.com/hraness/hra/actions/runs/34422315527),
-attempt 2, and both CodeQL analyses. Actual-main verification and guarded site
-promotion remain with that delivery owner. This usage candidate must join the
+attempt 2, and both CodeQL analyses. Its delivery owner verified fresh
+[actual-main CI 34424163044](https://github.com/hraness/hra/actions/runs/34424163044),
+attempt 1, with all ten jobs passing, and both analyses in
+[CodeQL 34424162555](https://github.com/hraness/hra/actions/runs/34424162555).
+Guarded site promotion has provider and browser readback, but final HTTP
+verification exposed response-header gaps that remain with that owner.
+[PR 172](https://github.com/hraness/hra/pull/172) carries the separate header
+repair at `47293548d4f3c511f6999d1339434f50b6632b26`; its required CI and
+CodeQL gates are still owned by that task. This usage candidate must join the
 admitted successor before its own final gates; a protected merge alone does
 not prove site promotion or admit v0.8.0.
 

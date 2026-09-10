@@ -32,7 +32,12 @@ export {
   type ClaudeStreamInitialization,
   type ClaudeStreamClientOptions,
 } from "./client.ts";
-export { ClaudeError, type ClaudeFailureCode } from "./errors.ts";
+export {
+  ClaudeError,
+  IndeterminateClaudeEffectError,
+  type ClaudeEffectOperation,
+  type ClaudeFailureCode,
+} from "./errors.ts";
 export { ClaudeJsonLineDecoder } from "./jsonl.ts";
 export {
   CLAUDE_HOST_TOOL_BINDING_VERSION,
