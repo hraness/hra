@@ -1616,7 +1616,11 @@ describe("OompaService work protocol", () => {
           revision: recoveryBefore?.revision,
         });
     }),
+    // Two real stores and three actors: the default five-second deadline is
+    // routinely exceeded on the macOS runners.
+    30_000,
   );
+
 
   test("accepts queued and steered signals with exact nested receipts", async () => {
     const value = await fixture();
