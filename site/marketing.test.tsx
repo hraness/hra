@@ -82,8 +82,8 @@ describe("public server marketing composition", () => {
     expect(installNotice?.nextElementSibling).toBe(commandBlocks[0]);
     expect(commandBlocks[0]?.textContent).toBe(publicContent.installCommand);
     const admissionNotice = setup.querySelector('aside[aria-label="Candidate artifact not yet admitted"]');
-    expect(admissionNotice?.textContent).toContain("Only after immutable GitHub and npm release admission");
-    expect(admissionNotice?.querySelector('a[href="https://github.com/hraness/hra/tree/v0.7.0#install-and-update"]')?.getAttribute("href")).toBe("https://github.com/hraness/hra/tree/v0.7.0#install-and-update");
+    expect(admissionNotice?.textContent).toContain("Only after immutable GitHub release admission");
+    expect(admissionNotice?.querySelector('a[href="https://github.com/hraness/hra/blob/v0.7.1/README.md#get-started"]')?.getAttribute("href")).toBe("https://github.com/hraness/hra/blob/v0.7.1/README.md#get-started");
     expect(admissionNotice?.nextElementSibling).toBe(commandBlocks[0]);
     for (const command of [publicContent.installCommand, publicContent.doctorCommand, publicContent.initCommand]) {
       expect(commandBlocks.some((block) => block.textContent.split("\n").includes(command))).toBe(true);

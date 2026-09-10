@@ -52,20 +52,6 @@ const workflowSchema = z.object({
   path: z.string(),
   state: z.string(),
 });
-const releaseEnvironmentSchema = z.object({
-  can_admins_bypass: z.literal(false),
-  deployment_branch_policy: z.object({
-    custom_branch_policies: z.literal(true),
-    protected_branches: z.literal(false),
-  }),
-  name: z.literal("npm-release"),
-  protection_rules: z.array(z.object({ type: z.string() })).max(10),
-});
-const releaseEnvironmentPoliciesSchema = z.object({
-  branch_policies: z.array(z.object({ name: z.string(), type: z.string() })).max(100),
-  total_count: z.number().int().nonnegative(),
-});
-
 type StableVersion = readonly [bigint, bigint, bigint];
 
 function commandText(command: readonly string[]): string {
@@ -306,22 +292,6 @@ export function assertActiveCiWorkflow(value: unknown): void {
   ) throw new Error("The required CI workflow is not the exact active repository workflow.");
 }
 
-export function assertReleaseEnvironment(environmentValue: unknown, policiesValue: unknown): void {
-  const environment = releaseEnvironmentSchema.parse(environmentValue);
-  if (JSON.stringify(environment.protection_rules.map((rule) => rule.type)) !== JSON.stringify(["branch_policy"])) {
-    throw new Error("npm-release environment has unexpected protection rules.");
-  }
-  const policies = releaseEnvironmentPoliciesSchema.parse(policiesValue);
-  const [policy] = policies.branch_policies;
-  if (
-    policies.total_count !== 1
-    || policies.branch_policies.length !== 1
-    || policy === undefined
-    || policy.name !== "v*"
-    || policy.type !== "tag"
-  ) throw new Error("npm-release environment must admit only version tags.");
-}
-
 export function assertReleaseRepository(value: unknown): void {
   const repository = repositorySchema.parse(value);
   if (
@@ -489,18 +459,6 @@ export async function createReleaseTag(
     ["gh", "api", `repos/${publicRepository}/actions/workflows/ci.yml`],
     "CI workflow metadata",
   ));
-  assertReleaseEnvironment(
-    requireJson(
-      runner,
-      ["gh", "api", `repos/${publicRepository}/environments/npm-release`],
-      "npm-release environment",
-    ),
-    requireJson(
-      runner,
-      ["gh", "api", "--method", "GET", `repos/${publicRepository}/environments/npm-release/deployment-branch-policies`, "-f", "per_page=100"],
-      "npm-release environment policies",
-    ),
-  );
 
   const identity = { defaultBranch, repository: publicRepository, sha } as const;
   const runInventory = requireJson(runner, [

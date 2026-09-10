@@ -12,7 +12,6 @@ import { DIRECT_WIRE_MARKERS } from "@hraness/direct/tooling/bundle-boundary";
 import {
   assertSiteFontStyleInventory,
   assertSiteBrowserBundle,
-  buildSite,
   HRA_POSTHOG_PROJECT_TOKEN_ENV,
   publishSiteFonts,
   readPackageVersion,
@@ -35,11 +34,12 @@ import {
 } from "./template.ts";
 import { HRA_RELEASE_VERSION } from "../scripts/release-evidence";
 import { mobileHeaderFlowClassName } from "./marketing.stylex.ts";
+import { createSiteCompilerCase, siteCompilerHookMs, siteCompilerOuterMs } from "./build-site-test-owner";
 
 const temporaryRoots: string[] = [];
-// A real site graph joins Vite foundation, Bun SSR, sealed templates and
-// analytics. The first completed native probe took 6.8s; pure cases keep 5s.
-const compilerBuildTimeoutMs = 30_000;
+// Ubuntu CI spent 29.36s in real graph work before final publication. Compiler
+// cases have one 60s work deadline plus bounded collection/drain; pure cases keep 5s.
+const compilerCases: ReturnType<typeof createSiteCompilerCase>[] = [];
 const sourceRoot = await realpath(join(import.meta.dir, ".."));
 const hash = (bytes: Uint8Array): string => createHash("sha256").update(bytes).digest("hex");
 const installedFontRoot = dirname(fileURLToPath(import.meta.resolve("@hraness/design-kit/fonts.css")));
@@ -119,9 +119,9 @@ async function createFontFixture(): Promise<{ source: string; output: string; st
   return { source, output: join(root, "published"), styles };
 }
 
-const createFixtureRoot = async (): Promise<string> => {
+const createFixtureRoot = async (registerRoot: (root: string) => void = (root) => { temporaryRoots.push(root); }): Promise<string> => {
   const root = await mkdtemp(join(tmpdir(), "hra-site-test-"));
-  temporaryRoots.push(root);
+  registerRoot(root);
   expect(await realpath(root)).not.toBe(sourceRoot);
   await mkdir(join(root, "site"), { recursive: true });
   await Promise.all(
@@ -132,13 +132,39 @@ const createFixtureRoot = async (): Promise<string> => {
   return root;
 };
 
+function compilerCase(name: string, operation: (context: {
+  buildSite: ReturnType<typeof createSiteCompilerCase>["buildSite"];
+  createFixtureRoot: () => Promise<string>;
+}) => Promise<void>): void {
+  test(name, () => {
+    const owner = createSiteCompilerCase(sourceRoot);
+    compilerCases.push(owner);
+    return owner.run(async () => await operation({
+      buildSite: owner.buildSite,
+      createFixtureRoot: async () => {
+        owner.checkpoint();
+        const root = await createFixtureRoot(owner.registerRoot);
+        owner.checkpoint();
+        return root;
+      },
+    }));
+  }, siteCompilerOuterMs);
+}
+
 afterEach(async () => {
+  // Capture lists synchronously. Late setup cannot donate a root to the next
+  // test, and each compiler owner must prove collection before removing its own.
+  const owners = compilerCases.splice(0);
+  const unownedRoots = temporaryRoots.splice(0);
+  const results = await Promise.allSettled(owners.map(async (owner) => await owner.close()));
   await Promise.all(
-    temporaryRoots.splice(0).map(async (root) => {
+    unownedRoots.map(async (root) => {
       await rm(root, { force: true, recursive: true });
     }),
   );
-});
+  const failures = results.flatMap((result) => result.status === "rejected" ? [result.reason as unknown] : []);
+  if (failures.length > 0) throw new AggregateError(failures, "SITE_COMPILER_TEARDOWN_FAILED");
+}, siteCompilerHookMs);
 
 describe("static-site build", () => {
   test("rejects Direct runtime or fixture selectors in parent browser bundles", () => {
@@ -292,7 +318,7 @@ describe("static-site build", () => {
     expect(renderPreviewHtml()).not.toContain('data-slot="ask-ai-about-this"');
   });
 
-  test("writes every named public artifact and then passes check mode", async () => {
+  compilerCase("writes every named public artifact and then passes check mode", async ({ buildSite, createFixtureRoot }) => {
     const root = await createFixtureRoot();
     expect(await buildSite({ check: false, repositoryRoot: root, sourceRoot })).toEqual([]);
     expect(await buildSite({ check: true, repositoryRoot: root, sourceRoot })).toEqual([]);
@@ -438,9 +464,9 @@ describe("static-site build", () => {
       },
       version: HRA_RELEASE_VERSION,
     });
-  }, compilerBuildTimeoutMs);
+  });
 
-  test("renders the social card as a 1200x630 PNG plus the legacy SVG path from one composition", async () => {
+  compilerCase("renders the social card as a 1200x630 PNG plus the legacy SVG path from one composition", async ({ buildSite, createFixtureRoot }) => {
     const root = await createFixtureRoot();
     await buildSite({ check: false, repositoryRoot: root, sourceRoot });
     const png = new Uint8Array(await readFile(join(root, "dist/site/social-card.png")));
@@ -453,9 +479,9 @@ describe("static-site build", () => {
     expect(renderSiteHtml()).toContain(
       `<meta property="og:image" content="${publicContent.siteUrl}/social-card.png">`,
     );
-  }, compilerBuildTimeoutMs);
+  });
 
-  test("binds hosted identity to one exact source commit", async () => {
+  compilerCase("binds hosted identity to one exact source commit", async ({ buildSite, createFixtureRoot }) => {
     const root = await createFixtureRoot();
     const commit = "0123456789abcdef0123456789abcdef01234567";
     await buildSite({ check: false, releaseCommit: commit, repositoryRoot: root, sourceRoot });
@@ -470,9 +496,9 @@ describe("static-site build", () => {
       repositoryRoot: root,
       sourceRoot,
     })).rejects.toThrow("Release commit");
-  }, compilerBuildTimeoutMs);
+  });
 
-  test("fails Production closed without valid public analytics and mailing configuration", async () => {
+  compilerCase("fails Production closed without valid public analytics and mailing configuration", async ({ buildSite, createFixtureRoot }) => {
     const validToken = "phc_public_production_token";
     expect(resolveHraAnalyticsProjectToken({ VERCEL_ENV: "preview" })).toBe("");
     expect(resolveHraAnalyticsProjectToken({
@@ -507,9 +533,9 @@ describe("static-site build", () => {
       repositoryRoot: missingTurnstileRoot,
       sourceRoot,
     })).rejects.toThrow(HRA_MAILING_TURNSTILE_SITEKEY_ENV);
-  }, compilerBuildTimeoutMs);
+  });
 
-  test("embeds only the public token in the self-hosted Production bundle", async () => {
+  compilerCase("embeds only the public token in the self-hosted Production bundle", async ({ buildSite, createFixtureRoot }) => {
     const root = await createFixtureRoot();
     const publicToken = "phc_public_production_token";
     await buildSite({
@@ -532,9 +558,9 @@ describe("static-site build", () => {
     expect(html).toContain(
       'src="https://challenges.cloudflare.com/turnstile/v0/api.js"',
     );
-  }, compilerBuildTimeoutMs);
+  });
 
-  test("keeps the hosted identity marker at the fixed release-evidence version", async () => {
+  compilerCase("keeps the hosted identity marker at the fixed release-evidence version", async ({ buildSite, createFixtureRoot }) => {
     const root = await createFixtureRoot();
     await buildSite({ check: false, repositoryRoot: root, sourceRoot });
     const identity = JSON.parse(
@@ -545,9 +571,9 @@ describe("static-site build", () => {
     expect(identity.version).toBe(HRA_RELEASE_VERSION);
     expect(identity.version).toBe("0.1.0");
     expect(await readPackageVersion()).not.toBe(identity.version);
-  }, compilerBuildTimeoutMs);
+  });
 
-  test("does not publish the retired adjacent-reading cluster", async () => {
+  compilerCase("does not publish the retired adjacent-reading cluster", async ({ buildSite, createFixtureRoot }) => {
     const root = await createFixtureRoot();
     await buildSite({ check: false, repositoryRoot: root, sourceRoot });
     const publicDocuments = await Promise.all([
@@ -569,9 +595,9 @@ describe("static-site build", () => {
       await expect(readFile(join(root, "dist/site", route, "index.html"), "utf8"))
         .rejects.toThrow();
     }
-  }, compilerBuildTimeoutMs);
+  });
 
-  test("reconstructs the owned site output without stale retired artifacts", async () => {
+  compilerCase("reconstructs the owned site output without stale retired artifacts", async ({ buildSite, createFixtureRoot }) => {
     const root = await createFixtureRoot();
     const stalePaths = [
       "dist/site/reading/index.html",
@@ -593,9 +619,9 @@ describe("static-site build", () => {
     }
     const html = await readFile(join(root, "dist/site/index.html"), "utf8");
     expect(compiledStylesheetJoin(html).authoredHtml).toBe(renderSiteHtml());
-  }, compilerBuildTimeoutMs);
+  });
 
-  test("generates the inert preview without publishing it as an indexable document", async () => {
+  compilerCase("generates the inert preview without publishing it as an indexable document", async ({ buildSite, createFixtureRoot }) => {
     const root = await createFixtureRoot();
     await buildSite({ check: false, repositoryRoot: root, sourceRoot });
     const preview = await readFile(join(root, "dist/site/preview/index.html"), "utf8");
@@ -606,17 +632,17 @@ describe("static-site build", () => {
     expect(preview).toContain('<link rel="canonical" href="https://hra.sh/">');
     expect(preview).not.toContain("/analytics.js");
     expect(sitemap).not.toContain("/preview");
-  }, compilerBuildTimeoutMs);
+  });
 
-  test("passes check mode in a clean clone without ignored build output", async () => {
+  compilerCase("passes check mode in a clean clone without ignored build output", async ({ buildSite, createFixtureRoot }) => {
     const root = await createFixtureRoot();
     await buildSite({ check: false, repositoryRoot: root, sourceRoot });
     await rm(join(root, "dist"), { force: true, recursive: true });
 
     expect(await buildSite({ check: true, repositoryRoot: root, sourceRoot })).toEqual([]);
-  }, compilerBuildTimeoutMs);
+  });
 
-  test("reports stale tracked public documents without repairing build output", async () => {
+  compilerCase("reports stale tracked public documents without repairing build output", async ({ buildSite, createFixtureRoot }) => {
     const root = await createFixtureRoot();
     await buildSite({ check: false, repositoryRoot: root, sourceRoot });
     await writeFile(join(root, "README.md"), "stale\n", "utf8");
@@ -626,7 +652,7 @@ describe("static-site build", () => {
     expect(mismatches).toEqual([join(root, "README.md")]);
     expect(await readFile(join(root, "README.md"), "utf8")).toBe("stale\n");
     expect(await readFile(join(root, "dist/site/stylex.css"), "utf8")).toBe("stale\n");
-  }, compilerBuildTimeoutMs);
+  });
 
   test("admits only owned browser entries, configured Turnstile, and restrictive response headers", async () => {
     const repositoryRoot = join(import.meta.dir, "..");

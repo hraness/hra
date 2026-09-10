@@ -85,6 +85,10 @@ package or command.
   or obtain bounded relevant evidence before shipping or activation. Preserve
   the identity, target, capacity, migration, and recovery guards applicable to
   the operational effect.
+- For eligible public packages, use verified immutable GitHub Release artifacts
+  as canonical distribution independently of optional exact-byte npm mirrors.
+  Prefer OIDC where provider policy permits; retain required staged approvals
+  and private-package access boundaries.
 - Replace an obsolete gate through a reviewed source and policy change with
   corresponding tests, never an ad hoc skip. Runtime-enforced approvals, access
   controls, branch and environment protections, and safety policies remain
@@ -162,6 +166,13 @@ The browser and Mac lanes each serialize their scarce capability while still
 sharing the weighted compute capacity. A nested wrapper must be covered by the
 outer lane; choose the top-level lane correctly instead of escalating it inside
 an existing lease.
+
+For an indivisible aggregate that requires macOS, such as Atet `bun run check`,
+use `exclusive` mode on `mac-native` when its Chromium work is an owned fixture
+with a fresh profile and loopback server. Exclusive reserves all common compute
+capacity. This mapping admits no personal authenticated browser, shared fixed
+server, or nested cross-lane acquisition. Separate browser-only gates retain
+`browser-auth`.
 
 For non-interactive macOS and Linux runs, the wrapper supervises a dedicated
 child process group and forwards `HUP`, `INT`, `QUIT`, and `TERM` to the whole

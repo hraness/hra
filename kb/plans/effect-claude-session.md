@@ -10,9 +10,10 @@ Design: [issue 166](https://github.com/hraness/hra/issues/166).
 
 Status: implementation and the constructor-custody repair pass focused validation.
 The earlier `135b853c` candidate installation passed, but its full CI failed
-service-fixture deadlines. Those fixture repairs are ready for the current-base
-join. Changed production source still needs a newly measured archive and fresh
-matching final gates. Integration and delivery remain pending, separately after
+service-fixture deadlines. The preparation branch now joins admitted main
+`d270616db2589ada8de2af2da697bb862f5d0aad`, preserving the provider-usage
+candidate and the constructor repair. Focused source-join checks and new package
+measurement review are complete; fresh matching final gates remain required. Integration and delivery remain pending, separately after
 the provider-usage v0.8 release window. The measured baseline
 is `82637bb9a5423adffb5185dc175fd74eb5dd2c89`, an ancestor of
 [the provider-usage candidate](https://github.com/hraness/hra/pull/140).
@@ -293,3 +294,49 @@ local aggregate when Required CI already owns its authoritative equivalent.
   production bytes. This repair requires a new archive, package-policy and
   installation evidence, and fresh required final checks on the eventual joined
   source. No new full CI, merge, publication or production result is claimed.
+
+- The release owner authorized an independent source-only join of admitted main
+  `d270616db2589ada8de2af2da697bb862f5d0aad` into the preparation branch.
+  Its common ancestor with the provider-usage candidate is `e1edb585`, not
+  the candidate itself. The merge preserves all inherited provider-account
+  authority and Effect production bytes rather than treating divergent endpoint
+  deletions as incoming changes. The source-join authorization does not change
+  the separate post-v0.8 delivery window or admit an unpublished upstream tail.
+- Independent review accepts the incoming main source admission, canonical
+  GitHub release and separate npm mirror policy, compiler-child ownership
+  helpers and retained source-shard deadlines. Existing security alerts remain
+  recorded; successful CodeQL jobs do not establish an alert-free codebase.
+  The compiler helpers and release workflow match admitted main exactly.
+- Resolved public surfaces keep v0.8 unavailable until its own immutable GitHub
+  artifact is admitted and link to v0.7.1 immutable installation instructions.
+  The complete v0.7.1 release record and original candidate installer bytes are
+  retained. Historical GitHub/npm evidence and all capacity, activation and
+  target-marker limits remain in force.
+- The paged-recovery fixture now returns its private owned task, checks
+  cancellation before post-await state access, and joins the task and service
+  before closing storage. Its 103 sessions, bounded eager observations, provider
+  authority, original assertions and five-second deadline are unchanged.
+  It and the four previously repaired recovery-fence rows pass five tests and
+  36 assertions. Strict TypeScript passes on the resolved source.
+- Release and site checks initially pass 96 cases and fail one stale current
+  fallback-link assertion. The assertion is corrected to the admitted v0.7.1
+  immutable README without changing any historical release checks. The focused
+  release-file rerun passes all 29 cases and 1,132 assertions. The three site
+  files already passed all 68 cases on their unchanged resolved inputs.
+- The new local archive contains the same 219 regular files. Every file matches
+  the frozen merged source in bytes, size and mode. Exactly README, third-party
+  notices, package description and the two constructor-repair modules differ
+  from the historical archive, adding 908 payload bytes. The new archive is
+  1,727,128 bytes, SHA-256
+  `e5142daddf8e23bbff5135db7824921b735beeea8862770dc51e2adfb0498f74`.
+  Independent review reconstructs 228 inventory entries and 11,337 canonical
+  JSON bytes, SHA-256
+  `094489413664730eb3004d530d8b84c1ca685f606fdf96c2547685bbf8c325bc`.
+  Only that measured digest changes in the strict inventory policy. The nine
+  implicit directory entries are reconstructed at canonical mode 0755; the
+  eventual supplied-artifact gate must verify actual extraction and installation.
+  This measurement is source-only evidence, not a final candidate admission.
+- Scoped lint and all 11 package-policy tests pass, with 42 package-policy
+  assertions. These focused checks and source-archive measurements do not
+  substitute for the required final integration, extracted-archive installation,
+  release or operational gates on the eventual delivery candidate.

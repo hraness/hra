@@ -25573,26 +25573,30 @@ describe("HraService", () => {
     expect(store.listQueue(started.session.id)[0]).toMatchObject({ state: "applied" });
   });
 
-  test("pages recovery across the session quota and bounds eager active observations", async () => {
-    const { service, codex, documents, store } = await fixture();
+  test("pages recovery across the session quota and bounds eager active observations", () => ownedServiceCase(async ({ createFixture, signal }) => {
+    const { service, codex, documents, store } = await createFixture();
+    signal.throwIfAborted();
     const added = await service.execute({
       kind: "account.add",
       label: "Paged active recovery",
     }, { signal }) as { account: { id: `acct_${string}` } };
+    signal.throwIfAborted();
     await service.execute({
       kind: "account.login",
       account: added.account.id,
       deviceCode: false,
     }, { signal });
+    signal.throwIfAborted();
     const project = await service.execute({
       kind: "project.add",
       label: "Paged recovery docs",
       path: documents,
     }, { signal }) as { project: { id: `proj_${string}` } };
+    signal.throwIfAborted();
     const created = Array.from({ length: 103 }, (_, index) => {
       const active = index >= 100;
       const session = store.upsertProviderSession({
-      providerAuthority: store.requireProviderAccountAuthority(added.account.id, "codex"),
+        providerAuthority: store.requireProviderAccountAuthority(added.account.id, "codex"),
         profileId: added.account.id,
         projectId: project.project.id,
         provider: "codex",
@@ -25606,20 +25610,23 @@ describe("HraService", () => {
       });
       return { active, index, session };
     }).toSorted((left, right) => left.session.id.localeCompare(right.session.id));
+    signal.throwIfAborted();
     codex.beforeObserveReturn = async () => await Bun.sleep(2);
 
     const readiness = await Promise.race([
       service.recover().then(() => "ready" as const),
       new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 100)),
     ]);
+    signal.throwIfAborted();
     expect(readiness).toBe("ready");
     await service.settled();
+    signal.throwIfAborted();
     for (const { active, index } of created.filter((entry) => entry.active)) {
       expect(codex.observedThreads).toContain(`provider-recovery-${String(index)}`);
       expect(active).toBe(true);
     }
     expect(codex.maximumConcurrentObservations).toBe(1);
-  });
+  }), 5_000);
 
   test("dispatches a durable queue immediately for an idle session", async () => {
     const { service, codex, documents, store } = await fixture();

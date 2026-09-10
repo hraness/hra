@@ -130,9 +130,9 @@ describe("task-oriented documentation content", () => {
     expect(blocks[0]).toMatchObject({ kind: "notice", label: "Candidate artifact not yet admitted" });
     expect(blockText(blocks[0]!)).toContain(publicContent.installNotice);
     expect(blockLinks(blocks[0]!)).toContain(publicContent.links.admittedInstall);
-    expect(blockText(blocks[0]!)).toContain("Only after immutable GitHub and npm release admission");
-    expect(blockText(blocks[0]!)).toContain("admitted v0.7.0 artifact");
-    expect(blockLinks(blocks[0]!)).toContain("https://github.com/hraness/hra/tree/v0.7.0#install-and-update");
+    expect(blockText(blocks[0]!)).toContain("Only after immutable GitHub release admission");
+    expect(blockText(blocks[0]!)).toContain("admitted v0.7.1 artifact");
+    expect(blockLinks(blocks[0]!)).toContain("https://github.com/hraness/hra/blob/v0.7.1/README.md#get-started");
     expect(blocks[1]).toEqual({ kind: "commands", commands: [publicContent.installCommand] });
     const text = pageText(page);
     expect(text.indexOf("Candidate artifact not yet admitted")).toBeLessThan(text.indexOf(publicContent.installCommand));
@@ -152,9 +152,9 @@ describe("task-oriented documentation content", () => {
     expect(parseCli(["session", "start", "personal", "--provider", "claude", "--preset", "fable-max"])).toMatchObject({ kind: "command", command: { kind: "session.start", provider: "claude", preset: "fable-max" } });
     const status = pageText(pageAt("/docs/status/"));
     expect(status).toContain(publicContent.daemonRolloutNotice);
-    expect(status).toContain("v0.8.0 is a candidate. v0.7.0 remains admitted.");
+    expect(status).toContain("v0.8.0 is a candidate. v0.7.1 remains admitted.");
     expect(status).toContain(publicContent.installNotice);
-    expect(status).toContain("The v0.7.0 CLI passed immutable GitHub and npm artifact admission.");
+    expect(status).toContain("The v0.7.1 CLI passed immutable GitHub and npm artifact admission.");
     expect(status).not.toContain("The v0.8.0 CLI passed");
     expect(status).not.toContain("v0.8.0 is released");
   });

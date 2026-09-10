@@ -17,7 +17,7 @@ const exactIdentity = {
   ].join(""),
   GITHUB_ACTIONS: "true",
   GITHUB_EVENT_NAME: "push",
-  GITHUB_JOB: "publish",
+  GITHUB_JOB: "npm_mirror",
   GITHUB_REF: "refs/tags/v0.6.1",
   GITHUB_REF_NAME: "v0.6.1",
   GITHUB_REF_TYPE: "tag",
@@ -66,6 +66,9 @@ describe("npm trusted-publisher boundary", () => {
         "v0.6.1",
         "a".repeat(40),
       ), key).toThrow("exact GitHub-hosted release OIDC identity");
+    }
+    for (const job of ["publish", "npm_preflight"]) {
+      expect(() => assertNpmPublisherIdentity({ ...exactIdentity, GITHUB_JOB: job }, "v0.6.1", "a".repeat(40))).toThrow();
     }
     expect(() => assertNpmPublisherIdentity(exactIdentity, "v0.1.8", "a".repeat(40))).toThrow();
     expect(() => assertNpmPublisherIdentity(exactIdentity, "v0.6.1", "b".repeat(40))).toThrow();

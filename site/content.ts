@@ -204,7 +204,7 @@ const {
 } = hostedSignupCopy(hostedSignup);
 
 const links = {
-  admittedInstall: "https://github.com/hraness/hra/blob/v0.7.0/docs/beta-release-notes.md#install",
+  admittedInstall: "https://github.com/hraness/hra/blob/v0.7.1/docs/beta-release-notes.md#install",
   app: "https://app.hra.sh",
   contributing: "https://github.com/hraness/hra/blob/main/CONTRIBUTING.md",
   documentation: "https://hra.sh/docs/",
@@ -300,8 +300,10 @@ const productName = "HRA";
 const tagline = "Workspace for Codex and Claude Code";
 const providerRoadmap = "Codex and Claude Code, side by side.";
 const releaseVersion = "0.8.0";
-export const admittedReleaseVersion = "0.7.0";
-const installNotice = `This release candidate is not yet admitted. The v${releaseVersion} install command is unavailable until its immutable GitHub and npm artifacts pass exact release admission. The last admitted release is v${admittedReleaseVersion}; use its immutable installation notes for the existing artifact.`;
+export const admittedReleaseVersion = "0.7.1";
+const admittedReleaseRun = "34367591503";
+export const isAdmittedRelease = (version: string): boolean => version === admittedReleaseVersion;
+const installNotice = `This release candidate is not yet admitted. The v${releaseVersion} install command is unavailable until its immutable GitHub artifact passes exact release admission. The npm mirror is admitted separately. The last admitted release is v${admittedReleaseVersion}; use its immutable installation notes for the existing artifact.`;
 const daemonRolloutNotice = `Current daemon and hosted command-writer rollout remains blocked on capacity. Do not initialize, start, or autostart either the admitted v${admittedReleaseVersion} daemon or the v${releaseVersion} candidate until the hosted operator records protected two-pass zero-debt capacity evidence and its exact .activated readback receipt. Artifact availability and the live sync service do not clear this gate. After activation, complete the update runbook's daemon and target marker-2 proofs before globally enabling hosted writers.`;
 
 /** The existing exact release evidence also belongs in the new status guide. */
@@ -312,7 +314,7 @@ export const releaseAdmissionNotice: ContentBlock = {
     text("The "),
     link(`v${admittedReleaseVersion} artifacts`, `https://github.com/hraness/hra/releases/tag/v${admittedReleaseVersion}`),
     text(" passed immutable GitHub and npm release admission in "),
-    link("release run 34278486095", "https://github.com/hraness/hra/actions/runs/34278486095"),
+    link(`release run ${admittedReleaseRun}`, `https://github.com/hraness/hra/actions/runs/${admittedReleaseRun}`),
     text(`, attempt 2. That evidence does not admit v${releaseVersion}. Use the predecessor's `),
     link("immutable installation notes", links.admittedInstall),
     text(". The candidate command below remains unavailable until its own admission. The website and optional hosted sync are live; artifact admission does not authorize current-daemon startup or hosted command writers."),
@@ -501,7 +503,7 @@ export const publicContent: PublicContent = {
     },
     {
       question: "Can I start using it now?",
-      answer: [text(`The website, web app, and hosted sync are available in ${hostedBetaLabel}. The admitted v${admittedReleaseVersion} CLI has its own `), link("immutable install instructions", `https://github.com/hraness/hra/tree/v${admittedReleaseVersion}#install-and-update`), text(" and "), link("admitted release's immutable installation notes", links.admittedInstall), text(`. The v${releaseVersion} candidate is not yet admitted. Starting or upgrading a daemon and enabling hosted commands are paused until the capacity checks pass. `), link("Check the setup status", "/docs/status/"), text(" before initialization or daemon startup.")],
+      answer: [text(`The website, web app, and hosted sync are available in ${hostedBetaLabel}. The admitted v${admittedReleaseVersion} CLI has its own `), link("immutable install instructions", `https://github.com/hraness/hra/blob/v${admittedReleaseVersion}/README.md#get-started`), text(" and "), link("admitted release's immutable installation notes", links.admittedInstall), text(`. The v${releaseVersion} candidate is not yet admitted. Starting or upgrading a daemon and enabling hosted commands are paused until the capacity checks pass. `), link("Check the setup status", "/docs/status/"), text(" before initialization or daemon startup.")],
     },
     {
       question: "Does HRA use my API keys or provider subscription?",
@@ -534,7 +536,7 @@ export const publicContent: PublicContent = {
   introduction: [
     releaseAdmissionNotice,
     paragraph(
-      text(`The v${releaseVersion} candidate adds a read-only exact Codex default-profile companion and a browser-safe projection decoder that does not require CSP-blocked dynamic code generation. The default-profile display remains unavailable until a matching fresh companion is published by the intended daemon after the relevant rollout. This observation does not change Ultra defaults, admit models, select a route, or authorize a command.`),
+      text(`The v${releaseVersion} ${isAdmittedRelease(releaseVersion) ? "release" : "candidate"} adds a read-only exact Codex default-profile companion and a browser-safe projection decoder that does not require CSP-blocked dynamic code generation. The default-profile display remains unavailable until a matching fresh companion is published by the intended daemon after the relevant rollout. This observation does not change Ultra defaults, admit models, select a route, or authorize a command.`),
     ),
     { kind: "notice", label: "Current daemon rollout blocked", content: [text(daemonRolloutNotice)] },
     paragraph(
@@ -560,9 +562,9 @@ export const publicContent: PublicContent = {
       id: "install-and-update",
       heading: "Install and update",
       blocks: [
-        { kind: "notice", label: "Candidate installation unavailable", content: [text(installNotice), text(" Read the "), link("v0.7.0 installation notes", links.admittedInstall), text(".")] },
+        { kind: "notice", label: "Candidate installation unavailable", content: [text(installNotice), text(" Read the "), link("v0.7.1 installation notes", links.admittedInstall), text(".")] },
         paragraph(
-          text("HRA requires Bun 1.3.14 plus curl with HTTPS and TLS 1.2 support. The CLI and local daemon support macOS and Linux. Codex effects run on both platforms; Claude Code effects run on Linux only. HRA refuses new Claude Code effects on macOS pending authenticated isolated-Keychain and detached-read acceptance. Supported ChatGPT desktop account switching is macOS-only. Native protected-input control loads only when a terminal prompt needs it and supports the standard macOS, glibc, and x64 or arm64 musl library names. Only after immutable GitHub and npm release admission, install the candidate's reviewed immutable tag, then verify the binary before initialization:"),
+          text(`HRA requires Bun 1.3.14 plus curl with HTTPS and TLS 1.2 support. The CLI and local daemon support macOS and Linux. Codex effects run on both platforms; Claude Code effects run on Linux only. HRA refuses new Claude Code effects on macOS pending authenticated isolated-Keychain and detached-read acceptance. Supported ChatGPT desktop account switching is macOS-only. Native protected-input control loads only when a terminal prompt needs it and supports the standard macOS, glibc, and x64 or arm64 musl library names. ${isAdmittedRelease(releaseVersion) ? "Install the admitted release's reviewed immutable tag, then verify the binary before initialization:" : "Only after immutable GitHub release admission, install the candidate's reviewed immutable tag, then verify the binary before initialization:"}`),
         ),
         {
           kind: "commands",
@@ -632,7 +634,7 @@ export const publicContent: PublicContent = {
           },
           {
             content: [
-              text("Only after immutable GitHub and npm release admission for v0.8.0, install its exact release and verify the installed version and offline health. Until then, use the admitted v0.7.0 installation notes instead:"),
+              text("Only after immutable GitHub release admission for v0.8.0, install its exact release and verify the installed version and offline health. Until then, use the admitted v0.7.1 installation notes instead:"),
             ],
             commands: [
               betaInstallCommand,
@@ -1832,8 +1834,8 @@ export const renderReadmeMarkdown = (content: PublicContent = publicContent): st
     content.hero.pillars.map((pillar) => `- **${pillar.label}.** ${pillar.summary}`).join("\n"),
     `## Get started\n\nPublic beta. Codex execution supports macOS and Linux; Claude Code execution supports Linux. The local CLI does not need an HRA cloud identity. The web workspace uses optional encrypted sync and requires a paired machine and browser.`,
     `> ${content.installNotice} [Admitted release installation notes](${content.links.admittedInstall}).`,
-    `The v${content.releaseVersion} candidate is not yet admitted. For the admitted v${admittedReleaseVersion} artifact, use its [immutable README](${content.links.github}/tree/v${admittedReleaseVersion}#install-and-update).`,
-    `Only after immutable GitHub and npm release admission, install and verify the v${content.releaseVersion} candidate CLI artifact. This does not start the daemon:`,
+    `The v${content.releaseVersion} candidate is not yet admitted. For the admitted v${admittedReleaseVersion} artifact, use its [immutable README](${content.links.github}/blob/v${admittedReleaseVersion}/README.md#get-started).`,
+    `Only after immutable GitHub release admission, install and verify the v${content.releaseVersion} candidate CLI artifact. This does not start the daemon:`,
     `\`\`\`sh\n${content.installCommand}\n\`\`\``,
     `\`\`\`sh\n${content.doctorCommand}\n\`\`\``,
     `> **Before initialization:** ${content.daemonRolloutNotice}`,
@@ -1870,7 +1872,7 @@ export const renderLlmsText = (content: PublicContent = publicContent): string =
     "",
     content.installNotice,
     `Admitted release installation notes: ${content.links.admittedInstall}`,
-    `Only after immutable GitHub and npm release admission, install the v${content.releaseVersion} local CLI artifact: ${content.installCommand}`,
+    `Only after immutable GitHub release admission, install the v${content.releaseVersion} local CLI artifact: ${content.installCommand}`,
     `Verify local prerequisites without cloud access: ${content.doctorCommand}`,
     content.daemonRolloutNotice,
     `Initialize only after the rollout prerequisite is satisfied: ${content.initCommand}`,
