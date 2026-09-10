@@ -14,7 +14,7 @@ import type { ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { type InlineContent, type PublicContent } from "./content.ts";
 import { ProductPreview } from "./product-preview.tsx";
-import { heroExampleMeasureClassName, mobileHeaderFlowClassName } from "./marketing.stylex.ts";
+import { productHeroClassName, mobileHeaderFlowClassName } from "./marketing.stylex.ts";
 import { sitePresentationClasses, type SitePresentationSlot } from "./presentation.stylex.ts";
 import { SiteAppearanceMenu } from "./appearance-menu.tsx";
 
@@ -64,14 +64,13 @@ export function renderMarketingPage(content: PublicContent): string {
         ]}
         align="center"
         boundary={content.hero.boundary}
-        className={heroExampleMeasureClassName()}
-        example={content.hero.example}
+        className={productHeroClassName()}
         eyebrow={content.hero.eyebrow}
         frame={<ProductPreview />}
         heading={content.hero.heading}
         headingId="hra-title"
         name={content.productName}
-        notice={<p className={sitePresentationClasses("installNote")}>New machine setup is temporarily paused. <a href="/docs/status/">Check current availability →</a></p>}
+        notice={<p className={sitePresentationClasses("installNote")}><strong>New machine setup is temporarily paused.</strong> <a href="/docs/status/">Check current availability</a></p>}
         summary={content.hero.summary}
         tone="paper"
       />
