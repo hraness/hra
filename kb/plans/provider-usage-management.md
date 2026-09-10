@@ -21,7 +21,45 @@ manual-switch and policy-control foundation. Managed automatic movement,
 Claude native fallback activation and the unfinished hosted/browser publisher
 remain dormant. Phases 6 through 9 are not complete.
 
-The September 9 delivery is joining the admitted compiler-lifecycle repair.
+The September 9 candidate joined the admitted compiler-lifecycle repair at
+`92a9b2ec81749755121a90ea55f30b63752d414d`, tree
+`cb88f319d89df84f3ffb290f47536c94cc45e9a9`. Independent impact review confirms
+the incoming compiler and release helpers are unchanged, and production source
+is byte-identical to the prior candidate. Focused workflow contracts passed
+30 cases with 1,160 assertions; focused site contracts passed 68 cases with
+2,547 assertions. Typecheck and scoped lint passed for those inputs.
+
+Two independent readers approved the actual 1,715,031-byte package, SHA-256
+`2589933870c19a555cebc62549c98886559e43d6e9dbf34e893f55d06dd485b1`.
+Its 214 files produce 223 inventory entries and 11,079 canonical bytes, digest
+`aca5dd79904441721ed31391fc453393839917037a91000f4f824435425b8203`.
+Both readers compared exact Git blobs, paths, sizes and modes. Only README,
+notices and package metadata differ from the previous reviewed package. The
+previous inventory pin rejected this archive before the independently approved
+digest replacement; its count, canonical size and refusal predicates remain
+unchanged. This inspection is not fresh installation or release acceptance.
+
+Source review also identified a possible Claude write-outcome gap: a rejected
+user-frame write without a result can clear the client's active turn while the
+daemon records a failed mutation and retains an idle projection. A different
+request key may then reach the same open process. An independently reviewed
+isolated regression crosses the real client, adapter, service and storage with
+a fake process that records the first frame before throwing. Execution remains
+blocked before dispatch; neither a failing test nor live provider acceptance is
+claimed. A repair must distinguish proven pre-write refusal from a possibly
+escaped effect, preserve actual observed facts and forbid speculative replay.
+The regression and any required repair remain delivery blockers. No packaged
+production change has been selected from this finding.
+
+[PR 170](https://github.com/hraness/hra/pull/170) independently merged the
+protected site-operator input repair at
+`32cf432247843a3c5dbf3ec1a1dc9e75ce5c236a`. Its exact candidate passed
+[CI 34422315527](https://github.com/hraness/hra/actions/runs/34422315527),
+attempt 2, and both CodeQL analyses. Actual-main verification and guarded site
+promotion remain with that delivery owner. This usage candidate must join the
+admitted successor before its own final gates; a protected merge alone does
+not prove site promotion or admit v0.8.0.
+
 [PR 169](https://github.com/hraness/hra/pull/169) reached protected main at
 `d270616db2589ada8de2af2da697bb862f5d0aad`, tree
 `82d82126fb8ab10c4acd59668b7d3c1c017b7993`. Fresh actual-main
@@ -40,14 +78,10 @@ follow-up, reached protected `main` at
 [actual-main CI 34404823161](https://github.com/hraness/hra/actions/runs/34404823161),
 attempt 1, failed Ubuntu remainder. That failed gate remains recorded without
 a blind rerun or a relaxed collection rule.
-PR 140 remains a separate draft foundation candidate. Its pre-diagnostic
-checkpoint is
-`087ec49746d82c0d2eada10e146b19d3734d0449`; its published head remains
-`fb1bf7e72dd89ca453dbee2bc51f96b0cfbbf348`. A prospective merge was inspected
-without changing the branch or index. At the pre-diagnostic checkpoint, the
-shared site compiler files matched `efcb9c4` exactly. The service conflict must
-retain the private-owner paged-recovery case and the existing immutable-send
-and recovery-fence repairs.
+PR 140 remains a separate draft foundation candidate. Its published head
+remains `fb1bf7e72dd89ca453dbee2bc51f96b0cfbbf348`; the local join above is not
+pushed. The joined service fixture retains the private-owner paged-recovery
+case and the existing immutable-send and recovery-fence repairs.
 Current content must distinguish the unadmitted v0.8.0 candidate from its
 admitted v0.7.1 predecessor, preserve canonical GitHub admission separately
 from the optional npm mirror, and retain every operational activation hold.
@@ -130,8 +164,9 @@ preserves this exact compiler implementation and the stronger task-owned
 paged-recovery fixture. It combines the canonical GitHub release policy with
 the unadmitted v0.8.0 candidate and admitted v0.7.1 predecessor, retaining the
 optional npm mirror and every separate activation hold. Neither parent's
-package inventory pin admits the joined archive. A fresh archive, independent
-inventory review and this candidate's own final gates remain required.
+package inventory pin admitted the joined archive. The fresh archive and
+independent inventory review are recorded above; this candidate's own final
+gates remain required.
 Neither this public handoff nor the local plan checkpoint is a release or
 deployment.
 
@@ -140,7 +175,7 @@ Independent review found that retaining the caller's mutable constructor
 options could redirect effects to another process while retaining the first
 process's exit observation. The finding was returned to its owner for a separate
 repair. None of that runtime refactor is imported into this candidate.
-The final actual-main join, independently measured package, exact-tree gates,
+The final actual-main join, exact-tree gates,
 protected merge, immutable release and applicable deployment evidence remain
 pending. No new artifact admission or operational activation is claimed.
 
