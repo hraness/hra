@@ -74,8 +74,13 @@ function requireCiGateCoverage(scripts: Readonly<Record<string, unknown>>): void
   }
 }
 
-const sourceShardArguments = ["--shard=1/3", "--shard=2/3", "--shard=3/3"] as const;
-const shardFixtureNames = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"] as const;
+const sourceShardArguments = [
+  "--shard=1/6", "--shard=2/6", "--shard=3/6", "--shard=4/6", "--shard=5/6", "--shard=6/6",
+] as const;
+// Eight fixture files across six shards: some shards receive two files and
+// the rest one, so the contract proves whole-file partitioning rather than
+// one file per shard.
+const shardFixtureNames = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"] as const;
 
 async function withShardFixture(run: (directory: string) => void): Promise<void> {
   const directory = await mkdtemp(join(tmpdir(), "oompa-ci-shard-contract-"));
@@ -132,7 +137,7 @@ describe("release workflow", () => {
       const shardCases = sourceShardArguments.map((shard) => {
         const result = runShardFixture(directory, shard, false);
         expect(result.exitCode).toBe(0);
-        expect(result.cases).toHaveLength(4);
+        expect([2, 4]).toContain(result.cases.length);
         for (const name of shardFixtureNames) {
           const cases = result.cases.filter((entry) => entry.startsWith(`CI_SHARD_CASE:${name}:`));
           expect(cases.length === 0 || cases.length === 2).toBeTrue();
@@ -141,6 +146,8 @@ describe("release workflow", () => {
       });
       expect(shardCases.flat().sort()).toEqual(expected);
       expect(new Set(shardCases.flat()).size).toBe(expected.length);
+      expect(shardCases.filter((cases) => cases.length === 4)).toHaveLength(2);
+      expect(shardCases.filter((cases) => cases.length === 2)).toHaveLength(4);
     });
   });
 
@@ -148,9 +155,10 @@ describe("release workflow", () => {
     await withShardFixture((directory) => {
       const result = runShardFixture(directory, shard, true);
       expect(result.exitCode).toBe(1);
-      expect(result.cases).toHaveLength(4);
-      expect(result.stderr).toContain("2 pass");
-      expect(result.stderr).toContain("2 fail");
+      expect([2, 4]).toContain(result.cases.length);
+      const files = result.cases.length / 2;
+      expect(result.stderr).toContain(`${files} pass`);
+      expect(result.stderr).toContain(`${files} fail`);
     });
   });
 
@@ -1200,7 +1208,7 @@ describe("release workflow", () => {
     expect(workflow).not.toContain("convex");
   });
 
-  test("requires all three source shards and remainder on both operating systems with complete governed history", async () => {
+  test("requires all six source shards and remainder on both operating systems with complete governed history", async () => {
     const workflow = await readFile(
       join(import.meta.dir, "..", ".github", "workflows", "ci.yml"),
       "utf8",
@@ -1219,7 +1227,7 @@ describe("release workflow", () => {
       "fail-fast": false,
       matrix: {
         os: ["macos-15", "ubuntu-24.04"],
-        gate: ["source-1", "source-2", "source-3", "remainder"],
+        gate: ["source-1", "source-2", "source-3", "source-4", "source-5", "source-6", "remainder"],
       },
     });
     const steps = check.steps;
@@ -1289,7 +1297,7 @@ describe("release workflow", () => {
     const gateStep = asRecord(gate, "CI gate step");
     expect(gateStep.if).toBeUndefined();
     expect(String(gateStep.run).trim().replace(/\s+/gu, " ")).toBe(
-      'set -euo pipefail case "$CI_GATE" in source-1) bun run test:source --shard=1/3 ;; source-2) bun run test:source --shard=2/3 ;; source-3) bun run test:source --shard=3/3 ;; remainder) bun run check:ci-remainder ;; *) echo "::error::Unexpected CI gate" exit 1 ;; esac',
+      'set -euo pipefail case "$CI_GATE" in source-1) bun run test:source --shard=1/6 ;; source-2) bun run test:source --shard=2/6 ;; source-3) bun run test:source --shard=3/6 ;; source-4) bun run test:source --shard=4/6 ;; source-5) bun run test:source --shard=5/6 ;; source-6) bun run test:source --shard=6/6 ;; remainder) bun run check:ci-remainder ;; *) echo "::error::Unexpected CI gate" exit 1 ;; esac',
     );
     expect(asRecord(asRecord(gate, "CI gate step").env, "CI gate environment")).toEqual({
       NODE_OPTIONS: "--max-old-space-size=4096",

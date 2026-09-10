@@ -18,6 +18,7 @@ Provider account visibility, local automatic usage policy controls, and recovery
 
 ## Release reliability follow-up (unreleased)
 
+- Source tests that open an empty control-plane store now copy one migrated current-schema template per test process instead of replaying the complete migration chain per test. The opt-in is explicit per fixture; historical fixture archives and every test that inspects the migration ledger, schema cohorts or first-open behaviour keep the real migration path, and a contract test proves the template is row-identical to a real migration under the same clock and time zone.
 - The npm provenance verifier includes stdin in its existing 60-second deadline and waits for the owned child, input and both output readers before reporting verification success. A failed operation gets a bounded five-second collection window; unproved collection remains a failure. Both release callers preserve the private TUF cache on every verification failure. Cryptographic identity checks, environment and byte bounds are unchanged. This source repair is not part of the immutable v0.7.1 artifact, and no evidence links the cleanup defect to that release's delayed registry visibility.
 - Current installation and status guidance records v0.7.1 admission while preserving daemon, hosted capacity and intended-target gates. The recovery runbook requires read-only reconciliation of exact public bytes and original provenance before complete same-run recovery, never artifact replacement or speculative republication.
 
