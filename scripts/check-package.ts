@@ -36,6 +36,7 @@ import {
   assertPublicTree,
 } from "./public-text-policy";
 import { assertProductionPackageOnly, assertReviewedReleaseInventory } from "./package-policy";
+import { assertPackageContentAt } from "./package-content";
 import {
   assertPseudoTerminalSuccess,
   PTY_BEGIN_MARKER,
@@ -1076,11 +1077,7 @@ await access(join(repositoryRoot, "src", "storage", "legacy-secret-migration.ts"
 await assertPublicCheckout(repositoryRoot);
 await assertCompleteGitHistoryPublic(repositoryRoot);
 
-const generated = requireSuccess(
-  "generated public tree check",
-  await run(process.execPath, ["run", "build:site", "--", "--check"], { cwd: repositoryRoot }),
-);
-if (generated.stdout.trim().length > 0) process.stdout.write(generated.stdout);
+await assertPackageContentAt(repositoryRoot);
 const dependencyCacheRoot = await resolvePackageDependencyCache(repositoryRoot);
 
 const temporaryRoot = await realpath(await mkdtemp(join(tmpdir(), "hra-package-")));
@@ -1139,6 +1136,7 @@ try {
   );
   await assertPublicTree(inspectionDirectory);
   await assertProductionPackageOnly(inspectionDirectory);
+  await assertPackageContentAt(join(inspectionDirectory, "package"));
   await assertReviewedReleaseInventory(join(inspectionDirectory, "package"));
   assertHraInstallManifest(
     JSON.parse(await readFile(join(inspectionDirectory, "package", "package.json"), "utf8")) as unknown,

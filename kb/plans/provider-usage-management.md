@@ -16,6 +16,12 @@ tags:
 
 ## Current delivery checkpoint
 
+The [Oompa rename and package separation plan](oompa-rename.md) now governs
+forward naming and delivery. Preserve this foundation's reviewed source and
+evidence, but hold old-name release and domain promotion until the rename's
+compatibility and admission gates pass. The requested orange-circle identity
+and package-only documentation do not activate unfinished usage features.
+
 The active delivery is the existing usage observation, cached visibility,
 manual-switch and policy-control foundation. Managed automatic movement,
 Claude native fallback activation and the unfinished hosted/browser publisher

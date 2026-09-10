@@ -28,6 +28,7 @@ const allowedPublicScopedPackages = new Set([
   "@hraness/direct",
   "@hraness/hra",
   "@hraness/oh",
+  "@hraness/oompa",
   "@hraness/posthog",
   "@hraness/site-footer",
   "@hraness/ui",

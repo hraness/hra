@@ -11,7 +11,6 @@ import {
   publicContent,
   renderLlmsText,
   renderPrivacyMarkdown,
-  renderReadmeMarkdown,
   renderSitemapXml,
 } from "../site/content.ts";
 import { docsPaths, renderDocsMarkdown } from "../site/docs-content.ts";
@@ -89,10 +88,6 @@ export function resolveHraAnalyticsProjectToken(
 }
 
 const trackedTextOutputs = (repositoryRoot: string): readonly TextOutput[] => [
-  {
-    path: join(repositoryRoot, "README.md"),
-    content: renderReadmeMarkdown(),
-  },
   {
     path: join(repositoryRoot, "PRIVACY.md"),
     content: renderPrivacyMarkdown(),

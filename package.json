@@ -1,7 +1,7 @@
 {
   "name": "@hraness/hra",
   "version": "0.8.0",
-  "description": "A workspace for Codex and Claude Code, in your browser or terminal. Local CLI v0.8.0 is a release candidate; v0.7.1 remains admitted; daemon and hosted command-writer rollout remains blocked on capacity.",
+  "description": "Bun CLI and local daemon for isolated Codex and Claude Code profiles, durable sessions, and optional encrypted sync. Local CLI v0.8.0 is a release candidate; daemon and hosted command-writer rollout remains blocked on capacity.",
   "license": "MIT",
   "publishConfig": {
     "access": "public",

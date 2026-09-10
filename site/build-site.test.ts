@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseHTML } from "linkedom";
+import fc from "fast-check";
 import { transform, type Selector } from "lightningcss";
 import { createStylexTransformCollector } from "@hraness/ui/stylex-build";
 import { DIRECT_WIRE_MARKERS } from "@hraness/direct/tooling/bundle-boundary";
@@ -12,6 +13,7 @@ import { DIRECT_WIRE_MARKERS } from "@hraness/direct/tooling/bundle-boundary";
 import {
   assertSiteFontStyleInventory,
   assertSiteBrowserBundle,
+  buildSite as buildSiteDirect,
   HRA_POSTHOG_PROJECT_TOKEN_ENV,
   publishSiteFonts,
   readPackageVersion,
@@ -167,6 +169,30 @@ afterEach(async () => {
 }, siteCompilerHookMs);
 
 describe("static-site build", () => {
+  test("does not create or require a package README in the site-owned tracked document phase", async () => {
+    const root = await createFixtureRoot();
+    await expect(buildSiteDirect({ check: false, repositoryRoot: root, releaseCommit: "invalid" }))
+      .rejects.toThrow("Release commit must be a lowercase 40-character Git SHA.");
+    await expect(lstat(join(root, "README.md"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await buildSiteDirect({ check: true, repositoryRoot: root })).toEqual([]);
+    await expect(lstat(join(root, "README.md"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("preserves arbitrary package README bytes before compilation and in check mode", async () => {
+    await fc.assert(fc.asyncProperty(fc.uint8Array({ maxLength: 512 }), async (bytes) => {
+      const root = await createFixtureRoot();
+      const path = join(root, "README.md");
+      await writeFile(path, bytes);
+      // This is a real builder boundary before any native compiler starts.
+      // Site-owned tracked documents may change; the package README may not.
+      await expect(buildSiteDirect({ check: false, repositoryRoot: root, releaseCommit: "invalid" }))
+        .rejects.toThrow("Release commit must be a lowercase 40-character Git SHA.");
+      expect(await readFile(path)).toEqual(Buffer.from(bytes));
+      expect(await buildSiteDirect({ check: true, repositoryRoot: root })).toEqual([]);
+      expect(await readFile(path)).toEqual(Buffer.from(bytes));
+    }), { seed: 20_260_909, numRuns: 16 });
+  });
+
   test("rejects Direct runtime or fixture selectors in parent browser bundles", () => {
     expect(() => assertSiteBrowserBundle("document.querySelector('[data-product-preview]')")).not.toThrow();
     for (const marker of [...DIRECT_WIRE_MARKERS, "@hraness/direct", "__direct_scenario", "__direct_fixture"]) {
@@ -320,11 +346,14 @@ describe("static-site build", () => {
 
   compilerCase("writes every named public artifact and then passes check mode", async ({ buildSite, createFixtureRoot }) => {
     const root = await createFixtureRoot();
+    const packageReadme = "# Independently authored package README\n";
+    await writeFile(join(root, "README.md"), packageReadme);
     expect(await buildSite({ check: false, repositoryRoot: root, sourceRoot })).toEqual([]);
+    expect(await readFile(join(root, "README.md"), "utf8")).toBe(packageReadme);
     expect(await buildSite({ check: true, repositoryRoot: root, sourceRoot })).toEqual([]);
+    expect(await readFile(join(root, "README.md"), "utf8")).toBe(packageReadme);
 
     const expectedPaths = [
-      "README.md",
       "PRIVACY.md",
       "dist/site/index.html",
       "dist/site/preview/index.html",
@@ -645,12 +674,12 @@ describe("static-site build", () => {
   compilerCase("reports stale tracked public documents without repairing build output", async ({ buildSite, createFixtureRoot }) => {
     const root = await createFixtureRoot();
     await buildSite({ check: false, repositoryRoot: root, sourceRoot });
-    await writeFile(join(root, "README.md"), "stale\n", "utf8");
+    await writeFile(join(root, "PRIVACY.md"), "stale\n", "utf8");
     await writeFile(join(root, "dist/site/stylex.css"), "stale\n", "utf8");
 
     const mismatches = await buildSite({ check: true, repositoryRoot: root, sourceRoot });
-    expect(mismatches).toEqual([join(root, "README.md")]);
-    expect(await readFile(join(root, "README.md"), "utf8")).toBe("stale\n");
+    expect(mismatches).toEqual([join(root, "PRIVACY.md")]);
+    expect(await readFile(join(root, "PRIVACY.md"), "utf8")).toBe("stale\n");
     expect(await readFile(join(root, "dist/site/stylex.css"), "utf8")).toBe("stale\n");
   });
 

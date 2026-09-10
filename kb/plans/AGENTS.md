@@ -1,5 +1,6 @@
 # Contents
 
+- `oompa-rename.md` governs the Oompa identity transition, package-only content, orange-circle branding, compatibility and organization-wide consumer delivery.
 - `ui-marketing-docs.md` tracks UI-first product marketing, task-oriented public guides, isolated Direct examples, and their delivery evidence.
 - `auth-hardening.md` tracks authentication UX, process lifetime, and exact restart recovery review.
 - `effect-provider-session.md` tracks the Codex-only Effect runtime migration and its acceptance evidence.

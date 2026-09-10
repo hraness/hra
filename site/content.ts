@@ -1825,40 +1825,6 @@ const renderMarkdownBlock = (block: ContentBlock, headingLevel: number): string 
 export const renderMarkdownBlocks = (blocks: readonly ContentBlock[], headingLevel: number): string =>
   blocks.map((block) => renderMarkdownBlock(block, headingLevel)).join("\n\n");
 
-export const renderReadmeMarkdown = (content: PublicContent = publicContent): string => {
-  const badgeLine = content.badges
-    .map((badge) => `[![${badge.alt}](${badge.image})](${badge.href})`)
-    .join(" ");
-
-  // The badge line ends with a hard line break so the thesis is line 3 of the
-  // README and still renders as its own line under the badges.
-  return [
-    `# ${content.productName}\n${badgeLine}\\\n${content.thesis}`,
-    content.statusLine,
-    `[Open HRA](${content.links.app}) · [Documentation](${content.links.documentation}) · [Availability](${content.siteUrl}/docs/status/)`,
-    content.hero.summary,
-    content.hero.pillars.map((pillar) => `- **${pillar.label}.** ${pillar.summary}`).join("\n"),
-    `## Get started\n\nPublic beta. Codex execution supports macOS and Linux; Claude Code execution supports Linux. The local CLI does not need an HRA cloud identity. The web workspace uses optional encrypted sync and requires a paired machine and browser.`,
-    ...(isAdmittedRelease(content.releaseVersion) ? [] : [
-      `> ${content.installNotice} [Admitted release installation notes](${content.links.admittedInstall}).`,
-    ]),
-    isAdmittedRelease(content.releaseVersion)
-      ? `The v${content.releaseVersion} CLI artifacts passed immutable GitHub and npm release admission in [release run ${admittedReleaseRun}](${content.links.github}/actions/runs/${admittedReleaseRun}), attempt 2. Artifact admission does not authorize daemon startup.`
-      : `The v${content.releaseVersion} candidate is not yet admitted. For the admitted v${admittedReleaseVersion} artifact, use its [immutable README](${content.links.github}/tree/v${admittedReleaseVersion}#get-started).`,
-    isAdmittedRelease(content.releaseVersion)
-      ? `Install and verify the admitted v${content.releaseVersion} CLI artifact. This does not start the daemon:`
-      : `Only after immutable GitHub release admission, install and verify the v${content.releaseVersion} candidate CLI artifact. This does not start the daemon:`,
-    `\`\`\`sh\n${content.installCommand}\n\`\`\``,
-    `\`\`\`sh\n${content.doctorCommand}\n\`\`\``,
-    `> **Before initialization:** ${content.daemonRolloutNotice}`,
-    `Continue with the [setup guide](${content.siteUrl}/docs/start/). For an existing installation, use the [ordered update runbook](${content.siteUrl}/docs/status/#install-and-update).`,
-    `## Use the interface that fits the work\n\n- [Web workspace](${content.siteUrl}/docs/web/): see the session grid, read a conversation, and send a follow-up from a paired browser.\n- [Sessions and accounts](${content.siteUrl}/docs/sessions/): inspect account usage, continue a conversation, switch providers, or recover a stopped session.\n- [CLI reference](${content.siteUrl}/docs/reference/): command families, structured JSON, cursor-based event streams, memory, and automation.`,
-    `### ${content.hero.proofLabel}\n\nThese examples require a machine whose setup and rollout prerequisites are satisfied.\n\n${content.hero.steps.map((step, index) => `${index + 1}. **${step.label}:** \`${step.command}\`. ${step.detail}`).join("\n")}`,
-    `## Local execution, optional encrypted sync\n\n${content.trust.slice(0, 3).map((item) => `**${item.label}.** ${item.detail}`).join("\n\n")}\n\nRead the [privacy policy](${content.links.privacy}) for the local, synced, and website data boundaries.`,
-    `## Project\n\nHRA is maintained by [Hraness](${content.links.hraness}) and published under the MIT license.\n\n[Contributing](${content.links.contributing}) · [Security policy](${content.links.security}) · [Release notes](${content.links.github}/blob/main/docs/beta-release-notes.md)`,
-  ].join("\n\n") + "\n";
-};
-
 export const renderPrivacyMarkdown = (content: PublicContent = publicContent): string => {
   const privacy = content.sections.find((section) => section.id === "privacy");
   if (privacy === undefined) {

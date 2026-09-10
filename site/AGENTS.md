@@ -1,6 +1,6 @@
 # Contents
 
-- `content.ts` is the shared public content contract for README and website generation.
+- `content.ts` owns the website's public content contract. Root `README.md` and the package description are independently authored package inputs, not website outputs.
 - `docs-content.ts` owns the task-oriented guide registry, canonical Markdown exports, detailed reference ownership, and individual editorial admission records.
 - `template.ts` renders the homepage, privacy page, and six documentation routes.
 - `marketing.tsx` composes public design-kit server components; `render.ts` is the captured build-time entry for all nine HTML routes.
@@ -15,6 +15,7 @@
 # Guidelines
 
 - Lead the homepage with the product and actual interface. Lead the installation guide with the real install command and the shortest safe first-run path. Keep startup restrictions adjacent to affected commands.
+- Never read or write root `README.md` as a website build input or output. Keep website release-limit and command coverage on the rendered site and its discovery documents; package admission separately checks package documentation and metadata.
 - Keep the site free of server runtime dependencies, responsive, keyboard-readable, and useful when its nonessential analytics JavaScript does not run.
 - Keep palette initialization in a classic same-origin head script and ship palette recipes through the captured StyleX union and its foundation bridge. Appearance stores only a bounded palette/mode preference; analytics remains memory-only. Never add executable inline scripts, runtime style injection, or a CSP exception for appearance.
 - Compile local recipes through the public UI build API. Publish completed HTML, stylesheet unions, captured foundations, approved WOFF2 files and attribution, the bounded parent enhancement bundle, and the closed product-preview projection. Keep renderer JavaScript and build receipts private. Use `bun run test:site` for the scoped test transform.

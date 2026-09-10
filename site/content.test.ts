@@ -23,7 +23,6 @@ import {
   renderLlmsText,
   renderMarkdownBlocks,
   renderPrivacyMarkdown,
-  renderReadmeMarkdown,
   renderSitemapXml,
   siteDocumentPaths,
 } from "./content.ts";
@@ -104,22 +103,18 @@ describe("public content contract", () => {
     expect(admittedReleaseVersion).toBe("0.7.1");
     expect(publicReleaseState).toBe("staged");
     expect(publicContent.endpoints.betaTag).toBe("beta-not-yet-live");
-    const readme = renderReadmeMarkdown();
     const llms = renderLlmsText();
     expect(llms).toContain(publicContent.statusLine);
     expect(llms).toContain("Local CLI v0.8.0 is a release candidate");
     expect(llms).toContain("v0.7.1 remains the fully admitted public artifact");
-    expect(readme).toContain("The v0.8.0 candidate is not yet admitted.");
-    expect(readme).toContain("For the admitted v0.7.1 artifact, use its [immutable README](https://github.com/hraness/hra/tree/v0.7.1#get-started).");
     expect(publicContent.links.admittedInstall).toBe("https://github.com/hraness/hra/blob/v0.7.1/docs/beta-release-notes.md#install");
-    expect(readme.indexOf("The v0.8.0 candidate is not yet admitted.")).toBeLessThan(readme.indexOf(publicContent.installCommand));
     const visibleSite = htmlVisibleText(renderSiteHtml());
     expect(visibleSite).toContain("The v0.8.0 candidate is not yet admitted.");
     expect(visibleSite).toContain("The admitted v0.7.1 CLI has its own");
     expect(visibleSite).not.toContain("The v0.7.1 candidate is not yet admitted.");
     expect(visibleSite).toContain("Starting or upgrading a daemon and enabling hosted commands are paused until the capacity checks pass.");
     expect(visibleSite).not.toContain("v0.8.0 artifacts admitted");
-    for (const surface of [readme, llms]) {
+    for (const surface of [llms]) {
       expect(surface).toContain("Only after immutable GitHub release admission");
       expect(surface).not.toContain("v0.7.1 candidate");
       expect(surface).not.toContain("v0.8.0 artifacts admitted");
@@ -144,15 +139,8 @@ describe("public content contract", () => {
   test("never transfers current admission to another version", () => {
     expect(isAdmittedRelease("0.7.1")).toBe(true);
     const admittedContent = { ...publicContent, releaseVersion: admittedReleaseVersion };
-    const admittedReadme = renderReadmeMarkdown(admittedContent);
-    expect(admittedReadme).toContain("The v0.7.1 CLI artifacts passed immutable GitHub and npm release admission");
-    expect(admittedReadme).toContain("https://github.com/hraness/hra/actions/runs/34367591503");
-    expect(admittedReadme).toContain("attempt 2. Artifact admission does not authorize daemon startup.");
-    expect(admittedReadme.indexOf("The v0.7.1 CLI artifacts passed"))
-      .toBeLessThan(admittedReadme.indexOf(admittedContent.installCommand));
-    expect(admittedReadme).toContain("Install and verify the admitted v0.7.1 CLI artifact. This does not start the daemon:");
     expect(renderLlmsText(admittedContent)).toContain("Install the admitted v0.7.1 local CLI artifact");
-    for (const surface of [admittedReadme, renderLlmsText(admittedContent)]) {
+    for (const surface of [renderLlmsText(admittedContent)]) {
       expect(surface).not.toContain("The v0.7.1 candidate is not yet admitted");
       expect(surface).toContain(admittedContent.daemonRolloutNotice);
     }
@@ -161,13 +149,13 @@ describe("public content contract", () => {
     }
     for (const version of ["0.7.2", "0.8.0"]) {
       const content = { ...publicContent, releaseVersion: version };
-      const readme = renderReadmeMarkdown(content);
-      expect(readme).toContain(`The v${version} candidate is not yet admitted.`);
-      expect(readme).toContain("For the admitted v0.7.1 artifact");
-      expect(readme.indexOf(`The v${version} candidate is not yet admitted.`))
-        .toBeLessThan(readme.indexOf(content.installCommand));
-      expect(readme).not.toContain(`The v${version} CLI artifacts passed`);
-      for (const surface of [readme, renderLlmsText(content)]) {
+      const llms = renderLlmsText(content);
+      expect(llms).toContain("This release candidate is not yet admitted.");
+      expect(llms).toContain("https://github.com/hraness/hra/blob/v0.7.1/docs/beta-release-notes.md#install");
+      expect(llms.indexOf("This release candidate is not yet admitted."))
+        .toBeLessThan(llms.indexOf(content.installCommand));
+      expect(llms).not.toContain(`Install the admitted v${version} local CLI artifact`);
+      for (const surface of [llms]) {
         expect(surface).toContain("Only after immutable GitHub release admission");
         expect(surface).toContain(content.daemonRolloutNotice);
       }
@@ -218,37 +206,30 @@ describe("public content contract", () => {
     });
   });
 
-  test("opens the concise README with the product, its interfaces, and a guarded install path", () => {
-    const markdown = renderReadmeMarkdown();
-    const lines = markdown.split("\n");
-    const badgeLine = publicContent.badges.map((badge) =>
-      `[![${badge.alt}](${badge.image})](${badge.href})`,
-    ).join(" ");
-    expect(lines[0]).toBe("# HRA");
-    expect(lines[1]).toBe(`${badgeLine}\\`);
-    expect(lines[2]).toBe(publicContent.thesis);
-    expect(lines[3]).toBe("");
-    expect(lines[4]).toBe(publicContent.statusLine);
+  test("keeps website positioning and install claims independent of the technical package description", () => {
+    const markdown = renderLlmsText();
+    expect(markdown.split("\n")[0]).toBe("# HRA");
+    expect(markdown).toContain(publicContent.thesis);
+    expect(markdown).toContain(publicContent.statusLine);
     expect(publicContent.statusLine).toContain("Local CLI v0.8.0 is a release candidate, not an admitted artifact");
     expect(publicContent.statusLine).toContain("hosted sync is live as an open beta");
-    expect(markdown).toContain(`> ${publicContent.installNotice} [Admitted release installation notes](${publicContent.links.admittedInstall}).`);
+    expect(markdown).toContain(publicContent.installNotice);
+    expect(markdown).toContain(publicContent.links.admittedInstall);
     expect(markdown.indexOf(publicContent.installNotice)).toBeLessThan(markdown.indexOf(publicContent.installCommand));
     expect(publicContent.thesis).toContain("browser");
     expect(publicContent.thesis).toContain("terminal");
     expect(publicContent.thesis).toContain("execution on your own machines");
-    expect(markdown).toContain(`[Open HRA](${publicContent.links.app})`);
-    expect(markdown).toContain(`[Documentation](${publicContent.links.documentation})`);
-    expect(markdown).toContain(publicContent.hero.summary);
+    expect(renderSiteHtml()).toContain(`href="${publicContent.links.app}"`);
+    expect(markdown).toContain(`Documentation: ${publicContent.links.documentation}`);
+    expect(htmlVisibleText(renderSiteHtml())).toContain(publicContent.hero.summary);
     expect(markdown.indexOf(publicContent.thesis)).toBeLessThan(markdown.indexOf(publicContent.installCommand));
     expect(markdown.indexOf(publicContent.installCommand)).toBeLessThan(markdown.indexOf(publicContent.doctorCommand));
     expect(markdown).toContain(publicContent.daemonRolloutNotice);
-    expect(markdown).toContain("/docs/status/#install-and-update");
-    expect(markdown).not.toContain("## Command reference\n");
-    expect(markdown).not.toContain("### Update runbook\n");
-    expect(markdown).not.toContain("## First account\n");
-    expect(markdown).not.toContain("## Privacy\n");
-    expect(markdown).not.toContain(`\n${publicContent.initCommand}\n`);
-    expect(markdown).toContain("1. **Start:** `" + publicContent.hero.steps[0]!.command + "`.");
+    expect(markdown).toContain("/docs/status/");
+    expect(htmlVisibleText(renderSiteHtml())).toContain(publicContent.hero.steps[0]!.command);
+    expect(packageJson.description).not.toBe(publicContent.description);
+    expect(markdown).not.toContain(packageJson.description);
+    expect(renderSiteHtml()).not.toContain(packageJson.description);
   });
 
   test("publishes trust-signal badges pinned to the package manifest", () => {
@@ -277,7 +258,7 @@ describe("public content contract", () => {
     expect(renderSiteHtml()).not.toContain("img.shields.io");
   });
 
-  test("states one neutral positioning in the manifest, JSON-LD, social card, and llms.txt", () => {
+  test("states one neutral website positioning in JSON-LD, social card, and llms.txt", () => {
     const html = renderSiteHtml();
     const jsonLd = /<script type="application\/ld\+json">([\s\S]*?)<\/script>/u.exec(html)?.[1];
     expect(jsonLd).toBeDefined();
@@ -285,7 +266,6 @@ describe("public content contract", () => {
 
     expect(publicContent.tagline).toBe("Workspace for Codex and Claude Code");
     expect(publicContent.providerRoadmap).toBe("Codex and Claude Code, side by side.");
-    expect(packageJson.description).toBe(publicContent.description);
     expect(publicContent.description).toContain("workspace for Codex and Claude Code");
     expect(publicContent.description).toContain("browser or terminal");
     expect(structured).toMatchObject({
@@ -378,11 +358,7 @@ describe("public content contract", () => {
   });
 
   test("identifies the product maintainer without repeating a brand explanation", () => {
-    const markdown = renderReadmeMarkdown();
     expect(publicContent.maintainer).toEqual({ name: "Hraness", url: "https://hraness.com/" });
-    expect(markdown).toContain("HRA is maintained by [Hraness](https://hraness.com/) and published under the MIT license.");
-    expect(markdown.match(/HRA is maintained by/gu)).toHaveLength(1);
-    expect(markdown).not.toContain("short for harness");
     const resources = oneElement(renderSiteHtml(), "aside.project-resources");
     expect(resources.textContent).toContain("MIT licensed");
     expect(resources.querySelector('a[href="https://hraness.com/"]')).toBeNull();
@@ -391,13 +367,11 @@ describe("public content contract", () => {
 
   test("publishes no em dash on any generated public surface", () => {
     for (const [label, surface] of [
-      ["README", renderReadmeMarkdown()],
       ["PRIVACY", renderPrivacyMarkdown()],
       ["llms.txt", renderLlmsText()],
       ["site", renderSiteHtml()],
       ["privacy page", renderPrivacyHtml()],
       ["preview", renderPreviewHtml()],
-      ["package description", packageJson.description],
       ...docsPages.map((page) => [page.path, renderDocsHtml(page)] as const),
       ...docsPages.map((page) => [`${page.path}index.md`, renderDocsMarkdown(page.path)] as const),
     ] as const) {
@@ -484,7 +458,7 @@ describe("public content contract", () => {
 
       expect(surface).not.toContain("Beta not yet live");
     }
-    for (const surface of [renderReadmeMarkdown(), renderLlmsText(), markdown, renderDocsMarkdown("/docs/start/")]) {
+    for (const surface of [renderLlmsText(), markdown, renderDocsMarkdown("/docs/start/")]) {
       expect(surface).toContain(publicContent.links.admittedInstall);
       const noticePosition = surface.indexOf(publicContent.installNotice);
       const commandPosition = surface.indexOf(publicContent.installCommand);
@@ -492,7 +466,7 @@ describe("public content contract", () => {
       expect(commandPosition).toBeGreaterThanOrEqual(0);
       expect(noticePosition).toBeLessThan(commandPosition);
     }
-    for (const surface of [renderReadmeMarkdown(), renderLlmsText()]) {
+    for (const surface of [renderLlmsText()]) {
       expect(surface).toContain("admitted v0.7.1");
       expect(surface).toContain(publicContent.daemonRolloutNotice);
       expect(surface).toContain("/docs/status/");
@@ -505,8 +479,6 @@ describe("public content contract", () => {
     expect(reference).toContain("v0.7.1");
     expect(reference).toContain("admitted local CLI release and are retained in the `v0.8.0` candidate");
     expect(renderLlmsText()).toContain("Only after immutable GitHub release admission, install the v0.8.0 local CLI artifact");
-    expect(renderReadmeMarkdown()).toContain("Only after immutable GitHub release admission, install and verify the v0.8.0 candidate CLI artifact. This does not start the daemon:");
-    expect(renderReadmeMarkdown()).toContain("The v0.8.0 candidate is not yet admitted");
     for (const path of ["/docs/start/", "/docs/status/"] as const) {
       const guideHtml = renderDocumentationHtml(path);
       expect(guideHtml).toContain(publicContent.links.admittedInstall);
@@ -535,8 +507,6 @@ describe("public content contract", () => {
       .toBeLessThan(setup.indexOf(publicContent.initCommand));
     expect(setup.indexOf(publicContent.doctorCommand)).toBeLessThan(setup.indexOf(publicContent.initCommand));
     expect(oneElement(setupHtml, "#connect-an-account aside.notice").textContent).toContain("before the steps below");
-    const readme = renderReadmeMarkdown();
-    expect(readme.indexOf(prerequisite)).toBeLessThan(readme.indexOf(publicContent.hero.steps[0]!.command));
     const llms = renderLlmsText();
     expect(llms.indexOf(prerequisite)).toBeLessThan(llms.indexOf(publicContent.initCommand));
     const home = htmlVisibleText(renderSiteHtml());
@@ -573,7 +543,6 @@ describe("public content contract", () => {
   test("states one hosted sign-up claim everywhere and switches it in one place", () => {
     expect(publicContent.hostedSignup).toBe("open");
     for (const surface of [
-      renderReadmeMarkdown(),
       renderSiteHtml(),
       renderPrivacyMarkdown(),
     ]) {
@@ -874,7 +843,6 @@ describe("public content contract", () => {
       }
     }
     expect(parseHTML(home).document.querySelectorAll("section.documentation-section")).toHaveLength(0);
-    expect(renderReadmeMarkdown()).not.toContain("## Command reference\n");
   });
 
   test("keeps the full privacy boundary on its canonical HTML and Markdown surfaces", () => {
@@ -919,7 +887,6 @@ describe("public content contract", () => {
         expect(surface).toContain(claim.replaceAll("'", "&#39;"));
       }
     }
-    expect(renderReadmeMarkdown()).toContain(publicContent.links.privacy);
     expect(renderSiteHtml()).toContain('href="/privacy/"');
   });
 
@@ -1531,7 +1498,6 @@ describe("public content contract", () => {
     const publicDocuments = [
       renderSiteHtml(),
       renderLlmsText(),
-      renderReadmeMarkdown(),
       renderSitemapXml(),
     ];
 

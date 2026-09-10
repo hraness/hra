@@ -1,20 +1,18 @@
 # HRA
-[![npm version](https://img.shields.io/npm/v/%40hraness%2Fhra)](https://www.npmjs.com/package/@hraness/hra) [![provenance: sigstore](https://img.shields.io/badge/provenance-sigstore-2e7d32)](https://www.npmjs.com/package/@hraness/hra#provenance) [![CI](https://img.shields.io/github/actions/workflow/status/hraness/hra/ci.yml?branch=main&label=CI)](https://github.com/hraness/hra/actions/workflows/ci.yml) [![license: MIT](https://img.shields.io/npm/l/%40hraness%2Fhra)](https://github.com/hraness/hra/blob/main/LICENSE) [![Bun 1.3.14](https://img.shields.io/badge/Bun-1.3.14-14151a)](https://bun.sh) [![runtime: Codex 0.153.2](https://img.shields.io/badge/runtime-Codex%200.153.2-0b5fa5)](https://www.npmjs.com/package/@openai/codex/v/0.153.2) [![runtime: Claude Code 2.1.260](https://img.shields.io/badge/runtime-Claude%20Code%202.1.260-6f42c1)](https://github.com/hraness/hra/blob/main/docs/providers/claude.md)\
-HRA brings your Codex and Claude Code sessions into one workspace. Follow the work in your browser, direct it from your terminal, and keep execution on your own machines.
 
-Status: public beta. Local CLI v0.8.0 is a release candidate, not an admitted artifact; v0.7.1 remains the fully admitted public artifact. Codex runs on macOS and Linux, Claude Code on Linux; hosted sync is live as an open beta. Current daemon and hosted command-writer rollout remains blocked on capacity.
+`@hraness/hra` supplies the `hra` command and local daemon. It manages isolated Codex and Claude Code profiles, durable sessions and command records, and optional encrypted sync. Provider tools own authentication and execution; HRA does not broker model access.
 
-[Open HRA](https://app.hra.sh) · [Documentation](https://hra.sh/docs/) · [Availability](https://hra.sh/docs/status/)
+Local CLI v0.8.0 is a release candidate, not an admitted artifact; v0.7.1 remains the fully admitted public artifact. Current daemon and hosted command-writer rollout remains blocked on capacity.
 
-See what’s running, follow the conversation, and decide what happens next. HRA brings your Codex and Claude Code sessions together in a web workspace, with a CLI for you and your agents.
+[CLI reference](https://hra.sh/docs/reference/) · [Availability](https://hra.sh/docs/status/)
 
-- **See the whole workspace.** A grid of sessions shows what is running and what needs your attention. Open a card to read the conversation.
-- **Pick up the next turn.** Send a follow-up from the browser or terminal. The session runs on its machine, even after you close the tab.
-- **Keep accounts separate.** Choose the provider profile for the work. Each managed profile has its own configuration; HRA does not rotate accounts for you.
+## Requirements
+
+Use Bun 1.3.14. Codex execution supports macOS and Linux; Claude Code execution supports Linux. The pinned provider runtimes are Codex 0.153.2 and Claude Code 2.1.260. The local CLI does not need an HRA cloud identity. Optional encrypted sync requires a paired machine and browser; its open-beta availability does not authorize daemon startup or hosted command writers.
 
 ## Get started
 
-Public beta. Codex execution supports macOS and Linux; Claude Code execution supports Linux. The local CLI does not need an HRA cloud identity. The web workspace uses optional encrypted sync and requires a paired machine and browser.
+Use the exact tagged installer for the artifact you intend to install. It checks the release identity and source digests before installation. Do not replace its command with a moving package tag.
 
 > This release candidate is not yet admitted. The v0.8.0 install command is unavailable until its immutable GitHub artifact passes exact release admission. The optional npm mirror has separate admission. The last admitted release is v0.7.1; use its immutable installation notes for the existing artifact. [Admitted release installation notes](https://github.com/hraness/hra/blob/v0.7.1/docs/beta-release-notes.md#install).
 
@@ -34,30 +32,28 @@ hra doctor --offline
 
 Continue with the [setup guide](https://hra.sh/docs/start/). For an existing installation, use the [ordered update runbook](https://hra.sh/docs/status/#install-and-update).
 
-## Use the interface that fits the work
-
-- [Web workspace](https://hra.sh/docs/web/): see the session grid, read a conversation, and send a follow-up from a paired browser.
-- [Sessions and accounts](https://hra.sh/docs/sessions/): inspect account usage, continue a conversation, switch providers, or recover a stopped session.
-- [CLI reference](https://hra.sh/docs/reference/): command families, structured JSON, cursor-based event streams, memory, and automation.
-
-### The same work, from your terminal.
+## CLI usage
 
 These examples require a machine whose setup and rollout prerequisites are satisfied.
 
-1. **Start:** `hra session start personal --provider codex --json`. Create a Codex session under the account profile you choose.
-2. **Inspect:** `hra session status <session-id> --json`. Read the session and the cursor where its event stream continues.
-3. **Switch:** `hra session switch <session-id> --provider claude --preset fable-max`. Continue on your signed-in Claude Code profile. HRA carries over the conversation it has retained and flags any missing history.
-4. **Direct:** `hra session send <session-id> -- "Review this project."`. Send the next request to that session and provider.
+- `hra session start personal --provider codex --json` starts a session under the selected account profile.
+- `hra session status <session-id> --json` reads session status and its event cursor.
+- `hra session switch <session-id> --provider claude --preset fable-max` requests a provider switch using retained conversation history. It requires a signed-in Claude Code profile and reports missing history.
+- `hra session send <session-id> -- "Review this project."` sends a request to the session's current provider.
+
+Use `hra --help` for command groups and `--json` for structured output. Inspect an uncertain mutation before retrying it; do not replay a failed or ambiguous request under another account.
 
 ## Local execution, optional encrypted sync
 
-**Your accounts, your provider tools.** Codex and Claude Code own their sign-in and execution. HRA keeps managed profiles separate and does not broker model access.
-
-**Local by default.** The local daemon runs the sessions. The CLI works without an HRA cloud identity; optional sync connects the web workspace and your other devices.
-
-**Encrypted before it leaves the machine.** Synced session content is encrypted for paired devices. The service still sees account and delivery metadata, described in the privacy policy.
+The local daemon owns session execution on one machine. Managed profiles have separate configuration. Synced session content is encrypted for paired devices; the service still receives account and delivery metadata. Provider credentials and raw reasoning are not sync payloads.
 
 Read the [privacy policy](https://github.com/hraness/hra/blob/main/PRIVACY.md) for the local, synced, and website data boundaries.
+
+## Package contents
+
+The npm archive contains CLI and daemon source, this package README, the license, and third-party notices. Website assets and website-authored content are not package inputs. The package has no install lifecycle scripts; runtime dependencies are exact public registry versions.
+
+An interrupted installer must be recovered using its exact originating release. Do not edit or delete its durable intent, receipt, staging directory, or previous installation. Follow the [ordered update runbook](https://hra.sh/docs/status/#install-and-update) and stop if exact recovery cannot be established.
 
 ## Project
 

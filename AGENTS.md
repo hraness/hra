@@ -2,7 +2,7 @@
 
 - `src/` contains the Bun CLI, daemon, local authority, Codex and Claude Code adapters, and cloud client.
 - `convex/` contains the optional encrypted sync and verified-email device authority.
-- `site/` contains the public product website, task-oriented documentation, and shared README content contract.
+- `site/` contains the public product website and task-oriented documentation. Its content is not an input to the npm package README or description.
 - `scripts/` contains deterministic checks, builds, and release helpers.
 - `kb/` contains maintained product knowledge and executable implementation plans.
 - `.agents/skills/` contains the portable five-skill phased planning and execution pack.
@@ -27,7 +27,7 @@
 - Keep `--json` stable and machine-readable. Write data to stdout and diagnostics to stderr. Use closed exit codes and bound every input, output, timeout, page, queue, and retry.
 - Colocate deterministic examples with each failure mode and property tests with parsers, reducers, ordering, state transitions, and round trips.
 - Give each owned source boundary an `AGENTS.md` with exactly `# Contents` and `# Guidelines`.
-- Follow `WRITING.md` for repository prose and `STYLE.md` for public copy. Keep README and website claims byte-derived from one content source.
+- Follow `WRITING.md` for repository prose and `STYLE.md` for public copy. Author root `README.md` and the package description for package users independently of website content. Check each surface's commands, claims and release limits against the authoritative runtime and release contracts; website builds must not write the package README.
 - Update the active plan in `kb/plans/` as work changes. Do not call a phase complete without the acceptance evidence named there.
 - Preserve public independence. Do not include private paths, credentials, private package dependencies, internal project names, or unpublished provenance.
 

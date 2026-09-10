@@ -131,6 +131,26 @@ describe("public text policy", () => {
     }), { numRuns: 40, seed: 20260908 });
   });
 
+  test("admits the exact Oompa rename coordinate without admitting unreviewed siblings or sensitive text", () => {
+    const name = "@hraness/oompa";
+    // This is permission to describe the planned public coordinate, not proof
+    // that an artifact exists or that its publication/installation is admitted.
+    for (const value of [name, `${name}@0.8.0`, `package ${name} is not yet admitted`]) {
+      expect(() => assertPublicText(value, "Oompa public identity")).not.toThrow();
+    }
+    expect(() => assertPublicText("@hraness/hra", "immutable predecessor identity")).not.toThrow();
+    fc.assert(fc.property(fc.constantFrom("-", ".", "_", ""),
+      fc.stringMatching(/^[a-z][a-z0-9]{0,12}$/u), (separator, suffix) => {
+        expect(() => assertPublicText(`${name}${separator}${suffix}`, "unreviewed Oompa sibling"))
+          .toThrow(PublicTextPolicyError);
+      }), { seed: 20_260_910, numRuns: 40 });
+    const secret = ["github", "pat", "abcdefghijklmnopqrstuvwxyz123456"].join("_");
+    for (const sensitive of [secret, syntheticPrivatePath(), ["@hraness", "private-package"].join("/")]) {
+      expect(() => assertPublicText(`${name}\n${sensitive}`, "Oompa identity with private content"))
+        .toThrow(PublicTextPolicyError);
+    }
+  });
+
   test("public Direct imports do not exempt nearby credentials or private paths", () => {
     const publicImport = 'import { installDirectBrowser } from "@hraness/direct/web";';
     const secret = ["github", "pat", "abcdefghijklmnopqrstuvwxyz123456"].join("_");
