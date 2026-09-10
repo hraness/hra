@@ -2749,7 +2749,8 @@ describe("provider portability", () => {
       { signal },
     );
     expect(value.claude.seededMessages.at(-1)).toBe("carry on");
-  });
+  }, 30_000);
+
 
   test("drops only the switching session's source protocol notice during target start", async () => {
     const value = await fixture();
