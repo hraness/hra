@@ -328,7 +328,7 @@ describe("host-wide resource wrapper", () => {
         cwd: root,
         env: {
           ...environment,
-          OOMPA_ATET_HOST_RESOURCES_MODULE: modulePath,
+          OOMPA_SLOPCAMERA_HOST_RESOURCES_MODULE: modulePath,
           OOMPA_LOCAL_EFFICIENCY_STATE_ROOT: join(root, "state", "host-resources-v1"),
           OOMPA_LOCAL_EFFICIENCY_TELEMETRY: "off",
         },
@@ -411,7 +411,7 @@ describe("host-wide resource wrapper", () => {
           cwd: root,
           env: {
             ...environment,
-            OOMPA_ATET_HOST_RESOURCES_MODULE: modulePath,
+            OOMPA_SLOPCAMERA_HOST_RESOURCES_MODULE: modulePath,
             OOMPA_LOCAL_EFFICIENCY_STATE_ROOT: join(root, "state", "host-resources-v1"),
             OOMPA_LOCAL_EFFICIENCY_TELEMETRY: "off",
           },

@@ -132,7 +132,7 @@ function legacyInstallation(root: string): {
     bunBin,
     claudeHome,
     codexHome,
-    environment: { ...fakeClaude(root), OOMPA_ATET_HOST_RESOURCES_MODULE: modulePath },
+    environment: { ...fakeClaude(root), OOMPA_SLOPCAMERA_HOST_RESOURCES_MODULE: modulePath },
     priorTargets,
   };
 }
@@ -457,7 +457,7 @@ describe("machine bootstrap", () => {
     const bunBin = join(root, "bin");
     const modulePath = join(root, "host-resources.js");
     writeFileSync(modulePath, "export const createHostResourceCoordinator = () => ({})\n");
-    const environment = { ...fakeClaude(root), OOMPA_ATET_HOST_RESOURCES_MODULE: modulePath };
+    const environment = { ...fakeClaude(root), OOMPA_SLOPCAMERA_HOST_RESOURCES_MODULE: modulePath };
 
     const applied = Bun.spawnSync({ cmd: bootstrapArguments("--apply", root), env: environment, stderr: "pipe" });
     expect(applied.exitCode, applied.stderr.toString()).toBe(0);

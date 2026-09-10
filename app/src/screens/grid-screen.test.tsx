@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, mock, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import { parseHTML } from "linkedom";
-import { parseDeviceRegistryPayload } from "../hra/cloud";
+import { parseDeviceRegistryPayload } from "../oompa/cloud";
 import { toMachineView, type MachineView } from "../model/settings-view";
 
 let loading = false;

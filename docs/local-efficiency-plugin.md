@@ -117,17 +117,17 @@ Session silence remains a review heuristic. The audit never writes the Codex dat
 ## Scheduler runtime identity
 
 Plugin 0.4.4 adopts the Slopcamera runtime name and an immutable source pin.
-The existing HRA ledger and inherited lease identities remain unchanged.
+The existing Oompa ledger and inherited lease identities remain unchanged.
 
 The local plugin retains a minimal, checksum-verified Slopcamera host-resource
 module at an immutable source commit. The runtime cache directory includes that
-commit. This cache is separate from HRA's stable resource and capability ledgers.
-HRA passes its own state roots and profile IDs explicitly, so an upstream default
-namespace change does not create another HRA admission domain.
+commit. This cache is separate from Oompa's stable resource and capability ledgers.
+Oompa passes its own state roots and profile IDs explicitly, so an upstream default
+namespace change does not create another Oompa admission domain.
 
 Before changing the pin, qualify both library directions with the opt-in
 `host-runtime-compatibility.process.test.ts` against isolated temporary state.
-Set `HRA_PREVIOUS_HOST_RESOURCES_MODULE` and `HRA_SLOPCAMERA_HOST_RESOURCES_MODULE`
+Set `OOMPA_PREVIOUS_HOST_RESOURCES_MODULE` and `OOMPA_SLOPCAMERA_HOST_RESOURCES_MODULE`
 to exact verified module files and use the installed host scheduler. The test
 proves an admitted holder excludes the other library until release, then verifies
 its later ticket, identical profile hash and complete lease cleanup. Ordinary
