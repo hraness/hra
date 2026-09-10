@@ -8,6 +8,8 @@ import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Switch } from "../components/ui/switch";
 import { AccountLoginRelay } from "../components/account-login-relay";
+import { UsageBreakdown } from "../components/usage-breakdown";
+import type { SettingsSection as SettingsSectionId } from "../routing/route";
 import {
   BackIcon,
   ChoiceGroup,
@@ -1132,8 +1134,16 @@ function DeviceRow({ device, now }: Readonly<{ device: DeviceView; now: number }
  * Self contained on purpose: it takes only `onBack`, so the router that owns
  * `#/settings` decides where back goes without this screen knowing about it.
  */
-export function SettingsScreen({ onBack }: Readonly<{ onBack: () => void }>) {
+export function SettingsScreen({ onBack, section = null }: Readonly<{
+  onBack: () => void;
+  /** A section to scroll into view on arrival, e.g. from the grid's usage meter. */
+  section?: SettingsSectionId | null;
+}>) {
   const { signOut } = useAuthActions();
+  useEffect(() => {
+    if (section === null) return;
+    document.getElementById(section)?.scrollIntoView({ block: "start" });
+  }, [section]);
   const registries = useDeviceRegistries();
   const { devices, loading: devicesLoading } = useDevices();
   // Readiness and `now` must come from one hosted-clock instance. Otherwise
@@ -1160,6 +1170,8 @@ export function SettingsScreen({ onBack }: Readonly<{ onBack: () => void }>) {
       </header>
 
       <main {...stylex.props(styles.main)}>
+        <UsageBreakdown />
+
         <SettingsSection
           description="Each machine publishes its own defaults. A change is sent as a durable command and applies when the daemon picks it up."
           title="Machines"

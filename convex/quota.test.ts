@@ -501,7 +501,7 @@ describe("hosted quota authority", () => {
       userId: conservativeIdentifier,
     };
     const maximumLogicalBytes = logicalDocumentBytes(maximumUsageDocument);
-    expect(maximumLogicalBytes).toBe(11_599);
+    expect(maximumLogicalBytes).toBe(11_642);
     // The open-beta free tier makes this statement per Codex account. One
     // account's worst-case telemetry before any row becomes cleanup-eligible
     // stays under a tenth of the tier, and the tier holds twelve such accounts
@@ -513,7 +513,7 @@ describe("hosted quota authority", () => {
       * USER_RESOURCE_QUOTAS.codex_account;
     expect(conservativeUserRecords).toBe(46_592);
     expect(conservativeUserRecords).toBeLessThan(CATEGORY_QUOTAS.usage.records);
-    expect(conservativeAccountUsageBytes).toBe(16_888_144);
+    expect(conservativeAccountUsageBytes).toBe(16_950_752);
     expect(conservativeAccountUsageBytes * 10)
       .toBeLessThan(USER_TOTAL_QUOTA.logicalBytes);
     expect(Math.floor(USER_TOTAL_QUOTA.logicalBytes / conservativeAccountUsageBytes))

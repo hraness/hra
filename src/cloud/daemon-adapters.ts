@@ -94,6 +94,7 @@ import {
   isUuidV7,
   redactAbsolutePaths,
   type AuthorityTuple,
+  isSafeNonNegativeInteger,
 } from "./contracts";
 import type { CloudProjectionRecoveryBaselineInteraction } from "./daemon-journal";
 import { deviceCommandGuardDecision } from "./device-command-policy";
@@ -2355,10 +2356,11 @@ export function projectStoredUsage(payload: unknown): UsageProjection {
     const rateLimits = parseRateLimits({
       rateLimits: payload.rateLimits.primary,
       rateLimitsByLimitId: payload.rateLimits.byLimitId,
-      // Reset inventory is intentionally local-only and never enters the
-      // encrypted usage projection or its compatibility parser.
+      // The local reset decision keeps its own authority; the projection only
+      // carries the count so the browser meter can show what is left.
       rateLimitResetCredits: null,
     });
+    const resetCredits = payload.rateLimits.resetCreditsAvailable;
     const limits: UsageLimit[] = [usageLimit(rateLimits.primary, "primary", false)];
     for (const [key, snapshot] of Object.entries(rateLimits.byLimitId ?? {})) {
       if (limits.length >= USAGE_CLOUD_PROJECTION_MAX_LIMITS) break;
@@ -2376,6 +2378,7 @@ export function projectStoredUsage(payload: unknown): UsageProjection {
         longestRunningTurnSeconds: usage.summary.longestRunningTurnSec ?? 0,
         longestStreakDays: usage.summary.longestStreakDays ?? 0,
         peakDailyTokens: usage.summary.peakDailyTokens ?? 0,
+        ...(isSafeNonNegativeInteger(resetCredits) ? { resetCredits } : {}),
       },
     };
     return parseUsageProjection(projection) ?? { state: "failed" };

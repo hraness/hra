@@ -47,4 +47,8 @@ If a response is lost, replay the exact original command, including its key and 
 
 Effective Codex disable suppresses new automatic reset-credit dispatches, including retries. An uncertain existing attempt retains its original key and remains recovery-pending. Disabling after durable reset admission does not cancel that provider operation or discard its result. Usage observation continues.
 
-These controls do not yet provide automatic account movement, managed-send forwarding, or the planned browser usage view. Claude native fallback remains unavailable without its separate pinned live-acceptance proof. Existing explicit account selection is unchanged.
+These controls do not yet provide automatic account movement or managed-send forwarding. Claude native fallback remains unavailable without its separate pinned live-acceptance proof. Existing explicit account selection is unchanged.
+
+## Browser usage meter
+
+The web app reads the hosted usage projection that each machine uploads for its signed-in Codex accounts. The grid shows one compact meter across every account and machine: the mean remaining percent of each account's binding window, the earliest reset, the projected reset credits, the summed token rate over recent observations, and whether the reset or the limit comes first at the current pace. Settings holds the breakdown per account: every limit's windows with used percent and reset countdown, reset credits, throughput, the runway at the current pace, and a short history of the binding window. The projection now carries the reset-credit count as an optional field; a machine on an older daemon shows no credit count rather than zero. The browser only reads; it never spends a reset credit or changes an account.

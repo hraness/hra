@@ -1,7 +1,7 @@
 /**
  * The one seam between the browser app and the repository source.
  *
- * Only `src/cloud/{crypto,projection,payloads,contracts,client}` and
+ * Only `src/cloud/{crypto,projection,payloads,contracts,client,usage}` and
  * `src/domain/*` are browser safe. Every other `src/cloud` module reaches for
  * node built-ins, the local daemon, or on-disk secret custody and must never
  * enter this bundle. Keeping the deep relative paths in one file makes the
@@ -98,6 +98,7 @@ export {
   decryptNotificationHours,
   decryptProfileBinding,
   decryptSessionMetadata,
+  decryptUsageProjection,
   deviceCommandLoginResultLifetimeMs,
   deviceCommandLimits,
   deviceRegistryLimits,
@@ -159,3 +160,11 @@ export {
   remoteInteractionAnswerLimits,
   remoteInteractionJsonFitsProviderLimit,
 } from "../../../src/domain/remote-interaction-contract";
+
+export {
+  parseUsageEncryptedEnvelope,
+  type UsageLimit,
+  type UsageProjection,
+  type UsageReady,
+  type UsageWindow,
+} from "../../../src/cloud/usage";

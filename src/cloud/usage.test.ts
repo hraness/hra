@@ -33,6 +33,7 @@ function maximumUsageProjection() {
       longestRunningTurnSeconds: Number.MAX_SAFE_INTEGER,
       longestStreakDays: Number.MAX_SAFE_INTEGER,
       peakDailyTokens: Number.MAX_SAFE_INTEGER,
+      resetCredits: Number.MAX_SAFE_INTEGER,
     },
     state: "ready",
   } as const;
@@ -76,6 +77,15 @@ describe("usage projection laws", () => {
       ...envelope,
       ciphertext: `${envelope.ciphertext}A`,
     })).toBeNull();
+  });
+
+  test("accepts a projection without reset credits and refuses a malformed count", () => {
+    expect(parseUsageProjection(ready)).toEqual(ready);
+    const withCredits = { ...ready, data: { ...ready.data, resetCredits: 3 } } as const;
+    expect(parseUsageProjection(withCredits)).toEqual(withCredits);
+    expect(parseUsageProjection({ ...ready, data: { ...ready.data, resetCredits: -1 } })).toBeNull();
+    expect(parseUsageProjection({ ...ready, data: { ...ready.data, resetCredits: 1.5 } })).toBeNull();
+    expect(parseUsageProjection({ ...ready, data: { ...ready.data, resetCredits: null } })).toBeNull();
   });
 
   test("keeps unavailable distinct from a ready zero", () => {

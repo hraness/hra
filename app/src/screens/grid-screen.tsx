@@ -14,6 +14,7 @@ import { ComposerTextarea } from "../components/composer-textarea";
 import { SettingsIcon } from "../components/icons";
 import { SessionCard } from "../components/session-card";
 import { Button } from "../components/ui/button";
+import { UsageMeter } from "../components/usage-meter";
 import { useCardOrder } from "../data/card-order";
 import {
   deviceCommandCommittedRowUnavailableMessage,
@@ -331,6 +332,7 @@ export function GridScreen(): ReactNode {
           ) : null}
           <p {...stylex.props(gridScreenStyles.quiet)}>{hint}</p>
         </div>
+        <UsageMeter />
         {startNotice === null ? null : (
           <p
             {...stylex.props(startNotice.tone === "error" ? gridScreenStyles.danger : gridScreenStyles.quiet)}

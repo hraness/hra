@@ -200,9 +200,9 @@ export default tseslint.config(
     files: ["app/**/*.ts", "app/**/*.tsx"],
     rules: layerRules([
       {
-        regex: "(^|/)src/(?!cloud/(client|contracts|crypto|payloads|projection)(\\.ts)?$)(?!domain/)",
+        regex: "(^|/)src/(?!cloud/(client|contracts|crypto|payloads|projection|usage)(\\.ts)?$)(?!domain/)",
         message:
-          "app/ imports repository source only from src/cloud/{crypto,projection,payloads,contracts,client} and src/domain/*, through app/src/oompa/.",
+          "app/ imports repository source only from src/cloud/{crypto,projection,payloads,contracts,client,usage} and src/domain/*, through app/src/oompa/.",
       },
     ]),
   },

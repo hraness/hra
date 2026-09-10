@@ -30,7 +30,7 @@ function RoutedScreens() {
   const route = useRoute();
   switch (route.kind) {
     case "settings":
-      return <SettingsScreen onBack={navigateBack} />;
+      return <SettingsScreen onBack={navigateBack} section={route.section} />;
     case "grid":
       return <GridScreen />;
   }

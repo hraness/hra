@@ -26,6 +26,8 @@ const reviewedResourceFunctionSha256s = new Set([
   "c8930b3dbd9f7a698c3f9089d32ba982b9684cf87625a70a44f8a75cf75f7a40",
   // Inline-conversation cards (2026-09-10): same function, new identifiers.
   "78bf0a7eede24af540a4a0068a29919376f5cc95c573f1ed9d539fe38ab1dbf3",
+  // Usage meter (2026-09-10): same function, new identifiers.
+  "c12ef99ca0bfd348356fed6b700a0418320b7b305e732dc168f1cd4961d6e3cf",
 ]);
 const stylexInjector = /stylex-inject|stylexInject|data-stylex|stylesheet-group/u;
 const unreviewedLiteralCall = /createElement\s*\(\s*["']style["']\s*\)|\.insertRule\s*\(/u;

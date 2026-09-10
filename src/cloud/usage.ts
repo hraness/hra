@@ -32,6 +32,12 @@ export type UsageReady = Readonly<{
   lifetimeTokens: number;
   peakDailyTokens: number;
   currentStreakDays: number;
+  /**
+   * Codex reset credits the account can still spend on its weekly window.
+   * Additive since the usage meter (2026-09-10): absent on projections from
+   * an older daemon, never absent-as-zero.
+   */
+  resetCredits?: number;
 }>;
 
 export type UsageProjection =
@@ -50,11 +56,13 @@ export type UsageSnapshotOrder = Readonly<{
 export const USAGE_CLOUD_PROJECTION_MAX_DAILY_ROWS = 1;
 export const USAGE_CLOUD_PROJECTION_MAX_LIMITS = 8;
 // Eight maximally wide limits, one daily row, maximal safe counters, maximal
-// finite window scalars, and 96 JSON six-byte escape sequences per name encode
-// to exactly 8,120 UTF-8 bytes. AES-GCM adds its 16-byte authentication tag;
-// unpadded base64url therefore requires exactly 10,848 characters.
-export const USAGE_CLOUD_PROJECTION_MAX_PLAINTEXT_BYTES = 8_120;
-export const USAGE_CLOUD_ENVELOPE_MAX_CIPHERTEXT_CHARACTERS = 10_848;
+// finite window scalars, 96 JSON six-byte escape sequences per name, and the
+// optional maximal reset-credit count encode to exactly 8,152 UTF-8 bytes.
+// AES-GCM adds its 16-byte authentication tag; unpadded base64url therefore
+// requires exactly 10,891 characters. (Before reset credits: 8,120 and
+// 10,848; every older envelope stays within the new bound.)
+export const USAGE_CLOUD_PROJECTION_MAX_PLAINTEXT_BYTES = 8_152;
+export const USAGE_CLOUD_ENVELOPE_MAX_CIPHERTEXT_CHARACTERS = 10_891;
 
 const datePattern = /^\d{4}-\d{2}-\d{2}$/u;
 const identifierPattern = /^[A-Za-z0-9_.:-]{1,96}$/u;
@@ -124,7 +132,9 @@ export function parseUsageProjection(value: unknown): UsageProjection | null {
     && (value.state === "unavailable" || value.state === "loading" || value.state === "failed")
   ) return { state: value.state };
   if (!hasExactKeys(value, ["data", "state"]) || value.state !== "ready") return null;
-  if (!isRecord(value.data) || !hasExactKeys(value.data, [
+  if (!isRecord(value.data)) return null;
+  const hasResetCredits = Object.hasOwn(value.data, "resetCredits");
+  if (!hasExactKeys(value.data, [
     "currentStreakDays",
     "daily",
     "lifetimeTokens",
@@ -132,7 +142,9 @@ export function parseUsageProjection(value: unknown): UsageProjection | null {
     "longestRunningTurnSeconds",
     "longestStreakDays",
     "peakDailyTokens",
+    ...(hasResetCredits ? ["resetCredits"] : []),
   ])) return null;
+  if (hasResetCredits && !isSafeNonNegativeInteger(value.data.resetCredits)) return null;
   if (
     !Array.isArray(value.data.limits)
     || value.data.limits.length > USAGE_CLOUD_PROJECTION_MAX_LIMITS
@@ -175,6 +187,7 @@ export function parseUsageProjection(value: unknown): UsageProjection | null {
       longestRunningTurnSeconds: value.data.longestRunningTurnSeconds,
       longestStreakDays: value.data.longestStreakDays,
       peakDailyTokens: value.data.peakDailyTokens,
+      ...(hasResetCredits ? { resetCredits: value.data.resetCredits as number } : {}),
     },
     state: "ready",
   } as const;

@@ -2,6 +2,11 @@
 
 Every entry names the release or the plan wave it belongs to. Unreleased work sits under the wave that produced it until a version ships.
 
+## Usage meter (unreleased)
+
+- The grid shows a compact Codex usage meter across every account and machine: remaining percent of the binding window, time to the next reset, reset credits, token rate, and whether the reset or the limit comes first. It opens the new Usage section in Settings (`#/settings/usage`) with each account's windows, reset countdowns, credits, throughput, runway and recent history.
+- The hosted usage projection gains an optional `resetCredits` field; its exact plaintext and ciphertext bounds grow to 8,152 bytes and 10,891 characters, and the hosted quota headroom statement is restated for the wider envelope. Older envelopes stay within the bound; the Convex deployment must carry the new bound before a maximal projection with credits is accepted.
+
 ## Inline conversations (unreleased)
 
 The web app keeps every conversation in its grid card and asks only for a prompt and a machine. Plan: `kb/plans/oompa-app-simplification.md`.

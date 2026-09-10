@@ -63,6 +63,7 @@ describe("closed encrypted payloads", () => {
         longestRunningTurnSeconds: Number.MAX_SAFE_INTEGER,
         longestStreakDays: Number.MAX_SAFE_INTEGER,
         peakDailyTokens: Number.MAX_SAFE_INTEGER,
+        resetCredits: Number.MAX_SAFE_INTEGER,
       },
       state: "ready",
     } as const;
