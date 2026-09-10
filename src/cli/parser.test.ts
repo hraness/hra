@@ -1036,6 +1036,18 @@ describe("CLI parser", () => {
     }
   });
 
+  test("rejects retired desktop account switching and recovery commands", () => {
+    for (const argv of [
+      ["account", "switch", "personal"],
+      ["account", "switch", "personal", "--json"],
+      ["account", "switch-recover"],
+      ["account", "switch-recover", "--json"],
+    ]) {
+      expect(() => parseCli(argv)).toThrow(CliUsageError);
+      expect(() => parseCli(argv)).toThrow("Unknown account action");
+    }
+  });
+
   test("keeps destructive local profile and project deletion out of the beta surface", () => {
     expect(() => parseCli(["account", "remove", "work"])).toThrow(CliUsageError);
     expect(() => parseCli(["project", "remove", "workspace"])).toThrow(CliUsageError);

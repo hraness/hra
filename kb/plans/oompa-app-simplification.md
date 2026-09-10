@@ -80,7 +80,7 @@ Unchanged: enrollment and `oompa device approve`, encrypted sync, the device-com
 
 - **Scope:** `src/desktop/`, `src/domain/desktop-switch.ts`, CLI parser and renderer entries, daemon command kinds and port, `installation.ts`, live-acceptance installation, tests, website section `desktop-account-switching`, FAQ lines, release notes, `docs/live-acceptance.md`, `AGENTS.md` mentions.
 - **Acceptance:** `oompa account switch` is an unknown command; `bun run check` passes; the package inventory pin is updated; no public text names the feature.
-- **Status:** Not started.
+- **Status:** Implemented in PR #179 (`claude/app-redesign-desktop`); required CI pending. Focused installer and recovery validation passes (61 tests); the retired CLI actions have explicit rejection coverage. Retained desktop-switch storage history stays intact.
 
 ### Phase 6. Usage meter and breakdown
 
@@ -102,3 +102,5 @@ Each phase is one pull request from `claude/app-redesign-<phase>` against `main`
 
 - 2026-09-10: Plan written from the app and daemon surveys. Worktree `hra-worktrees/oompa-redesign`, branch `claude/app-redesign`.
 - 2026-09-10: Phases 1 to 3 implemented together. Custody states are `unlocked`, `unlocking`, `unenrolled`; the lock screen, idle timer and shortcut are deleted. `session-card.tsx` holds the conversation (`conversation-panel.tsx` scroller with an "Earlier" loader and anchored scroll; `transcript-view.tsx` folds every closed response except the newest), the composer (`composer-textarea.tsx`, `model/composer.ts`), the interaction panel and a settings sheet limited to approvals and provider. `session-screen.tsx`, `streaming-tail.tsx` and the session route are removed. `sessionStartTargets` is per machine and resolves account, preset and project; the registry projects an optional `defaultProjectPublicId`. Browser acceptance (`scripts/app-browser.ts`) and the product examples render one card for the session views. The React DOM style-boundary hash set gains the new bundle's identifier allocation after a modulo-identifier diff against the reviewed function.
+
+- 2026-09-10: PR #179 installer-pin repair follows removal of desktop composition from the CLI: the documented pin updater binds the normalizer and staged runtime to the changed CLI bytes. Focused installer and recovery suites pass (61 tests), parser coverage passes (73 tests), and CI equivalence passes (33 tests). The unchanged compiled-browser gate passes with 204 evidence rows after the failed CI CSS negative-control sample did not recur locally. Final admission remains the unchanged Required CI gate.
