@@ -833,7 +833,7 @@ describe("browser acceptance boundaries", () => {
     expect(() => productionCsp({ headers: [] }, "/(.*)")).toThrow();
   });
   test("fixture replacement ownership is limited to IO", () => {
-    expect(browserIoModules).toHaveLength(8);
+    expect(browserIoModules).toHaveLength(9);
     expect(browserIoModules.every((path) => /^app\/src\/(data|custody)\//u.test(path))).toBe(true);
     expect(browserIoModules.some((path) => /\/(components|screens|model)\/|\.stylex/u.test(path))).toBe(false);
   });
