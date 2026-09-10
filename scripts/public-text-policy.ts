@@ -34,6 +34,7 @@ const allowedPublicScopedPackages = new Set([
   "@hraness/ui",
   "@stylexjs/babel-plugin",
   "@stylexjs/stylex",
+  "@vercel/routing-utils",
 ]);
 
 const secretPatterns = [

@@ -730,7 +730,7 @@ describe("static-site build", () => {
         ],
       },
       {
-        source: "/examples/app/:path*",
+        source: "/examples/app/:path(.*)",
         headers: [
           {
             key: "Content-Security-Policy",

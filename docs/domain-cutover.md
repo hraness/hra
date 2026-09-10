@@ -154,6 +154,8 @@ A completed source recovery is terminal for the original plan. Diagnose and reso
 
 ## Independent production verification
 
+Preserve the configured response headers as well as the body bytes. The site uses explicit slash-normalization redirects instead of Vercel's automatic `trailingSlash` transform, which can place a terminal `/.well-known` route before custom headers. The example header pattern must include the empty trailing segment in `/examples/app/`, not only descendant assets. The pinned route-compiler regression tests cover this ordering and matching behavior; they do not replace live response-header verification. Record the final URL after clean-URL redirects when checking the example document.
+
 After a committed result, independently repeat the filtered Vercel alias and deployment readbacks and fetch the public marker and release acceptance pages. Those observations do not expand the original authorization and must not perform another write.
 
 If comparing public content with local generated files, use a clean checkout of the plan's exact target commit with the pinned dependencies. First check the tracked public sources, then render fresh output:
