@@ -1,16 +1,50 @@
-# Model routing: Phase 3 shadow contract
+# Model routing: browser starts and the shadow contract
 
-Oompa does not automatically route work to a different model in Phase 3. Sol
+The Phase 3 shadow router does not automatically route work to a different model. Sol
 Ultra is the only effective automatic default for new Codex sessions, with Fast off.
-The task-shape classifier and the routing decision are shadow-only: they can
-describe disabled studies, but they cannot mutate a session or authorize a
-runtime profile.
+The shadow routing decision can describe disabled studies, but it cannot mutate
+a session or authorize a runtime profile. The browser separately reuses the
+pure task-shape classifier for the bounded new-start policy below.
 
 Terra, Opus, and Fast are not enabled by this work. Sol is the active Codex
 baseline, not a shadow candidate. New sessions that explicitly choose the Claude
 family continue to use Fable Max. Explicit preset choices are preserved, and
 established sessions never change provider, preset, exact model, effort, or Fast
 state because of a shadow decision or a default change.
+
+## Automatic effort for new browser conversations
+
+The grid composer may start a clearly bounded Codex prompt at Astra Max instead
+of Astra Ultra. It uses the existing `high` alias only when this browser build
+binds High and Ultra to exact contract 2 Astra Max and Astra Ultra profiles.
+Otherwise it keeps `ultra`. The ordinary device command carries that immutable
+preset contract, so a daemon with a different active binding refuses it before
+any provider effect.
+
+The conservative, local task-shape classifier admits only `well_defined` and
+`mechanical` prompts. Empty, uncertain, open-ended, unsupported or oversized
+text keeps Ultra, as does text naming an effort or preset. Named model choices
+already make the classifier uncertain. The composer shows the selected effort
+before submission. Claude starts stay on Fable Max.
+
+Settings → New conversations → Automatic effort controls this browser only.
+It is enabled when readable storage has no saved choice; turning it off makes
+every new Codex start use Ultra. The browser saves only `on` or `off`, never the
+prompt or decision. Malformed or unreadable storage disables the policy. A
+failed preference write disables it for the rest of the tab until a successful
+explicit save, and the screen reports that it could not retain the choice.
+
+The decision is captured once with the submitted command. There is no account
+movement, retry, reclassification of a submitted command, change to established
+conversations, or override of explicit CLI and other device-command presets.
+The CLI starts an idle session without a prompt, so it remains on Ultra; no
+daemon routing setting or new payload field is introduced. The command's exact
+preset and contract are the durable selection evidence. Historical commands
+gain no inferred rule provenance.
+
+This effort choice does not activate `src/domain/model-routing.ts`, a Terra or
+Opus study, Fast, or a new provider profile. The separate study gates below
+remain unchanged.
 
 ## Decision contract
 

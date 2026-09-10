@@ -396,7 +396,8 @@ describe("session start targets", () => {
     const codex = sessionStartTargets([machine()])[0];
     if (codex === undefined) throw new Error("expected Codex target");
     expect(sessionStartTargetLabel(codex)).toBe("Studio — Codex");
-    expect(sessionStartTargetHint(codex)).toContain("as Work on Astra Ultra");
+    expect(sessionStartTargetHint(codex)).toContain("as Work on Codex Ultra");
+    expect(sessionStartTargetHint({ ...codex, preset: "high" })).toContain("as Work on Codex High");
     expect(sessionStartTargetHint(codex)).not.toContain("Linux custodian");
     expect(sessionStartTargetLabel({ ...codex, machineOnline: false })).toBe("Studio — Codex (offline)");
   });

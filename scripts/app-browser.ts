@@ -10,6 +10,7 @@ import type { BrowserContext, Locator, Page, Request as BrowserRequest, Response
 import type { DirectBrowserBridge } from "@hraness/direct/web";
 import { browserIoModules } from "../app/fixtures/browser/config";
 import { productIoModules } from "../app/fixtures/product/config";
+import { activePresetBinding } from "../src/domain/presets";
 import { assertBrowserNode, browserDigest, browserExecutable, browserPublicArtifacts, publishBrowserJson, type BrowserExecutionAdmission } from "./app-browser-handoff.ts";
 import { serveBrowserAssets } from "./app-browser-server.ts";
 import { readRestoredStyleFramePair, settleExactStylesheet, StylesheetSettlementError, type StylesheetSettlementDiagnostics } from "./app-browser-settlement.ts";
@@ -1622,8 +1623,17 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
             assert.deepEqual(await cards.evaluateAll((elements) => elements.map((element) => element.getAttribute("data-session-id"))), [before[1], before[0], before[2]], "Keyboard card ordering did not preserve the displayed permutation");
             assert.ok(await page.getByLabel("Start a new session").isEnabled());
             assert.ok(await page.getByRole("button", { name: "Start", exact: true }).isDisabled());
+            await page.getByLabel("Start a new session").fill("Run `bun test src/value.test.ts` and report the exit status.");
+            const startContracts: readonly number[] = [activePresetBinding("high").contract, activePresetBinding("ultra").contract];
+            const astraEffort = startContracts.every((contract) => contract === 2);
+            assert.ok(await page.getByText(astraEffort
+              ? /Automatic effort: Max for this simple prompt\./u
+              : /Ultra\. Automatic effort requires the Astra update\./u).isVisible());
             await page.getByLabel("Start a new session").fill("Fixture prompt only");
             assert.ok(await page.getByRole("button", { name: "Start", exact: true }).isEnabled());
+            assert.ok(await page.getByText(astraEffort
+              ? /Automatic effort: Ultra\./u
+              : /Ultra\. Automatic effort requires the Astra update\./u).isVisible());
           }
           if (view === "session" || view === "session-long" || view === "retired") {
             assert.ok(await page.getByRole("heading", { name: "Browser fixture session", exact: true }).isVisible());
@@ -1682,6 +1692,22 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
           }
           if (view === "settings") {
             assert.ok(await page.getByRole("heading", { name: "Settings", exact: true }).isVisible());
+            const automaticEffort = page.getByRole("switch", { name: "Automatic effort", exact: true });
+            assert.equal(await automaticEffort.getAttribute("aria-checked"), "true");
+            await automaticEffort.click();
+            assert.equal(await automaticEffort.getAttribute("aria-checked"), "false");
+            await page.reload();
+            await automaticEffort.waitFor();
+            assert.equal(await automaticEffort.getAttribute("aria-checked"), "false", "Automatic effort disable did not survive reload");
+            await page.goto(`${fixture.origin}/?view=grid`);
+            await page.getByLabel("Start a new session").fill("Run `bun test src/value.test.ts` and report the exit status.");
+            assert.ok(await page.getByText(/Automatic effort is off: Ultra\./u).isVisible());
+            await page.goto(`${fixture.origin}/?view=settings`);
+            await automaticEffort.waitFor();
+            await automaticEffort.click();
+            assert.equal(await automaticEffort.getAttribute("aria-checked"), "true");
+            await page.evaluate((direction) => { document.documentElement.dir = direction; }, profile.rtl ? "rtl" : "ltr");
+            await settle(page);
             assert.ok((await page.getByText("Fixture machine", { exact: true }).count()) > 0);
             assert.ok(await page.getByText("Last reported Codex default", { exact: true }).isVisible());
             assert.ok(await page.getByText(

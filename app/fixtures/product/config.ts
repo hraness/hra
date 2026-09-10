@@ -7,6 +7,7 @@ export const productIoModules = Object.freeze([
   "app/src/appearance.ts",
   "app/src/custody/custody-context.tsx",
   "app/src/data/archived-sessions.ts",
+  "app/src/data/automatic-effort.ts",
   "app/src/data/card-order.ts",
   "app/src/data/commands.ts",
   "app/src/data/composer-attachments.ts",

@@ -18,6 +18,7 @@ import {
   SettingsSection,
 } from "../components/settings-list";
 import { useArchivedSessions } from "../data/archived-sessions";
+import { useAutomaticEffort } from "../data/automatic-effort";
 import { useCommandState, useSubmitCommand } from "../data/commands";
 import {
   deviceCommandCommittedRowUnavailableMessage,
@@ -1135,6 +1136,7 @@ function DeviceRow({ device, now }: Readonly<{ device: DeviceView; now: number }
 export function SettingsScreen({ onBack }: Readonly<{ onBack: () => void }>) {
   const { signOut } = useAuthActions();
   const registries = useDeviceRegistries();
+  const automaticEffort = useAutomaticEffort();
   const { devices, loading: devicesLoading } = useDevices();
   // Readiness and `now` must come from one hosted-clock instance. Otherwise
   // one hook can be ready while another still exposes its local-time fallback.
@@ -1160,6 +1162,17 @@ export function SettingsScreen({ onBack }: Readonly<{ onBack: () => void }>) {
       </header>
 
       <main {...stylex.props(styles.main)}>
+        <SettingsSection title="New conversations" description="This preference applies to new conversations started from this browser.">
+          <SettingsCard>
+            <SettingsRow
+              title="Automatic effort"
+              description="Use Max effort for clearly bounded Codex prompts and Ultra for everything else. Turn off to always start with Ultra. Claude stays on Fable Max."
+              control={<Switch label="Automatic effort" checked={automaticEffort.enabled} onCheckedChange={automaticEffort.setEnabled} />}
+            >
+              {automaticEffort.notice === null ? null : <p role="status">{automaticEffort.notice}</p>}
+            </SettingsRow>
+          </SettingsCard>
+        </SettingsSection>
         <SettingsSection
           description="Each machine publishes its own defaults. A change is sent as a durable command and applies when the daemon picks it up."
           title="Machines"

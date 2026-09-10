@@ -7,7 +7,8 @@
  * enter this bundle. Keeping the deep relative paths in one file makes the
  * boundary reviewable and keeps the eslint layering rule enforceable.
  */
-export { type SupportedPreset, type SupportedProvider } from "../../../src/domain/presets";
+export { activePresetBinding, type PresetContract, type SupportedPreset, type SupportedProvider } from "../../../src/domain/presets";
+export { classifyModelTaskShape, type ModelTaskShapeRule } from "../../../src/domain/model-task-shape";
 export {
   decodeHistoricalProfileKey,
   type CanonicalProfile,

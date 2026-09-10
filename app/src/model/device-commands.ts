@@ -59,7 +59,7 @@ export function sessionStartTargetHint(target: SessionStartTarget): string {
   const availability = target.machineOnline
     ? ""
     : " (offline; it will run when the machine wakes)";
-  const model = target.provider === "claude" ? "Fable Max" : "Astra Ultra";
+  const model = target.provider === "claude" ? "Fable Max" : target.preset === "high" ? "Codex High" : "Codex Ultra";
   const platform = target.provider === "claude"
     ? " Claude sessions require a Linux custodian; macOS refuses before launch."
     : "";

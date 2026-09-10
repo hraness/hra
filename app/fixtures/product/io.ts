@@ -11,6 +11,7 @@ import type * as Archived from "../../src/data/archived-sessions";
 import type * as Registries from "../../src/data/registry";
 import type * as Attachments from "../../src/data/composer-attachments";
 import type * as CardOrder from "../../src/data/card-order";
+import type * as AutomaticEffort from "../../src/data/automatic-effort";
 import type * as Auth from "@convex-dev/auth/react";
 import type * as Appearance from "../../src/appearance";
 import type { ProductPreviewHarness } from "./definition";
@@ -43,6 +44,10 @@ export const mountOompaAppearanceMenu: typeof Appearance.mountOompaAppearanceMen
 export const useSessionHeads: typeof Heads.useSessionHeads = () => ({
   heads: readProductPreviewHarness().observations.heads, isLoading: false, loadMore: noop, status: "Exhausted",
 });
+export const useAutomaticEffort: typeof AutomaticEffort.useAutomaticEffort = () => {
+  readProductPreviewHarness();
+  return { enabled: false, notice: null, setEnabled: refuse };
+};
 export const useSessionHead: typeof Heads.useSessionHead = (publicId) => {
   const head = readProductPreviewHarness().observations.heads.find((entry) => entry.publicId === publicId);
   if (head === undefined) throw new Error("Unknown product-example session.");

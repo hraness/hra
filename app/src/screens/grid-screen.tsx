@@ -15,6 +15,8 @@ import { SettingsIcon } from "../components/icons";
 import { SessionCard } from "../components/session-card";
 import { Button } from "../components/ui/button";
 import { useCardOrder } from "../data/card-order";
+import { useAutomaticEffort } from "../data/automatic-effort";
+import { browserStartDecision, browserStartEffortHint } from "../model/automatic-effort";
 import {
   deviceCommandCommittedRowUnavailableMessage,
   DeviceCommandResponseInvalidError,
@@ -70,7 +72,8 @@ function cardUnderPointer(clientX: number, clientY: number): string | null {
  * The composer at the top only starts sessions: each card carries its own
  * conversation and follow-up box. A start is a device command carrying a
  * prompt and addressed to a machine; the account, preset and project are the
- * machine's best, resolved by `sessionStartTargets`, never by a path. There is
+ * machine's defaults, resolved by `sessionStartTargets`, never by a path. The
+ * browser may choose Max effort once for a conservatively bounded start. There is
  * no field for a file, so attachments belong to the card composer only.
  */
 export function GridScreen(): ReactNode {
@@ -78,6 +81,7 @@ export function GridScreen(): ReactNode {
   const submitDeviceCommand = useSubmitDeviceCommand();
   const registries = useDeviceRegistries();
   const cardOrder = useCardOrder();
+  const automaticEffort = useAutomaticEffort();
 
   const [summaries, setSummaries] = useState<Readonly<Record<string, SessionCardSummary>>>({});
   const [message, setMessage] = useState("");
@@ -146,16 +150,22 @@ export function GridScreen(): ReactNode {
   }, [heads.length, startCommand?.state]);
 
   const canSubmit = message.trim().length > 0 && !sending && startTarget !== null;
+  const startDecision = useMemo(() => startTarget === null ? null : browserStartDecision({
+    automatic: automaticEffort.enabled, provider: startTarget.provider, prompt: message.trim(),
+  }), [automaticEffort.enabled, startTarget, message]);
 
   const start = () => {
     const text = message.trim();
-    if (!canSubmit) return;
+    if (!canSubmit || startDecision === null) return;
+    // Capture one exact decision with this prompt and command. Uncertain
+    // outcomes remain tracked by their original command id; never reroute them.
+    const decision = startDecision;
     setSending(true);
     setNotice(null);
     void submitDeviceCommand({
       payload: sessionStartCommand({
         accountPublicId: startTarget.accountPublicId,
-        preset: startTarget.preset,
+        preset: decision.preset,
         projectPublicId: startTarget.projectPublicId,
         prompt: text,
         provider: startTarget.provider,
@@ -275,7 +285,7 @@ export function GridScreen(): ReactNode {
 
   const hint = startTarget === null
     ? "No machine here can start a session yet. Sign an account in on a machine, run `oompa init --yes`, and leave `oompa remote allow device-commands` set."
-    : sessionStartTargetHint(startTarget);
+    : `${sessionStartTargetHint({ ...startTarget, preset: startDecision?.preset ?? startTarget.preset })} ${startDecision === null ? "" : browserStartEffortHint(startDecision)}`;
 
   return (
     <div {...stylex.props(gridScreenStyles.root)}>
