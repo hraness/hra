@@ -34,7 +34,7 @@ const newProjectId = "prj_8ciIt9t9foE3utG45frRN7cxckjS";
 const oldRepositoryId = 1_334_876_494;
 const newRepositoryId = 1_343_008_607;
 const teamId = "team_UAd1iD2XogJlbFg4h14mRaPM";
-const canonicalAlias = "oompa.app";
+const canonicalAlias = "oompa.dev";
 const fallbackAlias = "oompa-weld.vercel.app";
 const newStagingAlias = "hra.vercel.app";
 
@@ -267,7 +267,7 @@ class FakeCutoverProvider implements CutoverProvider {
       this.ownerReadOverrideDomainReads -= 1;
       if (this.ownerReadOverrideDomainReads === 0) this.ownerReadOverride = undefined;
     } else if (this.staleOwnerDomainReads > 0) this.staleOwnerDomainReads -= 1;
-    if (owner === "ambiguous") return ["oompa.app"];
+    if (owner === "ambiguous") return ["oompa.dev"];
     const sourceProjectId = this.plan.direction === "archive"
       ? oldProjectId
       : this.plan.source.projectId;
@@ -275,9 +275,9 @@ class FakeCutoverProvider implements CutoverProvider {
       ? newProjectId
       : this.plan.target.projectId;
     if (owner === "source") {
-      return projectId === sourceProjectId ? ["oompa.app"] : [];
+      return projectId === sourceProjectId ? ["oompa.dev"] : [];
     }
-    return projectId === targetProjectId ? ["oompa.app"] : [];
+    return projectId === targetProjectId ? ["oompa.dev"] : [];
   }
 
   async readMarker(aliasName: ManagedAlias): Promise<unknown> {
@@ -1882,7 +1882,7 @@ describe("domain cutover operator", () => {
     expect(provider.owner).toBe("source");
   });
 
-  test("restores both aliases to P if oompa.app fails after fallback Q is proven", async () => {
+  test("restores both aliases to P if oompa.dev fails after fallback Q is proven", async () => {
     const provider = new FakeCutoverProvider(archivePlan);
     provider.targetAliasSetFailure = canonicalAlias;
 
@@ -2232,7 +2232,7 @@ describe("domain cutover operator", () => {
       if (request.arguments[0] === "--version") {
         return { exitCode: 0, stderr: "", stdout: "54.18.0\n" };
       }
-      if (path === "/v4/aliases/oompa.app") {
+      if (path === "/v4/aliases/oompa.dev") {
         return { exitCode: 0, stderr: "", stdout: JSON.stringify(aliasFor(oldEndpoint)) };
       }
       if (path === `/v4/aliases/${fallbackAlias}`) {
@@ -2297,7 +2297,7 @@ describe("domain cutover operator", () => {
       deploymentFor(oldEndpoint),
     );
     expect(await provider.readProject(oldProjectId)).toEqual(projectFor(oldProjectId));
-    expect(await provider.readDomainNames(oldProjectId)).toEqual(["other.example", "oompa.app"]);
+    expect(await provider.readDomainNames(oldProjectId)).toEqual(["other.example", "oompa.dev"]);
     expect(await provider.readMarker(canonicalAlias)).toEqual(markerFor(oldEndpoint));
     expect(await provider.readMarker(fallbackAlias)).toEqual(markerFor(oldEndpoint));
     await provider.setAlias(oldEndpoint.deploymentUrl, canonicalAlias);
@@ -2312,7 +2312,7 @@ describe("domain cutover operator", () => {
 
     expect(requests.map((request) => request.arguments)).toContainEqual([
       "api",
-      "/v4/aliases/oompa.app",
+      "/v4/aliases/oompa.dev",
       "--scope",
       "hraness",
       "--raw",
@@ -2355,7 +2355,7 @@ describe("domain cutover operator", () => {
     ]);
     expect(requests.map((request) => request.arguments)).toContainEqual([
       "api",
-      `/v1/projects/${oldProjectId}/domains/oompa.app/move`,
+      `/v1/projects/${oldProjectId}/domains/oompa.dev/move`,
       "--scope",
       "hraness",
       "-X",

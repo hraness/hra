@@ -30,7 +30,7 @@ const observationMaximumMs = 5 * 60 * 1_000;
 const vercelApiOrigin = "https://api.vercel.com";
 const publicRepositoryUrl = "https://github.com/hraness/oompa.git";
 
-export const oompaAppAlias = "app.oompa.app";
+export const oompaAppAlias = "app.oompa.dev";
 export const oompaAppBranch = "main";
 export const oompaAppProjectId = "prj_3olYDT29BrwKO9PLByVq9HlgRkdA";
 export const oompaAppRepositoryId = 1_343_008_607;
@@ -129,7 +129,7 @@ const projectReadbackSchema = deploymentSnapshotBuildSettingsSchema.extend({
 });
 
 const projectDomainReadbackSchema = z.object({
-  apexName: z.literal("oompa.app"),
+  apexName: z.literal("oompa.dev"),
   customEnvironmentId: z.null().optional(),
   gitBranch: z.null().optional(),
   name: z.literal(oompaAppAlias),

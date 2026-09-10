@@ -8,7 +8,7 @@ Never copy retired Oompa v0 data, deployment URLs, deploy keys, authentication k
 
 The provider identity guard pins the intended Convex team to numeric ID `513923` and provider slug `cclrte`. Retired Oompa v0 Convex project ID `2680173` and production deployment ID `4677913` remain permanent denylisted safety tombstones; neither may be recreated, renamed into, or selected by this runbook. The current source repository has GitHub repository ID `1343008607`, and the current web project has Vercel project ID `prj_8ciIt9t9foE3utG45frRN7cxckjS`. Provider names may change. The team identity and numeric resource IDs do not.
 
-Browser app project. The web app at `app.oompa.app` is a second Vercel project in the same team, separate from the website project above so the two never share an origin, a cache policy, or a Content Security Policy. It has no framework preset, root directory `app`, build command `cd .. && bun install --frozen-lockfile --ignore-scripts && bun run build:app`, install command `true`, and output directory `dist`; source files outside the root directory are enabled because that exact build intentionally enters the repository root. Its tracked ignore command is exactly `test "$VERCEL_ENV" != "production"`, so Vercel builds production and ignores previews. The app requires no deployment-secret input: its Convex deployment origin is pinned in source at `app/src/env.ts` and in the `connect-src` allowlist of `app/vercel.json`. It was created on 2026-09-04 as Vercel project `prj_3olYDT29BrwKO9PLByVq9HlgRkdA` (name `oompa-app`, team `team_UAd1iD2XogJlbFg4h14mRaPM`, production branch `main`, domain `app.oompa.app`), alongside the website project `prj_8ciIt9t9foE3utG45frRN7cxckjS`. Every production build must receive Vercel's exact lowercase 40-character `VERCEL_GIT_COMMIT_SHA`; a missing or malformed value stops the build. The bundle publishes that commit, repository identity, and package version at the no-store path `/.well-known/oompa-app.json`, which is excluded from the SPA fallback.
+Browser app project. The web app at `app.oompa.dev` is a second Vercel project in the same team, separate from the website project above so the two never share an origin, a cache policy, or a Content Security Policy. It has no framework preset, root directory `app`, build command `cd .. && bun install --frozen-lockfile --ignore-scripts && bun run build:app`, install command `true`, and output directory `dist`; source files outside the root directory are enabled because that exact build intentionally enters the repository root. Its tracked ignore command is exactly `test "$VERCEL_ENV" != "production"`, so Vercel builds production and ignores previews. The app requires no deployment-secret input: its Convex deployment origin is pinned in source at `app/src/env.ts` and in the `connect-src` allowlist of `app/vercel.json`. It was created on 2026-09-04 as Vercel project `prj_3olYDT29BrwKO9PLByVq9HlgRkdA` (name `oompa-app`, team `team_UAd1iD2XogJlbFg4h14mRaPM`, production branch `main`, domain `app.oompa.dev`), alongside the website project `prj_8ciIt9t9foE3utG45frRN7cxckjS`. Every production build must receive Vercel's exact lowercase 40-character `VERCEL_GIT_COMMIT_SHA`; a missing or malformed value stops the build. The bundle publishes that commit, repository identity, and package version at the no-store path `/.well-known/oompa-app.json`, which is excluded from the SPA fallback.
 
 Live projection. Besides the compact stream of completed turns, the daemon streams the current turn's assistant text (and reasoning summaries only when show-thinking is enabled for the session, default off) to the `detail` stream about once per second in redacted, encrypted batches of at most 8 KiB. Detail chunks carry the `live_tail` retention class: each row expires six hours after it is written, a session keeps at most 200 rows, and the `live_tail_chunks` maintenance category sweeps expired rows behind a detail stream epoch so digest-chain verification of the surviving tail stays valid and both the chunk quota and the per-user `live_chunk` resource counter are released. Raw reasoning is never uploaded.
 
@@ -527,7 +527,7 @@ The command uses authenticated Vercel readbacks to require team
 `team_UAd1iD2XogJlbFg4h14mRaPM`, project
 `prj_3olYDT29BrwKO9PLByVq9HlgRkdA`, its GitHub link to repository ID
 `1343008607` on production branch `main`, a `READY` production Git deployment
-at the exact commit, and the `app.oompa.app` alias attached to that deployment. A
+at the exact commit, and the `app.oompa.dev` alias attached to that deployment. A
 project name, automatic hostname, or successful HTTP response is not a
 substitute for those stable identities. The deployment must not be prebuilt,
 and its best-effort provider `source` field must still say `git` as a
@@ -555,7 +555,7 @@ even while the production alias points at the candidate, so the verifier
 refuses that state.
 
 Between two complete provider samples, the command fetches a freshly
-cache-busted `https://app.oompa.app/.well-known/oompa-app.json` without Vercel
+cache-busted `https://app.oompa.dev/.well-known/oompa-app.json` without Vercel
 authentication and parses it as strict JSON. It requires exactly this document:
 
 ```json
@@ -629,10 +629,10 @@ credential, under the evidence boundary.
 `bun run hosted:configure` accepts one strict JSON object with exactly these fields:
 
 ```json
-{"attentionResendApiKey":"<attention-secret>","authEmailReplyTo":"ben@substrate.run","resendApiKey":"<sign-in-secret>","siteUrl":"https://oompa.app"}
+{"attentionResendApiKey":"<attention-secret>","authEmailReplyTo":"ben@substrate.run","resendApiKey":"<sign-in-secret>","siteUrl":"https://oompa.dev"}
 ```
 
-`siteUrl` must be one HTTPS origin. For the Oompa `v0.1.0` authority it is exactly `https://oompa.app`, the final canonical origin. Do not substitute `https://hra.vercel.app` or an automatic deployment hostname: configuration is one-shot, while staging aliases move and rehearsal may replace candidate deployments. `resendApiKey` must be a Resend sending key. Oompa pins every OTP sender to `Oompa sign-in <oompa@auth.hraness.com>` in source; the operator cannot replace it with an environment value. `authEmailReplyTo` must be one lowercase canonical mailbox without an apostrophe that is monitored and verified to receive mail. The sending-only `auth.hraness.com` and `news.hraness.com` domains are rejected. If the runtime variable is absent, Oompa falls back to the receive-capable `ben@substrate.run` mailbox. The helper generates a fresh 2048-bit RS256 private key, its matching public JWKS, and a 256-bit HMAC secret locally with WebCrypto.
+`siteUrl` must be one HTTPS origin. For the Oompa `v0.1.0` authority it is exactly `https://oompa.dev`, the final canonical origin. Do not substitute `https://hra.vercel.app` or an automatic deployment hostname: configuration is one-shot, while staging aliases move and rehearsal may replace candidate deployments. `resendApiKey` must be a Resend sending key. Oompa pins every OTP sender to `Oompa sign-in <oompa@auth.hraness.com>` in source; the operator cannot replace it with an environment value. `authEmailReplyTo` must be one lowercase canonical mailbox without an apostrophe that is monitored and verified to receive mail. The sending-only `auth.hraness.com` and `news.hraness.com` domains are rejected. If the runtime variable is absent, Oompa falls back to the receive-capable `ben@substrate.run` mailbox. The helper generates a fresh 2048-bit RS256 private key, its matching public JWKS, and a 256-bit HMAC secret locally with WebCrypto.
 
 `attentionResendApiKey` is a separate sending key for attention email. Both
 keys must use the strict `re_` token format, be 8 to 512 characters long, and

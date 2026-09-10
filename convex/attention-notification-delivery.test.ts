@@ -41,7 +41,7 @@ const body = {
     "Oompa needs your attention",
     "",
     "Open Oompa to review:",
-    "- Command approval: https://app.oompa.app/#/session/session_action_test",
+    "- Command approval: https://app.oompa.dev/#/session/session_action_test",
   ].join("\n"),
   version: 2 as const,
 };

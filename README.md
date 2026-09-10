@@ -4,7 +4,7 @@
 
 Local CLI v0.8.0 is a release candidate, not an admitted artifact; v0.7.1 remains the fully admitted public artifact. Current daemon and hosted command-writer rollout remains blocked on capacity.
 
-[CLI reference](https://oompa.app/docs/reference/) · [Availability](https://oompa.app/docs/status/)
+[CLI reference](https://oompa.dev/docs/reference/) · [Availability](https://oompa.dev/docs/status/)
 
 ## Requirements
 
@@ -30,7 +30,7 @@ oompa doctor --offline
 
 > **Before initialization:** Current daemon and hosted command-writer rollout remains blocked on capacity. Do not initialize, start, or autostart either the admitted v0.7.1 daemon or the v0.8.0 candidate until the hosted operator records protected two-pass zero-debt capacity evidence and its exact .activated readback receipt. Artifact availability and the live sync service do not clear this gate. After activation, complete the update runbook's daemon and target marker-2 proofs before globally enabling hosted writers.
 
-Continue with the [setup guide](https://oompa.app/docs/start/). For an existing installation, use the [ordered update runbook](https://oompa.app/docs/status/#install-and-update).
+Continue with the [setup guide](https://oompa.dev/docs/start/). For an existing installation, use the [ordered update runbook](https://oompa.dev/docs/status/#install-and-update).
 
 ## CLI usage
 
@@ -53,7 +53,7 @@ Read the [privacy policy](https://github.com/hraness/oompa/blob/main/PRIVACY.md)
 
 The npm archive contains CLI and daemon source, this package README, the license, and third-party notices. Website assets and website-authored content are not package inputs. The package has no install lifecycle scripts; runtime dependencies are exact public registry versions.
 
-An interrupted installer must be recovered using its exact originating release. Do not edit or delete its durable intent, receipt, staging directory, or previous installation. Follow the [ordered update runbook](https://oompa.app/docs/status/#install-and-update) and stop if exact recovery cannot be established.
+An interrupted installer must be recovered using its exact originating release. Do not edit or delete its durable intent, receipt, staging directory, or previous installation. Follow the [ordered update runbook](https://oompa.dev/docs/status/#install-and-update) and stop if exact recovery cannot be established.
 
 ## Project
 

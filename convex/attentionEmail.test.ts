@@ -72,11 +72,11 @@ describe("Oompa attention email body and payload", () => {
         "Oompa needs your attention",
         "",
         "Open Oompa to review:",
-        `- Command approval: https://app.oompa.app/#/session/${sessionPublicId}_0`,
-        `- File change approval: https://app.oompa.app/#/session/${sessionPublicId}_1`,
-        `- Permission approval: https://app.oompa.app/#/session/${sessionPublicId}_2`,
-        `- User input: https://app.oompa.app/#/session/${sessionPublicId}_3`,
-        `- MCP elicitation: https://app.oompa.app/#/session/${sessionPublicId}_4`,
+        `- Command approval: https://app.oompa.dev/#/session/${sessionPublicId}_0`,
+        `- File change approval: https://app.oompa.dev/#/session/${sessionPublicId}_1`,
+        `- Permission approval: https://app.oompa.dev/#/session/${sessionPublicId}_2`,
+        `- User input: https://app.oompa.dev/#/session/${sessionPublicId}_3`,
+        `- MCP elicitation: https://app.oompa.dev/#/session/${sessionPublicId}_4`,
       ].join("\n"),
       version: oompaAttentionEmailBodyVersion,
     });
@@ -156,7 +156,7 @@ describe("Oompa attention email body and payload", () => {
       { ...stored, version: 2 },
       { ...stored, version: 3 },
       { ...stored, text: `${stored.text}\n` },
-      { ...stored, text: stored.text.replace("app.hra.sh", "app.oompa.app") },
+      { ...stored, text: stored.text.replace("app.hra.sh", "app.oompa.dev") },
       { ...stored, text: stored.text.replace("app.hra.sh", "attacker.example") },
       { ...stored, text: stored.text.replace(sessionPublicId, "short") },
     ]) expect(parseOompaAttentionEmailBody(invalid)).toBeNull();
@@ -168,7 +168,7 @@ describe("Oompa attention email body and payload", () => {
         "Oompa needs your attention",
         "",
         "Open Oompa to review:",
-        `- User input: https://app.oompa.app/#/session/${sessionPublicId}`,
+        `- User input: https://app.oompa.dev/#/session/${sessionPublicId}`,
       ].join("\n"),
       version: 2 as const,
     };
@@ -180,8 +180,8 @@ describe("Oompa attention email body and payload", () => {
       { ...stored, extra: true },
       { ...stored, version: 1 },
       { ...stored, text: `${stored.text}\n` },
-      { ...stored, text: stored.text.replace("app.oompa.app", "app.hra.sh") },
-      { ...stored, text: stored.text.replace("app.oompa.app", "attacker.example") },
+      { ...stored, text: stored.text.replace("app.oompa.dev", "app.hra.sh") },
+      { ...stored, text: stored.text.replace("app.oompa.dev", "attacker.example") },
       { ...stored, text: stored.text.replace(sessionPublicId, "short") },
     ]) expect(parseOompaAttentionEmailBody(invalid)).toBeNull();
   });

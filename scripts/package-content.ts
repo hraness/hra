@@ -47,7 +47,7 @@ export function assertPackageContent(manifest: unknown, readme: unknown): void {
     "## Package contents\n",
     "The npm archive contains CLI and daemon source, this package README, the license, and third-party notices.",
     "Website assets and website-authored content are not package inputs.",
-    "https://oompa.app/docs/status/#install-and-update",
+    "https://oompa.dev/docs/status/#install-and-update",
     "https://github.com/hraness/oompa/blob/main/PRIVACY.md",
   ];
   if (required.some((part) => !text.includes(part))) {

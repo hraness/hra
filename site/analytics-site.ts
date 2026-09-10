@@ -5,8 +5,8 @@ import {
 
 export const oompaPostHogSite = {
   id: "oompa",
-  canonicalDomain: "oompa.app",
-  allowedHosts: ["oompa.app"],
+  canonicalDomain: "oompa.dev",
+  allowedHosts: ["oompa.dev"],
   schemaVersion: POSTHOG_SCHEMA_VERSION,
   routes: [
     {

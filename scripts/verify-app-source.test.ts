@@ -120,7 +120,7 @@ const alias = {
 };
 
 const projectDomain = {
-  apexName: "oompa.app",
+  apexName: "oompa.dev",
   customEnvironmentId: null,
   gitBranch: null,
   name: oompaAppAlias,

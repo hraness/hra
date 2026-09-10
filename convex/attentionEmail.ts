@@ -81,7 +81,7 @@ const attentionEmailBodyGrammars: Readonly<Record<AttentionEmailBodyVersion, Att
     [attentionEmailBodyV2Version]: Object.freeze({
       from: oompaAttentionEmailFrom,
       reviewLine: "Open Oompa to review:",
-      sessionUrl: "https://app.oompa.app/#/session/",
+      sessionUrl: "https://app.oompa.dev/#/session/",
       subject: oompaAttentionEmailSubject,
       subjectLine: oompaAttentionEmailSubject,
     }),

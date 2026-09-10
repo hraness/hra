@@ -205,9 +205,9 @@ const {
 
 const links = {
   admittedInstall: "https://github.com/hraness/oompa/blob/v0.7.1/docs/beta-release-notes.md#install",
-  app: "https://app.oompa.app",
+  app: "https://app.oompa.dev",
   contributing: "https://github.com/hraness/oompa/blob/main/CONTRIBUTING.md",
-  documentation: "https://oompa.app/docs/",
+  documentation: "https://oompa.dev/docs/",
   github: "https://github.com/hraness/oompa",
   hraness: "https://hraness.com/",
   privateSecurityReport: "https://github.com/hraness/oompa/security/advisories/new",
@@ -259,7 +259,7 @@ const privacyBlocks: readonly ContentBlock[] = [
     text("Oompa uses Resend to deliver verification email. Resend receives the recipient email address, sender identity, one-time verification code and message content, and ordinary delivery metadata. It receives no provider credentials or encrypted session projection."),
   ),
   paragraph(
-    text("Oompa uses anonymous, cookieless PostHog analytics on the public oompa.app pages to count page views and page leaves and measure selected Web Vitals. Collection runs only on the canonical production host, honors Do Not Track, keeps its visitor identifier in memory, and disables person profiles, autocapture, heatmaps, feature flags, surveys, conversations, and session recording. PostHog receives the canonical route, bounded referral classification, browser performance measurements, a cookieless visitor identifier, and ordinary request metadata such as IP address, user agent, and time. Oompa sends no form values, account identity, provider or session data, URL query, or fragment. Vercel serves oompa.app, and GitHub hosts the source repository, releases, and release downloads; those providers receive ordinary request metadata when visited."),
+    text("Oompa uses anonymous, cookieless PostHog analytics on the public oompa.dev pages to count page views and page leaves and measure selected Web Vitals. Collection runs only on the canonical production host, honors Do Not Track, keeps its visitor identifier in memory, and disables person profiles, autocapture, heatmaps, feature flags, surveys, conversations, and session recording. PostHog receives the canonical route, bounded referral classification, browser performance measurements, a cookieless visitor identifier, and ordinary request metadata such as IP address, user agent, and time. Oompa sends no form values, account identity, provider or session data, URL query, or fragment. Vercel serves oompa.dev, and GitHub hosts the source repository, releases, and release downloads; those providers receive ordinary request metadata when visited."),
   ),
   paragraph(
     text("Device credentials are bearer credentials, not hardware-bound proofs. Connection and generation fencing blocks a copied credential from creating a second concurrent connection or surviving revocation, but an uncontested, unrevoked copy can impersonate that device until it is detected and revoked."),
@@ -386,12 +386,12 @@ export const publicContent: PublicContent = {
     url: links.hraness,
   },
   socialCard: {
-    alt: `${productName} command-line card showing offline diagnostics and read-only status · v${releaseVersion} candidate · daemon rollout blocked on capacity · oompa.app`,
+    alt: `${productName} command-line card showing offline diagnostics and read-only status · v${releaseVersion} candidate · daemon rollout blocked on capacity · oompa.dev`,
     height: 630,
     path: "/social-card.png",
     width: 1200,
   },
-  siteUrl: "https://oompa.app",
+  siteUrl: "https://oompa.dev",
   installCommand: betaInstallCommand,
   installNotice,
   initCommand: "oompa init --yes",
@@ -493,7 +493,7 @@ export const publicContent: PublicContent = {
     },
     {
       label: "Analytics you can audit",
-      detail: "oompa.app counts page views anonymously, without cookies, only on the production host, and honors Do Not Track. The privacy page lists every field.",
+      detail: "oompa.dev counts page views anonymously, without cookies, only on the production host, and honors Do Not Track. The privacy page lists every field.",
     },
   ],
   questions: [
