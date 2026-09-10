@@ -668,7 +668,14 @@ async function verifyProductScene(iframe: Locator, view: ProductView): Promise<u
         assert.equal(await frame.getByText(title, { exact: true }).count(), 1);
       }
     } else {
-      assert.equal(await frame.locator("h1").textContent(), view === "conversation" ? "Polish the checkout" : view === "question" ? "Choose the export format" : "Settings");
+      if (view === "settings") {
+        assert.equal(await frame.locator("h1").textContent(), "Settings");
+      } else {
+        // A conversation scene is one grid card, whose title is a level-two heading.
+        assert.equal(await frame.locator("[data-session-id]").count(), 1);
+        assert.equal(await frame.getByRole("heading", { level: 2, name: view === "conversation" ? "Polish the checkout" : "Choose the export format", exact: true }).count(), 1);
+        assert.equal(await frame.locator("h1").count(), 0);
+      }
       if (view === "conversation") assert.equal(await frame.getByText("The compact layout is in place. I’m checking the empty cart, delivery choices, and payment error state next.", { exact: true }).count(), 1);
       if (view === "question") {
         const question = frame.locator('[aria-label="Pending interaction"]');
