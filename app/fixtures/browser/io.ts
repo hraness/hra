@@ -61,7 +61,7 @@ const registries: DeviceRegistries = {
     accountLinkingAllowed: false,
     accounts: [{ label: "Fixture account", provider: "codex", publicId: "account_browser_fixture", status: "signed_in" }],
     attentionEmailEnabled: null, daemonVersion: "0.7.0", defaultApprovalMode: "manual", defaultPreset: "ultra",
-    deviceCommandsAllowed: true, devicePublicId: browserHead.executionDevicePublicId, deviceStatus: "active",
+    defaultProjectPublicId: null, deviceCommandsAllowed: true, devicePublicId: browserHead.executionDevicePublicId, deviceStatus: "active",
     heartbeatAt: now, label: "Fixture machine", online: true,
     memorySummary: null, memorySummaryFreshness: "unsupported",
     notificationHours: null, notificationHoursStatus: "unsupported", notificationPolicyFreshness: "unsupported",
@@ -97,7 +97,7 @@ export const useAuthActions: typeof Auth.useAuthActions = () => ({ signIn: refus
 export function useCustody(): Custody {
   return {
     busy: false, devicePublicId: null, enroll: refuse, enrollment: "needs_registration",
-    error: null, fingerprint: null, lock: noop, refresh: refuse, reportAuthorityFailure: noop,
-    state: "locked", unlock: refuse,
+    error: null, fingerprint: null, refresh: refuse, reportAuthorityFailure: noop,
+    state: "unenrolled", unlock: refuse,
   };
 }

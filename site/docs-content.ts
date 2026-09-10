@@ -208,7 +208,7 @@ export const docsPages: readonly DocsPage[] = [
       readerJob: "Enroll a browser and use Oompa's real grid, conversation, and Settings screens without mistaking a browser for an execution machine.",
       contribution: "A screen-by-screen guide joins the app's actual enrollment states, target picker, composer, and remote interaction policy into a usable first browser journey.",
       overlapDecision: "Start owns local installation, Sessions owns CLI conversation operations, and the deployment runbook addresses operators. None explains everyday browser use.",
-      evidence: ["app/src/custody/enrollment-screen.tsx", "app/src/screens/grid-screen.tsx", "app/src/screens/session-screen.tsx", "app/src/screens/settings-screen.tsx", "src/domain/remote-interaction-policy.ts"],
+      evidence: ["app/src/custody/enrollment-screen.tsx", "app/src/screens/grid-screen.tsx", "app/src/components/session-card.tsx", "app/src/screens/settings-screen.tsx", "src/domain/remote-interaction-policy.ts"],
       scores: [2, 2, 2, 2, 2, 1],
     },
     sections: [
@@ -225,7 +225,7 @@ export const docsPages: readonly DocsPage[] = [
             [text("Return to the waiting browser and choose Check again. Once approved and unlocked, it can decrypt your synchronized sessions.")],
           ),
           commands("oompa device list", "oompa device approve <pending-device-id-or-prefix> --fingerprint <value>"),
-          paragraph(text("Email access alone cannot recover encrypted history. Keep an approved device with the account key. The browser drops its unwrapped account key when locked; "), code("Ctrl+L"), text(" also locks the app.")),
+          paragraph(text("Email access alone cannot recover encrypted history. Keep an approved device with the account key. The browser holds its unwrapped account key only in memory and drops it when the tab closes.")),
         ],
       },
       {

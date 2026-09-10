@@ -2,6 +2,17 @@
 
 Every entry names the release or the plan wave it belongs to. Unreleased work sits under the wave that produced it until a version ships.
 
+## Inline conversations (unreleased)
+
+The web app keeps every conversation in its grid card and asks only for a prompt and a machine. Plan: `kb/plans/oompa-app-simplification.md`.
+
+- The lock is gone. An enrolled, approved browser opens the account key when the page loads and drops it when the page closes or its authority fails; there is no Lock button, lock screen, idle lock or `Ctrl+L`.
+- The conversation screen and its `#/session/<id>` route are removed. Each card holds a bounded, scrollable conversation with earlier turns on demand; responses older than the newest fold to one line and open in place; the newest response and a streaming turn stay open. An old conversation link lands on the grid.
+- The start box and every card composer are multi-line: `Enter` sends, `Shift+Enter` breaks a line.
+- Starting a session names a machine only. The app picks the machine's first signed-in Codex account, else its first signed-in Claude Code account, that provider's best preset, and the machine's default project. The account, project and model pickers leave the app; the per-session model and Fast controls leave the card menu (the CLI keeps them). Approvals and the provider switch stay in the card menu.
+- Device registry version 1 gains an optional `defaultProjectPublicId`, always one of its listed projects. An older registry without it still starts sessions on its first project.
+- Card headers, drag handles, kebab menus and subagent chips are tighter.
+
 ## v0.8.0 candidate (unreleased)
 
 Provider account visibility, local automatic usage policy controls, and recovery hardening. This candidate is not yet admitted. The [v0.7.1 immutable installation notes](https://github.com/hraness/hra/blob/v0.7.1/docs/beta-release-notes.md#install) remain the installation path for the admitted artifact. Artifact admission does not clear daemon startup, hosted capacity or intended-target gates.
