@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { DesktopSwitchError } from "./errors.ts";
-import { deriveDesktopProfilePaths } from "./profile.ts";
+import { deriveDesktopProfilePaths } from "./desktop-profile-paths.ts";
 
 describe("desktop profile paths", () => {
   test("derives separate full profile boundaries", () => {
@@ -16,8 +15,13 @@ describe("desktop profile paths", () => {
     "rejects unsafe profile component %s",
     (profileId) => {
       expect(() => deriveDesktopProfilePaths("/tmp/hra-control-plane", profileId)).toThrow(
-        DesktopSwitchError,
+        "INVALID_PROFILE",
       );
     },
   );
+
+  test("rejects a relative or unnormalized state root", () => {
+    expect(() => deriveDesktopProfilePaths("relative/root", "personal")).toThrow("INVALID_PROFILE");
+    expect(() => deriveDesktopProfilePaths("/tmp/../tmp/x", "personal")).toThrow("INVALID_PROFILE");
+  });
 });

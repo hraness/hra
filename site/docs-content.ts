@@ -321,7 +321,7 @@ export const docsPages: readonly DocsPage[] = [
         ],
       },
     ],
-    referenceSectionIds: ["first-account", "first-session", "presets-and-permissions", "desktop-account-switching"],
+    referenceSectionIds: ["first-account", "first-session", "presets-and-permissions"],
     related: [{ path: "/docs/reference/", label: "Complete command reference" }, { path: "/docs/status/#install-and-update", label: "Update and recovery runbook" }],
   },
   {

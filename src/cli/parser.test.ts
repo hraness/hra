@@ -1155,30 +1155,10 @@ describe("CLI parser", () => {
     expect(parseCli(["session", "send", "session", "--idempotency-key", idempotencyKey, "--", "use", "--help"])).toMatchObject({
       command: { kind: "session.send", idempotencyKey, message: "use --help" },
     });
-    expect(parseCli(["account", "switch", "personal", "--idempotency-key", idempotencyKey])).toMatchObject({
-      command: { kind: "account.switch", account: "personal", idempotencyKey },
+    expect(parseCli(["account", "logout", "personal", "--idempotency-key", idempotencyKey])).toMatchObject({
+      command: { kind: "account.logout", account: "personal", idempotencyKey },
     });
     expect(() => parseCli(["account", "list", "--idempotency-key", idempotencyKey])).toThrow(CliUsageError);
-  });
-
-  test("generates a discoverable desktop-switch key before transport and parses recovery", () => {
-    const invocation = parseCli(["account", "switch", "personal"]);
-    expect(invocation).toMatchObject({
-      kind: "command",
-      command: { kind: "account.switch", account: "personal" },
-      json: false,
-    });
-    if (invocation.kind !== "command" || invocation.command.kind !== "account.switch") {
-      throw new Error("Expected an account switch command.");
-    }
-    expect(invocation.command.idempotencyKey).toMatch(
-      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
-    );
-    expect(parseCli(["account", "switch-recover", "--json"])).toEqual({
-      kind: "command",
-      command: { kind: "account.switch-recover" },
-      json: true,
-    });
   });
 
   test("generates discoverable keys at the CLI boundary for every provider-effect command", () => {

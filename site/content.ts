@@ -519,7 +519,7 @@ export const publicContent: PublicContent = {
     },
     {
       question: "Which platforms are supported?",
-      answer: [text(`The CLI requires Bun ${publicPins.bun}. Codex execution supports macOS and Linux; Claude Code execution supports Linux. The web interface can follow paired machines from a browser. ChatGPT desktop account switching is macOS-only.`)],
+      answer: [text(`The CLI requires Bun ${publicPins.bun}. Codex execution supports macOS and Linux; Claude Code execution supports Linux. The web interface can follow paired machines from a browser.`)],
     },
   ],
   maker: {
@@ -564,7 +564,7 @@ export const publicContent: PublicContent = {
       blocks: [
         { kind: "notice", label: "Candidate installation unavailable", content: [text(installNotice), text(" Read the "), link(`v${admittedReleaseVersion} installation notes`, links.admittedInstall), text(".")] },
         paragraph(
-          text(`Oompa requires Bun 1.3.14 plus curl with HTTPS and TLS 1.2 support. The CLI and local daemon support macOS and Linux. Codex effects run on both platforms; Claude Code effects run on Linux only. Oompa refuses new Claude Code effects on macOS pending authenticated isolated-Keychain and detached-read acceptance. Supported ChatGPT desktop account switching is macOS-only. Native protected-input control loads only when a terminal prompt needs it and supports the standard macOS, glibc, and x64 or arm64 musl library names. ${isAdmittedRelease(releaseVersion) ? "Install the admitted release's reviewed immutable tag, then verify the binary before initialization:" : "Only after immutable GitHub release admission, install the candidate's reviewed immutable tag, then verify the binary before initialization:"}`),
+          text(`Oompa requires Bun 1.3.14 plus curl with HTTPS and TLS 1.2 support. The CLI and local daemon support macOS and Linux. Codex effects run on both platforms; Claude Code effects run on Linux only. Oompa refuses new Claude Code effects on macOS pending authenticated isolated-Keychain and detached-read acceptance. Native protected-input control loads only when a terminal prompt needs it and supports the standard macOS, glibc, and x64 or arm64 musl library names. ${isAdmittedRelease(releaseVersion) ? "Install the admitted release's reviewed immutable tag, then verify the binary before initialization:" : "Only after immutable GitHub release admission, install the candidate's reviewed immutable tag, then verify the binary before initialization:"}`),
         ),
         {
           kind: "commands",
@@ -1456,30 +1456,6 @@ export const publicContent: PublicContent = {
       ],
     },
     {
-      id: "desktop-account-switching",
-      heading: "Desktop account switching",
-      blocks: [
-        paragraph(
-          code("oompa account switch <profile>"),
-          text(" is experimental and macOS-only in the first beta. The current compatibility gate accepts only the signed OpenAI ChatGPT application at "),
-          code("/Applications/ChatGPT.app"),
-          text(" with reviewed version, build, CDHash, and isolated-profile launch hooks. Unsupported or changed bundles fail before quit."),
-        ),
-        paragraph(
-          text("A switch requires a signed-in target with a verified provider email, takes one machine-global lock, rejects multiple exact app processes, and refuses an unsettled earlier switch. It journals the target generation, gracefully quits the exact process, waits for exit, relaunches once with the target's isolated Codex and desktop-data roots, and binds read-only account verification to that launched PID, executable, CDHash, and environment."),
-        ),
-        paragraph(
-          text("The experimental desktop switch never copies "),
-          code("auth.json"),
-          text(", swaps one token, changes Keychain blindly, responds to a provider limit, or retries an uncertain switch. An uncertain quit, transition, or relaunch becomes "),
-          code("recovery_required"),
-          text(" and preserves both profiles. Run "),
-          code("oompa account switch-recover"),
-          text(" to reconcile only the current attempt. Recovery performs bounded read-only bundle, process, environment, and account observations; it never quits or launches the app. It releases the switch authority only when those observations prove the target account is active or prove that no target instance remains."),
-        ),
-      ],
-    },
-    {
       id: "sessions-across-machines",
       heading: "Sessions across machines",
       blocks: [
@@ -1596,8 +1572,6 @@ export const publicContent: PublicContent = {
             "oompa account show <profile> --provider devin  (retired local history and cleanup only)",
             "oompa account usage [profile] [--refresh]",
             "oompa account usage-history <profile> [--from <UTC-RFC3339>] [--through <UTC-RFC3339>] [--limit <1..100>] [--cursor <cursor>]",
-            "oompa account switch <profile>",
-            "oompa account switch-recover",
             "oompa plugin list <account> [--project <project>] [--refresh]",
             "oompa plugin show <account> <plugin> [--project <project>] [--refresh]",
             "oompa project add --path <directory> [--name <name>]",

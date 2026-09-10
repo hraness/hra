@@ -38,7 +38,7 @@ import { canonical39RetiredDatabaseBytes, canonical39RetiredFixtures, type Canon
 import { canonical39RetiredRecoveryDatabaseBytes, canonical39RetiredRecoveryFixtures } from "../../scripts/fixtures/canonical39-retired-recovery";
 import { retiredSuccessorDatabaseBytes, retiredSuccessorFixtures } from "../../scripts/fixtures/retired-successors";
 import { provisionMigratedStateTemplate } from "../../scripts/fixtures/migrated-state-template";
-import { deriveDesktopProfilePaths } from "../desktop/profile";
+import { deriveDesktopProfilePaths } from "./desktop-profile-paths";
 import { AUTORESPOND_DAY_MS } from "../domain/autorespond-budget";
 import {
   ROOT_STATUS_ATTENTION_LIMIT,

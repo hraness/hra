@@ -123,7 +123,7 @@ import type {
   OompaFactsMemoryLifecyclePort,
   OompaFactsMemoryLifecycleReceipt,
 } from "./facts-memory-lifecycle";
-import { ClaudeProcessExitUnprovenError, ClaudeSessionObservationError, CodexClaimReleaseUnprovenError, CodexSessionObservationError, UnavailableClaudeRuntime, UnavailableCloudControl, type ClaudeProcessIdentity, type ClaudeRuntimePort, type ClaudeRuntimeStartReview, type CloudControlPort, type CodexAccountProjection, type CodexLoginOutcome, type CodexRuntimePort, type CodexSessionObservation, type CodexSessionProjection, type CompactProjectionRecoveryBlocker, type DesktopSwitchPort, type ProfileAuthority, type RuntimeStartReview } from "./ports";
+import { ClaudeProcessExitUnprovenError, ClaudeSessionObservationError, CodexClaimReleaseUnprovenError, CodexSessionObservationError, UnavailableClaudeRuntime, UnavailableCloudControl, type ClaudeProcessIdentity, type ClaudeRuntimePort, type ClaudeRuntimeStartReview, type CloudControlPort, type CodexAccountProjection, type CodexLoginOutcome, type CodexRuntimePort, type CodexSessionObservation, type CodexSessionProjection, type CompactProjectionRecoveryBlocker, type ProfileAuthority, type RuntimeStartReview } from "./ports";
 import {
   BoundedPersonalSessionDiscovery,
   CLAUDE_REGISTRY_MAX_RECORDS,
@@ -1222,45 +1222,6 @@ class FakeCloud implements CloudControlPort {
   }
 }
 
-class FakeDesktop implements DesktopSwitchPort {
-  readonly calls: string[] = [];
-  readonly switchInputs: Array<Parameters<DesktopSwitchPort["switchAccount"]>[0]> = [];
-  recovery: unknown = {
-    status: "resolved_not_applied",
-    idempotencyKey: "00000000-0000-4000-8000-000000000601",
-    switchGeneration: 1,
-    targetProfileId: "acct_00000000000000000000000000000000",
-    diagnostic: "ZERO_EXACT_PROCESSES",
-    observationDigest: "a".repeat(64),
-    resolvedAt: 2_000,
-  };
-  current: unknown = { status: "none" };
-  currentError?: unknown;
-
-  async switchAccount(
-    input: Parameters<DesktopSwitchPort["switchAccount"]>[0],
-  ): Promise<{ status: "applied"; idempotencyKey: string }> {
-    this.calls.push("switch");
-    this.switchInputs.push(input);
-    return { status: "applied", idempotencyKey: input.idempotencyKey };
-  }
-
-  async recoverSwitch(): Promise<unknown> {
-    this.calls.push("recover");
-    return this.recovery;
-  }
-
-  currentRecovery(): unknown {
-    this.calls.push("current");
-    if (this.currentError !== undefined) {
-      throw this.currentError instanceof Error
-        ? this.currentError
-        : new Error("Fake desktop recovery failed.");
-    }
-    return this.current;
-  }
-}
-
 class FakeFactsMemoryLifecycle implements OompaFactsMemoryLifecyclePort {
   readonly cleanups: Array<Parameters<OompaFactsMemoryLifecyclePort["cleanupSession"]>[0]> = [];
   readonly ensures: Array<Parameters<OompaFactsMemoryLifecyclePort["ensureSession"]>[0]> = [];
@@ -1553,7 +1514,6 @@ const serviceFixtureDatabaseSnapshot = (path: string) => {
 };
 
 async function fixture(
-  desktop?: DesktopSwitchPort,
   cloud = new FakeCloud(),
   requestStop: () => void = () => undefined,
   now: () => number = Date.now,
@@ -1665,7 +1625,6 @@ async function fixture(
     daemonAuthority,
     daemonGeneration,
     daemonBootId,
-    ...(desktop === undefined ? {} : { desktop }),
     ...(managedClaude === undefined ? {} : { claude: managedClaude }),
     eventCursors,
     ...(factsMemory === undefined ? {} : { factsMemory }),
@@ -1709,7 +1668,7 @@ async function archivedDevinFixture(cloud = new FakeCloud(), options: Readonly<{
   factsMemory?: OompaFactsMemoryLifecyclePort;
   memory?: OompaMemoryPort;
 }> = {}) {
-  const value = await fixture(undefined, cloud, () => undefined, Date.now,
+  const value = await fixture(cloud, () => undefined, Date.now,
     options.factsMemory, {}, {
       canonical39Devin: true,
       ...(options.memory === undefined ? {} : { memory: options.memory }),
@@ -1796,11 +1755,11 @@ function createOwnedServiceCase(
   const cancellation = new Error("Owned service case is closing.");
   const tasks: Array<Promise<{ status: "fulfilled" } | { status: "rejected"; reason: unknown }>> = [];
   const createFixture: ServiceFixtureFactory = async (
-    desktop, cloud, requestStop, now, factsMemory, autorespond, adoption,
+    cloud, requestStop, now, factsMemory, autorespond, adoption,
     platformOrClaude, platformOverride,
   ) => {
     controller.signal.throwIfAborted();
-    const value = await fixture(desktop, cloud, requestStop, now, factsMemory,
+    const value = await fixture(cloud, requestStop, now, factsMemory,
       autorespond, adoption, platformOrClaude, platformOverride, resources);
     controller.signal.throwIfAborted();
     return {
@@ -1933,7 +1892,7 @@ describe("owned service case lifecycle", () => {
     const release = Promise.withResolvers<undefined>();
     let value: Awaited<ReturnType<typeof fixture>> | undefined;
     await owner.run(async ({ createFixture }) => {
-      value = await createFixture(undefined, undefined, undefined, undefined, undefined, {
+      value = await createFixture(undefined, undefined, undefined, undefined, {
         beforeMemoryClose: async () => {
           entered.resolve(undefined);
           await release.promise;
@@ -2102,9 +2061,7 @@ async function adoptedCodexFixture(
 ) {
   const personalCodex = new FakeCodex();
   const discovery = new FakePersonalSessionDiscovery();
-  const value = await createFixture(
-    undefined,
-    new FakeCloud(),
+  const value = await createFixture(new FakeCloud(),
     () => undefined,
     () => personalAdoptionNow,
     factsMemory,
@@ -2170,9 +2127,7 @@ async function preparedPersonalCodexCandidate(input: Readonly<{
 }>) {
   const personalCodex = new FakeCodex();
   const discovery = new FakePersonalSessionDiscovery();
-  const value = await fixture(
-    undefined,
-    new FakeCloud(),
+  const value = await fixture(new FakeCloud(),
     () => undefined,
     input.now ?? (() => personalAdoptionNow),
     undefined,
@@ -2256,9 +2211,7 @@ async function adoptedClaudeFixture(
   });
   const personalClaude = new FakeClaude("personal", personalIdentity);
   const discovery = new FakePersonalSessionDiscovery();
-  const value = await createFixture(
-    undefined,
-    new FakeCloud(),
+  const value = await createFixture(new FakeCloud(),
     () => undefined,
     now,
     undefined,
@@ -2326,9 +2279,7 @@ async function nativeClaudeFixture(
   createFixture: ServiceFixtureFactory = fixture,
 ) {
   const managedClaude = new FakeClaude("isolated", identity);
-  const value = await createFixture(
-    undefined,
-    new FakeCloud(),
+  const value = await createFixture(new FakeCloud(),
     () => undefined,
     () => personalAdoptionNow,
     undefined,
@@ -2462,9 +2413,7 @@ async function claudeAccountFixture(
     pinnedVersion: () => CLAUDE_PIN,
     close: async () => undefined,
   };
-  const value = await createFixture(
-    undefined,
-    new FakeCloud(),
+  const value = await createFixture(new FakeCloud(),
     () => undefined,
     Date.now,
     undefined,
@@ -3501,9 +3450,7 @@ describe("OompaService personal-session adoption", () => {
       pidDomain: "darwin",
       procStart: "managed-claude-pre-admission",
     });
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => personalAdoptionNow,
       undefined,
@@ -3587,9 +3534,7 @@ describe("OompaService personal-session adoption", () => {
       pidDomain: "darwin",
       procStart: "managed-claude-unproven-start",
     });
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => personalAdoptionNow,
       undefined,
@@ -3674,7 +3619,6 @@ describe("OompaService personal-session adoption", () => {
       (closing) => expectedCustodyRefusal
         ? expectUnprovedLaunchCloseRefused(closing)
         : closing.service.close(),
-      undefined,
       new FakeCloud(),
       () => undefined,
       () => personalAdoptionNow,
@@ -3939,9 +3883,7 @@ describe("OompaService personal-session adoption", () => {
       pidDomain: "darwin",
       procStart: "managed-claude-public-profile",
     });
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => personalAdoptionNow,
       undefined,
@@ -4006,9 +3948,7 @@ describe("OompaService personal-session adoption", () => {
   test.each(["current", "legacy"] as const)(
     "keeps a stored %s Claude config-home private when managed control is platform-unavailable",
     async (profileShape) => {
-      const value = await fixture(
-        undefined,
-        new FakeCloud(),
+      const value = await fixture(new FakeCloud(),
         () => undefined,
         () => personalAdoptionNow,
         undefined,
@@ -4090,9 +4030,7 @@ describe("OompaService personal-session adoption", () => {
     managedClaude.disconnectOnObserveRequest = 1;
     managedClaude.processIdentityOnClaim = replacementIdentity;
     managedClaude.observationConnectionIdOnClaim = replacementConnectionId;
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => personalAdoptionNow,
       undefined,
@@ -4185,9 +4123,7 @@ describe("OompaService personal-session adoption", () => {
       ...claudeRuntimeProfile(authority, "isolated"),
       model: "claude-other-model",
     });
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => personalAdoptionNow,
       undefined,
@@ -4357,9 +4293,7 @@ describe("OompaService personal-session adoption", () => {
   test("holds account authority across a personal Codex adoption claim and managed disconnect", async () => {
     const personalCodex = new FakeCodex();
     const discovery = new FakePersonalSessionDiscovery();
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => personalAdoptionNow,
       undefined,
@@ -4719,9 +4653,7 @@ describe("OompaService personal-session adoption", () => {
       authorityScans.push(scan);
       return scan;
     };
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => personalAdoptionNow,
       undefined,
@@ -5000,9 +4932,7 @@ describe("OompaService personal-session adoption", () => {
       },
     };
     const personalCodex = new FakeCodex();
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => personalAdoptionNow,
       undefined,
@@ -5114,9 +5044,7 @@ describe("OompaService personal-session adoption", () => {
     const firstPersonalCodex = new FakeCodex();
     const firstReader = (request: CodexAutomationAuthorityRequest) =>
       readCodexAutomationAuthority({ ...request, automationsDirectory });
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => personalAdoptionNow,
       undefined,
@@ -5277,9 +5205,7 @@ describe("OompaService personal-session adoption", () => {
       },
     };
     const personalCodex = new FakeCodex();
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => now,
       undefined,
@@ -5468,9 +5394,7 @@ describe("OompaService personal-session adoption", () => {
       };
       return Promise.resolve({ ...page, nextCursor: cursorState.token });
     };
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => now,
       undefined,
@@ -5555,9 +5479,7 @@ describe("OompaService personal-session adoption", () => {
       )),
     };
     const personalCodex = new FakeCodex();
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => personalAdoptionNow,
       undefined,
@@ -5641,9 +5563,7 @@ describe("OompaService personal-session adoption", () => {
   test("bounds failed project canonicalization and reaches a later valid row next poll", async () => {
     const personalCodex = new FakeCodex();
     const discovery = new FakePersonalSessionDiscovery();
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => personalAdoptionNow,
       undefined,
@@ -5784,9 +5704,7 @@ describe("OompaService personal-session adoption", () => {
       scheduledProviderThreadIds.includes(providerThreadId)
         ? new Error("slow scheduled prefix failure")
         : undefined;
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => personalAdoptionNow,
       undefined,
@@ -5913,9 +5831,7 @@ describe("OompaService personal-session adoption", () => {
       },
     });
     const personalCodex = new FakeCodex();
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => personalAdoptionNow,
       undefined,
@@ -6003,9 +5919,7 @@ describe("OompaService personal-session adoption", () => {
       },
     ];
     const personalCodex = new FakeCodex();
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => personalAdoptionNow,
       undefined,
@@ -6169,9 +6083,7 @@ describe("OompaService personal-session adoption", () => {
       procStart: "personal-claim-cap",
     });
     personalClaude.claimSessionError = new Error("bounded Claude claim failure");
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => personalAdoptionNow,
       undefined,
@@ -6322,9 +6234,7 @@ describe("OompaService personal-session adoption", () => {
       },
     });
     const personalCodex = new FakeCodex();
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => personalAdoptionNow,
       undefined,
@@ -6549,9 +6459,7 @@ describe("OompaService personal-session adoption", () => {
   test("releases a Codex claim whose fresh projection revoked the quiet-window inference", async () => {
     const personalCodex = new FakeCodex();
     const discovery = new FakePersonalSessionDiscovery();
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => personalAdoptionNow,
       undefined,
@@ -6612,9 +6520,7 @@ describe("OompaService personal-session adoption", () => {
       procStart: "managed-claude-pagination",
     });
     const discovery = new FakePersonalSessionDiscovery();
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => personalAdoptionNow,
       undefined,
@@ -6938,9 +6844,7 @@ describe("OompaService personal-session adoption", () => {
       pidDomain: "darwin",
       procStart: "managed-claude-provider-collision",
     });
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => personalAdoptionNow,
       undefined,
@@ -7026,9 +6930,7 @@ describe("OompaService personal-session adoption", () => {
       procStart: "retained-adopted-process",
     });
     const discovery = new FakePersonalSessionDiscovery();
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => personalAdoptionNow,
       undefined,
@@ -7189,9 +7091,7 @@ describe("OompaService personal-session adoption", () => {
       pidDomain: "darwin",
       procStart: "personal-retained-prefix",
     });
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => personalAdoptionNow,
       undefined,
@@ -7302,9 +7202,7 @@ describe("OompaService personal-session adoption", () => {
       procStart: "retained-fenced-adopted",
     });
     const discovery = new FakePersonalSessionDiscovery();
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => personalAdoptionNow,
       undefined,
@@ -10078,9 +9976,7 @@ describe("OompaService personal-session adoption", () => {
   test("releases a claimed personal thread when durable adoption collides", async () => {
     const personalCodex = new FakeCodex();
     const discovery = new FakePersonalSessionDiscovery();
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => personalAdoptionNow,
       undefined,
@@ -10257,8 +10153,7 @@ describe("OompaService", () => {
       const claude = new FakeClaude("isolated", {
         pid: 63_042, pidDomain: "darwin", procStart: "automatic-policy-command-fake-process",
       });
-      const desktop = new FakeDesktop();
-      const value = await fixture(desktop, new FakeCloud(), () => undefined, () => now, undefined, { claude });
+      const value = await fixture(new FakeCloud(), () => undefined, () => now, undefined, { claude });
       const profiles = ["primary", "secondary"].map((label) => {
         const current = value.store.nextProfileGeneration(value.store.createProfile(`Automatic ${label}`).id);
         expect(value.store.setProfileState(current.id, current.processGeneration, "signed_in", {
@@ -10297,9 +10192,8 @@ describe("OompaService", () => {
         expect(value.codex.resetIdempotencyKeys).toEqual([]);
         expect(value.codex.turnEffectTrace).toEqual([]);
         expect(claude.calls).toEqual([]);
-        expect(desktop.calls).toEqual([]);
       };
-      return { ...value, claude, desktop, now, sessionId: session.id, snapshot, expectNoProviderWork };
+      return { ...value, claude, now, sessionId: session.id, snapshot, expectNoProviderWork };
     };
 
     test("reports defaults and exact provider filters without any write or provider call", async () => {
@@ -10418,7 +10312,7 @@ describe("OompaService", () => {
       const contenderStore = new StateStore(value.paths, { now: () => value.now });
       stores.push(contenderStore);
       const contender = new OompaService({ store: contenderStore, paths: value.paths,
-        codex: value.codex, claude: value.claude, desktop: value.desktop, cloud: value.cloud,
+        codex: value.codex, claude: value.claude, cloud: value.cloud,
         daemonAuthority: new FakeDaemonAuthority(), daemonGeneration: value.daemonGeneration,
         daemonBootId: value.daemonBootId, eventCursors: value.eventCursors, now: () => value.now,
         requestStop: () => undefined,
@@ -10493,9 +10387,7 @@ describe("OompaService", () => {
 
   test("reports and CAS-updates notification hours with the injected clock only", async () => {
     let now = Date.parse("2026-09-04T12:30:00.000Z");
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => now,
     );
@@ -10573,7 +10465,7 @@ describe("OompaService", () => {
   });
 
   test("keeps notification email local, default-off, and on the shared revision", async () => {
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => 1_000);
+    const value = await fixture(new FakeCloud(), () => undefined, () => 1_000);
     expect(await value.service.execute(
       { kind: "notification-email.status" },
       { signal },
@@ -10619,7 +10511,7 @@ describe("OompaService", () => {
 
   test("commits local disable before reporting hosted acknowledgement", async () => {
     const cloud = new FakeCloud();
-    const value = await fixture(undefined, cloud, () => undefined, () => 60_000);
+    const value = await fixture(cloud, () => undefined, () => 60_000);
     await value.service.execute({
       expectedRevision: 1,
       kind: "notification-email.enable",
@@ -10663,7 +10555,7 @@ describe("OompaService", () => {
       observedAt: 60_000,
       state: "observed",
     };
-    const value = await fixture(undefined, cloud, () => undefined, () => 60_000);
+    const value = await fixture(cloud, () => undefined, () => 60_000);
     expect(await value.service.execute(
       { kind: "notification-email.status" },
       { signal },
@@ -10715,7 +10607,7 @@ describe("OompaService", () => {
     cloud.beforeAttentionInvalidation = () => {
       throw new Error("offline");
     };
-    const value = await fixture(undefined, cloud, () => undefined, () => 60_000);
+    const value = await fixture(cloud, () => undefined, () => 60_000);
     await value.service.execute({
       expectedRevision: 1,
       kind: "notification-email.enable",
@@ -10736,7 +10628,7 @@ describe("OompaService", () => {
       expiresNoLaterThan: 180_000,
       state: "revocation_pending",
     };
-    const value = await fixture(undefined, cloud, () => undefined, () => 60_000);
+    const value = await fixture(cloud, () => undefined, () => 60_000);
     await value.service.execute({
       expectedRevision: 1,
       kind: "notification-email.enable",
@@ -10773,9 +10665,7 @@ describe("OompaService", () => {
 
   test("reads the default peer policy and applies exact-CAS owner updates", async () => {
     let now = 1_000;
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => now,
     );
@@ -11867,7 +11757,7 @@ describe("OompaService", () => {
 
   test("revalidates peer actor account authority after its mutation locks are acquired", async () => {
     const cloud = new FakeCloud();
-    const value = await fixture(undefined, cloud);
+    const value = await fixture(cloud);
     const { sessionId: actorSessionId } = await createIdleSession(
       value,
       "Peer actor authority race",
@@ -11951,7 +11841,7 @@ describe("OompaService", () => {
 
   test("refuses a peer target that moved to an account whose lock was not acquired", async () => {
     const cloud = new FakeCloud();
-    const value = await fixture(undefined, cloud);
+    const value = await fixture(cloud);
     const { sessionId: actorSessionId } = await createIdleSession(
       value,
       "Peer target lock freshness actor",
@@ -12626,7 +12516,7 @@ describe("OompaService", () => {
     "fences peer mutations when either account has durable projection recovery (%s)",
     (recoverySide) => ownedServiceCase(async ({ createFixture, signal }) => {
       const cloud = new FakeCloud();
-      const value = await createFixture(undefined, cloud);
+      const value = await createFixture(cloud);
       signal.throwIfAborted();
       const { sessionId: actorSessionId } = await createIdleSession(
         value,
@@ -12712,7 +12602,7 @@ describe("OompaService", () => {
     "fences peer mutations while a sibling projection recovery owns the %s account",
     (recoverySide) => ownedServiceCase(async ({ createFixture, signal }) => {
       const cloud = new FakeCloud();
-      const value = await createFixture(undefined, cloud);
+      const value = await createFixture(cloud);
       signal.throwIfAborted();
       const { sessionId: actorSessionId } = await createIdleSession(
         value,
@@ -12850,9 +12740,7 @@ describe("OompaService", () => {
 
   test("dispatches memory host tools with session authority, deterministic mutation keys, and closed refusals", async () => {
     const memory = new FakeMemory();
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       Date.now,
       undefined,
@@ -12983,9 +12871,7 @@ describe("OompaService", () => {
     let markQuiescenceStarted!: () => void;
     const quiescenceStarted = new Promise<void>((resolve) => { markQuiescenceStarted = resolve; });
     const quiescence = new Promise<void>((resolve) => { releaseQuiescence = resolve; });
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       Date.now,
       undefined,
@@ -13009,9 +12895,7 @@ describe("OompaService", () => {
   test("does not close memory when external observer quiescence fails", async () => {
     const memory = new FakeMemory();
     const quiescenceFailure = new Error("external memory observer remained live");
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       Date.now,
       undefined,
@@ -13027,9 +12911,7 @@ describe("OompaService", () => {
 
   test("routes the owner memory CLI through the coordinator with exact session and replay authority", async () => {
     const memory = new FakeMemory();
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       Date.now,
       undefined,
@@ -13121,9 +13003,7 @@ describe("OompaService", () => {
   test("revalidates memory actor authority after acquiring the session lock", async () => {
     const memory = new FakeMemory();
     const cloud = new FakeCloud();
-    const value = await fixture(
-      undefined,
-      cloud,
+    const value = await fixture(cloud,
       () => undefined,
       Date.now,
       undefined,
@@ -13177,7 +13057,7 @@ describe("OompaService", () => {
 
   test("revalidates peer actor account authority after acquiring both session locks", async () => {
     const cloud = new FakeCloud();
-    const value = await fixture(undefined, cloud);
+    const value = await fixture(cloud);
     const { sessionId: actorSessionId } = await createIdleSession(
       value,
       "Queued peer actor account authority",
@@ -13261,9 +13141,7 @@ describe("OompaService", () => {
   test("requires exact live runtime authority before and after the host-tool session lock", async () => {
     const memory = new FakeMemory();
     const cloud = new FakeCloud();
-    const value = await fixture(
-      undefined,
-      cloud,
+    const value = await fixture(cloud,
       () => undefined,
       Date.now,
       undefined,
@@ -13391,7 +13269,7 @@ describe("OompaService", () => {
   test("forwards one caller UUIDv7 through lost device responses and exact replays", async () => {
     for (const kind of ["approve", "revoke"] as const) {
       const cloud = new FakeCloud();
-      const { service } = await fixture(undefined, cloud);
+      const { service } = await fixture(cloud);
       const idempotencyKey = kind === "approve"
         ? "018bcfe5-6800-7000-8000-000000000041"
         : "018bcfe5-6800-7000-8000-000000000042";
@@ -13425,7 +13303,7 @@ describe("OompaService", () => {
 
   test("rejects a device caller key reused across targets or operations", async () => {
     const cloud = new FakeCloud();
-    const { service } = await fixture(undefined, cloud);
+    const { service } = await fixture(cloud);
     const idempotencyKey = "018bcfe5-6800-7000-8000-000000000043";
     await expect(service.execute({
       device: "device_original",
@@ -13481,7 +13359,7 @@ describe("OompaService", () => {
       },
     ] as const;
     const cloud = new FakeCloud();
-    const { service } = await fixture(undefined, cloud);
+    const { service } = await fixture(cloud);
     for (const expected of cases) {
       cloud.keyLossError = new AccountKeyLossPreconditionError(expected.failure);
       await expect(service.execute({
@@ -13499,7 +13377,7 @@ describe("OompaService", () => {
   test("defers identity-switch and account-erasure shutdown until after the response boundary", async () => {
     const cloud = new FakeCloud();
     let stopCalls = 0;
-    const { service, store } = await fixture(undefined, cloud, () => { stopCalls += 1; });
+    const { service, store } = await fixture(cloud, () => { stopCalls += 1; });
     const afterResponse: Array<() => void> = [];
 
     cloud.authResult = { daemonRestartRequired: true, signedIn: true };
@@ -13539,78 +13417,12 @@ describe("OompaService", () => {
     expect(stopCalls).toBe(2);
   });
 
-  test("delegates desktop recovery and projects the exact doctor action", async () => {
-    const desktop = new FakeDesktop();
-    desktop.current = {
-      status: "recovery_required",
-      idempotencyKey: "00000000-0000-4000-8000-000000000601",
-      switchGeneration: 1,
-      targetProfileId: "acct_00000000000000000000000000000000",
-      diagnostic: "PROCESS_SET_CHANGED",
-      action: "oompa account switch-recover",
-    };
-    const { service } = await fixture(desktop);
-
-    expect(await service.execute({ kind: "account.switch-recover" }, { signal })).toBe(desktop.recovery);
-    const doctor = await service.execute({ kind: "doctor", offline: true }, { signal }) as {
-      desktop: { recovery: unknown };
-      problems: string[];
-    };
-    expect(desktop.calls).toEqual(["recover", "current"]);
-    expect(doctor.desktop.recovery).toBe(desktop.current);
-    expect(doctor.problems).toContain("A desktop switch is unresolved. Run `oompa account switch-recover`.");
-  });
-
-  test("does not claim the active provider default is the running desktop source", async () => {
-    const desktop = new FakeDesktop();
-    const { service, store } = await fixture(desktop);
-    const source = await service.execute(
-      { kind: "account.add", label: "New-work default" },
-      { signal },
-    ) as { account: { id: `acct_${string}` } };
-    await service.execute(
-      { account: source.account.id, deviceCode: false, kind: "account.login" },
-      { signal },
-    );
-    const target = await service.execute(
-      { kind: "account.add", label: "Desktop target" },
-      { signal },
-    ) as { account: { id: `acct_${string}` } };
-    await service.execute(
-      { account: target.account.id, deviceCode: false, kind: "account.login" },
-      { signal },
-    );
-    const state = store.readProviderAccountState("codex");
-    store.activateProviderAccount({
-      provider: "codex",
-      expectedPointerRevision: state.pointerRevision,
-      providerAccountId: source.account.id,
-    });
-
-    await service.execute({
-      account: target.account.id,
-      idempotencyKey: crypto.randomUUID(),
-      kind: "account.switch",
-    }, { signal });
-
-    expect(store.readProviderAccountState("codex").activeProviderAccountId).toBe(source.account.id);
-    expect(desktop.switchInputs).toHaveLength(1);
-    expect(desktop.switchInputs[0]?.source).toBeUndefined();
-    expect(desktop.switchInputs[0]?.target).toMatchObject({
-      id: target.account.id,
-      provider: "codex",
-      providerAccountId: target.account.id,
-    });
-  });
-
   test("doctor closes dependency failures without repeating arbitrary runtime diagnostics", async () => {
     const privatePath = ["", "Users", "operator", "private"].join("/");
     const secret = `sk-live-secret ${privatePath}\u001b[31m`;
     const cloud = new FakeCloud();
     cloud.statusError = new Error(secret);
-    const desktop = new FakeDesktop();
-    desktop.currentError = new Error(secret);
-    const { service } = await fixture(desktop, cloud);
+    const { service } = await fixture(cloud);
 
     const doctor = await service.execute({ kind: "doctor", offline: false }, { signal });
     const serialized = JSON.stringify(doctor);
@@ -13621,12 +13433,6 @@ describe("OompaService", () => {
       cloud: {
         diagnostic: "Cloud status failed without exposing its runtime diagnostic.",
         status: "unavailable",
-      },
-      desktop: {
-        recovery: {
-          diagnostic: "Desktop switch recovery failed without exposing its runtime diagnostic.",
-          status: "invalid",
-        },
       },
     });
   });
@@ -14771,7 +14577,7 @@ describe("OompaService", () => {
 
   test("fails closed for unknown or cross-provider methods on a bound session", async () => {
     let now = 50_000;
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const value = await fixture(new FakeCloud(), () => undefined, () => now);
     const { sessionId } = await createIdleSession(value, "Provider-bound interaction");
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
@@ -15252,7 +15058,7 @@ describe("OompaService", () => {
 
   test("turns bounded projection and deployment status into actionable doctor health", async () => {
     const cloud = new FakeCloud();
-    const { service, documents } = await fixture(undefined, cloud);
+    const { service, documents } = await fixture(cloud);
     await service.execute({ kind: "project.add", label: "Doctor docs", path: documents }, { signal });
 
     cloud.statusResult = {
@@ -15843,7 +15649,7 @@ describe("OompaService", () => {
 
   test("scheduled task materialization dispatches through the sealed empty-attachment queue writer", async () => {
     let now = 2_000;
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const value = await fixture(new FakeCloud(), () => undefined, () => now);
     const { service, store, codex } = value;
     try {
       const { sessionId } = await createIdleSession(value, "Sealed scheduled task");
@@ -15937,8 +15743,7 @@ describe("OompaService", () => {
     "projects authentic predecessor attachment names only for its exact settled replay (%s)",
     async (scenario) => {
       const captured = canonical39AttachmentFixtures[scenario];
-      const { service, codex, store, paths } = await fixture(
-        undefined, new FakeCloud(), () => undefined, () => 40_000, undefined, {},
+      const { service, codex, store, paths } = await fixture(new FakeCloud(), () => undefined, () => 40_000, undefined, {},
         { canonical39Attachments: scenario },
       );
       const unsafeNames = [
@@ -16470,7 +16275,7 @@ describe("OompaService", () => {
   });
 
   test("queue attachment identity quarantines an unproved legacy FIFO head until explicit abandonment", async () => {
-    const value = await fixture(undefined, new FakeCloud(), () => undefined,
+    const value = await fixture(new FakeCloud(), () => undefined,
       () => 1_900_000_001_000, undefined, {}, { canonical40Queues: true });
     const { service, store, paths, codex } = value;
     const archived = canonical40QueuesFixture.queues.find((entry) => entry.state === "pending");
@@ -16513,9 +16318,7 @@ describe("OompaService", () => {
 
   test("pages neutral transcript records without skipping and reports retained-history loss", async () => {
     let currentTime = 1_000;
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => currentTime,
     );
@@ -16580,9 +16383,7 @@ describe("OompaService", () => {
   test("hooks host-owned facts memory into start, resume, terminal archive, and expiry without a model command", async () => {
     const factsMemory = new FakeFactsMemoryLifecycle();
     const now = () => 10_000;
-    const { service, documents, codex } = await fixture(
-      undefined,
-      new FakeCloud(),
+    const { service, documents, codex } = await fixture(new FakeCloud(),
       () => undefined,
       now,
       factsMemory,
@@ -16622,9 +16423,7 @@ describe("OompaService", () => {
 
   test.each([false, true])("honors bound working-memory ownership during a cross-account switch (unsettled=%s)", async (unsettled) => {
     const factsMemory = new FakeFactsMemoryLifecycle();
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       Date.now,
       factsMemory,
@@ -16708,9 +16507,7 @@ describe("OompaService", () => {
   test("cancels pre-effect memory submissions before terminal facts-memory purge", async () => {
     const factsMemory = new FakeFactsMemoryLifecycle();
     const memory = new FakeMemory();
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       Date.now,
       factsMemory,
@@ -16759,9 +16556,7 @@ describe("OompaService", () => {
   test("terminalizes provider deletion immediately but orders purge after admitted memory", async () => {
     const factsMemory = new FakeFactsMemoryLifecycle();
     const memory = new FakeMemory();
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       Date.now,
       factsMemory,
@@ -16837,9 +16632,7 @@ describe("OompaService", () => {
   test("retains terminal facts memory while a post-effect submission needs recovery", async () => {
     const factsMemory = new FakeFactsMemoryLifecycle();
     const memory = new FakeMemory();
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       Date.now,
       factsMemory,
@@ -16909,9 +16702,7 @@ describe("OompaService", () => {
     factsMemory.simulateExpiry = true;
     const memory = new FakeMemory();
     let now = 1_000;
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => now,
       factsMemory,
@@ -16965,9 +16756,7 @@ describe("OompaService", () => {
 
   test("blocks project reassignment while a memory submission is unsettled", async () => {
     const memory = new FakeMemory();
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       Date.now,
       undefined,
@@ -17114,9 +16903,7 @@ describe("OompaService", () => {
 
   test("cleans list-driven terminalization and reconciles a crash-left terminal on restart", async () => {
     const factsMemory = new FakeFactsMemoryLifecycle();
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       Date.now,
       factsMemory,
@@ -17204,9 +16991,7 @@ describe("OompaService", () => {
   test("renews facts-memory expiry after metadata-only durable activity", async () => {
     const factsMemory = new FakeFactsMemoryLifecycle();
     let now = 1_000;
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => now,
       factsMemory,
@@ -17262,9 +17047,7 @@ describe("OompaService", () => {
     const factsMemory = new FakeFactsMemoryLifecycle();
     factsMemory.simulateExpiry = true;
     let now = 1_000;
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => now,
       factsMemory,
@@ -17296,9 +17079,7 @@ describe("OompaService", () => {
   test("sweeps and renews facts memory for remote metadata and provider-list commits", async () => {
     const factsMemory = new FakeFactsMemoryLifecycle();
     let now = 2_000;
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => now,
       factsMemory,
@@ -17353,9 +17134,7 @@ describe("OompaService", () => {
 
   test("terminal recovery commits purge immediately and a poisoned terminal row cannot block restart", async () => {
     const factsMemory = new FakeFactsMemoryLifecycle();
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       Date.now,
       factsMemory,
@@ -17434,9 +17213,7 @@ describe("OompaService", () => {
 
   test("purges facts memory before releasing an abandoned local recovery authority", async () => {
     const factsMemory = new FakeFactsMemoryLifecycle();
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       Date.now,
       factsMemory,
@@ -17454,9 +17231,7 @@ describe("OompaService", () => {
 
   test("does not purge facts memory when abandon is rejected for a live session", async () => {
     const factsMemory = new FakeFactsMemoryLifecycle();
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       Date.now,
       factsMemory,
@@ -17470,9 +17245,7 @@ describe("OompaService", () => {
   test("returns the created session authority when memory finalization needs an exact retry", async () => {
     const factsMemory = new FakeFactsMemoryLifecycle();
     factsMemory.ensureErrorOnce = new Error("lost memory receipt");
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       Date.now,
       factsMemory,
@@ -17509,9 +17282,7 @@ describe("OompaService", () => {
   test("same-key settled start replay reconciles missing facts memory without another provider start", async () => {
     const factsMemory = new FakeFactsMemoryLifecycle();
     factsMemory.ensureErrorOnce = new Error("lost memory receipt");
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       Date.now,
       factsMemory,
@@ -17556,9 +17327,7 @@ describe("OompaService", () => {
 
   test("same-key settled start replay keeps terminal facts memory purged without live dependencies", async () => {
     const factsMemory = new FakeFactsMemoryLifecycle();
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       Date.now,
       factsMemory,
@@ -17968,7 +17737,7 @@ describe("OompaService", () => {
       change,
     });
     const setup = async () => {
-      const value = await fixture(undefined, new FakeCloud(), () => undefined,
+      const value = await fixture(new FakeCloud(), () => undefined,
         () => automaticResetWindowResetsAt - 3 * 24 * 60 * 60_000);
       const added = await value.service.execute({ kind: "account.add", label: "Policy reset" }, { signal }) as {
         account: { id: `acct_${string}` };
@@ -18427,9 +18196,7 @@ describe("OompaService", () => {
     let now = 1_000_000_000;
     const suppressedWindow = now + 3 * 24 * 60 * 60 * 1_000;
     const laterWindow = suppressedWindow + 3 * 24 * 60 * 60 * 1_000;
-    const { service, codex, store } = await fixture(
-      undefined,
-      new FakeCloud(),
+    const { service, codex, store } = await fixture(new FakeCloud(),
       () => undefined,
       () => now,
     );
@@ -19192,9 +18959,7 @@ describe("OompaService", () => {
     let now = 2_000_000_000;
     const originalWindow = now + 3 * 24 * 60 * 60 * 1_000;
     const laterWindow = originalWindow + 3 * 24 * 60 * 60 * 1_000;
-    const { service, codex, store } = await fixture(
-      undefined,
-      new FakeCloud(),
+    const { service, codex, store } = await fixture(new FakeCloud(),
       () => undefined,
       () => now,
     );
@@ -19558,9 +19323,7 @@ describe("OompaService", () => {
   test("synchronously fences provider authority when reset journaling fails", async () => {
     for (const boundary of ["defer", "settle"] as const) {
       let stopCalls = 0;
-      const value = await fixture(
-        undefined,
-        new FakeCloud(),
+      const value = await fixture(new FakeCloud(),
         () => { stopCalls += 1; },
       );
       const added = await value.service.execute({
@@ -19771,7 +19534,7 @@ describe("OompaService", () => {
 
   test("pages a safe source-ordered 24-hour account usage history", async () => {
     let now = 1_700_000_000_000;
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const value = await fixture(new FakeCloud(), () => undefined, () => now);
     const added = await value.service.execute(
       { kind: "account.add", label: "Usage history" },
       { signal },
@@ -19925,7 +19688,7 @@ describe("OompaService", () => {
 
   test("binds usage-history rows and cursors to the current account identity", async () => {
     const now = 1_700_000_000_000;
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const value = await fixture(new FakeCloud(), () => undefined, () => now);
     const added = await value.service.execute({
       kind: "account.add",
       label: "Identity history",
@@ -20003,7 +19766,7 @@ describe("OompaService", () => {
 
   test("rejects usage-history ranges outside the retained window", async () => {
     const now = 1_700_000_000_000;
-    const { service } = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const { service } = await fixture(new FakeCloud(), () => undefined, () => now);
     const added = await service.execute(
       { kind: "account.add", label: "Bounded usage" },
       { signal },
@@ -20570,7 +20333,7 @@ describe("OompaService", () => {
 
   test("lets the cloud projection reader reacquire authority while the in-flight fence rejects concurrent mutations", async () => {
     const cloud = new FakeCloud();
-    const value = await fixture(undefined, cloud);
+    const value = await fixture(cloud);
     const { sessionId } = await createIdleSession(value, "Projection serialization");
     const recoverySession = value.store.requireSession(sessionId);
     const recoveryProfile = value.store.requireProfileById(recoverySession.profileId);
@@ -20757,9 +20520,7 @@ describe("OompaService", () => {
   test("fences manual, autorespond, and deadline interaction effects during projection recovery", async () => {
     let now = 125_000;
     const cloud = new FakeCloud();
-    const value = await fixture(
-      undefined,
-      cloud,
+    const value = await fixture(cloud,
       () => undefined,
       () => now,
     );
@@ -20855,9 +20616,7 @@ describe("OompaService", () => {
 
   test("fences every interaction effect behind a pending accepted-message transcript", async () => {
     let now = 126_000;
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       () => now,
     );
@@ -20962,7 +20721,7 @@ describe("OompaService", () => {
 
   test("routes same-key projection recovery replay through the same closed cloud seam", async () => {
     const cloud = new FakeCloud();
-    const value = await fixture(undefined, cloud);
+    const value = await fixture(cloud);
     const { sessionId } = await createIdleSession(value, "Projection replay");
     const providerWritesBefore = providerMutationCalls(value.codex);
     const command = {
@@ -20987,7 +20746,7 @@ describe("OompaService", () => {
 
   test("classifies absent old keys and changed-key recovery authority without opaque internal failures", async () => {
     const cloud = new FakeCloud();
-    const value = await fixture(undefined, cloud);
+    const value = await fixture(cloud);
     const { sessionId } = await createIdleSession(value, "Projection admission guidance");
     const command = {
       acknowledgeGap: true as const,
@@ -21017,7 +20776,7 @@ describe("OompaService", () => {
 
   test("durably blocks provider and metadata mutations until an unsettled recovery resolves", async () => {
     const cloud = new FakeCloud();
-    const value = await fixture(undefined, cloud);
+    const value = await fixture(cloud);
     const { sessionId } = await createIdleSession(value, "Projection durable block");
     const sessionBefore = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(sessionBefore.profileId);
@@ -21121,7 +20880,7 @@ describe("OompaService", () => {
 
   test("drops queue-scheduling provider facts while projection recovery preserves the session", async () => {
     const cloud = new FakeCloud();
-    const value = await fixture(undefined, cloud);
+    const value = await fixture(cloud);
     const { sessionId } = await createIdleSession(value, "Projection fact block");
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
@@ -21153,7 +20912,7 @@ describe("OompaService", () => {
 
   test("drops a provider fact when its profile generation advances during the recovery-state read", async () => {
     const cloud = new FakeCloud();
-    const value = await fixture(undefined, cloud);
+    const value = await fixture(cloud);
     const { sessionId } = await createIdleSession(value, "Stale fact generation");
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
@@ -21198,7 +20957,7 @@ describe("OompaService", () => {
 
   test("drops a provider fact when its same-generation profile signs out during the recovery-state read", async () => {
     const cloud = new FakeCloud();
-    const value = await fixture(undefined, cloud);
+    const value = await fixture(cloud);
     const { sessionId } = await createIdleSession(value, "Signed-out fact authority");
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
@@ -21235,7 +20994,7 @@ describe("OompaService", () => {
 
   test("provider deletion supersedes an in-flight recovery and terminalizes local authority exactly once", async () => {
     const cloud = new FakeCloud();
-    const value = await fixture(undefined, cloud);
+    const value = await fixture(cloud);
     const { sessionId } = await createIdleSession(value, "Projection deletion race");
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
@@ -21593,7 +21352,7 @@ describe("OompaService", () => {
   test("rejects projection recovery before cloud dispatch for unsettled mutation and queue authority", async () => {
     for (const unsettled of ["mutation", "queue"] as const) {
       const cloud = new FakeCloud();
-      const value = await fixture(undefined, cloud);
+      const value = await fixture(cloud);
       const { sessionId } = await createIdleSession(value, `Projection ${unsettled}`);
       const session = value.store.requireSession(sessionId);
       const profile = value.store.requireProfile(session.profileId);
@@ -21626,7 +21385,7 @@ describe("OompaService", () => {
 
   test("rejects a projection recovery result when daemon authority becomes stale during the cloud await", async () => {
     const cloud = new FakeCloud();
-    const value = await fixture(undefined, cloud);
+    const value = await fixture(cloud);
     const { sessionId } = await createIdleSession(value, "Projection stale fence");
     const providerWritesBefore = providerMutationCalls(value.codex);
     cloud.beforeProjectionRecoveryReturn = async () => { value.daemonAuthority.invalidate(); };
@@ -21643,7 +21402,7 @@ describe("OompaService", () => {
 
   test("fences an in-flight projection recovery during shutdown and joins it", async () => {
     const cloud = new FakeCloud();
-    const value = await fixture(undefined, cloud);
+    const value = await fixture(cloud);
     const { sessionId } = await createIdleSession(value, "Projection shutdown fence");
     const providerWritesBefore = providerMutationCalls(value.codex);
     let entered!: () => void;
@@ -23581,7 +23340,7 @@ describe("OompaService", () => {
 
   test("quarantines retired bound recovery without changing evidence or causing provider or facts-memory effects", async () => {
     const memory = new FakeFactsMemoryLifecycle();
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, Date.now,
+    const value = await fixture(new FakeCloud(), () => undefined, Date.now,
       memory, {}, { canonical39RetiredRecovery: "bound_send" });
     const captured = canonical39RetiredRecoveryFixtures.bound_send.retained;
     const sessionId = captured.session.id;
@@ -23628,7 +23387,7 @@ describe("OompaService", () => {
       const scenario = side === "source" ? "source_switch" : "target_switch";
       const archive = canonical39RetiredTargetFixtures[scenario];
       const captured = archive.retained;
-      const value = await fixture(undefined, new FakeCloud(), () => undefined, () => archive.fixedTime,
+      const value = await fixture(new FakeCloud(), () => undefined, () => archive.fixedTime,
         memory, {}, { canonical39RetiredTarget: scenario });
       const session = value.store.requireSession(captured.session.id);
       const key = captured.idempotencyKey;
@@ -23722,7 +23481,7 @@ describe("OompaService", () => {
 
   test("quarantines an exact retired in-flight start without blocking supported startup", async () => {
     const memory = new FakeFactsMemoryLifecycle();
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, Date.now,
+    const value = await fixture(new FakeCloud(), () => undefined, Date.now,
       memory, {}, { canonical39RetiredRecovery: "inflight_start" });
     const captured = canonical39RetiredRecoveryFixtures.inflight_start.retained;
     const session = value.store.requireSession(captured.session.id);
@@ -23763,7 +23522,7 @@ describe("OompaService", () => {
     // The archived39 writer really admitted this dispatch and its runtime
     // evidence. The fixture performs the current migration and one real boot;
     // no current queue or provider authority is retagged as historical input.
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, Date.now,
+    const value = await fixture(new FakeCloud(), () => undefined, Date.now,
       memory, {}, { canonical39Retired: "queue_dispatch" });
     const captured = canonical39RetiredFixtures.queue_dispatch.retained;
     const session = value.store.requireSession(captured.session.id);
@@ -23790,9 +23549,7 @@ describe("OompaService", () => {
 
   test("keeps independent Claude authority unchanged on Codex login and disconnect", async () => {
     const claude = new TrackingClaudeAuthority();
-    const { codex, documents, service, store } = await fixture(
-      undefined,
-      new FakeCloud(),
+    const { codex, documents, service, store } = await fixture(new FakeCloud(),
       () => undefined,
       Date.now,
       undefined,
@@ -23839,9 +23596,7 @@ describe("OompaService", () => {
   test("does not call an unrelated Claude rebind during Codex generation advance", async () => {
     let stopCalls = 0;
     const claude = new TrackingClaudeAuthority();
-    const { codex, daemonAuthority, documents, service, store } = await fixture(
-      undefined,
-      new FakeCloud(),
+    const { codex, daemonAuthority, documents, service, store } = await fixture(new FakeCloud(),
       () => { stopCalls += 1; },
       Date.now,
       undefined,
@@ -23894,9 +23649,7 @@ describe("OompaService", () => {
   test("leaves a restarted Claude schedule due until this daemon has its live binding", async () => {
     const clock = { value: 1_000 };
     const claude = new TrackingClaudeAuthority();
-    const { service, store, documents } = await fixture(
-      undefined,
-      new FakeCloud(),
+    const { service, store, documents } = await fixture(new FakeCloud(),
       () => undefined,
       () => clock.value,
       undefined,
@@ -24614,9 +24367,7 @@ describe("OompaService", () => {
 
   test("does not resurrect a retained-out send transcript record on exact replay", async () => {
     let currentTime = 1_000;
-    const { service, codex, documents, store } = await fixture(
-      undefined,
-      new FakeCloud(),
+    const { service, codex, documents, store } = await fixture(new FakeCloud(),
       () => undefined,
       () => currentTime,
     );
@@ -24654,9 +24405,7 @@ describe("OompaService", () => {
 
   test("does not reopen the human autorespond budget on retained-out exact replay", async () => {
     let currentTime = 1_000;
-    const { service, codex, documents, store } = await fixture(
-      undefined,
-      new FakeCloud(),
+    const { service, codex, documents, store } = await fixture(new FakeCloud(),
       () => undefined,
       () => currentTime,
     );
@@ -24687,9 +24436,7 @@ describe("OompaService", () => {
 
   test("does not resurrect a retained-out steer transcript record on exact replay", async () => {
     let currentTime = 1_000;
-    const { service, codex, documents, store } = await fixture(
-      undefined,
-      new FakeCloud(),
+    const { service, codex, documents, store } = await fixture(new FakeCloud(),
       () => undefined,
       () => currentTime,
     );
@@ -24849,8 +24596,7 @@ describe("OompaService", () => {
     "replays an authentic archived start only under its captured source contract (%s)",
     async (scenario) => {
       const captured = canonicalSessionStartFixtures[scenario];
-      const { service, codex, store, paths } = await fixture(
-        undefined, new FakeCloud(), () => undefined, () => 40_000, undefined, {},
+      const { service, codex, store, paths } = await fixture(new FakeCloud(), () => undefined, () => 40_000, undefined, {},
         { canonicalSessionStart: scenario },
       );
       // The fixture is imported before migration and a real new daemon boot.
@@ -24988,8 +24734,7 @@ describe("OompaService", () => {
     "retains an authentic indeterminate start across boot, checking source authority only when its captured root is usable (%s)",
     async (scenario) => {
       const captured = canonicalSessionStartFixtures[scenario];
-      const { service, codex, store, paths } = await fixture(
-        undefined, new FakeCloud(), () => undefined, () => 40_000, undefined, {},
+      const { service, codex, store, paths } = await fixture(new FakeCloud(), () => undefined, () => 40_000, undefined, {},
         { canonicalSessionStart: scenario },
       );
       expect(store.requireProfileById(captured.profile.id).processGeneration)
@@ -25233,7 +24978,7 @@ describe("OompaService", () => {
   ) {
     const factsMemory = new FakeFactsMemoryLifecycle();
     const memory = new FakeMemory();
-    const value = await fixture(undefined, new FakeCloud(), () => undefined,
+    const value = await fixture(new FakeCloud(), () => undefined,
       () => 1_800_000_000_000, factsMemory, {}, { memory });
     const { sessionId } = await createIdleSession(value, "Terminal local acknowledgment");
     const current = value.store.requireSession(sessionId);
@@ -25824,8 +25569,7 @@ describe("OompaService", () => {
 
   test("reports a committed scrub quarantine and stops only after the local response boundary", async () => {
     let stopRequests = 0;
-    const value = await fixture(
-      undefined, new FakeCloud(), () => { stopRequests += 1; }, undefined, undefined,
+    const value = await fixture(new FakeCloud(), () => { stopRequests += 1; }, undefined, undefined,
       { securityScrubCheckpoint: shortScrubCheckpoint },
     );
     const { sessionId } = await createIdleSession(value, "Committed scrub quarantine");
@@ -26065,8 +25809,7 @@ describe("OompaService", () => {
 
   test("stops after a committed queued turn scrub failure without inventing ambiguity", async () => {
     let stopRequests = 0;
-    const value = await fixture(
-      undefined, new FakeCloud(), () => { stopRequests += 1; }, undefined, undefined,
+    const value = await fixture(new FakeCloud(), () => { stopRequests += 1; }, undefined, undefined,
       { securityScrubCheckpoint: shortScrubCheckpoint },
     );
     const { sessionId } = await createIdleSession(value, "Queued scrub quarantine");
@@ -26112,8 +25855,7 @@ describe("OompaService", () => {
 
   test("stops when a deterministic queued turn failure commits but its scrub cannot finish", async () => {
     let stopRequests = 0;
-    const value = await fixture(
-      undefined, new FakeCloud(), () => { stopRequests += 1; }, undefined, undefined,
+    const value = await fixture(new FakeCloud(), () => { stopRequests += 1; }, undefined, undefined,
       { securityScrubCheckpoint: shortScrubCheckpoint },
     );
     const { sessionId } = await createIdleSession(value, "Failed queue scrub quarantine");
@@ -26615,9 +26357,7 @@ describe("OompaService", () => {
 
   test("releases retained Codex custody when durable logout admission fails", async () => {
     let stopRequests = 0;
-    const { service, codex, store } = await fixture(
-      undefined,
-      new FakeCloud(),
+    const { service, codex, store } = await fixture(new FakeCloud(),
       () => { stopRequests += 1; },
     );
     const added = await service.execute({ kind: "account.add", label: "Rejected logout admission" }, { signal }) as { account: { id: string } };
@@ -26926,9 +26666,7 @@ describe("OompaService", () => {
   test("maintains idle and terminal event streams on read without a new append", async () => {
     for (const localState of ["idle_signed_out", "terminal"] as const) {
       let currentTime = 1_000;
-      const value = await fixture(
-        undefined,
-        new FakeCloud(),
+      const value = await fixture(new FakeCloud(),
         () => undefined,
         () => currentTime,
       );
@@ -27107,7 +26845,7 @@ describe("OompaService", () => {
   });
 
   test("reports explicit provider provenance for unbound, signed-out, quarantined, and terminal sessions", async () => {
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => 210_000);
+    const value = await fixture(new FakeCloud(), () => undefined, () => 210_000);
     const unboundProfile = value.store.createProfile("Unbound observation");
     const unboundSession = value.store.createSession({
       profileId: unboundProfile.id,
@@ -27382,9 +27120,7 @@ describe("OompaService", () => {
 
   test("routes provider close and delete lifecycle without leaving a mutable stale session", async () => {
     const factsMemory = new FakeFactsMemoryLifecycle();
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => undefined,
       Date.now,
       factsMemory,
@@ -27815,9 +27551,7 @@ describe("OompaService", () => {
   ] as const) {
     test(`quarantines an interaction persistence fault ${fault.timing} ${fault.boundary}`, async () => {
       let stopCalls = 0;
-      const value = await fixture(
-        undefined,
-        new FakeCloud(),
+      const value = await fixture(new FakeCloud(),
         () => { stopCalls += 1; },
       );
       const { sessionId } = await createIdleSession(
@@ -27981,9 +27715,7 @@ describe("OompaService", () => {
 
   test("stops admitting work immediately when the atomic interaction quarantine itself fails", async () => {
     let stopCalls = 0;
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => { stopCalls += 1; },
     );
     const { sessionId } = await createIdleSession(value, "Failed persistence quarantine");
@@ -28477,9 +28209,7 @@ describe("OompaService", () => {
   for (const timing of ["before", "after"] as const) {
     test(`quarantines a committed provider-resolution event boundary ${timing} event insertion`, async () => {
     let stopCalls = 0;
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => { stopCalls += 1; },
     );
     const { sessionId } = await createIdleSession(value, "Provider resolution persistence");
@@ -28577,7 +28307,7 @@ describe("OompaService", () => {
   }
 
   test("pages signed interaction listings and caps the separate status summary", async () => {
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => 200_000);
+    const value = await fixture(new FakeCloud(), () => undefined, () => 200_000);
     const { sessionId } = await createIdleSession(value, "Interaction pagination");
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
@@ -28727,7 +28457,7 @@ describe("OompaService", () => {
   });
 
   test("session status separates pending summaries from responses in flight and reports queue axes", async () => {
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => 200_000);
+    const value = await fixture(new FakeCloud(), () => undefined, () => 200_000);
     const { sessionId } = await createIdleSession(value, "Unsettled status");
     const seeded = seedUnsettledInteractionStates(
       value,
@@ -28797,7 +28527,7 @@ describe("OompaService", () => {
     const archive = canonical39RetiredRecoveryFixtures.interaction_deadlines;
     const captured = archive.retained;
     let now = archive.fixedTime;
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now,
+    const value = await fixture(new FakeCloud(), () => undefined, () => now,
       undefined, {}, { canonical39RetiredRecovery: "interaction_deadlines" });
     // Keep the archived byte image independently readable. The current fixture
     // already performed the real migration and boot, not a restamped downgrade.
@@ -28884,7 +28614,7 @@ describe("OompaService", () => {
 
   test("expires all callback kinds exactly at their receipt-anchored deadline", async () => {
     let now = 50_000;
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const value = await fixture(new FakeCloud(), () => undefined, () => now);
     const { sessionId } = await createIdleSession(value, "Interaction deadlines");
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
@@ -29006,7 +28736,7 @@ describe("OompaService", () => {
 
   test("rejects every manual interaction shape at the exact immutable deadline", async () => {
     let now = 70_000;
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const value = await fixture(new FakeCloud(), () => undefined, () => now);
     const { sessionId } = await createIdleSession(value, "Manual interaction deadlines");
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
@@ -29192,7 +28922,7 @@ describe("OompaService", () => {
 
   test("expires a manual resolution when validation crosses the deadline before dispatch", async () => {
     let now = 80_000;
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const value = await fixture(new FakeCloud(), () => undefined, () => now);
     const { sessionId } = await createIdleSession(value, "Deadline validation race");
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
@@ -29259,7 +28989,7 @@ describe("OompaService", () => {
   test("does not dispatch a response prepared on the deadline clock edge", async () => {
     let baseNow = 90_000;
     const now = () => baseNow;
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, now);
+    const value = await fixture(new FakeCloud(), () => undefined, now);
     const { sessionId } = await createIdleSession(value, "Deadline prepare edge");
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
@@ -29343,7 +29073,7 @@ describe("OompaService", () => {
 
   test("settles a manual response unknown when account authority changes after the provider write", async () => {
     const now = 95_000;
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const value = await fixture(new FakeCloud(), () => undefined, () => now);
     const { sessionId } = await createIdleSession(value, "Interaction post-write account fence");
     const seeded = await seedResolvableInteraction(
       value,
@@ -29413,7 +29143,7 @@ describe("OompaService", () => {
 
   test("settles a deadline timeout unknown when account authority changes after its provider write", async () => {
     let now = 96_000;
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const value = await fixture(new FakeCloud(), () => undefined, () => now);
     const { sessionId } = await createIdleSession(value, "Deadline timeout post-write account fence");
     const seeded = await seedResolvableInteraction(
       value,
@@ -29461,7 +29191,7 @@ describe("OompaService", () => {
 
   test("settles maintenance timeout unknown when account authority changes after its provider write", async () => {
     let now = 98_000;
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const value = await fixture(new FakeCloud(), () => undefined, () => now);
     const { sessionId } = await createIdleSession(value, "Maintenance timeout post-write account fence");
     const seeded = await seedResolvableInteraction(
       value,
@@ -29491,7 +29221,7 @@ describe("OompaService", () => {
 
   test("turns a client final-boundary deadline rejection into one durable neutral timeout", async () => {
     let now = 100_000;
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const value = await fixture(new FakeCloud(), () => undefined, () => now);
     const { sessionId } = await createIdleSession(value, "Client deadline boundary");
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
@@ -29586,9 +29316,7 @@ describe("OompaService", () => {
   test("quarantines automatic timeout persistence after the provider accepts the timeout", async () => {
     const now = 120_000;
     let stopCalls = 0;
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => { stopCalls += 1; },
       () => now,
     );
@@ -29656,9 +29384,7 @@ describe("OompaService", () => {
   test("repairs a final automatic-timeout event failure before retiring the provider generation", async () => {
     const now = 125_000;
     let stopCalls = 0;
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => { stopCalls += 1; },
       () => now,
     );
@@ -29747,9 +29473,7 @@ describe("OompaService", () => {
   test("quarantines deadline-supersede persistence after the provider accepts the neutral timeout", async () => {
     let now = 130_000;
     let stopCalls = 0;
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
+    const value = await fixture(new FakeCloud(),
       () => { stopCalls += 1; },
       () => now,
     );
@@ -29817,7 +29541,7 @@ describe("OompaService", () => {
 
   test("backs off a persistent deadline maintenance fault and later recovers", async () => {
     const now = 60_000;
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const value = await fixture(new FakeCloud(), () => undefined, () => now);
     const { sessionId } = await createIdleSession(value, "Deadline retry");
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
@@ -30736,7 +30460,7 @@ describe("OompaService autorespond", () => {
 
   test("keeps after-hours consent default-off and CAS-bound without changing notifications or resetting spend", async () => {
     const now = Date.parse("2026-09-04T09:59:59.999Z");
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const value = await fixture(new FakeCloud(), () => undefined, () => now);
     const { sessionId } = await createIdleSession(value, "Separate after-hours consent");
     value.store.setSessionApprovalMode(sessionId, "auto:all");
     await acceptProtocolApprovals(value, sessionId, 1, "separate-consent");
@@ -30771,7 +30495,7 @@ describe("OompaService autorespond", () => {
     { label: "enabled inside hours", enabled: true, instant: "2026-09-04T10:00:00.000Z", cap: 3 },
   ])("keeps the protocol consecutive cap at $cap when $label", async ({ label, enabled, instant, cap }) => {
     const now = Date.parse(instant);
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const value = await fixture(new FakeCloud(), () => undefined, () => now);
     const { sessionId } = await createIdleSession(value, label);
     await configureAfterHours(value, enabled);
     value.store.setSessionApprovalMode(sessionId, "auto:all");
@@ -30792,7 +30516,7 @@ describe("OompaService autorespond", () => {
     "rechecks after-hours authority after protocol validation: %s",
     async (change) => {
       let now = Date.parse("2026-09-04T09:59:59.999Z");
-      const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+      const value = await fixture(new FakeCloud(), () => undefined, () => now);
       const { sessionId } = await createIdleSession(value, `After-hours ${change}`);
       await configureAfterHours(value, true);
       value.store.setSessionApprovalMode(sessionId, "auto:all");
@@ -30838,7 +30562,7 @@ describe("OompaService autorespond", () => {
 
   test("reserves only the sixth after-hours slot across concurrent protocol approvals", async () => {
     const now = Date.parse("2026-09-04T09:59:59.999Z");
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const value = await fixture(new FakeCloud(), () => undefined, () => now);
     const { sessionId } = await createIdleSession(value, "Concurrent after-hours approvals");
     await configureAfterHours(value, true);
     value.store.setSessionApprovalMode(sessionId, "auto:all");
@@ -30884,7 +30608,7 @@ describe("OompaService autorespond", () => {
     { code: "daily_budget", consecutive: 0, priorAcceptances: 39, ageMs: 2 * 60 * 60 * 1_000, limit: 40, field: "lastDay" },
   ] as const)("enforces $code across concurrently admitted protocol approvals", async (budget) => {
     let now = 1_900_000_000_000;
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const value = await fixture(new FakeCloud(), () => undefined, () => now);
     const { sessionId } = await createIdleSession(value, `Concurrent ${budget.code}`);
     value.store.setSessionApprovalMode(sessionId, "auto:all");
     for (let count = 0; count < budget.consecutive; count += 1) {
@@ -31177,7 +30901,7 @@ describe("OompaService autorespond", () => {
 
   test("clears autorespond attention when the pending approval expires", async () => {
     let now = 10_000;
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const value = await fixture(new FakeCloud(), () => undefined, () => now);
     const { sessionId } = await createIdleSession(value, "Autorespond expiry lifecycle");
     value.store.setSessionApprovalMode(sessionId, "auto:workspace");
     const interaction = await requestCommandApproval(value, sessionId, "attention-expiry");
@@ -31270,9 +30994,7 @@ describe("OompaService prose autorespond", () => {
   }> = {}, createFixture: ServiceFixtureFactory = fixture) => {
     const responder = options.responder ?? new DeterministicProseResponder();
     const gatewayKeys = options.gatewayKeys ?? new InMemoryGatewayKeyStore(testGatewayKey);
-    const value = await createFixture(
-      undefined,
-      new FakeCloud(),
+    const value = await createFixture(new FakeCloud(),
       options.onStopRequested ?? (() => undefined),
       options.now ?? Date.now,
       undefined,

@@ -2,6 +2,9 @@
 
 Every entry names the release or the plan wave it belongs to. Unreleased work sits under the wave that produced it until a version ships.
 
+## Desktop switching removed (unreleased)
+
+- The macOS ChatGPT desktop account switch is removed: `oompa account switch`, `oompa account switch-recover`, the `src/desktop` state machine, its daemon port and the doctor's `desktop` recovery block are gone, and the website no longer documents it. The `desktop_switches`, `desktop_switch_authority` and `desktop_switch_resolutions` tables, their migrations and the retained journal decoders stay, so an existing state root opens unchanged. Plan: `kb/plans/oompa-app-simplification.md`, Phase 5.
 ## Inline conversations (unreleased)
 
 The web app keeps every conversation in its grid card and asks only for a prompt and a machine. Plan: `kb/plans/oompa-app-simplification.md`.
