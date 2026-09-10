@@ -279,8 +279,8 @@ Platform:
 
 Recommended profiles:
   low         Luna Max        (codex)
-  high        Sol Max         (codex)
-  ultra       Sol Ultra       (codex)
+  high        Astra Max       (codex)
+  ultra       Astra Ultra     (codex)
   fable-max   Claude Fable    (claude)
 
 Run \`oompa <group> --help\` or \`oompa help <group> [<command>]\` for command examples.`;

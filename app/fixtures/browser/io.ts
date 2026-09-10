@@ -67,7 +67,7 @@ const registries: DeviceRegistries = {
     notificationHours: null, notificationHoursStatus: "unsupported", notificationPolicyFreshness: "unsupported",
     notificationPolicyRevision: null, projects: [{ label: "Fixture project", publicId: "project_browser_fixture" }],
     profileBinding: {
-      profile: { effort: "ultra", key: "codex:gpt-5.6-sol:ultra", model: "gpt-5.6-sol", provider: "codex" },
+      profile: { effort: "ultra", key: "codex:gpt-6-astra:ultra", model: "gpt-6-astra", provider: "codex" },
       status: "current",
     },
     proseAutorespondConfigured: false, revision: 1, scheduledTasks: [], sessionAdoption: null,

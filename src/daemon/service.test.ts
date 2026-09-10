@@ -157,7 +157,7 @@ const runtimeProfile = (authority: ProfileAuthority): EffectiveRuntimeProfile =>
   processGeneration: authority.generation,
   observedAt: 2_000,
   preset: "high",
-  model: "gpt-5.6-sol",
+  model: "gpt-6-astra",
   reasoningEffort: "max",
   serviceTier: null,
   fast: false,
@@ -2532,7 +2532,7 @@ async function createIdleSession(
   const added = await execute({ kind: "account.add", label }) as { account: { id: string } };
   await execute({ kind: "account.login", account: added.account.id, deviceCode: false });
   await execute({ kind: "project.add", label: `${label} docs`, path: value.documents });
-  const started = await execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }) as { session: { id: `sess_${string}` } };
+  const started = await execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }) as { session: { id: `sess_${string}` } };
   return { sessionId: started.session.id };
 }
 
@@ -2873,10 +2873,10 @@ describe("OompaService personal-session adoption", () => {
   };
 
   test.each([
-    ["high", { model: "gpt-5.6-sol", effort: "max" }],
-    ["ultra", { model: "gpt-5.6-sol", effort: "ultra" }],
+    ["high", { model: "gpt-6-astra", effort: "max" }],
+    ["ultra", { model: "gpt-6-astra", effort: "ultra" }],
   ] as const)(
-    "binds a fresh adopted Codex %s session to Sol contract 1",
+    "binds a fresh adopted Codex %s session to Astra contract 2",
     async (preset, requirement) => {
       const providerThreadId = `personal-codex-fresh-${preset}-contract`;
       const value = await preparedPersonalCodexCandidate({
@@ -2913,7 +2913,7 @@ describe("OompaService personal-session adoption", () => {
       try {
         expect(inspector.query(
           "SELECT preset_contract FROM sessions WHERE id=?",
-        ).get(session.id)).toEqual({ preset_contract: legacyPresetContract });
+        ).get(session.id)).toEqual({ preset_contract: currentPresetContract });
       } finally {
         inspector.close(false);
       }
@@ -3154,10 +3154,10 @@ describe("OompaService personal-session adoption", () => {
     },
   );
 
-  test("preserves an active adopted Astra contract across rediscovery and restart, then rebinds Sol after detach", async () => {
-    const providerThreadId = "personal-codex-historical-astra-contract";
+  test("preserves an established adopted Sol contract across rediscovery and restart, then rebinds Astra after detach", async () => {
+    const providerThreadId = "personal-codex-historical-sol-contract";
     const value = await adoptedCodexFixture(
-      "Historical adopted Astra contract",
+      "Historical adopted Sol contract",
       providerThreadId,
     );
     const initialAuthority = value.personalCodex.claimRequests[0]?.authority;
@@ -3165,21 +3165,21 @@ describe("OompaService personal-session adoption", () => {
     const historicalAstraProfile: EffectiveRuntimeProfile = {
       ...runtimeProfile(initialAuthority),
       preset: "ultra",
-      model: "gpt-6-astra",
+      model: "gpt-5.6-sol",
       reasoningEffort: "ultra",
     };
     const writer = new Database(value.paths.database, { strict: true });
     try {
       expect(writer.query(
-        "UPDATE sessions SET preset_contract=?,canonical_profile_key='codex:gpt-6-astra:ultra' WHERE id=?",
-      ).run(currentPresetContract, value.session.id).changes).toBe(1);
+        "UPDATE sessions SET preset_contract=?,canonical_profile_key='codex:gpt-5.6-sol:ultra' WHERE id=?",
+      ).run(legacyPresetContract, value.session.id).changes).toBe(1);
     } finally {
       writer.close(false);
     }
     value.store.recordSessionRuntimeProfile({
       sessionId: value.session.id,
       sourceKind: "turn_start",
-      sourceId: "historical-adopted-astra-contract",
+      sourceId: "historical-adopted-sol-contract",
       profile: historicalAstraProfile,
       providerAuthority: value.store.requireProviderAccountAuthority(historicalAstraProfile.profileId, "codex"),
     });
@@ -3187,7 +3187,7 @@ describe("OompaService personal-session adoption", () => {
     const establishedProfile = value.store.latestSessionRuntimeProfile(value.session.id);
     expect(value.store.requireSessionPresetRequirement(value.session.id)).toEqual({
       preset: "ultra",
-      requirement: { model: "gpt-6-astra", effort: "ultra" },
+      requirement: { model: "gpt-5.6-sol", effort: "ultra" },
     });
 
     await expect(value.service.execute({
@@ -3268,7 +3268,7 @@ describe("OompaService personal-session adoption", () => {
     expect(restartedPersonalCodex.observedThreads).toContain(providerThreadId);
     expect(value.store.requireSessionPresetRequirement(value.session.id)).toEqual({
       preset: "ultra",
-      requirement: { model: "gpt-6-astra", effort: "ultra" },
+      requirement: { model: "gpt-5.6-sol", effort: "ultra" },
     });
     expect(value.store.latestSessionRuntimeProfile(value.session.id)).toEqual(establishedProfile);
 
@@ -3280,7 +3280,7 @@ describe("OompaService personal-session adoption", () => {
     });
     expect(restartedPersonalCodex.claimRequests).toHaveLength(0);
     expect(value.store.requireSessionPresetRequirement(value.session.id).requirement)
-      .toEqual({ model: "gpt-6-astra", effort: "ultra" });
+      .toEqual({ model: "gpt-5.6-sol", effort: "ultra" });
 
     value.store.detachPersonalSession({ sessionId: value.session.id, archive: false });
     value.store.setSessionAdoptionPolicy({ provider: "codex", profileId: null });
@@ -3295,17 +3295,17 @@ describe("OompaService personal-session adoption", () => {
     expect(restartedPersonalCodex.claimRequests).toHaveLength(1);
     expect(restartedPersonalCodex.claimRequests[0]).toMatchObject({
       preset: "high",
-      requirement: { model: "gpt-5.6-sol", effort: "max" },
+      requirement: { model: "gpt-6-astra", effort: "max" },
     });
     expect(value.store.requireSessionPresetRequirement(value.session.id)).toEqual({
       preset: "high",
-      requirement: { model: "gpt-5.6-sol", effort: "max" },
+      requirement: { model: "gpt-6-astra", effort: "max" },
     });
     const inspector = new Database(value.paths.database, { readonly: true, strict: true });
     try {
       expect(inspector.query(
         "SELECT preset_contract FROM sessions WHERE id=?",
-      ).get(value.session.id)).toEqual({ preset_contract: legacyPresetContract });
+      ).get(value.session.id)).toEqual({ preset_contract: currentPresetContract });
     } finally {
       inspector.close(false);
     }
@@ -7582,10 +7582,10 @@ describe("OompaService personal-session adoption", () => {
     expect(value.store.requireSession(value.session.id).title).toBe(durableTitle);
   });
 
-  test("refuses a fresh Codex adoption whose claimed runtime profile uses the inactive Astra contract", async () => {
-    const providerThreadId = "personal-thread-inactive-astra-runtime-profile";
+  test("refuses a fresh Codex adoption whose claimed runtime profile uses the inactive Sol contract", async () => {
+    const providerThreadId = "personal-thread-inactive-sol-runtime-profile";
     const value = await preparedPersonalCodexCandidate({
-      label: "Inactive Astra runtime profile",
+      label: "Inactive Sol runtime profile",
       providerThreadId,
       updatedAt: personalAdoptionNow - 11 * 60_000,
       liveness: "not_live",
@@ -7599,7 +7599,7 @@ describe("OompaService personal-session adoption", () => {
         desktopUserData: join(privatePathRoot, "personal-codex-desktop"),
       }),
       preset,
-      model: "gpt-6-astra",
+      model: "gpt-5.6-sol",
       reasoningEffort: preset === "ultra" ? "ultra" : "max",
     };
 
@@ -8216,7 +8216,7 @@ describe("OompaService personal-session adoption", () => {
     const command = {
       idempotencyKey: crypto.randomUUID(),
       kind: "session.switch" as const,
-      presetContract: legacyPresetContract,
+      presetContract: currentPresetContract,
       provider: "codex" as const,
       session: value.session.id,
     };
@@ -8232,7 +8232,7 @@ describe("OompaService personal-session adoption", () => {
       await expect(value.service.execute({
         idempotencyKey: command.idempotencyKey,
         kind: "session.switch",
-        presetContract: legacyPresetContract,
+        presetContract: currentPresetContract,
         provider: "codex",
         session: value.session.id,
       }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
@@ -8366,7 +8366,7 @@ describe("OompaService personal-session adoption", () => {
       const outcome = await value.service.execute({
         idempotencyKey,
         kind: "session.switch",
-        presetContract: legacyPresetContract,
+        presetContract: currentPresetContract,
         provider: "codex",
         session: value.session.id,
       }, { signal }).catch((error: unknown) => ({
@@ -10109,7 +10109,7 @@ describe("OompaService personal-session adoption", () => {
       kind: "session.start",
       account: existingOwner.account.id,
       preset: "high",
-      presetContract: legacyPresetContract,
+      presetContract: currentPresetContract,
       fast: false,
     }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const adoptingOwner = await value.service.execute(
@@ -11550,7 +11550,7 @@ describe("OompaService", () => {
       kind: "account.login", account: targetAccount.account.id, deviceCode: false,
     }, { signal });
     const targetStarted = await value.service.execute({
-      kind: "session.start", account: targetAccount.account.id, preset: "high", presetContract: 1, fast: false,
+      kind: "session.start", account: targetAccount.account.id, preset: "high", presetContract: 2, fast: false,
     }, { signal }) as { session: { id: `sess_${string}` } };
     const targetId = targetStarted.session.id;
     if (delivery === "steer") {
@@ -14255,7 +14255,7 @@ describe("OompaService", () => {
       fast: false,
       kind: "session.start",
       preset: "high",
-      presetContract: 1,
+      presetContract: 2,
     }, { signal }) as { session: { id: `sess_${string}` } };
     const loginKey = "00000000-0000-4000-8000-000000000712";
     const expectedPlatformRefusal = {
@@ -14667,7 +14667,7 @@ describe("OompaService", () => {
       account: added.account.id,
       provider: "claude",
       preset: "ultra",
-      presetContract: 1,
+      presetContract: 2,
       fast: false,
     }, { signal })).rejects.toThrow("does not support the `ultra` model preset");
 
@@ -14695,7 +14695,7 @@ describe("OompaService", () => {
       kind: "session.start",
       account: added.account.id,
       preset: "high",
-      presetContract: 1,
+      presetContract: 2,
       fast: false,
     }, { signal }) as { session: { id: `sess_${string}` } };
     expect(started.session.id).toMatch(/^sess_/u);
@@ -14877,7 +14877,7 @@ describe("OompaService", () => {
       kind: "session.start",
       account: added.account.id,
       preset: "high",
-      presetContract: 1,
+      presetContract: 2,
       fast: false,
     }, { signal }) as { session: { id: `sess_${string}` } };
 
@@ -14934,7 +14934,7 @@ describe("OompaService", () => {
       kind: "session.start",
       account: added.account.id,
       preset: "high",
-      presetContract: 1,
+      presetContract: 2,
       fast: false,
     }, { signal }) as { session: { id: `sess_${string}` } };
     await service.execute({
@@ -15218,7 +15218,7 @@ describe("OompaService", () => {
       kind: "session.start",
       account: added.account.id,
       preset: "high",
-      presetContract: 1,
+      presetContract: 2,
       fast: false,
     }, { signal })).rejects.toMatchObject({
       code: "UNAVAILABLE",
@@ -15829,7 +15829,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Work" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Documents", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: true }, { signal }) as { session: { id: `sess_${string}` }; effectiveRuntimeProfile: EffectiveRuntimeProfile };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: true }, { signal }) as { session: { id: `sess_${string}` }; effectiveRuntimeProfile: EffectiveRuntimeProfile };
     expect(started.effectiveRuntimeProfile).toMatchObject({ reviewMode: "auto_review", computerUse: true, enabledApps: [{ id: "app.files" }] });
     expect(store.latestSessionRuntimeProfile(started.session.id)).toMatchObject({ revision: 1, sourceKind: "session_start", profile: started.effectiveRuntimeProfile });
     await service.execute({ kind: "session.send", session: started.session.id, message: "hello" }, { signal });
@@ -15880,7 +15880,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Work" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Documents", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
 
     // The image bytes are assembled here; the repository commits no binary.
     const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01]);
@@ -16326,7 +16326,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Work" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Documents", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     await expect(service.execute({
       attachments: [{
         byteLength: 7,
@@ -16345,7 +16345,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Queue identity" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Documents", path: documents }, { signal });
-    const started = await service.execute({ presetContract: legacyPresetContract, kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ presetContract: currentPresetContract, kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     await service.execute({ kind: "session.send", session: started.session.id, message: "Keep the provider busy." }, { signal });
     await writeFile(join(documents, "first.txt"), "first attachment");
     await writeFile(join(documents, "second.txt"), "second attachment");
@@ -16373,7 +16373,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Queue rollback" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Documents", path: documents }, { signal });
-    const started = await service.execute({ presetContract: legacyPresetContract, kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ presetContract: currentPresetContract, kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     await service.execute({ kind: "session.send", session: started.session.id, message: "Keep the provider busy." }, { signal });
     await writeFile(join(documents, "atomic.txt"), "atomic attachment");
     const references = await ingestAttachments(AttachmentBlobStore.forStatePaths(paths), ["atomic.txt"], documents);
@@ -16396,7 +16396,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Queue historical replay" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Documents", path: documents }, { signal });
-    const started = await service.execute({ presetContract: legacyPresetContract, kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ presetContract: currentPresetContract, kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     await service.execute({ kind: "session.send", session: started.session.id, message: "Keep the provider busy." }, { signal });
     await writeFile(join(documents, "historical.txt"), "historical attachment");
     const blobs = AttachmentBlobStore.forStatePaths(paths);
@@ -16594,7 +16594,7 @@ describe("OompaService", () => {
       kind: "session.start",
       account: added.account.id,
       preset: "high",
-      presetContract: 1,
+      presetContract: 2,
       fast: false,
     }, { signal }) as { session: { id: string } };
     expect(factsMemory.ensures.length).toBeGreaterThanOrEqual(2);
@@ -16645,7 +16645,7 @@ describe("OompaService", () => {
       kind: "session.start",
       account: source.account.id,
       preset: "high",
-      presetContract: legacyPresetContract,
+      presetContract: currentPresetContract,
       fast: false,
     }, { signal }) as { session: { id: `sess_${string}` } };
     const target = await value.service.execute(
@@ -16675,7 +16675,7 @@ describe("OompaService", () => {
       account: target.account.id,
       idempotencyKey: key,
       kind: "session.switch" as const,
-      presetContract: legacyPresetContract,
+      presetContract: currentPresetContract,
       provider: "codex" as const,
       session: started.session.id,
     };
@@ -17486,7 +17486,7 @@ describe("OompaService", () => {
         kind: "session.start",
         account: added.account.id,
         preset: "high",
-        presetContract: 1,
+        presetContract: 2,
         fast: false,
       }, { signal });
     } catch (error: unknown) {
@@ -17534,7 +17534,7 @@ describe("OompaService", () => {
       idempotencyKey: "00000000-0000-4000-8000-00000000041e",
       kind: "session.start" as const,
       preset: "high" as const,
-      presetContract: 1 as const,
+      presetContract: 2 as const,
     };
 
     await expect(value.service.execute(command, { signal }))
@@ -17581,7 +17581,7 @@ describe("OompaService", () => {
       idempotencyKey: "00000000-0000-4000-8000-00000000041f",
       kind: "session.start" as const,
       preset: "high" as const,
-      presetContract: 1 as const,
+      presetContract: 2 as const,
     };
     const first = await value.service.execute(command, { signal }) as {
       session: { id: `sess_${string}`; profileId: `acct_${string}`; providerThreadId?: string };
@@ -20509,7 +20509,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Race" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: legacyPresetContract, fast: false }, { signal }) as { session: { id: string; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: currentPresetContract, fast: false }, { signal }) as { session: { id: string; providerThreadId: string } };
     const authority = liveAuthorityFor(store, added.account.id as `acct_${string}`);
     codex.beforeStartTurnReturn = async () => service.observeCodexFact(authority, { type: "turnStarted", threadId: started.session.providerThreadId, turn: { id: "turn-next", items: [], status: "inProgress", startedAt: 1, completedAt: null, durationMs: null } });
     expect(await service.execute({ kind: "session.send", session: started.session.id, message: "race" }, { signal })).toMatchObject({ session: { state: "active", activeTurnId: "turn-next" } });
@@ -20525,7 +20525,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Review order" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
 
     codex.turnEffectTrace.length = 0;
     await service.execute({ kind: "session.send", session: started.session.id, message: "active" }, { signal });
@@ -20548,7 +20548,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Metadata race" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     let note: Promise<unknown> | undefined;
     let fast: Promise<unknown> | undefined;
     codex.beforeStartTurnReturn = async () => {
@@ -21428,7 +21428,7 @@ describe("OompaService", () => {
       fast: false,
       kind: "session.start",
       preset: "high",
-      presetContract: 1,
+      presetContract: 2,
     }, { signal }) as { session: { id: `sess_${string}` } };
     const unrelatedSessionId = unrelatedStarted.session.id;
     const affectedSession = value.store.requireSession(affectedSessionId);
@@ -21676,7 +21676,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Completion race" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const queued = store.enqueue(started.session.id, "after completion");
     const authority = liveAuthorityFor(store, added.account.id as `acct_${string}`);
     codex.beforeStartTurnReturn = async () => {
@@ -21697,7 +21697,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Terminal response" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     const queued = store.enqueue(started.session.id, "next");
     codex.turnStatus = "completed";
     codex.beforeStartTurnReturn = async () => { delete codex.beforeStartTurnReturn; codex.turnStatus = "inProgress"; };
@@ -21713,7 +21713,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Queued completion race" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const first = store.enqueue(started.session.id, "first queued");
     const second = store.enqueue(started.session.id, "second queued");
     const authority = liveAuthorityFor(store, added.account.id as `acct_${string}`);
@@ -21736,7 +21736,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Coherent show" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     let releaseRead!: () => void;
     let markReadStarted!: () => void;
     const readStarted = new Promise<void>((resolve) => { markReadStarted = resolve; });
@@ -21763,7 +21763,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Queue" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: string; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: string; providerThreadId: string } };
     await service.execute({ kind: "session.send", session: started.session.id, message: "first" }, { signal });
     await service.execute({ kind: "session.queue", session: started.session.id, message: "second" }, { signal });
     codex.readProjection = { ...codex.readProjection, status: "idle", providerUpdatedAt: (codex.readProjection.providerUpdatedAt ?? 10) + 1 };
@@ -21784,7 +21784,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Queue liveness" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     await service.execute({ kind: "session.send", session: started.session.id, message: "active" }, { signal });
     expect(store.requireSession(started.session.id)).toMatchObject({ state: "active" });
     const first = await service.execute({ kind: "session.queue", session: started.session.id, message: "fails" }, { signal }) as { queued: { id: `queue_${string}` } };
@@ -21838,12 +21838,12 @@ describe("OompaService", () => {
     expect(store.requireQueue(queued.queued.id)).toMatchObject({ state: "applied" });
     expect(codex.calls.filter((call) => call === "send")).toHaveLength(1);
     expect(codex.turnReviewRequests.at(-1)?.requirement).toEqual({
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       effort: "max",
     });
     expect(store.latestSessionRuntimeProfile(imported.id)?.profile).toMatchObject({
       preset: "high",
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       reasoningEffort: "max",
     });
   });
@@ -21881,12 +21881,12 @@ describe("OompaService", () => {
     }, { signal });
 
     expect(codex.turnReviewRequests.at(-1)?.requirement).toEqual({
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       effort: "max",
     });
     expect(store.latestSessionRuntimeProfile(imported.id)?.profile).toMatchObject({
       preset: "high",
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       reasoningEffort: "max",
     });
   });
@@ -21899,7 +21899,7 @@ describe("OompaService", () => {
       const added = await service.execute({ kind: "account.add", label: `Transient ${failure}` }, { signal }) as { account: { id: string } };
       await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
       await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-      const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+      const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
       if (failure === "baseline") codex.readSessionErrorOnce = new Error("transient baseline read");
       else codex.reviewTurnErrorOnce = new Error("transient capability read");
 
@@ -21962,7 +21962,7 @@ describe("OompaService", () => {
         const added = await execute({ kind: "account.add", label: `Unavailable ${failure.code}` }) as { account: { id: string } };
         await execute({ kind: "account.login", account: added.account.id, deviceCode: false });
         await execute({ kind: "project.add", label: "Docs", path: documents });
-        const started = await execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }) as { session: { id: `sess_${string}` } };
+        const started = await execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }) as { session: { id: `sess_${string}` } };
         const idempotencyKey = `00000000-0000-4000-8000-${String(730 + index).padStart(12, "0")}`;
         codex.reviewTurnErrorOnce = new CodexError(failure.code, "private provider capability diagnostic");
 
@@ -21989,7 +21989,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Remote rejection" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     const idempotencyKey = "00000000-0000-4000-8000-000000000799";
     codex.startTurnErrorOnce = new CodexRemoteError(-32_600, "private provider rejection diagnostic");
 
@@ -22015,7 +22015,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Bounded retry" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     const project = await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal }) as { project: { id: string } };
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     codex.beforeReadSessionReturn = async () => { throw new Error("persistent baseline failure"); };
 
     const queued = await service.execute({ kind: "session.queue", session: started.session.id, message: "bounded retry" }, { signal }) as { queued: { id: `queue_${string}` } };
@@ -22036,7 +22036,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Canonical" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: string; title: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: string; title: string } };
     const results = await Promise.allSettled([
       service.execute({ kind: "session.send", session: started.session.id, message: "one" }, { signal }),
       service.execute({ kind: "session.send", session: started.session.title, message: "two" }, { signal }),
@@ -22051,7 +22051,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Remote authority" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     const session = store.requireSession(started.session.id);
     const profile = store.requireProfile(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("The provider binding is missing.");
@@ -22081,7 +22081,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Remote metadata" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const session = store.requireSession(started.session.id);
     if (session.providerThreadId === undefined) throw new Error("The provider binding is missing.");
     let entered!: () => void;
@@ -22118,7 +22118,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Remote fence" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const session = store.requireSession(started.session.id);
     if (session.providerThreadId === undefined) throw new Error("The provider binding is missing.");
     let entered!: () => void;
@@ -23751,7 +23751,7 @@ describe("OompaService", () => {
       }, { signal });
       await expect(value.service.execute({
         kind: "session.start", account: added.account.id, project: project.id,
-        preset: "high", presetContract: legacyPresetContract, fast: false,
+        preset: "high", presetContract: currentPresetContract, fast: false,
       }, { signal })).resolves.toMatchObject({ session: { provider: "codex" } });
     } finally {
       await value.service.close();
@@ -23821,7 +23821,7 @@ describe("OompaService", () => {
       kind: "session.start",
       account: added.account.id,
       preset: "high",
-      presetContract: legacyPresetContract,
+      presetContract: currentPresetContract,
       fast: false,
     }, { signal });
 
@@ -23867,7 +23867,7 @@ describe("OompaService", () => {
       kind: "session.start",
       account: added.account.id,
       preset: "high",
-      presetContract: legacyPresetContract,
+      presetContract: currentPresetContract,
       fast: false,
     }, { signal });
     const before = store.requireProfileById(added.account.id);
@@ -24413,7 +24413,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Queue replay" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     const command = { kind: "session.queue" as const, session: started.session.id, message: "only once", idempotencyKey: "00000000-0000-4000-8000-000000000103" };
     const first = await service.execute(command, { signal }) as { queued: { id: string } };
     const replay = await service.execute(command, { signal }) as { queued: { id: string } };
@@ -24426,7 +24426,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Effect replay" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: string } };
     const send = { kind: "session.send" as const, session: started.session.id, message: "once", idempotencyKey: "00000000-0000-4000-8000-000000000105" };
     const firstSend = await service.execute(send, { signal });
     expect(await service.execute(send, { signal })).toEqual(firstSend);
@@ -24462,7 +24462,7 @@ describe("OompaService", () => {
       kind: "session.start",
       account: added.account.id,
       preset: "high",
-      presetContract: 1,
+      presetContract: 2,
       fast: false,
     }, { signal }) as { session: { id: `sess_${string}` } };
     const session = store.requireSession(started.session.id);
@@ -24623,7 +24623,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Send retention replay" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     const command = {
       kind: "session.send" as const,
       session: started.session.id,
@@ -24663,7 +24663,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Human replay budget" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     const command = {
       kind: "session.send" as const,
       session: started.session.id,
@@ -24696,7 +24696,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Steer retention replay" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     await service.execute({ kind: "session.send", session: started.session.id, message: "activate" }, { signal });
     const command = {
       kind: "session.steer" as const,
@@ -24731,7 +24731,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Receipt failure" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: string } };
     codex.turnId = "";
     const idempotencyKey = "00000000-0000-4000-8000-000000000107";
     const command = { kind: "session.send" as const, session: started.session.id, message: "ambiguous", idempotencyKey };
@@ -24763,7 +24763,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Runtime receipt" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     const originalComplete = store.completeSessionTurnEffect.bind(store);
     store.completeSessionTurnEffect = (() => { throw new Error("simulated receipt storage failure"); }) as StateStore["completeSessionTurnEffect"];
     const key = "00000000-0000-4000-8000-000000000111";
@@ -24787,7 +24787,7 @@ describe("OompaService", () => {
         const added = await execute({ kind: "account.add", label: `Lost ${operation}` }) as { account: { id: string } };
         await execute({ kind: "account.login", account: added.account.id, deviceCode: false });
         await execute({ kind: "project.add", label: "Docs", path: documents });
-        const started = await execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }) as { session: { id: string } };
+        const started = await execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }) as { session: { id: string } };
         if (operation === "steer" || operation === "stop") {
           await execute({ kind: "session.send", session: started.session.id, message: "activate" });
         }
@@ -24831,7 +24831,7 @@ describe("OompaService", () => {
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
     const originalComplete = store.completeSessionStartEffect.bind(store);
     store.completeSessionStartEffect = (() => { throw new Error("simulated atomic start receipt failure"); }) as StateStore["completeSessionStartEffect"];
-    const command = { kind: "session.start" as const, account: added.account.id, preset: "high" as const, presetContract: 1 as const, fast: false, idempotencyKey: "00000000-0000-4000-8000-000000000401" };
+    const command = { kind: "session.start" as const, account: added.account.id, preset: "high" as const, presetContract: 2 as const, fast: false, idempotencyKey: "00000000-0000-4000-8000-000000000401" };
     await expect(service.execute(command, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
     store.completeSessionStartEffect = originalComplete;
 
@@ -24906,7 +24906,7 @@ describe("OompaService", () => {
       idempotencyKey: "00000000-0000-4000-8000-00000000041c",
       kind: "session.start" as const,
       preset: "high" as const,
-      presetContract: 1 as const,
+      presetContract: 2 as const,
     };
     const first = await service.execute(command, { signal }) as {
       idempotencyKey: string;
@@ -24939,7 +24939,7 @@ describe("OompaService", () => {
     }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
     await expect(service.execute({
       ...command,
-      presetContract: 2,
+      presetContract: 1,
     }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
     expect(codex.calls).toEqual(providerCalls);
   });
@@ -24964,7 +24964,7 @@ describe("OompaService", () => {
       idempotencyKey: "00000000-0000-4000-8000-00000000041d",
       kind: "session.start" as const,
       preset: "ultra" as const,
-      presetContract: 1 as const,
+      presetContract: 2 as const,
       project: project.project.id,
     };
     const first = await service.execute(command, { signal }) as {
@@ -25091,7 +25091,7 @@ describe("OompaService", () => {
     };
     for (const [idempotencyKey, presetContract] of [
       ["00000000-0000-4000-8000-00000000040a", undefined],
-      ["00000000-0000-4000-8000-00000000040b", 2],
+      ["00000000-0000-4000-8000-00000000040b", 1],
     ] as const) {
       await expect(service.execute({
         ...base,
@@ -25106,10 +25106,10 @@ describe("OompaService", () => {
     await expect(service.execute({
       ...base,
       idempotencyKey: currentKey,
-      presetContract: 1,
+      presetContract: 2,
     }, { signal })).resolves.toMatchObject({ session: { state: "idle" } });
     expect(store.readMutation(currentKey)).toMatchObject({
-      evidence: { evidence: { presetContract: 1 } },
+      evidence: { evidence: { presetContract: 2 } },
       requestDigest: mutationRequestDigest({
         authorityGeneration: store.requireProfileById(added.account.id).processGeneration,
         authorityId: added.account.id,
@@ -25117,7 +25117,7 @@ describe("OompaService", () => {
         request: sessionStartMutationRequest({
           fast: false,
           preset: "high",
-          presetContract: 1,
+          presetContract: 2,
           projectId: project.project.id,
           provider: "codex",
         }),
@@ -25129,7 +25129,7 @@ describe("OompaService", () => {
       ...base,
       fast: true,
       idempotencyKey: currentKey,
-      presetContract: 1,
+      presetContract: 2,
     }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
     await expect(service.execute({
       ...base,
@@ -25189,7 +25189,7 @@ describe("OompaService", () => {
     const legacyPreparedKey = "00000000-0000-4000-8000-00000000040e";
     prepareContractless(legacyPreparedKey);
     const stalePreparedKey = "00000000-0000-4000-8000-00000000040f";
-    prepare(stalePreparedKey, 2);
+    prepare(stalePreparedKey, 1);
     const providerCallsBefore = codex.calls.length;
     await expect(service.execute({
       ...base,
@@ -25198,28 +25198,28 @@ describe("OompaService", () => {
     await expect(service.execute({
       ...base,
       idempotencyKey: legacyPreparedKey,
-      presetContract: 1,
+      presetContract: 2,
     }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
     await expect(service.execute({
       ...base,
       idempotencyKey: legacyPreparedKey,
-      presetContract: 2,
+      presetContract: 1,
     }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
     await expect(service.execute({
       ...base,
       idempotencyKey: stalePreparedKey,
-      presetContract: 2,
+      presetContract: 1,
     }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
     expect(codex.calls).toHaveLength(providerCallsBefore);
     expect(store.readMutation(legacyPreparedKey)).toMatchObject({ state: "prepared" });
     expect(store.readMutation(stalePreparedKey)).toMatchObject({ state: "prepared" });
 
     const currentPreparedKey = "00000000-0000-4000-8000-000000000412";
-    prepare(currentPreparedKey, 1);
+    prepare(currentPreparedKey, 2);
     await expect(service.execute({
       ...base,
       idempotencyKey: currentPreparedKey,
-      presetContract: 1,
+      presetContract: 2,
     }, { signal })).resolves.toMatchObject({ session: { preset: "high", state: "idle" } });
     expect(store.readMutation(currentPreparedKey)).toMatchObject({ state: "applied" });
     expect(codex.calls.filter((call) => call === "review-session")).toHaveLength(1);
@@ -25459,7 +25459,7 @@ describe("OompaService", () => {
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
     codex.startSessionError = new IndeterminateCodexEffectError("thread/start", 42);
-    const command = { kind: "session.start" as const, account: added.account.id, preset: "high" as const, presetContract: 1 as const, fast: false, idempotencyKey: "00000000-0000-4000-8000-000000000403" };
+    const command = { kind: "session.start" as const, account: added.account.id, preset: "high" as const, presetContract: 2 as const, fast: false, idempotencyKey: "00000000-0000-4000-8000-000000000403" };
     await expect(service.execute(command, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
     expect(store.listSessions()).toHaveLength(1);
     expect(store.listSessions()[0]).toMatchObject({ state: "recovery_required" });
@@ -25553,7 +25553,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Causal send" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     const key = "00000000-0000-4000-8000-000000000405";
     codex.startTurnError = new IndeterminateCodexEffectError("turn/start", 44);
     await expect(service.execute({ kind: "session.send", session: started.session.id, message: "causal", idempotencyKey: key }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED", details: { idempotencyKey: key } });
@@ -25580,7 +25580,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Rollover causal send" }, { signal }) as { account: { id: `acct_${string}` } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Rollover docs", path: documents }, { signal });
-    const started = await service.execute({ presetContract: legacyPresetContract, kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ presetContract: currentPresetContract, kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     const key = "00000000-0000-4000-8000-00000000040a";
     codex.startTurnError = new IndeterminateCodexEffectError("turn/start", 44);
     await expect(service.execute({ kind: "session.send", session: started.session.id, message: "causal across rollover", idempotencyKey: key }, { signal }))
@@ -25637,7 +25637,7 @@ describe("OompaService", () => {
       const added = await service.execute({ kind: "account.add", label: "Fenced rollover" }, { signal }) as { account: { id: `acct_${string}` } };
       await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
       await service.execute({ kind: "project.add", label: "Fenced docs", path: documents }, { signal });
-      const started = await service.execute({ presetContract: legacyPresetContract, kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+      const started = await service.execute({ presetContract: currentPresetContract, kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
       const key = crypto.randomUUID();
       codex.startTurnError = new IndeterminateCodexEffectError("turn/start", 44);
       await expect(service.execute({ kind: "session.send", session: started.session.id, message: "immutable", idempotencyKey: key }, { signal }))
@@ -25694,7 +25694,7 @@ describe("OompaService", () => {
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
     codex.startSessionError = new IndeterminateCodexEffectError("thread/start", 45);
     const key = "00000000-0000-4000-8000-000000000407";
-    await expect(service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false, idempotencyKey: key }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED", details: { idempotencyKey: key } });
+    await expect(service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false, idempotencyKey: key }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED", details: { idempotencyKey: key } });
     const [session] = store.listSessions();
     if (session === undefined) throw new Error("Expected a bound start placeholder.");
     expect(await service.execute({ kind: "session.recover", session: session.id }, { signal }).catch((error: unknown) => error)).toMatchObject({ code: "RECOVERY_REQUIRED" });
@@ -25704,9 +25704,9 @@ describe("OompaService", () => {
       recovery: { resolution: "abandoned", providerEffectRetried: false, providerStateDeleted: false },
     });
     expect(store.readMutation(key)).toMatchObject({ state: "reconciled", originalState: "ambiguous", resolution: { kind: "abandoned" } });
-    await expect(service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false, idempotencyKey: key }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false, idempotencyKey: key }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
     delete codex.startSessionError;
-    expect(await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false, idempotencyKey: "00000000-0000-4000-8000-000000000408" }, { signal })).toMatchObject({ session: { state: "idle" } });
+    expect(await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false, idempotencyKey: "00000000-0000-4000-8000-000000000408" }, { signal })).toMatchObject({ session: { state: "idle" } });
     expect(codex.calls.filter((call) => call.startsWith("start:"))).toHaveLength(2);
   });
 
@@ -25715,7 +25715,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Status recovery" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ presetContract: legacyPresetContract, kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ presetContract: currentPresetContract, kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const authority = liveAuthorityFor(store, added.account.id as `acct_${string}`);
     await service.observeCodexFact(authority, { type: "threadStatusChanged", threadId: started.session.providerThreadId, status: { type: "systemError" } });
     expect(store.requireSession(started.session.id)).toMatchObject({ state: "recovery_required" });
@@ -25736,7 +25736,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Recovery queue" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const pending = store.enqueue(started.session.id, "continue after recovery");
     const authority = liveAuthorityFor(store, added.account.id as `acct_${string}`);
     await service.observeCodexFact(authority, { type: "threadStatusChanged", threadId: started.session.providerThreadId, status: { type: "systemError" } });
@@ -25756,7 +25756,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Status abandon" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const pending = store.enqueue(started.session.id, "never dispatched");
     const authority = liveAuthorityFor(store, added.account.id as `acct_${string}`);
     await service.observeCodexFact(authority, { type: "threadStatusChanged", threadId: started.session.providerThreadId, status: { type: "systemError" } });
@@ -25869,7 +25869,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Tamper proof" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     codex.startTurnError = new IndeterminateCodexEffectError("turn/start", 46);
     const key = "00000000-0000-4000-8000-000000000409";
     await expect(service.execute({ kind: "session.send", session: started.session.id, message: "tamper", idempotencyKey: key }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
@@ -25926,7 +25926,7 @@ describe("OompaService", () => {
       kind: "session.start",
       account: added.account.id,
       preset: "high",
-      presetContract: legacyPresetContract,
+      presetContract: currentPresetContract,
       fast: false,
     }, { signal }) as { session: { id: `sess_${string}` } };
     await service.execute({
@@ -25973,7 +25973,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Queue readiness" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     store.enqueue(started.session.id, "resume in background");
     let releaseDispatch!: () => void;
     const dispatchGate = new Promise<void>((resolve) => { releaseDispatch = resolve; });
@@ -26049,7 +26049,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Idle queue" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     await service.execute({ kind: "session.queue", session: started.session.id, message: "dispatch now" }, { signal });
     await service.settled();
     expect(store.listQueue(started.session.id)[0]).toMatchObject({ state: "applied" });
@@ -26163,7 +26163,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Queue recovery" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     const queued = store.enqueue(started.session.id, "uncertain");
     store.beginQueueEffect({
       queueId: queued.id,
@@ -26197,7 +26197,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Queue causal recovery" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     codex.startTurnError = new IndeterminateCodexEffectError("turn/start", 47);
     const queued = await service.execute({ kind: "session.queue", session: started.session.id, message: "uncertain queue" }, { signal }) as { queued: { id: `queue_${string}` } };
     await service.settled();
@@ -26330,7 +26330,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Rollover queue" }, { signal }) as { account: { id: `acct_${string}` } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Rollover queue docs", path: documents }, { signal });
-    const started = await service.execute({ presetContract: legacyPresetContract, kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ presetContract: currentPresetContract, kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     codex.startTurnError = new IndeterminateCodexEffectError("turn/start", 47);
     const queued = await service.execute({ kind: "session.queue", session: started.session.id, message: "queue across rollover" }, { signal }) as { queued: { id: `queue_${string}` } };
     await service.settled();
@@ -26372,7 +26372,7 @@ describe("OompaService", () => {
     const { service, documents, store, codex } = await fixture();
     const added = await service.execute({ kind: "account.add", label: "Signed out" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    await expect(service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal })).rejects.toMatchObject({ code: "INTERACTION_REQUIRED" });
+    await expect(service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal })).rejects.toMatchObject({ code: "INTERACTION_REQUIRED" });
     await expect(service.execute({ kind: "account.usage", account: added.account.id, refresh: true }, { signal })).rejects.toMatchObject({ code: "INTERACTION_REQUIRED" });
     expect(store.listSessions()).toHaveLength(0);
     expect(codex.calls).toHaveLength(0);
@@ -26385,7 +26385,7 @@ describe("OompaService", () => {
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
     codex.startSessionError = new Error("provider rejected before creating a thread");
 
-    await expect(service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal })).rejects.toThrow("provider rejected");
+    await expect(service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal })).rejects.toThrow("provider rejected");
 
     expect(store.listSessions()).toHaveLength(0);
     expect(codex.calls.filter((call) => call.startsWith("start:"))).toHaveLength(1);
@@ -26396,7 +26396,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Idle steer" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: string } };
     const idempotencyKey = "00000000-0000-4000-8000-000000000108";
     const steer = { kind: "session.steer" as const, session: started.session.id, message: "future", idempotencyKey };
     await expect(service.execute(steer, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
@@ -26411,7 +26411,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Queue failure" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     codex.startTurnError = new Error("provider rejected before effect");
     await service.execute({ kind: "session.queue", session: started.session.id, message: "will fail" }, { signal });
     await service.settled();
@@ -26435,7 +26435,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Logout recovery" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ presetContract: legacyPresetContract, kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: string } };
+    const started = await service.execute({ presetContract: currentPresetContract, kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: string } };
     const seeded = await seedResolvableInteraction(
       value,
       started.session.id as `sess_${string}`,
@@ -26659,7 +26659,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Stale authority" }, { signal }) as { account: { id: `acct_${string}` } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Documents", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
     let releaseProvider!: () => void;
     let signalProviderApplied!: () => void;
     const providerGate = new Promise<void>((resolve) => { releaseProvider = resolve; });
@@ -30299,7 +30299,7 @@ describe("OompaService", () => {
         kind: "session.start",
         account: value.accountId,
         preset: "high",
-        presetContract: legacyPresetContract,
+        presetContract: currentPresetContract,
         fast: false,
       }, { signal }) as { session: { id: `sess_${string}` } };
       const nativeSessionId = started.session.id;
@@ -30494,7 +30494,7 @@ describe("OompaService", () => {
     const added = await service.execute({ kind: "account.add", label: "Shutdown authority" }, { signal }) as { account: { id: `acct_${string}`; processGeneration: number } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Documents", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 2, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     await service.execute({ kind: "session.send", session: started.session.id, message: "active" }, { signal });
     const queued = await service.execute({ kind: "session.queue", session: started.session.id, message: "must remain queued" }, { signal }) as { queued: { id: string } };
     let releaseFact!: () => void;

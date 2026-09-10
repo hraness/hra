@@ -108,7 +108,7 @@ describe("device command builders", () => {
       accountPublicId: "acct_primary0001",
       kind: "session_start",
       preset: "ultra",
-      presetContract: 1,
+      presetContract: 2,
       projectPublicId: "proj_alpha000001",
       prompt: "continue the migration",
       provider: "codex",

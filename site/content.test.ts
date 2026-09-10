@@ -1093,9 +1093,9 @@ describe("public content contract", () => {
       ["The request version and any authored preset contract are part of changed-intent detection"],
       ["Each Work also freezes the meaning of its High and Ultra routes when it is created"],
       ["A fresh affected version 1 request is refused"],
-      ["An existing contract 2 Work whose coordinator and participating session authorities remain supported keeps Astra for already-declared tasks"],
+      ["An existing contract 1 Work whose coordinator and participating session authorities remain supported keeps Sol for already-declared tasks"],
       ["A Work associated with a retired Devin session remains readable but is fenced from mutation and execution"],
-      ["Current tooling does not append a new High or Ultra task to a historical contract 2 Work"],
+      ["Current tooling does not append a new High or Ultra task to a contract 1 Work"],
       ["Reusing that key with another version or contract is a conflict"],
       [
         "A source-sensitive Codex session start or provider-switch replay includes both --idempotency-key and its immutable --preset-contract",
@@ -1106,6 +1106,8 @@ describe("public content contract", () => {
       ["An older session-start release did not print the source contract"],
       ["--preset high --preset-contract 1", "`--preset high --preset-contract 1`"],
       ["Neither selector can resume a contractless prepared row"],
+      ["Contract 1 cannot authorize a fresh effect under the current Astra binding"],
+      ["contract 2 can authorize the exact Astra request when the key has no stored row"],
       ["If the originating meaning cannot be proved, use the retained old release rather than guessing"],
       ["A contractless prepared row has no supported cancellation or retirement command"],
       ["Do not use a fresh key or session abandon as a workaround", "Do not use a fresh key or `session abandon` as a workaround"],
@@ -1176,8 +1178,8 @@ describe("public content contract", () => {
     expect(html).toContain("New Oompa-created Codex sessions that use high or ultra");
     expect(markdown).toContain("The `low` and `fable-max` bindings are unchanged");
     expect(markdown).not.toContain("every explicit preset selection use the Sol mapping");
-    expect(markdown).toContain("sessions already bound to historical contract 2 keep their exact Astra model and effort");
-    expect(html).toContain("sessions already bound to historical contract 2 keep their exact Astra model and effort");
+    expect(markdown).toContain("sessions already bound to contract 1 keep their exact Sol model and effort");
+    expect(html).toContain("sessions already bound to contract 1 keep their exact Sol model and effort");
     expect(markdown).not.toContain("session start personal --provider codex --preset high");
   });
 

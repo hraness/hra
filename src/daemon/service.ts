@@ -18114,7 +18114,12 @@ export class OompaService {
           ? undefined
           : await this.#requireUsableProjectRoot(project.rootPath);
         const targetRuntime = this.#sessionRuntime(record.targetAuthority.provider);
-        const requirement = presetRequirementForContract(record.targetPreset, record.targetPresetContract);
+        // The stored target contract is historical data, so the typed lookup is
+        // widened back to "maybe absent" rather than trusted from the type alone.
+        const requirement = presetRequirementForContract(
+          record.targetPreset,
+          record.targetPresetContract,
+        ) as PresetRequirement | undefined;
         if (requirement === undefined) throw new CommandFailure("CONFLICT", "The provider-switch target has no admitted preset contract.");
         targetReview = await this.#fencedRuntimeReview(targetRuntime, async () => await targetRuntime.reviewSessionStart({
           authority: authorityFor(this.#paths, targetProfile as ProfileRecord, record.targetAuthority),

@@ -32923,7 +32923,9 @@ export class StateStore {
         ...(parsed.projectId === undefined ? {} : { projectId: parsed.projectId }),
         title: parsed.title,
         preset: parsed.preset,
-        presetContract: legacyPresetContract,
+        // An adopted provider session is a new Oompa binding, so it takes the
+        // active contract for its alias like any other new session.
+        presetContract: activePresetBinding(parsed.preset).contract,
         fastEnabled: parsed.fastEnabled,
         state: parsed.state,
         ...(parsed.activeTurnId === undefined ? {} : { activeTurnId: parsed.activeTurnId }),

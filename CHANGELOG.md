@@ -2,6 +2,14 @@
 
 Every entry names the release or the plan wave it belongs to. Unreleased work sits under the wave that produced it until a version ships.
 
+## Astra binding (unreleased)
+
+Codex `high` and `ultra` bind to Astra again. Plan: `kb/plans/oompa-app-simplification.md`, Phase 4a. Start-time routing remains pending.
+
+- New and explicitly reselected Codex `high` and `ultra` sessions, Work plans and provider switches use contract 2: `gpt-6-astra` at `max` and `ultra` reasoning. Established contract 1 Sol sessions keep their exact route until a preset is explicitly reselected; same-alias reselection moves the session to Astra. Existing Works retain their frozen contract and may settle their existing tasks; a new Astra task graph needs a new Work. No stored contract is renumbered or reinterpreted.
+- Remote and local writes that name either rebound alias, and preset-omitted Codex switches, now carry contract 2. A browser or CLI built before this change targeting a current daemon, or the reverse, fails closed before any provider effect, as the `presetContract` fence was designed to do.
+- The CLI help, website preset copy, release notes and routing contract name Astra Max and Astra Ultra as the active Codex mapping. Browser labels stay `Codex High` and `Codex Ultra`; registry version 1 still projects only the alias.
+
 ## Inline conversations (unreleased)
 
 The web app keeps every conversation in its grid card and asks only for a prompt and a machine. Plan: `kb/plans/oompa-app-simplification.md`.

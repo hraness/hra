@@ -1,13 +1,14 @@
 # Model routing: Phase 3 shadow contract
 
-Oompa does not automatically route work to a different model in Phase 3. Sol
-Ultra is the only effective automatic default for new Codex sessions, with Fast off.
+Oompa does not automatically route work to a different model in Phase 3. Astra
+Ultra (contract 2) is the only effective automatic default for new Codex sessions, with Fast off.
 The task-shape classifier and the routing decision are shadow-only: they can
 describe disabled studies, but they cannot mutate a session or authorize a
 runtime profile.
 
-Terra, Opus, and Fast are not enabled by this work. Sol is the active Codex
-baseline, not a shadow candidate. New sessions that explicitly choose the Claude
+Terra, Opus, and Fast are not enabled by this work. Astra is the active Codex
+baseline since 2026-09-10 (contract 1 Sol was active between 2026-09-06 and
+then), not a shadow candidate. New sessions that explicitly choose the Claude
 family continue to use Fable Max. Explicit preset choices are preserved, and
 established sessions never change provider, preset, exact model, effort, or Fast
 state because of a shadow decision or a default change.
@@ -37,7 +38,7 @@ identifier that is not a preset, and never occupies the effective field.
 Established sessions, explicit presets, mechanical work, open-ended work,
 uncertain work, and work requiring the strong profile receive no candidate.
 A new, well-defined Codex default may describe the disabled Terra Ultra and
-Terra Fast studies against the active Sol baseline. A new, explicit,
+Terra Fast studies against the active Codex baseline. A new, explicit,
 well-defined Claude family default may
 describe the disabled Opus effort study. Unknown safety does not license either
 study; it adds an unresolved effect-class blocker.
@@ -46,7 +47,7 @@ The live web app labels mutable remote choices as `Codex High` and
 `Codex Ultra`. A browser deployment and its target daemon can roll
 independently, while encrypted device-registry version 1 projects only the
 preset alias and not that daemon's exact active alias binding. Source-bound CLI
-and documentation can name the current Sol mapping, but the browser must not
+and documentation can name the current Astra mapping, but the browser must not
 claim Sol or Astra for a remote command until a future additive registry
 contract proves that target-specific binding. Every explicit remote preset
 write for the rebound Codex `high` or `ultra` aliases carries the client's
@@ -115,19 +116,19 @@ contract with the idempotency key, and the replay must preserve both values.
 An applied source-matched request replays its historical result, and an
 effect-started request remains recovery-required. A missing or inactive source
 cannot create a fresh session or resume a prepared no-effect row. This lets a
-current daemon look up historical evidence without treating an old Astra
-request as a new Sol request.
+current daemon look up historical evidence without treating an old Sol
+request as a new Astra request, or the reverse.
 
 Released session-start commands before this source field used their own exact
 request digest. A v0.5.0 Codex start with the then-default preset omitted must
 be replayed with an explicit `high` and contract 1, because that release meant
-Sol Max and did not include `provider` in the digest. Contract 2 is a valid
-compatibility selector only for an untagged Astra-era request whose immutable
+Sol Max and did not include `provider` in the digest. Contract 2 is also the
+compatibility selector for an untagged Astra-era request whose immutable
 runtime evidence proves Astra. Either selector can reach a source-matched
 settled result or recovery-required evidence, and neither can admit a
-contractless prepared row. Inactive contract 2 cannot authorize a fresh effect
-under the current Sol binding. Active contract 1 can authorize the exact Sol
-request when the key has no stored row, the same as a newly generated key.
+contractless prepared row. Inactive contract 1 cannot authorize a fresh effect
+under the current Astra binding. Active contract 2 can authorize the exact
+Astra request when the key has no stored row, the same as a newly generated key.
 Retain the originating binary when the historical meaning cannot be proved. A
 contractless prepared row has no supported cancellation or retirement command.
 It must reach a terminal settlement through exact replay under the originating
@@ -144,12 +145,12 @@ not identifiable, while exact applied version 1 replay and stable version 1
 operations remain available. Request version and source contract participate
 in changed-intent detection. Fresh High or Ultra task additions also require
 the target Work's durable contract to equal the current active contract. An
-established contract 2 Work whose coordinator and participating session
+established contract 1 Work whose coordinator and participating session
 authorities remain supported stays readable and may claim, execute, review, and
-settle its existing Astra tasks. A Work associated with a retired Devin session
+settle its existing Sol tasks. A Work associated with a retired Devin session
 remains readable but is fenced from mutation and execution. Current tooling
-refuses to extend any historical contract 2 Work with another rebound task;
-create a new Work for a new Sol task graph.
+refuses to extend any contract 1 Work with another rebound task; create a new
+Work for a new Astra task graph.
 
 Provider-switch preparation also includes the resolved High or Ultra contract
 in its durable request identity. A prepared row left by a pre-update build
@@ -201,7 +202,9 @@ private field cannot be copied into diagnostics.
 
 The current schema version 3 accepts one of three comparisons:
 
-- Codex Terra Ultra against Codex Sol Ultra.
+- Codex Terra Ultra against Codex Sol Ultra (the baseline schema 3 was
+  declared against; a study against the active Astra baseline needs a new
+  schema version and is not part of this contract).
 - Claude Opus at `high`, `xhigh`, or `max` effort against Claude Fable Max.
 - Codex Terra Fast against Terra in standard mode.
 

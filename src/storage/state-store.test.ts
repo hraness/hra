@@ -52,7 +52,6 @@ import {
   devinPresetContract,
   legacyPresetContract,
   presetRequirements,
-  solCodexPresetContract,
 } from "../domain/presets";
 import {
   createPortableProjectMemoryCanonicalIdentity,
@@ -2171,7 +2170,7 @@ async function prepareSignedOutSessionStart(
       projectId: project.id,
       provider: input.provider,
       preset: input.preset,
-      ...(input.preset === "high" ? { presetContract: legacyPresetContract } : {}),
+      ...(input.preset === "high" ? { presetContract: currentPresetContract } : {}),
       fast: false,
     }),
   });
@@ -2296,7 +2295,7 @@ const codexRuntimeProfile = (
   processGeneration: profile.processGeneration,
   observedAt,
   preset: "high" as const,
-  model: "gpt-5.6-sol",
+  model: "gpt-6-astra",
   reasoningEffort: "max" as const,
   serviceTier: null,
   fast: false,
@@ -3793,8 +3792,8 @@ describe("StateStore", () => {
     const { store } = await fixture();
     const prepared = prepareDedicatedSessionSwitch(store, 701);
     expect(prepared.status).toBe("prepared");
-    expect(prepared.switch.sourcePresetContract).toBe(legacyPresetContract);
-    expect(store.latestSessionRuntimeProfile(prepared.session.id)?.profile.model).toBe("gpt-5.6-sol");
+    expect(prepared.switch.sourcePresetContract).toBe(currentPresetContract);
+    expect(store.latestSessionRuntimeProfile(prepared.session.id)?.profile.model).toBe("gpt-6-astra");
     expect(prepared.switch.targetPresetContract).toBe(currentPresetContract);
     expect(store.prepareSessionSwitch({
       targetAccountKey: prepared.targetAccountKey,
@@ -7002,7 +7001,7 @@ describe("StateStore", () => {
             provider_v39: z.literal("codex"),
             session_preset: z.enum(["low", "ultra"]),
             session_contract: z.union([z.literal(1), z.literal(2)]),
-            work_contract: z.literal(1),
+            work_contract: z.literal(2),
             route_preset: z.literal("ultra"),
             task_preset: z.literal("ultra"),
             attempt_preset: z.literal("ultra"),
@@ -7043,10 +7042,10 @@ describe("StateStore", () => {
           dispatch: value.dispatchSettlement === null ? null
             : owner.finalizeDispatch(value.dispatchSettlement.key, value.dispatchSettlement.outcome),
         });
-        const solUltra = "codex:gpt-5.6-sol:ultra";
+        const solUltra = "codex:gpt-6-astra:ultra";
         expect(historicalKeys()).toEqual({ session: solUltra, route: solUltra, task: solUltra, attempt: solUltra });
         expect(value.store.requireSessionPresetRequirement(value.session.id)).toEqual({
-          preset: "ultra", requirement: { model: "gpt-5.6-sol", effort: "ultra" },
+          preset: "ultra", requirement: { model: "gpt-6-astra", effort: "ultra" },
         });
         const retained = persistedHistory();
         const before = publicHistory(work);
@@ -7529,7 +7528,7 @@ describe("StateStore", () => {
     });
   });
 
-  test("uses active Sol bindings while preserving established contract 2", async () => {
+  test("uses active Astra bindings while preserving established contract 1", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Preset contracts", "preset-contracts@example.com");
     const created = store.createSession({
@@ -7539,7 +7538,7 @@ describe("StateStore", () => {
     });
     expect(store.requireSessionPresetRequirement(created.id)).toEqual({
       preset: "high",
-      requirement: { model: "gpt-5.6-sol", effort: "max" },
+      requirement: { model: "gpt-6-astra", effort: "max" },
     });
 
     const imported = store.upsertProviderSession({
@@ -7555,34 +7554,34 @@ describe("StateStore", () => {
     });
     expect(store.requireSessionPresetRequirement(imported.id)).toEqual({
       preset: "high",
-      requirement: { model: "gpt-5.6-sol", effort: "max" },
+      requirement: { model: "gpt-6-astra", effort: "max" },
     });
     const database = new Database(store.paths.database, { strict: true });
     // Synthetic historical binding, not a source-authentic release fixture.
-    database.query("UPDATE sessions SET preset_contract=?,canonical_profile_key='codex:gpt-6-astra:max' WHERE id=?")
-      .run(currentPresetContract, created.id);
+    database.query("UPDATE sessions SET preset_contract=?,canonical_profile_key='codex:gpt-5.6-sol:max' WHERE id=?")
+      .run(legacyPresetContract, created.id);
     database.close(false);
     expect(store.requireSessionPresetRequirement(created.id)).toEqual({
       preset: "high",
-      requirement: { model: "gpt-6-astra", effort: "max" },
+      requirement: { model: "gpt-5.6-sol", effort: "max" },
     });
     const renamed = store.updateSessionMetadata({
       sessionId: created.id,
       expectedRevision: created.revision,
-      title: "Established Astra",
+      title: "Established Sol",
     });
     expect(store.requireSessionPresetRequirement(created.id).requirement.model)
-      .toBe("gpt-6-astra");
+      .toBe("gpt-5.6-sol");
     store.updateSessionMetadata({
       sessionId: created.id,
       expectedRevision: renamed.revision,
       preset: "high",
     });
     expect(store.requireSessionPresetRequirement(created.id).requirement.model)
-      .toBe("gpt-5.6-sol");
+      .toBe("gpt-6-astra");
   });
 
-  test("settles immutable Astra evidence before permitting a Sol reselection", async () => {
+  test("settles immutable Sol evidence before permitting an Astra reselection", async () => {
     let { store } = await fixture();
     const daemon = startInputFixtureDaemon(store);
     const profile = signInProfile(store, "Legacy recovery preset", "legacy-recovery@example.com");
@@ -7600,15 +7599,15 @@ describe("StateStore", () => {
     });
     const database = new Database(store.paths.database, { strict: true });
     // Retain the legacy binding coherently before authoring its recovery evidence.
-    database.query("UPDATE sessions SET preset_contract=?,canonical_profile_key='codex:gpt-6-astra:max' WHERE id=?")
-      .run(currentPresetContract, session.id);
+    database.query("UPDATE sessions SET preset_contract=?,canonical_profile_key='codex:gpt-5.6-sol:max' WHERE id=?")
+      .run(legacyPresetContract, session.id);
     database.close(false);
     const runtimeProfile = {
       approvalPolicy: "on-request" as const,
       computerUse: true as const,
       enabledApps: [],
       fast: false,
-      model: "gpt-6-astra",
+      model: "gpt-5.6-sol",
       observedAt: 2_000,
       permissionProfile: ":workspace" as const,
       pluginCapability: true as const,
@@ -7693,7 +7692,7 @@ describe("StateStore", () => {
     expect(store.runtimeProfileForTurn(session.id, "turn-legacy-recovery-preset"))
       .toEqual(runtimeProfile);
     expect(store.requireSessionPresetRequirement(session.id).requirement)
-      .toEqual({ model: "gpt-6-astra", effort: "max" });
+      .toEqual({ model: "gpt-5.6-sol", effort: "max" });
 
     store.updateSessionMetadata({
       expectedRevision: recovered.revision,
@@ -7701,7 +7700,7 @@ describe("StateStore", () => {
       sessionId: session.id,
     });
     expect(store.requireSessionPresetRequirement(session.id).requirement)
-      .toEqual({ model: "gpt-5.6-sol", effort: "max" });
+      .toEqual({ model: "gpt-6-astra", effort: "max" });
   });
 
   test("records the session provider and refuses another provider's preset", async () => {
@@ -12570,7 +12569,7 @@ describe("StateStore", () => {
         projectId: project.id,
         provider: "codex",
         preset: "high",
-        presetContract: legacyPresetContract,
+        presetContract: currentPresetContract,
         fast: false,
       }),
       idempotencyKey: "00000000-0000-4000-8000-0000000006c0",
@@ -12590,7 +12589,7 @@ describe("StateStore", () => {
         projectId: project.id,
         clientMessageId: null,
         messageDigest: null,
-        presetContract: legacyPresetContract,
+        presetContract: currentPresetContract,
       },
     });
     store.enqueue(queued.id, "retained queue evidence");
@@ -13334,7 +13333,7 @@ describe("StateStore", () => {
       authorityId: profile.id,
       authorityGeneration: providerAuthority.processGeneration,
       request: sessionStartMutationRequest({ projectId: project.id, provider: "codex", preset: "high",
-        presetContract: legacyPresetContract, fast: false }),
+        presetContract: currentPresetContract, fast: false }),
       idempotencyKey: "00000000-0000-4000-8000-000000000625",
       providerAuthorities: [{ role: "primary", authority: providerAuthority, provenance: "session_start" }],
     });
@@ -13353,7 +13352,7 @@ describe("StateStore", () => {
         projectId: project.id,
         clientMessageId: null,
         messageDigest: null,
-        presetContract: legacyPresetContract,
+        presetContract: currentPresetContract,
         runtimeProfile: reviewedCodexProfile(profile),
       },
     });
@@ -13719,7 +13718,7 @@ describe("StateStore", () => {
       request: sessionProviderSwitchMutationRequest({
         provider: "codex",
         preset: "high",
-        presetContract: legacyPresetContract,
+        presetContract: currentPresetContract,
         targetProfileId: codexProfile.id,
         seedDigest: personalSourceSeed,
       }),
@@ -13754,7 +13753,7 @@ describe("StateStore", () => {
         targetProvider: "codex",
         targetProviderAccountKey: providerAccountKeyForProfile(store, codexProfile.id, "codex"),
         targetHostCapabilities: testSwitchHostCapabilities,
-        presetContract: legacyPresetContract,
+        presetContract: currentPresetContract,
         transcriptDigest: personalSourceTranscript,
       },
     });
@@ -13825,7 +13824,7 @@ describe("StateStore", () => {
       title: "Recovered Codex target",
       providerUpdatedAt: 20,
     });
-    expect(store.requireSessionPresetContract(recoveredTarget.id)).toBe(legacyPresetContract);
+    expect(store.requireSessionPresetContract(recoveredTarget.id)).toBe(currentPresetContract);
     expect(recoveredTarget).toMatchObject({
       profileId: codexProfile.id,
       provider: "codex",
@@ -13943,7 +13942,7 @@ describe("StateStore", () => {
       request: {
         accountId: null,
         preset: "high" as const,
-        presetContract: legacyPresetContract,
+        presetContract: currentPresetContract,
         provider: "codex" as const,
       },
       seed: {
@@ -14126,7 +14125,7 @@ describe("StateStore", () => {
       computerUse: true as const,
       enabledApps: [],
       fast: false,
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       permissionProfile: ":workspace" as const,
       pluginCapability: true as const,
       preset: "high" as const,
@@ -14340,7 +14339,7 @@ describe("StateStore", () => {
       computerUse: true as const,
       enabledApps: [],
       fast: false,
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       permissionProfile: ":workspace" as const,
       pluginCapability: true as const,
       preset: "high" as const,
@@ -14691,7 +14690,7 @@ describe("StateStore", () => {
         projectId: project.id,
         provider: "codex",
         preset: "high",
-        presetContract: legacyPresetContract,
+        presetContract: currentPresetContract,
         fast: false,
       }),
       idempotencyKey: key,
@@ -14706,7 +14705,7 @@ describe("StateStore", () => {
       provider: "codex",
       providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
       providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
-      evidence: { kind: "session.start", projectId: project.id, clientMessageId: null, messageDigest: null, presetContract: legacyPresetContract },
+      evidence: { kind: "session.start", projectId: project.id, clientMessageId: null, messageDigest: null, presetContract: currentPresetContract },
       hostCapabilities: {
         preambleVersion: 1,
         preambleDigest: "a".repeat(64),
@@ -14726,7 +14725,7 @@ describe("StateStore", () => {
       evidence: {
         evidence: {
           kind: "session.start",
-          presetContract: legacyPresetContract,
+          presetContract: currentPresetContract,
           projectId: project.id,
         },
       },
@@ -14758,7 +14757,7 @@ describe("StateStore", () => {
     expect(reopened.requireSession(session.id).providerThreadId).toBeUndefined();
     expect(reopened.readMutation(key)?.evidence).toEqual(originalMutation?.evidence);
     expect(reopened.readMutation(key)?.evidence?.evidence)
-      .toMatchObject({ presetContract: legacyPresetContract });
+      .toMatchObject({ presetContract: currentPresetContract });
     expect(reopened.requireSessionHostCapabilityBinding(session.id)).toEqual(originalCapabilities);
   });
 
@@ -14772,7 +14771,7 @@ describe("StateStore", () => {
     const attempt = store.prepareMutation({
       kind: "session.start", authorityId: profile.id, authorityGeneration: profile.processGeneration,
       request: sessionStartMutationRequest({ projectId: project.id, provider: "codex", preset: "high",
-        presetContract: legacyPresetContract, fast: false }),
+        presetContract: currentPresetContract, fast: false }),
       idempotencyKey: key,
     });
     const session = store.beginSessionStartEffect({
@@ -14781,13 +14780,13 @@ describe("StateStore", () => {
       providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
       providerAccountKey: providerAccountKeyForProfile(store, profile.id, "codex"),
       evidence: { kind: "session.start", projectId: project.id, clientMessageId: null,
-        messageDigest: null, presetContract: legacyPresetContract },
+        messageDigest: null, presetContract: currentPresetContract },
       hostCapabilities: { preambleVersion: 1, preambleDigest: "a".repeat(64),
         manifestVersion: 1, manifestDigest: "b".repeat(64) },
     });
     expect(store.readMutation(key)).toMatchObject({
       state: "effect_started", sessionStartId: session.id,
-      evidence: { evidence: { presetContract: legacyPresetContract } },
+      evidence: { evidence: { presetContract: currentPresetContract } },
     });
     const paths = store.paths;
     store.close();
@@ -14858,7 +14857,7 @@ describe("StateStore", () => {
         clientMessageId: null,
         kind: "session.start",
         messageDigest: null,
-        presetContract: legacyPresetContract,
+        presetContract: currentPresetContract,
         projectId: project.id,
       },
       fastEnabled: false,
@@ -14935,7 +14934,7 @@ describe("StateStore", () => {
         projectId: project.id,
         provider: "codex",
         preset: "high",
-        presetContract: legacyPresetContract,
+        presetContract: currentPresetContract,
         fast: false,
       }),
     });
@@ -14946,7 +14945,7 @@ describe("StateStore", () => {
         clientMessageId: null,
         kind: "session.start",
         messageDigest: null,
-        presetContract: legacyPresetContract,
+        presetContract: currentPresetContract,
         projectId: project.id,
         runtimeProfile,
       },
@@ -14991,7 +14990,7 @@ describe("StateStore", () => {
       computerUse: true as const,
       enabledApps: [],
       fast: false,
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       observedAt: 2_000,
       permissionProfile: ":workspace" as const,
       pluginCapability: true as const,
@@ -15012,7 +15011,7 @@ describe("StateStore", () => {
         projectId: project.id,
         provider: "codex",
         preset: "high",
-        presetContract: legacyPresetContract,
+        presetContract: currentPresetContract,
         fast: false,
       }),
     });
@@ -15023,7 +15022,7 @@ describe("StateStore", () => {
         clientMessageId: null,
         kind: "session.start",
         messageDigest: null,
-        presetContract: legacyPresetContract,
+        presetContract: currentPresetContract,
         projectId: project.id,
         runtimeProfile,
       },
@@ -15263,7 +15262,7 @@ describe("StateStore", () => {
         projectId: logoutProject.id,
         provider: "codex",
         preset: "high",
-        presetContract: legacyPresetContract,
+        presetContract: currentPresetContract,
         fast: false,
       }),
     });
@@ -15282,7 +15281,7 @@ describe("StateStore", () => {
         clientMessageId: null,
         kind: "session.start",
         messageDigest: null,
-        presetContract: legacyPresetContract,
+        presetContract: currentPresetContract,
         projectId: logoutProject.id,
       },
       fastEnabled: false,
@@ -15443,7 +15442,7 @@ describe("StateStore", () => {
         clientMessageId: null,
         kind: "session.start",
         messageDigest: null,
-        presetContract: legacyPresetContract,
+        presetContract: currentPresetContract,
         projectId: project.id,
       },
       fastEnabled: false,
@@ -15473,7 +15472,7 @@ describe("StateStore", () => {
         clientMessageId: null,
         kind: "session.start",
         messageDigest: null,
-        presetContract: legacyPresetContract,
+        presetContract: currentPresetContract,
         projectId: project.id,
       },
       fastEnabled: false,
@@ -15509,7 +15508,7 @@ describe("StateStore", () => {
       computerUse: true as const,
       enabledApps: [],
       fast: false,
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       observedAt: 2_000,
       permissionProfile: ":workspace" as const,
       pluginCapability: true as const,
@@ -15563,7 +15562,7 @@ describe("StateStore", () => {
           projectId: project.id,
           provider,
           preset,
-          ...(preset === "high" ? { presetContract: legacyPresetContract } : {}),
+          ...(preset === "high" ? { presetContract: currentPresetContract } : {}),
           fast: false,
         }),
       });
@@ -15573,7 +15572,7 @@ describe("StateStore", () => {
           clientMessageId: null,
           kind: "session.start",
           messageDigest: null,
-          ...(preset === "high" ? { presetContract: legacyPresetContract } : {}),
+          ...(preset === "high" ? { presetContract: currentPresetContract } : {}),
           projectId: project.id,
           runtimeProfile,
         },
@@ -15716,7 +15715,7 @@ describe("StateStore", () => {
         request: sessionProviderSwitchMutationRequest({
           provider: "codex",
           preset: "high",
-          presetContract: legacyPresetContract,
+          presetContract: currentPresetContract,
           targetProfileId: targetProfile.id,
           seedDigest,
         }),
@@ -15752,7 +15751,7 @@ describe("StateStore", () => {
             "codex",
           ),
           targetHostCapabilities: testSwitchHostCapabilities,
-          presetContract: legacyPresetContract,
+          presetContract: currentPresetContract,
           transcriptDigest: createHash("sha256").update(seedName).digest("hex"),
         },
       });
@@ -16034,7 +16033,7 @@ describe("StateStore", () => {
       computerUse: true as const,
       enabledApps: [],
       fast: false,
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       observedAt: 2_000,
       permissionProfile: ":workspace" as const,
       pluginCapability: true as const,
@@ -16072,7 +16071,7 @@ describe("StateStore", () => {
         projectId: project.id,
         provider: "codex",
         preset: "high",
-        presetContract: legacyPresetContract,
+        presetContract: currentPresetContract,
         fast: false,
       }),
     });
@@ -16083,7 +16082,7 @@ describe("StateStore", () => {
         conversationAutomationCapability: SESSION_CONVERSATION_AUTOMATION_CAPABILITY,
         kind: "session.start",
         messageDigest: null,
-        presetContract: legacyPresetContract,
+        presetContract: currentPresetContract,
         projectId: project.id,
         runtimeProfile: codexProfile,
       },
@@ -16981,7 +16980,7 @@ describe("StateStore", () => {
       computerUse: true as const,
       enabledApps: [],
       fast: false,
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       observedAt: 2_000,
       permissionProfile: ":workspace" as const,
       pluginCapability: true as const,
@@ -17019,7 +17018,7 @@ describe("StateStore", () => {
           targetProfile.id,
           "codex",
         ),
-        presetContract: solCodexPresetContract,
+        presetContract: currentPresetContract,
         transcriptDigest: createHash("sha256").update("legacy switch transcript").digest("hex"),
       },
       sessionId: session.id,
@@ -17073,7 +17072,7 @@ describe("StateStore", () => {
         request: sessionProviderSwitchMutationRequest({
           provider: "codex",
           preset: "high",
-          presetContract: legacyPresetContract,
+          presetContract: currentPresetContract,
           targetProfileId: targetProfile.id,
           seedDigest,
         }),
@@ -17087,7 +17086,7 @@ describe("StateStore", () => {
         daemonGeneration: 0,
         requestedAccountId: targetProfile.id,
         requestedPreset: "high" as const,
-        runtimeProfile: solProfile,
+        runtimeProfile: astraProfile,
         seedDigest,
         seedIncludedRecords: 1,
         seedOmittedRecords: 0,
@@ -17106,7 +17105,7 @@ describe("StateStore", () => {
         targetProcessGeneration: targetProfile.processGeneration,
         targetProfileId: targetProfile.id,
         targetProvider: "codex" as const,
-        presetContract: legacyPresetContract,
+        presetContract: currentPresetContract,
         transcriptDigest: createHash("sha256").update(`transcript-${suffix}`).digest("hex"),
       };
       store.beginSessionProviderSwitchEffect({
@@ -17122,11 +17121,12 @@ describe("StateStore", () => {
       return { attempt, seedText, session };
     };
 
-    const current = stageSwitch("6b2", "Seed the active Sol target.");
+    const current = stageSwitch("6b2", "Seed the active Astra target.");
+    // A Sol runtime profile no longer matches the active Astra target.
     expect(() => store.recordSessionProviderSwitchSeedIntent({
       attemptId: current.attempt.id,
       providerThreadId: "target-6b2",
-      runtimeProfile: astraProfile,
+      runtimeProfile: solProfile,
       seedText: current.seedText,
       sessionId: current.session.id,
     })).toThrow("SESSION_PROVIDER_SWITCH_SEED_INTENT_AUTHORITY_MISMATCH");
@@ -17134,18 +17134,18 @@ describe("StateStore", () => {
     store.recordSessionProviderSwitchSeedIntent({
       attemptId: current.attempt.id,
       providerThreadId: "target-6b2",
-      runtimeProfile: solProfile,
+      runtimeProfile: astraProfile,
       seedText: current.seedText,
       sessionId: current.session.id,
     });
     expect(store.readSessionProviderSwitchProgress(current.attempt.id).seed?.runtimeProfile.model)
-      .toBe("gpt-5.6-sol");
+      .toBe("gpt-6-astra");
 
-    const tampered = stageSwitch("6b3", "Keep the second admitted Sol target unchanged.");
+    const tampered = stageSwitch("6b3", "Keep the second admitted Astra target unchanged.");
     const inspector = new Database(store.paths.database, { create: false, strict: true });
     try {
-      // Deliberate current-row corruption is not historical contract-2 proof.
-      // Authentic canonical39 fixtures separately retain the old runtime bytes.
+      // Deliberate current-row corruption is not historical contract-1 proof.
+      // Authentic canonical fixtures separately retain the old runtime bytes.
       const before = snapshotSwitchContainmentForTest(inspector);
       const stored = inspector.query(
         "SELECT evidence_json FROM mutation_effect_evidence WHERE attempt_id=?",
@@ -17153,7 +17153,7 @@ describe("StateStore", () => {
       const alteredEvidence = JSON.parse(stored.evidence_json) as {
         runtimeProfile: { model: string };
       };
-      alteredEvidence.runtimeProfile.model = "gpt-6-astra";
+      alteredEvidence.runtimeProfile.model = "gpt-5.6-sol";
       const alteredEvidenceJson = JSON.stringify(alteredEvidence);
       withRemovedTestGuards(inspector, ["mutation_effect_evidence_immutable_update"], () => inspector.query(
         `UPDATE mutation_effect_evidence SET evidence_json=?,evidence_digest=?
@@ -18615,7 +18615,7 @@ describe("StateStore", () => {
       processGeneration: profile.processGeneration,
       observedAt: 2_000,
       preset: "high" as const,
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       reasoningEffort: "max" as const,
       serviceTier: null,
       fast: false,
@@ -19764,7 +19764,7 @@ describe("StateStore", () => {
       processGeneration: profile.processGeneration,
       observedAt: 2_000,
       preset: "high" as const,
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       reasoningEffort: "max" as const,
       serviceTier: null,
       fast: false,
@@ -19884,7 +19884,7 @@ describe("StateStore", () => {
       processGeneration: profile.processGeneration,
       observedAt: 2_000,
       preset: "high" as const,
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       reasoningEffort: "max" as const,
       serviceTier: null,
       fast: false,
@@ -27593,7 +27593,8 @@ describe("StateStore", () => {
       const workGuard = z.object({ sql: z.string() }).parse(inspector.query(
         "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='work_devin_preset_contract_guard'",
       ).get()).sql;
-      expect(workGuard).toContain("NEW.preset_contract!=1");
+      // The Work guard is rebuilt at open against the active contract (2, Astra).
+      expect(workGuard).toContain("NEW.preset_contract!=2");
       expect(workGuard).not.toContain("provider_v39='devin'");
       const sessionGuard = z.object({ sql: z.string() }).parse(inspector.query(
         "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='work_session_devin_contract_guard'",
@@ -28441,7 +28442,7 @@ describe("StateStore", () => {
     });
     const runtime = {
       profileId: profile.id, processGeneration: profile.processGeneration, observedAt: now,
-      preset: "high" as const, model: "gpt-5.6-sol", reasoningEffort: "max" as const,
+      preset: "high" as const, model: "gpt-6-astra", reasoningEffort: "max" as const,
       serviceTier: null, fast: false, approvalPolicy: "on-request" as const,
       reviewMode: "auto_review" as const, permissionProfile: ":workspace" as const,
       computerUse: true as const, pluginCapability: true as const, enabledApps: [],
@@ -28531,7 +28532,7 @@ describe("StateStore", () => {
       processGeneration: profile.processGeneration,
       observedAt: 2_000,
       preset: "high" as const,
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       reasoningEffort: "max" as const,
       serviceTier: null,
       fast: false,
@@ -28669,7 +28670,7 @@ describe("StateStore", () => {
       processGeneration: profile.processGeneration,
       observedAt: 2_000,
       preset: "high" as const,
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       reasoningEffort: "max" as const,
       serviceTier: null,
       fast: false,
@@ -28782,7 +28783,7 @@ describe("StateStore", () => {
       computerUse: true as const,
       enabledApps: [],
       fast: false,
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       observedAt: 2_100,
       permissionProfile: ":workspace" as const,
       pluginCapability: true as const,
@@ -29033,7 +29034,7 @@ describe("StateStore", () => {
       processGeneration: profile.processGeneration,
       observedAt: 2_000,
       preset: "high" as const,
-      model: "gpt-5.6-sol",
+      model: "gpt-6-astra",
       reasoningEffort: "max" as const,
       serviceTier: null,
       fast: false,
@@ -33531,7 +33532,9 @@ describe("StateStore", () => {
       idempotencyKey: peerIdempotencyKey(9_101),
       message,
     });
-    const runtime = codexRuntimeProfile(profile, 50_000);
+    // The retained pre-v44 session keeps its contract 1 (Sol) route; only new
+    // sessions take the active Astra binding.
+    const runtime = { ...codexRuntimeProfile(profile, 50_000), model: "gpt-5.6-sol" };
     expect(migrated.requireSessionPresetRequirement(currentTarget.id)).toEqual({
       preset: runtime.preset, requirement: { model: runtime.model, effort: runtime.reasoningEffort },
     });

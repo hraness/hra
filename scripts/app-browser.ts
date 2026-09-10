@@ -1685,7 +1685,7 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
             assert.ok((await page.getByText("Fixture machine", { exact: true }).count()) > 0);
             assert.ok(await page.getByText("Last reported Codex default", { exact: true }).isVisible());
             assert.ok(await page.getByText(
-              "gpt-5.6-sol / ultra. Reported configuration only, not session state or runtime capability.",
+              "gpt-6-astra / ultra. Reported configuration only, not session state or runtime capability.",
               { exact: true },
             ).isVisible());
           }
