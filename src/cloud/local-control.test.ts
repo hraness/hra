@@ -34,6 +34,7 @@ import {
   createLocalCloudControlFromEnvironment,
   createCloudUuidV7,
   deploymentFencedCloudTransport,
+  deploymentUrlFromEnvironment,
   LocalCloudControl,
   type CloudSecretCustodyPort,
 } from "./local-control";
@@ -1528,6 +1529,31 @@ describe("local cloud control", () => {
       environment: { HRA_CONVEX_URL: "" },
       secretCustody: custody,
     })).toBeNull();
+  });
+
+  test("forward cloud aliases select locally and conflicts refuse custody and transport", async () => {
+    expect(deploymentUrlFromEnvironment({ OOMPA_CONVEX_URL: testDeploymentUrl })).toBe(testDeploymentUrl);
+    expect(deploymentUrlFromEnvironment({ OOMPA_CONVEX_URL: " " })).toBeNull();
+    const custody = new MemoryCustody();
+    let effects = 0;
+    const rejectEffect = async (): Promise<never> => { effects++; throw new Error("Unexpected cloud effect."); };
+    const transport: CloudTransport = { action: rejectEffect, mutation: rejectEffect, query: rejectEffect };
+    for (const deploymentAuthority of [undefined, { ...testDeploymentAuthority, assertCurrent: rejectEffect }]) {
+      await expect(createLocalCloudControlFromEnvironment({
+        environment: { OOMPA_CONVEX_URL: testDeploymentUrl, HRA_CONVEX_URL: `${testDeploymentUrl}/` },
+        secretCustody: custody,
+        transport,
+        ...(deploymentAuthority === undefined ? {} : { deploymentAuthority }),
+      })).rejects.toThrow("must be byte-identical");
+      expect(custody.reads).toEqual([]);
+      expect([...custody.values]).toEqual([]);
+      expect(effects).toBe(0);
+    }
+    const selected = await createLocalCloudControlFromEnvironment({
+      environment: { OOMPA_CONVEX_URL: testDeploymentUrl }, secretCustody: custody, transport,
+    });
+    expect(selected).toBeInstanceOf(LocalCloudControl);
+    expect(effects).toBe(0);
   });
 
   test("refuses implicit migration of legacy auth custody before transport", async () => {

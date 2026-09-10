@@ -458,9 +458,9 @@ const doctorRecord = (value: unknown): Record<string, unknown> | null =>
 const cloudReenableAction = (root: Record<string, unknown>): string => {
   const parsed = doctorCloudReenableSchema.safeParse(root.reenable);
   if (parsed.success && parsed.data.kind === "restore_bound_deployment") {
-    return `Set HRA_CONVEX_URL to ${parsed.data.deploymentUrl} and restart the daemon`;
+    return `Set OOMPA_CONVEX_URL to ${parsed.data.deploymentUrl}, unset HRA_CONVEX_URL, and restart the daemon`;
   }
-  if (parsed.success) return "Unset HRA_CONVEX_URL and restart the daemon";
+  if (parsed.success) return "Unset OOMPA_CONVEX_URL and HRA_CONVEX_URL and restart the daemon";
   return "Restore this state root's bound cloud deployment selection and restart the daemon";
 };
 

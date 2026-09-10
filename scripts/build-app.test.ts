@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 import { afterAll, describe, expect, test } from "bun:test";
 import { getDesignPaletteTheme } from "@hraness/design-kit";
+import fc from "fast-check";
 
 import { appDevelopmentConfig, appProductionConfig } from "../app/vite.config.ts";
 import {
@@ -26,7 +27,9 @@ afterAll(async () => {
 });
 
 const entry = "/fixture/app/src/main.tsx";
-const shell = '<!doctype html>\n<html lang="en" data-palette="catppuccin" data-theme="dark"><head><meta name="viewport" content="width=device-width, viewport-fit=cover"><meta name="color-scheme" content="dark light"><meta name="referrer" content="no-referrer"><meta name="robots" content="noindex, nofollow"><title>HRA</title></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>\n';
+const faviconBytes = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Oompa">\n  <circle cx="32" cy="32" r="27" fill="#f58220" stroke="#ad430d" stroke-width="2"/>\n</svg>\n');
+const faviconTag = `<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,${faviconBytes.toString("base64")}">`;
+const shell = `<!doctype html>\n<html lang="en" data-palette="catppuccin" data-theme="dark"><head>${faviconTag}<meta name="viewport" content="width=device-width, viewport-fit=cover"><meta name="color-scheme" content="dark light"><meta name="referrer" content="no-referrer"><meta name="robots" content="noindex, nofollow"><title>HRA</title></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>\n`;
 const chunk = (name: string, code: string, isEntry = false) => ({
   code, facadeModuleId: isEntry ? entry : null, fileName: `assets/${name}.js`, isEntry, map: null, type: "chunk",
 });
@@ -144,6 +147,55 @@ describe("app graph output values", () => {
 });
 
 describe("registered authored shell", () => {
+  test("admits only the exact Oompa favicon bytes already held by the shell", async () => {
+    const bytes = await readFile(new URL("../site/favicon.svg", import.meta.url));
+    const tag = `<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,${bytes.toString("base64")}">`;
+    expect(bytes).toEqual(faviconBytes);
+    expect(tag).toBe(faviconTag);
+    const authored = await readFile(new URL("../app/index.html", import.meta.url), "utf8");
+    const graph = snapshotAppGraph(bundle(), entry, appearance);
+    for (const mount of ["/", "./"] as const) {
+      expect(prepareAppShell(authored, graph, mount)).toContain(tag);
+    }
+  });
+
+  test("refuses missing, duplicate, alternate, inert, or active-payload favicons", () => {
+    const graph = snapshotAppGraph(bundle(), entry, appearance);
+    const active = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"><script>alert(1)</script></svg>').toString("base64");
+    for (const changed of [
+      shell.replace(faviconTag, ""),
+      shell.replace(faviconTag, faviconTag + faviconTag),
+      shell.replace(faviconTag, `${faviconTag}<link rel="icon" href="/favicon.svg">`),
+      shell.replace(faviconTag, '<link rel="icon" href="https://example.test/favicon.svg">'),
+      shell.replace(faviconTag, faviconTag.replace('rel="icon"', 'rel="shortcut icon"')),
+      shell.replace(faviconTag, faviconTag.replace('type="image/svg+xml"', 'type="image/png"')),
+      shell.replace(faviconTag, faviconTag.replace('href="data:', 'href="/favicon.svg" href="data:')),
+      shell.replace(faviconTag, faviconTag.replace(">", ' onload="alert(1)">')),
+      shell.replace(faviconTag, faviconTag.replace("base64,", "base64,\n")),
+      shell.replace(faviconTag, faviconTag.replace(faviconBytes.toString("base64"), active)),
+      shell.replace(faviconTag, faviconTag.replace(faviconBytes.toString("base64"), faviconBytes.toString("base64") + "=")),
+      shell.replace(faviconTag, `<!--${faviconTag}-->`),
+      shell.replace(faviconTag, `<title>${faviconTag}</title>`),
+      shell.replace(faviconTag, `<meta content='${faviconTag}'>`),
+      shell.replace(faviconTag, "").replace("</body>", `${faviconTag}</body>`),
+      shell.replace("<head>", "<textarea><head>"),
+    ]) expect(() => prepareAppShell(changed, graph)).toThrow();
+  });
+
+  test("rejects every sampled changed favicon byte under the unchanged finite asset contract", () => {
+    const graph = snapshotAppGraph(bundle(), entry, appearance);
+    fc.assert(fc.property(
+      fc.integer({ min: 0, max: faviconBytes.length - 1 }),
+      fc.integer({ min: 1, max: 255 }),
+      (offset, delta) => {
+        const changed = Buffer.from(faviconBytes);
+        changed[offset] = (changed[offset] ?? 0) ^ delta;
+        const altered = shell.replace(faviconBytes.toString("base64"), changed.toString("base64"));
+        expect(() => prepareAppShell(altered, graph)).toThrow("Unreviewed app favicon bytes");
+      },
+    ), { seed: 20_260_913, numRuns: 64 });
+  });
+
   test("retains metadata and every other authored byte with foundation before recipes", () => {
     const graph = snapshotAppGraph(bundle(), entry, appearance);
     const rendered = prepareAppShell(shell, graph);

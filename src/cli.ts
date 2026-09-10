@@ -59,6 +59,7 @@ import {
 import { discardReadableUntilEnd, ShellTerminalCoordinator } from "./cli/shell-terminal";
 import { followSessionEvents } from "./cli/watch";
 import { followWorkEvents } from "./cli/work-watch";
+import { CloudDeploymentAliasConflictError, requireCloudDeploymentEnvironment } from "./domain/cloud-deployment-environment";
 import {
   BridgedCloudControl,
   CloudDaemonJournalRecoveryBlocker,
@@ -1663,14 +1664,15 @@ class DiagnosedUnavailableCloudControl extends UnavailableCloudControl {
 }
 
 function cloudBindingDiagnostic(error: unknown): string {
+  if (error instanceof CloudDeploymentAliasConflictError) return error.message;
   if (!(error instanceof CloudDeploymentAuthorityError)) {
     return "Cloud sync is unavailable because local cloud custody requires recovery.";
   }
   switch (error.code) {
     case "invalid_configuration":
-      return "Cloud sync is unavailable because HRA_CONVEX_URL is invalid.";
+      return "Cloud sync is unavailable because OOMPA_CONVEX_URL or its legacy alias HRA_CONVEX_URL is invalid.";
     case "legacy_binding_required":
-      return "Cloud sync is unavailable until HRA_CONVEX_URL explicitly selects the legacy deployment.";
+      return "Cloud sync is unavailable until OOMPA_CONVEX_URL (or legacy HRA_CONVEX_URL) explicitly selects the legacy deployment.";
     case "target_mismatch":
       return "Cloud sync is unavailable because this state root is bound to another deployment.";
     case "concurrent_change":
@@ -1699,8 +1701,8 @@ const cloudReenableConfiguration = (
 
 const disabledCloudDiagnostic = (reenable: CloudReenableConfiguration): string =>
   reenable.kind === "use_hosted_default"
-    ? "Cloud sync is disabled for this daemon. Unset HRA_CONVEX_URL and restart the daemon to use hosted sync."
-    : "Cloud sync is disabled for this daemon. Restore this state root's bound HRA_CONVEX_URL deployment and restart the daemon.";
+    ? "Cloud sync is disabled for this daemon. Unset OOMPA_CONVEX_URL and HRA_CONVEX_URL and restart the daemon to use hosted sync."
+    : "Cloud sync is disabled for this daemon. Restore this state root's bound deployment with OOMPA_CONVEX_URL, unset HRA_CONVEX_URL, and restart the daemon.";
 
 type DaemonCloudStartup = Readonly<{
   deploymentAuthority: CloudDeploymentAuthority | null;
@@ -1820,13 +1822,16 @@ export async function resolveDaemonCloudStartup(input: Readonly<{
   isSessionTerminal?: (sessionPublicId: string) => boolean | Promise<boolean>;
   secretCustody: CloudSecretCustodyPort;
 }>): Promise<DaemonCloudStartup> {
+  // A contradictory target is not a custody-recovery condition. Refuse before
+  // the recovery path can read or open any local cloud authority.
+  const cloud = requireCloudDeploymentEnvironment(input.environment);
   let deploymentAuthority: CloudDeploymentAuthority | null = null;
   let diagnostic: string | undefined;
   let unavailability: "disabled" | "recovery_required" | undefined;
   try {
     deploymentAuthority = await cloudDeploymentAuthorityFromEnvironment(
       input.secretCustody,
-      input.environment,
+      cloud.environment,
     );
     if (deploymentAuthority === null) {
       diagnostic = disabledCloudDiagnostic({ kind: "use_hosted_default" });
@@ -2159,34 +2164,43 @@ export const daemonRunProcessArguments = (
   "run",
 ];
 
-// The detached daemon receives the Codex child allowlist plus the one HRA
-// variable it reads at boot: the explicit cloud deployment selection.
-export const DAEMON_ENVIRONMENT_KEYS: ReadonlySet<string> = new Set(["HRA_CONVEX_URL"]);
+// The detached daemon receives the Codex child allowlist plus the exact pair
+// of compatible cloud-deployment inputs captured for this invocation.
+export const DAEMON_ENVIRONMENT_KEYS: ReadonlySet<string> = new Set(["HRA_CONVEX_URL", "OOMPA_CONVEX_URL"]);
 
 export const daemonRunProcessOptions = (
   cwd: string,
   environment: Readonly<Record<string, string | undefined>> = process.env,
-) => ({
-  cwd,
-  detached: true,
-  env: allowlistedEnvironment(environment, DAEMON_ENVIRONMENT_KEYS),
-  stdin: "ignore" as const,
-  stdout: "ignore" as const,
-  stderr: "ignore" as const,
-});
+) => {
+  const env = allowlistedEnvironment(environment, DAEMON_ENVIRONMENT_KEYS);
+  requireCloudDeploymentEnvironment(env);
+  return {
+    cwd,
+    detached: true,
+    env,
+    stdin: "ignore" as const,
+    stdout: "ignore" as const,
+    stderr: "ignore" as const,
+  };
+};
 
 async function startDaemonProcess(installation: HraInstallation): Promise<DaemonReadyStatus> {
   assertInstallationHome(installation);
   if (installation.kind !== "production") {
     throw new Error("A live-acceptance daemon must be started by its source-only worker.");
   }
+  const cloud = requireCloudDeploymentEnvironment(installation.cloudEnvironment);
+  const processOptions = daemonRunProcessOptions(installation.paths.root, {
+    ...allowlistedEnvironment(process.env),
+    ...cloud.environment,
+  });
   const cliPath = process.argv[1] ?? import.meta.path;
   const paths = installation.paths;
   await requireInitializedDaemonState(paths);
   await initializeStatePaths(paths);
   const child = Bun.spawn(
     daemonRunProcessArguments(process.execPath, cliPath),
-    daemonRunProcessOptions(paths.root),
+    processOptions,
   );
   child.unref();
   let exited = false;
@@ -2380,12 +2394,14 @@ async function callWithAutostart(
   return await callWithSafeAutostart(
     async () => await callLocalDaemon({ paths, command, ...(signal === undefined ? {} : { signal }) }),
     async () => {
+      const cloud = requireCloudDeploymentEnvironment(installation.cloudEnvironment);
+      const selectedInstallation = { ...installation, cloudEnvironment: cloud.environment };
       if (injectedStart === undefined) {
-        await startDaemonProcess(installation);
+        await startDaemonProcess(selectedInstallation);
         return;
       }
       await requireInitializedDaemonState(paths);
-      await injectedStart(installation);
+      await injectedStart(selectedInstallation);
     },
   );
 }
@@ -3036,9 +3052,12 @@ async function executeRemoteInvocation(
   process.once("SIGINT", abort);
   process.once("SIGTERM", abort);
   try {
+    const environment = injectedStatus === undefined
+      ? requireCloudDeploymentEnvironment(installation.cloudEnvironment).environment
+      : installation.cloudEnvironment;
     const control = injectedStatus === undefined
       ? await createLocalCloudControlFromEnvironment({
-          environment: installation.cloudEnvironment,
+          environment,
           lifetimeSignal: controller.signal,
           secretCustody: installation.createSecretCustody(),
         })
@@ -3046,7 +3065,7 @@ async function executeRemoteInvocation(
     if (control === null && injectedStatus === undefined) {
       return renderFailure({
         code: "UNAVAILABLE",
-        message: "Cloud sync is disabled. Unset HRA_CONVEX_URL for hosted sync, or set a deployment URL, then run `hra auth login`.",
+        message: "Cloud sync is disabled. Unset both OOMPA_CONVEX_URL and HRA_CONVEX_URL to use hosted sync; for a custom deployment, set only OOMPA_CONVEX_URL. Then run `hra auth login`.",
       }, invocation.json, output);
     }
     if (invocation.command.kind === "remote.list") {
@@ -3097,7 +3116,7 @@ async function executeRemoteInvocation(
     renderRemoteSuccess(invocation.command, data, invocation.json, output);
     return 0;
   } catch (error: unknown) {
-    if (error instanceof CloudDeploymentAuthorityError) {
+    if (error instanceof CloudDeploymentAuthorityError || error instanceof CloudDeploymentAliasConflictError) {
       return renderFailure({
         code: "UNAVAILABLE",
         message: cloudBindingDiagnostic(error),
@@ -4189,6 +4208,7 @@ export async function runDaemon(
   installation: HraInstallation = createProductionInstallation(),
   options: RunDaemonOptions = {},
 ): Promise<number> {
+  const cloud = requireCloudDeploymentEnvironment(installation.cloudEnvironment);
   if (
     (
       options.liveAcceptanceCanonicalMemoryTransportDecorator !== undefined
@@ -4213,7 +4233,7 @@ export async function runDaemon(
   if (stopSignal?.aborted === true) requestLatchedStop();
   try {
     return await runDaemonLifecycle(
-      installation,
+      { ...installation, cloudEnvironment: cloud.environment },
       stopLatch,
       options.liveAcceptanceCanonicalMemoryTransportDecorator,
       options.liveAcceptanceClaudeProof,
@@ -6356,8 +6376,9 @@ async function executeInvocation(
     } catch (error: unknown) {
       if (!isLocalDaemonUnavailable(error)) throw error;
     }
+    const cloud = requireCloudDeploymentEnvironment(installation.cloudEnvironment);
     await requireInitializedDaemonState(installation.paths);
-    const ready = await (input.startDaemon ?? startDaemonProcess)(installation);
+    const ready = await (input.startDaemon ?? startDaemonProcess)({ ...installation, cloudEnvironment: cloud.environment });
     renderSuccess({ kind: "daemon.status" }, ready, invocation.json, output);
     return 0;
   }
@@ -6592,6 +6613,9 @@ export async function main(
         message: error.message,
         ...(error.details === undefined ? {} : { details: error.details }),
       }, json, output);
+    }
+    if (error instanceof CloudDeploymentAliasConflictError) {
+      return renderFailure({ code: "UNAVAILABLE", message: error.message }, json, output);
     }
     if (json) {
       return renderFailure({

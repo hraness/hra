@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { resolveCloudDeploymentEnvironment, type CloudDeploymentEnvironment } from "./domain/cloud-deployment-environment";
 
 import {
   personalProviderPaths,
@@ -10,7 +11,7 @@ import {
 import { GenerationalSecretCustody } from "./storage/secret-custody";
 
 type HraInstallationCommon = Readonly<{
-  cloudEnvironment: Readonly<{ HRA_CONVEX_URL?: string }>;
+  cloudEnvironment: CloudDeploymentEnvironment;
   codexEnvironment(codexHome: string): Promise<Readonly<Record<string, string | undefined>> | undefined>;
   credentialStorePreflight: Readonly<{
     readonly cliAuth: "file";
@@ -42,11 +43,11 @@ const defaultCodexEnvironment = (): Promise<undefined> => Promise.resolve(undefi
 
 export function createProductionInstallation(): HraInstallation {
   const paths = resolveStatePaths();
-  const cloudDeploymentUrl = process.env.HRA_CONVEX_URL;
+  const cloud = resolveCloudDeploymentEnvironment(process.env);
   return {
-    cloudEnvironment: cloudDeploymentUrl === undefined
-      ? {}
-      : { HRA_CONVEX_URL: cloudDeploymentUrl },
+    // Capturing a conflict must not prevent help, local diagnosis, or stop.
+    // Authority-starting consumers require agreement before their first effect.
+    cloudEnvironment: cloud.environment,
     codexEnvironment: defaultCodexEnvironment,
     credentialStorePreflight: {
       cliAuth: "file",

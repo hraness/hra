@@ -59,6 +59,9 @@ const STYLEX_UNION_POLICY_SHA256 = "1ceced1f1bf6359413ca6425ede61e1fdae272b897f4
 const PUBLICATION_JOURNAL = "pending-publication.json";
 const ENTRY_TAG = '<script type="module" src="/src/main.tsx"></script>';
 const HTML_TAG = '<html lang="en" data-palette="catppuccin" data-theme="dark">';
+// This one authored image is already held by the shell under img-src data:.
+// Its exact SVG bytes are reviewed independently of the website runtime.
+const APP_FAVICON_SHA256 = "8b3323b41b8c95bfa39af9af23152105b87b205959834ff096aa7c5b6f83b98d";
 export const APP_CSS_PLACEHOLDER = "__HRANESS_STYLEX_CSS__";
 
 export type AppPublicationFailureBoundary =
@@ -208,7 +211,18 @@ export function prepareAppShell(
   assert.equal((source.match(/<script\b/giu) ?? []).length, 1);
   assert.equal(source.split("</head>").length - 1, 1);
   assert.ok(!/<!--|<\?|<!\[CDATA\[|<(?:template|noscript|svg|math)\b/iu.test(source), "The app shell must retain its active native HTML boundary");
-  assert.ok(!/<(?:style|link|base)\b|\bstyle\s*=/iu.test(source), "Unexpected authored shell stylesheet or inline style");
+  const icons = [...source.matchAll(/<link rel="icon" type="image\/svg\+xml" href="data:image\/svg\+xml;base64,([A-Za-z0-9+/=]{1,512})">/gu)];
+  assert.equal(icons.length, 1, "The app must have exactly one canonical favicon");
+  const icon = icons[0];
+  assert.ok(icon !== undefined && icon[1] !== undefined);
+  const iconBytes = Buffer.from(icon[1], "base64");
+  assert.equal(iconBytes.toString("base64"), icon[1], "Favicon encoding must be canonical");
+  assert.equal(appSha256(iconBytes), APP_FAVICON_SHA256, "Unreviewed app favicon bytes");
+  assert.equal(source.split("<head>").length - 1, 1);
+  const head = source.indexOf("<head>");
+  assert.equal(source.slice(0, head).trimEnd(), `<!doctype html>\n${HTML_TAG}`, "Unexpected authored shell head boundary");
+  assert.ok(source.slice(head + "<head>".length).trimStart().startsWith(icon[0]), "Favicon must start the active app head");
+  assert.ok(!/<(?:style|link|base)\b|\bstyle\s*=/iu.test(source.replace(icon[0], "")), "Unexpected authored shell stylesheet or inline style");
   assert.ok(!source.includes(APP_CSS_PLACEHOLDER));
   assert.ok(compilerPublicPath(`graphs/client/${graph.entry}`) && graph.entry.endsWith(".js"));
   assert.ok(compilerPublicPath(`graphs/client/${graph.foundation}`) && graph.foundation.endsWith(".css"));

@@ -166,6 +166,7 @@ import {
   type CloudDeploymentAuthority,
   type CloudDeploymentSelection,
 } from "./identity-custody";
+import { requireCloudDeploymentEnvironment } from "../domain/cloud-deployment-environment";
 
 const maximumLocalSessions = 25;
 const maximumRemoteSessions = 25;
@@ -7764,6 +7765,11 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
 export async function createLocalCloudDaemonBridgeFromEnvironment(
   options: LocalCloudDaemonBridgeEnvironmentOptions,
 ): Promise<LocalCloudDaemonBridge | null> {
+  // An explicit URL still cannot override contradictory explicitly supplied
+  // aliases. It does not acquire a new dependency on the parent's environment.
+  if (options.deploymentUrl !== undefined && options.environment !== undefined) {
+    requireCloudDeploymentEnvironment(options.environment);
+  }
   const selection: CloudDeploymentSelection = options.deploymentUrl === undefined
     ? cloudDeploymentSelectionFromEnvironment(options.environment)
     : {

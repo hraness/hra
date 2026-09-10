@@ -391,9 +391,15 @@ describe("bundle invariants", () => {
     }
   });
 
-  test("no output embeds a data URI asset", () => {
+  test("no output embeds a data URI asset except the single byte-verified authored favicon", async () => {
+    const favicon = await readFile(join(repositoryRoot, "site", "favicon.svg"));
+    const tag = `<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,${favicon.toString("base64")}">`;
+    expect(shell.split(tag)).toHaveLength(2);
+    expect([...shell.matchAll(/<link\b[^>]*\brel="[^"]*icon[^"]*"[^>]*>/gu)].map((match) => match[0])).toEqual([tag]);
+    expect(shell.slice(shell.indexOf("<head>") + "<head>".length).trimStart().startsWith(tag)).toBe(true);
     for (const artifact of artifacts) {
-      expect(artifact.text).not.toMatch(/data:[a-z]+\/[a-z0-9.+-]+;base64,/iu);
+      const remaining = artifact.name === "index.html" ? artifact.text.replace(tag, "") : artifact.text;
+      expect(remaining).not.toMatch(/data:[a-z]+\/[a-z0-9.+-]+;base64,/iu);
     }
   });
 

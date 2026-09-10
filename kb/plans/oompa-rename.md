@@ -63,7 +63,7 @@ Old-name release, repository rename, domain promotion, and dependent polish deli
 
 ## Phase 1: Exact inventory and compatibility contracts
 
-- **Status:** In progress; runtime and domain audits recorded, complete default-head census pending
+- **Status:** Exact default-head tree census complete for all 52 repositories; full verified text scan and compatibility classification pending
 - **Depends on:** None
 - **Objective:** Account for every old-name reference and decide its treatment before effects.
 - **Scope:** Repository tracked paths and text, the full organization default-head census, runtime/release compatibility specifications, and a closed rename-audit checker.
@@ -85,7 +85,7 @@ Old-name release, repository rename, domain promotion, and dependent polish deli
 
 ## Phase 3: Runtime and tooling identities
 
-- **Status:** In progress for the additive cloud-environment alias; other runtime identities not started
+- **Status:** Additive cloud-environment alias and accurate recovery guidance implemented, independently source-reviewed, focused-test and type-check green; other runtime identities not started
 - **Depends on:** Phase 1
 - **Objective:** Present Oompa consistently while existing state remains recoverable under one authority.
 - **Scope:** CLI help and diagnostics, public source symbols and imports, forward environment names, versioned session tool contracts, and plugin command/catalog names.
@@ -96,7 +96,7 @@ Old-name release, repository rename, domain promotion, and dependent polish deli
 
 ## Phase 4: Orange-circle website and app
 
-- **Status:** Orange-circle favicon source implemented with a focused geometry contract; broader branding and rendered acceptance pending
+- **Status:** Site/app orange-circle favicon source and finite app asset admission implemented with focused checks passing; isolated compiled proof, broader branding and rendered acceptance pending
 - **Depends on:** Phase 1 and the confirmed visual scope
 - **Objective:** Make Oompa recognizable as the orange-circle product across public and operational surfaces.
 - **Scope:** Favicon and shared mark, product naming, accessible theme roles, page titles, social cards, metadata, guides, app shell, authentication presentation, and the guarded new-domain contract.
@@ -144,3 +144,7 @@ Old-name release, repository rename, domain promotion, and dependent polish deli
 - 2026-09-10: The search-index census found 52 organization repositories, including seven archived repositories, with coverage gaps that require exact default-head scanning. Read-only domain review established separate website/app projects, new-domain TLS not yet ready, non-extractable origin-bound browser keys and differing automatic-assignment settings. Split consumer preparation from post-artifact delivery to remove a circular prerequisite: consumers cannot require an admitted new package before that package's own publication can proceed.
 - 2026-09-10: Package separation passed seven package-content cases with 142 assertions and 56 affected site-content/build cases with 2,741 assertions, including a genuine pre-fix README overwrite failure and successful-build byte preservation. Scoped lint and independent full source review passed. Both local extracted-archive checks and release preparation use the new independent package-content admission. No package archive, installer, runtime, manifest identity, dependency lock or release workflow was changed by this slice. A new exact public-text allowance for the planned package coordinate retains private-sibling and secret refusal; its source review passed, but the full policy suite's Git-fixture rerun still needs host transport because sandboxed Apple Git emits a rejected temporary-directory warning. No publication is claimed.
 - 2026-09-10: The favicon now uses the user-confirmed orange-circle shape and an Oompa accessible name. Its focused static contract passed after failing against the old H mark. This is source evidence only; rendered small-size/light/dark inspection, app favicon admission, broader branding and final browser gates are pending. The cloud-environment alias slice is separately in progress: a captured conflict may not select or start authority, while help, local diagnostics and existing stop controls remain usable.
+- 2026-09-10: Package separation is committed in `36e6e88c35cbec0525dc3f41840363dfe142edd5`, not pushed or published. The organization census covers 52 exact default heads, with no truncated trees and unchanged final head readbacks. A bounded GraphQL pilot verified complete UTF-8 source against canonical Git blob hashes and kept the binary response explicitly unscanned; the full-reader source awaits independent review before dispatch. Published originating installers still bind the old GitHub path before local recovery, so repository movement remains a separate unresolved compatibility decision.
+- 2026-09-10: The additive `OOMPA_CONVEX_URL` slice passed 52 focused tests with 782 assertions, plus scoped lint and independent production/test source review. Raw conflicts refuse new cloud authority before migration, custody or process startup, while non-authority local controls remain available. Both aliases are captured once; explicit API targets do not consult unrelated ambient settings. Persistent namespaces and existing wire values are unchanged. Forward-alias recovery wording still needs a coordinated follow-up; the final integration, archive and publication gates remain pending.
+- 2026-09-10: Follow-up regression evidence caught recovery guidance that mentioned only the old alias. The corrected default action clears both aliases; the self-managed action restores only the validated bound origin through `OOMPA_CONVEX_URL` and clears the legacy alias. Independent byte comparison proved that URL validation, wire shapes, state and effect ordering did not change. All 72 renderer cases, 14 identity-custody cases and 17 selected CLI/daemon cases passed, as did repository type checking and scoped lint. Type checking also caught a test response missing its required request ID; the fixture was corrected without changing its existing-daemon assertions.
+- 2026-09-10: The app admits exactly one canonical data-URI favicon pinned to the same reviewed SVG as the site, without a new image origin, public asset type or general inline-asset exception. Thirty builder contract cases passed with 369 assertions after genuine pre-fix refusal. Independent source review and scoped lint passed. The compiled-output check refused an existing output directory without its publication receipt; the directory was preserved, and a fresh exact-source verification tree is the next proof. The browser also refused a standalone data-URL preview; no workaround or rendered acceptance is claimed.

@@ -1308,6 +1308,23 @@ describe("CLI rendering", () => {
     }
   });
 
+  test("cloud recovery guidance covers both deployment aliases without selecting a different target", () => {
+    for (const [reenable, guidance] of [
+      [{ kind: "use_hosted_default" }, "unset OOMPA_CONVEX_URL and HRA_CONVEX_URL and restart the daemon"],
+      [{ kind: "restore_bound_deployment", deploymentUrl: "https://bound.convex.cloud" },
+        "set OOMPA_CONVEX_URL to https://bound.convex.cloud, unset HRA_CONVEX_URL, and restart the daemon"],
+    ] as const) {
+      for (const kind of ["sync.status", "doctor"] as const) {
+        const cloud = { configured: false, reenable, signedIn: false, unavailability: "disabled" };
+        const target = capture();
+        if (kind === "sync.status") renderSuccess({ kind }, cloud, false, target.output);
+        else renderSuccess({ kind, offline: false }, { cloud, healthy: true, problems: [] }, false, target.output);
+        expect(target.stdout.join("")).toContain(`Next: ${guidance}\n`);
+        expect(target.stderr).toEqual([]);
+      }
+    }
+  });
+
   test("treats intentionally disabled cloud as optional without a circular doctor action", () => {
     const target = capture();
     renderSuccess({ kind: "sync.status" }, {
@@ -1318,7 +1335,7 @@ describe("CLI rendering", () => {
       unavailability: "disabled",
     }, false, target.output);
     expect(target.stdout.join("")).toContain("Cloud sync: unavailable\n");
-    expect(target.stdout.join("")).toContain("Next: unset HRA_CONVEX_URL and restart the daemon\n");
+    expect(target.stdout.join("")).toContain("Next: unset OOMPA_CONVEX_URL and HRA_CONVEX_URL and restart the daemon\n");
 
     const ordinarySelfManaged = capture();
     renderSuccess({ kind: "sync.status" }, {
@@ -1332,7 +1349,7 @@ describe("CLI rendering", () => {
       unavailability: "disabled",
     }, false, ordinarySelfManaged.output);
     expect(ordinarySelfManaged.stdout.join("")).toContain(
-      "Next: set HRA_CONVEX_URL to https://self-managed.convex.cloud and restart the daemon\n",
+      "Next: set OOMPA_CONVEX_URL to https://self-managed.convex.cloud, unset HRA_CONVEX_URL, and restart the daemon\n",
     );
 
     const recovery = capture();
@@ -1354,7 +1371,7 @@ describe("CLI rendering", () => {
       unavailability: "disabled",
     }, false, recovery.output);
     expect(recovery.stdout.join("")).toContain("Cloud sync: unavailable (projection recovery pending)\n");
-    expect(recovery.stdout.join("")).toContain("Recovery prerequisite: unset HRA_CONVEX_URL and restart the daemon.\n");
+    expect(recovery.stdout.join("")).toContain("Recovery prerequisite: unset OOMPA_CONVEX_URL and HRA_CONVEX_URL and restart the daemon.\n");
     expect(recovery.stdout.join("")).toContain(
       `Next after restart: hra sync projection recover sess_${"2".repeat(32)} --acknowledge-gap --idempotency-key 018bcfe5-6800-7000-8000-000000000702\n`,
     );
@@ -1382,7 +1399,7 @@ describe("CLI rendering", () => {
       unavailability: "disabled",
     }, false, selfManaged.output);
     expect(selfManaged.stdout.join("")).toContain(
-      "Recovery prerequisite: set HRA_CONVEX_URL to https://self-managed.convex.cloud and restart the daemon.\n",
+      "Recovery prerequisite: set OOMPA_CONVEX_URL to https://self-managed.convex.cloud, unset HRA_CONVEX_URL, and restart the daemon.\n",
     );
   });
 
@@ -1405,7 +1422,7 @@ describe("CLI rendering", () => {
       problems: [],
     }, false, disabledSelfManaged.output);
     expect(disabledSelfManaged.stdout.join("")).toBe(
-      "HRA checks passed.\nCloud sync: disabled (optional)\nNext: set HRA_CONVEX_URL to https://self-managed.convex.cloud and restart the daemon\n",
+      "HRA checks passed.\nCloud sync: disabled (optional)\nNext: set OOMPA_CONVEX_URL to https://self-managed.convex.cloud, unset HRA_CONVEX_URL, and restart the daemon\n",
     );
 
     const unhealthy = capture();
@@ -1430,7 +1447,7 @@ describe("CLI rendering", () => {
       "- Repair the local projection cache.",
       "",
       "Cloud sync: disabled (optional)",
-      "Next: unset HRA_CONVEX_URL and restart the daemon",
+      "Next: unset OOMPA_CONVEX_URL and HRA_CONVEX_URL and restart the daemon",
       "",
     ].join("\n"));
 

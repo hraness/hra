@@ -15329,7 +15329,7 @@ describe("HraService", () => {
 
     cloud.statusResult = {
       configured: false,
-      diagnostic: "Cloud sync is disabled for this daemon. Unset HRA_CONVEX_URL and restart the daemon to use hosted sync.",
+      diagnostic: "Cloud sync is disabled for this daemon. Unset OOMPA_CONVEX_URL and HRA_CONVEX_URL and restart the daemon to use hosted sync.",
       projectionRecovery: {
         recoveries: [{
           cacheActivated: false,
@@ -15350,12 +15350,12 @@ describe("HraService", () => {
     };
     expect(disabledRecovery.healthy).toBe(false);
     expect(disabledRecovery.problems).toContain(
-      `Cloud projection recovery is unsettled. Unset HRA_CONVEX_URL and restart the daemon first. After restart, retry \`hra sync projection recover ${affectedSession} --acknowledge-gap --idempotency-key ${idempotencyKey}\`.`,
+      `Cloud projection recovery is unsettled. Unset OOMPA_CONVEX_URL and HRA_CONVEX_URL and restart the daemon first. After restart, retry \`hra sync projection recover ${affectedSession} --acknowledge-gap --idempotency-key ${idempotencyKey}\`.`,
     );
 
     cloud.statusResult = {
       ...(cloud.statusResult as Record<string, unknown>),
-      diagnostic: "Cloud sync is disabled for this daemon. Restore this state root's bound HRA_CONVEX_URL deployment and restart the daemon.",
+      diagnostic: "Cloud sync is disabled for this daemon. Restore this state root's bound deployment with OOMPA_CONVEX_URL, unset HRA_CONVEX_URL, and restart the daemon.",
       reenable: {
         deploymentUrl: "https://bound.convex.cloud",
         kind: "restore_bound_deployment",
@@ -15367,12 +15367,12 @@ describe("HraService", () => {
     };
     expect(selfManagedRecovery.healthy).toBe(false);
     expect(selfManagedRecovery.problems).toContain(
-      `Cloud projection recovery is unsettled. Set HRA_CONVEX_URL to https://bound.convex.cloud and restart the daemon first. After restart, retry \`hra sync projection recover ${affectedSession} --acknowledge-gap --idempotency-key ${idempotencyKey}\`.`,
+      `Cloud projection recovery is unsettled. Set OOMPA_CONVEX_URL to https://bound.convex.cloud, unset HRA_CONVEX_URL, and restart the daemon first. After restart, retry \`hra sync projection recover ${affectedSession} --acknowledge-gap --idempotency-key ${idempotencyKey}\`.`,
     );
 
     cloud.statusResult = {
       configured: false,
-      diagnostic: "Cloud sync is disabled for this daemon. Unset HRA_CONVEX_URL and restart the daemon to use hosted sync.",
+      diagnostic: "Cloud sync is disabled for this daemon. Unset OOMPA_CONVEX_URL and HRA_CONVEX_URL and restart the daemon to use hosted sync.",
       reenable: { kind: "use_hosted_default" },
       signedIn: false,
       unavailability: "disabled",

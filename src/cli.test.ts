@@ -13,6 +13,7 @@ import {
   admitExactDaemonStop,
   daemonRunProcessArguments,
   daemonRunProcessOptions,
+  DAEMON_ENVIRONMENT_KEYS,
   EDITOR_ENVIRONMENT_KEYS,
   HUMAN_SESSION_WATCH_BOOTSTRAP_MAXIMUM_BYTES,
   initialize,
@@ -5723,7 +5724,7 @@ describe("CLI entry point", () => {
         ok: false,
         error: {
           code: "UNAVAILABLE",
-          message: "Cloud sync is unavailable because HRA_CONVEX_URL is invalid.",
+          message: "Cloud sync is unavailable because OOMPA_CONVEX_URL or its legacy alias HRA_CONVEX_URL is invalid.",
         },
       });
       expect(captured.read().stderr).toBe("");
@@ -5883,7 +5884,7 @@ describe("CLI entry point", () => {
       supersedeCompactProjectionRecoveryForProviderDeletion: async () => ({ superseded: false }),
       supersedeTerminalCompactProjectionRecoveries: async () => ({ superseded: 0 }),
     };
-    const diagnostic = "Cloud sync is unavailable until HRA_CONVEX_URL explicitly selects the legacy deployment.";
+    const diagnostic = "Cloud sync is unavailable until OOMPA_CONVEX_URL (or legacy HRA_CONVEX_URL) explicitly selects the legacy deployment.";
     const control = selectDaemonCloudControl(null, blocker, diagnostic);
     expect(await control.status(new AbortController().signal)).toEqual({
       configured: false,
@@ -5899,14 +5900,17 @@ describe("CLI entry point", () => {
     expect(() => control.listDevices(new AbortController().signal)).toThrow(diagnostic);
   });
 
-  test("marks an explicitly disabled cloud deployment as optional machine state", async () => {
+  test.each(["legacy", "forward", "both"] as const)("marks an explicitly disabled cloud deployment as optional machine state with %s aliases", async (alias) => {
     const startup = await resolveDaemonCloudStartup({
-      environment: { HRA_CONVEX_URL: "" },
+      environment: {
+        ...(alias === "forward" ? {} : { HRA_CONVEX_URL: "" }),
+        ...(alias === "legacy" ? {} : { OOMPA_CONVEX_URL: "" }),
+      },
       secretCustody: new MemoryCloudCustody(),
     });
     expect(startup).toMatchObject({
       deploymentAuthority: null,
-      diagnostic: "Cloud sync is disabled for this daemon. Unset HRA_CONVEX_URL and restart the daemon to use hosted sync.",
+      diagnostic: "Cloud sync is disabled for this daemon. Unset OOMPA_CONVEX_URL and HRA_CONVEX_URL and restart the daemon to use hosted sync.",
       reenable: { kind: "use_hosted_default" },
       unavailability: "disabled",
     });
@@ -5929,7 +5933,7 @@ describe("CLI entry point", () => {
     );
     expect(await control.status(new AbortController().signal)).toEqual({
       configured: false,
-      diagnostic: "Cloud sync is disabled for this daemon. Unset HRA_CONVEX_URL and restart the daemon to use hosted sync.",
+      diagnostic: "Cloud sync is disabled for this daemon. Unset OOMPA_CONVEX_URL and HRA_CONVEX_URL and restart the daemon to use hosted sync.",
       projectionRecovery: {
         recoveries: [{
           cacheActivated: false,
@@ -5946,7 +5950,7 @@ describe("CLI entry point", () => {
     });
   });
 
-  test("preserves a self-managed binding when cloud transport is explicitly disabled", async () => {
+  test.each(["legacy", "forward", "both"] as const)("preserves a self-managed binding when cloud transport is explicitly disabled with %s aliases", async (alias) => {
     const raw = new MemoryCloudCustody();
     const authority = await cloudDeploymentAuthorityFromEnvironment(raw, {
       HRA_CONVEX_URL: "https://self-managed.convex.cloud",
@@ -5954,12 +5958,15 @@ describe("CLI entry point", () => {
     if (authority === null) throw new Error("Expected a deployment authority fixture.");
 
     const startup = await resolveDaemonCloudStartup({
-      environment: { HRA_CONVEX_URL: "" },
+      environment: {
+        ...(alias === "forward" ? {} : { HRA_CONVEX_URL: "" }),
+        ...(alias === "legacy" ? {} : { OOMPA_CONVEX_URL: "" }),
+      },
       secretCustody: raw,
     });
     expect(startup).toMatchObject({
       deploymentAuthority: null,
-      diagnostic: "Cloud sync is disabled for this daemon. Restore this state root's bound HRA_CONVEX_URL deployment and restart the daemon.",
+      diagnostic: "Cloud sync is disabled for this daemon. Restore this state root's bound deployment with OOMPA_CONVEX_URL, unset HRA_CONVEX_URL, and restart the daemon.",
       reenable: {
         deploymentUrl: "https://self-managed.convex.cloud",
         kind: "restore_bound_deployment",
@@ -6313,7 +6320,7 @@ describe("CLI entry point", () => {
     });
     const defaulted = daemonRunProcessOptions("/var/lib/hra-control-plane-v1");
     expect(Object.keys(defaulted.env).every((key) =>
-      key === "HRA_CONVEX_URL" || SAFE_ENVIRONMENT_KEYS.has(key))).toBe(true);
+      DAEMON_ENVIRONMENT_KEYS.has(key) || SAFE_ENVIRONMENT_KEYS.has(key))).toBe(true);
     expect(EDITOR_ENVIRONMENT_KEYS.has("TERM")).toBe(true);
     expect(allowlistedEnvironment(environment, EDITOR_ENVIRONMENT_KEYS)).toEqual({
       HOME: "/Users/example",
@@ -6321,6 +6328,128 @@ describe("CLI entry point", () => {
       PATH: "/usr/bin:/bin",
       TMPDIR: "/private/tmp",
     });
+  });
+
+  test("detached daemon options preserve forward and identical aliases and reject raw disagreement", () => {
+    for (const value of ["", " ", "https://forward.convex.cloud/"]) {
+      for (const selected of [
+        { OOMPA_CONVEX_URL: value }, { OOMPA_CONVEX_URL: value, HRA_CONVEX_URL: value },
+      ]) {
+        const environment = { HOME: "/example-home", ...selected, UNRELATED_VALUE: "not forwarded" };
+        expect(daemonRunProcessOptions("/example-state", environment).env)
+          .toEqual({ HOME: "/example-home", ...selected });
+      }
+    }
+    let reads = 0;
+    const options = daemonRunProcessOptions("/example-state", {
+      get OOMPA_CONVEX_URL() { reads++; return reads === 1 ? "" : "changed"; },
+      HRA_CONVEX_URL: "",
+    });
+    expect(reads).toBe(1);
+    expect(options.env).toEqual({ OOMPA_CONVEX_URL: "", HRA_CONVEX_URL: "" });
+    expect(() => daemonRunProcessOptions("/example-state", { OOMPA_CONVEX_URL: "", HRA_CONVEX_URL: " " }))
+      .toThrow("must be byte-identical");
+  });
+
+  test("alias conflicts refuse cloud startup before its recovery-custody fallback", async () => {
+    let calls = 0;
+    const unexpected = async (): Promise<never> => { calls++; throw new Error("Unexpected recovery custody."); };
+    await expect(resolveDaemonCloudStartup({
+      environment: { OOMPA_CONVEX_URL: "https://first.convex.cloud", HRA_CONVEX_URL: "https://second.convex.cloud" },
+      secretCustody: { read: unexpected, compareAndSwap: unexpected, clearIfGeneration: unexpected },
+    })).rejects.toThrow("must be byte-identical");
+    expect(calls).toBe(0);
+  });
+
+  test("alias conflicts refuse remote selection before constructing custody without exposing values", async () => {
+    const original = createProductionInstallation();
+    let calls = 0;
+    const output = capture();
+    expect(await main(["remote", "list", "--json"], output.output, {
+      installation: {
+        ...original,
+        cloudEnvironment: { OOMPA_CONVEX_URL: "https://first.convex.cloud", HRA_CONVEX_URL: "https://second.convex.cloud" },
+        createSecretCustody: () => { calls++; throw new Error("Unexpected cloud custody."); },
+      },
+    })).toBe(5);
+    expect(JSON.parse(output.read().stdout)).toMatchObject({
+      ok: false,
+      error: { code: "UNAVAILABLE", message: "OOMPA_CONVEX_URL and HRA_CONVEX_URL must be byte-identical when both are set." },
+    });
+    expect(output.read().stdout).not.toContain("first.convex");
+    expect(output.read().stdout).not.toContain("second.convex");
+    expect(output.read().stderr).toBe("");
+    expect(calls).toBe(0);
+  });
+
+  test.each(["explicit", "autostart", "direct"] as const)("alias conflicts refuse %s daemon startup before migration or spawn", async (path) => {
+    const { installation: original, runRoot } = await upgradeFixture(`cloud-alias-${path}`);
+    let starts = 0;
+    let custody = 0;
+    const installation = {
+      ...original,
+      cloudEnvironment: { OOMPA_CONVEX_URL: "https://first.convex.cloud", HRA_CONVEX_URL: "https://second.convex.cloud" },
+      createSecretCustody: () => { custody++; throw new Error("Unexpected secret custody."); },
+    };
+    try {
+      expect(await main(["init", "--yes", "--json"], capture().output, { installation })).toBe(0);
+      installPrivateTask48State(installation.paths.database);
+      const before = stateSchemaSnapshot(installation.paths.database);
+      const bytes = await readFile(installation.paths.database);
+      if (path === "direct") {
+        await expect(runDaemon(installation)).rejects.toThrow("must be byte-identical");
+      } else {
+        const output = capture();
+        const argv = path === "explicit" ? ["daemon", "start", "--json"] : ["session", "list", "--json"];
+        expect(await main(argv, output.output, {
+          installation,
+          startDaemon: async () => { starts++; return readyDaemonStatus(); },
+        })).toBe(5);
+        expect(JSON.parse(output.read().stdout)).toMatchObject({
+          ok: false,
+          error: { code: "UNAVAILABLE", message: "OOMPA_CONVEX_URL and HRA_CONVEX_URL must be byte-identical when both are set." },
+        });
+        expect(output.read().stdout).not.toContain("first.convex");
+        expect(output.read().stdout).not.toContain("second.convex");
+        expect(output.read().stderr).toBe("");
+      }
+      expect(starts).toBe(0);
+      expect(custody).toBe(0);
+      expect(stateSchemaVersion(installation.paths.database)).toBe(48);
+      expect(stateSchemaSnapshot(installation.paths.database)).toBe(before);
+      expect(await readFile(installation.paths.database)).toEqual(bytes);
+    } finally {
+      await rm(runRoot, { force: true, recursive: true });
+    }
+  });
+
+  test("alias conflicts leave help, version, local diagnosis, stop, and existing-daemon dispatch available", async () => {
+    const { installation: original, runRoot } = await upgradeFixture("cloud-alias-local-controls");
+    const installation = {
+      ...original,
+      cloudEnvironment: { OOMPA_CONVEX_URL: "https://first.convex.cloud", HRA_CONVEX_URL: "https://second.convex.cloud" },
+    };
+    try {
+      for (const argv of [["--help"], ["--version"], ["daemon", "stop", "--json"]]) {
+        expect(await main(argv, capture().output, { installation })).toBe(0);
+      }
+      await expect(lstat(installation.paths.root)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await main(["init", "--yes", "--json"], capture().output, { installation })).toBe(0);
+      const before = stateSchemaSnapshot(installation.paths.database);
+      expect(await main(["status", "--json"], capture().output, { installation })).toBe(0);
+      const doctor = capture();
+      await main(["doctor", "--offline", "--json"], doctor.output, { installation });
+      expect(doctor.read().stdout).not.toContain("must be byte-identical");
+      let dispatched = 0;
+      expect(await main(["session", "list", "--json"], capture().output, {
+        installation,
+        callDaemon: async () => { dispatched++; return { ok: false, error: { code: "UNAVAILABLE", message: "Existing daemon fixture." }, requestId: crypto.randomUUID(), version: 1 }; },
+      })).toBe(5);
+      expect(dispatched).toBe(1);
+      expect(stateSchemaSnapshot(installation.paths.database)).toBe(before);
+    } finally {
+      await rm(runRoot, { force: true, recursive: true });
+    }
   });
 
   test("latches an already-aborted daemon stop until lifecycle delivery is installed", async () => {

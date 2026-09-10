@@ -2886,7 +2886,7 @@ const disabledCloudRestartAction = (root: Record<string, unknown>): string | nul
   if (root.unavailability !== "disabled") return null;
   const reenable = object(root.reenable);
   if (reenable?.kind === "use_hosted_default") {
-    return "unset HRA_CONVEX_URL and restart the daemon";
+    return "unset OOMPA_CONVEX_URL and HRA_CONVEX_URL and restart the daemon";
   }
   if (
     reenable?.kind === "restore_bound_deployment"
@@ -2904,7 +2904,7 @@ const disabledCloudRestartAction = (root: Record<string, unknown>): string | nul
         && url.search === ""
         && url.hash === ""
         && url.origin === reenable.deploymentUrl
-      ) return `set HRA_CONVEX_URL to ${safeDiagnostic(reenable.deploymentUrl)} and restart the daemon`;
+      ) return `set OOMPA_CONVEX_URL to ${safeDiagnostic(reenable.deploymentUrl)}, unset HRA_CONVEX_URL, and restart the daemon`;
     } catch {
       // Keep the static recovery instruction for malformed daemon output.
     }

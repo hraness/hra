@@ -2468,9 +2468,13 @@ function saturatedCommandJournal(
 }
 
 describe("cloud daemon bridge", () => {
-  test("control and daemon factories converge on one bound deployment before transport", async () => {
+  test.each(["legacy", "forward", "both"] as const)("control and daemon factories converge on one bound deployment before transport with %s aliases", async (alias) => {
     const custody = new DeploymentCustody();
-    const environment = { HRA_CONVEX_URL: "https://shared.convex.cloud/" };
+    const url = "https://shared.convex.cloud/";
+    const environment = {
+      ...(alias === "forward" ? {} : { HRA_CONVEX_URL: url }),
+      ...(alias === "legacy" ? {} : { OOMPA_CONVEX_URL: url }),
+    };
     let transportCalls = 0;
     const transport: CloudTransport = {
       action: async () => { transportCalls += 1; throw new Error("unexpected transport"); },
@@ -2501,6 +2505,43 @@ describe("cloud daemon bridge", () => {
       deploymentUrl: "https://shared.convex.cloud",
       version: 1,
     });
+    const before = [...custody.values];
+    let custodyCalls = 0;
+    const rejectCustody = async (): Promise<never> => { custodyCalls++; throw new Error("Unexpected custody access."); };
+    for (const deploymentUrl of [undefined, "https://shared.convex.cloud"]) {
+      await expect(createLocalCloudDaemonBridgeFromEnvironment({
+        daemonAuthority: { bootGeneration: 1, bootId: "boot_shared_target_12345678" },
+        daemonAuthorityFence: { assertCurrent: () => Promise.resolve() },
+        ...(deploymentUrl === undefined ? {} : { deploymentUrl }),
+        environment: { OOMPA_CONVEX_URL: url, HRA_CONVEX_URL: "https://shared.convex.cloud" },
+        executor: new RecordingExecutor(), local: new EmptyLocal(), registration: control,
+        secretCustody: { read: rejectCustody, compareAndSwap: rejectCustody, clearIfGeneration: rejectCustody },
+        transport,
+      })).rejects.toThrow("must be byte-identical");
+    }
+    expect(custodyCalls).toBe(0);
+    expect(transportCalls).toBe(0);
+    expect([...custody.values]).toEqual(before);
+    const ambientForward = process.env.OOMPA_CONVEX_URL;
+    const ambientLegacy = process.env.HRA_CONVEX_URL;
+    try {
+      process.env.OOMPA_CONVEX_URL = "https://unrelated-forward.convex.cloud";
+      process.env.HRA_CONVEX_URL = "https://unrelated-legacy.convex.cloud";
+      expect(await createLocalCloudDaemonBridgeFromEnvironment({
+        daemonAuthority: { bootGeneration: 1, bootId: "boot_shared_target_12345678" },
+        daemonAuthorityFence: { assertCurrent: () => Promise.resolve() },
+        deploymentUrl: "https://shared.convex.cloud",
+        executor: new RecordingExecutor(), local: new EmptyLocal(), registration: control,
+        secretCustody: custody, transport,
+      })).toBeInstanceOf(LocalCloudDaemonBridge);
+      expect(transportCalls).toBe(0);
+      expect([...custody.values]).toEqual(before);
+    } finally {
+      if (ambientForward === undefined) delete process.env.OOMPA_CONVEX_URL;
+      else process.env.OOMPA_CONVEX_URL = ambientForward;
+      if (ambientLegacy === undefined) delete process.env.HRA_CONVEX_URL;
+      else process.env.HRA_CONVEX_URL = ambientLegacy;
+    }
   });
 
   test("refuses stale deployment authority before identity credentials or transport", async () => {
