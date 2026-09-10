@@ -216,11 +216,11 @@ export function siteProductionCsp(value: unknown): Readonly<{ siteCsp: string; p
   }
   assert.deepEqual(previewCsp.split(";").map((part) => part.trim()).filter((part) => part.startsWith("script-src")), ["script-src 'none'"]);
   assert.deepEqual(siteCsp.split(";").map((part) => part.trim()).filter((part) => part.startsWith("frame-src")), ["frame-src 'self' https://challenges.cloudflare.com"]);
-  const productCsp = productionCsp(value, "/examples/app/:path*");
+  const productCsp = productionCsp(value, "/examples/app/:path(.*)");
   assert.equal(productCsp, `${productPreviewCsp}; frame-ancestors 'self'`, "Product example CSP drifted");
   const rows = record(value).headers;
   assert.ok(Array.isArray(rows));
-  const headers = record(rows.map(record).find((row) => row.source === "/examples/app/:path*")).headers;
+  const headers = record(rows.map(record).find((row) => row.source === "/examples/app/:path(.*)")).headers;
   assert.ok(Array.isArray(headers));
   assert.deepEqual(headers.map(record).map(({ key, value }) => [key, value]).sort(), [
     ["Content-Security-Policy", productCsp], ["Access-Control-Allow-Origin", "*"],

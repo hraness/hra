@@ -202,7 +202,7 @@ describe("static site graph acceptance", () => {
     const config = (site: string, preview: string) => ({ headers: [
       { source: "/((?!preview/?$|examples/app(?:/|$)).*)", headers: [{ key: "Content-Security-Policy", value: site }] },
       { source: "/preview/", headers: [{ key: "Content-Security-Policy", value: preview }] },
-      { source: "/examples/app/:path*", headers: [
+      { source: "/examples/app/:path(.*)", headers: [
         { key: "Content-Security-Policy", value: productPreviewCsp }, { key: "Access-Control-Allow-Origin", value: "*" },
         { key: "Permissions-Policy", value: "camera=(), geolocation=(), microphone=(), payment=(), usb=()" },
         { key: "Referrer-Policy", value: "no-referrer" }, { key: "X-Content-Type-Options", value: "nosniff" }, { key: "X-Robots-Tag", value: "noindex, nofollow" },

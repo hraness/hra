@@ -14,6 +14,14 @@ tags:
 
 # HRA v1
 
+## Canonical site response headers (2026-09-10)
+
+Status: source repair in progress. Production readback after the protected-input operator merge proved the canonical source identity and matching public page and asset content, but found missing declared headers on the well-known data files and canonical example document. Browser interaction success does not satisfy those response-header contracts.
+
+The pinned `@vercel/routing-utils` 6.4.0 compiler reproduces the two configuration failures: automatic trailing-slash handling places a terminal well-known rule before header routes, and the former example star parameter misses its empty trailing segment. Use explicit 308 slash-normalization redirects that exclude the well-known boundary and an example pattern that includes `/examples/app/`. Preserve all three header-value sets and the canonical page URLs. The compiler is a development-only regression dependency, not a production runtime or provider upgrade. Its legacy parser is overridden to patched `path-to-regexp` 6.3.0; compare the exact compiled HRA routes against the unmodified compiler before admission. Pin the existing development-only `js-yaml` dependency to 4.3.2 to resolve the separately observed dependency advisory.
+
+Acceptance requires causal routing regressions, exact header-value and browser-policy contracts, independent full-diff review, fresh current-base Required CI and actual-main admission, then a new guarded source-to-target alias plan and independent live headers, content and browser verification. The already committed alias plan remains terminal; this follow-up does not authorize replay, ledger edits, release republication, or daemon, hosted or new-model activation.
+
 ## Web appearance (2026-09-08)
 
 Status: the native app/site menu integration is implemented. Focused validation passed 44 tests with 728 assertions, changed-file lint, and diff checks. The final aggregate, mandatory browser checks, current-head CI, and production verification remain pending.
