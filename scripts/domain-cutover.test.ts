@@ -424,7 +424,20 @@ describe("domain cutover runbook", () => {
     expect(runbook).toContain("bun ./scripts/current-project-alias-release.ts preflight");
     expect(runbook).toContain("bun ./scripts/current-project-alias-release.ts --execute");
     expect(runbook).toContain("bun ./scripts/current-project-alias-release.ts recover-source");
-    expect(runbook).toContain("--recovery-evidence-fd 5");
+    const aliasCommands = [...runbook.matchAll(
+      /```sh\n(bun \.\/scripts\/current-project-alias-release\.ts [\s\S]*?)\n```/g,
+    )].map((match) => match[1]!);
+    expect(aliasCommands).toHaveLength(4);
+    for (const command of aliasCommands) {
+      expect(command).toContain("--vercel-auth-file /absolute/path/to/reviewed-vercel-auth.json");
+      expect(command).toContain("--plan-file /absolute/path/to/");
+      expect(command).not.toMatch(/--(?:vercel-auth|plan|recovery-evidence)-fd\b/);
+    }
+    expect(aliasCommands.filter((command) => command.includes("--recovery-evidence-file")))
+      .toHaveLength(1);
+    expect(aliasCommands[3]).toContain(
+      "--recovery-evidence-file /absolute/path/to/reviewed-compound-phase-evidence.json",
+    );
     expect(runbook).not.toContain("bun run release:canonical-alias");
     expect(runbook).toContain("--confirm-exact");
     expect(runbook).toContain("standing authorization for task-owned Hraness delivery");
