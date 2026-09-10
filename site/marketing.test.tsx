@@ -3,7 +3,7 @@ import { parseHTML } from "linkedom";
 import { findSection, publicContent, type PublicContent } from "./content.ts";
 import { findDocsPage, type DocsPath } from "./docs-content.ts";
 import { renderMarketingHeader, renderMarketingPage } from "./marketing.tsx";
-import { heroExampleMeasureClassName } from "./marketing.stylex.ts";
+import { productHeroClassName } from "./marketing.stylex.ts";
 import { sitePresentationClasses } from "./presentation.stylex.ts";
 import { productPreviewDisclosure, productScenes } from "./product-scenes.ts";
 import { renderDocsHtml } from "./template.ts";
@@ -55,7 +55,8 @@ describe("public server marketing composition", () => {
     expect(document.querySelector("h1")?.textContent).toBe(publicContent.hero.heading);
     expect(document.querySelectorAll("h1")).toHaveLength(1);
     const heroClasses = classNames(document.querySelector('[data-hraness-marketing="hero"]')?.className);
-    for (const name of classNames(heroExampleMeasureClassName())) expect(heroClasses).toContain(name);
+    for (const name of classNames(productHeroClassName())) expect(heroClasses).toContain(name);
+    expect(document.querySelector(".hraness-marketing-hero__example")).toBeNull();
     expect(document.querySelector(".hraness-marketing-facts")).toBeNull();
     expect(document.querySelector(".hraness-marketing-pillars")?.children).toHaveLength(3);
     expect([...document.querySelectorAll(".hraness-marketing-pillars__summary")].map((node) => node.textContent))
@@ -66,7 +67,8 @@ describe("public server marketing composition", () => {
     const { document } = parseHTML(renderMarketingPage(publicContent));
     const notice = document.querySelector('.hraness-marketing-hero__copy a[href="/docs/status/"]')?.parentElement;
     expect(notice?.textContent).toContain("New machine setup is temporarily paused.");
-    expect(notice?.querySelector("a")?.textContent).toBe("Check current availability →");
+    expect(notice?.querySelector("a")?.textContent).toBe("Check current availability");
+    expect(notice?.querySelector("strong")?.textContent).toBe("New machine setup is temporarily paused.");
     const flow = document.querySelector("#how-it-works");
     expect(flow?.querySelector('a[href="/docs/start/"]')?.parentElement?.textContent)
       .toBe("These commands run on an initialized, authorized machine. Complete setup first.");
@@ -108,7 +110,7 @@ describe("public server marketing composition", () => {
     const textsAt = (selector: string) => [...document.querySelectorAll(selector)].map((node) => node.textContent);
     for (const [role, text] of [
       ["eyebrow", publicContent.hero.eyebrow], ["name", publicContent.productName],
-      ["summary", publicContent.hero.summary], ["example", publicContent.hero.example], ["boundary", publicContent.hero.boundary],
+      ["summary", publicContent.hero.summary], ["boundary", publicContent.hero.boundary],
     ]) expect(textAt(`.hraness-marketing-hero__${role}`)).toBe(text);
     expect(textsAt(".hraness-marketing-pillars__label")).toEqual(publicContent.hero.pillars.map((pillar) => pillar.label));
     expect(textAt("#how-it-works-heading")).toBe(publicContent.hero.proofLabel);

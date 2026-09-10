@@ -1,15 +1,19 @@
 import * as stylex from "@stylexjs/stylex";
 
 const marketingStyles = stylex.create({
-  heroExampleMeasure: { "--hraness-marketing-example-measure": "36rem" },
+  productHero: {
+    paddingTop: { default: null, ":is(header)": "clamp(2rem, 4vw, 3.5rem)" },
+    paddingBottom: { default: null, ":is(header)": "2rem" },
+    gap: { default: null, ":is(header)": "clamp(1.5rem, 3vw, 2.5rem)" },
+  },
   // A wrapping mobile header has no fixed height. Keep fragment destinations
   // visible without changing the public component's sticky desktop default.
   mobileHeaderFlow: { position: { default: null, "@media (max-width: 48rem)": "static" } },
 });
 
-/** The public example-only variable leaves the hero summary and frame unchanged. */
-export function heroExampleMeasureClassName(): string {
-  return stylex.props(marketingStyles.heroExampleMeasure).className ?? "";
+/** Compact the product-owned outer spacing without replacing shared recipes. */
+export function productHeroClassName(): string {
+  return stylex.props(marketingStyles.productHero).className ?? "";
 }
 
 export function mobileHeaderFlowClassName(): string {
