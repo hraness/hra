@@ -20,6 +20,7 @@ import { z } from "zod";
 import { assertSafeDarwinInstallAcl } from "../src/install-normalizer";
 import { proveDescriptorAclAbsence } from "../src/storage/descriptor-security";
 import { createBoundedAuthorityFetch } from "./bounded-authority-fetch";
+import { aliasInputMaximumBytes, readAliasInputBuffer } from "./alias-input-buffer";
 import {
   BoundedProcessInvocationGuard,
   boundedProcessRecoveryDirectory,
@@ -70,7 +71,7 @@ const commandTimeoutMs = 30_000;
 const commandTerminationGraceMs = 1_000;
 const convergenceTimeoutMs = 60_000;
 const outputMaximumBytes = 128 * 1024;
-const inputMaximumBytes = 32 * 1024;
+const inputMaximumBytes = aliasInputMaximumBytes;
 const markerMaximumBytes = 16 * 1024;
 const vercelAuthMaximumBytes = 8 * 1024;
 const vercelCredentialMinimumLifetimeSeconds = 15 * 60;
@@ -1948,25 +1949,19 @@ const sameCredentialIdentity = (left: Stats, right: Stats): boolean =>
   && left.ctimeMs === right.ctimeMs
   && left.mtimeMs === right.mtimeMs;
 
-const readCredentialDescriptor = (descriptor: number, size: number): Buffer => {
-  const document = Buffer.alloc(size + 1);
-  let offset = 0;
-  while (offset < document.byteLength) {
-    const count = readSync(
-      descriptor,
-      document,
-      offset,
-      document.byteLength - offset,
-      offset,
-    );
-    if (count === 0) break;
-    offset += count;
-  }
-  if (offset !== size) {
-    document.fill(0);
-    throw new CurrentAliasReleaseError("provider_credentials_refused");
-  }
-  return document;
+const readCredentialDescriptor = (descriptor: number, size: number): Buffer =>
+  readAliasInputBuffer(size, (document, offset) => readSync(
+    descriptor, document, offset, document.byteLength - offset, offset,
+  ));
+
+const parseProtectedVercelSession = (document: string, nowSeconds: number): string => {
+  const parsed = vercelAuthSchema.safeParse(JSON.parse(document) as unknown);
+  if (
+    !parsed.success
+    || parsed.data.expiresAt !== undefined
+      && parsed.data.expiresAt < nowSeconds + vercelCredentialMinimumLifetimeSeconds
+  ) throw new CurrentAliasReleaseError("provider_credentials_refused");
+  return parsed.data.token;
 };
 
 export const readProtectedVercelAccessToken = (
@@ -2020,13 +2015,7 @@ export const readProtectedVercelAccessToken = (
 
     const document = new TextDecoder("utf-8", { fatal: true })
       .decode(first.subarray(0, initial.size));
-    const parsed = vercelAuthSchema.safeParse(JSON.parse(document) as unknown);
-    if (
-      !parsed.success
-      || parsed.data.expiresAt !== undefined
-        && parsed.data.expiresAt < nowSeconds + vercelCredentialMinimumLifetimeSeconds
-    ) throw new CurrentAliasReleaseError("provider_credentials_refused");
-    accessToken = parsed.data.token;
+    accessToken = parseProtectedVercelSession(document, nowSeconds);
   } catch {
     refused = true;
   } finally {
@@ -2485,8 +2474,11 @@ type ParsedArguments = Readonly<{
   confirmation?: string;
   operation: "execute" | "preflight" | "recover-source";
   planFd: number;
+  planFile?: string;
   recoveryEvidenceFd?: number;
+  recoveryEvidenceFile?: string;
   vercelAuthFd?: number;
+  vercelAuthFile?: string;
   vercelCli?: string;
 }>;
 
@@ -2494,11 +2486,25 @@ export const parseArguments = (arguments_: readonly string[]): ParsedArguments =
   let confirmation: string | undefined;
   let operation: ParsedArguments["operation"] | undefined;
   let planFd = 0;
+  let planFile: string | undefined;
   let recoveryEvidenceFd: number | undefined;
+  let recoveryEvidenceFile: string | undefined;
   let vercelAuthFd: number | undefined;
+  let vercelAuthFile: string | undefined;
   let vercelCli: string | undefined;
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
+    if (argument === "--plan-file" || argument === "--vercel-auth-file"
+      || argument === "--recovery-evidence-file") {
+      const value = arguments_[index + 1];
+      if (!isExplicitAliasInputPath(value)) throw new CurrentAliasReleaseError("usage_invalid");
+      if (argument === "--plan-file" && planFile === undefined) planFile = value;
+      else if (argument === "--vercel-auth-file" && vercelAuthFile === undefined) vercelAuthFile = value;
+      else if (argument === "--recovery-evidence-file" && recoveryEvidenceFile === undefined) recoveryEvidenceFile = value;
+      else throw new CurrentAliasReleaseError("usage_invalid");
+      index += 1;
+      continue;
+    }
     if (argument === "preflight" && operation === undefined) {
       operation = "preflight";
       continue;
@@ -2571,7 +2577,13 @@ export const parseArguments = (arguments_: readonly string[]): ParsedArguments =
   }
   if (
     operation === undefined
-    || (vercelCli === undefined) === (vercelAuthFd === undefined)
+    || [vercelCli, vercelAuthFd, vercelAuthFile].filter((value) => value !== undefined).length !== 1
+    || planFile !== undefined && planFd !== 0
+    || recoveryEvidenceFile !== undefined && recoveryEvidenceFd !== undefined
+    || recoveryEvidenceFile !== undefined && operation !== "recover-source"
+    || recoveryEvidenceFile !== undefined && vercelCli !== undefined
+    || new Set([planFile, vercelAuthFile, recoveryEvidenceFile].filter((value) => value !== undefined)).size
+      !== [planFile, vercelAuthFile, recoveryEvidenceFile].filter((value) => value !== undefined).length
     || vercelAuthFd !== undefined && planFd === vercelAuthFd
     || operation === "preflight" && confirmation !== undefined
     || operation !== "recover-source" && recoveryEvidenceFd !== undefined
@@ -2584,10 +2596,95 @@ export const parseArguments = (arguments_: readonly string[]): ParsedArguments =
     ...(confirmation === undefined ? {} : { confirmation }),
     operation,
     planFd,
+    ...(planFile === undefined ? {} : { planFile }),
     ...(recoveryEvidenceFd === undefined ? {} : { recoveryEvidenceFd }),
+    ...(recoveryEvidenceFile === undefined ? {} : { recoveryEvidenceFile }),
     ...(vercelAuthFd === undefined ? {} : { vercelAuthFd }),
+    ...(vercelAuthFile === undefined ? {} : { vercelAuthFile }),
     ...(vercelCli === undefined ? {} : { vercelCli }),
   };
+};
+
+const isExplicitAliasInputPath = (value: unknown): value is string =>
+  typeof value === "string" && value.length > 0 && value.length <= 4_096
+  && !hasControlCharacter(value) && isAbsolute(value) && resolve(value) === value;
+
+// Open only caller-selected files, after scheduler admission. No inherited
+// descriptor is repurposed and importing this module discovers no input path.
+const readProtectedAliasInputFile = (
+  path: string,
+  maximumBytes: number,
+  code: "input_not_protected" | "provider_credentials_refused" | "recovery_evidence_invalid",
+): string => {
+  let descriptor: number | undefined;
+  let first: Buffer | undefined;
+  let second: Buffer | undefined;
+  let document: string | undefined;
+  let refused = false;
+  try {
+    if (!isExplicitAliasInputPath(path)) throw new CurrentAliasReleaseError(code);
+    const uid = process.getuid?.();
+    const initial = lstatSync(path);
+    if (uid === undefined || !initial.isFile() || initial.uid !== uid
+      || initial.nlink !== 1 || (initial.mode & 0o777) !== 0o600
+      || initial.size <= 0 || initial.size > maximumBytes) throw new CurrentAliasReleaseError(code);
+    descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    if (!sameCredentialIdentity(initial, fstatSync(descriptor))) throw new CurrentAliasReleaseError(code);
+    proveDescriptorAclAbsence(descriptor, {}, code);
+    first = readCredentialDescriptor(descriptor, initial.size);
+    const afterFirstRead = fstatSync(descriptor);
+    second = readCredentialDescriptor(descriptor, initial.size);
+    const final = fstatSync(descriptor);
+    proveDescriptorAclAbsence(descriptor, {}, code);
+    if (!sameCredentialIdentity(initial, afterFirstRead)
+      || !sameCredentialIdentity(initial, final)
+      || !sameCredentialIdentity(initial, lstatSync(path))
+      || !first.equals(second)) throw new CurrentAliasReleaseError(code);
+    document = new TextDecoder("utf-8", { fatal: true }).decode(first.subarray(0, initial.size));
+  } catch {
+    refused = true;
+  } finally {
+    first?.fill(0);
+    second?.fill(0);
+    if (descriptor !== undefined) {
+      try { closeSync(descriptor); } catch { refused = true; }
+    }
+  }
+  if (refused || document === undefined) throw new CurrentAliasReleaseError(code);
+  return document;
+};
+
+export const readProtectedVercelAccessTokenFile = (
+  path: string,
+  nowSeconds = Math.floor(Date.now() / 1_000),
+): string => {
+  try {
+    return parseProtectedVercelSession(
+      readProtectedAliasInputFile(path, vercelAuthMaximumBytes, "provider_credentials_refused"),
+      nowSeconds,
+    );
+  } catch { throw new CurrentAliasReleaseError("provider_credentials_refused"); }
+};
+
+export const readProtectedAliasPlanFile = (path: string): string => {
+  const document = readProtectedAliasInputFile(path, inputMaximumBytes, "input_not_protected");
+  parseCurrentProjectAliasReleasePlan(document);
+  return document;
+};
+
+export const readProtectedProviderActivityEvidenceFile = (path: string): ProviderActivityTargetEvidence => {
+  try {
+    return currentAliasReleaseProviderActivityEvidenceSchema.parse(JSON.parse(
+      readProtectedAliasInputFile(path, inputMaximumBytes, "recovery_evidence_invalid"),
+    ) as unknown);
+  } catch { throw new CurrentAliasReleaseError("recovery_evidence_invalid"); }
+};
+
+const directAliasAccessToken = (arguments_: ParsedArguments, accessToken: string | undefined): string => {
+  if (accessToken !== undefined) return accessToken;
+  if (arguments_.vercelAuthFile !== undefined) return readProtectedVercelAccessTokenFile(arguments_.vercelAuthFile);
+  if (arguments_.vercelAuthFd !== undefined) return readProtectedVercelAccessToken(arguments_.vercelAuthFd);
+  throw new CurrentAliasReleaseError("provider_credentials_refused");
 };
 
 export const readPlanInput = async (fd: number, timeoutMs = 15_000): Promise<string> => {
@@ -2786,7 +2883,7 @@ const executeCurrentProjectAliasRelease = async (
         ]) {
           guard.retainRecoveryPath(path);
         }
-        const provider = options.provider ?? (arguments_.vercelAuthFd === undefined
+        const provider = options.provider ?? (arguments_.vercelCli !== undefined
           ? new VercelCurrentProjectAliasProvider({
               ...(options.convexVerifier === undefined
                 ? {}
@@ -2795,11 +2892,10 @@ const executeCurrentProjectAliasRelease = async (
               ...(options.fetcher === undefined ? {} : { fetcher: options.fetcher }),
               guard,
               ...(options.runner === undefined ? {} : { runner: options.runner }),
-              vercelCli: arguments_.vercelCli as string,
+              vercelCli: arguments_.vercelCli,
             })
           : new VercelCurrentProjectAliasApiProvider({
-              accessToken: options.vercelAccessToken
-                ?? readProtectedVercelAccessToken(arguments_.vercelAuthFd),
+              accessToken: directAliasAccessToken(arguments_, options.vercelAccessToken),
               ...(options.convexVerifier === undefined
                 ? {}
                 : { convexVerifier: options.convexVerifier }),
@@ -2872,7 +2968,7 @@ const executeCurrentProjectAliasRelease = async (
         dirname(paths.intent),
       );
       unresolvedIntent = durableState.intent !== null && durableState.receipt === null;
-      const provider = options.provider ?? (arguments_.vercelAuthFd === undefined
+      const provider = options.provider ?? (arguments_.vercelCli !== undefined
         ? new VercelCurrentProjectAliasProvider({
             ...(options.convexVerifier === undefined
               ? {}
@@ -2881,11 +2977,10 @@ const executeCurrentProjectAliasRelease = async (
             ...(options.fetcher === undefined ? {} : { fetcher: options.fetcher }),
             guard,
             ...(options.runner === undefined ? {} : { runner: options.runner }),
-            vercelCli: arguments_.vercelCli as string,
+            vercelCli: arguments_.vercelCli,
           })
         : new VercelCurrentProjectAliasApiProvider({
-            accessToken: options.vercelAccessToken
-              ?? readProtectedVercelAccessToken(arguments_.vercelAuthFd),
+            accessToken: directAliasAccessToken(arguments_, options.vercelAccessToken),
             ...(options.convexVerifier === undefined
               ? {}
               : { convexVerifier: options.convexVerifier }),
@@ -3333,7 +3428,7 @@ export type CurrentProjectAliasReleaseExplicitApiCapability = Readonly<{
 // This deterministic seam supplies every authority capability explicitly. It
 // cannot discover a credential, fetch implementation, Convex session, or state
 // root and it still traverses the complete lock/intent/confirmation/receipt
-// state machine. Production invocation consumes the protected descriptor in
+// state machine. Production invocation consumes the explicit protected inputs in
 // the executable wrapper instead.
 export const executeCurrentProjectAliasReleaseWithExplicitApiCapability = async (
   capability: CurrentProjectAliasReleaseExplicitApiCapability,
@@ -3355,7 +3450,7 @@ export const executeCurrentProjectAliasReleaseWithExplicitApiCapability = async 
     // Render the same closed usage result as the executable surface.
   }
   if (
-    parsedArguments?.vercelAuthFd === undefined
+    (parsedArguments?.vercelAuthFd === undefined && parsedArguments?.vercelAuthFile === undefined)
     ||
     !vercelAccessTokenSchema.safeParse(accessToken).success
     || typeof convexVerifier !== "function"
@@ -3385,14 +3480,18 @@ if (import.meta.main) {
   try {
     assertCurrentAliasReleaseBunVersion();
     const arguments_ = parseArguments(process.argv.slice(2));
-    const vercelAccessToken = arguments_.vercelAuthFd === undefined
-      ? undefined
-      : readProtectedVercelAccessToken(arguments_.vercelAuthFd);
-    const providerActivityEvidence = arguments_.recoveryEvidenceFd === undefined
-      ? undefined
-      : readProtectedProviderActivityEvidence(arguments_.recoveryEvidenceFd);
+    const vercelAccessToken = arguments_.vercelAuthFile !== undefined
+      ? readProtectedVercelAccessTokenFile(arguments_.vercelAuthFile)
+      : arguments_.vercelAuthFd === undefined ? undefined
+        : readProtectedVercelAccessToken(arguments_.vercelAuthFd);
+    const providerActivityEvidence = arguments_.recoveryEvidenceFile !== undefined
+      ? readProtectedProviderActivityEvidenceFile(arguments_.recoveryEvidenceFile)
+      : arguments_.recoveryEvidenceFd === undefined ? undefined
+        : readProtectedProviderActivityEvidence(arguments_.recoveryEvidenceFd);
+    const fileInputDocument = arguments_.planFile === undefined
+      ? undefined : readProtectedAliasPlanFile(arguments_.planFile);
     await recoverBoundedProcessJournal();
-    const inputDocument = await readPlanInput(arguments_.planFd);
+    const inputDocument = fileInputDocument ?? await readPlanInput(arguments_.planFd);
     exitCode = await executeCurrentProjectAliasRelease({
       arguments: process.argv.slice(2),
       inputDocument,
