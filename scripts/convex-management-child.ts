@@ -1,9 +1,9 @@
 import { z } from "zod";
 
 import {
-  HRA_CONVEX_PROJECT_ID,
-  HRA_CONVEX_TEAM_ID,
-  HRA_CONVEX_TEAM_SLUG,
+  OOMPA_CONVEX_PROJECT_ID,
+  OOMPA_CONVEX_TEAM_ID,
+  OOMPA_CONVEX_TEAM_SLUG,
   parseConvexTarget,
   readConvexAccessToken,
   type ConvexTarget,
@@ -44,12 +44,12 @@ const targetSchema = z.object({
   deploymentId: z.number().int().positive().safe(),
   deploymentName: deploymentNameSchema,
   deploymentUrl: deploymentUrlSchema,
-  projectId: z.literal(HRA_CONVEX_PROJECT_ID),
-  teamId: z.literal(HRA_CONVEX_TEAM_ID),
+  projectId: z.literal(OOMPA_CONVEX_PROJECT_ID),
+  teamId: z.literal(OOMPA_CONVEX_TEAM_ID),
 }).strict();
 
 const replacementReferenceSchema = z.string()
-  .regex(/^hra-replace-[0-9a-f]{32}$/u);
+  .regex(/^oompa-replace-[0-9a-f]{32}$/u);
 
 const childRequestSchema = z.discriminatedUnion("kind", [
   z.object({
@@ -108,17 +108,17 @@ const deploymentReadbackSchema = z.object({
 }).passthrough();
 
 const projectReadbackSchema = z.object({
-  id: z.literal(HRA_CONVEX_PROJECT_ID),
+  id: z.literal(OOMPA_CONVEX_PROJECT_ID),
   prodDeploymentName: deploymentNameSchema.nullable(),
   slug: projectSlugSchema,
-  teamId: z.literal(HRA_CONVEX_TEAM_ID),
+  teamId: z.literal(OOMPA_CONVEX_TEAM_ID),
 }).passthrough();
 
 const teamAndProjectReadbackSchema = z.object({
   project: projectSlugSchema,
-  projectId: z.literal(HRA_CONVEX_PROJECT_ID),
-  team: z.literal(HRA_CONVEX_TEAM_SLUG),
-  teamId: z.literal(HRA_CONVEX_TEAM_ID),
+  projectId: z.literal(OOMPA_CONVEX_PROJECT_ID),
+  team: z.literal(OOMPA_CONVEX_TEAM_SLUG),
+  teamId: z.literal(OOMPA_CONVEX_TEAM_ID),
 }).passthrough();
 
 const deploymentReferenceReadbackSchema = z.object({
@@ -273,7 +273,7 @@ class ManagementClient {
   }
 
   async referenceName(reference: string): Promise<string | null> {
-    const path = `/v1/projects/${String(HRA_CONVEX_PROJECT_ID)}/deployment?reference=${encodeURIComponent(reference)}`;
+    const path = `/v1/projects/${String(OOMPA_CONVEX_PROJECT_ID)}/deployment?reference=${encodeURIComponent(reference)}`;
     let response: Response;
     try {
       response = await this.#fetcher(new URL(path, managementOrigin), {
@@ -333,7 +333,7 @@ class ManagementClient {
   async project(): Promise<z.infer<typeof projectReadbackSchema>> {
     try {
       return projectReadbackSchema.parse(await this.json(
-        `/v1/projects/${String(HRA_CONVEX_PROJECT_ID)}`,
+        `/v1/projects/${String(OOMPA_CONVEX_PROJECT_ID)}`,
       ));
     } catch (error: unknown) {
       if (error instanceof ConvexManagementChildError) throw error;
@@ -423,7 +423,7 @@ const createNondefault = async (
   let createdName: string;
   try {
     createdName = createDeploymentReadbackSchema.parse(await client.json(
-      `/v1/projects/${String(HRA_CONVEX_PROJECT_ID)}/create_deployment`,
+      `/v1/projects/${String(OOMPA_CONVEX_PROJECT_ID)}/create_deployment`,
       {
         body: {
           isDefault: false,

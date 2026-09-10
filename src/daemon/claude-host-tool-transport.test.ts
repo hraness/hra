@@ -31,7 +31,7 @@ describe("Claude host-tool callback transport", () => {
     await initializeStatePaths(paths);
     await chmod(paths.runtime, 0o700);
     const authority = new ClaudeHostToolBindingAuthority({
-      bridgeArguments: ["/private/hra/host-tool-bridge-main.ts"],
+      bridgeArguments: ["/private/oompa/host-tool-bridge-main.ts"],
       bridgeCommand: process.execPath,
       newBindingId: () => `clhb_${"1".repeat(32)}`,
       newCapability: () => "A".repeat(43),

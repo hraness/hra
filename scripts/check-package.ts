@@ -23,8 +23,8 @@ import {
 import { rootStatusSchema } from "../src/domain/observation";
 import type { StatePaths } from "../src/storage/paths";
 import { resolveStatePaths } from "../src/storage/paths";
-import { assertHraInstallManifest, assertSafeDarwinInstallAcl } from "../src/install-normalizer";
-import { HRA_INSTALL_PREFLIGHT_SUCCESS } from "../src/install-preflight";
+import { assertOompaInstallManifest, assertSafeDarwinInstallAcl } from "../src/install-normalizer";
+import { OOMPA_INSTALL_PREFLIGHT_SUCCESS } from "../src/install-preflight";
 import {
   requireBoundedProcessCleanup,
   runBoundedProcess,
@@ -36,6 +36,7 @@ import {
   assertPublicTree,
 } from "./public-text-policy";
 import { assertProductionPackageOnly, assertReviewedReleaseInventory } from "./package-policy";
+import { assertPackageContentAt } from "./package-content";
 import {
   assertPseudoTerminalSuccess,
   PTY_BEGIN_MARKER,
@@ -43,24 +44,24 @@ import {
 } from "./pty-acceptance";
 
 const packageSchema = z.object({
-  bin: z.object({ hra: z.literal("./src/cli.ts") }).strict(),
-  bugs: z.object({ url: z.literal("https://github.com/hraness/hra/issues") }).strict(),
+  bin: z.object({ oompa: z.literal("./src/cli.ts") }).strict(),
+  bugs: z.object({ url: z.literal("https://github.com/hraness/oompa/issues") }).strict(),
   engines: z.object({ bun: z.literal("1.3.14") }).strict(),
   exports: z.object({ ".": z.literal("./src/index.ts") }).strict(),
   files: z.array(z.string()).min(1),
-  homepage: z.literal("https://hra.sh"),
+  homepage: z.literal("https://oompa.dev"),
   license: z.literal("MIT"),
-  name: z.literal("@hraness/hra"),
+  name: z.literal("@hraness/oompa"),
   publishConfig: z.object({
     access: z.literal("public"),
     registry: z.literal("https://registry.npmjs.org"),
   }).strict(),
   repository: z.object({
     type: z.literal("git"),
-    url: z.literal("git+https://github.com/hraness/hra.git"),
+    url: z.literal("git+https://github.com/hraness/oompa.git"),
   }).strict(),
   scripts: z.record(z.string(), z.string()),
-  version: z.literal("0.7.1"),
+  version: z.literal("0.8.0"),
 }).passthrough();
 
 type ProcessResult = Readonly<{
@@ -634,7 +635,7 @@ export const normalizeGitHistoryPatchForPublicScan = (
  */
 export const stripGitHunkSectionHeadingsForScopeScan = (patch: string): string =>
   patch.split("\n").map((line) => line.replace(
-    /^(@@ -(?:0|[1-9][0-9]*)(?:,(?:0|[1-9][0-9]*))? \+(?:0|[1-9][0-9]*)(?:,(?:0|[1-9][0-9]*))? @@) [^\r\n]*$/u,
+    /^(@@ -(?:0|[1-9][0-9]*)(?:,(?:0|[1-9][0-9]*))? \+(?:0|[1-9][0-9]*)(?:,(?:0|[1-9][0-9]*))? @@) [^\r\n\u2028\u2029]*$/u,
     "$1",
   )).join("\n");
 
@@ -800,6 +801,11 @@ export const parseGitHistoryCommitList = (value: string): readonly string[] => {
   return Object.freeze(commits);
 };
 
+export const assertGitHistoryPatchPublicText = (patch: string, label: string): void => {
+  assertPublicSensitiveText(patch, label);
+  assertPublicText(stripGitHunkSectionHeadingsForScopeScan(patch), label);
+};
+
 export const assertCompleteGitHistoryPublic = async (repositoryRoot: string): Promise<void> => {
   const temporaryDirectory = await realpath(tmpdir());
   const startedAt = performance.now();
@@ -850,10 +856,8 @@ export const assertCompleteGitHistoryPublic = async (repositoryRoot: string): Pr
       `Git history public-text commit ${commit}`,
       readHistory({ commit, kind: "public_patch" }),
     );
-    assertPublicText(
-      stripGitHunkSectionHeadingsForScopeScan(
-        normalizeGitHistoryPatchForPublicScan(commit, "public_patch", authoredPatch),
-      ),
+    assertGitHistoryPatchPublicText(
+      normalizeGitHistoryPatchForPublicScan(commit, "public_patch", authoredPatch),
       `Git history commit ${commit}`,
     );
   }
@@ -875,9 +879,9 @@ const assertSessionObservationHelp = (label: string, result: ProcessResult): voi
   requireSuccess(label, result);
   if (result.stderr !== "") throw new Error(`${label} wrote diagnostics.`);
   for (const command of [
-    "hra session status <session> [--json]",
-    "hra session watch <session> [--cursor <cursor>] [--jsonl]",
-    "hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]",
+    "oompa session status <session> [--json]",
+    "oompa session watch <session> [--cursor <cursor>] [--jsonl]",
+    "oompa session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]",
   ]) {
     if (!result.stdout.includes(command)) {
       throw new Error(`${label} omitted ${command}.`);
@@ -1069,7 +1073,7 @@ const repositoryRoot = resolve(import.meta.dir, "..");
 const packageJson = packageSchema.parse(
   JSON.parse(await readFile(join(repositoryRoot, "package.json"), "utf8")) as unknown,
 );
-assertHraInstallManifest(packageJson);
+assertOompaInstallManifest(packageJson);
 if (!packageJson.files.includes("src")) throw new Error("The package must include src.");
 if (!packageJson.files.includes("!src/cloud/inviteAuthority.ts")) {
   throw new Error("The package must exclude operator-only invite authority.");
@@ -1082,11 +1086,7 @@ await access(join(repositoryRoot, "src", "storage", "legacy-secret-migration.ts"
 await assertPublicCheckout(repositoryRoot);
 await assertCompleteGitHistoryPublic(repositoryRoot);
 
-const generated = requireSuccess(
-  "generated public tree check",
-  await run(process.execPath, ["run", "build:site", "--", "--check"], { cwd: repositoryRoot }),
-);
-if (generated.stdout.trim().length > 0) process.stdout.write(generated.stdout);
+await assertPackageContentAt(repositoryRoot);
 const dependencyCacheRoot = await resolvePackageDependencyCache(repositoryRoot);
 
 const temporaryRoot = await realpath(await mkdtemp(join(tmpdir(), "hra-package-")));
@@ -1113,7 +1113,7 @@ try {
   }
   await symlink(process.execPath, join(runtimeBin, "bun"));
 
-  const expectedArchiveName = `hraness-hra-${packageJson.version}.tgz`;
+  const expectedArchiveName = `hraness-oompa-${packageJson.version}.tgz`;
   let archive: string;
   if (suppliedArchive === undefined) {
     requireSuccess(
@@ -1145,8 +1145,9 @@ try {
   );
   await assertPublicTree(inspectionDirectory);
   await assertProductionPackageOnly(inspectionDirectory);
+  await assertPackageContentAt(join(inspectionDirectory, "package"));
   await assertReviewedReleaseInventory(join(inspectionDirectory, "package"));
-  assertHraInstallManifest(
+  assertOompaInstallManifest(
     JSON.parse(await readFile(join(inspectionDirectory, "package", "package.json"), "utf8")) as unknown,
   );
   try {
@@ -1182,7 +1183,7 @@ try {
           phase: "package-transactional-global-install",
         })),
     );
-    if (preflight.stderr !== "" || preflight.stdout !== `${HRA_INSTALL_PREFLIGHT_SUCCESS}\n`) {
+    if (preflight.stderr !== "" || preflight.stdout !== `${OOMPA_INSTALL_PREFLIGHT_SUCCESS}\n`) {
       throw new Error(`${label} did not return its one exact success token.`);
     }
   };
@@ -1194,9 +1195,9 @@ try {
         env: isolatedEnvironment,
       })),
   );
-  const localPackageRoot = join(consumerDirectory, "node_modules", "@hraness", "hra");
-  const executable = join(consumerDirectory, "node_modules", ".bin", "hra");
-  assertHraInstallManifest(
+  const localPackageRoot = join(consumerDirectory, "node_modules", "@hraness", "oompa");
+  const executable = join(consumerDirectory, "node_modules", ".bin", "oompa");
+  assertOompaInstallManifest(
     JSON.parse(await readFile(join(localPackageRoot, "package.json"), "utf8")) as unknown,
   );
   if (((await lstat(join(localPackageRoot, "src", "cli.ts"))).mode & 0o777) !== 0o777) {
@@ -1211,14 +1212,14 @@ try {
   );
   await assertProductionPackageOnly(localPackageRoot, "installed");
   z.object({
-    dependencies: z.record(z.string(), z.string()).refine((value) => Object.hasOwn(value, "@hraness/hra")),
+    dependencies: z.record(z.string(), z.string()).refine((value) => Object.hasOwn(value, "@hraness/oompa")),
     trustedDependencies: z.undefined().optional(),
   }).passthrough().parse(
     JSON.parse(await readFile(join(consumerDirectory, "package.json"), "utf8")) as unknown,
   );
   requireSuccess(
     "side-effect-free package import",
-    await run(process.execPath, ["-e", "await import('@hraness/hra')"], {
+    await run(process.execPath, ["-e", "await import('@hraness/oompa')"], {
       cwd: consumerDirectory,
       env: isolatedEnvironment,
     }),
@@ -1228,7 +1229,7 @@ try {
     "installed CLI help",
     await run(executable, ["--help"], { cwd: consumerDirectory, env: isolatedEnvironment }),
   );
-  if (!help.stdout.startsWith("HRA\n")) throw new Error("Installed CLI help has an unexpected header.");
+  if (!help.stdout.startsWith("Oompa\n")) throw new Error("Installed CLI help has an unexpected header.");
   if (help.stderr !== "") throw new Error("Installed CLI help wrote diagnostics.");
   assertSessionObservationHelp(
     "installed session help",
@@ -1242,7 +1243,7 @@ try {
     "installed CLI version",
     await run(executable, ["--version"], { cwd: consumerDirectory, env: isolatedEnvironment }),
   );
-  if (version.stdout !== `hra ${packageJson.version}\n` || version.stderr !== "") {
+  if (version.stdout !== `oompa ${packageJson.version}\n` || version.stderr !== "") {
     throw new Error("Installed CLI version does not match package.json.");
   }
 
@@ -1261,7 +1262,7 @@ try {
   if (doctor.exitCode !== 0) throw new Error("Offline doctor failed in the clean consumer.");
 
   await installGlobalTransaction("transactional lifecycle-disabled global consumer install");
-  const globalExecutable = join(globalInstallRoot, "bin", "hra");
+  const globalExecutable = join(globalInstallRoot, "bin", "oompa");
   const activeGlobalCommand = await lstat(globalExecutable);
   const uid = process.getuid?.();
   if (
@@ -1270,15 +1271,15 @@ try {
     || activeGlobalCommand.nlink !== 1
     || activeGlobalCommand.uid !== uid
   ) {
-    throw new Error("The active global HRA command is not one exact current-user symlink.");
+    throw new Error("The active global Oompa command is not one exact current-user symlink.");
   }
   const globalCli = await realpath(globalExecutable);
   const globalPackageRoot = dirname(dirname(globalCli));
   const globalVersionRoot = resolve(globalPackageRoot, "..", "..", "..", "..", "..");
-  if (!globalVersionRoot.startsWith(`${join(globalInstallRoot, "install", "hra", "versions")}${sep}`)) {
-    throw new Error("The active global HRA command is outside its protected complete-version root.");
+  if (!globalVersionRoot.startsWith(`${join(globalInstallRoot, "install", "oompa", "versions")}${sep}`)) {
+    throw new Error("The active global Oompa command is outside its protected complete-version root.");
   }
-  assertHraInstallManifest(
+  assertOompaInstallManifest(
     JSON.parse(await readFile(join(globalPackageRoot, "package.json"), "utf8")) as unknown,
   );
   if (((await lstat(globalCli)).mode & 0o777) !== 0o755) {
@@ -1288,21 +1289,21 @@ try {
   await access(globalNormalizer, constants.R_OK);
   await assertProductionPackageOnly(globalPackageRoot, "installed");
   z.object({
-    dependencies: z.record(z.string(), z.string()).refine((value) => Object.hasOwn(value, "@hraness/hra")),
+    dependencies: z.record(z.string(), z.string()).refine((value) => Object.hasOwn(value, "@hraness/oompa")),
     trustedDependencies: z.undefined().optional(),
   }).passthrough().parse(
     JSON.parse(
       await readFile(join(globalVersionRoot, "install", "global", "package.json"), "utf8"),
     ) as unknown,
   );
-  if (await Bun.file(join(globalInstallRoot, "install", "global", "node_modules", "@hraness", "hra")).exists()) {
-    throw new Error("The transactional global install exposed HRA in Bun's final global package path.");
+  if (await Bun.file(join(globalInstallRoot, "install", "global", "node_modules", "@hraness", "oompa")).exists()) {
+    throw new Error("The transactional global install exposed Oompa in Bun's final global package path.");
   }
   const globalHelp = requireSuccess(
     "global CLI help",
     await run(globalExecutable, ["--help"], { cwd: consumerDirectory, env: isolatedEnvironment }),
   );
-  if (!globalHelp.stdout.startsWith("HRA\n") || globalHelp.stderr !== "") {
+  if (!globalHelp.stdout.startsWith("Oompa\n") || globalHelp.stderr !== "") {
     throw new Error("Globally installed CLI help is invalid.");
   }
   assertSessionObservationHelp(
@@ -1359,8 +1360,8 @@ try {
       environment: daemonEnvironment,
       steps: [
         { expect: PTY_BEGIN_MARKER },
-        { expect: "HRA is ready." },
-        { expect: "Next: hra account add Personal" },
+        { expect: "Oompa is ready." },
+        { expect: "Next: oompa account add Personal" },
       ],
       temporaryDirectory: temporaryRoot,
       timeoutMs: lifecycleTimeoutMs,
@@ -1563,20 +1564,20 @@ try {
       environment: daemonEnvironment,
       steps: [
         { expect: PTY_BEGIN_MARKER },
-        { expect: "HRA shell. /help lists commands; /exit leaves the daemon running." },
-        { expect: "hra> ", write: `/account ${addedAccountValue.data.account.id}\n` },
+        { expect: "Oompa shell. /help lists commands; /exit leaves the daemon running." },
+        { expect: "oompa> ", write: `/account ${addedAccountValue.data.account.id}\n` },
         { expect: `Selected account ${addedAccountValue.data.account.id}.` },
-        { expect: "hra[", write: "/session\n" },
+        { expect: "oompa[", write: "/session\n" },
         { expect: "No results." },
-        { expect: "hra[", write: "//slash-command\n" },
+        { expect: "oompa[", write: "//slash-command\n" },
         {
-          expect: "hra: Select a session with /session <selector> before sending or following it.",
+          expect: "oompa: Select a session with /session <selector> before sending or following it.",
         },
-        { expect: "hra[", write: "/send /slash-command\n" },
+        { expect: "oompa[", write: "/send /slash-command\n" },
         {
-          expect: "hra: Select a session with /session <selector> before sending or following it.",
+          expect: "oompa: Select a session with /session <selector> before sending or following it.",
         },
-        { expect: "hra[", write: "/exit\n" },
+        { expect: "oompa[", write: "/exit\n" },
       ],
       temporaryDirectory: temporaryRoot,
       timeoutMs: lifecycleTimeoutMs,

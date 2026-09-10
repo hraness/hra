@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 
 import {
-  HRA_HOST_TOOL_NAMES,
+  OOMPA_HOST_TOOL_NAMES,
 } from "../domain/host-tools.ts";
 import {
   CLAUDE_HOST_TOOL_SESSION_HISTORY_LIMIT,
@@ -72,8 +72,8 @@ const ready = async (server: ClaudeHostToolMcpServer): Promise<void> => {
       capabilities: { tools: { listChanged: false } },
       protocolVersion: CLAUDE_PIN_MCP_PROTOCOL_VERSION,
       serverInfo: {
-        name: "hra",
-        title: "HRA session host tools",
+        name: "oompa",
+        title: "Oompa session host tools",
         version: "1",
       },
     },
@@ -84,7 +84,7 @@ const ready = async (server: ClaudeHostToolMcpServer): Promise<void> => {
   })).toBeNull();
 };
 
-describe("Claude HRA MCP protocol", () => {
+describe("Claude Oompa MCP protocol", () => {
   test("pins the exact three-frame Claude 2.1.260 MCP startup capture", async () => {
     const fixture = await Bun.file(join(
       import.meta.dir,
@@ -113,7 +113,7 @@ describe("Claude HRA MCP protocol", () => {
       name: string;
       inputSchema: Readonly<Record<string, unknown>>;
     }[] };
-    expect(result.tools.map((tool) => tool.name)).toEqual([...HRA_HOST_TOOL_NAMES]);
+    expect(result.tools.map((tool) => tool.name)).toEqual([...OOMPA_HOST_TOOL_NAMES]);
     expect(result.tools).toHaveLength(8);
     expect(result.tools.every((tool) => tool.inputSchema.type === "object"
       || Object.hasOwn(tool.inputSchema, "oneOf"))).toBe(true);
@@ -172,7 +172,7 @@ describe("Claude HRA MCP protocol", () => {
     });
     expect(injected?.response.error).toEqual({
       code: -32_602,
-      message: "MCP tool arguments do not match an advertised HRA tool",
+      message: "MCP tool arguments do not match an advertised Oompa tool",
     });
     expect(calls).toHaveLength(1);
   });
@@ -319,7 +319,7 @@ describe("Claude HRA MCP protocol", () => {
       params: { arguments: {}, name: "sessions_list" },
     });
     expect(dispatch?.response.result).toEqual({
-      content: [{ text: "HRA could not complete this host-tool request.", type: "text" }],
+      content: [{ text: "Oompa could not complete this host-tool request.", type: "text" }],
       isError: true,
     });
     expect(JSON.stringify(dispatch)).not.toContain("PRIVATE_HANDLER_DETAIL");
@@ -348,7 +348,7 @@ describe("Claude HRA MCP protocol", () => {
       params: { arguments: {}, name: "sessions_list" },
     });
     expect(over?.response.result).toEqual({
-      content: [{ text: "HRA refused an invalid host-tool result.", type: "text" }],
+      content: [{ text: "Oompa refused an invalid host-tool result.", type: "text" }],
       isError: true,
     });
   });

@@ -1,13 +1,13 @@
 ---
 name: Feature request
-about: A capability HRA should have
+about: A capability Oompa should have
 title: ""
 labels: enhancement
 ---
 
 ## The job you are trying to do
 
-## What HRA does today
+## What Oompa does today
 
 ## What you propose
 

@@ -1,5 +1,6 @@
 import type { AttachmentManifestEntry, PreparedAttachment } from "../domain/attachments";
 import type { Preset, PresetRequirement, Provider } from "../domain/presets";
+import type { ProviderAccountId } from "../domain/provider-accounts";
 import type {
   EffectiveClaudeRuntimeProfile,
   EffectiveRuntimeProfile,
@@ -19,11 +20,18 @@ import type { ClaudeProcessIdentity } from "../claude/process";
 
 export type { ClaudeProcessIdentity } from "../claude/process";
 
-export type ProfileAuthority = {
+type ProfileAuthorityBase = {
   id: ProfileId;
   generation: number;
   codexHome: string;
   desktopUserData: string;
+};
+
+/** Exact provider-account authority required at every live runtime boundary. */
+export type ProfileAuthority = ProfileAuthorityBase & {
+  provider: Provider;
+  providerAccountId: ProviderAccountId;
+  bindingGeneration: number;
 };
 
 /**
@@ -49,6 +57,12 @@ export type CodexAccountProjection = {
   /** Stable provider organization identity when account authority is org-scoped. */
   organizationId?: string;
   plan?: string;
+};
+
+/** Bounded Oompa observation; Claude exposes no admitted stable account identity. */
+export type ClaudeAccountReadinessProjection = {
+  readiness: "signed_in" | "signed_out" | "unverified";
+  observedAt: number;
 };
 
 export type CodexLoginOutcome =
@@ -207,11 +221,13 @@ export interface SessionRuntimePort<Profile> {
   discardRuntimeReview(review: RuntimeStartReviewOf<Profile>): void;
   startSession(input: {
     authority: ProfileAuthority;
+    /** Only retained V1 switch evidence selects the frozen launch contract. */
+    hostCapabilities?: "current" | "historical_v1";
     /** Persists exact Claude child custody before that child is admitted. */
     admitProcessIdentity?: (identity: ClaudeProcessIdentity) => Promise<void>;
     projectRoot?: string;
     /**
-     * An HRA-reserved provider identity supplied before a Claude child is
+     * An Oompa-reserved provider identity supplied before a Claude child is
      * launched, so crash recovery can recognize an indeterminate launch.
      * Codex allocates its own thread identity and therefore ignores this.
      */
@@ -247,7 +263,7 @@ export interface SessionRuntimePort<Profile> {
   }): boolean;
   /**
    * Release this runtime's hold on one provider thread without deleting it.
-   * `hra session switch` calls it on the provider a session is leaving, so a
+   * `oompa session switch` calls it on the provider a session is leaving, so a
    * runtime that owns a per-session process stops that process instead of
    * leaking it. It never destroys the user's thread: a switched-away Codex
    * thread stays exactly where it is on the provider.
@@ -299,6 +315,9 @@ export interface SessionRuntimePort<Profile> {
  */
 export interface ClaudeRuntimePort extends SessionRuntimePort<EffectiveClaudeRuntimeProfile> {
   readonly provider: "claude";
+  readAccount(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<ClaudeAccountReadinessProjection>;
+  /** Optional exact identity proof; adoption refuses when the runtime cannot provide it. */
+  readProviderAccountIdentity?(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<CodexAccountProjection>;
   /**
    * Reclaims an existing Claude conversation under this runtime's full stdin
    * and interaction authority. Callers may supply the closed liveness proof
@@ -306,7 +325,7 @@ export interface ClaudeRuntimePort extends SessionRuntimePort<EffectiveClaudeRun
    */
   claimSession(input: {
     authority: ProfileAuthority;
-    /** Every reclaim explicitly proves whether its durable row admits HRA tools. */
+    /** Every reclaim explicitly proves whether its durable row admits Oompa tools. */
     hostTools: "required" | "disabled";
     /** Persists exact child custody before the resumed process is admitted. */
     admitProcessIdentity?: (identity: ClaudeProcessIdentity) => Promise<void>;
@@ -326,17 +345,15 @@ export interface ClaudeRuntimePort extends SessionRuntimePort<EffectiveClaudeRun
     providerThreadId: string;
     signal: AbortSignal;
   }): Promise<ClaudeProcessIdentity>;
-  readAccount(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<CodexAccountProjection>;
   pinnedVersion(): string;
   /**
    * Rekeys idle live Claude sessions and their private host-tool bindings
-   * after the durable shared-generation commit. Active or ambiguously
+   * after the durable provider-generation commit. Active or ambiguously
    * retained children are rejected rather than carried across authority.
    */
   rebindProfileAuthority(input: {
-    profileId: ProfileId;
-    expectedGeneration: number;
-    nextGeneration: number;
+    expectedAuthority: ProfileAuthority;
+    nextAuthority: ProfileAuthority;
   }): void;
   /** Current-daemon execution authority used before scheduled work becomes durable. */
   hasLiveSession?(input: {
@@ -348,7 +365,11 @@ export interface ClaudeRuntimePort extends SessionRuntimePort<EffectiveClaudeRun
    * Codex publishes its own request authority on the notification; Claude's
    * control request carries only an id, so the daemon asks the port for it.
    */
-  interactionAuthority(providerThreadId: string, requestId: string): ProviderInteractionAuthority;
+  interactionAuthority(
+    authority: ProfileAuthority,
+    providerThreadId: string,
+    requestId: string,
+  ): ProviderInteractionAuthority;
 }
 
 export interface CodexRuntimePort extends SessionRuntimePort<EffectiveRuntimeProfile> {
@@ -550,7 +571,7 @@ export class UnavailableClaudeRuntime implements ClaudeRuntimePort {
   #unavailable(): never {
     throw new ProviderRuntimeUnavailableError(
       `This daemon has no Claude Code runtime. Install Claude Code ${this.#pinnedVersion} exactly, `
-      + "put `claude` on this daemon's PATH, restart the daemon with `hra daemon restart`, then sign in "
+      + "put `claude` on this daemon's PATH, restart the daemon with `oompa daemon restart`, then sign in "
       + "inside the account's isolated Claude profile.",
     );
   }
@@ -565,15 +586,15 @@ export class UnavailableClaudeRuntime implements ClaudeRuntimePort {
   activateSessionHostTools(): Promise<never> { return Promise.reject(this.#unavailable()); }
   pinnedVersion(): string { return this.#unavailable(); }
   rebindProfileAuthority(input: {
-    profileId: ProfileId;
-    expectedGeneration: number;
-    nextGeneration: number;
+    expectedAuthority: ProfileAuthority;
+    nextAuthority: ProfileAuthority;
   }): void {
     void input;
   }
   claimSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
   readSessionProcessIdentity(): Promise<never> { return Promise.reject(this.#unavailable()); }
   readAccount(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  readProviderAccountIdentity(): Promise<never> { return Promise.reject(this.#unavailable()); }
   reviewSessionStart(): Promise<never> { return Promise.reject(this.#unavailable()); }
   discardRuntimeReview(): void {}
   startSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
@@ -599,7 +620,7 @@ export class UnavailableCloudControl implements CloudControlPort {
     this.#projectionRecoveryBlocker = projectionRecoveryBlocker;
   }
 
-  #unavailable(): never { throw new Error("Cloud sync is not configured. Run `hra auth login` first."); }
+  #unavailable(): never { throw new Error("Cloud sync is not configured. Run `oompa auth login` first."); }
   status(): Promise<unknown> { return Promise.resolve({ configured: false, signedIn: false }); }
   sync(): Promise<never> { return Promise.reject(this.#unavailable()); }
   isCompactProjectionRecoveryUnsettledForProfile(profileId: ProfileId): Promise<boolean> {

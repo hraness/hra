@@ -42,7 +42,7 @@ import {
   randomKeyBytes,
   signDeviceBind,
   unwrapAccountDataKey,
-} from "../hra/cloud";
+} from "../oompa/cloud";
 import { createCancellation } from "../lib/cancellation";
 import { isAuthorityError, wipeBytes } from "./authority";
 import { deviceKeyFingerprint } from "./fingerprint";
@@ -67,7 +67,7 @@ export type EnrollmentStage =
   | "needs_registration"
   /** Keys exist and a device row exists, but this auth session is not bound. */
   | "needs_bind"
-  /** Registered and waiting for `hra device approve` against the fingerprint. */
+  /** Registered and waiting for `oompa device approve` against the fingerprint. */
   | "awaiting_approval"
   /** The device row was revoked from another device. */
   | "revoked"
@@ -238,7 +238,7 @@ export function CustodyProvider({ children }: Readonly<{ children: ReactNode }>)
     const context = await readAccount();
     if (!context.hasActiveDevices) {
       throw new Error(
-        "A browser is never the first device on an account. Enroll a machine with hra installed first.",
+        "A browser is never the first device on an account. Enroll a machine with oompa installed first.",
       );
     }
     const deviceKeys = await readOrCreateDeviceKeys();
@@ -340,7 +340,7 @@ export function CustodyProvider({ children }: Readonly<{ children: ReactNode }>)
   }, [convex, readAccount]);
 
   // Device key fingerprint, shown so the operator can compare it before running
-  // `hra device approve`.
+  // `oompa device approve`.
   useEffect(() => {
     if (keys === null) {
       setFingerprint(null);
@@ -354,7 +354,7 @@ export function CustodyProvider({ children }: Readonly<{ children: ReactNode }>)
   }, [keys]);
 
   // First read, then a bounded poll while a registration is waiting for
-  // approval from a machine with hra installed.
+  // approval from a machine with oompa installed.
   const stage = stageFor(account, keys);
   const guardedRefresh = useMemo(() => guard(refresh), [guard, refresh]);
   useEffect(() => {

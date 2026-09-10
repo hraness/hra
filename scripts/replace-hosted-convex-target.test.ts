@@ -10,29 +10,29 @@ import {
   replaceHostedConvexTarget,
 } from "./replace-hosted-convex-target";
 import {
-  HRA_CONVEX_PROJECT_ID,
-  HRA_CONVEX_TEAM_ID,
+  OOMPA_CONVEX_PROJECT_ID,
+  OOMPA_CONVEX_TEAM_ID,
   type ConvexTarget,
 } from "./convex-target";
 
 const roots: string[] = [];
 const replacementId = "018f6c9a-24d7-7a12-a45f-06d1e3c5b7a9";
-const replacementReference = "hra-replace-018f6c9a24d77a12a45f06d1e3c5b7a9";
+const replacementReference = "oompa-replace-018f6c9a24d77a12a45f06d1e3c5b7a9";
 
 const previousTarget: ConvexTarget = {
   deploymentId: 7_654_321,
   deploymentName: "steady-otter-321",
   deploymentUrl: "https://steady-otter-321.convex.cloud",
-  projectId: HRA_CONVEX_PROJECT_ID,
-  teamId: HRA_CONVEX_TEAM_ID,
+  projectId: OOMPA_CONVEX_PROJECT_ID,
+  teamId: OOMPA_CONVEX_TEAM_ID,
 };
 
 const replacementTarget: ConvexTarget = {
   deploymentId: 7_654_322,
   deploymentName: "patient-lynx-322",
   deploymentUrl: "https://patient-lynx-322.convex.cloud",
-  projectId: HRA_CONVEX_PROJECT_ID,
-  teamId: HRA_CONVEX_TEAM_ID,
+  projectId: OOMPA_CONVEX_PROJECT_ID,
+  teamId: OOMPA_CONVEX_TEAM_ID,
 };
 
 const targetArguments = [
@@ -44,7 +44,7 @@ const targetArguments = [
 ] as const;
 
 const makeRoot = async (): Promise<string> => {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-convex-replacement-test-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-convex-replacement-test-")));
   await chmod(root, 0o700);
   roots.push(root);
   return root;

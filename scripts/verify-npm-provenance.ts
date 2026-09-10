@@ -11,7 +11,7 @@ const GITHUB_BUILD_TYPE = "https://slsa-framework.github.io/github-actions-build
 const GITHUB_BUILDER_ID = "https://github.com/actions/runner/github-hosted";
 const GITHUB_REPOSITORY_OWNER = "hraness";
 const GITHUB_REPOSITORY_OWNER_ID = "307125679";
-const GITHUB_REPOSITORY_NAME = "hra";
+const GITHUB_REPOSITORY_NAME = "oompa";
 const GITHUB_REPOSITORY = `${GITHUB_REPOSITORY_OWNER}/${GITHUB_REPOSITORY_NAME}`;
 const GITHUB_REPOSITORY_URL = `https://github.com/${GITHUB_REPOSITORY}`;
 const GITHUB_REPOSITORY_ID = "1343008607";
@@ -25,7 +25,7 @@ export async function withNpmProvenanceCache(
   purpose: "publish" | "readback",
   verify: (tufCachePath: string) => Promise<void>,
 ): Promise<void> {
-  const prefix = purpose === "publish" ? "hra-publish-sigstore-tuf-" : "hra-sigstore-tuf-";
+  const prefix = purpose === "publish" ? "oompa-publish-sigstore-tuf-" : "oompa-sigstore-tuf-";
   const tufCachePath = await mkdtemp(join(tmpdir(), prefix));
   await verify(tufCachePath);
   // Failed verification retains evidence and may still own an uncollected child.
@@ -102,7 +102,7 @@ export function npmProvenanceSignerPolicy(tag: string, sha: string, invocation: 
   if (
     !/^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u.test(tag)
     || !/^[0-9a-f]{40}$/u.test(sha)
-    || !/^https:\/\/github\.com\/hraness\/hra\/actions\/runs\/[1-9][0-9]*\/attempts\/[1-9][0-9]*$/u.test(invocation)
+    || !/^https:\/\/github\.com\/hraness\/oompa\/actions\/runs\/[1-9][0-9]*\/attempts\/[1-9][0-9]*$/u.test(invocation)
   ) throw new Error("npm provenance signer coordinates are invalid.");
   const ref = `refs/tags/${tag}`;
   const identity = `${GITHUB_REPOSITORY_URL}/.github/workflows/release.yml@${ref}`;
@@ -234,7 +234,7 @@ export function assertNpmProvenanceSubject(
   const digest = record(subject.digest, "npm provenance subject digest");
   exactKeys(digest, ["sha512"], "npm provenance subject digest");
   if (
-    subject.name !== `pkg:npm/%40hraness/hra@${input.tag.slice(1)}`
+    subject.name !== `pkg:npm/%40hraness/oompa@${input.tag.slice(1)}`
     || digest.sha512 !== integrityBytes.toString("hex")
   ) throw new Error("npm provenance subject does not bind the exact package bytes.");
 }
@@ -305,9 +305,9 @@ export function assertNpmPublishAttestation(
   const predicate = record(statement.predicate, "npm registry publish predicate");
   exactKeys(predicate, ["name", "registry", "version"], "npm registry publish predicate");
   if (
-    subject.name !== `pkg:npm/%40hraness/hra@${input.tag.slice(1)}`
+    subject.name !== `pkg:npm/%40hraness/oompa@${input.tag.slice(1)}`
     || digest.sha512 !== expectedDigest
-    || predicate.name !== "@hraness/hra"
+    || predicate.name !== "@hraness/oompa"
     || predicate.version !== input.tag.slice(1)
     || predicate.registry !== "https://registry.npmjs.org"
   ) throw new Error("npm registry publish attestation does not bind the exact package bytes.");

@@ -809,23 +809,23 @@ const operationContractByKind = new Map<typeof WORK_OPERATION_KINDS[number], Ope
 
 const commands = {
   "work.protocol": {
-    argv: ["hra", "work", "protocol"], positionals: [], output: "json",
+    argv: ["oompa", "work", "protocol"], positionals: [], output: "json",
     options: {
       "--operation": { type: "operation-kind" }, "--type": { type: "protocol-type-name" }, "--topic": { type: "protocol-topic" }, "--json": { type: "flag", redundant: true },
     },
     rules: ["at-most-one(--operation,--type,--topic)", "unknown-and-duplicate-options-rejected"], result: "ProtocolDocument",
   },
   "work.apply": {
-    argv: ["hra", "work", "apply"], positionals: [], output: "json",
+    argv: ["oompa", "work", "apply"], positionals: [], output: "json",
     options: { "--input-stdin": { type: "flag" }, "--input-fd": { type: "integer", minimum: 0, maximum: 1_048_575, excluded: [1, 2] }, "--json": { type: "flag", redundant: true } },
     rules: ["exactly-one(--input-stdin,--input-fd)", "input-must-be-non-terminal", "one-bounded-json-document", "global-idempotency-key-forbidden"], result: "ApplyResponse",
   },
   "work.snapshot": {
-    argv: ["hra", "work", "snapshot"], positionals: [{ name: "work", type: "WorkId" }], output: "json",
+    argv: ["oompa", "work", "snapshot"], positionals: [{ name: "work", type: "WorkId" }], output: "json",
     options: { "--actor": { type: "SessionId" }, "--json": { type: "flag", redundant: true } }, rules: ["exact-identifiers-only"], result: "WorkSnapshot",
   },
   "work.task": {
-    argv: ["hra", "work", "task"], positionals: [{ name: "task", type: "TaskId" }], output: "json",
+    argv: ["oompa", "work", "task"], positionals: [{ name: "task", type: "TaskId" }], output: "json",
     options: {
       "--history-limit": { type: "integer", minimum: 1, maximum: WORK_TASK_HISTORY_ITEM_LIMIT, defaultWhenHistoryMode: WORK_TASK_HISTORY_DEFAULT_ITEM_LIMIT },
       "--history-cursor": { type: "TaskHistoryCursor" },
@@ -835,17 +835,17 @@ const commands = {
     result: "TaskDetail|TaskHistoryPage",
   },
   "work.poll": {
-    argv: ["hra", "work", "poll"], positionals: [{ name: "work", type: "WorkId" }], output: "json",
+    argv: ["oompa", "work", "poll"], positionals: [{ name: "work", type: "WorkId" }], output: "json",
     options: { "--actor": { type: "SessionId" }, "--cursor": { type: "EventCursor" }, "--action-cursor": { type: "ActionCursor" }, "--limit": { type: "integer", minimum: 1, maximum: WORK_POLL_ITEM_LIMIT, default: 20 }, "--wait-ms": { type: "integer", minimum: 0, maximum: WORK_WAIT_MAX_MS, default: 0 }, "--json": { type: "flag", redundant: true } },
     rules: ["action-cursor-implies-wait-ms-zero", "exact-identifiers-only"], result: "Poll",
   },
   "work.events": {
-    argv: ["hra", "work", "events"], positionals: [{ name: "work", type: "WorkId" }], output: "json-or-jsonl-follow",
+    argv: ["oompa", "work", "events"], positionals: [{ name: "work", type: "WorkId" }], output: "json-or-jsonl-follow",
     options: { "--cursor": { type: "EventCursor" }, "--limit": { type: "integer", minimum: 1, maximum: WORK_EVENT_PAGE_LIMIT, default: WORK_EVENT_PAGE_LIMIT }, "--wait-ms": { type: "integer", minimum: 0, maximum: WORK_WAIT_MAX_MS, default: 0 }, "--json": { type: "flag" }, "--jsonl": { type: "flag" }, "--follow": { type: "flag" } },
     rules: ["json-mutually-exclusive-with-jsonl-or-follow", "jsonl-and-follow-may-be-combined", "jsonl-or-follow-selects-stream", "stream-wait-ms-positive-default-30000"], result: "EventPage|WorkEventStreamLine",
   },
   "work.watch": {
-    argv: ["hra", "work", "watch"], positionals: [{ name: "work", type: "WorkId" }], output: "jsonl",
+    argv: ["oompa", "work", "watch"], positionals: [{ name: "work", type: "WorkId" }], output: "jsonl",
     options: { "--cursor": { type: "EventCursor" }, "--jsonl": { type: "flag", redundant: true } },
     rules: ["fixed-limit-200", "fixed-wait-ms-30000", "stdout-stream-errors-on-stderr"], result: "WorkEventStreamLine",
   },
@@ -945,7 +945,7 @@ const topicValues = {
     },
     release: "terminal coordinator-only explicit logical destructive purge with bounded replay tombstone; history membership and public versions become unavailable, with no promise of immediate physical WAL or storage-media sanitization",
   },
-  types: { names: [...WORK_PROTOCOL_TYPE_NAMES], query: "hra work protocol --type <name>" },
+  types: { names: [...WORK_PROTOCOL_TYPE_NAMES], query: "oompa work protocol --type <name>" },
 } as const;
 
 const canonicalJson = (value: unknown): string => {

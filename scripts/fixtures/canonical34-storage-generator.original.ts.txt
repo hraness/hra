@@ -1,0 +1,274 @@
+// Execute only after the coordinator has staged and reviewed this exact archive
+// and its pinned dependencies. These are synthetic storage observations, not
+// provider, process, credential, desktop, or current-schema authority proofs.
+import { createHash } from "node:crypto";
+import { lstatSync, readdirSync, readFileSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join, relative } from "node:path";
+import { Database } from "bun:sqlite";
+import { z } from "zod";
+
+const sourceCommit = "127c1e7dcf8ef1461b7d71ab4d077a93f85cc682";
+const sourceTree = "cec00d7ec6d35f6e0c3e3f3c60ccfe516d5f58d5";
+const fixedTime = 34_001;
+const sha256 = (input: string | Uint8Array) => createHash("sha256").update(input).digest("hex");
+const readBounded = (path: string, maximumBytes: number) => {
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.size > maximumBytes) throw new Error("CAPTURE_FILE_BOUND_EXCEEDED");
+  return readFileSync(path);
+};
+// Build the denylist from explicit path components so this self-auditing
+// recipe does not itself contain a literal host-path prefix. No image span is
+// exempted and no original cell, artifact, or metadata value is normalized.
+const hostPrefixes = [["", "Users", ""], ["", "home", ""], ["", "private", ""],
+  ["", "tmp", ""], ["", "var", "folders", ""]].map((parts) => parts.join("/"));
+hostPrefixes.push(["", "Users", ""].join("\\"));
+const assertPrivatePathFree = (bytes: Uint8Array, label: string) => {
+  const data = Buffer.from(bytes);
+  for (const prefix of hostPrefixes) {
+    for (const encoding of ["utf8", "utf16le"] as const) {
+      if (data.includes(Buffer.from(prefix, encoding))) throw new Error(`CAPTURE_HOST_PATH:${label}`);
+    }
+  }
+};
+const recipe = readBounded(import.meta.filename, 64 * 1024);
+assertPrivatePathFree(recipe, "recipe");
+if (Bun.version !== "1.3.14" || (lstatSync(import.meta.dir).mode & 0o777) !== 0o700) {
+  throw new Error("CAPTURE_RUNTIME_OR_DIRECTORY_MISMATCH");
+}
+const sourceRoot = join(import.meta.dir, "canonical34");
+const sourceManifestSha256 = "3eac01b5007eb0e3ec097b49035f4f4c1151c315596530d56a9892fa955e52a7";
+const sourceFileCount = 247;
+const expectedSourceHashes = {
+  "src/storage/state-store.ts": "7e1bc77f9315cada0ff5b3de57cee9d59018c2ba86fd96e72ea5cc77a9048eb2",
+  "package.json": "b24d0878dbb4ac09e58c7ca270f748aec559befddb3765772133b47e540ba1b2",
+  "bun.lock": "2640e9d87062f81a175d4b022c377018e7c13bbe5065dcb904fac2b066fa703c",
+} as const;
+const dependencies = { "@hraness/oh": "0.2.7", "@openai/codex": "0.153.2", convex: "1.45.0", zod: "4.4.3" } as const;
+const verifySourceAndDependencies = () => {
+for (const [relative, expected] of Object.entries(expectedSourceHashes)) {
+  if (sha256(readBounded(join(sourceRoot, relative), 8 * 1024 * 1024)) !== expected) {
+    throw new Error(`ARCHIVED_SOURCE_MISMATCH:${relative}`);
+  }
+}
+const sourceFiles: { path: string; sha256: string }[] = [];
+const visit = (directory: string) => {
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    if (!/^[A-Za-z0-9_.-]+$/u.test(entry.name)) throw new Error("UNEXPECTED_SOURCE_ENTRY");
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) visit(path);
+    else if (entry.isFile() && lstatSync(path).size <= 8 * 1024 * 1024) {
+      sourceFiles.push({ path: relative(sourceRoot, path), sha256: sha256(readFileSync(path)) });
+    } else throw new Error("UNEXPECTED_SOURCE_ENTRY");
+  }
+};
+visit(join(sourceRoot, "src"));
+sourceFiles.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+if (sourceFiles.length !== sourceFileCount || sha256(JSON.stringify(sourceFiles)) !== sourceManifestSha256) {
+  throw new Error("ARCHIVED_SOURCE_MANIFEST_MISMATCH");
+}
+const manifest = z.object({ dependencies: z.record(z.string(), z.string()) }).passthrough()
+  .parse(JSON.parse(readBounded(join(sourceRoot, "package.json"), 256 * 1024).toString("utf8")));
+if (JSON.stringify(manifest.dependencies) !== JSON.stringify(dependencies)) throw new Error("ARCHIVED_DEPENDENCIES_MISMATCH");
+for (const [name, expected] of Object.entries(dependencies)) {
+  const installed = z.object({ version: z.literal(expected) }).passthrough()
+    .parse(JSON.parse(readBounded(join(sourceRoot, "node_modules", name, "package.json"), 256 * 1024).toString("utf8")));
+  if (installed.version !== expected) throw new Error("INSTALLED_DEPENDENCY_MISMATCH");
+}
+};
+verifySourceAndDependencies();
+
+const { StateStore } = await import("./canonical34/src/storage/state-store");
+const { initializeStatePaths, resolveStatePaths } = await import("./canonical34/src/storage/paths");
+const { presetRequirements } = await import("./canonical34/src/domain/presets");
+const { effectiveRuntimeProfileSchema } = await import("./canonical34/src/domain/runtime-profile");
+const { deriveDesktopProfilePaths } = await import("./canonical34/src/desktop/profile");
+
+const capture = join(import.meta.dir, "capture");
+await mkdir(capture, { mode: 0o700 }); // Must be a fresh output directory.
+const paths = resolveStatePaths({ homeDirectory: join(capture, "home"), platform: "darwin" });
+await initializeStatePaths(paths);
+const store = new StateStore(paths, { now: () => fixedTime });
+const bootId = `boot_${"3".repeat(32)}`;
+const daemonGeneration = store.nextDaemonGeneration(bootId);
+const created = store.createProfile("Canonical34 synthetic storage");
+const profile = store.nextProfileGeneration(created.id);
+// Explicit old public allocator use avoids the old constructor's later
+// INSERT OR IGNORE backfill. This is an unused reservation, not an observation.
+const reservedUsageRevision = store.allocateNextUsageRevision(profile.id);
+if (reservedUsageRevision !== 1) throw new Error("ARCHIVED_USAGE_RESERVATION_CHANGED");
+const email = "canonical34-storage@example.com";
+if (!store.setProfileState(profile.id, profile.processGeneration, "signed_in", { email, plan: "Plus" })) {
+  throw new Error("ARCHIVED_SIGNIN_REFUSED");
+}
+// Registration inspects this pre-existing directory. No task, provider, or file
+// write is dispatched into it; all fixture state remains under capture/home.
+const project = await store.createProject("Canonical34 metadata project", "/opt/homebrew", true);
+const session = store.upsertProviderSession({
+  profileId: profile.id, projectId: project.id,
+  providerThreadId: "canonical34-synthetic-sol-thread", title: "Canonical34 Sol",
+  state: "idle", providerUpdatedAt: fixedTime,
+});
+const requirement = presetRequirements.high;
+const runtime = effectiveRuntimeProfileSchema.parse({
+  profileId: profile.id, processGeneration: profile.processGeneration, observedAt: fixedTime,
+  preset: "high", model: requirement.model, reasoningEffort: requirement.effort,
+  serviceTier: null, fast: false, approvalPolicy: "on-request", reviewMode: "auto_review",
+  permissionProfile: ":workspace", computerUse: true, pluginCapability: true, enabledApps: [],
+});
+const runtimeRecord = store.recordSessionRuntimeProfile({
+  sessionId: session.id, sourceKind: "session_start", sourceId: "canonical34-synthetic-runtime", profile: runtime,
+});
+// A separate genuinely unbound old session and queue retain missing-custody
+// evidence. Do not add a runtime, native thread, account key, or effect receipt.
+const unboundSession = store.createSession({
+  profileId: profile.id, provider: "codex", title: "Canonical34 unbound queue",
+  preset: "high", fastEnabled: false,
+});
+const unboundQueue = store.enqueue(unboundSession.id, "Canonical34 retained unbound queue body.");
+
+// Only archived journal methods run: no desktop adapter, app launch, process
+// inspection, native account probe, or external provider operation is called.
+const idempotencyKey = "34000000-0000-4000-8000-000000000034";
+const plan = await store.beginDesktopSwitch({
+  idempotencyKey, target: { profileId: profile.id, processGeneration: profile.processGeneration },
+});
+if (plan.status !== "ready") throw new Error("ARCHIVED_DESKTOP_PLAN_REFUSED");
+const binding = {
+  switchGeneration: plan.switchGeneration,
+  sourceProfileId: plan.sourceProfileId,
+  sourceProcessGeneration: plan.sourceProcessGeneration,
+  targetProfileId: plan.targetProfileId,
+  targetProcessGeneration: plan.targetProcessGeneration,
+};
+await store.prepareDesktopSwitchJournal({
+  idempotencyKey, ...binding, bundleCdHash: "9".repeat(40), sourcePid: null,
+  targetPaths: deriveDesktopProfilePaths(paths.root, profile.id),
+  expectedAccountKey: email,
+});
+await store.advanceDesktopSwitchJournal({ idempotencyKey, switchGeneration: plan.switchGeneration, stage: "launch-requested" });
+await store.advanceDesktopSwitchJournal({
+  idempotencyKey, switchGeneration: plan.switchGeneration, stage: "recovery-required", diagnostic: "SYNTHETIC_RECOVERY_REQUIRED",
+});
+const recovery = z.object({ status: z.literal("recovery_required"), attemptId: z.string() })
+  .passthrough().parse(store.readCurrentDesktopSwitchRecovery());
+const resolutionInput = {
+  attemptId: recovery.attemptId, idempotencyKey, ...binding,
+  resolution: "resolved_applied" as const, diagnostic: "STABLE_TARGET_ACCOUNT_VERIFIED",
+  observationDigest: sha256("canonical34 synthetic account observation, not native proof"),
+  activeAccount: { signedIn: true, email, plan: "Plus" },
+};
+const receipt = store.resolveDesktopSwitchRecovery(resolutionInput);
+if (JSON.stringify(store.resolveDesktopSwitchRecovery(resolutionInput)) !== JSON.stringify(receipt)) {
+  throw new Error("ARCHIVED_DESKTOP_REPLAY_CHANGED");
+}
+const retainedProfile = store.requireProfile(profile.id);
+store.close();
+
+const identifier = (value: string) => {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(value)) throw new Error("UNEXPECTED_FIXTURE_IDENTIFIER");
+  return `"${value}"`;
+};
+const schemaRow = z.object({ type: z.string(), name: z.string(), tbl_name: z.string(), sql: z.string().nullable() }).strict();
+const snapshot = () => {
+  const database = new Database(paths.database, { create: false, strict: true });
+  try {
+    database.exec("PRAGMA query_only=ON");
+    return database.transaction(() => {
+    const schema = z.array(schemaRow).max(2048).parse(database.query("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name LIMIT 2049").all());
+    const tables = schema.filter((row) => row.type === "table").map((row) => row.name).sort();
+    if (tables.length > 256) throw new Error("FIXTURE_TABLE_LIMIT");
+    const rows: Record<string, unknown[]> = {};
+    for (const table of tables) {
+      const columns = z.array(z.object({ name: z.string() }).passthrough()).parse(database.query(`PRAGMA table_xinfo(${identifier(table)})`).all());
+      const projection = columns.map(({ name }) => {
+        const quoted = identifier(name);
+        return `json_array(typeof(${quoted}),CASE WHEN typeof(${quoted}) IN ('text','blob') THEN hex(${quoted}) ELSE ${quoted} END) AS ${quoted}`;
+      }).join(",");
+      rows[table] = database.query(`SELECT ${projection} FROM ${identifier(table)} LIMIT 4097`).all()
+        .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+      if (rows[table].length > 4096) throw new Error("FIXTURE_ROW_LIMIT");
+    }
+    const result = {
+      version: database.query("PRAGMA user_version").get(),
+      ledger: database.query("SELECT * FROM migrations ORDER BY version").all(),
+      foreignKeys: database.query("PRAGMA foreign_key_check").all(), schema, rows,
+      inspectionChanges: database.query("SELECT total_changes() AS count").get(),
+    };
+    z.object({ count: z.literal(0) }).strict().parse(result.inspectionChanges);
+    if (Buffer.byteLength(JSON.stringify(result)) > 8 * 1024 * 1024) throw new Error("FIXTURE_SNAPSHOT_LIMIT");
+    return result;
+    }).deferred();
+  } finally { database.close(false); }
+};
+const checkpoint = new Database(paths.database, { create: false, strict: true });
+let checkpointResult: unknown;
+let immutableDesktop: unknown;
+try {
+  checkpointResult = checkpoint.query("PRAGMA wal_checkpoint(TRUNCATE)").get();
+  z.object({ busy: z.literal(0), log: z.literal(0), checkpointed: z.literal(0) }).strict().parse(checkpointResult);
+  immutableDesktop = checkpoint.query("SELECT * FROM desktop_switch_resolutions WHERE attempt_id=?").get(recovery.attemptId);
+} finally { checkpoint.close(false); }
+const before = snapshot();
+if (JSON.stringify(before.version) !== '{"user_version":34}' || before.foreignKeys.length !== 0) {
+  throw new Error("ARCHIVED_SCHEMA_OR_FK_INVALID");
+}
+if (before.rows.usage_snapshots?.length !== 0 || before.rows.usage_poll_failures?.length !== 0
+  || before.rows.usage_revision_authority?.length !== 1) {
+  throw new Error("ARCHIVED_UNUSED_USAGE_RESERVATION_INVALID");
+}
+const usageAuthority = new Database(paths.database, { create: false, strict: true });
+try {
+  usageAuthority.exec("PRAGMA query_only=ON");
+  z.object({ profile_id: z.literal(profile.id), next_revision: z.literal(2) }).strict()
+    .parse(usageAuthority.query("SELECT profile_id,next_revision FROM usage_revision_authority").get());
+  z.object({ count: z.literal(0) }).strict()
+    .parse(usageAuthority.query("SELECT total_changes() AS count").get());
+} finally { usageAuthority.close(false); }
+for (const readonly of [false, true]) {
+  const bytesBefore = readBounded(paths.database, 8 * 1024 * 1024);
+  const reopened = new StateStore(paths, { readonly, now: () => fixedTime + 1 });
+  try {
+    if (JSON.stringify(reopened.readCurrentDesktopSwitchRecovery()) !== JSON.stringify(receipt)) throw new Error("ARCHIVED_RECEIPT_CHANGED");
+    if (JSON.stringify(reopened.latestSessionRuntimeProfile(session.id)) !== JSON.stringify(runtimeRecord)) throw new Error("ARCHIVED_RUNTIME_CHANGED");
+    if (JSON.stringify(reopened.requireSession(unboundSession.id)) !== JSON.stringify(unboundSession)
+      || JSON.stringify(reopened.requireQueue(unboundQueue.id)) !== JSON.stringify(unboundQueue)
+      || reopened.latestSessionRuntimeProfile(unboundSession.id) !== null) throw new Error("ARCHIVED_UNBOUND_QUEUE_CHANGED");
+  } finally { reopened.close(); }
+  if (JSON.stringify(snapshot()) !== JSON.stringify(before)) throw new Error("ARCHIVED_REOPEN_CHANGED");
+  const check = new Database(paths.database, { create: false, strict: true });
+  try {
+    z.object({ busy: z.literal(0), log: z.literal(0), checkpointed: z.literal(0) }).strict()
+      .parse(check.query("PRAGMA wal_checkpoint(TRUNCATE)").get());
+  } finally { check.close(false); }
+  if (readonly && sha256(readBounded(paths.database, 8 * 1024 * 1024)) !== sha256(bytesBefore)) {
+    throw new Error("ARCHIVED_READONLY_DATABASE_BYTES_CHANGED");
+  }
+}
+verifySourceAndDependencies();
+if (sha256(readBounded(import.meta.filename, 64 * 1024)) !== sha256(recipe)) throw new Error("CAPTURE_RECIPE_CHANGED");
+const bytes = readBounded(paths.database, 8 * 1024 * 1024);
+assertPrivatePathFree(bytes, "whole-database-image");
+const source = recipe.toString("utf8");
+const metadata = {
+  sourceCommit, sourceTree, sourceHashes: expectedSourceHashes, sourceManifestSha256, sourceFileCount, dependencies,
+  schemaVersion: 34, fixedTime,
+  generatorSha256: sha256(source), databaseSha256: sha256(bytes), databaseBytes: bytes.length,
+  checkpointResult, bunVersion: Bun.version,
+  provenance: { syntheticStorageOnly: true, nativeProviderEffects: 0, nativeDesktopEffects: 0,
+    rawSqlRowOrSchemaWrites: false, randomizedIds: true, archivedWritableAndReadonlyReopensUnchanged: true,
+    archivedReadonlyDatabaseSha256Unchanged: true, sourceAndDependenciesReverifiedAfterUse: true,
+    noCurrentSchemaOrNativeAuthorityClaim: true },
+  retained: { bootId, daemonGeneration, profile: retainedProfile,
+    project, session, runtime, runtimeRecord, unboundSession, unboundQueue,
+    usage: { reservedUsageRevision, reservationUnused: true, snapshotCount: 0, pollFailureCount: 0 },
+    plan, resolutionInput, receipt, immutableDesktop },
+  snapshot: before,
+};
+const metadataBytes = Buffer.from(`${JSON.stringify(metadata, null, 2)}\n`);
+if (metadataBytes.length > 16 * 1024 * 1024) throw new Error("FIXTURE_METADATA_LIMIT");
+assertPrivatePathFree(metadataBytes, "metadata");
+await writeFile(join(capture, "canonical34.sqlite"), bytes, { mode: 0o600, flag: "wx" });
+await writeFile(join(capture, "fixture.json"), metadataBytes, { mode: 0o600, flag: "wx" });
+console.log(JSON.stringify({ schemaVersion: 34, databaseSha256: metadata.databaseSha256, databaseBytes: bytes.length,
+  generatorSha256: metadata.generatorSha256, preservedTables: Object.keys(before.rows).length }));

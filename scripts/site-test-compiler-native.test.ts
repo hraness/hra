@@ -14,7 +14,7 @@ async function withNativeFixture(mode: Mode, proof: (input: Readonly<{
   root: string; controller: AbortController; result: Promise<CompletedBoundedProcessResult>;
 }>) => Promise<void>): Promise<void> {
   const sourceRoot = await realpath(join(import.meta.dir, ".."));
-  const root = await mkdtemp(join(tmpdir(), "hra-site-compiler-native-"));
+  const root = await mkdtemp(join(tmpdir(), "oompa-site-compiler-native-"));
   const controller = new AbortController();
   const raw = runBoundedProcess({
     executable: process.execPath, arguments: [join(sourceRoot, "scripts/site-test-compiler-native-fixture.ts"), mode, root],

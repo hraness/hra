@@ -5,10 +5,10 @@
   },
   "plugins": [
     {
-      "name": "hra-local-efficiency",
+      "name": "oompa-local-efficiency",
       "source": {
         "source": "local",
-        "path": "./plugins/hra-local-efficiency"
+        "path": "./plugins/oompa-local-efficiency"
       },
       "policy": {
         "installation": "AVAILABLE",
@@ -17,10 +17,10 @@
       "category": "Productivity"
     },
     {
-      "name": "hra-cloud-efficiency",
+      "name": "oompa-cloud-efficiency",
       "source": {
         "source": "local",
-        "path": "./plugins/hra-cloud-efficiency"
+        "path": "./plugins/oompa-cloud-efficiency"
       },
       "policy": {
         "installation": "AVAILABLE",

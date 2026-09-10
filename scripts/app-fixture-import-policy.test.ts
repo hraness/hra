@@ -40,7 +40,7 @@ describe("browser fixture source import boundary", () => {
         "../../src/model/session-model", "../../src/custody/custody-context",
         "../../src/data/wire", "../../src/auth/sign-in-screen.tsx",
         "../../src/screens/settings-screen", "../../src/components/ui/input",
-        "../../src/components/ui/primitives.stylex.ts", "../../src/hra/contracts",
+        "../../src/components/ui/primitives.stylex.ts", "../../src/oompa/contracts",
         "../../src/index.css",
       ]) expect(await restrictedImports(filePath, specifier)).toEqual([]);
       expect(await restrictedImports(filePath, "../../src/data/wire", true)).toEqual([]);
@@ -63,6 +63,6 @@ describe("browser fixture source import boundary", () => {
       expect(await restrictedImports(filePath, "../../src/data/wire")).toHaveLength(1);
       expect(await restrictedImports(filePath, "../../../src/storage/paths")).toHaveLength(1);
     }
-    expect(await restrictedImports("app/src/hra/contracts.ts", "../../../src/cloud/contracts")).toEqual([]);
+    expect(await restrictedImports("app/src/oompa/contracts.ts", "../../../src/cloud/contracts")).toEqual([]);
   });
 });

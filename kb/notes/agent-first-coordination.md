@@ -1,25 +1,25 @@
 ---
 title: Agent-first coordination substrate
-description: The durable, bounded HRA protocol for coordinating parallel Codex sessions.
+description: The durable, bounded Oompa protocol for coordinating parallel Codex sessions.
 type: note
 status: current
-area: hra
+area: oompa
 tags:
   - agents
   - cli
   - coordination
   - sqlite
 relations:
-  related-to: [ plans/hra-v1 ]
+  related-to: [ plans/oompa-v1 ]
 ---
 
 # Agent-first coordination substrate
 
 ## Decision
 
-HRA adds a small durable coordination kernel for already-existing Codex sessions. The kernel lets orchestrating agents declare work, claim it, bind exact HRA sessions, exchange bounded signals, submit structured results, and review those results. Codex app-server remains the execution runtime. HRA does not add its own model loop, tool runtime, memory system, or human workflow editor.
+Oompa adds a small durable coordination kernel for already-existing Codex sessions. The kernel lets orchestrating agents declare work, claim it, bind exact Oompa sessions, exchange bounded signals, submit structured results, and review those results. Codex app-server remains the execution runtime. Oompa does not add its own model loop, tool runtime, memory system, or human workflow editor.
 
-This decision intentionally narrows and supersedes the earlier deferral of product-owned task graphs. HRA remains a Codex account, device, and session control plane. It gains closed coordination records for those sessions rather than becoming a generic autonomous-agent framework.
+This decision intentionally narrows and supersedes the earlier deferral of product-owned task graphs. Oompa remains a Codex account, device, and session control plane. It gains closed coordination records for those sessions rather than becoming a generic autonomous-agent framework.
 
 ## Source assessment and clean-room boundary
 
@@ -32,17 +32,17 @@ The repository is source-readable but does not carry a license grant at that rev
 - [`package.json`](https://github.com/kousun12/agencity/blob/4beeb6fef202a491959ceef9b1f74d1567349b4c/package.json) marks the package private.
 - The [README](https://github.com/kousun12/agencity/blob/4beeb6fef202a491959ceef9b1f74d1567349b4c/README.md) supports use from a source checkout, but it does not grant redistribution or derivative-work rights.
 
-Agencity is not a Codex-subscription client. Its documented product transports use direct OpenAI, Anthropic, or Vercel AI Gateway credentials through the Vercel AI SDK. The source contains no Codex app-server or ChatGPT subscription integration. Making it use Codex subscriptions would require replacing its provider and autonomous-run boundary, then reconciling its sessions, effects, approvals, and recovery with Codex app-server. That work would duplicate HRA inside a source base without a clear license grant.
+Agencity is not a Codex-subscription client. Its documented product transports use direct OpenAI, Anthropic, or Vercel AI Gateway credentials through the Vercel AI SDK. The source contains no Codex app-server or ChatGPT subscription integration. Making it use Codex subscriptions would require replacing its provider and autonomous-run boundary, then reconciling its sessions, effects, approvals, and recovery with Codex app-server. That work would duplicate Oompa inside a source base without a clear license grant.
 
-Official OpenAI documentation describes [Codex app-server](https://developers.openai.com/codex/app-server) as the open-source deep-integration interface for authentication, conversation history, approvals, and streamed agent events. A Codex-backed harness is therefore technically possible, and HRA already uses that boundary; Agencity simply does not implement it. Retrofitting Agencity would be a new integration rather than a supported configuration or CLI adapter.
+Official OpenAI documentation describes [Codex app-server](https://developers.openai.com/codex/app-server) as the open-source deep-integration interface for authentication, conversation history, approvals, and streamed agent events. A Codex-backed harness is therefore technically possible, and Oompa already uses that boundary; Agencity simply does not implement it. Retrofitting Agencity would be a new integration rather than a supported configuration or CLI adapter.
 
-HRA will therefore use only independently expressed systems concepts. No Agencity source, schema, prompt, naming system, or prose is copied. HRA will not depend on, embed, fork, or redistribute that repository.
+Oompa will therefore use only independently expressed systems concepts. No Agencity source, schema, prompt, naming system, or prose is copied. Oompa will not depend on, embed, fork, or redistribute that repository.
 
 ## Transaction model and durable prefixes
 
-Chroma's article [*Agent Swarms are a Distributed Systems Problem*](https://www.trychroma.com/engineering/transactions) identifies an important mismatch between classical optimistic transactions and agents: reasoning and tool work are expensive, read sets emerge during execution, and aborting a long speculative run can waste substantial work. Its proposed Fission mechanisms are not copied into HRA, but the framing sharpens this protocol's transaction boundary.
+Chroma's article [*Agent Swarms are a Distributed Systems Problem*](https://www.trychroma.com/engineering/transactions) identifies an important mismatch between classical optimistic transactions and agents: reasoning and tool work are expensive, read sets emerge during execution, and aborting a long speculative run can waste substantial work. Its proposed Fission mechanisms are not copied into Oompa, but the framing sharpens this protocol's transaction boundary.
 
-HRA treats each independently validated coordination fact as a durable prefix:
+Oompa treats each independently validated coordination fact as a durable prefix:
 
 - a completed task with its accepted submission remains completed when later work is failed or cancelled;
 - immutable submissions, reviews, evidence references, receipts, and events are never rolled back because a downstream task fails or the work is cancelled;
@@ -50,7 +50,7 @@ HRA treats each independently validated coordination fact as a durable prefix:
 - one short SQLite transaction performs each compare-and-swap, capability check, projection update, receipt settlement, and event append;
 - no SQLite transaction remains open across model reasoning, a Codex request, filesystem verification, or another provider effect.
 
-This is forward recovery, not a claim that every partial result is valid. A prefix becomes reusable only after its declared shape, evidence, authority, and review gates accept it. HRA does not adopt page-level locking, wound-wait scheduling, or generic early commit: HRA has entity revisions and task fences, and an ambiguous provider effect must be reconciled rather than wounded, stolen, or replayed. Local SQLite remains the one linearizable execution authority for a machine.
+This is forward recovery, not a claim that every partial result is valid. A prefix becomes reusable only after its declared shape, evidence, authority, and review gates accept it. Oompa does not adopt page-level locking, wound-wait scheduling, or generic early commit: Oompa has entity revisions and task fences, and an ambiguous provider effect must be reconciled rather than wounded, stolen, or replayed. Local SQLite remains the one linearizable execution authority for a machine.
 
 ## Authority split
 
@@ -62,7 +62,7 @@ Codex app-server continues to own:
 - tools, skills, apps, permissions, and approvals;
 - workspace execution and provider-visible outcomes.
 
-HRA owns:
+Oompa owns:
 
 - isolated account profiles and exact account generations;
 - work declarations and dependency state;
@@ -71,7 +71,7 @@ HRA owns:
 - bounded submissions, reviews, signals, and evidence references;
 - local projections and work-scoped event streams; encrypted work projection remains a later extension.
 
-An HRA session is the durable actor. A task is finite work. An attempt binds one task to one exact session execution. HRA does not add a second `Agent` aggregate.
+An Oompa session is the durable actor. A task is finite work. An attempt binds one task to one exact session execution. Oompa does not add a second `Agent` aggregate.
 
 ## Core model
 
@@ -81,7 +81,7 @@ The coordination kernel has six primitives.
 | --- | --- | --- |
 | Work | One bounded objective, policy, explicit account routes, revision, lifecycle, and work-scoped event stream | Maximum task count, depth, dependency count, active attempts, result bytes, and retention are explicit |
 | Task | One finite objective with parent containment, dependency edges, routing key, priority, timing, deliverable contract, and review policy | Task identity is distinct from a session; dependency and parent edges are distinct |
-| Attempt | One claim and execution lineage for a task | Pins claim fence, actor, exact account and generation, project, runtime profile, HRA session, provider-effect receipts, and terminal or ambiguous state |
+| Attempt | One claim and execution lineage for a task | Pins claim fence, actor, exact account and generation, project, runtime profile, Oompa session, provider-effect receipts, and terminal or ambiguous state |
 | Submission | One immutable structured result from an attempt | Carries bounded summary, result JSON, evidence references, and content digests; assistant prose alone never creates it |
 | Review | One immutable accept or revise decision over an exact submission revision | A required reviewer must use a session distinct from the worker session; approval does not prove factual correctness |
 | Signal | One attributable message between joined work participants | Keeps provider `deliveryState` separate from recipient `acknowledgedAt`; optional session delivery uses existing queue or steer operations |
@@ -112,13 +112,13 @@ This is a logical SQLite deletion contract, not a forensic-erasure promise. The 
 
 ### Exact account routing
 
-Each work record declares immutable execution routes. HRA resolves each route to exact local account and project IDs when it admits the route. A route is exactly:
+Each work record declares immutable execution routes. Oompa resolves each route to exact local account and project IDs when it admits the route. A route is exactly:
 
 - account ID;
 - project ID;
 - preset and Fast setting.
 
-Tasks repeat one exactly declared route. The scheduler never selects an account from usage, quota, freshness, availability, or incidental ordering. A provider limit ends or blocks the current attempt. HRA never replays it under another account. Routes cannot be revised in protocol v1; differently routed work must be declared explicitly.
+Tasks repeat one exactly declared route. The scheduler never selects an account from usage, quota, freshness, availability, or incidental ordering. A provider limit ends or blocks the current attempt. Oompa never replays it under another account. Routes cannot be revised in protocol v1; differently routed work must be declared explicitly.
 
 Multiple Codex subscriptions remain independent capacities, not a pooled quota. Explicit parallel assignment is supported. Automatic rotation, failover, quota evasion, and usage-based routing are unavailable.
 
@@ -130,15 +130,15 @@ Renewal and release require the exact attempt ID, actor, fence, expected revisio
 
 A claim lease prevents duplicate admission. It does not prove that a Codex effect stopped. On expiry:
 
-1. If no provider effect began, HRA closes the attempt as expired without effect and makes the task eligible again.
-2. If the exact bound session and turn are provably terminal, HRA records that observation and waits for a submission or explicit terminal report.
-3. If a provider effect may have begun or cannot be observed conclusively, HRA marks the attempt and task `recovery_required`. It does not steal, reroute, or redispatch the task.
+1. If no provider effect began, Oompa closes the attempt as expired without effect and makes the task eligible again.
+2. If the exact bound session and turn are provably terminal, Oompa records that observation and waits for a submission or explicit terminal report.
+3. If a provider effect may have begun or cannot be observed conclusively, Oompa marks the attempt and task `recovery_required`. It does not steal, reroute, or redispatch the task.
 
 Process IDs, account labels, timestamps, terminal presence, and missing heartbeats are not execution authority.
 
 ### Request-before-effect dispatch
 
-Dispatch binds an already-existing exact actor session. It never creates a session. The session must match the task's explicit account generation and project route before HRA admits the effect. Dispatch then composes existing HRA turn operations without weakening their recovery rules:
+Dispatch binds an already-existing exact actor session. It never creates a session. The session must match the task's explicit account generation and project route before Oompa admits the effect. Dispatch then composes existing Oompa turn operations without weakening their recovery rules:
 
 1. Resolve the existing session and verify its exact account generation and project against the task route.
 2. Commit the attempt, claim, session binding, exact route, and dispatch request digest.
@@ -159,7 +159,7 @@ Independent fanout uses two phases:
 
 Atomic admission does not claim atomic external execution. Dependent tasks are admitted only after their prerequisites are accepted.
 
-Every mutation document carries a caller-supplied UUIDv7 `idempotencyKey` plus a canonical request digest computed by HRA. Reusing the key with identical durable meaning preserves the original decision, identities, and capabilities without adding a mutation, event, or revision. Mutable public records and `workRevision` are reprojected from current state, so an ordinary replay is not promised to be byte-identical. Reusing the key with changed meaning returns `CONFLICT`. A retained `work.release` tombstone is the exception: its exact stored release result is the whole remaining replay boundary.
+Every mutation document carries a caller-supplied UUIDv7 `idempotencyKey` plus a canonical request digest computed by Oompa. Reusing the key with identical durable meaning preserves the original decision, identities, and capabilities without adding a mutation, event, or revision. Mutable public records and `workRevision` are reprojected from current state, so an ordinary replay is not promised to be byte-identical. Reusing the key with changed meaning returns `CONFLICT`. A retained `work.release` tombstone is the exception: its exact stored release result is the whole remaining replay boundary.
 
 An empty `task.claimNext` result is durable and same-key replayable, but it appends no event and advances no work revision. A successful claim still appends `task.claimed` and advances the work stream. This keeps high-frequency empty polling from manufacturing history.
 
@@ -167,7 +167,7 @@ An empty `task.claimNext` result is durable and same-key replayable, but it appe
 
 A signal is stored before any session delivery effect. Both sender and target must be exact joined session members and present the appropriate work-scoped capability. An optional task reference provides context but does not widen authority.
 
-`queue` and `steer` retain their existing HRA meanings:
+`queue` and `steer` retain their existing Oompa meanings:
 
 - `queue` creates one durable future turn and may wake an idle session.
 - `steer` targets one exact active turn and does not create a future-turn receipt.
@@ -189,13 +189,13 @@ Submission documents use a strict, bounded discriminated schema. They may contai
 
 - a short summary;
 - finite structured JSON under an optional restricted deliverable schema;
-- exact HRA session or session-and-turn references;
+- exact Oompa session or session-and-turn references;
 - workspace-relative artifact references with project, byte length, and SHA-256 digest;
 - Git commit IDs bound to an exact project.
 
-HRA does not store arbitrary tool output, raw reasoning, provider payloads, absolute paths, credentials, or unbounded file bytes in coordination records.
+Oompa does not store arbitrary tool output, raw reasoning, provider payloads, absolute paths, credentials, or unbounded file bytes in coordination records.
 
-Initial completion gates may inspect only HRA-owned facts:
+Initial completion gates may inspect only Oompa-owned facts:
 
 - required dependencies have accepted submissions;
 - the exact attempt has no unresolved provider effect;
@@ -204,7 +204,7 @@ Initial completion gates may inspect only HRA-owned facts:
 - required independent review accepted the exact submission revision;
 - deadlines, maximum attempts, and explicit cancellation state are satisfied.
 
-HRA does not run arbitrary shell commands as completion gates. Codex may run tests and report evidence, but HRA does not treat reported success as independently verified unless a later closed verifier can validate that exact evidence.
+Oompa does not run arbitrary shell commands as completion gates. Codex may run tests and report evidence, but Oompa does not treat reported success as independently verified unless a later closed verifier can validate that exact evidence.
 
 ## Local storage and event semantics
 
@@ -223,13 +223,13 @@ The coordination surface is machine-only. It has no table renderer, prompts, TUI
 The minimally complete vocabulary is frozen to one mutation entry point and six read or streaming entry points:
 
 ```text
-hra work protocol [--operation <kind>|--type <name>|--topic <topic>]
-hra work apply --input-stdin
-hra work snapshot <work> [--actor <session>]
-hra work task <task> [--history-limit <1..50>] [--history-cursor <cursor>]
-hra work poll <work> [--actor <session>] [--cursor <event-cursor>] [--action-cursor <action-cursor>] [--limit <1..50>] [--wait-ms <0..30000>]
-hra work events <work> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
-hra work watch <work> [--cursor <cursor>]
+oompa work protocol [--operation <kind>|--type <name>|--topic <topic>]
+oompa work apply --input-stdin
+oompa work snapshot <work> [--actor <session>]
+oompa work task <task> [--history-limit <1..50>] [--history-cursor <cursor>]
+oompa work poll <work> [--actor <session>] [--cursor <event-cursor>] [--action-cursor <action-cursor>] [--limit <1..50>] [--wait-ms <0..30000>]
+oompa work events <work> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
+oompa work watch <work> [--cursor <cursor>]
 ```
 
 `work apply` accepts one strict versioned JSON request from protected standard input: `{protocol, version, requestId, operation}`. The nested operation carries its own UUIDv7 `idempotencyKey` and one of the closed operation kinds advertised by `work protocol`. Unknown kinds, unknown fields, non-UUIDv7 keys, and input on argv are rejected. Success and failure both echo the request ID in a versioned protocol response. There are no separate mutation commands.
@@ -240,7 +240,7 @@ Each complete compact JSON response for snapshot, task detail, and task history,
 
 The signed task-history cursor binds the exact work and task, work stream epoch and sequence, task-history membership high-water ordinal, task revision, projection time, and offset. The first page freezes that cut. Continued pages select only memberships at or below its high-water ordinal and the newest public projection version at or before its work sequence. Later mutations and later memberships are excluded, so all pages remain coherent as of one fixed cut even while the live task changes.
 
-Every non-streaming work command writes one versioned success or failure JSON document to stdout and diagnostics to stderr. A JSONL stream writes only gap, event, and checkpoint frames to stdout and one closed terminal failure envelope to stderr. Each complete terminal-safe JSONL frame, including its newline, is capped at 512 KiB; the terminal failure document is capped at 64 KiB. The protocol descriptor advertises both wire ceilings. Existing HRA exit codes remain authoritative.
+Every non-streaming work command writes one versioned success or failure JSON document to stdout and diagnostics to stderr. A JSONL stream writes only gap, event, and checkpoint frames to stdout and one closed terminal failure envelope to stderr. Each complete terminal-safe JSONL frame, including its newline, is capped at 512 KiB; the terminal failure document is capped at 64 KiB. The protocol descriptor advertises both wire ceilings. Existing Oompa exit codes remain authoritative.
 
 `work poll` is the compact orchestration read. One response contains only:
 
@@ -266,34 +266,34 @@ Cloud absence never blocks local coordination. Local SQLite owns task admission,
 
 The initial work protocol does not add a Convex schema, hosted executor, or remote work command. A later extension may carry encrypted bounded projections through the existing infrastructure. Such a service may see only opaque user, device, work, task, revision, lifecycle, size, and timestamp metadata required for authorization, quotas, retention, and routing. Objectives, messages, results, evidence, project details, and account labels must remain encrypted.
 
-Any later remote projection must route commands to the exact execution custodian. Remote devices may not claim local tasks, dispatch turns into bound local sessions, answer local interactions, take over an attempt, or become a second provider writer. Revocation and account-key loss would retain the existing HRA device and erasure boundaries.
+Any later remote projection must route commands to the exact execution custodian. Remote devices may not claim local tasks, dispatch turns into bound local sessions, answer local interactions, take over an attempt, or become a second provider writer. Revocation and account-key loss would retain the existing Oompa device and erasure boundaries.
 
 ## Turso decision
 
 Do not add Turso for this feature.
 
-Agencity's own [capability documentation](https://github.com/kousun12/agencity/blob/4beeb6fef202a491959ceef9b1f74d1567349b4c/docs/capabilities.md) describes Turso as a separate immutable-envelope exchange while keeping local relational state canonical. It explicitly does not provide distributed leases, task stealing, automatic execution-owner failover, or artifact replication. Those limits mean the adapter does not solve HRA's coordination authority problem.
+Agencity's own [capability documentation](https://github.com/kousun12/agencity/blob/4beeb6fef202a491959ceef9b1f74d1567349b4c/docs/capabilities.md) describes Turso as a separate immutable-envelope exchange while keeping local relational state canonical. It explicitly does not provide distributed leases, task stealing, automatic execution-owner failover, or artifact replication. Those limits mean the adapter does not solve Oompa's coordination authority problem.
 
-HRA already has local SQLite transactions, encrypted Convex projections, authenticated device state, server-time execution leases, remote-command fencing, quota enforcement, retention, revocation, and erasure. A Turso adjunct would add a second credential boundary, replication protocol, conflict model, retention policy, deletion surface, and network truth without removing an existing authority.
+Oompa already has local SQLite transactions, encrypted Convex projections, authenticated device state, server-time execution leases, remote-command fencing, quota enforcement, retention, revocation, and erasure. A Turso adjunct would add a second credential boundary, replication protocol, conflict model, retention policy, deletion surface, and network truth without removing an existing authority.
 
 The store boundary is the future storage seam. Reconsider Turso only when a concrete server-side SQL consumer exists and the design specifies tenancy, authentication, encryption, conditional writes, retention, export, erasure, conflict handling, and credential custody. Evaluate it then as a replacement authority or immutable export transport, not as a second canonical store beside SQLite and Convex.
 
 ## Adapted and rejected ideas
 
-| Source concept | HRA decision |
+| Source concept | Oompa decision |
 | --- | --- |
 | Durable state outlives a process or model context | Adopt for work, attempts, submissions, reviews, signals, and receipts |
-| Agent identity is separate from finite task identity | Adopt by treating the existing HRA session as actor and task as work |
+| Agent identity is separate from finite task identity | Adopt by treating the existing Oompa session as actor and task as work |
 | Parent, child, and sibling relationships are explicit | Adopt as task and attempt edges, never folders, labels, process IDs, or terminal state |
-| Request-before-effect execution and explicit unknown outcomes | Adopt through existing HRA mutation journals and new work receipts |
+| Request-before-effect execution and explicit unknown outcomes | Adopt through existing Oompa mutation journals and new work receipts |
 | Stable handles, atomic fanout admission, and idempotent replay | Adopt with bounded UUIDv7 receipts and independent provider effects |
 | Structured results and independent review | Adopt as submissions and reviews; shape validity is not factual proof |
 | Durable mailbox with queue and steer | Adopt through signals composed with existing session operations |
-| Bounded goals, deadlines, gates, schedules, and budgets | Adopt objectives, timing, attempt limits, concurrency, and HRA-owned gates; defer recurring schedules until wake revisions are complete; provider token usage remains observational |
+| Bounded goals, deadlines, gates, schedules, and budgets | Adopt objectives, timing, attempt limits, concurrency, and Oompa-owned gates; defer recurring schedules until wake revisions are complete; provider token usage remains observational |
 | Cursor-based recovery and compact derived context | Adopt one work-scoped stream and bounded accepted-result summaries with evidence references |
 | Persistent TypeScript REPL and model loop | Reject because Codex owns execution, context, and tools |
-| Direct OpenAI, Anthropic, or Gateway provider layer | Reject because HRA is a Codex-subscription control plane |
-| Generic shell, SQL, file, dynamic tool, or RPC surface | Reject; HRA exposes closed domain commands and Codex owns tools |
+| Direct OpenAI, Anthropic, or Gateway provider layer | Reject because Oompa is a Codex-subscription control plane |
+| Generic shell, SQL, file, dynamic tool, or RPC surface | Reject; Oompa exposes closed domain commands and Codex owns tools |
 | Separate transcript, raw reasoning, or arbitrary tool-output archive | Reject |
 | Separate agent catalog or profile-learning system | Reject; sessions, Codex skills, and repository instructions remain authoritative |
 | Human TUI, web observer, city metaphor, or workflow editor | Reject for the agent-only coordination surface |
@@ -338,7 +338,7 @@ The store boundary is the future storage seam. Reconsider Turso only when a conc
 | Exact account routing | Supported | Route resolves to one account and project; no implicit fallback |
 | Atomic claim and claim-next | Supported | Local compare-and-swap with monotonic task fence |
 | Atomic fanout admission | Supported | All attempts reserved or none; provider execution remains independent |
-| Codex session dispatch | Supported | Binds one already-existing exact actor session and reuses journaled HRA turn start under its account generation |
+| Codex session dispatch | Supported | Binds one already-existing exact actor session and reuses journaled Oompa turn start under its account generation |
 | Attempt renewal and recovery | Supported | Exact actor, fence, revision, lease, and effect reconciliation |
 | Structured submission and review | Supported | Bounded schemas, immutable evidence references, independent review where required |
 | Joined-participant signals | Supported | Capability-scoped work mailbox; optional delivery through existing queue or steer |
@@ -348,7 +348,7 @@ The store boundary is the future storage seam. Reconsider Turso only when a conc
 | Bounded work wait | Conditional | Only predicates with transactionally complete revision and lost-wake proof |
 | Not-before time and deadline | Supported | Daemon clock locally; no claim based solely on another device's wall clock |
 | Recurring schedule or autonomous wake | Deferred | Requires durable tick identity, coalescing, and transactionally complete wake revision |
-| Token or quota budget enforcement | Observational | HRA reports provider observations; it does not pool subscriptions or invent reserved provider quota |
+| Token or quota budget enforcement | Observational | Oompa reports provider observations; it does not pool subscriptions or invent reserved provider quota |
 | Encrypted multi-device projection | Conditional | Extends existing Convex projection after local correctness; local authority remains complete |
 | Remote work command submission | Conditional | Routed to exact execution custodian through existing encrypted command authority |
 | Cross-device task claim or provider takeover | Unavailable | One machine remains the fenced session executor |

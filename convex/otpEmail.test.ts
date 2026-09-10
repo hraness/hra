@@ -3,49 +3,49 @@ import { describe, expect, spyOn, test } from "bun:test";
 import type { CanonicalAuthEmail } from "../src/cloud/authCredentials";
 import { authOtpLifetimeMs } from "./authPolicy";
 import {
-  buildHraOtpEmailPayload,
+  buildOompaOtpEmailPayload,
   sendOtpEmail,
 } from "./otpEmail";
 import {
-  defaultHraOtpReplyTo,
-  hraOtpEmailFrom,
-  hraOtpReplyToEnvironmentName,
-  isHraOtpReplyTo,
-  resolveHraOtpReplyTo,
+  defaultOompaOtpReplyTo,
+  oompaOtpEmailFrom,
+  oompaOtpReplyToEnvironmentName,
+  isOompaOtpReplyTo,
+  resolveOompaOtpReplyTo,
 } from "./otpEmailConfig";
 import {
-  hraAttentionResendApiKeyEnvironmentName,
-  hraResendApiKeyEnvironmentName,
-  requireHraResendApiKey,
+  oompaAttentionResendApiKeyEnvironmentName,
+  oompaResendApiKeyEnvironmentName,
+  requireOompaResendApiKey,
 } from "./resendApiKey";
 
 const email = "reader@example.com" as CanonicalAuthEmail;
 const now = 1_787_968_800_000;
 
-describe("HRA OTP email delivery", () => {
+describe("Oompa OTP email delivery", () => {
   test("keeps the authentication accessor independent of attention readiness", () => {
     const authKey = "re_auth_fixture";
     for (const attentionKey of [undefined, "invalid", authKey, "re_attention_fixture"]) {
-      expect(requireHraResendApiKey({
-        [hraResendApiKeyEnvironmentName]: authKey,
-        [hraAttentionResendApiKeyEnvironmentName]: attentionKey,
+      expect(requireOompaResendApiKey({
+        [oompaResendApiKeyEnvironmentName]: authKey,
+        [oompaAttentionResendApiKeyEnvironmentName]: attentionKey,
       })).toBe(authKey);
     }
     // Preserve the existing OTP validation boundary rather than tightening it
     // indirectly when the separate attention credential contract changes.
-    expect(requireHraResendApiKey({
-      [hraResendApiKeyEnvironmentName]: "re_legacy.key",
+    expect(requireOompaResendApiKey({
+      [oompaResendApiKeyEnvironmentName]: "re_legacy.key",
     })).toBe("re_legacy.key");
-    expect(() => requireHraResendApiKey({
-      [hraAttentionResendApiKeyEnvironmentName]: "re_attention_fixture",
+    expect(() => requireOompaResendApiKey({
+      [oompaAttentionResendApiKeyEnvironmentName]: "re_attention_fixture",
     })).toThrow("Email delivery is unavailable.");
   });
 
   test("sends authentication mail with only the auth key even when attention is unavailable", async () => {
     const names = [
-      hraResendApiKeyEnvironmentName,
-      hraAttentionResendApiKeyEnvironmentName,
-      hraOtpReplyToEnvironmentName,
+      oompaResendApiKeyEnvironmentName,
+      oompaAttentionResendApiKeyEnvironmentName,
+      oompaOtpReplyToEnvironmentName,
     ] as const;
     const previous = names.map((name) => [name, process.env[name]] as const);
     const authKey = "re_auth_test";
@@ -58,12 +58,12 @@ describe("HRA OTP email delivery", () => {
       { preconnect: () => undefined },
     ));
     try {
-      process.env[hraResendApiKeyEnvironmentName] = authKey;
-      Reflect.deleteProperty(process.env, hraOtpReplyToEnvironmentName);
+      process.env[oompaResendApiKeyEnvironmentName] = authKey;
+      Reflect.deleteProperty(process.env, oompaOtpReplyToEnvironmentName);
       for (const attentionKey of [undefined, "invalid", authKey, "re_attention_fixture"]) {
         if (attentionKey === undefined) {
-          Reflect.deleteProperty(process.env, hraAttentionResendApiKeyEnvironmentName);
-        } else process.env[hraAttentionResendApiKeyEnvironmentName] = attentionKey;
+          Reflect.deleteProperty(process.env, oompaAttentionResendApiKeyEnvironmentName);
+        } else process.env[oompaAttentionResendApiKeyEnvironmentName] = attentionKey;
         await sendOtpEmail({
           email,
           expiresAt: Date.now() + authOtpLifetimeMs,
@@ -71,7 +71,7 @@ describe("HRA OTP email delivery", () => {
         });
       }
       expect(authorizations).toEqual(Array.from({ length: 4 }, () => `Bearer ${authKey}`));
-      Reflect.deleteProperty(process.env, hraResendApiKeyEnvironmentName);
+      Reflect.deleteProperty(process.env, oompaResendApiKeyEnvironmentName);
       await expect(sendOtpEmail({
         email,
         expiresAt: Date.now() + authOtpLifetimeMs,
@@ -88,32 +88,32 @@ describe("HRA OTP email delivery", () => {
   });
 
   test("pins the auth-subdomain sender and uses the receive-capable fallback", () => {
-    expect(buildHraOtpEmailPayload({
+    expect(buildOompaOtpEmailPayload({
       email,
       expiresAt: now + authOtpLifetimeMs,
       token: "12345678",
     }, {
       environment: {
-        HRA_AUTH_EMAIL_FROM: "Attacker <attacker@example.com>",
+        OOMPA_AUTH_EMAIL_FROM: "Attacker <attacker@example.com>",
       },
       now,
     })).toEqual({
-      from: hraOtpEmailFrom,
-      reply_to: defaultHraOtpReplyTo,
-      subject: "Your HRA sign-in code",
+      from: oompaOtpEmailFrom,
+      reply_to: defaultOompaOtpReplyTo,
+      subject: "Your Oompa sign-in code",
       text: [
-        "Your HRA sign-in code is 12345678.",
+        "Your Oompa sign-in code is 12345678.",
         "",
         "It expires in 10 minutes. If you did not request it, you can ignore this email.",
       ].join("\n"),
       to: [email],
     });
-    expect(hraOtpEmailFrom).toBe("HRA sign-in <hra@auth.hraness.com>");
+    expect(oompaOtpEmailFrom).toBe("Oompa sign-in <oompa@auth.hraness.com>");
   });
 
   test("accepts one canonical configured reply mailbox and rejects unsafe values", () => {
-    expect(resolveHraOtpReplyTo({
-      [hraOtpReplyToEnvironmentName]: "support@example.com",
+    expect(resolveOompaOtpReplyTo({
+      [oompaOtpReplyToEnvironmentName]: "support@example.com",
     })).toBe("support@example.com" as CanonicalAuthEmail);
 
     for (const value of [
@@ -124,20 +124,20 @@ describe("HRA OTP email delivery", () => {
       "o'hare@example.com",
       "support@example.com\r\nBcc: attacker@example.com",
     ]) {
-      expect(isHraOtpReplyTo(value)).toBe(false);
-      expect(() => resolveHraOtpReplyTo({
-        [hraOtpReplyToEnvironmentName]: value,
+      expect(isOompaOtpReplyTo(value)).toBe(false);
+      expect(() => resolveOompaOtpReplyTo({
+        [oompaOtpReplyToEnvironmentName]: value,
       })).toThrow("Email delivery is unavailable.");
     }
   });
 
   test("fails closed when the OTP request itself is malformed", () => {
-    expect(() => buildHraOtpEmailPayload({
+    expect(() => buildOompaOtpEmailPayload({
       email,
       expiresAt: now + authOtpLifetimeMs,
       token: "1234567",
     }, { environment: {}, now })).toThrow("Email delivery is unavailable.");
-    expect(() => buildHraOtpEmailPayload({
+    expect(() => buildOompaOtpEmailPayload({
       email,
       expiresAt: now,
       token: "12345678",

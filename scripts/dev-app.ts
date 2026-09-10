@@ -28,9 +28,9 @@ import {
 } from "./build-app.ts";
 import { APP_SOURCE_MARKER_PATH } from "./app-source-marker.ts";
 
-export const HRA_DEV_HOST = "127.0.0.1";
-export const HRA_DEV_PORT = 5183;
-export const HRA_DEV_PREFIX = "/_hra_dev";
+export const OOMPA_DEV_HOST = "127.0.0.1";
+export const OOMPA_DEV_PORT = 5183;
+export const OOMPA_DEV_PREFIX = "/_hra_dev";
 
 const MAX_INPUT_FILES = 4096;
 const MAX_INPUT_DIRECTORIES = 512;
@@ -42,7 +42,7 @@ const DEV_CHILD_GRACE_MS = 2_000;
 const DEV_POLL_MS = 350;
 const DEV_RECEIPT_SCHEMA_VERSION = 2;
 
-export const HRA_DEV_CACHE_LIMITS = Object.freeze({
+export const OOMPA_DEV_CACHE_LIMITS = Object.freeze({
   bytes: 2 * 1024 * 1024 * 1024,
   directories: 4096,
   files: 32_768,
@@ -715,7 +715,7 @@ export async function inspectDevCache(root: string): Promise<DevCacheCensus> {
   let directories = 0;
   let files = 0;
   async function walk(path: string, depth: number): Promise<void> {
-    assert.ok(++directories <= HRA_DEV_CACHE_LIMITS.directories && depth <= 20, "Development cache directory bound exceeded");
+    assert.ok(++directories <= OOMPA_DEV_CACHE_LIMITS.directories && depth <= 20, "Development cache directory bound exceeded");
     await assertOwnedDirectory(path);
     const stream = await opendir(path);
     for await (const entry of stream) {
@@ -726,10 +726,10 @@ export async function inspectDevCache(root: string): Promise<DevCacheCensus> {
       else {
         assertOwnedEntry(metadata, false);
         files += 1;
-        assert.ok(files <= HRA_DEV_CACHE_LIMITS.files, "Development cache file bound exceeded");
+        assert.ok(files <= OOMPA_DEV_CACHE_LIMITS.files, "Development cache file bound exceeded");
         assert.ok(metadata.size <= MAX_INPUT_FILE_BYTES, "Development cache file bound exceeded");
         bytes += metadata.size;
-        assert.ok(bytes <= HRA_DEV_CACHE_LIMITS.bytes, "Development cache byte bound exceeded");
+        assert.ok(bytes <= OOMPA_DEV_CACHE_LIMITS.bytes, "Development cache byte bound exceeded");
       }
     }
   }
@@ -748,11 +748,11 @@ export async function inspectDevCache(root: string): Promise<DevCacheCensus> {
 }
 
 export function assertDevCacheCapacity(census: DevCacheCensus): void {
-  if (census.runs >= HRA_DEV_CACHE_LIMITS.runs
-    || census.revisions >= HRA_DEV_CACHE_LIMITS.revisions
-    || census.files + HRA_DEV_CACHE_LIMITS.reserveFiles > HRA_DEV_CACHE_LIMITS.files
-    || census.directories + HRA_DEV_CACHE_LIMITS.reserveDirectories > HRA_DEV_CACHE_LIMITS.directories
-    || census.bytes + HRA_DEV_CACHE_LIMITS.reserveBytes > HRA_DEV_CACHE_LIMITS.bytes) {
+  if (census.runs >= OOMPA_DEV_CACHE_LIMITS.runs
+    || census.revisions >= OOMPA_DEV_CACHE_LIMITS.revisions
+    || census.files + OOMPA_DEV_CACHE_LIMITS.reserveFiles > OOMPA_DEV_CACHE_LIMITS.files
+    || census.directories + OOMPA_DEV_CACHE_LIMITS.reserveDirectories > OOMPA_DEV_CACHE_LIMITS.directories
+    || census.bytes + OOMPA_DEV_CACHE_LIMITS.reserveBytes > OOMPA_DEV_CACHE_LIMITS.bytes) {
     throw new DevCapacityError(
       "The retained compiled-development cache reached its reviewed bound; stop the server and review tmp/build-app/dev before removing any revision",
     );
@@ -764,11 +764,11 @@ function assertDevPublicationCapacity(
   createsRevision: boolean,
   receiptBytes: number,
 ): void {
-  if (census.runs > HRA_DEV_CACHE_LIMITS.runs
-    || census.revisions + (createsRevision ? 1 : 0) > HRA_DEV_CACHE_LIMITS.revisions
-    || census.files + 1 > HRA_DEV_CACHE_LIMITS.files
-    || census.directories > HRA_DEV_CACHE_LIMITS.directories
-    || census.bytes + receiptBytes > HRA_DEV_CACHE_LIMITS.bytes) {
+  if (census.runs > OOMPA_DEV_CACHE_LIMITS.runs
+    || census.revisions + (createsRevision ? 1 : 0) > OOMPA_DEV_CACHE_LIMITS.revisions
+    || census.files + 1 > OOMPA_DEV_CACHE_LIMITS.files
+    || census.directories > OOMPA_DEV_CACHE_LIMITS.directories
+    || census.bytes + receiptBytes > OOMPA_DEV_CACHE_LIMITS.bytes) {
     throw new DevCapacityError(
       "The completed development build cannot fit its exact publication receipt; preserve the retained cache for review",
     );
@@ -1484,7 +1484,7 @@ export class DevBuildCoordinator {
         }
         const diagnostic = genericDiagnostic(error);
         this.#setStatus(error instanceof DevCapacityError ? "capacity-blocked" : "degraded", diagnostic);
-        if (error instanceof Error) console.error(`HRA compiled development build failed: ${error.message.slice(0, MAX_DIAGNOSTIC_BYTES)}`);
+        if (error instanceof Error) console.error(`Oompa compiled development build failed: ${error.message.slice(0, MAX_DIAGNOSTIC_BYTES)}`);
       } finally {
         if (this.#activeController === controller) this.#activeController = undefined;
       }
@@ -1565,10 +1565,10 @@ export function createDevRequestHandler(options: Readonly<{
     if (latest === null) {
       const headers = responseHeaders(options.securityHeaders, "no-store");
       headers.set("Content-Type", "text/plain; charset=utf-8");
-      return new Response("HRA is compiling its first complete development graph.\n", { headers, status: 503 });
+      return new Response("Oompa is compiling its first complete development graph.\n", { headers, status: 503 });
     }
     const headers = responseHeaders(options.securityHeaders, "no-store");
-    headers.set("Location", `${HRA_DEV_PREFIX}/${latest}/${url.search}`);
+    headers.set("Location", `${OOMPA_DEV_PREFIX}/${latest}/${url.search}`);
     return new Response(null, { headers, status: 307 });
   };
 
@@ -1595,15 +1595,15 @@ export function createDevRequestHandler(options: Readonly<{
       headers.set("Content-Type", contentType(path));
       return new Response(request.method === "HEAD" ? null : Uint8Array.from(bytes), { headers });
     } catch (error) {
-      console.error(`HRA immutable development artifact failed revalidation: ${error instanceof Error ? error.message.slice(0, MAX_DIAGNOSTIC_BYTES) : "unknown error"}`);
+      console.error(`Oompa immutable development artifact failed revalidation: ${error instanceof Error ? error.message.slice(0, MAX_DIAGNOSTIC_BYTES) : "unknown error"}`);
       return new Response(null, { headers: responseHeaders(options.securityHeaders, "no-store"), status: 500 });
     }
   };
 
   return async (request: Request): Promise<Response> => {
     const url = new URL(request.url);
-    if (url.protocol !== "http:" || url.hostname !== HRA_DEV_HOST
-      || url.port !== String(HRA_DEV_PORT) || url.username !== "" || url.password !== "") {
+    if (url.protocol !== "http:" || url.hostname !== OOMPA_DEV_HOST
+      || url.port !== String(OOMPA_DEV_PORT) || url.username !== "" || url.password !== "") {
       return new Response(null, { headers: responseHeaders(options.securityHeaders, "no-store"), status: 421 });
     }
     if (request.method !== "GET" && request.method !== "HEAD") {
@@ -1621,10 +1621,10 @@ export function createDevRequestHandler(options: Readonly<{
       return serveRevisionArtifact(request, latest, APP_SOURCE_MARKER_PATH);
     }
     if (url.pathname === "/" || url.pathname === "/index.html"
-      || url.pathname === `${HRA_DEV_PREFIX}/latest` || url.pathname === `${HRA_DEV_PREFIX}/latest/`) {
+      || url.pathname === `${OOMPA_DEV_PREFIX}/latest` || url.pathname === `${OOMPA_DEV_PREFIX}/latest/`) {
       return redirectLatest(url);
     }
-    if (url.pathname === `${HRA_DEV_PREFIX}/status.json`) {
+    if (url.pathname === `${OOMPA_DEV_PREFIX}/status.json`) {
       const body = `${JSON.stringify(options.getStatus())}\n`;
       const headers = responseHeaders(options.securityHeaders, "no-store");
       headers.set("Content-Type", "application/json; charset=utf-8");
@@ -1706,17 +1706,17 @@ async function runDevelopmentServer(): Promise<void> {
     server = Bun.serve({
       development: false,
       fetch: handler,
-      hostname: HRA_DEV_HOST,
-      port: HRA_DEV_PORT,
+      hostname: OOMPA_DEV_HOST,
+      port: OOMPA_DEV_PORT,
       reusePort: false,
     });
   } catch (error) {
     devLock.release();
     throw error;
   }
-  assert.equal(server.hostname, HRA_DEV_HOST, "Development server did not bind the loopback host");
-  assert.equal(server.port, HRA_DEV_PORT, "Development server did not bind the fixed port");
-  console.log(`HRA compiled development server bound http://${HRA_DEV_HOST}:${String(HRA_DEV_PORT)}/ before its first build.`);
+  assert.equal(server.hostname, OOMPA_DEV_HOST, "Development server did not bind the loopback host");
+  assert.equal(server.port, OOMPA_DEV_PORT, "Development server did not bind the fixed port");
+  console.log(`Oompa compiled development server bound http://${OOMPA_DEV_HOST}:${String(OOMPA_DEV_PORT)}/ before its first build.`);
   try {
     try {
       spec = await defaultDevInputSpec(root);
@@ -1728,9 +1728,9 @@ async function runDevelopmentServer(): Promise<void> {
         build: (snapshot, signal) => runBuildChild(root, cache, devLock, snapshot, signal),
         currentSnapshot,
         onStatus: (status) => {
-          if (status.phase === "ready" && status.diagnostic === null) console.log(`HRA development revision ready: ${status.latest ?? "unknown"}. Refresh the page to load it.`);
-          if (status.phase === "restart-required") console.error("HRA development dependencies changed. Restart dev:app; no install was attempted.");
-          if (status.phase === "capacity-blocked") console.error("HRA development cache is full. Stop dev:app and review tmp/build-app/dev before cleanup.");
+          if (status.phase === "ready" && status.diagnostic === null) console.log(`Oompa development revision ready: ${status.latest ?? "unknown"}. Refresh the page to load it.`);
+          if (status.phase === "restart-required") console.error("Oompa development dependencies changed. Restart dev:app; no install was attempted.");
+          if (status.phase === "capacity-blocked") console.error("Oompa development cache is full. Stop dev:app and review tmp/build-app/dev before cleanup.");
         },
         publish: (candidate, snapshot, signal) => publishDevCandidate({
           cache,
@@ -1763,7 +1763,7 @@ async function runDevelopmentServer(): Promise<void> {
         ).finally(() => { polling = false; });
       }, DEV_POLL_MS);
     } catch (error) {
-      console.error(`HRA development initialization requires restart: ${error instanceof Error ? error.message.slice(0, MAX_DIAGNOSTIC_BYTES) : "unknown error"}`);
+      console.error(`Oompa development initialization requires restart: ${error instanceof Error ? error.message.slice(0, MAX_DIAGNOSTIC_BYTES) : "unknown error"}`);
       coordinator = new DevBuildCoordinator({
         build: async () => { throw new Error("Development initialization failed"); },
         currentSnapshot: async () => { throw new Error("Development initialization failed"); },

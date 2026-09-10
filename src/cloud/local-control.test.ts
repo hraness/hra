@@ -34,6 +34,7 @@ import {
   createLocalCloudControlFromEnvironment,
   createCloudUuidV7,
   deploymentFencedCloudTransport,
+  deploymentUrlFromEnvironment,
   LocalCloudControl,
   type CloudSecretCustodyPort,
 } from "./local-control";
@@ -1096,7 +1097,7 @@ describe("local cloud control", () => {
         deviceClass: "daemon",
         fingerprint: await fingerprintOf(cloud, paired.device.publicId),
         keyVersion: 1,
-        label: `HRA device ${paired.device.publicId.slice(-8)}`,
+        label: `Oompa device ${paired.device.publicId.slice(-8)}`,
         labelSource: "encrypted",
         lastSeenAt: fixedNow,
         online: true,
@@ -1188,7 +1189,7 @@ describe("local cloud control", () => {
     };
 
     await expect(fixture.control.status(signal))
-      .rejects.toThrow("Cloud identity selection changed; restart HRA.");
+      .rejects.toThrow("Cloud identity selection changed; restart Oompa.");
     expect(switched).toBe(true);
   });
 
@@ -1210,7 +1211,7 @@ describe("local cloud control", () => {
     };
 
     await expect(fixture.control.listDevices(signal))
-      .rejects.toThrow("Cloud identity selection changed; restart HRA.");
+      .rejects.toThrow("Cloud identity selection changed; restart Oompa.");
     expect(cycled).toBe(true);
     expect((await IdentityScopedCloudSecretCustody.open(raw)).activeUserPublicId)
       .toBe("user_identity_a");
@@ -1504,7 +1505,7 @@ describe("local cloud control", () => {
     expect(reopened.activeUserPublicId).toBe("user_identity_a");
   });
 
-  test("forwards first-admission invites only to the HRA OTP provider", async () => {
+  test("forwards first-admission invites only to the Oompa OTP provider", async () => {
     const cloud = new FakeCloud();
     const adapter = control(cloud, new MemoryCustody());
     const invite = `hra_invite_identity_v1_${"A".repeat(43)}`;
@@ -1514,7 +1515,7 @@ describe("local cloud control", () => {
       params: { email: "reader@example.com", invite },
       provider: "hra-control-plane-otp-v1",
     }]);
-    expect(JSON.stringify(cloud.authAttempts)).not.toContain(["hra", "otp"].join("-"));
+    expect(JSON.stringify(cloud.authAttempts)).not.toContain(["oompa", "otp"].join("-"));
   });
 
   test("uses the release deployment by default and honors an explicit empty disable", async () => {
@@ -1530,6 +1531,31 @@ describe("local cloud control", () => {
     })).toBeNull();
   });
 
+  test("forward cloud aliases select locally and conflicts refuse custody and transport", async () => {
+    expect(deploymentUrlFromEnvironment({ OOMPA_CONVEX_URL: testDeploymentUrl })).toBe(testDeploymentUrl);
+    expect(deploymentUrlFromEnvironment({ OOMPA_CONVEX_URL: " " })).toBeNull();
+    const custody = new MemoryCustody();
+    let effects = 0;
+    const rejectEffect = async (): Promise<never> => { effects++; throw new Error("Unexpected cloud effect."); };
+    const transport: CloudTransport = { action: rejectEffect, mutation: rejectEffect, query: rejectEffect };
+    for (const deploymentAuthority of [undefined, { ...testDeploymentAuthority, assertCurrent: rejectEffect }]) {
+      await expect(createLocalCloudControlFromEnvironment({
+        environment: { OOMPA_CONVEX_URL: testDeploymentUrl, HRA_CONVEX_URL: `${testDeploymentUrl}/` },
+        secretCustody: custody,
+        transport,
+        ...(deploymentAuthority === undefined ? {} : { deploymentAuthority }),
+      })).rejects.toThrow("must be byte-identical");
+      expect(custody.reads).toEqual([]);
+      expect([...custody.values]).toEqual([]);
+      expect(effects).toBe(0);
+    }
+    const selected = await createLocalCloudControlFromEnvironment({
+      environment: { OOMPA_CONVEX_URL: testDeploymentUrl }, secretCustody: custody, transport,
+    });
+    expect(selected).toBeInstanceOf(LocalCloudControl);
+    expect(effects).toBe(0);
+  });
+
   test("refuses implicit migration of legacy auth custody before transport", async () => {
     const custody = new MemoryCustody();
     custody.values.set("cloud-auth", { generation: 0, value: "legacy-auth" });
@@ -1543,7 +1569,7 @@ describe("local cloud control", () => {
       environment: {},
       secretCustody: custody,
       transport,
-    })).rejects.toThrow("requires an explicit HRA_CONVEX_URL");
+    })).rejects.toThrow("requires an explicit OOMPA_CONVEX_URL");
     expect(transportCalls).toBe(0);
     expect(custody.values.has("cloud-deployment-authority")).toBe(false);
   });
@@ -2477,7 +2503,7 @@ describe("local cloud control", () => {
     expect(custody.values.has("cloud-auth-logout")).toBe(false);
   });
 
-  test("fails closed before reusing another HRA identity's local custody", async () => {
+  test("fails closed before reusing another Oompa identity's local custody", async () => {
     const firstCloud = new FakeCloud("user_first000");
     const custody = new MemoryCustody();
     const first = control(firstCloud, custody);
@@ -2489,7 +2515,7 @@ describe("local cloud control", () => {
     const second = control(secondCloud, custody);
     await authenticate(second);
     const protectedBefore = new Map([...custody.values].filter(([slot]) => slot !== "cloud-auth"));
-    await expect(second.pairDevice(signal)).rejects.toThrow("different HRA identity");
+    await expect(second.pairDevice(signal)).rejects.toThrow("different Oompa identity");
     expect(new Map([...custody.values].filter(([slot]) => slot !== "cloud-auth"))).toEqual(protectedBefore);
     expect(secondCloud.registrationAttempts).toHaveLength(0);
 
@@ -2966,7 +2992,7 @@ describe("local cloud control", () => {
     await authenticate(second);
     const protectedBefore = new Map([...custody.values].filter(([slot]) => slot !== "cloud-auth"));
     await expect(second.ensureDeviceRegistered(signal)).rejects.toThrow(
-      "different HRA identity",
+      "different Oompa identity",
     );
     expect(new Map([...custody.values].filter(([slot]) => slot !== "cloud-auth")))
       .toEqual(protectedBefore);

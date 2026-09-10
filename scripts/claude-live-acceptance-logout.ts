@@ -14,7 +14,7 @@ import {
 } from "../src/claude/index";
 import { profileIdSchema, type ProfileId } from "../src/domain/values";
 import { profilePaths } from "../src/storage/paths";
-import { HRA_VERSION } from "../src/version";
+import { OOMPA_VERSION } from "../src/version";
 import { isBoundedProcessCleanupUnprovenError } from "./bounded-process";
 import type { CommandRunner } from "./configure-hosted-sync";
 import {
@@ -69,7 +69,7 @@ const preflightReceiptBaseSchema = z.object({
   phase: z.literal("preflight_complete"),
   candidate: z.object({
     cloudTargetDigest: digestSchema,
-    packageVersion: z.literal(HRA_VERSION),
+    packageVersion: z.literal(OOMPA_VERSION),
     sourceRevision: z.string().regex(/^[0-9a-f]{40}$/u),
   }).strict(),
   runId: z.string().uuid(),
@@ -417,7 +417,7 @@ export function createClaudeLiveAcceptanceLogout(options: Readonly<{
   const descriptor = acceptanceInstallationDescriptorSchema.parse(options.descriptor);
   const profileId = profileIdSchema.parse(options.profileId);
   const candidate = descriptor.candidate;
-  if (candidate === undefined || candidate.packageVersion !== HRA_VERSION) {
+  if (candidate === undefined || candidate.packageVersion !== OOMPA_VERSION) {
     throw new ClaudeLiveAcceptanceLogoutError("scope_refused");
   }
   const paths = createAcceptanceInstallation(descriptor).paths;

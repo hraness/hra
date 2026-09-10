@@ -2,7 +2,7 @@ import { useQuery } from "convex/react";
 import { useEffect, useRef, useState } from "react";
 
 import { useCustody } from "../custody/custody-context";
-import type { EncryptedEnvelope, SessionChunkAuthority, SyncStream } from "../hra/cloud";
+import type { EncryptedEnvelope, SessionChunkAuthority, SyncStream } from "../oompa/cloud";
 import { createCancellation } from "../lib/cancellation";
 import { chunkAuthority, chunksForStream } from "./chunks";
 import { getHead, getLatestChunks } from "./functions";

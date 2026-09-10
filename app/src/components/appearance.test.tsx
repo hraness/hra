@@ -3,7 +3,7 @@ import { parseHTML } from "linkedom";
 import { act, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
-import { bindHraAppearanceMenus, hraAppearanceStorageKey, initializeHraAppearance } from "../appearance";
+import { bindOompaAppearanceMenus, oompaAppearanceStorageKey, initializeOompaAppearance } from "../appearance";
 import { AppearanceButton, AppearanceHeader } from "./appearance";
 import { NativeAppearanceMenu } from "./appearance-menu";
 
@@ -11,7 +11,7 @@ const names = ["document", "Document", "DocumentFragment", "Element", "Event", "
 const globals = globalThis as unknown as Record<string, unknown>;
 const originals = new Map(names.map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
 let roots: Root[] = [];
-let bootstrap: ReturnType<typeof initializeHraAppearance> | undefined;
+let bootstrap: ReturnType<typeof initializeOompaAppearance> | undefined;
 let stopStatic: (() => void) | undefined;
 let values: Map<string, string>;
 let writes: number;
@@ -25,7 +25,7 @@ beforeEach(() => {
   const record = parsed.window as unknown as Record<string, unknown>;
   for (const name of names) globals[name] = name === "window" ? parsed.window : name === "document" ? parsed.document : record[name];
   globals.IS_REACT_ACT_ENVIRONMENT = true;
-  values = new Map([[hraAppearanceStorageKey, JSON.stringify({ palette: "gruvbox", mode: "light" })]]);
+  values = new Map([[oompaAppearanceStorageKey, JSON.stringify({ palette: "gruvbox", mode: "light" })]]);
   writes = 0;
   systemDark = false;
   systemListeners = new Set();
@@ -82,14 +82,14 @@ function choose(container: ParentNode, selector: string, value: string): void {
   select.dispatchEvent(new Event("change", { bubbles: true }));
 }
 function assertMenu(container: ParentNode, palette: string, mode: string): void {
-  expect(container.querySelector<HTMLSelectElement>("[data-hra-palette]")?.value).toBe(palette);
-  expect(container.querySelector<HTMLSelectElement>("[data-hra-mode]")?.value).toBe(mode);
+  expect(container.querySelector<HTMLSelectElement>("[data-oompa-palette]")?.value).toBe(palette);
+  expect(container.querySelector<HTMLSelectElement>("[data-oompa-mode]")?.value).toBe(mode);
   expect(container.querySelector("details")?.getAttribute("data-ready")).toBe("true");
 }
 
 test("the app header renders one last native control without a React palette provider", () => {
   const { document } = parseHTML(renderToStaticMarkup(<AppearanceHeader />));
-  const menu = document.querySelector("details[data-hra-appearance]")!;
+  const menu = document.querySelector("details[data-oompa-appearance]")!;
   expect(menu.closest("header")).not.toBeNull();
   expect(menu.parentElement?.nextElementSibling).toBeNull();
   expect(document.querySelectorAll("details").length).toBe(1);
@@ -100,16 +100,16 @@ test("the app header renders one last native control without a React palette pro
 });
 
 test("mounted native menus adopt first-paint preferences and release only their own references", () => {
-  bootstrap = initializeHraAppearance(document);
+  bootstrap = initializeOompaAppearance(document);
   const staticHost = document.getElementById("static")!;
   staticHost.innerHTML = renderToStaticMarkup(<NativeAppearanceMenu />);
   const first = mount("root");
   // Parsing may finish after React mounts. The static binder must skip app menus.
-  stopStatic = bindHraAppearanceMenus(document, bootstrap);
+  stopStatic = bindOompaAppearanceMenus(document, bootstrap);
   assertMenu(first, "gruvbox", "light");
   expect(document.documentElement.dataset.palette).toBe("gruvbox");
   const before = writes;
-  choose(first, "[data-hra-palette]", "rose-pine");
+  choose(first, "[data-oompa-palette]", "rose-pine");
   expect(writes - before).toBe(1);
   assertMenu(staticHost, "rose-pine", "light");
   const second = mount("other");
@@ -117,7 +117,7 @@ test("mounted native menus adopt first-paint preferences and release only their 
   expect(document.querySelectorAll('meta[name="theme-color"]:not([media])').length).toBe(1);
   expect(systemListeners.size).toBe(1);
 
-  const oldSelect = first.querySelector<HTMLSelectElement>("[data-hra-palette]")!;
+  const oldSelect = first.querySelector<HTMLSelectElement>("[data-oompa-palette]")!;
   const firstRoot = roots.shift()!;
   act(() => { firstRoot.unmount(); });
   expect(oldSelect.disabled).toBe(true);
@@ -125,16 +125,16 @@ test("mounted native menus adopt first-paint preferences and release only their 
   oldSelect.dispatchEvent(new Event("change", { bubbles: true }));
   expect(bootstrap.getSnapshot().preference.palette).toBe("rose-pine");
   expect(systemListeners.size).toBe(1);
-  choose(second, "[data-hra-mode]", "system");
+  choose(second, "[data-oompa-mode]", "system");
   systemDark = true;
   for (const listener of systemListeners) listener();
   expect(document.documentElement.dataset.theme).toBe("dark");
   assertMenu(second, "rose-pine", "system");
   assertMenu(mount("root"), "rose-pine", "system");
 
-  values.set(hraAppearanceStorageKey, JSON.stringify({ palette: "tokyo-night", mode: "light" }));
+  values.set(oompaAppearanceStorageKey, JSON.stringify({ palette: "tokyo-night", mode: "light" }));
   const event = new Event("storage");
-  Object.defineProperty(event, "key", { value: hraAppearanceStorageKey });
+  Object.defineProperty(event, "key", { value: oompaAppearanceStorageKey });
   window.dispatchEvent(event);
   assertMenu(second, "tokyo-night", "light");
   assertMenu(staticHost, "tokyo-night", "light");

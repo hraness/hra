@@ -104,7 +104,7 @@ function AuthGate() {
 /**
  * Authentication tokens live in `memoryTokenStorage`, never in `localStorage`.
  * A reload asks for a new one-time code and a closed tab leaves no refresh token
- * behind (HRA v2 F5).
+ * behind (Oompa v2 F5).
  */
 export function App() {
   return (

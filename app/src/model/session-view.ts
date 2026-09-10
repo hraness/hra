@@ -13,7 +13,7 @@ import type {
   CompactRemoteInteractionQuestion,
   CompactRemoteInteractionReasonCode,
   SessionStateValue,
-} from "../hra/cloud";
+} from "../oompa/cloud";
 
 export type SessionTone = "neutral" | "accent" | "attention" | "danger";
 

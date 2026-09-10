@@ -46,7 +46,7 @@ export type CanonicalMemoryHostedCreateResult = Readonly<{
  * Daemon-owned hosted-memory seam. Cloud implements transport and encryption;
  * the memory coordinator consumes only this project-scoped capability.
  */
-export interface HraCanonicalMemorySyncPort {
+export interface OompaCanonicalMemorySyncPort {
   createHostedSpace(input: Readonly<{
     idempotencyKey: string;
     projectId: string;

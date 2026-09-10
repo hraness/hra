@@ -154,7 +154,7 @@ function staticSiteFixture(sanitized = false) {
   const fontPaths = fontNames.map((path, index) => `graphs/foundation/assets/${path.split("/").at(-1)!.replace(".woff2", `-testhash${index}.woff2`).replace("[wght]", sanitized ? "_wght_" : "[wght]")}`);
   const css = fontPaths.map((path, index) => `@font-face{font-family:"Fixture ${index}";src:url("./${path.split("/").at(-1)}") format("woff2")}`).join("");
   const appearance = '<script src="/appearance.js"></script>';
-  const menu = '<header><details data-hra-appearance><summary>Appearance</summary></details></header>';
+  const menu = '<header><details data-oompa-appearance><summary>Appearance</summary></details></header>';
   const html = Buffer.from(`<!doctype html><html data-palette="catppuccin" data-theme="dark"><head><link rel="stylesheet" href="/${foundation}"><link rel="stylesheet" href="/stylex.css">${appearance}</head><body>${menu}<h1 class="x123">Fixture</h1></body></html>`);
   const inertHtml = Buffer.from(html.toString().replace(appearance, "").replace(menu, ""));
   const files = new Map<string, Buffer>([
@@ -178,7 +178,7 @@ describe("static site graph acceptance", () => {
         (html: string) => html.replace('src="/appearance.js"', 'defer src="/appearance.js"'),
         (html: string) => html.replace('data-palette="catppuccin"', 'data-palette="other"'),
         (html: string) => html.replace('data-theme="dark"', 'data-theme="light"'),
-        (html: string) => html.replace("data-hra-appearance", "data-unbound-appearance"),
+        (html: string) => html.replace("data-oompa-appearance", "data-unbound-appearance"),
       ]) {
         const fixture = staticSiteFixture();
         fixture.files.set(path, Buffer.from(mutate(fixture.html.toString())));
@@ -202,7 +202,7 @@ describe("static site graph acceptance", () => {
     const config = (site: string, preview: string) => ({ headers: [
       { source: "/((?!preview/?$|examples/app(?:/|$)).*)", headers: [{ key: "Content-Security-Policy", value: site }] },
       { source: "/preview/", headers: [{ key: "Content-Security-Policy", value: preview }] },
-      { source: "/examples/app/:path*", headers: [
+      { source: "/examples/app/:path(.*)", headers: [
         { key: "Content-Security-Policy", value: productPreviewCsp }, { key: "Access-Control-Allow-Origin", value: "*" },
         { key: "Permissions-Policy", value: "camera=(), geolocation=(), microphone=(), payment=(), usb=()" },
         { key: "Referrer-Policy", value: "no-referrer" }, { key: "X-Content-Type-Options", value: "nosniff" }, { key: "X-Robots-Tag", value: "noindex, nofollow" },
@@ -727,7 +727,7 @@ describe("browser acceptance boundaries", () => {
     }
   });
   test("hashes executable bytes separately and rejects linked or nonexecutable files", async () => {
-    const root = await mkdtemp(join(tmpdir(), "hra-browser-executable-test-"));
+    const root = await mkdtemp(join(tmpdir(), "oompa-browser-executable-test-"));
     try {
       const path = join(root, "browser");
       const bytes = "#!/bin/sh\nexit 0\n";

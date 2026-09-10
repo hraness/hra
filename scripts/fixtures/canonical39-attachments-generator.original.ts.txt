@@ -1,0 +1,380 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { existsSync, lstatSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdir } from "node:fs/promises";
+import { join, relative } from "node:path";
+import { pathToFileURL } from "node:url";
+import { gzipSync } from "node:zlib";
+import { Database } from "bun:sqlite";
+
+// Revised capture: retain the first public-StateStore-only request outputs;
+// this recipe uses the actual archived service input parser's reference order.
+// Separate exact canonical39 terminal send/steer capture. No prior images,
+// source rewrites, provider process, blob bytes, or current StateStore imports.
+// Raw unsafe names remain in request preimages and original manifests. Synthetic
+// receipts exercise archived public writers, never native execution authority.
+// RW reopen must preserve every row/schema; only RO claims physical byte identity.
+const root = import.meta.dir;
+const output = join(root, "attachments-capture2");
+const hash = (value: string | Uint8Array) => createHash("sha256").update(value).digest("hex");
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+  && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
+const record = (value: unknown): Record<string, unknown> => {
+  assert.equal(isRecord(value), true);
+  if (!isRecord(value)) throw new Error("Expected a plain record.");
+  return value;
+};
+const string = (value: unknown): string => {
+  assert.equal(typeof value, "string");
+  if (typeof value !== "string") throw new Error("Expected a string.");
+  return value;
+};
+const exactKeys = (value: Record<string, unknown>, keys: readonly string[]) =>
+  assert.deepEqual(Object.keys(value).sort(), [...keys].sort());
+// Reject private root prefixes in literal and decoded strings and in either
+// UTF-16 byte order, including prefixes starting at an odd SQLite byte offset.
+// No captured value is normalized, scrubbed, exempted, or repaired.
+const hostRoots = [
+  ["", "Users"], ["", "home"], ["", "private"], ["", "tmp"],
+  ["", "var", "folders"],
+].map((parts) => parts.join("/"));
+hostRoots.push(["", "Users"].join("\\"));
+const assertPrivatePathFree = (value: string | Uint8Array) => {
+  const bytes = typeof value === "string" ? Buffer.from(value, "utf8") : Buffer.from(value);
+  for (const prefix of hostRoots) {
+    for (const suffix of ["/", "\\", "\u0000", '"', "'"]) {
+      const text = prefix + suffix;
+      const littleEndian = Buffer.from(text, "utf16le");
+      const bigEndian = Buffer.from(littleEndian);
+      bigEndian.swap16();
+      assert.equal(bytes.includes(Buffer.from(text, "utf8")), false, "Private UTF-8 path refused.");
+      assert.equal(bytes.includes(littleEndian), false, "Private UTF-16LE path refused.");
+      assert.equal(bytes.includes(bigEndian), false, "Private UTF-16BE path refused.");
+    }
+    if (typeof value === "string") assert.equal(value === prefix || value.includes(prefix + "/") || value.includes(prefix + "\\"), false);
+  }
+};
+const assertDecodedPrivatePathFree = (value: unknown, depth = 0): void => {
+  assert.ok(depth <= 64);
+  if (typeof value === "string") { assertPrivatePathFree(value); return; }
+  if (value === null || typeof value === "number" || typeof value === "boolean") return;
+  if (Array.isArray(value)) {
+    assert.ok(value.length <= 4096);
+    for (const item of value) assertDecodedPrivatePathFree(item, depth + 1);
+    return;
+  }
+  const object = record(value);
+  for (const [key, item] of Object.entries(object)) {
+    assertPrivatePathFree(key);
+    assertDecodedPrivatePathFree(item, depth + 1);
+  }
+};
+assert.equal(Bun.version, "1.3.14");
+assert.equal(lstatSync(root).mode & 0o777, 0o700);
+assert.equal(existsSync(output), false, "Never overwrite or resume a capture.");
+const definitions = [
+  {
+    name: "canonical39", version: 39, sourceCommit: "5f2735191640037c86d9949bc1d7f04b2ef09ffe",
+    sourceTree: "12b4cec2c26b328e41d763ecca41c9a844d3dec3",
+    sourceFileCount: 282, sourceManifestSha256: "b4a34de0517950f4dc6bb2288c3f5ca79274551095a1aa63436c1099181e71fc",
+    sourceHashes: {
+      "src/storage/state-store.ts": "bde901608092489d89aa9acdfde320a0cf2959a6bd3659879cf7ac9dfab43e89",
+      "src/domain/runtime-profile.ts": "49305314d5619f828b685a8e45d5bd055719c7661e77db8ea9e44924de4f85b2",
+      "src/domain/presets.ts": "cde66c4106ee7f2961b8c959327cc277e056b761cf282d53738792d9d99e66de",
+      "package.json": "ef8779bd5fa796f395ad3d064710e247a89eb0cbd4023dc069b4daaad8e12d3c",
+      "bun.lock": "5a2b90063d8eb1aa55e18be71abbca59c1f051a9358a2a36ff89698d066b182a",
+    },
+    dependencies: { "@agentclientprotocol/sdk": "1.4.0", "@hraness/oh": "0.2.7", "@openai/codex": "0.153.2", convex: "1.45.0", zod: "4.4.3" },
+    model: "gpt-6-astra", interpretedPresetContract: 2,
+  },
+] as const;
+const readBounded = (path: string) => {
+  const stat = lstatSync(path);
+  assert.equal(stat.isFile(), true);
+  assert.ok(stat.size <= 8 * 1024 * 1024);
+  return readFileSync(path);
+};
+const originalDependencyManifests = new Map<string, string>();
+const verifySource = (definition: typeof definitions[number]) => {
+  const sourceRoot = join(root, definition.name);
+  assert.equal(lstatSync(sourceRoot).isDirectory(), true);
+  for (const [path, expected] of Object.entries(definition.sourceHashes)) {
+    assert.equal(hash(readBounded(join(sourceRoot, path))), expected, path);
+  }
+  const files: { path: string; sha256: string }[] = [];
+  const visit = (directory: string) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      assert.match(entry.name, /^[A-Za-z0-9_.-]+$/);
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) visit(path);
+      else if (entry.isFile()) files.push({ path: relative(sourceRoot, path), sha256: hash(readBounded(path)) });
+      else throw new Error("Unexpected source entry.");
+    }
+  };
+  visit(join(sourceRoot, "src"));
+  files.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+  assert.equal(files.length, definition.sourceFileCount);
+  assert.equal(hash(JSON.stringify(files)), definition.sourceManifestSha256);
+  const manifest = record(JSON.parse(readBounded(join(sourceRoot, "package.json")).toString("utf8")) as unknown);
+  const dependencies = record(manifest.dependencies);
+  assert.deepEqual(dependencies, definition.dependencies);
+  for (const [name, version] of Object.entries(definition.dependencies)) {
+    const installedBytes = readBounded(join(sourceRoot, "node_modules", name, "package.json"));
+    const installed = record(JSON.parse(installedBytes.toString("utf8")) as unknown);
+    assert.equal(string(installed.version), version);
+    const identity = `${definition.name}:${name}`;
+    const digest = hash(installedBytes);
+    const original = originalDependencyManifests.get(identity);
+    if (original === undefined) originalDependencyManifests.set(identity, digest);
+    else assert.equal(digest, original, "Archived dependency manifest changed.");
+  }
+  return files;
+};
+const snapshot = (path: string) => {
+  const database = new Database(path, { create: false, strict: true });
+  database.exec("PRAGMA query_only=ON");
+  try {
+    return database.transaction(() => {
+      const schema = database.query("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name LIMIT 2049").all()
+        .map((value: unknown) => {
+          const row = record(value);
+          exactKeys(row, ["type", "name", "tbl_name", "sql"]);
+          assert.ok(row.sql === null || typeof row.sql === "string");
+          return { type: string(row.type), name: string(row.name), tbl_name: string(row.tbl_name), sql: row.sql };
+        });
+      assert.ok(schema.length <= 2048);
+      const tables = database.query("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name LIMIT 257").all()
+        .map((value: unknown) => { const row = record(value); exactKeys(row, ["name"]); return { name: string(row.name) }; });
+      assert.ok(tables.length <= 256);
+      const rows: Record<string, unknown[]> = {};
+      for (const { name } of tables) {
+        assert.match(name, /^[A-Za-z0-9_]+$/);
+        rows[name] = database.query(`SELECT * FROM "${name}" LIMIT 4097`).all().map((value: unknown) => record(value))
+          .sort((a, b) => JSON.stringify(a) < JSON.stringify(b) ? -1 : JSON.stringify(a) > JSON.stringify(b) ? 1 : 0);
+        assert.ok(rows[name].length <= 4096);
+      }
+      const version = record(database.query("PRAGMA user_version").get());
+      exactKeys(version, ["user_version"]);
+      assert.equal(Number.isSafeInteger(version.user_version), true);
+      const result = { version, schema, rows,
+        foreignKeys: database.query("PRAGMA foreign_key_check").all(),
+        changes: database.query("SELECT total_changes() AS count").get() };
+      assert.deepEqual(result.foreignKeys, []);
+      assert.deepEqual(result.changes, { count: 0 });
+      assert.ok(Buffer.byteLength(JSON.stringify(result)) < 8 * 1024 * 1024);
+      assertDecodedPrivatePathFree(result);
+      return result;
+    }).deferred();
+  } finally { database.close(false); }
+};
+const checkpoint = (path: string): void => {
+  const database = new Database(path, { create: false, strict: true });
+  try {
+    const row = record(database.query("PRAGMA wal_checkpoint(TRUNCATE)").get());
+    exactKeys(row, ["busy", "log", "checkpointed"]);
+    assert.deepEqual(row, { busy: 0, log: 0, checkpointed: 0 });
+  } finally { database.close(false); }
+  if (existsSync(`${path}-wal`)) assert.equal(lstatSync(`${path}-wal`).size, 0);
+};
+
+
+for (const definition of definitions) verifySource(definition);
+const generatorSource = readBounded(import.meta.path).toString("utf8");
+const generatorSha256 = hash(generatorSource);
+assertPrivatePathFree(generatorSource);
+await mkdir(output, { mode: 0o700 });
+const summaries: unknown[] = [];
+for (const definition of definitions) {
+  const sourceRoot = join(root, definition.name);
+  const sourceFiles = verifySource(definition);
+  const { StateStore } = await import(pathToFileURL(join(sourceRoot, "src/storage/state-store.ts")).href);
+  const { initializeStatePaths, resolveStatePaths } = await import(pathToFileURL(join(sourceRoot, "src/storage/paths.ts")).href);
+  const { effectiveRuntimeProfileSchema } = await import(pathToFileURL(join(sourceRoot, "src/domain/runtime-profile.ts")).href);
+  const { attachmentReferenceListSchema } = await import(pathToFileURL(join(sourceRoot, "src/domain/attachment-schemas.ts")).href);
+  const { SESSION_CONVERSATION_AUTOMATION_CAPABILITY } = await import(pathToFileURL(join(sourceRoot, "src/domain/session-tasks.ts")).href);
+  assert.equal(SESSION_CONVERSATION_AUTOMATION_CAPABILITY, "hra.automation_update.v1");
+  for (const scenario of ["send", "steer"] as const) {
+    const directory = join(output, scenario);
+    await mkdir(directory, { mode: 0o700 });
+    const paths = resolveStatePaths({ rootDirectory: join(directory, "state") });
+    await initializeStatePaths(paths);
+    const now = 39_043;
+    const store = new StateStore(paths, { now: () => now });
+    const bootId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
+    const daemonGeneration = store.nextDaemonGeneration(bootId);
+    assert.equal(daemonGeneration, 1);
+    const profile = store.nextProfileGeneration(store.createProfile(`Synthetic historical attachment ${scenario}`).id);
+    assert.equal(profile.processGeneration, 1);
+    assert.equal(store.allocateNextUsageRevision(profile.id), 1);
+    assert.equal(store.setProfileState(profile.id, 1, "signed_in", { email: "historical-attachments@example.com", plan: "Plus" }), true);
+    // This public canonical directory is metadata only; never open its contents.
+    const project = await store.createProject("Synthetic historical attachment", "/opt/homebrew", true);
+    assert.equal(project.rootPath, "/opt/homebrew");
+    const runtime = effectiveRuntimeProfileSchema.parse({
+      profileId: profile.id, processGeneration: 1, observedAt: now, preset: "high",
+      model: definition.model, reasoningEffort: "max", serviceTier: null, fast: false,
+      approvalPolicy: "on-request", reviewMode: "auto_review", permissionProfile: ":workspace",
+      computerUse: true, pluginCapability: true, enabledApps: [],
+    });
+    const startKey = crypto.randomUUID();
+    const start = store.prepareMutation({ kind: "session.start", authorityId: profile.id,
+      authorityGeneration: 1, idempotencyKey: startKey,
+      request: { projectId: project.id, provider: "codex", preset: "high", fast: false } });
+    const starting = store.beginSessionStartEffect({
+      attemptId: start.id, profileId: profile.id, profileGeneration: 1,
+      projectId: project.id, provider: "codex", preset: "high", fastEnabled: false,
+      providerAuthentication: { profileId: profile.id, processGeneration: 1, provider: "codex", signedIn: true },
+      evidence: { kind: "session.start", projectId: project.id, clientMessageId: null,
+        messageDigest: null, runtimeProfile: runtime,
+        conversationAutomationCapability: SESSION_CONVERSATION_AUTOMATION_CAPABILITY },
+    });
+    const providerThreadId = `synthetic-historical-attachment-${scenario}`;
+    store.completeSessionStartEffect({
+      attemptId: start.id, sessionId: starting.id, expectedSessionRevision: starting.revision,
+      providerThreadId, state: "idle", providerUpdatedAt: now, runtimeProfile: runtime,
+      receipt: { sessionId: starting.id, sourceId: start.id, effectiveRuntimeProfile: runtime },
+    });
+    const appendUserMessage = (message: string, turnId: string) => store.appendSessionEvent({
+      sessionId: starting.id, accountId: profile.id, providerGeneration: 1, providerConnectionId: null,
+      body: { type: "user_message", turnId, actor: "human", text: message, omittedCharacters: 0 },
+    });
+    // A steer needs an actual archived active turn. Produce its primer through
+    // the same begin/complete APIs rather than retagging session or runtime rows.
+    let primerKey: string | null = null;
+    if (scenario === "steer") {
+      primerKey = crypto.randomUUID();
+      const message = "Synthetic archived primer";
+      const primer = store.prepareMutation({ kind: "session.send", authorityId: starting.id,
+        authorityGeneration: 1, idempotencyKey: primerKey, request: { message } });
+      store.beginSessionMutationEffect({
+        attemptId: primer.id, sessionId: starting.id, profileGeneration: 1,
+        evidence: { kind: "session.send", providerThreadId,
+          baseline: { providerUpdatedAt: now, status: "idle", activeTurnId: null },
+          clientMessageId: primer.id, messageDigest: hash(message), runtimeProfile: runtime },
+      });
+      store.completeSessionTurnEffect({
+        attemptId: primer.id, sessionId: starting.id,
+        expectedSessionRevision: store.requireSession(starting.id).revision,
+        applyResponseState: true, turnId: "synthetic-primer-turn", turnStatus: "inProgress",
+        runtimeProfile: runtime, receipt: { turnId: "synthetic-primer-turn", status: "inProgress",
+          sourceId: primer.id, effectiveRuntimeProfile: runtime },
+      });
+      appendUserMessage(message, "synthetic-primer-turn");
+    }
+    const rawNames = ["legacy\u2028notes.txt", "legacy\u2029notes.txt", "legacy�notes.txt"];
+    const body = "legacy body";
+    const attachments = attachmentReferenceListSchema.parse(rawNames.map((name) => ({
+      digest: hash(body), name, mediaType: "text/plain", byteLength: Buffer.byteLength(body),
+    })));
+    for (const reference of attachments) assert.deepEqual(Object.keys(reference), ["byteLength", "digest", "mediaType", "name"]);
+    const storedAttachments = attachments.map((attachment) => ({ ...attachment, canonicalMediaType: "text/plain" }));
+    const message = `Synthetic archived ${scenario} with exact unsafe names`;
+    const request = { message, attachments };
+    const key = crypto.randomUUID();
+    const kind = scenario === "send" ? "session.send" : "session.steer";
+    const attempt = store.prepareMutation({ kind, authorityId: starting.id,
+      authorityGeneration: 1, idempotencyKey: key, request });
+    const activeTurnId = scenario === "steer" ? "synthetic-primer-turn" : null;
+    const commonEvidence = {
+      kind, providerThreadId, baseline: { providerUpdatedAt: now,
+        status: scenario === "steer" ? "active" : "idle", activeTurnId },
+      clientMessageId: attempt.id, messageDigest: hash(message),
+    };
+    store.beginSessionMutationEffect({
+      attemptId: attempt.id, sessionId: starting.id, profileGeneration: 1,
+      evidence: scenario === "send"
+        ? { ...commonEvidence, runtimeProfile: runtime }
+        : { ...commonEvidence, activeTurnId },
+    });
+    store.recordMessageAttachments({
+      sessionId: starting.id, sourceId: attempt.id, attachments: storedAttachments,
+    });
+    const receipt = scenario === "send"
+      ? { turnId: "synthetic-attachment-turn", status: "completed", sourceId: attempt.id, effectiveRuntimeProfile: runtime }
+      : { steered: true, activeTurnId: "synthetic-primer-turn" };
+    if (scenario === "send") store.completeSessionTurnEffect({
+      attemptId: attempt.id, sessionId: starting.id,
+      expectedSessionRevision: store.requireSession(starting.id).revision, applyResponseState: true,
+      turnId: "synthetic-attachment-turn", turnStatus: "completed", runtimeProfile: runtime, receipt,
+    });
+    else assert.equal(store.transitionMutation(attempt.id, "effect_started", "applied", receipt), true);
+    appendUserMessage(message, scenario === "send" ? "synthetic-attachment-turn" : "synthetic-primer-turn");
+    const retained = store.readMutation(key);
+    const startRetained = store.readMutation(startKey);
+    const primerRetained = primerKey === null ? null : store.readMutation(primerKey);
+    const session = store.requireSession(starting.id);
+    const manifest = store.messageAttachmentManifest(starting.id, attempt.id);
+    assert.equal(retained.state, "applied");
+    assert.deepEqual(retained.result, receipt);
+    assert.equal(retained.requestDigest, hash(JSON.stringify({ kind, authorityId: starting.id, authorityGeneration: 1, request })));
+    assert.deepEqual(manifest.map((row: unknown) => string(record(row).name)), rawNames);
+    assert.equal(session.state, scenario === "send" ? "idle" : "active");
+    const capturedProfile = store.requireProfileById(profile.id);
+    store.close();
+    checkpoint(paths.database);
+    const before = snapshot(paths.database);
+    assert.deepEqual(before.version, { user_version: 39 });
+    assert.equal(before.rows.profiles?.length, 1);
+    assert.equal(before.rows.sessions?.length, 1);
+    assert.equal(before.rows.attachments?.length, 1);
+    assert.equal(before.rows.message_attachments?.length, 3);
+    assert.deepEqual(before.rows.message_attachments?.map((row) => string(record(row).name)).sort(), [...rawNames].sort());
+    assert.equal(before.rows.mutation_attempts?.length, scenario === "send" ? 2 : 3);
+    assert.equal(before.rows.mutation_effect_evidence?.length, scenario === "send" ? 2 : 3);
+    assert.equal(before.rows.usage_snapshots?.length, 0);
+    assert.equal(before.rows.usage_revision_authority?.length, 1);
+    for (const readonly of [false, true]) {
+      const beforeReopenSha256 = hash(readBounded(paths.database));
+      const reopened = new StateStore(paths, { now: () => now, readonly });
+      assert.deepEqual(reopened.readMutation(key), retained);
+      assert.deepEqual(reopened.readMutation(startKey), startRetained);
+      if (primerKey !== null) assert.deepEqual(reopened.readMutation(primerKey), primerRetained);
+      assert.deepEqual(reopened.requireSession(session.id), session);
+      assert.deepEqual(reopened.messageAttachmentManifest(session.id, attempt.id), manifest);
+      reopened.close();
+      checkpoint(paths.database);
+      assert.deepEqual(snapshot(paths.database), before, "Archived reopen changed producer evidence.");
+      if (readonly) assert.equal(hash(readBounded(paths.database)), beforeReopenSha256);
+    }
+    const databaseBytes = readBounded(paths.database);
+    assert.ok(databaseBytes.length <= 4 * 1024 * 1024);
+    assertPrivatePathFree(databaseBytes);
+    const compressed = gzipSync(databaseBytes, { level: 9 });
+    const metadata = {
+      ...definition, scenario, generatorSha256, generatorSource,
+      dependencyManifestSha256: Object.fromEntries(Object.keys(definition.dependencies).map((name) => {
+        const digest = originalDependencyManifests.get(`${definition.name}:${name}`);
+        assert.equal(typeof digest, "string"); return [name, digest];
+      })),
+      bootId, daemonGeneration, originalUnusedUsageRevision: 1, usageObservations: 0,
+      profile: capturedProfile, project, session, runtime, idempotencyKey: key,
+      request, attachments, rawNames, manifest, mutation: retained,
+      startIdempotencyKey: startKey, startMutation: startRetained,
+      primerIdempotencyKey: primerKey, primerMutation: primerRetained, expectedReceipt: receipt,
+      databaseBytes: databaseBytes.length, databaseSha256: hash(databaseBytes),
+      gzipBytes: compressed.length, gzipSha256: hash(compressed),
+      snapshotSha256: hash(JSON.stringify(before)), schemaSha256: hash(JSON.stringify(before.schema)),
+      ledger: before.rows.migrations, archivedRowsAndSchemaReopensUnchanged: true,
+      archivedReadonlyImageUnchanged: true, attachmentBlobFilesCreated: 0,
+      proofScope: "exact archived public StateStore APIs with synthetic terminal send/steer receipts and original names; no native execution or blob possession proof",
+    };
+    const metadataBytes = Buffer.from(JSON.stringify(metadata, null, 2) + "\n", "utf8");
+    const manifestBytes = Buffer.from(JSON.stringify(sourceFiles, null, 2) + "\n", "utf8");
+    assert.ok(metadataBytes.length <= 8 * 1024 * 1024);
+    assert.ok(manifestBytes.length <= 1024 * 1024);
+    assert.ok(compressed.length <= 4 * 1024 * 1024);
+    assertPrivatePathFree(metadataBytes); assertPrivatePathFree(manifestBytes);
+    assertDecodedPrivatePathFree(JSON.parse(metadataBytes.toString("utf8")) as unknown);
+    assertDecodedPrivatePathFree(JSON.parse(manifestBytes.toString("utf8")) as unknown);
+    assert.equal(hash(readBounded(import.meta.path)), generatorSha256);
+    for (const source of definitions) verifySource(source);
+    writeFileSync(join(directory, "state.sqlite.gz"), compressed, { mode: 0o600, flag: "wx" });
+    writeFileSync(join(directory, "fixture.json"), metadataBytes, { mode: 0o600, flag: "wx" });
+    writeFileSync(join(directory, "source-manifest.json"), manifestBytes, { mode: 0o600, flag: "wx" });
+    writeFileSync(join(directory, "generator.original.ts.txt"), generatorSource, { mode: 0o600, flag: "wx" });
+    summaries.push({ scenario, databaseSha256: hash(databaseBytes), archivedRowsAndSchemaReopensUnchanged: true,
+      archivedReadonlyImageUnchanged: true, attachmentBlobFilesCreated: 0 });
+  }
+}
+console.log(JSON.stringify({ generatorSha256, summaries, priorImagesOpened: false }));

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
+import { createClaudeProviderAccountId } from "../domain/provider-accounts";
 import { createProfileId, createSessionId } from "../domain/values";
 import { projectPublicProviderIdentifier } from "../public-provider-identifier";
 import {
@@ -12,6 +13,13 @@ import {
 const accountId = createProfileId();
 const sessionId = createSessionId();
 const connectionId = "65000000-0000-4000-8000-000000000001";
+const providerAuthority = {
+  providerAccountId: accountId,
+  profileId: accountId,
+  provider: "codex" as const,
+  bindingGeneration: 2,
+  processGeneration: 3,
+};
 const privatePathRoot = ["", "Users", "private"].join("/");
 const providerIdentifierKey = Buffer.alloc(32, 0x51);
 const publicProviderId = (value: string): string =>
@@ -30,14 +38,21 @@ const createRedactor = (
 const write = (
   body: SessionEventWrite["body"],
   overrides: Partial<Omit<SessionEventWrite, "body">> = {},
-): SessionEventWrite => ({
-  accountId,
-  providerConnectionId: connectionId,
-  providerGeneration: 3,
-  sessionId,
-  ...overrides,
-  body,
-});
+): SessionEventWrite => {
+  const providerGeneration = overrides.providerGeneration ?? 3;
+  return {
+    accountId,
+    providerAuthority: overrides.providerAuthority ?? {
+      ...providerAuthority,
+      processGeneration: providerGeneration,
+    },
+    providerConnectionId: connectionId,
+    providerGeneration,
+    sessionId,
+    ...overrides,
+    body,
+  };
+};
 
 const assistant = (itemId: string, text: string): SessionEventWrite => write({
   type: "assistant_delta",
@@ -400,20 +415,64 @@ describe("SessionEventStreamRedactor", () => {
 
     expect(redactor.accept(assistant("authority-bound", "exact authority remains safe")))
       .toEqual([]);
-    expect(redactor.accept(write({
+    const mismatchedComplete = redactor.accept(write({
       type: "item_completed",
       turnId: "turn-1",
       itemId: "authority-bound",
       itemKind: "agentMessage",
       status: "completed",
-    }, otherAuthority))).toEqual([]);
+    }, otherAuthority));
+    expect(mismatchedComplete).toHaveLength(1);
+    expect(mismatchedComplete[0]).toMatchObject(otherAuthority);
     const completed = redactor.accept(complete("authority-bound"));
     expect(texts(completed, "authority-bound")).toBe("exact authority remains safe");
     expect(completed.map((entry) => entry.body.type)).toEqual([
       "assistant_delta",
       "item_completed",
-      "item_completed",
     ]);
+  });
+
+  test("does not flush delayed events under a replacement provider or binding authority", () => {
+    const replacements = [
+      {
+        ...providerAuthority,
+        bindingGeneration: providerAuthority.bindingGeneration + 1,
+      },
+      {
+        providerAccountId: "pact_00000000000000000000000000000000",
+        profileId: accountId,
+        provider: "claude" as const,
+        bindingGeneration: 7,
+        processGeneration: providerAuthority.processGeneration,
+      },
+    ] as const;
+
+    for (const replacement of replacements) {
+      const redactor = createRedactor();
+      redactor.accept(start("delayed"));
+      expect(redactor.accept(assistant("delayed", "old authority api_"))).toEqual([]);
+
+      const replacementBoundary = redactor.accept(write({
+        type: "turn_started",
+        turnId: "replacement-turn",
+      }, { providerAuthority: replacement }));
+      expect(replacementBoundary).toHaveLength(1);
+      expect(replacementBoundary[0]?.providerAuthority).toEqual(replacement);
+      expect(JSON.stringify(replacementBoundary)).not.toContain("old authority");
+
+      const released = redactor.interruptSession({
+        accountId,
+        providerAuthority,
+        providerConnectionId: connectionId,
+        providerGeneration: providerAuthority.processGeneration,
+        sessionId,
+      });
+      expect(texts(released, "delayed")).toBe("[protected]");
+      expect(released.every((entry) =>
+        JSON.stringify(entry.providerAuthority) === JSON.stringify(providerAuthority)
+      )).toBe(true);
+      expect(JSON.stringify(released)).not.toContain("old authority");
+    }
   });
 
   test("releases staged interleaved deltas and non-deltas in provider source order", () => {
@@ -566,7 +625,7 @@ describe("SessionEventStreamRedactor", () => {
       throughSequence: 12,
     }, replacement));
     expect(texts(restarted, "restart")).toBe("[protected]");
-    expect(JSON.stringify(restarted)).not.toContain("Authori");
+    expect(JSON.stringify(restarted.map((entry) => entry.body))).not.toContain("Authori");
     expect(restarted.at(-1)?.body).toEqual({
       type: "gap",
       reason: "provider_restart",
@@ -583,6 +642,7 @@ describe("SessionEventStreamRedactor", () => {
 
     const flushed = redactor.flushSession({
       accountId,
+      providerAuthority,
       providerConnectionId: connectionId,
       providerGeneration: 3,
       sessionId,
@@ -594,6 +654,48 @@ describe("SessionEventStreamRedactor", () => {
     const completed = redactor.accept(complete("active-item"));
     expect(texts(completed, "active-item")).toBe("assistant after steer");
     expect(JSON.stringify([...flushed, ...completed])).not.toContain("[protected]");
+  });
+
+  for (const dimension of ["provider", "binding", "process"] as const) {
+    test(`flushes only the captured ${dimension} authority without finishing another stream`, () => {
+      const redactor = createRedactor();
+      const otherAuthority = dimension === "provider"
+        ? { ...providerAuthority, provider: "claude" as const, providerAccountId: createClaudeProviderAccountId() }
+        : { ...providerAuthority,
+            ...(dimension === "binding" ? { bindingGeneration: 3 } : { processGeneration: 4 }) };
+      const other = {
+        providerAuthority: otherAuthority,
+        providerGeneration: otherAuthority.processGeneration,
+      };
+      redactor.accept(start("original"));
+      redactor.accept(start("other", other));
+      expect(redactor.accept(assistant("original", "original pending text"))).toEqual([]);
+      expect(redactor.accept(write({
+        type: "assistant_delta", turnId: "turn-1", itemId: "other", text: "other pending text",
+      }, other))).toEqual([]);
+      const context = { accountId, providerAuthority, providerGeneration: 3,
+        providerConnectionId: connectionId, sessionId };
+      const flushed = redactor.flushSession(context);
+      expect(texts(flushed, "original")).toBe("original pending text");
+      expect(texts(flushed, "other")).toBe("");
+      expect(flushed.every((entry) => entry.providerAuthority === providerAuthority
+        || JSON.stringify(entry.providerAuthority) === JSON.stringify(providerAuthority))).toBe(true);
+      expect(redactor.activeStreamCount).toBe(1);
+      expect(texts(redactor.flushSession({ ...context, ...other }), "other")).toBe("other pending text");
+      expect(redactor.activeStreamCount).toBe(0);
+    });
+  }
+
+  test("a mismatched flush tuple is inert before touching pending text", () => {
+    const redactor = createRedactor();
+    redactor.accept(start("pending"));
+    redactor.accept(assistant("pending", "preserved pending text"));
+    const context = { accountId, providerAuthority, providerGeneration: 3,
+      providerConnectionId: connectionId, sessionId };
+    expect(() => redactor.flushSession({ ...context, providerGeneration: 4 }))
+      .toThrow("SESSION_EVENT_PROVIDER_AUTHORITY_MISMATCH");
+    expect(redactor.activeStreamCount).toBe(1);
+    expect(texts(redactor.flushSession(context), "pending")).toBe("preserved pending text");
   });
 
   test("sanitizes complete plan and interaction prose without changing closed decisions", () => {

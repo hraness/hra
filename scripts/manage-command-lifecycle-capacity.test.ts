@@ -16,8 +16,8 @@ import {
   parseCommandCapacityArguments,
 } from "./manage-command-lifecycle-capacity";
 import {
-  HRA_CONVEX_PROJECT_ID,
-  HRA_CONVEX_TEAM_ID,
+  OOMPA_CONVEX_PROJECT_ID,
+  OOMPA_CONVEX_TEAM_ID,
   type ConvexTarget,
 } from "./convex-target";
 import {
@@ -35,8 +35,8 @@ const target: ConvexTarget = {
   deploymentId: 7_654_321,
   deploymentName: "steady-otter-321",
   deploymentUrl: "https://steady-otter-321.convex.cloud",
-  projectId: HRA_CONVEX_PROJECT_ID,
-  teamId: HRA_CONVEX_TEAM_ID,
+  projectId: OOMPA_CONVEX_PROJECT_ID,
+  teamId: OOMPA_CONVEX_TEAM_ID,
 };
 const targetArguments = [
   "--deployment", target.deploymentName,
@@ -174,9 +174,9 @@ type HarnessOptions = Readonly<{
 }>;
 
 const makeHarness = async (options: HarnessOptions = {}) => {
-  const deployDirectory = await makeProtectedDirectory("hra-command-capacity-deploy-");
-  const evidenceDirectory = await makeProtectedDirectory("hra-command-capacity-output-");
-  const sourceRoot = await makeProtectedDirectory("hra-command-capacity-source-");
+  const deployDirectory = await makeProtectedDirectory("oompa-command-capacity-deploy-");
+  const evidenceDirectory = await makeProtectedDirectory("oompa-command-capacity-output-");
+  const sourceRoot = await makeProtectedDirectory("oompa-command-capacity-source-");
   const trackedBytes = Buffer.from("exact command-capacity source\n", "utf8");
   await writeFile(join(sourceRoot, "tracked.txt"), trackedBytes, { mode: 0o600 });
   const trackedObjectId = createHash("sha1")

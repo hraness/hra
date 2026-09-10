@@ -1,5 +1,5 @@
 import { compactTailChunkLimit } from "../env";
-import { decryptCompactEvents, type CompactSessionEvent } from "../hra/cloud";
+import { decryptCompactEvents, type CompactSessionEvent } from "../oompa/cloud";
 import { useStreamTail, type StreamTail } from "./stream-tail";
 
 export type CompactTail = StreamTail<CompactSessionEvent>;

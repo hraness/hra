@@ -34,14 +34,14 @@ import {
   writeProtectedJsonNoReplace,
 } from "./release-evidence";
 import {
-  HRA_EXPECTED_CONVEX_DEPLOY_URL,
-  HRA_RESOLVED_CONVEX_DEPLOY_URL,
+  OOMPA_EXPECTED_CONVEX_DEPLOY_URL,
+  OOMPA_RESOLVED_CONVEX_DEPLOY_URL,
   resolvedConvexDeployTargetMatches,
 } from "./assert-convex-deploy-target";
 import {
   ConvexTargetError,
-  HRA_CONVEX_PROJECT_ID,
-  HRA_CONVEX_TEAM_ID,
+  OOMPA_CONVEX_PROJECT_ID,
+  OOMPA_CONVEX_TEAM_ID,
   type ConvexTarget,
   type ConvexTargetVerifier,
 } from "./convex-target";
@@ -51,8 +51,8 @@ const target: ConvexTarget = {
   deploymentId: 7_654_321,
   deploymentName: "steady-otter-321",
   deploymentUrl: "https://steady-otter-321.convex.cloud",
-  projectId: HRA_CONVEX_PROJECT_ID,
-  teamId: HRA_CONVEX_TEAM_ID,
+  projectId: OOMPA_CONVEX_PROJECT_ID,
+  teamId: OOMPA_CONVEX_TEAM_ID,
 };
 const targetArguments = [
   "--deployment",
@@ -122,10 +122,10 @@ const outputWriter = (chunks: string[]): Pick<NodeJS.WriteStream, "write"> => ({
 });
 
 const makeDeployEvidenceHarness = async () => {
-  const repositoryRoot = await makeTemporaryDirectory("hra-hosted-chain-source-");
-  const temporaryRoot = await makeTemporaryDirectory("hra-hosted-chain-temp-");
+  const repositoryRoot = await makeTemporaryDirectory("oompa-hosted-chain-source-");
+  const temporaryRoot = await makeTemporaryDirectory("oompa-hosted-chain-temp-");
   const evidenceDirectory = await realpath(
-    await makeTemporaryDirectory("hra-hosted-chain-output-"),
+    await makeTemporaryDirectory("oompa-hosted-chain-output-"),
   );
   await chmod(evidenceDirectory, 0o700);
   let activeSourceCommit = sourceCommit;
@@ -245,7 +245,7 @@ describe("verified hosted deployment", () => {
 
   test("binds deploy to one exact generated target and clean source without inheriting stale selectors", async () => {
     const repositoryRoot = await makeTemporaryDirectory("hra-hosted-source-");
-    const temporaryRoot = await makeTemporaryDirectory("hra-hosted-binding-");
+    const temporaryRoot = await makeTemporaryDirectory("oompa-hosted-binding-");
     await writeFile(
       join(repositoryRoot, ".env.local"),
       "CONVEX_DEPLOYMENT=prod:stale-beaver-999\n",
@@ -313,14 +313,14 @@ describe("verified hosted deployment", () => {
       "--cmd",
       resolvedTargetAssertionCommand,
       "--cmd-url-env-var-name",
-      HRA_RESOLVED_CONVEX_DEPLOY_URL,
+      OOMPA_RESOLVED_CONVEX_DEPLOY_URL,
       "--skip-workos-check",
       "--message",
-      `HRA source ${sourceCommit}`,
+      `Oompa source ${sourceCommit}`,
     ]);
     expect(deployRequest.environment).toEqual({
       HOME: "/operator-home",
-      [HRA_EXPECTED_CONVEX_DEPLOY_URL]: target.deploymentUrl,
+      [OOMPA_EXPECTED_CONVEX_DEPLOY_URL]: target.deploymentUrl,
       NO_COLOR: "1",
       PATH: "/safe/bin",
       TERM: "dumb",
@@ -341,15 +341,15 @@ describe("verified hosted deployment", () => {
 
   test("the mandatory pre-push command refuses a deployment resolved after a default switch", () => {
     const environment = {
-      [HRA_EXPECTED_CONVEX_DEPLOY_URL]: target.deploymentUrl,
-      [HRA_RESOLVED_CONVEX_DEPLOY_URL]: "https://other-otter-999.convex.cloud",
+      [OOMPA_EXPECTED_CONVEX_DEPLOY_URL]: target.deploymentUrl,
+      [OOMPA_RESOLVED_CONVEX_DEPLOY_URL]: "https://other-otter-999.convex.cloud",
     };
     expect(resolvedConvexDeployTargetMatches(environment)).toBeFalse();
     expect(resolvedTargetAssertionCommand).toContain("assert-convex-deploy-target.ts");
   });
 
   test("refuses an unavailable authority backend without postflight or cleanup-recovery output", async () => {
-    const temporaryRoot = await makeTemporaryDirectory("hra-hosted-authority-unavailable-");
+    const temporaryRoot = await makeTemporaryDirectory("oompa-hosted-authority-unavailable-");
     const stdout: string[] = [];
     const stderr: string[] = [];
     const requests: CommandRequest[] = [];
@@ -387,7 +387,7 @@ describe("verified hosted deployment", () => {
   });
 
   test("renders unproven deployment cleanup as a recovery-required temporary failure", async () => {
-    const temporaryRoot = await makeTemporaryDirectory("hra-hosted-cleanup-unproven-");
+    const temporaryRoot = await makeTemporaryDirectory("oompa-hosted-cleanup-unproven-");
     const stdout: string[] = [];
     const stderr: string[] = [];
     let authorityCalls = 0;
@@ -435,7 +435,7 @@ describe("verified hosted deployment", () => {
   });
 
   test("preserves a blocked deployment recovery journal", async () => {
-    const temporaryRoot = await makeTemporaryDirectory("hra-hosted-journal-blocked-");
+    const temporaryRoot = await makeTemporaryDirectory("oompa-hosted-journal-blocked-");
     const stdout: string[] = [];
     const stderr: string[] = [];
     let verifications = 0;
@@ -473,10 +473,10 @@ describe("verified hosted deployment", () => {
 
   test("classifies later filesystem cleanup failures while preserving a blocked journal", async () => {
     for (const failedCleanup of ["binding", "source", "both"] as const) {
-      const repositoryRoot = await makeTemporaryDirectory("hra-hosted-journal-cleanup-source-");
-      const temporaryRoot = await makeTemporaryDirectory("hra-hosted-journal-cleanup-temp-");
+      const repositoryRoot = await makeTemporaryDirectory("oompa-hosted-journal-cleanup-source-");
+      const temporaryRoot = await makeTemporaryDirectory("oompa-hosted-journal-cleanup-temp-");
       const evidenceDirectory = await realpath(
-        await makeTemporaryDirectory("hra-hosted-journal-cleanup-evidence-"),
+        await makeTemporaryDirectory("oompa-hosted-journal-cleanup-evidence-"),
       );
       await chmod(evidenceDirectory, 0o700);
       const evidencePath = join(evidenceDirectory, `bootstrap-${failedCleanup}.json`);
@@ -572,10 +572,10 @@ describe("verified hosted deployment", () => {
 
   test("surfaces a source archive root when local preparation cleanup is unproven", async () => {
     for (const failedExecutable of ["/usr/bin/git", "/usr/bin/tar", process.execPath] as const) {
-      const repositoryRoot = await makeTemporaryDirectory("hra-hosted-archive-terminal-source-");
-      const temporaryRoot = await makeTemporaryDirectory("hra-hosted-archive-terminal-temp-");
+      const repositoryRoot = await makeTemporaryDirectory("oompa-hosted-archive-terminal-source-");
+      const temporaryRoot = await makeTemporaryDirectory("oompa-hosted-archive-terminal-temp-");
       const evidenceDirectory = await realpath(
-        await makeTemporaryDirectory("hra-hosted-archive-terminal-evidence-"),
+        await makeTemporaryDirectory("oompa-hosted-archive-terminal-evidence-"),
       );
       await chmod(evidenceDirectory, 0o700);
       const evidencePath = join(evidenceDirectory, "bootstrap.json");
@@ -636,10 +636,10 @@ describe("verified hosted deployment", () => {
   });
 
   test("refuses before provider execution when the archived frozen install fails", async () => {
-    const repositoryRoot = await makeTemporaryDirectory("hra-hosted-install-source-");
-    const temporaryRoot = await makeTemporaryDirectory("hra-hosted-install-temp-");
+    const repositoryRoot = await makeTemporaryDirectory("oompa-hosted-install-source-");
+    const temporaryRoot = await makeTemporaryDirectory("oompa-hosted-install-temp-");
     const evidenceDirectory = await realpath(
-      await makeTemporaryDirectory("hra-hosted-install-evidence-"),
+      await makeTemporaryDirectory("oompa-hosted-install-evidence-"),
     );
     await chmod(evidenceDirectory, 0o700);
     const evidencePath = join(evidenceDirectory, "bootstrap.json");
@@ -699,7 +699,7 @@ describe("verified hosted deployment", () => {
       containment: "local",
       environment: {
         HOME: "/operator-home",
-        [HRA_EXPECTED_CONVEX_DEPLOY_URL]: target.deploymentUrl,
+        [OOMPA_EXPECTED_CONVEX_DEPLOY_URL]: target.deploymentUrl,
         NO_COLOR: "1",
         PATH: "/safe/bin",
         TERM: "dumb",
@@ -716,10 +716,10 @@ describe("verified hosted deployment", () => {
   });
 
   test("surfaces the archived root when preparation cleanup fails with a primary error", async () => {
-    const repositoryRoot = await makeTemporaryDirectory("hra-hosted-preparation-cleanup-source-");
-    const temporaryRoot = await makeTemporaryDirectory("hra-hosted-preparation-cleanup-temp-");
+    const repositoryRoot = await makeTemporaryDirectory("oompa-hosted-preparation-cleanup-source-");
+    const temporaryRoot = await makeTemporaryDirectory("oompa-hosted-preparation-cleanup-temp-");
     const evidenceDirectory = await realpath(
-      await makeTemporaryDirectory("hra-hosted-preparation-cleanup-evidence-"),
+      await makeTemporaryDirectory("oompa-hosted-preparation-cleanup-evidence-"),
     );
     await chmod(evidenceDirectory, 0o700);
     const evidencePath = join(evidenceDirectory, "bootstrap.json");
@@ -781,10 +781,10 @@ describe("verified hosted deployment", () => {
 
   test("surfaces post-deploy archived cleanup failures with and without a primary error", async () => {
     for (const providerFails of [false, true]) {
-      const repositoryRoot = await makeTemporaryDirectory("hra-hosted-post-cleanup-source-");
-      const temporaryRoot = await makeTemporaryDirectory("hra-hosted-post-cleanup-temp-");
+      const repositoryRoot = await makeTemporaryDirectory("oompa-hosted-post-cleanup-source-");
+      const temporaryRoot = await makeTemporaryDirectory("oompa-hosted-post-cleanup-temp-");
       const evidenceDirectory = await realpath(
-        await makeTemporaryDirectory("hra-hosted-post-cleanup-evidence-"),
+        await makeTemporaryDirectory("oompa-hosted-post-cleanup-evidence-"),
       );
       await chmod(evidenceDirectory, 0o700);
       const evidencePath = join(evidenceDirectory, "bootstrap.json");
@@ -856,10 +856,10 @@ describe("verified hosted deployment", () => {
 
   test("composes binding and source cleanup roots without losing the primary failure", async () => {
     for (const scenario of ["success", "ordinary", "authority", "target"] as const) {
-      const repositoryRoot = await makeTemporaryDirectory("hra-hosted-cleanup-compose-source-");
-      const temporaryRoot = await makeTemporaryDirectory("hra-hosted-cleanup-compose-temp-");
+      const repositoryRoot = await makeTemporaryDirectory("oompa-hosted-cleanup-compose-source-");
+      const temporaryRoot = await makeTemporaryDirectory("oompa-hosted-cleanup-compose-temp-");
       const evidenceDirectory = await realpath(
-        await makeTemporaryDirectory("hra-hosted-cleanup-compose-evidence-"),
+        await makeTemporaryDirectory("oompa-hosted-cleanup-compose-evidence-"),
       );
       await chmod(evidenceDirectory, 0o700);
       const evidencePath = join(evidenceDirectory, `bootstrap-${scenario}.json`);
@@ -974,12 +974,12 @@ describe("verified hosted deployment", () => {
 
   test("refuses symlink ancestors for the archived assertion and Convex CLI", async () => {
     for (const hostileAncestor of ["scripts", "convex-package"] as const) {
-      const repositoryRoot = await makeTemporaryDirectory("hra-hosted-symlink-source-");
-      const temporaryRoot = await makeTemporaryDirectory("hra-hosted-symlink-temp-");
+      const repositoryRoot = await makeTemporaryDirectory("oompa-hosted-symlink-source-");
+      const temporaryRoot = await makeTemporaryDirectory("oompa-hosted-symlink-temp-");
       const evidenceDirectory = await realpath(
-        await makeTemporaryDirectory("hra-hosted-symlink-evidence-"),
+        await makeTemporaryDirectory("oompa-hosted-symlink-evidence-"),
       );
-      const outside = await makeTemporaryDirectory("hra-hosted-symlink-outside-");
+      const outside = await makeTemporaryDirectory("oompa-hosted-symlink-outside-");
       await chmod(evidenceDirectory, 0o700);
       const evidencePath = join(evidenceDirectory, `bootstrap-${hostileAncestor}.json`);
       let authorityCalls = 0;
@@ -1040,10 +1040,10 @@ describe("verified hosted deployment", () => {
 
   test("rechecks archived assertion and CLI identities immediately before authority launch", async () => {
     for (const substitutedPath of ["assertion", "cli"] as const) {
-      const repositoryRoot = await makeTemporaryDirectory("hra-hosted-substitution-source-");
-      const temporaryRoot = await makeTemporaryDirectory("hra-hosted-substitution-temp-");
+      const repositoryRoot = await makeTemporaryDirectory("oompa-hosted-substitution-source-");
+      const temporaryRoot = await makeTemporaryDirectory("oompa-hosted-substitution-temp-");
       const evidenceDirectory = await realpath(
-        await makeTemporaryDirectory("hra-hosted-substitution-evidence-"),
+        await makeTemporaryDirectory("oompa-hosted-substitution-evidence-"),
       );
       await chmod(evidenceDirectory, 0o700);
       const evidencePath = join(evidenceDirectory, `bootstrap-${substitutedPath}.json`);
@@ -1099,10 +1099,10 @@ describe("verified hosted deployment", () => {
   test("supersedes a proven pre-mutation stop only through a fresh source path", async () => {
     const oldSourceCommit = "a".repeat(40);
     const fixedSourceCommit = "b".repeat(40);
-    const repositoryRoot = await makeTemporaryDirectory("hra-hosted-supersession-source-");
-    const temporaryRoot = await makeTemporaryDirectory("hra-hosted-supersession-temp-");
+    const repositoryRoot = await makeTemporaryDirectory("oompa-hosted-supersession-source-");
+    const temporaryRoot = await makeTemporaryDirectory("oompa-hosted-supersession-temp-");
     const evidenceDirectory = await realpath(
-      await makeTemporaryDirectory("hra-hosted-supersession-evidence-"),
+      await makeTemporaryDirectory("oompa-hosted-supersession-evidence-"),
     );
     await chmod(evidenceDirectory, 0o700);
     const oldEvidencePath = join(evidenceDirectory, `bootstrap-${oldSourceCommit}.json`);
@@ -1267,10 +1267,10 @@ describe("verified hosted deployment", () => {
   });
 
   test("surfaces every preserved deploy root and durable intent without postflight", async () => {
-    const repositoryRoot = await makeTemporaryDirectory("hra-hosted-deploy-terminal-source-");
-    const temporaryRoot = await makeTemporaryDirectory("hra-hosted-deploy-terminal-temp-");
+    const repositoryRoot = await makeTemporaryDirectory("oompa-hosted-deploy-terminal-source-");
+    const temporaryRoot = await makeTemporaryDirectory("oompa-hosted-deploy-terminal-temp-");
     const evidenceDirectory = await realpath(
-      await makeTemporaryDirectory("hra-hosted-deploy-terminal-evidence-"),
+      await makeTemporaryDirectory("oompa-hosted-deploy-terminal-evidence-"),
     );
     await chmod(evidenceDirectory, 0o700);
     const evidencePath = join(evidenceDirectory, "bootstrap.json");
@@ -1353,7 +1353,7 @@ describe("verified hosted deployment", () => {
   });
 
   test("always performs numeric postflight after an attempted deploy and suppresses failure output", async () => {
-    const temporaryRoot = await makeTemporaryDirectory("hra-hosted-failed-binding-");
+    const temporaryRoot = await makeTemporaryDirectory("oompa-hosted-failed-binding-");
     let verification = 0;
     const runner: CommandRunner = async (request) => {
       if (request.executable === "/usr/bin/git") {
@@ -1397,7 +1397,7 @@ describe("verified hosted deployment", () => {
       .toThrow("usage_invalid");
     expect(() => parseDeployArguments([
       ...targetArguments.slice(0, 3),
-      String(HRA_CONVEX_TEAM_ID + 1),
+      String(OOMPA_CONVEX_TEAM_ID + 1),
       ...targetArguments.slice(4),
       "--source-commit",
       sourceCommit,
@@ -1411,10 +1411,10 @@ describe("verified hosted deployment", () => {
   });
 
   test("deploys a deterministic archive overlay, reconciles a lost result, and replays without mutation", async () => {
-    const repositoryRoot = await makeTemporaryDirectory("hra-hosted-evidence-source-");
-    const temporaryRoot = await makeTemporaryDirectory("hra-hosted-evidence-temp-");
+    const repositoryRoot = await makeTemporaryDirectory("oompa-hosted-evidence-source-");
+    const temporaryRoot = await makeTemporaryDirectory("oompa-hosted-evidence-temp-");
     const evidenceDirectory = await realpath(
-      await makeTemporaryDirectory("hra-hosted-evidence-output-"),
+      await makeTemporaryDirectory("oompa-hosted-evidence-output-"),
     );
     await chmod(evidenceDirectory, 0o700);
     const evidencePath = join(evidenceDirectory, "bootstrap.json");
@@ -1493,7 +1493,7 @@ describe("verified hosted deployment", () => {
       ],
       containment: "local",
       environment: {
-        [HRA_EXPECTED_CONVEX_DEPLOY_URL]: target.deploymentUrl,
+        [OOMPA_EXPECTED_CONVEX_DEPLOY_URL]: target.deploymentUrl,
         NO_COLOR: "1",
         PATH: "/hostile/git-bin",
         TERM: "dumb",
@@ -1660,10 +1660,10 @@ describe("verified hosted deployment", () => {
   });
 
   test("reconciles a committed bootstrap intent across invocations without redeploying", async () => {
-    const repositoryRoot = await makeTemporaryDirectory("hra-hosted-crash-source-");
-    const temporaryRoot = await makeTemporaryDirectory("hra-hosted-crash-temp-");
+    const repositoryRoot = await makeTemporaryDirectory("oompa-hosted-crash-source-");
+    const temporaryRoot = await makeTemporaryDirectory("oompa-hosted-crash-temp-");
     const evidenceDirectory = await realpath(
-      await makeTemporaryDirectory("hra-hosted-crash-output-"),
+      await makeTemporaryDirectory("oompa-hosted-crash-output-"),
     );
     await chmod(evidenceDirectory, 0o700);
     const evidencePath = join(evidenceDirectory, "bootstrap.json");
@@ -1733,9 +1733,9 @@ describe("verified hosted deployment", () => {
   });
 
   test("does not reserve a bootstrap intent for a foreign committed runtime", async () => {
-    const repositoryRoot = await makeTemporaryDirectory("hra-hosted-foreign-source-");
+    const repositoryRoot = await makeTemporaryDirectory("oompa-hosted-foreign-source-");
     const evidenceDirectory = await realpath(
-      await makeTemporaryDirectory("hra-hosted-foreign-output-"),
+      await makeTemporaryDirectory("oompa-hosted-foreign-output-"),
     );
     await chmod(evidenceDirectory, 0o700);
     const evidencePath = join(evidenceDirectory, "bootstrap.json");
@@ -1771,9 +1771,9 @@ describe("verified hosted deployment", () => {
   });
 
   test("refuses an ambiguous bootstrap attestation pre-read before archive or provider mutation", async () => {
-    const repositoryRoot = await makeTemporaryDirectory("hra-hosted-preread-source-");
+    const repositoryRoot = await makeTemporaryDirectory("oompa-hosted-preread-source-");
     const evidenceDirectory = await realpath(
-      await makeTemporaryDirectory("hra-hosted-preread-output-"),
+      await makeTemporaryDirectory("oompa-hosted-preread-output-"),
     );
     await chmod(evidenceDirectory, 0o700);
     const requests: CommandRequest[] = [];
@@ -1812,9 +1812,9 @@ describe("verified hosted deployment", () => {
   });
 
   test("refuses an invalid existing evidence destination before archive or deployment", async () => {
-    const repositoryRoot = await makeTemporaryDirectory("hra-hosted-invalid-evidence-source-");
+    const repositoryRoot = await makeTemporaryDirectory("oompa-hosted-invalid-evidence-source-");
     const evidenceDirectory = await realpath(
-      await makeTemporaryDirectory("hra-hosted-invalid-evidence-output-"),
+      await makeTemporaryDirectory("oompa-hosted-invalid-evidence-output-"),
     );
     await chmod(evidenceDirectory, 0o700);
     const evidencePath = join(evidenceDirectory, "bootstrap.json");

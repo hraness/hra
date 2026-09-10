@@ -1,14 +1,14 @@
-# Current HRA canonical alias release
+# Current Oompa canonical alias release
 
-HRA v0 status: retired on 2026-08-27. This procedure is current-project-only.
+Oompa v0 status: retired on 2026-08-27. This procedure is current-project-only.
 
-This runbook can reassign the single Vercel alias record `hra.sh` between two exact deployments of the current HRA Vercel project. It does not add, change, or remove DNS, move project-domain ownership, deploy source, configure Convex, create a tag, publish a release, or operate another alias.
+This runbook can reassign the single Vercel alias record `oompa.dev` between two exact deployments of the current Oompa Vercel project. It does not add, change, or remove DNS, move project-domain ownership, deploy source, configure Convex, create a tag, publish a release, or operate another alias.
 
 ## Authorization boundary
 
 The user's standing authorization for task-owned Hraness delivery includes this exact current-project alias transition when it is a documented release or deployment step already inside the task's scope. Do not ask for a second conversational confirmation. If the task did not authorize production delivery, the target represents a material product decision not already made, required credentials are missing, or the requested effect extends to DNS, project-domain ownership, another alias, or a retired resource, stop and obtain the missing authority instead of treating this runbook as permission.
 
-The fresh plan and passing preflight narrow existing task authority; they do not create broader authority. The designated custodian passes the exact `requiredConfirmation` value emitted by preflight to `--confirm-exact`. The command accepts that internal machine token only when it is byte-for-byte equal to the record and UUID derived from the protected plan. The authorized transition includes automatic restoration of `hra.sh` to the plan's exact current-project source deployment if an acknowledged target cannot be proved. It does not authorize HRA v0, another alias, DNS, or project-domain ownership.
+The fresh plan and passing preflight narrow existing task authority; they do not create broader authority. The designated custodian passes the exact `requiredConfirmation` value emitted by preflight to `--confirm-exact`. The command accepts that internal machine token only when it is byte-for-byte equal to the record and UUID derived from the protected plan. The authorized transition includes automatic restoration of `oompa.dev` to the plan's exact current-project source deployment if an acknowledged target cannot be proved. It does not authorize Oompa v0, another alias, DNS, or project-domain ownership.
 
 Execution has exactly one designated writer custodian: one supported Darwin or Linux host and one persistent operating-system account holding the reviewed file-backed Vercel session, protected Convex session, and durable state directory. The local lock cannot fence another host or account, and the alias API has no expected-source compare-and-swap. Do not run this operator or another alias writer from a second host or account while a plan or recovery is live. Other devices may inspect evidence, but they may not dispatch provider writes.
 
@@ -16,13 +16,13 @@ Execution has exactly one designated writer custodian: one supported Darwin or L
 
 The only accepted authorities are:
 
-- GitHub repository `hraness/hra`, numeric ID `1343008607`;
+- GitHub repository `hraness/oompa`, numeric ID `1343008607`;
 - Vercel team `hraness`, stable ID `team_UAd1iD2XogJlbFg4h14mRaPM`;
 - Vercel project ID `prj_8ciIt9t9foE3utG45frRN7cxckjS`;
 - Convex team ID `513923`, project ID `2854545`, and the exact default production deployment named in the plan; and
-- canonical alias `hra.sh`.
+- canonical alias `oompa.dev`.
 
-The following retired HRA v0 identities remain one-way safety tombstones:
+The following retired Oompa v0 identities remain one-way safety tombstones:
 
 - GitHub repository ID `1334876494`, retained only as archived `hraness/hra-v0` history;
 - Vercel project ID `prj_eRfUBHdHkEbvIaB8x7dyyZhBc3wr`;
@@ -32,6 +32,10 @@ The following retired HRA v0 identities remain one-way safety tombstones:
 The new plan schema accepts only the current numeric identities, so none of those retired resources can become a target, source, fallback, staging surface, or recovery authority. The historical implementation in `scripts/domain-cutover.ts` remains non-operational design evidence: its executable and public operator entry points return `operator_retired`, and it has no built-in provider runner. Historical tests can exercise its parser and state machine only by supplying their own explicit effect capability. Do not invoke or import it for provider work.
 
 A normal source and every target must be an exact Vercel `source: "git"` GitHub deployment of repository ID `1343008607`, ref `main`, and the plan commit. Contradictory hybrid source metadata is rejected. One narrow source-only compatibility form exists for the current public alias when that alias still names a pre-integration Vercel CLI deployment. The plan must opt into `vercel.sourceProvenance` with the exact closed values `kind: "vercel-cli-public-marker"`, `actor: "cursor-cli"`, `gitCommitRef: "HEAD"`, and `gitRootDirectory: ""`. This does not admit a CLI target. It binds the source to the exact deployment ID, hostname, plan commit, Vercel `source: "cli"`, null `gitSource`, matching deployment metadata, the strict public marker, and an alias read-marker-read sandwich. A plan without that object retains the GitHub-only source contract.
+
+## Retired receipt-less record compatibility
+
+The one terminal receipt emitted by the short-lived receipt-less reconciliation implementation belongs to the `hra.sh` alias era. This operator binds `oompa.dev`, so that record is no longer readable through it; an intent whose receipt does not match the current receipt schema fails closed with `durable_state_invalid` and exit `75`, and the files stay untouched on disk.
 
 ## Fresh plan for each release
 
@@ -59,12 +63,12 @@ Preflight and execution read the following state from the providers instead of t
 1. Convex management API readback must prove the plan's exact numeric team, project, production deployment ID, generated name, canonical URL, `isDefault: true`, and matching project `prodDeploymentName`. The protected Convex CLI config path is derived from the operating-system account record rather than inherited `HOME`; its held file must be current-user-owned, single-link, regular, mode `0600`, stable across the bounded read, and free of any Darwin extended ACL.
 2. Vercel project readback from `/v9/projects/prj_8ciIt9t9foE3utG45frRN7cxckjS` must return the exact project and team IDs and `autoAssignCustomDomains: false`.
 3. Vercel deployment readback from `/v13/deployments/<deployment-id>` must prove each exact deployment ID, automatic hostname, current project ID, and `READY` production state. The target always proves Vercel `source: "git"`, GitHub repository ID `1343008607`, `main` ref, and the plan commit. The source proves the same GitHub tuple unless the plan explicitly carries the closed CLI source provenance object; only then must it instead prove Vercel `source: "cli"`, exact actor `cursor-cli`, exact ref `HEAD`, empty root directory, and `meta.gitCommitSha` equal to the source commit in the plan. Vercel's live CLI-deployment shape omits `gitSource`; the parser normalizes only that omission or an explicit JSON `null` to the internal null value and still rejects every non-null lookalike.
-4. Authenticated alias readback from `/v4/aliases/hra.sh` must return one exact `(alias, projectId, deploymentId, deployment.id, deployment.url)` tuple matching the plan source or target. When the source uses the narrow CLI form, the same exact source tuple must still hold after the public marker read.
-5. Public `https://hra.sh/.well-known/hra.json` readback must be strict schema version 2, generation 1, product `HRA`, repository ID `1343008607`, path `hraness/hra`, version `0.1.0`, and the commit belonging to that exact alias tuple.
+4. Authenticated alias readback from `/v4/aliases/oompa.dev` must return one exact `(alias, projectId, deploymentId, deployment.id, deployment.url)` tuple matching the plan source or target. When the source uses the narrow CLI form, the same exact source tuple must still hold after the public marker read.
+5. Public `https://oompa.dev/.well-known/hra.json` readback must be strict schema version 2, generation 1, product `Oompa`, repository ID `1343008607`, path `hraness/oompa`, version `0.1.0`, and the commit belonging to that exact alias tuple.
 
-The protected automatic target hostname is not treated as public product evidence. Before mutation, the exact `READY` GitHub `main` deployment record is the target provider evidence. A CLI deployment can never satisfy target authority. After mutation, the public marker must bind `hra.sh` to the target commit; failure to prove that marker invokes recovery.
+The protected automatic target hostname is not treated as public product evidence. Before mutation, the exact `READY` GitHub `main` deployment record is the target provider evidence. A CLI deployment can never satisfy target authority. After mutation, the public marker must bind `oompa.dev` to the target commit; failure to prove that marker invokes recovery.
 
-Provider output is parsed from `unknown`, bounded, and reduced to closed result fields. An accepted mutation response must contain the documented `uid`, `created`, and exact `alias: "hra.sh"` fields. The initial target response must also report `oldDeploymentId` equal to the plan source; an automatic source-restoration response must report it equal to the plan target. Missing, null, or unplanned prior authority fails closed. Do not use `--debug`, `--verbose`, `--token`, `--force`, remove-then-add, the friendly `vercel alias set` command, a DNS command, a certificate command, or a domain-move endpoint.
+Provider output is parsed from `unknown`, bounded, and reduced to closed result fields. An accepted mutation response must contain the documented `uid`, `created`, and exact `alias: "oompa.dev"` fields. The initial target response must also report `oldDeploymentId` equal to the plan source; an automatic source-restoration response must report it equal to the plan target. Missing, null, or unplanned prior authority fails closed. Do not use `--debug`, `--verbose`, `--token`, `--force`, remove-then-add, the friendly `vercel alias set` command, a DNS command, a certificate command, or a domain-move endpoint.
 
 ## Read-only preflight
 
@@ -73,7 +77,7 @@ Run preflight as the designated Darwin or Linux writer custodian from a clean ch
 ```sh
 bun ./scripts/current-project-alias-release.ts preflight \
   --vercel-auth-file /absolute/path/to/reviewed-vercel-auth.json \
-  --plan-file /absolute/path/to/fresh-hra-sh-plan.json
+  --plan-file /absolute/path/to/fresh-oompa-sh-plan.json
 ```
 
 Preflight performs no provider write. Its result uses `schemaVersion: 3`; version 3 replaces the retired conversational-approval action while retaining `requiredConfirmation` as the exact machine token. It first takes the designated custodian's same machine-local lock and inspects the protected ledger. A receipt-less current intent returns `unresolved_current_intent`, and a different receipt-less intent returns `unresolved_prior_intent`, before provider readback; neither can be reclassified as already committed. Exact source authority with no terminal record returns `status: "ready"`, `nextAction: "execute_with_machine_token_under_standing_task_authority"`, and `requiredConfirmation`. Exact target authority returns `status: "already_committed"` only when no intent exists or a valid target receipt agrees. An unplanned alias, marker mismatch, provider mismatch, unreadable response, unsafe project setting, wrong Convex default, terminal receipt mismatch, or retired identity blocks or refuses.
@@ -87,13 +91,13 @@ After a ready preflight under applicable standing task authority, the designated
 ```sh
 bun ./scripts/current-project-alias-release.ts --execute \
   --vercel-auth-file /absolute/path/to/reviewed-vercel-auth.json \
-  --plan-file /absolute/path/to/fresh-hra-sh-plan.json \
+  --plan-file /absolute/path/to/fresh-oompa-sh-plan.json \
   --confirm-exact '<exact requiredConfirmation from the immediately preceding preflight>'
 ```
 
-The only provider mutation form constructed by the operator is the documented direct `POST /v2/deployments/<exact-deployment-id>/aliases` request with the JSON field `alias: "hra.sh"`, scoped to stable Vercel team ID `team_UAd1iD2XogJlbFg4h14mRaPM`. The deployment ID is either the exact plan target or, only after a protected target phase and durable source-recovery intent, the exact plan source. The bounded in-process transport never invokes the friendly `vercel alias set` command because that command can perform implicit domain and certificate setup beyond the one alias record. Each request carries its distinct plan- and effect-derived mutation key in an `Idempotency-Key` correlation header. The alias endpoint does not document deduplication for that header, so recovery safety does not assume provider-side idempotency. An uncertain target request is never redispatched and is never followed by an opposing source write; it becomes a durable hard stop. The request does not detach the alias first and cannot select another alias or project. After an acknowledged target response with exact prior-source provenance, one 60-second retry-admission deadline governs every attempt to obtain the complete target proof. The operator starts no new fast or complete sample after that deadline. A provider read already in progress completes or fails under its own stricter bounded transport or process timeout. Every exact sample requires the authenticated alias tuple and public marker to match before the operator rechecks the Vercel project, both deployments, current Convex default production, alias, and marker. Two consecutive complete samples must agree before the operator returns `status: "committed"`. A transient unplanned alias, marker mismatch, or closed provider-read failure resets the consecutive count and is retried within the same admission deadline. The operator never turns a mismatch into authority and never restarts the deadline between the fast tuple-marker check and full readback.
+The only provider mutation form constructed by the operator is the documented direct `POST /v2/deployments/<exact-deployment-id>/aliases` request with the JSON field `alias: "oompa.dev"`, scoped to stable Vercel team ID `team_UAd1iD2XogJlbFg4h14mRaPM`. The deployment ID is either the exact plan target or, only after a protected target phase and durable source-recovery intent, the exact plan source. The bounded in-process transport never invokes the friendly `vercel alias set` command because that command can perform implicit domain and certificate setup beyond the one alias record. Each request carries its distinct plan- and effect-derived mutation key in an `Idempotency-Key` correlation header. The alias endpoint does not document deduplication for that header, so recovery safety does not assume provider-side idempotency. An uncertain target request is never redispatched and is never followed by an opposing source write; it becomes a durable hard stop. The request does not detach the alias first and cannot select another alias or project. After an acknowledged target response with exact prior-source provenance, one 60-second retry-admission deadline governs every attempt to obtain the complete target proof. The operator starts no new fast or complete sample after that deadline. A provider read already in progress completes or fails under its own stricter bounded transport or process timeout. Every exact sample requires the authenticated alias tuple and public marker to match before the operator rechecks the Vercel project, both deployments, current Convex default production, alias, and marker. Two consecutive complete samples must agree before the operator returns `status: "committed"`. A transient unplanned alias, marker mismatch, or closed provider-read failure resets the consecutive count and is retried within the same admission deadline. The operator never turns a mismatch into authority and never restarts the deadline between the fast tuple-marker check and full readback.
 
-Execution derives a fixed `<system-account-home>/.local/state/hra/canonical-alias-release` directory from the operating system account record, not from an inherited `HOME`. It requires a protected mode-`0700` directory and mode-`0600`, single-link regular state files. One inode-checked machine-local advisory lock serializes every plan for that designated host and account. It is not a distributed provider lock. While holding it, the operator scans the bounded directory and refuses a new plan behind any older unresolved intent. The 8,193 persistent-entry bound reserves the lock plus as many as four records for each of 2,048 terminal plans: `<uuid>.intent.json`, `<uuid>.target-phase.json`, the optional `<uuid>.source-recovery.json`, and `<uuid>.receipt.json`. Admission reserves the complete four-record plan capacity, so it cannot strand a later phase, recovery intent, or receipt. Scan startup permits only one transient 8,194th hardlink so it can finish a proved publication interrupted after its destination link was created, then requires the recovered directory to be back within the persistent bound.
+Execution derives a fixed `<system-account-home>/.local/state/oompa/canonical-alias-release` directory from the operating system account record, not from an inherited `HOME`. It requires a protected mode-`0700` directory and mode-`0600`, single-link regular state files. One inode-checked machine-local advisory lock serializes every plan for that designated host and account. It is not a distributed provider lock. While holding it, the operator scans the bounded directory and refuses a new plan behind any older unresolved intent. The 8,193 persistent-entry bound reserves the lock plus as many as four records for each of 2,048 terminal plans: `<uuid>.intent.json`, `<uuid>.target-phase.json`, the optional `<uuid>.source-recovery.json`, and `<uuid>.receipt.json`. Admission reserves the complete four-record plan capacity, so it cannot strand a later phase, recovery intent, or receipt. Scan startup permits only one transient 8,194th hardlink so it can finish a proved publication interrupted after its destination link was created, then requires the recovered directory to be back within the persistent bound.
 
 For an exact source state, the operator completes one full provider read, including the second alias comparison required by an explicitly planned CLI source, durably publishes and rereads a self-digested intent, repeats the full provider read, and only then dispatches the target assignment. The intent binds the exact plan, optional source-only provenance, confirmation, observed source and intended target authorities, and distinct plan-bound mutation keys for target assignment and source restoration. A mutation is never dispatched after the lock identity is lost. Immediately after validating that the target response names the exact planned source as `oldDeploymentId`, the operator durably publishes and rereads a self-digested target phase record. That phase record binds the intent, plan, exact source and target, target mutation key, and accepted response evidence before target proof or source restoration can begin. Failure to prove the phase record durable is recovery-required and permits no opposing write. A completed stable target proof publishes and rereads a terminal target receipt that binds the target phase before success is printed.
 
@@ -103,15 +107,15 @@ An exact target state with no durable intent is safe to classify read-only with 
 
 ## Recovery design
 
-The plan's current-project source deployment is the only automatic recovery target. HRA v0 is never a fallback.
+The plan's current-project source deployment is the only automatic recovery target. Oompa v0 is never a fallback.
 
-After an acknowledged target response whose `oldDeploymentId` proves the exact plan source and whose target phase is durable, failure to obtain two consecutive complete target-authority samples within the shared target deadline publishes the source-recovery intent and reasserts only the plan's exact source automatic hostname on `hra.sh`. It then requires the source response to prove `oldDeploymentId` was the exact target and uses a fresh bounded recovery deadline to obtain two consecutive complete source-authority samples, including the exact source alias tuple, source commit-bearing marker, Vercel project, both current-project deployments, and current Convex production target. Proven restoration records the target-phase-bound and recovery-intent-bound terminal source receipt, then returns `status: "reverted"` with nonzero exit; it never reports a release commit. An ambiguous target response performs no automatic restoration because the delayed target effect cannot be ordered safely against an opposing source write.
+After an acknowledged target response whose `oldDeploymentId` proves the exact plan source and whose target phase is durable, failure to obtain two consecutive complete target-authority samples within the shared target deadline publishes the source-recovery intent and reasserts only the plan's exact source automatic hostname on `oompa.dev`. It then requires the source response to prove `oldDeploymentId` was the exact target and uses a fresh bounded recovery deadline to obtain two consecutive complete source-authority samples, including the exact source alias tuple, source commit-bearing marker, Vercel project, both current-project deployments, and current Convex production target. Proven restoration records the target-phase-bound and recovery-intent-bound terminal source receipt, then returns `status: "reverted"` with nonzero exit; it never reports a release commit. An ambiguous target response performs no automatic restoration because the delayed target effect cannot be ordered safely against an opposing source write.
 
 `recover-source` is the only explicit recovery mutation. Run it with the unchanged protected plan and the exact original machine confirmation:
 
 ```sh
 bun ./scripts/current-project-alias-release.ts recover-source \
-  --plan-file /absolute/path/to/unchanged-hra-sh-plan.json \
+  --plan-file /absolute/path/to/unchanged-oompa-sh-plan.json \
   --vercel-auth-file /absolute/path/to/reviewed-vercel-auth.json \
   --confirm-exact '<exact requiredConfirmation from the original ready preflight>'
 ```
@@ -122,7 +126,7 @@ Only legacy compound attestation takes an additional evidence input. Use direct 
 
 ```sh
 bun ./scripts/current-project-alias-release.ts recover-source \
-  --plan-file /absolute/path/to/unchanged-hra-sh-plan.json \
+  --plan-file /absolute/path/to/unchanged-oompa-sh-plan.json \
   --vercel-auth-file /absolute/path/to/reviewed-vercel-auth.json \
   --recovery-evidence-file /absolute/path/to/reviewed-compound-phase-evidence.json \
   --confirm-exact '<exact requiredConfirmation from the original ready preflight>'
@@ -148,11 +152,13 @@ Durable recovery codes are closed instructions:
 - `durable_state_capacity_exhausted` is a designed stop after the ledger has reserved its lock plus as many as four records for each of 2,048 terminal plans. Do not remove history by hand. No new provider read or write is permitted until a reviewed operator revision adds a self-digested checkpoint or increases the bound while retaining every prior UUID and plan digest.
 - `unresolved_prior_intent` means a different older plan has an intent without a terminal receipt. The error identifies that older UUID plus its exact intent and expected receipt paths. Stop behind that hard boundary. Do not start the new plan and do not delete or edit the older evidence.
 
-For any exit `75`, stop release work, retain the unchanged plan and exact machine token, and preserve the fixed state directory. Re-running ordinary preflight or `--execute` may repeat readback, but a receipt-less intent remains a nonmutating hard stop for those operations. Use `recover-source` only after its protected phase prerequisite is established. Do not copy the intent to a second custodian, start a competing writer, or try a different UUID. Do not improvise a DNS change, domain move, deployment, detached alias command, HRA v0 route, new plan, or manual recovery while authority is uncertain.
+For any exit `75`, stop release work, retain the unchanged plan and exact machine token, and preserve the fixed state directory. Re-running ordinary preflight or `--execute` may repeat readback, but a receipt-less intent remains a nonmutating hard stop for those operations. Use `recover-source` only after its protected phase prerequisite is established. Do not copy the intent to a second custodian, start a competing writer, or try a different UUID. Do not improvise a DNS change, domain move, deployment, detached alias command, Oompa v0 route, new plan, or manual recovery while authority is uncertain.
 
 A completed source recovery is terminal for the original plan. Diagnose and resolve the recorded failure, wait for the reviewed operator and its exact production deployment to be ready, then prepare and preflight a fresh source-to-target plan. Earlier machine tokens and recovery evidence never carry into the fresh plan; standing task authority may continue to cover it only when the target and delivery outcome remain in the same authorized scope.
 
 ## Independent production verification
+
+Preserve the configured response headers as well as the body bytes. The site uses explicit slash-normalization redirects instead of Vercel's automatic `trailingSlash` transform, which can place a terminal `/.well-known` route before custom headers. The example header pattern must include the empty trailing segment in `/examples/app/`, not only descendant assets. The pinned route-compiler regression tests cover this ordering and matching behavior; they do not replace live response-header verification. Record the final URL after clean-URL redirects when checking the example document.
 
 After a committed result, independently repeat the filtered Vercel alias and deployment readbacks and fetch the public marker and release acceptance pages. Those observations do not expand the original authorization and must not perform another write.
 
@@ -163,8 +169,10 @@ bun run build:site -- --check
 bun run build:site
 ```
 
-The `--check` command validates the tracked README and privacy output; it returns before rendering `dist/site`. A passing check does not prove existing generated site files belong to the current checkout. The normal build regenerates those files. Confirm the tracked checkout remains clean afterward.
+The `--check` command validates the tracked privacy output; it returns before rendering `dist/site`. The package README is independently authored and checked by package admission, not generated by the website. A passing site check does not prove existing generated site files belong to the current checkout. The normal build regenerates those files. Confirm the tracked checkout remains clean afterward.
 
 A plain local build uses a `local` release marker unless an explicit build environment supplies the commit. Prove the public marker against the exact target commit and fixed marker contract above, not against that default local marker. Record the exact routes, content fragments and assets compared; matching selected page fragments does not prove whole-page or environment-specific analytics byte parity. Reload the real browser page before checking navigation, narrow layouts and sticky-header boundaries.
+
+An unconfigured local build omits the mailing footer's Turnstile script; Production requires the configured footer on all eight navigable pages. Validate exactly the script emitted by the pinned `@hraness/site-footer`, with one occurrence on each navigable page and none on `/preview/`; do not exempt arbitrary third-party scripts. Preserve exact owned stylesheet and script references. The homepage and six documentation pages load `/site.js`; `/privacy/` uses `/appearance.js` without `/site.js`, and `/preview/` remains inert.
 
 If content comparison fails after a committed transition, retain the provider readbacks and terminal receipt and first verify the local commit and fresh render. A stale local build is not authority to replay a terminal plan, edit the ledger or issue another alias write. Diagnose any remaining product mismatch under the same release and recovery boundaries.

@@ -40,9 +40,9 @@ const oldRepositoryId = 1_334_876_494;
 const newRepositoryId = 1_343_008_607;
 const team = "hraness";
 const teamId = "team_UAd1iD2XogJlbFg4h14mRaPM";
-const canonicalAlias = "hra.sh";
-const fallbackAlias = "hra-weld.vercel.app";
-const newStagingAlias = "try-hra.vercel.app";
+const canonicalAlias = "oompa.dev";
+const fallbackAlias = "oompa-weld.vercel.app";
+const newStagingAlias = "hra.vercel.app";
 const supportedVercelVersion = "54.18.0";
 const convergenceTimeoutMs = 60_000;
 const domainPageLimit = 20;
@@ -168,7 +168,7 @@ const markerSourceSchema = z.object({ commit: commitSchema }).strict();
 const markerSchema = z.union([
   z.object({
     generation: z.union([z.literal(0), z.literal(1)]),
-    product: z.literal("HRA"),
+    product: z.literal("Oompa"),
     publication: z.object({ version: versionSchema }).passthrough(),
     repository: z.object({
       id: z.literal(oldRepositoryId),
@@ -179,10 +179,10 @@ const markerSchema = z.union([
   }).strict(),
   z.object({
     generation: z.literal(1),
-    product: z.literal("HRA"),
+    product: z.literal("Oompa"),
     repository: z.object({
       id: z.literal(newRepositoryId),
-      path: z.literal("hraness/hra"),
+      path: z.literal("hraness/oompa"),
     }).strict(),
     schemaVersion: z.literal(2),
     source: markerSourceSchema,
@@ -329,7 +329,7 @@ const deploymentMatches = (
 const markerMatches = (value: unknown, endpoint: CutoverEndpoint): boolean => {
   if (endpoint.generation === null) return true;
   const parsed = markerSchema.safeParse(value);
-  const expectedPath = endpoint.projectId === oldProjectId ? "hraness/hra-v0" : "hraness/hra";
+  const expectedPath = endpoint.projectId === oldProjectId ? "hraness/hra-v0" : "hraness/oompa";
   const markerVersion = parsed.success
     ? "publication" in parsed.data
       ? parsed.data.publication.version

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { requireCloudDeploymentEnvironment } from "../domain/cloud-deployment-environment";
 
 import { hasExactKeys, isOpaqueIdentifier, isRecord } from "./contracts";
 
@@ -90,7 +91,7 @@ export function canonicalCloudDeploymentUrl(value: string): string {
   } catch {
     throw new CloudDeploymentAuthorityError(
       "invalid_configuration",
-      "HRA_CONVEX_URL is invalid.",
+      "The selected cloud deployment URL is invalid.",
     );
   }
   const localHttp = url.protocol === "http:"
@@ -105,7 +106,7 @@ export function canonicalCloudDeploymentUrl(value: string): string {
   ) {
     throw new CloudDeploymentAuthorityError(
       "invalid_configuration",
-      "HRA_CONVEX_URL is invalid.",
+      "The selected cloud deployment URL is invalid.",
     );
   }
   return url.origin;
@@ -114,7 +115,8 @@ export function canonicalCloudDeploymentUrl(value: string): string {
 export function cloudDeploymentSelectionFromEnvironment(
   environment: Readonly<Record<string, string | undefined>> = process.env,
 ): CloudDeploymentSelection {
-  const value = environment.HRA_CONVEX_URL;
+  const resolved = requireCloudDeploymentEnvironment(environment);
+  const value = resolved.selection.kind === "selected" ? resolved.selection.value : undefined;
   if (value === undefined) {
     return {
       deploymentUrl: DEFAULT_CLOUD_DEPLOYMENT_URL,
@@ -325,7 +327,7 @@ export async function acquireCloudDeploymentAuthority(
     if (!selection.explicit && hasLegacyCustody) {
       throw new CloudDeploymentAuthorityError(
         "legacy_binding_required",
-        "Legacy cloud custody requires an explicit HRA_CONVEX_URL before deployment binding.",
+        "Legacy cloud custody requires an explicit OOMPA_CONVEX_URL (or legacy HRA_CONVEX_URL) before deployment binding.",
       );
     }
     const value = {
@@ -423,21 +425,21 @@ export class IdentityScopedCloudSecretCustody implements CloudSecretCustodyPort 
   async assertCurrentIdentity(expectedUserPublicId: string | null): Promise<void> {
     if (expectedUserPublicId === null) {
       if (this.#activeIdentity !== null || await this.#custody.read(activeIdentitySlot) !== null) {
-        throw new Error("Cloud identity selection changed; restart HRA.");
+        throw new Error("Cloud identity selection changed; restart Oompa.");
       }
       return;
     }
     if (
       !isOpaqueIdentifier(expectedUserPublicId)
       || this.#activeIdentity?.userPublicId !== expectedUserPublicId
-    ) throw new Error("Cloud identity selection changed; restart HRA.");
+    ) throw new Error("Cloud identity selection changed; restart Oompa.");
     const current = await this.#custody.read(activeIdentitySlot);
     if (
       current === null
       || current.generation !== this.#activeIdentity.generation
       || current.value !== this.#activeIdentity.serialized
       || parseActiveIdentity(current.value).userPublicId !== expectedUserPublicId
-    ) throw new Error("Cloud identity selection changed; restart HRA.");
+    ) throw new Error("Cloud identity selection changed; restart Oompa.");
   }
 
   get cacheNamespace(): string | null {

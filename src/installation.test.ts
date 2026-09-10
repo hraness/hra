@@ -44,7 +44,37 @@ async function acceptanceDescriptor(
   };
 }
 
-describe("HRA installation composition", () => {
+describe("Oompa installation composition", () => {
+  test("captures both cloud aliases without selecting authority or changing the production namespace", () => {
+    const previousForward = process.env.OOMPA_CONVEX_URL;
+    const previousLegacy = process.env.HRA_CONVEX_URL;
+    try {
+      for (const environment of [
+        {}, { OOMPA_CONVEX_URL: "" }, { HRA_CONVEX_URL: " " },
+        { OOMPA_CONVEX_URL: "https://forward.convex.cloud" },
+        { OOMPA_CONVEX_URL: "", HRA_CONVEX_URL: "" },
+        { OOMPA_CONVEX_URL: "https://first.convex.cloud", HRA_CONVEX_URL: "https://second.convex.cloud" },
+      ]) {
+        delete process.env.OOMPA_CONVEX_URL;
+        delete process.env.HRA_CONVEX_URL;
+        Object.assign(process.env, environment);
+        const installation = createProductionInstallation();
+        expect(installation.cloudEnvironment).toEqual(environment);
+        expect(Object.isFrozen(installation.cloudEnvironment)).toBe(true);
+        expect(installation.paths).toEqual(resolveStatePaths());
+        expect(installation.personalProviderHomes).toEqual(personalProviderPaths());
+        process.env.OOMPA_CONVEX_URL = "later value";
+        process.env.HRA_CONVEX_URL = "later value";
+        expect(installation.cloudEnvironment).toEqual(environment);
+      }
+    } finally {
+      if (previousForward === undefined) delete process.env.OOMPA_CONVEX_URL;
+      else process.env.OOMPA_CONVEX_URL = previousForward;
+      if (previousLegacy === undefined) delete process.env.HRA_CONVEX_URL;
+      else process.env.HRA_CONVEX_URL = previousLegacy;
+    }
+  });
+
   test("keeps the production namespace fixed", () => {
     const installation = createProductionInstallation();
     expect(installation.kind).toBe("production");

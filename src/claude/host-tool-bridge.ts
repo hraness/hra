@@ -14,9 +14,9 @@ import { fileURLToPath } from "node:url";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 import {
-  HRA_HOST_TOOL_MANIFEST_VERSION,
-  parseHraHostToolRequest,
-  type HraHostToolRequest,
+  OOMPA_HOST_TOOL_MANIFEST_VERSION,
+  parseOompaHostToolRequest,
+  type OompaHostToolRequest,
 } from "../domain/host-tools.ts";
 import { ClaudeError } from "./errors.ts";
 import {
@@ -125,7 +125,7 @@ export type ClaudeHostToolCallbackResponse =
     }>;
 
 type BindingCallRecord = {
-  request: HraHostToolRequest | null;
+  request: OompaHostToolRequest | null;
   requestDigest: string;
   responseWritten: boolean;
   responseWrittenTask: Promise<void> | null;
@@ -427,7 +427,7 @@ export class ClaudeHostToolBindingAuthority {
       this.#provisioningIds.add(id);
       try {
         const token = capability(this.#newCapability());
-        const directory = await mkdtemp(join(root, ".hra-claude-host-tools-"));
+        const directory = await mkdtemp(join(root, ".oompa-claude-host-tools-"));
         try {
           await chmod(directory, 0o700);
           assertPrivateStat(await lstat(directory), "directory");
@@ -676,9 +676,9 @@ export class ClaudeHostToolBindingAuthority {
       };
     }
 
-    let parsed: HraHostToolRequest;
+    let parsed: OompaHostToolRequest;
     try {
-      parsed = parseHraHostToolRequest(request.tool, request.input);
+      parsed = parseOompaHostToolRequest(request.tool, request.input);
     } catch {
       throw new ClaudeError("PROTOCOL_ERROR", "Claude host-tool callback input is invalid");
     }
@@ -741,7 +741,7 @@ export class ClaudeHostToolBindingAuthority {
           kind: "call_result" as const,
           ok: false,
           requestDigest: request.requestDigest,
-          text: "HRA could not complete this host-tool request.",
+          text: "Oompa could not complete this host-tool request.",
           version: CLAUDE_HOST_TOOL_CALLBACK_VERSION,
         };
       }
@@ -1053,4 +1053,4 @@ export async function runClaudeHostToolStdio(input: {
 }
 
 /** Shared manifest version appears in the MCP config tests without duplicating it. */
-export const CLAUDE_HOST_TOOL_MCP_MANIFEST_VERSION = HRA_HOST_TOOL_MANIFEST_VERSION;
+export const CLAUDE_HOST_TOOL_MCP_MANIFEST_VERSION = OOMPA_HOST_TOOL_MANIFEST_VERSION;

@@ -35,7 +35,7 @@ import {
   type NotificationEmailPolicy,
   type NotificationHoursPolicy,
   type ProfileBindingPayload,
-} from "../hra/cloud";
+} from "../oompa/cloud";
 import { createCancellation } from "../lib/cancellation";
 import {
   sortMachines,

@@ -1,6 +1,6 @@
 # Model routing: Phase 3 shadow contract
 
-HRA does not automatically route work to a different model in Phase 3. Sol
+Oompa does not automatically route work to a different model in Phase 3. Sol
 Ultra is the only effective automatic default for new Codex sessions, with Fast off.
 The task-shape classifier and the routing decision are shadow-only: they can
 describe disabled studies, but they cannot mutate a session or authorize a
@@ -249,10 +249,10 @@ digest predates a study. Reports therefore always state:
 
 Broad plans sometimes treat public benchmark rank, advertised latency, nominal
 context size, provider pricing, or account quota as sufficient routing proof.
-They are not. Public evaluations need not match HRA's task distribution,
+They are not. Public evaluations need not match Oompa's task distribution,
 permissions, tool surface, repair policy, runtime generation, or safety effect
 class. List prices do not establish observed private cost, and a documented
-model name does not prove that HRA's pinned runtime can select and verify that
+model name does not prove that Oompa's pinned runtime can select and verify that
 exact profile.
 
 For the same reason, Phase 3 does not translate general claims such as “faster,”

@@ -194,7 +194,7 @@ export default tseslint.config(
   {
     // The browser app is a separate consumer of the repository, not another
     // `src/` layer. It may reach only the browser-safe cloud modules and the
-    // domain leaf, and it reaches those through `app/src/hra/`. Every other
+    // domain leaf, and it reaches those through `app/src/oompa/`. Every other
     // `src/cloud` module is node-only (daemon adapters, journals, on-disk
     // secret custody) and must never enter the bundle.
     files: ["app/**/*.ts", "app/**/*.tsx"],
@@ -202,7 +202,7 @@ export default tseslint.config(
       {
         regex: "(^|/)src/(?!cloud/(client|contracts|crypto|payloads|projection)(\\.ts)?$)(?!domain/)",
         message:
-          "app/ imports repository source only from src/cloud/{crypto,projection,payloads,contracts,client} and src/domain/*, through app/src/hra/.",
+          "app/ imports repository source only from src/cloud/{crypto,projection,payloads,contracts,client} and src/domain/*, through app/src/oompa/.",
       },
     ]),
   },
@@ -215,7 +215,7 @@ export default tseslint.config(
     rules: layerRules([
       {
         regex: `^(?!${browserFixtureAppSource}$).*(?:^|/)src/`,
-        message: "Browser fixtures import app source through canonical ../../src/ paths. Repository source must stay behind app/src/hra/.",
+        message: "Browser fixtures import app source through canonical ../../src/ paths. Repository source must stay behind app/src/oompa/.",
       },
     ]),
   },

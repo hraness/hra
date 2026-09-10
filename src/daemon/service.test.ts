@@ -1,12 +1,37 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import fc from "fast-check";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { Database } from "bun:sqlite";
-import { z } from "zod";
 
+import { canonical40QueuesDatabaseBytes, canonical40QueuesFixture } from "../../scripts/fixtures/canonical40-queues";
+import { canonical39DevinDatabaseBytes, canonical39DevinFixture } from "../../scripts/fixtures/canonical39-devin";
+import { canonical39RetiredDatabaseBytes, canonical39RetiredFixtures } from "../../scripts/fixtures/canonical39-retired-effects";
+import {
+  canonical39RetiredRecoveryDatabaseBytes,
+  canonical39RetiredRecoveryFixtures,
+  type Canonical39RetiredRecoveryScenario,
+} from "../../scripts/fixtures/canonical39-retired-recovery";
+import {
+  canonical39RetiredTargetDatabaseBytes,
+  canonical39RetiredTargetFixtures,
+  type Canonical39RetiredTargetScenario,
+} from "../../scripts/fixtures/canonical39-retired-targets";
+import { canonical24ResetDatabaseBytes, canonical24ResetFixture } from "../../scripts/fixtures/canonical24-reset";
+import { canonicalLoginLedgerDatabaseBytes, canonicalLoginLedgerFixtures } from "../../scripts/fixtures/canonical-login-ledger";
+import {
+  canonical39AttachmentDatabaseBytes,
+  canonical39AttachmentFixtures,
+  type Canonical39AttachmentScenario,
+} from "../../scripts/fixtures/canonical39-attachments";
+import {
+  canonicalSessionStartDatabaseBytes,
+  canonicalSessionStartFixtures,
+  type CanonicalSessionStartScenario,
+} from "../../scripts/fixtures/canonical-session-start";
 import {
   CodexError,
   CodexRemoteError,
@@ -15,12 +40,13 @@ import {
   type CodexAutomationAuthorityRequest,
   type CodexAutomationAuthorityScan,
   type CodexFact,
-  type HraHostToolCall,
+  type OompaHostToolCall,
   type CodexPluginCatalog,
 } from "../codex";
 import { parseFact, parseThreadMetadataRead } from "../codex/protocol";
 import { projectBoundedThread } from "./codex-runtime-adapter";
 import { CLAUDE_PIN, CLAUDE_PIN_MODEL } from "../claude/pin";
+import { IndeterminateClaudeEffectError } from "../claude/errors";
 import { CloudProjectionRecoveryAdmissionError } from "../cloud/contracts";
 import { AccountKeyLossPreconditionError } from "../cloud/local-control";
 import {
@@ -37,7 +63,7 @@ import {
   type LocalCommand,
   type NotificationEmailHostedAuthority,
 } from "../domain/contracts";
-import { HRA_HOST_TOOL_PUBLIC_RESULT_MAX_BYTES } from "../domain/host-tools";
+import { OOMPA_HOST_TOOL_PUBLIC_RESULT_MAX_BYTES } from "../domain/host-tools";
 import { PROJECT_MEMORY_EMPTY_HEAD } from "../domain/project-memory";
 import {
   PROTECTED_INTERACTION_DETAIL_MAXIMUM_BYTES,
@@ -55,11 +81,9 @@ import { AttachmentBlobStore } from "../storage/attachment-store";
 import { ingestAttachments } from "./attachment-ingest";
 import {
   currentPresetContract,
-  devinPresetContract,
   legacyPresetContract,
   presetRequirements,
 } from "../domain/presets";
-import { createQueueId } from "../domain/values";
 import type {
   EffectiveClaudeRuntimeProfile,
   EffectiveRuntimeProfile,
@@ -73,6 +97,7 @@ import {
   storedAccountUsageSnapshotSchema,
 } from "../domain/usage-metrics";
 import { initializeStatePaths, profilePaths, resolveStatePaths } from "../storage/paths";
+import { resolveUsableCanonicalProjectDirectory } from "../storage/project-directory";
 import {
   InMemoryGatewayKeyStore,
   type GatewayKeyPort,
@@ -80,10 +105,13 @@ import {
 import {
   mutationRequestDigest,
   sessionStartMutationRequest,
+  StateSecurityScrubRequiredError,
   StateStore,
   type SecurityScrubCheckpointPolicy,
   type SessionRecord,
 } from "../storage/state-store";
+import { SessionSendOwnershipError } from "../storage/session-send-owner";
+import { canonicalAdoption40DatabaseBytes, canonicalAdoption40Fixture } from "../../scripts/fixtures/canonical-adoption40";
 import {
   DeterministicProseResponder,
   PROSE_APPROVAL_REPLY,
@@ -91,8 +119,8 @@ import {
 } from "./prose-responder";
 import { DaemonAuthoritySafetyError } from "./daemon-lock";
 import type {
-  HraFactsMemoryLifecyclePort,
-  HraFactsMemoryLifecycleReceipt,
+  OompaFactsMemoryLifecyclePort,
+  OompaFactsMemoryLifecycleReceipt,
 } from "./facts-memory-lifecycle";
 import { ClaudeProcessExitUnprovenError, ClaudeSessionObservationError, CodexClaimReleaseUnprovenError, CodexSessionObservationError, UnavailableClaudeRuntime, UnavailableCloudControl, type ClaudeProcessIdentity, type ClaudeRuntimePort, type ClaudeRuntimeStartReview, type CloudControlPort, type CodexAccountProjection, type CodexLoginOutcome, type CodexRuntimePort, type CodexSessionObservation, type CodexSessionProjection, type CompactProjectionRecoveryBlocker, type DesktopSwitchPort, type ProfileAuthority, type RuntimeStartReview } from "./ports";
 import {
@@ -106,11 +134,11 @@ import {
   type PersonalSessionDiscoveryPort,
 } from "./personal-session-discovery";
 import type {
-  HraMemoryPort,
-  HraMemoryRefusalCode,
+  OompaMemoryPort,
+  OompaMemoryRefusalCode,
 } from "./memory-coordinator";
 import { SessionEventCursorCodec } from "./session-event-cursor";
-import { CommandFailure, FACTS_MEMORY_SESSION_TTL_MS, HraService } from "./service";
+import { CommandFailure, FACTS_MEMORY_SESSION_TTL_MS, OompaService } from "./service";
 import { USAGE_HISTORY_CURSOR_TTL_MS } from "./usage-history-cursor";
 
 const privatePathRoot = ["", "Users", "private"].join("/");
@@ -223,8 +251,10 @@ class FakeCodex implements CodexRuntimePort {
   accountProjection: CodexAccountProjection = { signedIn: true, email: "person@example.com", plan: "Plus" };
   usageResult: { revision: number; observedAt: number; payload: unknown } = { revision: 1, observedAt: 2_000, payload: { primary: { usedPercent: 25 } } };
   readonly usageResults: Array<{ revision: number; observedAt: number; payload: unknown }> = [];
+  readonly readAccountAuthorities: ProfileAuthority[] = [];
+  readonly readUsageAuthorities: ProfileAuthority[] = [];
   usageError: Error | undefined;
-  beforeReadUsageReturn?: () => Promise<void>;
+  beforeReadUsageReturn?: (input: Parameters<CodexRuntimePort["readUsage"]>[0]) => Promise<void>;
   resetOutcome: "reset" | "alreadyRedeemed" | "nothingToReset" | "noCredit" = "reset";
   resetError: Error | undefined;
   beforeResetReturn?: () => Promise<void>;
@@ -300,9 +330,9 @@ class FakeCodex implements CodexRuntimePort {
   cancelLoginResult: { status: "canceled" | "not_found" } = { status: "canceled" };
   beforeLoginReturn?: (input: { authority: ProfileAuthority; method: "browser" | "device_code" }) => Promise<void>;
   beforeCancelLoginReturn: (() => Promise<void>) | undefined = undefined;
-  beforeReadAccountReturn?: () => Promise<void>;
+  beforeReadAccountReturn?: (input: Parameters<CodexRuntimePort["readAccount"]>[0]) => Promise<void>;
   #authorityKey(authority: ProfileAuthority): string {
-    return `${authority.id}:${String(authority.generation)}`;
+    return `${authority.provider}:${authority.providerAccountId}:${authority.bindingGeneration}:${authority.id}:${String(authority.generation)}`;
   }
   retireAuthority(authority: ProfileAuthority): void {
     this.retiredAuthorityKeys.add(this.#authorityKey(authority));
@@ -341,8 +371,9 @@ class FakeCodex implements CodexRuntimePort {
     if (this.retiredAuthorityKeys.has(this.#authorityKey(input.authority))) {
       throw new Error("AUTHORITY_STALE");
     }
+    this.readAccountAuthorities.push(input.authority);
     const observed = this.accountProjection;
-    await this.beforeReadAccountReturn?.();
+    await this.beforeReadAccountReturn?.(input);
     return observed;
   }
   async listPlugins(input: Parameters<CodexRuntimePort["listPlugins"]>[0]): Promise<CodexPluginCatalog> {
@@ -350,9 +381,10 @@ class FakeCodex implements CodexRuntimePort {
     this.pluginRequests.push(input);
     return this.pluginCatalog;
   }
-  async readUsage(): Promise<{ revision: number; observedAt: number; payload: unknown }> {
+  async readUsage(input: Parameters<CodexRuntimePort["readUsage"]>[0]): Promise<{ revision: number; observedAt: number; payload: unknown }> {
     this.calls.push("usage");
-    await this.beforeReadUsageReturn?.();
+    this.readUsageAuthorities.push(input.authority);
+    await this.beforeReadUsageReturn?.(input);
     if (this.usageError !== undefined) throw this.usageError;
     return this.usageResults.shift() ?? this.usageResult;
   }
@@ -659,6 +691,7 @@ class FakeClaude implements ClaudeRuntimePort {
     Parameters<ClaudeRuntimePort["validateInteractionResolution"]>[0]
   > = [];
   beforeEndSessionReturn?: () => Promise<void>;
+  beforeStartTurnReturn?: () => Promise<void>;
   beforeClaimSessionAdmission?: (
     input: Parameters<ClaudeRuntimePort["claimSession"]>[0],
   ) => Promise<void> | void;
@@ -758,7 +791,11 @@ class FakeClaude implements ClaudeRuntimePort {
     this.hostToolActivationRequests.push(input);
   }
 
-  async readAccount(): Promise<CodexAccountProjection> {
+  async readAccount(): ReturnType<ClaudeRuntimePort["readAccount"]> {
+    return { readiness: this.accountProjection.signedIn ? "signed_in" : "signed_out", observedAt: personalAdoptionNow };
+  }
+
+  async readProviderAccountIdentity(): Promise<CodexAccountProjection> {
     return this.accountProjection;
   }
 
@@ -922,6 +959,7 @@ class FakeClaude implements ClaudeRuntimePort {
       ],
     };
     if (this.startTurnError !== undefined) throw this.startTurnError;
+    if (this.beforeStartTurnReturn !== undefined) await this.beforeStartTurnReturn();
     return {
       turnId,
       status: "completed",
@@ -941,15 +979,16 @@ class FakeClaude implements ClaudeRuntimePort {
   }
 
   interactionAuthority(
+    authority: ProfileAuthority,
     providerThreadId: string,
     requestId: string,
   ): ProviderInteractionAuthority {
-    const authority = this.claimRequests.at(-1)?.authority
-      ?? this.startSessionRequests.at(-1)?.authority;
-    if (authority === undefined) return this.#unsupported();
     return {
       profileId: authority.id,
       processGeneration: authority.generation,
+      provider: authority.provider,
+      providerAccountId: authority.providerAccountId,
+      bindingGeneration: authority.bindingGeneration,
       connectionId: this.observationConnectionId,
       requestId: { type: "string", value: requestId },
       method: "claude/control_request/can_use_tool",
@@ -1184,6 +1223,7 @@ class FakeCloud implements CloudControlPort {
 
 class FakeDesktop implements DesktopSwitchPort {
   readonly calls: string[] = [];
+  readonly switchInputs: Array<Parameters<DesktopSwitchPort["switchAccount"]>[0]> = [];
   recovery: unknown = {
     status: "resolved_not_applied",
     idempotencyKey: "00000000-0000-4000-8000-000000000601",
@@ -1196,8 +1236,11 @@ class FakeDesktop implements DesktopSwitchPort {
   current: unknown = { status: "none" };
   currentError?: unknown;
 
-  async switchAccount(input: { idempotencyKey: string }): Promise<{ status: "applied"; idempotencyKey: string }> {
+  async switchAccount(
+    input: Parameters<DesktopSwitchPort["switchAccount"]>[0],
+  ): Promise<{ status: "applied"; idempotencyKey: string }> {
     this.calls.push("switch");
+    this.switchInputs.push(input);
     return { status: "applied", idempotencyKey: input.idempotencyKey };
   }
 
@@ -1217,19 +1260,21 @@ class FakeDesktop implements DesktopSwitchPort {
   }
 }
 
-class FakeFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
-  readonly cleanups: Array<Parameters<HraFactsMemoryLifecyclePort["cleanupSession"]>[0]> = [];
-  readonly ensures: Array<Parameters<HraFactsMemoryLifecyclePort["ensureSession"]>[0]> = [];
+class FakeFactsMemoryLifecycle implements OompaFactsMemoryLifecyclePort {
+  readonly cleanups: Array<Parameters<OompaFactsMemoryLifecyclePort["cleanupSession"]>[0]> = [];
+  readonly ensures: Array<Parameters<OompaFactsMemoryLifecyclePort["ensureSession"]>[0]> = [];
   readonly sweeps: number[] = [];
+  readonly transfers: Array<Parameters<OompaFactsMemoryLifecyclePort["transferSessionOwner"]>[0]> = [];
   readonly epochs = new Map<string, number>();
   readonly expiries = new Map<string, number>();
   readonly owners = new Map<string, string>();
   readonly states = new Map<string, "active" | "purged">();
   readonly cleanupErrors = new Set<string>();
   ensureErrorOnce: Error | undefined;
+  transferErrorOnce: Error | undefined;
   simulateExpiry = false;
 
-  #receipt(sessionId: string, state: HraFactsMemoryLifecycleReceipt["state"] = "active"): HraFactsMemoryLifecycleReceipt {
+  #receipt(sessionId: string, state: OompaFactsMemoryLifecycleReceipt["state"] = "active"): OompaFactsMemoryLifecycleReceipt {
     return {
       bindingDigest: "a".repeat(64),
       epoch: this.epochs.get(sessionId) ?? 1,
@@ -1245,19 +1290,19 @@ class FakeFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
     };
   }
 
-  readSession(sessionId: string): HraFactsMemoryLifecycleReceipt | null {
+  readSession(sessionId: string): OompaFactsMemoryLifecycleReceipt | null {
     const state = this.states.get(sessionId);
     return state === undefined ? null : this.#receipt(sessionId, state);
   }
 
-  async cleanupSession(input: Parameters<HraFactsMemoryLifecyclePort["cleanupSession"]>[0]) {
+  async cleanupSession(input: Parameters<OompaFactsMemoryLifecyclePort["cleanupSession"]>[0]) {
     this.cleanups.push(input);
     if (this.cleanupErrors.has(input.sessionId)) throw new Error("poisoned terminal cleanup");
     this.states.set(input.sessionId, "purged");
     return this.#receipt(input.sessionId, "purged");
   }
 
-  async ensureSession(input: Parameters<HraFactsMemoryLifecyclePort["ensureSession"]>[0]) {
+  async ensureSession(input: Parameters<OompaFactsMemoryLifecyclePort["ensureSession"]>[0]) {
     this.ensures.push(input);
     const error = this.ensureErrorOnce;
     this.ensureErrorOnce = undefined;
@@ -1276,17 +1321,47 @@ class FakeFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
     return this.#receipt(input.sessionId);
   }
 
-  async forkSession(input: Parameters<HraFactsMemoryLifecyclePort["forkSession"]>[0]) {
+  async transferSessionOwner(
+    input: Parameters<OompaFactsMemoryLifecyclePort["transferSessionOwner"]>[0],
+  ) {
+    this.transfers.push(input);
+    const error = this.transferErrorOnce;
+    this.transferErrorOnce = undefined;
+    if (error !== undefined) throw error;
+    const owner = this.owners.get(input.sessionId);
+    if (owner !== undefined && owner !== input.fromOwnerId && owner !== input.toOwnerId) {
+      throw new Error("FACTS_MEMORY_AUTHORITY_MISMATCH");
+    }
+    if (owner === input.toOwnerId || input.fromOwnerId === input.toOwnerId) {
+      this.owners.set(input.sessionId, input.toOwnerId);
+      this.expiries.set(
+        input.sessionId,
+        Math.max(this.expiries.get(input.sessionId) ?? 0, input.expiresAt),
+      );
+      this.states.set(input.sessionId, "active");
+      return this.#receipt(input.sessionId);
+    }
+    this.owners.set(input.sessionId, input.toOwnerId);
+    this.expiries.set(
+      input.sessionId,
+      Math.max(this.expiries.get(input.sessionId) ?? 0, input.expiresAt),
+    );
+    this.states.set(input.sessionId, "active");
+    this.epochs.set(input.sessionId, (this.epochs.get(input.sessionId) ?? 0) + 1);
+    return this.#receipt(input.sessionId);
+  }
+
+  async forkSession(input: Parameters<OompaFactsMemoryLifecyclePort["forkSession"]>[0]) {
     return this.#receipt(input.childSessionId);
   }
 
-  async resumeSession(input: Parameters<HraFactsMemoryLifecyclePort["resumeSession"]>[0]) {
+  async resumeSession(input: Parameters<OompaFactsMemoryLifecyclePort["resumeSession"]>[0]) {
     return this.#receipt(input.sessionId);
   }
 
   async sweepExpired(
     now: number,
-    policy?: Parameters<HraFactsMemoryLifecyclePort["sweepExpired"]>[1],
+    policy?: Parameters<OompaFactsMemoryLifecyclePort["sweepExpired"]>[1],
   ) {
     this.sweeps.push(now);
     let purged = 0;
@@ -1303,41 +1378,41 @@ class FakeFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
   }
 }
 
-class FakeMemory implements HraMemoryPort {
-  readonly statuses: Array<Parameters<HraMemoryPort["status"]>[0]> = [];
-  readonly remembers: Array<Parameters<HraMemoryPort["remember"]>[0]> = [];
-  readonly queries: Array<Parameters<HraMemoryPort["query"]>[0]> = [];
-  readonly explanations: Array<Parameters<HraMemoryPort["explain"]>[0]> = [];
-  readonly shares: Array<Parameters<HraMemoryPort["share"]>[0]> = [];
+class FakeMemory implements OompaMemoryPort {
+  readonly statuses: Array<Parameters<OompaMemoryPort["status"]>[0]> = [];
+  readonly remembers: Array<Parameters<OompaMemoryPort["remember"]>[0]> = [];
+  readonly queries: Array<Parameters<OompaMemoryPort["query"]>[0]> = [];
+  readonly explanations: Array<Parameters<OompaMemoryPort["explain"]>[0]> = [];
+  readonly shares: Array<Parameters<OompaMemoryPort["share"]>[0]> = [];
   readonly forgottenSessions: string[] = [];
   queryError: Error | undefined;
   beforeRememberReturn: (() => Promise<void>) | undefined;
   closeCalls = 0;
   recoverCalls = 0;
 
-  async status(input: Parameters<HraMemoryPort["status"]>[0]) {
+  async status(input: Parameters<OompaMemoryPort["status"]>[0]) {
     this.statuses.push(input);
     return { version: 1, ok: true, kind: "status", sessionId: input.actorSessionId };
   }
 
-  async remember(input: Parameters<HraMemoryPort["remember"]>[0]) {
+  async remember(input: Parameters<OompaMemoryPort["remember"]>[0]) {
     this.remembers.push(input);
     await this.beforeRememberReturn?.();
     return { version: 1, ok: true, kind: "remember" };
   }
 
-  async query(input: Parameters<HraMemoryPort["query"]>[0]) {
+  async query(input: Parameters<OompaMemoryPort["query"]>[0]) {
     this.queries.push(input);
     if (this.queryError !== undefined) throw this.queryError;
     return { version: 1, ok: true, kind: "query" };
   }
 
-  async explain(input: Parameters<HraMemoryPort["explain"]>[0]) {
+  async explain(input: Parameters<OompaMemoryPort["explain"]>[0]) {
     this.explanations.push(input);
     return { version: 1, ok: true, kind: "explain" };
   }
 
-  async share(input: Parameters<HraMemoryPort["share"]>[0]) {
+  async share(input: Parameters<OompaMemoryPort["share"]>[0]) {
     this.shares.push(input);
     return { version: 1, ok: true, kind: "share" };
   }
@@ -1356,9 +1431,9 @@ class FakeMemory implements HraMemoryPort {
 }
 
 class FakeMemoryRefusalError extends Error {
-  override readonly name = "HraMemoryRefusalError";
+  override readonly name = "OompaMemoryRefusalError";
 
-  constructor(readonly code: HraMemoryRefusalCode) {
+  constructor(readonly code: OompaMemoryRefusalCode) {
     super(code);
   }
 }
@@ -1391,7 +1466,14 @@ class TrackingClaudeAuthority extends UnavailableClaudeRuntime {
 const stores: StateStore[] = [];
 const serviceRoots: string[] = [];
 const ownedFixtureTeardowns: Array<() => Promise<void>> = [];
+type ServiceCaseResources = {
+  stores: Array<Pick<StateStore, "close">>;
+  roots: string[];
+  services: Array<Pick<OompaService, "close">>;
+};
+const ownedServiceCaseTeardowns: Array<() => Promise<void>> = [];
 afterEach(async () => {
+  const caseTeardowns = ownedServiceCaseTeardowns.splice(0);
   // A timed-out owned fixture can still have an admitted command. Join its
   // request and service before the shared fixture cleanup removes storage.
   for (const teardown of ownedFixtureTeardowns) await teardown();
@@ -1399,11 +1481,23 @@ afterEach(async () => {
   for (const store of stores.splice(0)) store.close();
   await Promise.all(serviceRoots.splice(0).map(async (root) =>
     rm(root, { force: true, recursive: true })));
+  // Each case owns private lists. A late drain cannot claim fixtures from a
+  // subsequent test, even if this afterEach itself reaches its deadline.
+  const results = await Promise.allSettled(caseTeardowns.map(async (teardown) => await teardown()));
+  const failures = results.flatMap((result): unknown[] => result.status === "rejected" ? [result.reason] : []);
+  if (failures.length > 0) throw new AggregateError(failures, "Service case teardown failed.");
 });
 
 type FixtureAdoptionOptions = Readonly<{
+  canonical40Queues?: true;
+  canonical39Devin?: true;
+  canonical39Retired?: "queue_dispatch";
+  canonical39RetiredRecovery?: Canonical39RetiredRecoveryScenario;
+  canonical39RetiredTarget?: Canonical39RetiredTargetScenario;
+  canonicalSessionStart?: CanonicalSessionStartScenario;
+  canonical39Attachments?: Canonical39AttachmentScenario;
   managedClaude?: ClaudeRuntimePort;
-  memory?: HraMemoryPort;
+  memory?: OompaMemoryPort;
   personalCodex?: CodexRuntimePort;
   personalClaude?: ClaudeRuntimePort;
   personalDiscovery?: PersonalSessionDiscoveryPort;
@@ -1423,18 +1517,39 @@ const shortScrubCheckpoint: SecurityScrubCheckpointPolicy = {
   backoffMs: 10,
 };
 
-const isHraMemoryPort = (
-  value: FixtureAdoptionOptions | HraMemoryPort | NodeJS.Platform | undefined,
-): value is HraMemoryPort => typeof value === "object"
-  && typeof (value as Partial<HraMemoryPort>).status === "function"
-  && typeof (value as Partial<HraMemoryPort>).remember === "function";
+const isOompaMemoryPort = (
+  value: FixtureAdoptionOptions | OompaMemoryPort | NodeJS.Platform | undefined,
+): value is OompaMemoryPort => typeof value === "object"
+  && typeof (value as Partial<OompaMemoryPort>).status === "function"
+  && typeof (value as Partial<OompaMemoryPort>).remember === "function";
+
+const expectHistoricalValue = (actual: unknown, expected: unknown): void => {
+  expect(actual).toEqual(expected);
+};
+
+const serviceFixtureDatabaseSnapshot = (path: string) => {
+  const database = new Database(path, { strict: true });
+  try {
+    database.exec("PRAGMA query_only=ON");
+    return database.transaction(() => ({
+      schema: database.query("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name").all(),
+      tables: database.query<{ name: string }, []>("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name").all()
+        .map(({ name }) => {
+          if (!/^[A-Za-z0-9_]+$/u.test(name)) throw new Error("Unexpected service fixture table name.");
+          const rows = database.query(`SELECT * FROM "${name}" LIMIT 4097`).all();
+          if (rows.length > 4096) throw new Error("Service fixture exceeded its row bound.");
+          return { name, rows: rows.map((row) => JSON.stringify(row)).sort() };
+        }),
+    })).deferred();
+  } finally { database.close(false); }
+};
 
 async function fixture(
   desktop?: DesktopSwitchPort,
   cloud = new FakeCloud(),
   requestStop: () => void = () => undefined,
   now: () => number = Date.now,
-  factsMemory?: HraFactsMemoryLifecyclePort,
+  factsMemory?: OompaFactsMemoryLifecyclePort,
   autorespond: Readonly<{
     beforeMemoryClose?: () => Promise<void>;
     claude?: ClaudeRuntimePort;
@@ -1442,34 +1557,80 @@ async function fixture(
     proseResponder?: ProseResponder;
     securityScrubCheckpoint?: SecurityScrubCheckpointPolicy;
   }> = {},
-  adoptionOrMemoryOrPlatform: FixtureAdoptionOptions | HraMemoryPort | NodeJS.Platform = {},
+  adoptionOrMemoryOrPlatform: FixtureAdoptionOptions | OompaMemoryPort | NodeJS.Platform = {},
   platformOrClaude?: NodeJS.Platform | ClaudeRuntimePort,
   platformOverride: NodeJS.Platform = "linux",
-): Promise<{ service: HraService; store: StateStore; codex: FakeCodex; cloud: FakeCloud; daemonAuthority: FakeDaemonAuthority; documents: string; eventCursors: SessionEventCursorCodec; paths: ReturnType<typeof resolveStatePaths> }> {
-  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-service-")));
-  serviceRoots.push(home);
+  resources?: ServiceCaseResources,
+): Promise<{ service: OompaService; store: StateStore; codex: FakeCodex; cloud: FakeCloud; daemonAuthority: FakeDaemonAuthority; daemonGeneration: number; daemonBootId: string; documents: string; eventCursors: SessionEventCursorCodec; paths: ReturnType<typeof resolveStatePaths> }> {
+  const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-service-")));
+  (resources?.roots ?? serviceRoots).push(home);
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   const documents = join(home, "Documents");
   await mkdir(documents, { recursive: true });
   await initializeStatePaths(paths);
+  const adoption: FixtureAdoptionOptions = typeof adoptionOrMemoryOrPlatform === "object"
+    && !isOompaMemoryPort(adoptionOrMemoryOrPlatform)
+    ? adoptionOrMemoryOrPlatform
+    : {};
+  if (adoption.canonical40Queues === true) {
+    await writeFile(paths.database, canonical40QueuesDatabaseBytes(), { mode: 0o600 });
+  }
+  if (adoption.canonical39Devin === true) {
+    if (adoption.canonical40Queues === true) throw new Error("Choose exactly one archived source.");
+    // Preserve the actual released producer's sessions and login evidence. This
+    // is synthetic control-plane history, not a native provider custody proof.
+    await writeFile(paths.database, canonical39DevinDatabaseBytes(), { mode: 0o600 });
+  }
+  if (adoption.canonical39Retired !== undefined) {
+    if (adoption.canonical40Queues === true || adoption.canonical39Devin === true) {
+      throw new Error("Choose exactly one archived source.");
+    }
+    await writeFile(paths.database, canonical39RetiredDatabaseBytes(adoption.canonical39Retired), { mode: 0o600 });
+  }
+  if (adoption.canonical39RetiredRecovery !== undefined) {
+    if (adoption.canonical40Queues === true || adoption.canonical39Devin === true
+      || adoption.canonical39Retired !== undefined) throw new Error("Choose exactly one archived source.");
+    await writeFile(paths.database, canonical39RetiredRecoveryDatabaseBytes(adoption.canonical39RetiredRecovery), { mode: 0o600 });
+  }
+  if (adoption.canonical39RetiredTarget !== undefined) {
+    if (adoption.canonical40Queues === true || adoption.canonical39Devin === true
+      || adoption.canonical39Retired !== undefined || adoption.canonical39RetiredRecovery !== undefined) {
+      throw new Error("Choose exactly one archived source.");
+    }
+    await writeFile(paths.database, canonical39RetiredTargetDatabaseBytes(adoption.canonical39RetiredTarget), { mode: 0o600 });
+  }
+  if (adoption.canonicalSessionStart !== undefined) {
+    if (adoption.canonical40Queues === true || adoption.canonical39Devin === true
+      || adoption.canonical39Retired !== undefined || adoption.canonical39RetiredRecovery !== undefined
+      || adoption.canonical39RetiredTarget !== undefined) throw new Error("Choose exactly one archived source.");
+    await writeFile(paths.database, canonicalSessionStartDatabaseBytes(adoption.canonicalSessionStart), { mode: 0o600 });
+  }
+  if (adoption.canonical39Attachments !== undefined) {
+    if (adoption.canonical40Queues === true || adoption.canonical39Devin === true
+      || adoption.canonical39Retired !== undefined || adoption.canonical39RetiredRecovery !== undefined
+      || adoption.canonical39RetiredTarget !== undefined || adoption.canonicalSessionStart !== undefined) {
+      throw new Error("Choose exactly one archived source.");
+    }
+    await writeFile(paths.database, canonical39AttachmentDatabaseBytes(adoption.canonical39Attachments), { mode: 0o600 });
+  }
   const store = new StateStore(paths, {
     now,
     ...(autorespond.securityScrubCheckpoint === undefined
       ? {}
       : { securityScrubCheckpoint: autorespond.securityScrubCheckpoint }),
   });
-  stores.push(store);
+  (resources?.stores ?? stores).push(store);
+  // Exercise the same explicit persisted boot fence used by the real daemon;
+  // generation zero is not attachment reservation or deletion authority.
+  const daemonBootId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
+  const daemonGeneration = store.nextDaemonGeneration(daemonBootId);
   // The daemon defaults to answering approvals itself; these tests exercise
   // the manual paths and opt in to autorespond explicitly where needed.
   store.setDefaultApprovalMode("manual");
   const codex = new FakeCodex();
   const daemonAuthority = new FakeDaemonAuthority();
   const eventCursors = new SessionEventCursorCodec(SessionEventCursorCodec.generateKey());
-  const adoption: FixtureAdoptionOptions = typeof adoptionOrMemoryOrPlatform === "object"
-    && !isHraMemoryPort(adoptionOrMemoryOrPlatform)
-    ? adoptionOrMemoryOrPlatform
-    : {};
-  const memory = isHraMemoryPort(adoptionOrMemoryOrPlatform)
+  const memory = isOompaMemoryPort(adoptionOrMemoryOrPlatform)
     ? adoptionOrMemoryOrPlatform
     : adoption.memory;
   const explicitClaude = typeof platformOrClaude === "string"
@@ -1481,49 +1642,88 @@ async function fixture(
       ? platformOrClaude
       : platformOverride;
   const managedClaude = adoption.managedClaude ?? explicitClaude ?? autorespond.claude;
+  const service = new OompaService({
+    store,
+    paths,
+    codex,
+    cloud,
+    daemonAuthority,
+    daemonGeneration,
+    daemonBootId,
+    ...(desktop === undefined ? {} : { desktop }),
+    ...(managedClaude === undefined ? {} : { claude: managedClaude }),
+    eventCursors,
+    ...(factsMemory === undefined ? {} : { factsMemory }),
+    ...(memory === undefined ? {} : { memory }),
+    ...(autorespond.beforeMemoryClose === undefined
+      ? {}
+      : { beforeMemoryClose: autorespond.beforeMemoryClose }),
+    ...(autorespond.gatewayKeys === undefined ? {} : { gatewayKeys: autorespond.gatewayKeys }),
+    ...(autorespond.proseResponder === undefined ? {} : { proseResponder: autorespond.proseResponder }),
+    ...(adoption.personalCodex === undefined ? {} : { personalCodex: adoption.personalCodex }),
+    ...(adoption.personalClaude === undefined ? {} : { personalClaude: adoption.personalClaude }),
+    ...(adoption.personalDiscovery === undefined ? {} : { personalDiscovery: adoption.personalDiscovery }),
+    ...(adoption.readPersonalCodexAutomations === undefined
+      ? {}
+      : { readPersonalCodexAutomations: adoption.readPersonalCodexAutomations }),
+    ...(adoption.personalCodexHome === undefined ? {} : { personalCodexHome: adoption.personalCodexHome }),
+    ...(adoption.claudeProcessLiveness === undefined ? {} : { claudeProcessLiveness: adoption.claudeProcessLiveness }),
+    ...(adoption.daemonGeneration === undefined
+      ? {}
+      : { daemonGeneration: adoption.daemonGeneration }),
+    now,
+    platform,
+    requestStop,
+  });
+  resources?.services.push(service);
   return {
-    service: new HraService({
-      store,
-      paths,
-      codex,
-      cloud,
-      daemonAuthority,
-      ...(desktop === undefined ? {} : { desktop }),
-      ...(managedClaude === undefined ? {} : { claude: managedClaude }),
-      eventCursors,
-      ...(factsMemory === undefined ? {} : { factsMemory }),
-      ...(memory === undefined ? {} : { memory }),
-      ...(autorespond.beforeMemoryClose === undefined
-        ? {}
-        : { beforeMemoryClose: autorespond.beforeMemoryClose }),
-      ...(autorespond.gatewayKeys === undefined ? {} : { gatewayKeys: autorespond.gatewayKeys }),
-      ...(autorespond.proseResponder === undefined ? {} : { proseResponder: autorespond.proseResponder }),
-      ...(adoption.personalCodex === undefined ? {} : { personalCodex: adoption.personalCodex }),
-      ...(adoption.personalClaude === undefined ? {} : { personalClaude: adoption.personalClaude }),
-      ...(adoption.personalDiscovery === undefined ? {} : { personalDiscovery: adoption.personalDiscovery }),
-      ...(adoption.readPersonalCodexAutomations === undefined
-        ? {}
-        : { readPersonalCodexAutomations: adoption.readPersonalCodexAutomations }),
-      ...(adoption.personalCodexHome === undefined ? {} : { personalCodexHome: adoption.personalCodexHome }),
-      ...(adoption.claudeProcessLiveness === undefined ? {} : { claudeProcessLiveness: adoption.claudeProcessLiveness }),
-      ...(adoption.daemonGeneration === undefined
-        ? {}
-        : { daemonGeneration: adoption.daemonGeneration }),
-      now,
-      platform,
-      requestStop,
-    }),
+    service,
     store,
     codex,
     cloud,
     daemonAuthority,
+    daemonGeneration,
+    daemonBootId,
     documents,
     eventCursors,
     paths,
   };
 }
 
+async function archivedDevinFixture(cloud = new FakeCloud(), options: Readonly<{
+  factsMemory?: OompaFactsMemoryLifecyclePort;
+  memory?: OompaMemoryPort;
+}> = {}) {
+  const value = await fixture(undefined, cloud, () => undefined, Date.now,
+    options.factsMemory, {}, {
+      canonical39Devin: true,
+      ...(options.memory === undefined ? {} : { memory: options.memory }),
+    });
+  const captured = canonical39DevinFixture.cases[0];
+  expect(value.store.requireSession(captured.session.id)).toEqual(captured.session);
+  expect(value.store.readMutation(captured.idempotencyKey)).toMatchObject(captured.mutation);
+  return { ...value, captured };
+}
+
+async function abandonArchivedDevinLogin(value: Awaited<ReturnType<typeof archivedDevinFixture>>) {
+  const { captured } = value;
+  await value.service.execute({
+    kind: "account.devin-login.abandon", account: captured.profile.id,
+    attemptId: captured.mutation.id, idempotencyKey: captured.idempotencyKey,
+    providerGeneration: captured.generation, acknowledgeChildExited: true,
+  }, { signal });
+}
+
 function ownedServiceFixture(...args: Parameters<typeof fixture>): Promise<Awaited<ReturnType<typeof fixture>> & {
+  execute: (command: LocalCommand) => Promise<unknown>;
+}> {
+  return ownedServiceFixtureWithClose((value) => value.service.close(), ...args);
+}
+
+function ownedServiceFixtureWithClose(
+  close: (value: Awaited<ReturnType<typeof fixture>>) => Promise<void>,
+  ...args: Parameters<typeof fixture>
+): Promise<Awaited<ReturnType<typeof fixture>> & {
   execute: (command: LocalCommand) => Promise<unknown>;
 }> {
   const controller = new AbortController();
@@ -1535,7 +1735,7 @@ function ownedServiceFixture(...args: Parameters<typeof fixture>): Promise<Await
     controller.abort(new Error("Owned service fixture is closing."));
     const [result] = await Promise.allSettled([setup]);
     await Promise.allSettled([...requests]);
-    if (result.status === "fulfilled") await result.value.service.close();
+    if (result.status === "fulfilled") await close(result.value);
   });
   return setup.then((value) => {
     controller.signal.throwIfAborted();
@@ -1566,6 +1766,240 @@ type ServiceFixtureFactory = (...args: Parameters<typeof fixture>) => Promise<
     execute?: (command: LocalCommand) => Promise<unknown>;
   }
 >;
+
+type ServiceCaseContext = {
+  createFixture: ServiceFixtureFactory;
+  signal: AbortSignal;
+  resources: ServiceCaseResources;
+};
+
+function createOwnedServiceCase(
+  teardowns = ownedServiceCaseTeardowns,
+) {
+  const resources: ServiceCaseResources = { roots: [], stores: [], services: [] };
+  const controller = new AbortController();
+  const cancellation = new Error("Owned service case is closing.");
+  const tasks: Array<Promise<{ status: "fulfilled" } | { status: "rejected"; reason: unknown }>> = [];
+  const createFixture: ServiceFixtureFactory = async (
+    desktop, cloud, requestStop, now, factsMemory, autorespond, adoption,
+    platformOrClaude, platformOverride,
+  ) => {
+    controller.signal.throwIfAborted();
+    const value = await fixture(desktop, cloud, requestStop, now, factsMemory,
+      autorespond, adoption, platformOrClaude, platformOverride, resources);
+    controller.signal.throwIfAborted();
+    return {
+      ...value,
+      execute: async (command: LocalCommand): Promise<unknown> => {
+        controller.signal.throwIfAborted();
+        const result = await value.service.execute(command, { signal: controller.signal });
+        controller.signal.throwIfAborted();
+        return result;
+      },
+    };
+  };
+  const run = (runCase: (context: ServiceCaseContext) => Promise<void>): Promise<void> => {
+    // Return this exact observed task to Bun, including from setup hooks. An
+    // outer async hook would create a different, unowned timeout rejection.
+    const task = Promise.resolve().then(async () => {
+      controller.signal.throwIfAborted();
+      await runCase({ createFixture, signal: controller.signal, resources });
+      controller.signal.throwIfAborted();
+    });
+    tasks.push(task.then(
+      () => ({ status: "fulfilled" } as const),
+      (reason: unknown) => ({ status: "rejected", reason } as const),
+    ));
+    return task;
+  };
+  teardowns.push(async () => {
+    controller.abort(cancellation);
+    const failures: unknown[] = [];
+    for (const result of await Promise.all(tasks)) {
+      if (result.status === "rejected" && result.reason !== cancellation) failures.push(result.reason);
+    }
+    let serviceCloseFailed = false;
+    for (const service of resources.services.splice(0)) {
+      try { await service.close(); } catch (error: unknown) {
+        serviceCloseFailed = true;
+        failures.push(error);
+      }
+    }
+    if (serviceCloseFailed) throw new AggregateError(failures, "Service close failed; owned storage was retained.");
+    let storeCloseFailed = false;
+    for (const store of resources.stores.splice(0)) {
+      try { store.close(); } catch (error: unknown) {
+        storeCloseFailed = true;
+        failures.push(error);
+      }
+    }
+    if (storeCloseFailed) throw new AggregateError(failures, "Store close failed; owned roots were retained.");
+    for (const root of resources.roots.splice(0)) {
+      try { await rm(root, { force: true, recursive: true }); } catch (error: unknown) { failures.push(error); }
+    }
+    if (failures.length > 0) throw new AggregateError(failures, "Owned service teardown failed.");
+  });
+  return { run };
+}
+
+function ownedServiceCase(
+  runCase: (context: ServiceCaseContext) => Promise<void>,
+  teardowns = ownedServiceCaseTeardowns,
+): Promise<void> {
+  return createOwnedServiceCase(teardowns).run(runCase);
+}
+
+describe("owned service case lifecycle", () => {
+  test("checks cancellation between prepared-value resolution and publication", async () => {
+    const teardowns: Array<() => Promise<void>> = [];
+    const owner = createOwnedServiceCase(teardowns);
+    const entered = Promise.withResolvers<undefined>();
+    const preparation = Promise.withResolvers<string>();
+    let published: string | undefined;
+    const setup = owner.run(async (context) => {
+      entered.resolve(undefined);
+      const value = await preparation.promise;
+      context.signal.throwIfAborted();
+      published = value;
+    });
+    await entered.promise;
+    preparation.resolve("prepared");
+    const closing = teardowns[0]?.();
+    await closing;
+    await expect(setup).rejects.toThrow("Owned service case is closing.");
+    expect(published).toBeUndefined();
+  });
+
+  test.each(["setup", "case"] as const)("returns the observed %s task and drains it before later cleanup", async (phase) => {
+    const teardowns: Array<() => Promise<void>> = [];
+    const owner = createOwnedServiceCase(teardowns);
+    const nextTeardowns: Array<() => Promise<void>> = [];
+    const nextOwner = createOwnedServiceCase(nextTeardowns);
+    const entered = Promise.withResolvers<undefined>();
+    const release = Promise.withResolvers<undefined>();
+    const lateFailure = new Error(`late ${phase} failure`);
+    const events: string[] = [];
+    if (phase === "case") await owner.run(async () => undefined);
+    await nextOwner.run(async ({ resources }) => {
+      resources.stores.push({ close: () => { events.push("close-next-case"); } });
+    });
+    let observed: Promise<void> | undefined;
+    const hook = () => {
+      observed = owner.run(async ({ resources }) => {
+        entered.resolve(undefined);
+        await release.promise;
+        resources.stores.push({ close: () => { events.push("close-late-store"); } });
+        events.push("raw-failed");
+        throw lateFailure;
+      });
+      return observed;
+    };
+    const task = hook();
+    expect<Promise<void> | undefined>(task).toBe(observed);
+    await entered.promise;
+    const closing = teardowns[0]?.().catch((error: unknown) => error);
+    await Promise.resolve();
+    expect(events).toEqual([]);
+    release.resolve(undefined);
+    const error = await closing;
+    expect(error).toBeInstanceOf(AggregateError);
+    if (!(error instanceof AggregateError)) throw new Error("Expected the original late phase failure.");
+    expect(error.errors).toEqual([lateFailure]);
+    await expect(task).rejects.toBe(lateFailure);
+    expect(events).toEqual(["raw-failed", "close-late-store"]);
+    await nextTeardowns[0]?.();
+    expect(events).toEqual(["raw-failed", "close-late-store", "close-next-case"]);
+  });
+
+  test("keeps real SQLite open until delayed service retirement has joined", async () => {
+    const teardowns: Array<() => Promise<void>> = [];
+    const owner = createOwnedServiceCase(teardowns);
+    const entered = Promise.withResolvers<undefined>();
+    const release = Promise.withResolvers<undefined>();
+    let value: Awaited<ReturnType<typeof fixture>> | undefined;
+    await owner.run(async ({ createFixture }) => {
+      value = await createFixture(undefined, undefined, undefined, undefined, undefined, {
+        beforeMemoryClose: async () => {
+          entered.resolve(undefined);
+          await release.promise;
+        },
+      });
+    });
+    if (value === undefined) throw new Error("Expected the real service fixture.");
+    const store = value.store;
+    const closing = teardowns[0]?.();
+    void closing?.catch((error: unknown) => { entered.reject(error); });
+    try {
+      await entered.promise;
+      expect(store.listUnreleasedClaudeProcessAuthorities()).toEqual([]);
+    } finally {
+      release.resolve(undefined);
+      await closing;
+    }
+    expect(() => store.listUnreleasedClaudeProcessAuthorities()).toThrow("Cannot use a closed database");
+  });
+
+  test("registers before deferred setup and cancels before resources open", async () => {
+    const teardowns: Array<() => Promise<void>> = [];
+    let opened = false;
+    const task = ownedServiceCase(async () => { opened = true; }, teardowns);
+    expect(teardowns).toHaveLength(1);
+    await teardowns[0]?.();
+    await expect(task).rejects.toThrow("Owned service case is closing.");
+    expect(opened).toBe(false);
+  });
+
+  test("joins a late case failure and tries every service close before retaining unproved storage", async () => {
+    const teardowns: Array<() => Promise<void>> = [];
+    const entered = Promise.withResolvers<undefined>();
+    const release = Promise.withResolvers<undefined>();
+    const caseFailure = new Error("late service case failure");
+    const closeFailure = new Error("service close failure");
+    const events: string[] = [];
+    const task = ownedServiceCase(async ({ resources }) => {
+      resources.services.push({ close: async () => { events.push("close-first"); throw closeFailure; } });
+      entered.resolve(undefined);
+      await release.promise;
+      resources.services.push({ close: async () => { events.push("close-late"); } });
+      resources.stores.push({ close: () => { events.push("close-store"); } });
+      events.push("raw-failed");
+      throw caseFailure;
+    }, teardowns);
+    await entered.promise;
+    const closing = teardowns[0]?.().catch((error: unknown) => error);
+    await Promise.resolve();
+    expect(events).toEqual([]);
+    release.resolve(undefined);
+    const error = await closing;
+    expect(error).toBeInstanceOf(AggregateError);
+    if (!(error instanceof AggregateError)) throw new Error("Expected case and service close failures.");
+    expect(error.errors).toEqual([caseFailure, closeFailure]);
+    await expect(task).rejects.toBe(caseFailure);
+    expect(events).toEqual(["raw-failed", "close-first", "close-late"]);
+  });
+
+  test("closes stores only after the raw case and every service have joined", async () => {
+    const teardowns: Array<() => Promise<void>> = [];
+    const entered = Promise.withResolvers<undefined>();
+    const release = Promise.withResolvers<undefined>();
+    const events: string[] = [];
+    const task = ownedServiceCase(async ({ resources }) => {
+      resources.services.push({ close: async () => { events.push("close-service"); } });
+      entered.resolve(undefined);
+      await release.promise;
+      resources.stores.push({ close: () => { events.push("close-store"); } });
+      events.push("raw-joined");
+    }, teardowns);
+    await entered.promise;
+    const closing = teardowns[0]?.();
+    await Promise.resolve();
+    expect(events).toEqual([]);
+    release.resolve(undefined);
+    await closing;
+    await expect(task).rejects.toThrow("Owned service case is closing.");
+    expect(events).toEqual(["raw-joined", "close-service", "close-store"]);
+  });
+});
 
 // These cases migrate a FULL-WAL database, create account/project authority,
 // and exercise multiple persisted Claude transitions with fake providers.
@@ -1648,11 +2082,12 @@ class FakePersonalSessionDiscovery implements PersonalSessionDiscoveryPort {
 async function adoptedCodexFixture(
   label: string,
   providerThreadId: string,
-  factsMemory?: HraFactsMemoryLifecyclePort,
+  factsMemory?: OompaFactsMemoryLifecyclePort,
+  createFixture: ServiceFixtureFactory = fixture,
 ) {
   const personalCodex = new FakeCodex();
   const discovery = new FakePersonalSessionDiscovery();
-  const value = await fixture(
+  const value = await createFixture(
     undefined,
     new FakeCloud(),
     () => undefined,
@@ -1665,25 +2100,17 @@ async function adoptedCodexFixture(
       personalDiscovery: discovery,
     },
   );
-  const added = await value.service.execute(
-    { kind: "account.add", label },
-    { signal },
-  ) as { account: { id: `acct_${string}` } };
-  await value.service.execute(
-    { kind: "account.login", account: added.account.id, deviceCode: false },
-    { signal },
-  );
-  await value.service.execute(
-    { kind: "project.add", label: `${label} project`, path: value.documents },
-    { signal },
-  );
+  const execute = value.execute ?? ((command: LocalCommand) => value.service.execute(command, { signal }));
+  const added = await execute({ kind: "account.add", label }) as { account: { id: `acct_${string}` } };
+  await execute({ kind: "account.login", account: added.account.id, deviceCode: false });
+  await execute({ kind: "project.add", label: `${label} project`, path: value.documents });
   personalCodex.readProjection = {
     providerThreadId,
     title: `${label} personal thread`,
     status: "idle",
     projectRoot: value.documents,
     providerUpdatedAt: personalAdoptionNow - 11 * 60_000,
-    messages: [{ role: "user", text: "Started outside HRA" }],
+    messages: [{ role: "user", text: "Started outside Oompa" }],
   };
   discovery.candidates = [{
     provider: "codex",
@@ -1693,12 +2120,12 @@ async function adoptedCodexFixture(
     updatedAt: personalAdoptionNow - 11 * 60_000,
     liveness: "not_live",
   }];
-  const enabled = await value.service.execute({
+  const enabled = await execute({
     kind: "session.adoption.set",
     provider: "codex",
     enabled: true,
     account: added.account.id,
-  }, { signal });
+  });
   const session = value.store.findSessionByProviderThread(
     added.account.id,
     providerThreadId,
@@ -1799,7 +2226,8 @@ async function adoptedClaudeFixture(
   platform: NodeJS.Platform = "linux",
   signInCodex = true,
   now: () => number = () => personalAdoptionNow,
-  memory?: HraMemoryPort,
+  memory?: OompaMemoryPort,
+  createFixture: ServiceFixtureFactory = fixture,
 ) {
   const personalIdentity: ClaudeProcessIdentity = {
     pid: 63_001,
@@ -1813,7 +2241,7 @@ async function adoptedClaudeFixture(
   });
   const personalClaude = new FakeClaude("personal", personalIdentity);
   const discovery = new FakePersonalSessionDiscovery();
-  const value = await fixture(
+  const value = await createFixture(
     undefined,
     new FakeCloud(),
     () => undefined,
@@ -1829,20 +2257,12 @@ async function adoptedClaudeFixture(
     },
     platform,
   );
-  const added = await value.service.execute(
-    { kind: "account.add", label },
-    { signal },
-  ) as { account: { id: `acct_${string}` } };
+  const execute = value.execute ?? ((command: LocalCommand) => value.service.execute(command, { signal }));
+  const added = await execute({ kind: "account.add", label }) as { account: { id: `acct_${string}` } };
   if (signInCodex) {
-    await value.service.execute(
-      { kind: "account.login", account: added.account.id, deviceCode: false },
-      { signal },
-    );
+    await execute({ kind: "account.login", account: added.account.id, deviceCode: false });
   }
-  await value.service.execute(
-    { kind: "project.add", label: `${label} project`, path: value.documents },
-    { signal },
-  );
+  await execute({ kind: "project.add", label: `${label} project`, path: value.documents });
   personalClaude.projection = {
     providerThreadId,
     title,
@@ -1859,12 +2279,12 @@ async function adoptedClaudeFixture(
     updatedAt: personalAdoptionNow - 1_000,
     liveness: "not_live",
   }];
-  const enabled = await value.service.execute({
+  const enabled = await execute({
     kind: "session.adoption.set",
     provider: "claude",
     enabled: true,
     account: added.account.id,
-  }, { signal });
+  });
   const session = value.store.findSessionByProviderThread(
     added.account.id,
     providerThreadId,
@@ -1947,85 +2367,39 @@ async function nativeClaudeFixture(
   };
 }
 
-/**
- * Reconstructs the immutable request and evidence shape emitted by a historical
- * binary. The current writer correctly cannot create or rewrite this shape, so
- * the test fixture temporarily removes and then restores the evidence-update
- * guard around one exact compatibility-row rewrite.
- */
-function rewriteSessionStartAttemptAsHistoricalFixture(input: Readonly<{
-  idempotencyKey: string;
-  request: unknown;
-  store: StateStore;
-}>): Readonly<{ evidence: Readonly<Record<string, unknown>>; requestDigest: string }> {
-  const attempt = input.store.readMutation(input.idempotencyKey);
-  if (attempt === null) throw new Error("The session-start compatibility fixture is missing its mutation attempt.");
-  const inspector = new Database(input.store.paths.database, { create: false, strict: true });
-  let evidenceUpdateGuardDropped = false;
-  try {
-    const evidenceRow = inspector.query(
-      `SELECT e.evidence_json FROM mutation_effect_evidence e
-       JOIN mutation_attempts m ON m.id=e.attempt_id
-       WHERE m.idempotency_key=?`,
-    ).get(input.idempotencyKey) as { evidence_json: string } | null;
-    if (evidenceRow === null) {
-      throw new Error("The session-start compatibility fixture is missing its effect evidence.");
-    }
-    const parsedEvidence = JSON.parse(evidenceRow.evidence_json) as unknown;
-    if (typeof parsedEvidence !== "object" || parsedEvidence === null || Array.isArray(parsedEvidence)) {
-      throw new Error("The session-start compatibility fixture has invalid effect evidence.");
-    }
-    const contractlessEvidence = { ...(parsedEvidence as Record<string, unknown>) };
-    delete contractlessEvidence.presetContract;
-    const evidence = contractlessEvidence;
-    const evidenceJson = JSON.stringify(evidence);
-    const requestDigest = mutationRequestDigest({
-      authorityGeneration: attempt.authorityGeneration,
-      authorityId: attempt.authorityId,
-      kind: attempt.kind,
-      request: input.request,
-    });
-    inspector.exec("DROP TRIGGER mutation_effect_evidence_immutable_update");
-    evidenceUpdateGuardDropped = true;
-    inspector.query(
-      "UPDATE mutation_attempts SET request_digest=? WHERE idempotency_key=?",
-    ).run(requestDigest, input.idempotencyKey);
-    inspector.query(
-      "UPDATE mutation_effect_evidence SET evidence_json=?,evidence_digest=? WHERE attempt_id=?",
-    ).run(
-      evidenceJson,
-      createHash("sha256").update(evidenceJson).digest("hex"),
-      attempt.id,
-    );
-    return { evidence, requestDigest };
-  } finally {
-    try {
-      if (evidenceUpdateGuardDropped) {
-        inspector.exec(`CREATE TRIGGER IF NOT EXISTS mutation_effect_evidence_immutable_update
-BEFORE UPDATE ON mutation_effect_evidence
-BEGIN SELECT RAISE(ABORT, 'mutation effect evidence is immutable'); END;`);
-      }
-    } finally {
-      inspector.close(false);
-    }
-  }
-}
-
 async function claudeAccountFixture(
   initiallySignedIn = false,
   platform: NodeJS.Platform = "linux",
+  createFixture: ServiceFixtureFactory = fixture,
 ) {
   let signedIn = initiallySignedIn;
   let readError: Error | undefined;
   let readCalls = 0;
+  let readHook: ((authority: ProfileAuthority) => void | Promise<void>) | undefined;
+  const readAuthorities: ProfileAuthority[] = [];
   const providerSessionCalls: string[] = [];
-  const claude = {
+  const unexpectedInteraction = async (): Promise<never> => {
+    throw new Error("No Claude session interaction expected.");
+  };
+  const claude: ClaudeRuntimePort = {
     provider: "claude" as const,
     rebindProfileAuthority: () => undefined,
-    readAccount: async () => {
+    claimSession: async () => {
+      providerSessionCalls.push("claim-session");
+      throw new Error("Claude session claim was not expected.");
+    },
+    readSessionProcessIdentity: async () => {
+      providerSessionCalls.push("read-session-process-identity");
+      throw new Error("Claude session process identity was not expected.");
+    },
+    readAccount: async (input) => {
       readCalls += 1;
+      readAuthorities.push({ ...input.authority });
+      const hook = readHook;
+      readHook = undefined;
+      await hook?.(input.authority);
       if (readError !== undefined) throw readError;
-      return { signedIn };
+      return { readiness: signedIn ? "signed_in" : "signed_out", observedAt: 2_000 };
     },
     observeSession: async () => {
       providerSessionCalls.push("observe-session");
@@ -2064,10 +2438,16 @@ async function claudeAccountFixture(
       throw new Error("Claude session end was not expected.");
     },
     interactionAuthority: () => { throw new Error("No Claude session interaction expected."); },
+    discardRuntimeReview: () => undefined,
+    inspectInteractionAuthority: unexpectedInteraction,
+    validateInteractionResolution: unexpectedInteraction,
+    resolveInteraction: unexpectedInteraction,
+    validateInteractionTimeout: unexpectedInteraction,
+    timeoutInteraction: unexpectedInteraction,
     pinnedVersion: () => CLAUDE_PIN,
     close: async () => undefined,
-  } as unknown as ClaudeRuntimePort;
-  const value = await fixture(
+  };
+  const value = await createFixture(
     undefined,
     new FakeCloud(),
     () => undefined,
@@ -2081,73 +2461,144 @@ async function claudeAccountFixture(
   return {
     ...value,
     claudeReadCalls: () => readCalls,
+    providerReadCalls: () => readCalls,
+    readAuthorities,
+    setProviderReadHook: (hook: typeof readHook) => { readHook = hook; },
+    setProviderSignedIn: (value: boolean) => { signedIn = value; },
     providerSessionCalls,
     setClaudeReadError: (value: Error | undefined) => { readError = value; },
     setClaudeSignedIn: (value: boolean) => { signedIn = value; },
   };
 }
 
-// Remove only the current canonical overlay before an explicit older fixture
-// shaper. This does not make the shaped root an authentic historical capture.
-function removeCanonicalProfileFixtureOverlay(database: Database): void {
-  const tables = ["sessions", "work_routes", "work_tasks", "work_attempts"] as const;
-  const rows = (table: typeof tables[number]) => database.query(`SELECT * FROM ${table}`).all()
-    .map((value) => {
-      const row = z.record(z.string(), z.unknown()).parse(value);
-      delete row.canonical_profile_key;
-      return row;
-    });
-  const before = tables.map((table) => rows(table));
-  database.transaction(() => {
-    database.exec(`
-      DROP TRIGGER canonical_profile_session_insert_guard;
-      DROP TRIGGER canonical_profile_session_update_guard;
-      DROP TRIGGER canonical_profile_session_live_attempt_guard;
-      DROP TRIGGER canonical_profile_work_route_insert_guard;
-      DROP TRIGGER canonical_profile_work_task_insert_guard;
-      DROP TRIGGER canonical_profile_work_attempt_insert_guard;
-      DROP TRIGGER canonical_profile_work_attempt_immutable_guard;
-    `);
-    for (const table of tables) database.exec(`ALTER TABLE ${table} DROP COLUMN canonical_profile_key`);
-  }).immediate();
-  expect(tables.map((table) => rows(table))).toEqual(before);
-}
-
-// Seed frozen v39 provenance plus its coherent current canonical mirror,
-// not an active retired-provider API or an authentic old database capture.
-function legacyDevinSession(
-  value: Awaited<ReturnType<typeof fixture>>,
-  profileId: Parameters<StateStore["createSession"]>[0]["profileId"],
-) {
-  const created = value.store.createSession({
-    profileId, provider: "codex", preset: "ultra", fastEnabled: false,
-    title: "Historical Devin",
-  });
-  value.store.bindSession({
-    sessionId: created.id, expectedRevision: created.revision,
-    providerThreadId: "historical-devin-thread", state: "idle",
-  });
-  const legacy = new Database(value.paths.database, { strict: true });
-  try {
-    legacy.query("DELETE FROM session_provider_account_authorities WHERE session_id=?").run(created.id);
-    legacy.query(
-      "UPDATE sessions SET provider_v39='devin',preset_contract=?,canonical_profile_key='devin:gpt-6-astra:provider-default' WHERE id=?",
-    ).run(devinPresetContract, created.id);
-  } finally {
-    legacy.close();
-  }
-  return value.store.requireSession(created.id);
+async function isolatedLoginCompletionFixture(provider: "claude") {
+  const value = await claudeAccountFixture();
+  const profile = value.store.createProfile(`${provider} completion authority`);
+  const key = crypto.randomUUID();
+  const prepared = await value.service.execute({
+    kind: "account.claude-login.prepare", account: profile.id, idempotencyKey: key,
+  }, { signal }) as { login: { attemptId: `attempt_${string}`; providerGeneration: number } };
+  const complete = {
+    kind: "account.claude-login.complete",
+    account: profile.id,
+    attemptId: prepared.login.attemptId,
+    idempotencyKey: key,
+    providerGeneration: prepared.login.providerGeneration,
+    outcome: { state: "joined" as const, exitCode: 0, interruptedBy: null },
+  } satisfies LocalCommand;
+  value.setProviderSignedIn(true);
+  const corruptProviderProcess = () => {
+    const original = value.store.requireProviderAccountAuthority(profile.id, provider);
+    // The public retirement CAS refuses a live CLI-owned login grant. Model
+    // external corruption directly to prove the service also rejects it.
+    const database = new Database(value.paths.database, { create: false, strict: true });
+    try {
+      expect(database.query(`UPDATE provider_accounts
+        SET process_generation=process_generation+1
+        WHERE id=? AND profile_id=? AND provider=?
+          AND binding_generation=? AND process_generation=?`).run(
+        original.providerAccountId, original.profileId, original.provider,
+        original.bindingGeneration, original.processGeneration,
+      ).changes).toBe(1);
+    } finally {
+      database.close(false);
+    }
+  };
+  return { ...value, profile, key, prepared, complete, corruptProviderProcess };
 }
 
 async function createIdleSession(
-  value: Awaited<ReturnType<typeof fixture>>,
+  value: Awaited<ReturnType<typeof fixture>> & {
+    execute?: (command: LocalCommand) => Promise<unknown>;
+  },
   label: string,
 ): Promise<{ sessionId: `sess_${string}` }> {
-  const added = await value.service.execute({ kind: "account.add", label }, { signal }) as { account: { id: string } };
-  await value.service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
-  await value.service.execute({ kind: "project.add", label: `${label} docs`, path: value.documents }, { signal });
-  const started = await value.service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+  const execute = value.execute ?? ((command: LocalCommand) => value.service.execute(command, { signal }));
+  const added = await execute({ kind: "account.add", label }) as { account: { id: string } };
+  await execute({ kind: "account.login", account: added.account.id, deviceCode: false });
+  await execute({ kind: "project.add", label: `${label} docs`, path: value.documents });
+  const started = await execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }) as { session: { id: `sess_${string}` } };
   return { sessionId: started.session.id };
+}
+
+function remoteAuthorityFor(
+  store: StateStore,
+  sessionId: string,
+) {
+  const session = store.requireSession(sessionId);
+  if (session.providerThreadId === undefined) throw new Error("Expected provider binding.");
+  const authority = store.requireSessionProviderAuthority(session.id);
+  return {
+    sessionId: session.id,
+    profileId: authority.profileId,
+    processGeneration: authority.processGeneration,
+    provider: authority.provider,
+    providerAccountId: authority.providerAccountId,
+    bindingGeneration: authority.bindingGeneration,
+    providerThreadId: session.providerThreadId,
+  };
+}
+
+function liveAuthorityFor(
+  store: StateStore,
+  profileSelector: string,
+  provider: "codex" | "claude" = "codex",
+  paths: Readonly<{ codexHome?: string; desktopUserData?: string }> = {},
+): ProfileAuthority {
+  const profile = store.requireProfile(profileSelector);
+  const authority = store.requireProviderAccountAuthority(profile.id, provider);
+  return {
+    id: authority.profileId,
+    generation: authority.processGeneration,
+    provider: authority.provider,
+    providerAccountId: authority.providerAccountId,
+    bindingGeneration: authority.bindingGeneration,
+    codexHome: paths.codexHome ?? "unused",
+    desktopUserData: paths.desktopUserData ?? "unused",
+  };
+}
+
+function codexInteractionBinding(
+  store: StateStore,
+  profileSelector: string,
+) {
+  const profile = store.requireProfile(profileSelector);
+  const authority = store.requireProviderAccountAuthority(profile.id, "codex");
+  return {
+    provider: authority.provider,
+    providerAccountId: authority.providerAccountId,
+    bindingGeneration: authority.bindingGeneration,
+  };
+}
+
+function hostToolAuthorityFor(authority: ProfileAuthority): OompaHostToolCall["authority"] {
+  if (authority.provider === "devin") throw new Error("A retired provider cannot originate a host-tool fixture.");
+  return {
+    provider: authority.provider,
+    providerAccountId: authority.providerAccountId,
+    bindingGeneration: authority.bindingGeneration,
+    profileId: authority.id,
+    processGeneration: authority.generation,
+  };
+}
+
+function interactionAuthorityFor(
+  authority: ProfileAuthority,
+  value: Omit<ProviderInteractionAuthority,
+    | "profileId"
+    | "processGeneration"
+    | "provider"
+    | "providerAccountId"
+    | "bindingGeneration">,
+): ProviderInteractionAuthority {
+  return {
+    ...value,
+    profileId: authority.id,
+    processGeneration: authority.generation,
+    provider: authority.provider,
+    providerAccountId: authority.providerAccountId,
+    bindingGeneration: authority.bindingGeneration,
+  };
 }
 
 async function createPeerMessageBoundaryFixture(delivery: "send" | "steer") {
@@ -2208,13 +2659,8 @@ async function createPeerMessageBoundaryFixture(delivery: "send" | "steer") {
       unreadItemTurnIds: [],
     },
   };
-  const authority: ProfileAuthority = {
-    id: profile.id,
-    generation: profile.processGeneration,
-    codexHome: "unused",
-    desktopUserData: "unused",
-  };
-  const callFor = (index: number): Extract<HraHostToolCall, { tool: "session_message" }> => {
+  const authority = liveAuthorityFor(value.store, profile.id);
+  const callFor = (index: number): Extract<OompaHostToolCall, { tool: "session_message" }> => {
     const callId = `peer-boundary-${delivery}-${String(index)}`;
     const input = {
       sessionId: target.id,
@@ -2224,7 +2670,7 @@ async function createPeerMessageBoundaryFixture(delivery: "send" | "steer") {
       reason: "Exercise exact peer effect settlement",
     };
     return {
-      authority: { profileId: profile.id, processGeneration: profile.processGeneration },
+      authority: hostToolAuthorityFor(authority),
       callId,
       connectionId: value.codex.observationConnectionId,
       input,
@@ -2248,12 +2694,16 @@ function seedUnsettledInteractionStates(
   const profile = value.store.requireProfileById(session.profileId);
   if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
   const providerThreadId = session.providerThreadId;
+  const liveAuthority = liveAuthorityFor(value.store, profile.id);
   const admit = (state: "pending" | "prepared" | "written") => value.store.admitInteraction({
     publicId: crypto.randomUUID(),
     sessionId,
     authority: {
       profileId: profile.id,
       processGeneration: profile.processGeneration,
+      provider: liveAuthority.provider,
+      providerAccountId: liveAuthority.providerAccountId,
+      bindingGeneration: liveAuthority.bindingGeneration,
       connectionId,
       requestId: { type: "string", value: `${prefix}-${state}` },
       method: "item/fileChange/requestApproval",
@@ -2313,18 +2763,11 @@ async function seedResolvableInteraction(
   }
   const connectionId = personalCodex?.observationConnectionId
     ?? value.codex.observationConnectionId;
-  const authority: ProfileAuthority = personalClaim?.authority ?? {
-    id: profile.id,
-    generation: profile.processGeneration,
-    codexHome: "unused",
-    desktopUserData: "unused",
-  };
+  const authority: ProfileAuthority = personalClaim?.authority ?? liveAuthorityFor(value.store, profile.id);
   const fact: CodexFact = {
     type: "interactionRequested",
     connectionId,
-    provider: {
-      profileId: profile.id,
-      processGeneration: profile.processGeneration,
+    provider: interactionAuthorityFor(authority, {
       connectionId,
       requestId: { type: "string", value: requestId },
       method: "item/commandExecution/requestApproval",
@@ -2333,7 +2776,7 @@ async function seedResolvableInteraction(
       turnId: `turn-${requestId}`,
       itemId: `item-${requestId}`,
       approvalId: null,
-    },
+    }),
     kind: "command_approval",
     blocking: true,
     display: {
@@ -2387,7 +2830,23 @@ const renderJson = (command: LocalCommand, data: unknown): string => {
   return stdout;
 };
 
-describe("HraService personal-session adoption", () => {
+describe("OompaService personal-session adoption", () => {
+  const expectUnprovedLaunchCloseRefused = async (value: {
+    service: OompaService;
+    store: StateStore;
+  }): Promise<void> => {
+    const intents = value.store.listClaudeProcessLaunchIntents(500);
+    expect(intents.length).toBeGreaterThan(0);
+    const authorities = intents.map((intent) =>
+      value.store.requireProviderAccountAuthority(intent.profileId, "claude"));
+    await expect(value.service.close()).rejects.toThrow(
+      "An unresolved Claude launch still requires exact process recovery.",
+    );
+    expect(value.store.listClaudeProcessLaunchIntents(500)).toEqual(intents);
+    expect(intents.map((intent) =>
+      value.store.requireProviderAccountAuthority(intent.profileId, "claude"))).toEqual(authorities);
+  };
+
   const waitFor = async (predicate: () => boolean, timeoutMs = 2_000): Promise<void> => {
     const startedAt = Date.now();
     while (!predicate()) {
@@ -2707,6 +3166,7 @@ describe("HraService personal-session adoption", () => {
       sourceKind: "turn_start",
       sourceId: "historical-adopted-astra-contract",
       profile: historicalAstraProfile,
+      providerAuthority: value.store.requireProviderAccountAuthority(historicalAstraProfile.profileId, "codex"),
     });
     const establishedSession = value.store.requireSession(value.session.id);
     const establishedProfile = value.store.latestSessionRuntimeProfile(value.session.id);
@@ -2725,14 +3185,54 @@ describe("HraService personal-session adoption", () => {
     expect(value.store.requireSession(value.session.id)).toEqual(establishedSession);
     expect(value.store.latestSessionRuntimeProfile(value.session.id)).toEqual(establishedProfile);
 
+    const originalCaptured = value.store.requireCapturedSessionProviderAuthority(value.session.id);
     await value.service.close();
+    // Shutdown alone retires the runtime. Its exact historical observation
+    // permission is local-only and must not silently revive the old tuple.
+    expect(value.store.requireCapturedSessionProviderAuthority(value.session.id)).toEqual(originalCaptured);
+    expect(value.store.readHistoricalSessionObservationAuthority(value.session.id)).toEqual({
+      authority: originalCaptured, lineage: "provider_disconnect",
+    });
+    expect(() => value.store.requireSessionProviderAuthority(value.session.id))
+      .toThrow("SESSION_PROVIDER_AUTHORITY_STALE");
+    expect(value.store.latestSessionRuntimeProfile(value.session.id)).toEqual(establishedProfile);
+    const restartBootId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
+    const restartGeneration = value.store.nextDaemonGeneration(restartBootId);
+    expect(restartGeneration).toBe(value.daemonGeneration + 1);
+    const rebound = value.store.requireSessionProviderAuthority(value.session.id);
+    expect(rebound).toEqual({
+      ...originalCaptured,
+      authorityRevision: originalCaptured.authorityRevision + 1,
+      processGeneration: originalCaptured.processGeneration + 2,
+    });
+    expect(value.store.readHistoricalSessionObservationAuthority(value.session.id)).toBeNull();
+    const successorReader = new Database(value.paths.database, { strict: true });
+    try {
+      successorReader.exec("PRAGMA query_only=ON");
+      expect(successorReader.query(`SELECT from_provider_account_id,to_provider_account_id,
+        from_profile_id,to_profile_id,from_provider,to_provider,
+        from_binding_generation,to_binding_generation,from_process_generation,to_process_generation,
+        transition_kind,transition_id FROM session_provider_authority_successors
+        WHERE session_id=? AND from_authority_revision=?`).all(value.session.id, originalCaptured.authorityRevision))
+        .toEqual([{
+          from_provider_account_id: originalCaptured.providerAccountId,
+          to_provider_account_id: originalCaptured.providerAccountId,
+          from_profile_id: originalCaptured.profileId, to_profile_id: originalCaptured.profileId,
+          from_provider: "codex", to_provider: "codex",
+          from_binding_generation: originalCaptured.bindingGeneration,
+          to_binding_generation: originalCaptured.bindingGeneration,
+          from_process_generation: originalCaptured.processGeneration,
+          to_process_generation: rebound.processGeneration,
+          transition_kind: "provider_restart", transition_id: restartBootId,
+        }]);
+    } finally { successorReader.close(false); }
     const restartedPersonalCodex = new FakeCodex();
     restartedPersonalCodex.readProjection = {
       ...value.personalCodex.readProjection,
       providerThreadId,
       status: "idle",
     };
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store: value.store,
       paths: value.paths,
       codex: new FakeCodex(),
@@ -2741,6 +3241,8 @@ describe("HraService personal-session adoption", () => {
       personalDiscovery: value.discovery,
       cloud: new FakeCloud(),
       daemonAuthority: new FakeDaemonAuthority(),
+      daemonGeneration: restartGeneration,
+      daemonBootId: restartBootId,
       eventCursors: value.eventCursors,
       now: () => personalAdoptionNow,
       requestStop: () => undefined,
@@ -2846,7 +3348,7 @@ describe("HraService personal-session adoption", () => {
         ...value.personalCodex.readProjection,
         providerThreadId,
       };
-      const restarted = new HraService({
+      const restarted = new OompaService({
         store: value.store,
         paths: value.paths,
         codex: new FakeCodex(),
@@ -2925,7 +3427,7 @@ describe("HraService personal-session adoption", () => {
         status: "idle",
         providerUpdatedAt: personalAdoptionNow - 24 * 60 * 60_000,
       };
-      const restarted = new HraService({
+      const restarted = new OompaService({
         store: value.store,
         paths: value.paths,
         codex: new FakeCodex(),
@@ -3136,7 +3638,7 @@ describe("HraService personal-session adoption", () => {
     expect(replay).toBeInstanceOf(CommandFailure);
     expect((replay as CommandFailure).code).toBe("RECOVERY_REQUIRED");
     expect(managedClaude.startSessionRequests).toHaveLength(1);
-    await value.service.close();
+    await expectUnprovedLaunchCloseRefused(value);
   });
 
   test("retains adopted Claude launch authority and never reclaims after an unproven child exit", async () => {
@@ -3152,7 +3654,11 @@ describe("HraService personal-session adoption", () => {
     });
     personalClaude.claimSessionError = new ClaudeProcessExitUnprovenError();
     const discovery = new FakePersonalSessionDiscovery();
-    const value = await ownedServiceFixture(
+    let expectedCustodyRefusal = false;
+    const value = await ownedServiceFixtureWithClose(
+      (closing) => expectedCustodyRefusal
+        ? expectUnprovedLaunchCloseRefused(closing)
+        : closing.service.close(),
       undefined,
       new FakeCloud(),
       () => undefined,
@@ -3230,7 +3736,8 @@ describe("HraService personal-session adoption", () => {
       profileId: added.account.id,
       runtimeScope: "personal",
     })).not.toBeNull();
-    await value.service.close();
+    expectedCustodyRefusal = true;
+    await expectUnprovedLaunchCloseRefused(value);
   }, claudeAuthorityFixtureTimeoutMs);
 
   for (const source of ["managed", "personal"] as const) {
@@ -3308,7 +3815,7 @@ describe("HraService personal-session adoption", () => {
       providerObservation: { state: "recovery_required" },
     });
     expect(value.managedClaude.claimRequests).toHaveLength(1);
-    await value.service.close();
+    await expectUnprovedLaunchCloseRefused(value);
   });
 
   test("retires an exact Claude resume launch intent after an ordinary pre-admission claim failure", async () => {
@@ -3377,6 +3884,7 @@ describe("HraService personal-session adoption", () => {
         expectedRevision: original.revision,
       });
       replacementIntentId = value.store.stageClaudeProcessLaunchIntent({
+        providerAuthority: value.store.requireProviderAccountAuthority(value.accountId, "claude"),
         providerThreadId: original.providerThreadId,
         profileId: original.profileId,
         profileGeneration: original.profileGeneration,
@@ -3407,7 +3915,7 @@ describe("HraService personal-session adoption", () => {
       profileId: value.accountId,
       runtimeScope: "managed",
     })?.state).toBe("released");
-    await value.service.close();
+    await expectUnprovedLaunchCloseRefused(value);
   });
 
   test("keeps native Claude config-home provenance private across start, show, and send", async () => {
@@ -3498,6 +4006,7 @@ describe("HraService personal-session adoption", () => {
       ) as { account: { id: `acct_${string}` } };
       const profile = value.store.requireProfileById(added.account.id);
       const session = value.store.upsertProviderSession({
+      providerAuthority: value.store.requireProviderAccountAuthority(profile.id, "claude"),
         profileId: profile.id,
         provider: "claude",
         providerThreadId: `darwin-${profileShape}-claude-profile`,
@@ -3507,12 +4016,7 @@ describe("HraService personal-session adoption", () => {
         state: "idle",
         providerAccountKey: claudeProviderAccountKey(),
       });
-      const authority: ProfileAuthority = {
-        id: profile.id,
-        generation: profile.processGeneration,
-        codexHome: "unused",
-        desktopUserData: "unused",
-      };
+      const authority = liveAuthorityFor(value.store, profile.id, "claude");
       const currentProfile = claudeRuntimeProfile(authority, "isolated");
       const storedProfile: EffectiveClaudeRuntimeProfile = profileShape === "current"
         ? currentProfile
@@ -3530,6 +4034,7 @@ describe("HraService personal-session adoption", () => {
             inputFormat: currentProfile.inputFormat,
           };
       value.store.recordSessionRuntimeProfile({
+        providerAuthority: value.store.requireProviderAccountAuthority(session.profileId, "claude"),
         sessionId: session.id,
         sourceKind: "session_start",
         sourceId: `darwin-${profileShape}-stored-profile`,
@@ -4136,7 +4641,7 @@ describe("HraService personal-session adoption", () => {
   });
 
   test("adopts an old exact target from a real paused Desktop heartbeat without projecting task metadata", async () => {
-    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-scheduled-adoption-chain-")));
+    const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-scheduled-adoption-chain-")));
     serviceRoots.push(root);
     const codexHome = join(root, "codex-home");
     const automationsDirectory = join(codexHome, "automations");
@@ -4230,8 +4735,7 @@ describe("HraService personal-session adoption", () => {
     }, { signal });
     const profile = value.store.requireProfileById(added.account.id);
     context.personalAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
+      ...liveAuthorityFor(value.store, profile.id),
       codexHome,
       desktopUserData: profilePaths(value.paths, profile.id).desktopUserData,
     };
@@ -4547,7 +5051,7 @@ describe("HraService personal-session adoption", () => {
   });
 
   test("rotates the first scheduled-target page by daemon generation across reader restarts", async () => {
-    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-automation-restart-")));
+    const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-automation-restart-")));
     serviceRoots.push(root);
     const automationsDirectory = join(root, "automations");
     await mkdir(automationsDirectory);
@@ -4652,7 +5156,7 @@ describe("HraService personal-session adoption", () => {
     // at the next dense page instead of returning to the first fifty forever.
     const restartedReader = (request: CodexAutomationAuthorityRequest) =>
       readCodexAutomationAuthority({ ...request, automationsDirectory });
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store: value.store,
       paths: value.paths,
       codex: new FakeCodex(),
@@ -6014,7 +6518,7 @@ describe("HraService personal-session adoption", () => {
     await expect(value.service.execute({
       kind: "session.send",
       session: value.session.id,
-      message: "Continue under HRA",
+      message: "Continue under Oompa",
       idempotencyKey: "00000000-0000-4000-8000-00000000a001",
     }, { signal })).resolves.toMatchObject({
       session: { id: value.session.id, state: "active" },
@@ -6347,11 +6851,9 @@ describe("HraService personal-session adoption", () => {
 
   test("pages every authorized local session and retired history while provider listing is recovery-blocked", async () => {
     const cloud = new FakeCloud();
-    const value = await fixture(undefined, cloud);
-    const added = await value.service.execute(
-      { kind: "account.add", label: "Recovery local pagination" },
-      { signal },
-    ) as { account: { id: `acct_${string}` } };
+    const value = await archivedDevinFixture(cloud);
+    await abandonArchivedDevinLogin(value);
+    const added = { account: value.captured.profile };
     await value.service.execute({
       kind: "account.login",
       account: added.account.id,
@@ -6359,6 +6861,7 @@ describe("HraService personal-session adoption", () => {
     }, { signal });
     const expectedIds = new Set(Array.from({ length: 3 }, (_, index) => {
       const session = value.store.upsertProviderSession({
+      providerAuthority: value.store.requireProviderAccountAuthority(added.account.id, "codex"),
         profileId: added.account.id,
         provider: "codex",
         providerThreadId: `recovery-local-${String(index)}`,
@@ -6370,7 +6873,7 @@ describe("HraService personal-session adoption", () => {
       });
       return session.id;
     }));
-    expectedIds.add(legacyDevinSession(value, added.account.id).id);
+    expectedIds.add(value.captured.session.id);
     const callsBeforeListing = [...value.codex.calls];
     cloud.unsettledProjectionProfiles.add(added.account.id);
     value.codex.listedProjections = [{
@@ -6617,7 +7120,7 @@ describe("HraService personal-session adoption", () => {
     expect(value.store.listSessionAdoptionCandidates({ provider: "claude" })[0])
       .toMatchObject({ liveness: "live", status: "pending", sourceProcessIdentity });
 
-    // Once a later proven-complete snapshot contains no row for the id, HRA
+    // Once a later proven-complete snapshot contains no row for the id, Oompa
     // can prove the retained PID/start tuple is gone and admit the candidate.
     discovery.candidates = [];
     await expect(value.service.execute({
@@ -7076,8 +7579,7 @@ describe("HraService personal-session adoption", () => {
     const preset = value.store.readDefaultPreset("codex");
     value.personalCodex.claimRuntimeProfileOverride = {
       ...runtimeProfile({
-        id: profile.id,
-        generation: profile.processGeneration,
+        ...liveAuthorityFor(value.store, profile.id),
         codexHome: personalCodexHome,
         desktopUserData: join(privatePathRoot, "personal-codex-desktop"),
       }),
@@ -7096,7 +7598,7 @@ describe("HraService personal-session adoption", () => {
     expect(value.store.findSessionByProviderThread(value.accountId, providerThreadId)).toBeNull();
   });
 
-  test("keeps account-authority failures source-neutral for native and adopted controllers", async () => {
+  describe("keeps account-authority failures source-neutral for native and adopted controllers", () => {
     const shape = (error: unknown) => {
       const failure = error as CommandFailure;
       return { code: failure.code, message: failure.message, details: failure.details };
@@ -7107,114 +7609,129 @@ describe("HraService personal-session adoption", () => {
       return { ...failure, details: { ...details, accountId: "<account>" } };
     };
 
-    const adopted = await adoptedCodexFixture(
-      "Source-neutral adopted authority",
-      "source-neutral-adopted-codex",
-    );
-    const adoptedAuthority = adopted.personalCodex.claimRequests[0]?.authority;
-    if (adoptedAuthority === undefined) throw new Error("Expected adopted authority.");
-    const replacementAccount = {
-      signedIn: true as const,
-      email: "replacement-source-neutral@example.com",
-      plan: "Plus",
-    };
-    const adoptedMismatch = await adopted.service.observePersonalCodexAccount(
-      adoptedAuthority,
-      replacementAccount,
-    ).catch((error: unknown) => error);
-
-    const native = await fixture();
-    const { sessionId } = await createIdleSession(native, "Source-neutral native authority");
-    const nativeProfile = native.store.requireProfileById(
-      native.store.requireSession(sessionId).profileId,
-    );
-    const nativePaths = profilePaths(native.paths, nativeProfile.id);
-    const nativeMismatch = await native.service.observeCodexAccount({
-      id: nativeProfile.id,
-      generation: nativeProfile.processGeneration,
-      codexHome: nativePaths.codexHome,
-      desktopUserData: nativePaths.desktopUserData,
-    }, replacementAccount).catch((error: unknown) => error);
-    await Promise.all([adopted.service.settled(), native.service.settled()]);
-
-    expect(adoptedMismatch).toBeInstanceOf(CommandFailure);
-    expect(nativeMismatch).toBeInstanceOf(CommandFailure);
-    expect(withoutAccountIdentity(adoptedMismatch)).toEqual(
-      withoutAccountIdentity(nativeMismatch),
-    );
-    expect(withoutAccountIdentity(adoptedMismatch)).toEqual({
-      code: "RECOVERY_REQUIRED",
-      message: "The provider account changed. HRA refused stale controller authority and is releasing the affected sessions.",
-      details: { accountId: "<account>", provider: "codex" },
-    });
-
-    const pending = await adoptedClaudeFixture(
-      "Source-neutral pending authority",
-      "source-neutral-pending-adopted-claude",
-    );
-    pending.managedClaude.projection = {
-      providerThreadId: "source-neutral-pending-native-claude",
-      title: "Source-neutral pending native Claude",
-      status: "idle",
-      projectRoot: pending.documents,
-      providerUpdatedAt: personalAdoptionNow,
-    };
-    await pending.service.execute({
-      kind: "session.start",
-      account: pending.accountId,
-      provider: "claude",
-      preset: "fable-max",
-      fast: false,
-    }, { signal });
-    const pendingProfile = pending.store.requireProfileById(pending.accountId);
-    const direct = new Database(pending.paths.database, { create: false, strict: true });
-    try {
-      for (const runtimeScope of ["personal", "managed"] as const) {
-        direct.query(
-          `INSERT INTO provider_runtime_account_revocations(
-             profile_id,profile_generation,provider,runtime_scope,current_account_key,
-             state,revision,created_at,updated_at,completed_at
-           ) VALUES (?,?,'claude',?,?, 'releasing',1,?,?,NULL)`,
-        ).run(
-          pendingProfile.id,
-          pendingProfile.processGeneration,
-          runtimeScope,
-          claudeProviderAccountKey(),
-          personalAdoptionNow,
-          personalAdoptionNow,
-        );
+    const expectPrivateDetailsAbsent = (failures: readonly unknown[]) => {
+      for (const failure of failures) {
+        const serialized = JSON.stringify(shape(failure)).toLowerCase();
+        expect(serialized).not.toContain("personal");
+        expect(serialized).not.toContain("managed");
+        expect(serialized).not.toContain("runtimescope");
+        expect(serialized).not.toContain("home");
       }
-    } finally {
-      direct.close();
-    }
+    };
 
-    const adoptedPending = await pending.service.discoverPersonalSessions(
-      "claude",
-      signal,
-    ).catch((error: unknown) => error);
-    const nativePending = await pending.service.execute({
-      kind: "session.start",
-      account: pending.accountId,
-      provider: "claude",
-      preset: "fable-max",
-      fast: false,
-    }, { signal }).catch((error: unknown) => error);
-    expect(adoptedPending).toBeInstanceOf(CommandFailure);
-    expect(nativePending).toBeInstanceOf(CommandFailure);
-    expect(shape(adoptedPending)).toEqual(shape(nativePending));
-    expect(shape(adoptedPending)).toEqual({
-      code: "RECOVERY_REQUIRED",
-      message: "The provider account authority is being released.",
-      details: { accountId: pending.accountId, provider: "claude" },
-    });
+    test("Codex account mismatch retains the paired controller comparison", () => ownedServiceCase(async ({ createFixture, signal }) => {
+      const adopted = await adoptedCodexFixture(
+        "Source-neutral adopted authority",
+        "source-neutral-adopted-codex",
+        undefined,
+        createFixture,
+      );
+      signal.throwIfAborted();
+      const adoptedAuthority = adopted.personalCodex.claimRequests[0]?.authority;
+      if (adoptedAuthority === undefined) throw new Error("Expected adopted authority.");
+      const replacementAccount = {
+        signedIn: true as const,
+        email: "replacement-source-neutral@example.com",
+        plan: "Plus",
+      };
+      const adoptedMismatch = await adopted.service.observePersonalCodexAccount(
+        adoptedAuthority,
+        replacementAccount,
+      ).catch((error: unknown) => error);
 
-    for (const failure of [adoptedMismatch, nativeMismatch, adoptedPending, nativePending]) {
-      const serialized = JSON.stringify(shape(failure)).toLowerCase();
-      expect(serialized).not.toContain("personal");
-      expect(serialized).not.toContain("managed");
-      expect(serialized).not.toContain("runtimescope");
-      expect(serialized).not.toContain("home");
-    }
+      const native = await createFixture();
+      signal.throwIfAborted();
+      const { sessionId } = await createIdleSession(native, "Source-neutral native authority");
+      signal.throwIfAborted();
+      const nativeProfile = native.store.requireProfileById(
+        native.store.requireSession(sessionId).profileId,
+      );
+      const nativePaths = profilePaths(native.paths, nativeProfile.id);
+      const nativeMismatch = await native.service.observeCodexAccount({
+        ...liveAuthorityFor(native.store, nativeProfile.id),
+        codexHome: nativePaths.codexHome,
+        desktopUserData: nativePaths.desktopUserData,
+      }, replacementAccount).catch((error: unknown) => error);
+      await Promise.all([adopted.service.settled(), native.service.settled()]);
+
+      expect(adoptedMismatch).toBeInstanceOf(CommandFailure);
+      expect(nativeMismatch).toBeInstanceOf(CommandFailure);
+      expect(withoutAccountIdentity(adoptedMismatch)).toEqual(
+        withoutAccountIdentity(nativeMismatch),
+      );
+      expect(withoutAccountIdentity(adoptedMismatch)).toEqual({
+        code: "RECOVERY_REQUIRED",
+        message: "The provider account changed. Oompa refused stale controller authority and is releasing the affected sessions.",
+        details: { accountId: "<account>", provider: "codex" },
+      });
+      expectPrivateDetailsAbsent([adoptedMismatch, nativeMismatch]);
+    }));
+
+    test("Claude pending release retains the paired controller comparison", () => ownedServiceCase(async ({ createFixture, signal }) => {
+      const pending = await adoptedClaudeFixture(
+        "Source-neutral pending authority",
+        "source-neutral-pending-adopted-claude",
+        undefined, undefined, "linux", true, () => personalAdoptionNow, undefined,
+        createFixture,
+      );
+      signal.throwIfAborted();
+      pending.managedClaude.projection = {
+        providerThreadId: "source-neutral-pending-native-claude",
+        title: "Source-neutral pending native Claude",
+        status: "idle",
+        projectRoot: pending.documents,
+        providerUpdatedAt: personalAdoptionNow,
+      };
+      await pending.service.execute({
+        kind: "session.start",
+        account: pending.accountId,
+        provider: "claude",
+        preset: "fable-max",
+        fast: false,
+      }, { signal });
+      const pendingProfile = pending.store.requireProfileById(pending.accountId);
+      const direct = new Database(pending.paths.database, { create: false, strict: true });
+      try {
+        for (const runtimeScope of ["personal", "managed"] as const) {
+          direct.query(
+            `INSERT INTO provider_runtime_account_revocations(
+               profile_id,profile_generation,provider,runtime_scope,current_account_key,
+               state,revision,created_at,updated_at,completed_at
+             ) VALUES (?,?,'claude',?,?, 'releasing',1,?,?,NULL)`,
+          ).run(
+            pendingProfile.id,
+            pendingProfile.processGeneration,
+            runtimeScope,
+            claudeProviderAccountKey(),
+            personalAdoptionNow,
+            personalAdoptionNow,
+          );
+        }
+      } finally {
+        direct.close();
+      }
+
+      const adoptedPending = await pending.service.discoverPersonalSessions(
+        "claude",
+        signal,
+      ).catch((error: unknown) => error);
+      const nativePending = await pending.service.execute({
+        kind: "session.start",
+        account: pending.accountId,
+        provider: "claude",
+        preset: "fable-max",
+        fast: false,
+      }, { signal }).catch((error: unknown) => error);
+      expect(adoptedPending).toBeInstanceOf(CommandFailure);
+      expect(nativePending).toBeInstanceOf(CommandFailure);
+      expect(shape(adoptedPending)).toEqual(shape(nativePending));
+      expect(shape(adoptedPending)).toEqual({
+        code: "RECOVERY_REQUIRED",
+        message: "The provider account authority is being released.",
+        details: { accountId: pending.accountId, provider: "claude" },
+      });
+      expectPrivateDetailsAbsent([adoptedPending, nativePending]);
+    }));
   });
 
   test("routes an adopted Claude session on Darwin only through personal custody", async () => {
@@ -7289,6 +7806,7 @@ describe("HraService personal-session adoption", () => {
     expect(listed.sessions[0]).not.toHaveProperty("origin");
 
     value.store.recordClaimedClaudeProcessAuthority({
+      providerAuthority: value.store.requireProviderAccountAuthority(value.accountId, "claude"),
       providerThreadId: "same-opaque-claude-thread",
       profileId: value.accountId,
       profileGeneration: value.store.requireProfileById(value.accountId).processGeneration,
@@ -7544,12 +8062,7 @@ describe("HraService personal-session adoption", () => {
       session: { id: value.session.id },
     });
 
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id, "claude");
     const requestId = "signed-out-native-claude-approval";
     await value.service.observeClaudeFact(authority, {
       providerThreadId: value.providerThreadId,
@@ -7676,72 +8189,148 @@ describe("HraService personal-session adoption", () => {
     expect(value.store.requireProfileById(value.accountId).state).toBe("signed_out");
   });
 
-  test("recovers a target-bound switch whose source was an adopted personal Claude session", async () => {
+  test("replays a dedicated switch from personal Claude after committed seed response loss", async () => {
     const value = await adoptedClaudeFixture(
-      "Adopted Claude switch recovery",
-      "adopted-claude-switch-source",
+      "Adopted Claude dedicated switch",
+      "adopted-claude-dedicated-source",
     );
-    const idempotencyKey = crypto.randomUUID();
-    const complete = value.store.completeSessionProviderSwitch.bind(value.store);
-    Object.defineProperty(value.store, "completeSessionProviderSwitch", {
+    const personalAuthority = value.store.requireSessionProviderAuthority(value.session.id);
+    expect(personalAuthority.processGeneration).toBeGreaterThan(0);
+    expect(value.store.requireProviderAccount(personalAuthority.providerAccountId).readiness)
+      .toBe("unverified");
+    const command = {
+      idempotencyKey: crypto.randomUUID(),
+      kind: "session.switch" as const,
+      presetContract: legacyPresetContract,
+      provider: "codex" as const,
+      session: value.session.id,
+    };
+    const complete = value.store.completeSessionSwitchSeed.bind(value.store);
+    Object.defineProperty(value.store, "completeSessionSwitchSeed", {
       configurable: true,
-      value: () => {
-        throw new Error("simulated final switch commit failure");
+      value: (input: Parameters<StateStore["completeSessionSwitchSeed"]>[0]) => {
+        complete(input);
+        throw new Error("simulated response loss after the durable seed receipt");
       },
     });
     try {
       await expect(value.service.execute({
-        idempotencyKey,
+        idempotencyKey: command.idempotencyKey,
         kind: "session.switch",
         presetContract: legacyPresetContract,
         provider: "codex",
         session: value.session.id,
       }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
     } finally {
-      Object.defineProperty(value.store, "completeSessionProviderSwitch", {
-        configurable: true,
-        value: complete,
+      Object.defineProperty(value.store, "completeSessionSwitchSeed", {
+        configurable: true, value: complete,
       });
     }
+    const settled = value.store.readSessionSwitchByIdempotencyKey(command.idempotencyKey);
+    if (settled === null) throw new Error("Expected the dedicated switch journal.");
+    expect(settled.phase).toBe("seed_settled");
+    expect(value.store.readSessionSwitchAdoption(settled.attemptId)).toMatchObject({
+      sourceRuntimeScope: "personal",
+      sourcePersonalBindingRevision: expect.any(Number),
+      targetAccountKey: codexProviderAccountKey(),
+    });
+    expect(value.store.readSessionPersonalRuntimeBinding(value.session.id, true))
+      .toMatchObject({ provider: "claude", providerThreadId: "adopted-claude-dedicated-source", state: "detached" });
+    expect(value.codex.committedStartTurns).toBe(1);
+    expect(value.personalClaude.endRequests).toHaveLength(1);
+    const calls = {
+      codex: [...value.codex.calls],
+      managedClaude: [...value.managedClaude.calls],
+      personalClaude: [...value.personalClaude.calls],
+    };
+    await expect(value.service.execute(command, { signal })).resolves.toMatchObject({
+      session: { id: value.session.id, provider: "codex" },
+      seed: { delivered: true },
+    });
+    expect({
+      codex: value.codex.calls,
+      managedClaude: value.managedClaude.calls,
+      personalClaude: value.personalClaude.calls,
+    }).toEqual(calls);
+    expect(value.codex.committedStartTurns).toBe(1);
+    await value.service.close();
+  });
 
-    const unsettled = value.store.readMutation(idempotencyKey);
-    if (unsettled?.evidence?.evidence.kind !== "session.switch") {
-      throw new Error("Expected an unsettled provider switch.");
-    }
-    expect(unsettled.evidence.evidence.targetProviderAccountKey).toBeString();
-    expect(value.store.requireSession(value.session.id)).toMatchObject({
-      profileId: value.accountId,
-      provider: "codex",
-      providerThreadId: "provider-thread",
-      state: "recovery_required",
+  test("quarantines a real canonical-40 target-bound personal-source switch without inventing Claude authority", async () => {
+    const origin = canonicalAdoption40Fixture;
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-canonical40-switch-")));
+    serviceRoots.push(home);
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    await writeFile(paths.database, canonicalAdoption40DatabaseBytes(), { mode: 0o600 });
+    // A fully checkpointed WAL-mode image has no copied -shm file. Let SQLite
+    // initialize its local auxiliaries, then enforce read-only SQL inspection.
+    const raw = new Database(paths.database, { create: false, strict: true });
+    raw.exec("PRAGMA query_only=ON");
+    const before = raw.query(
+      "SELECT evidence_json,evidence_digest FROM mutation_effect_evidence WHERE attempt_id=?",
+    ).get(origin.attemptId);
+    expect(raw.query("PRAGMA user_version").get()).toEqual({ user_version: 40 });
+    expect(raw.query(
+      "SELECT state,provider,provider_thread_id FROM session_personal_runtime_bindings WHERE session_id=?",
+    ).get(origin.sessionId)).toEqual({
+      state: "detached", provider: "claude", provider_thread_id: origin.sourceThread,
     });
-    expect(value.store.readSessionPersonalRuntimeBinding(
-      value.session.id,
-      true,
-    )).toMatchObject({
-      provider: "claude",
-      providerThreadId: "adopted-claude-switch-source",
-      state: "detached",
+    raw.close();
+    const store = new StateStore(paths, { now: () => personalAdoptionNow });
+    stores.push(store);
+    const migrated = new Database(paths.database, { readonly: true, strict: true });
+    expect(migrated.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
+    expect(migrated.query(
+      "SELECT evidence_json,evidence_digest FROM mutation_effect_evidence WHERE attempt_id=?",
+    ).get(origin.attemptId)).toEqual(before);
+    migrated.close();
+    expect(store.readMutation(origin.idempotencyKey)).toMatchObject({
+      id: origin.attemptId, state: "ambiguous", evidence: { digest: origin.evidenceDigest },
     });
-
-    await expect(value.service.execute({
-      kind: "session.recover",
-      session: value.session.id,
-    }, { signal })).resolves.toMatchObject({
-      recovery: {
-        providerEffectRetried: false,
-        resolution: "proven_applied",
-      },
-      session: {
-        profileId: value.accountId,
-        provider: "codex",
-        providerThreadId: "provider-thread",
-      },
+    expect(JSON.stringify(store.readSessionProviderSwitchProgress(origin.attemptId)))
+      .toBe(JSON.stringify(origin.progress));
+    const codex = new FakeCodex();
+    codex.accountProjection = { signedIn: true, email: "canonical40-fixture@example.com", plan: "Plus" };
+    codex.readProjection = {
+      providerThreadId: origin.targetThread, status: "idle", title: "Canonical 40 personal source",
+      providerUpdatedAt: personalAdoptionNow,
+    };
+    const personalClaude = new FakeClaude("personal", {
+      pid: 63040, pidDomain: "darwin", procStart: "canonical40-fixture-process",
     });
-    expect(value.store.readMutation(idempotencyKey)).toMatchObject({
-      resolution: { kind: "proven_applied" },
-      state: "reconciled",
+    const service = new OompaService({
+      store, paths, codex, personalClaude, cloud: new FakeCloud(),
+      daemonAuthority: new FakeDaemonAuthority(), daemonGeneration: 1,
+      daemonBootId: `boot_${"6".repeat(32)}`,
+      eventCursors: new SessionEventCursorCodec(SessionEventCursorCodec.generateKey()),
+      now: () => personalAdoptionNow, requestStop: () => undefined,
     });
+    // The released source proves only Claude's shared profile-generation
+    // shadow. Target Codex evidence cannot manufacture the absent independent
+    // source tuple or authorize settlement of the entire historical switch.
+    expect(store.hasUnsettledLegacyProviderAuthorityQuarantineForSession(origin.sessionId)).toBe(true);
+    await expect(service.execute({
+      kind: "session.recover", session: origin.sessionId,
+    }, { signal })).rejects.toMatchObject({
+      code: "RECOVERY_REQUIRED",
+      message: expect.stringContaining("no provable provider-account authority"),
+    });
+    expect(store.readMutation(origin.idempotencyKey)).toMatchObject({
+      state: "ambiguous", evidence: { digest: origin.evidenceDigest },
+    });
+    expect(JSON.stringify(store.readSessionProviderSwitchProgress(origin.attemptId)))
+      .toBe(JSON.stringify(origin.progress));
+    expect(store.requireSession(origin.sessionId)).toMatchObject({
+      provider: "codex", providerThreadId: origin.targetThread, state: "recovery_required",
+    });
+    expect(codex.committedStartTurns).toBe(0);
+    expect(codex.calls).toEqual([]);
+    expect(personalClaude.calls).toEqual([]);
+    expect(personalClaude.endRequests).toEqual([]);
+    expect(store.readSessionPersonalRuntimeBinding(origin.sessionId, true))
+      .toMatchObject({ provider: "claude", providerThreadId: origin.sourceThread, state: "detached" });
+    await service.close();
   });
 
   test("acknowledges only the exact completed provider switch after its response is lost", async () => {
@@ -7807,11 +8396,16 @@ describe("HraService personal-session adoption", () => {
     });
     if (oldAuthority === null) throw new Error("Expected initial Claude process authority.");
     const oldGeneration = value.store.requireProfileById(value.accountId).processGeneration;
+    const oldClaudeAuthority = value.store.requireProviderAccountAuthority(value.accountId, "claude");
     await value.service.close();
     expect(value.store.requireProfileById(value.accountId).processGeneration)
       .toBe(oldGeneration + 1);
     expect(value.store.readSessionPersonalRuntimeBinding(value.session.id))
       .toMatchObject({ state: "active" });
+    const daemonBootId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
+    const daemonGeneration = value.store.nextDaemonGeneration(daemonBootId);
+    const restartedClaudeAuthority = value.store.requireProviderAccountAuthority(value.accountId, "claude");
+    expect(restartedClaudeAuthority.processGeneration).toBe(oldClaudeAuthority.processGeneration + 1);
 
     const restartedPersonal = new FakeClaude("personal", {
       pid: 63_003,
@@ -7831,8 +8425,10 @@ describe("HraService personal-session adoption", () => {
       procStart: "managed-claude-restarted",
     });
     const livenessChecks: Array<Parameters<ClaudeProcessLivenessProbe>[0]> = [];
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store: value.store,
+      daemonGeneration,
+      daemonBootId,
       paths: value.paths,
       codex: new FakeCodex(),
       claude: restartedManaged,
@@ -7861,7 +8457,10 @@ describe("HraService personal-session adoption", () => {
     expect(restartedPersonal.claimRequests[0]).toMatchObject({
       authority: {
         id: value.accountId,
-        generation: oldGeneration + 1,
+        provider: "claude",
+        providerAccountId: restartedClaudeAuthority.providerAccountId,
+        bindingGeneration: restartedClaudeAuthority.bindingGeneration,
+        generation: restartedClaudeAuthority.processGeneration,
         codexHome: personalCodexHome,
       },
       providerThreadId: "personal-claude-restart",
@@ -7874,7 +8473,8 @@ describe("HraService personal-session adoption", () => {
       runtimeScope: "personal",
     })).toMatchObject({
       identity: restartedPersonal.processIdentity,
-      profileGeneration: oldGeneration + 1,
+      profileGeneration: value.store.requireProfileById(value.accountId).processGeneration,
+      providerAuthority: restartedClaudeAuthority,
       sessionId: value.session.id,
       state: "bound",
     });
@@ -7908,7 +8508,7 @@ describe("HraService personal-session adoption", () => {
     await restarted.close();
   });
 
-  test("clean shutdown retires generation-zero adopted Claude without advancing a pristine account", async () => {
+  test("clean shutdown retires adopted Claude while preserving zero-generation Codex and pristine providers", async () => {
     const value = await adoptedClaudeFixture(
       "Generation-zero adopted Claude shutdown",
       "generation-zero-personal-claude-shutdown",
@@ -7929,11 +8529,13 @@ describe("HraService personal-session adoption", () => {
       processGeneration: 0,
       state: "signed_out",
     });
+    const claudeBefore = value.store.requireProviderAccountAuthority(value.accountId, "claude");
+    expect(claudeBefore.processGeneration).toBeGreaterThan(0);
 
     await expect(value.service.close()).resolves.toBeUndefined();
 
     expect(value.store.requireProfileById(value.accountId)).toMatchObject({
-      processGeneration: 1,
+      processGeneration: 0,
       state: "signed_out",
     });
     expect(value.store.requireProfileById(pristine.account.id)).toMatchObject({
@@ -7952,6 +8554,14 @@ describe("HraService personal-session adoption", () => {
       sessionId: value.session.id,
       state: "released",
     });
+    expect(value.store.requireProviderAccountAuthority(value.accountId, "claude").processGeneration)
+      .toBe(claudeBefore.processGeneration);
+    expect(value.store.requireProviderAccountAuthority(pristine.account.id, "claude").processGeneration)
+      .toBe(0);
+    const daemonBootId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
+    const daemonGeneration = value.store.nextDaemonGeneration(daemonBootId);
+    const restartedClaudeAuthority = value.store.requireProviderAccountAuthority(value.accountId, "claude");
+    expect(restartedClaudeAuthority.processGeneration).toBe(claudeBefore.processGeneration + 1);
 
     const restartedPersonal = new FakeClaude("personal", {
       pid: 63_029,
@@ -7965,8 +8575,10 @@ describe("HraService personal-session adoption", () => {
     };
     restartedPersonal.readIdentityErrorOnce = new Error("prior child is gone");
     restartedPersonal.observeErrorOnce = new ClaudeSessionObservationError();
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store: value.store,
+      daemonGeneration,
+      daemonBootId,
       paths: value.paths,
       codex: new FakeCodex(),
       claude: new FakeClaude("isolated", {
@@ -7988,7 +8600,11 @@ describe("HraService personal-session adoption", () => {
 
     expect(restartedPersonal.claimRequests).toHaveLength(1);
     expect(restartedPersonal.claimRequests[0]).toMatchObject({
-      authority: { id: value.accountId, generation: 1, codexHome: personalCodexHome },
+      authority: {
+        id: value.accountId, generation: restartedClaudeAuthority.processGeneration,
+        provider: "claude", providerAccountId: restartedClaudeAuthority.providerAccountId,
+        bindingGeneration: restartedClaudeAuthority.bindingGeneration, codexHome: personalCodexHome,
+      },
       providerThreadId: "generation-zero-personal-claude-shutdown",
     });
     expect(value.store.readClaudeProcessAuthority({
@@ -7997,7 +8613,8 @@ describe("HraService personal-session adoption", () => {
       runtimeScope: "personal",
     })).toMatchObject({
       identity: restartedPersonal.processIdentity,
-      profileGeneration: 1,
+      profileGeneration: value.store.requireProfileById(value.accountId).processGeneration,
+      providerAuthority: restartedClaudeAuthority,
       sessionId: value.session.id,
       state: "bound",
     });
@@ -8058,6 +8675,28 @@ describe("HraService personal-session adoption", () => {
     expect(value.store.readSessionPersonalRuntimeBinding(value.session.id)).toMatchObject({
       state: "active",
     });
+    const daemonBootId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
+    const daemonGeneration = value.store.nextDaemonGeneration(daemonBootId);
+    const authority = value.store.requireSessionProviderAuthority(value.session.id);
+    expect(authority).toMatchObject({ provider: "codex", processGeneration: before + 2,
+      routingProvenance: "explicit", appliedPointerRevision: null });
+    const personalCodex = new FakeCodex();
+    personalCodex.readProjection = { ...value.personalCodex.readProjection };
+    const managedCodex = new FakeCodex();
+    const restarted = new OompaService({ store: value.store, paths: value.paths,
+      daemonGeneration, daemonBootId, codex: managedCodex, personalCodex, personalCodexHome,
+      cloud: new FakeCloud(), daemonAuthority: new FakeDaemonAuthority(),
+      eventCursors: value.eventCursors, now: () => personalAdoptionNow,
+      requestStop: () => undefined });
+    await restarted.recover();
+    await expect(restarted.execute({ kind: "session.send", session: value.session.id,
+      message: "Continue the personal Codex session after restart",
+      idempotencyKey: "00000000-0000-4000-8000-00000000c105" }, { signal }))
+      .resolves.toMatchObject({ session: { id: value.session.id, state: "active", activeTurnId: "turn-next" } });
+    expect(personalCodex.committedStartTurns).toBe(1);
+    expect(managedCodex.committedStartTurns).toBe(0);
+    expect(value.store.readSessionPersonalRuntimeBinding(value.session.id)).toMatchObject({ state: "active" });
+    await restarted.close();
   });
 
   test("terminalizes an adopted Codex session task and releases personal custody on provider deletion", async () => {
@@ -8155,6 +8794,9 @@ describe("HraService personal-session adoption", () => {
       provider: {
         profileId: value.session.profileId,
         processGeneration: authority.generation,
+        provider: authority.provider,
+        providerAccountId: authority.providerAccountId,
+        bindingGeneration: authority.bindingGeneration,
         connectionId,
         requestId: { type: "string", value: requestId },
         method: "item/commandExecution/requestApproval",
@@ -8224,6 +8866,9 @@ describe("HraService personal-session adoption", () => {
     ): ProviderInteractionAuthority => ({
       profileId: value.session.profileId,
       processGeneration: authority.generation,
+      provider: authority.provider,
+      providerAccountId: authority.providerAccountId,
+      bindingGeneration: authority.bindingGeneration,
       connectionId,
       requestId: { type: "string", value: requestId },
       method,
@@ -8714,6 +9359,119 @@ describe("HraService personal-session adoption", () => {
     expect(value.managedClaude.turnRequests).toHaveLength(1);
   });
 
+  test("preserves live exact Claude custody across same-profile Codex login", async () => {
+    const value = await nativeClaudeFixture(
+      "Independent Codex login",
+      "native-claude-sibling-codex-login",
+      { pid: 63_030, pidDomain: "darwin", procStart: "sibling-codex-login-process" },
+      undefined,
+      false,
+    );
+    const captured = value.store.requireSessionProviderAuthority(value.session.id);
+    const profileBefore = value.store.requireProfileById(value.accountId);
+    const processSelector = {
+      providerThreadId: value.providerThreadId,
+      profileId: value.accountId,
+      runtimeScope: "managed" as const,
+    };
+    const processBefore = value.store.readClaudeProcessAuthority(processSelector);
+    const callsBefore = [...value.managedClaude.calls];
+    const originalFactAuthority = value.managedClaude.startSessionRequests[0]?.authority;
+    if (originalFactAuthority === undefined) throw new Error("Expected the original Claude writer authority.");
+    expect(profileBefore.processGeneration).toBe(0);
+    expect(captured.processGeneration).toBeGreaterThan(0);
+    expect(processBefore).toMatchObject({ state: "bound", profileGeneration: 0 });
+
+    await expect(value.service.execute({
+      kind: "account.login",
+      account: value.accountId,
+      deviceCode: false,
+      idempotencyKey: "00000000-0000-4000-8000-00000000c103",
+    }, { signal })).resolves.toMatchObject({ account: { id: value.accountId } });
+    await value.service.settled();
+
+    expect(value.store.requireProfileById(value.accountId)).toMatchObject({
+      state: "signed_in", processGeneration: profileBefore.processGeneration + 1,
+    });
+    expect(value.store.requireSessionProviderAuthority(value.session.id)).toEqual(captured);
+    expect(value.store.readClaudeProcessAuthority(processSelector)).toEqual(processBefore);
+    expect(value.managedClaude.calls).toEqual(callsBefore);
+    expect(value.managedClaude.endRequests).toEqual([]);
+    expect(value.managedClaude.endedProcessIdentities).toEqual([]);
+    expect(value.store.readProviderRuntimeAccountRevocation({
+      profileId: value.accountId, provider: "claude", runtimeScope: "managed",
+    })).toBeNull();
+    // Deliver on the pre-login connection before any service send can refresh
+    // its observation capability from the now-advanced Codex shadow.
+    await value.service.observeClaudeFact(originalFactAuthority, {
+      providerThreadId: value.providerThreadId,
+      connectionId: value.managedClaude.observationConnectionId,
+      type: "assistantDelta", turnId: "unchanged-claude-turn",
+      itemId: "unchanged-claude-item", text: "Still the original Claude writer",
+    });
+    // Flush the streaming redactor at the real provider turn boundary.
+    await value.service.observeClaudeFact(originalFactAuthority, {
+      providerThreadId: value.providerThreadId,
+      connectionId: value.managedClaude.observationConnectionId,
+      type: "turnCompleted", turnId: "unchanged-claude-turn", status: "completed",
+    });
+    const acceptedFact = value.store.listSessionEvents({
+      sessionId: value.session.id, afterSequence: 0, limit: 100,
+    }).events.find((event) => event.body.type === "assistant_delta"
+      && event.body.text === "Still the original Claude writer");
+    expect(acceptedFact).toBeDefined();
+    if (acceptedFact === undefined) throw new Error("Expected the original Claude fact to remain admissible.");
+    const raw = new Database(value.paths.database, { readonly: true });
+    expect(raw.query(`SELECT provider,provider_account_id,binding_generation,process_generation
+      FROM session_event_provider_authorities WHERE session_id=? AND sequence=?`)
+      .get(value.session.id, acceptedFact.sequence)).toEqual({
+        provider: captured.provider, provider_account_id: captured.providerAccountId,
+        binding_generation: captured.bindingGeneration, process_generation: captured.processGeneration,
+      });
+    raw.close();
+    expect(value.store.requireSessionProviderAuthority(value.session.id)).toEqual(captured);
+    expect(value.store.readClaudeProcessAuthority(processSelector)).toEqual(processBefore);
+    await expect(value.service.execute({
+      kind: "session.send", session: value.session.id,
+      message: "Continue on the unchanged Claude writer",
+      idempotencyKey: "00000000-0000-4000-8000-00000000c104",
+    }, { signal })).resolves.toMatchObject({ session: { id: value.session.id } });
+    expect(value.managedClaude.turnRequests).toHaveLength(1);
+    await value.service.close();
+  });
+
+  test("preserves exact Claude custody after a sibling Codex signout observation", async () => {
+    const value = await nativeClaudeFixture(
+      "Observed sibling signout",
+      "native-claude-observed-sibling-signout",
+      { pid: 63_029, pidDomain: "darwin", procStart: "observed-sibling-signout-process" },
+    );
+    const captured = value.store.requireSessionProviderAuthority(value.session.id);
+    const processSelector = {
+      providerThreadId: value.providerThreadId,
+      profileId: value.accountId,
+      runtimeScope: "managed" as const,
+    };
+    const processBefore = value.store.readClaudeProcessAuthority(processSelector);
+    await expect(value.service.observeCodexAccount(
+      liveAuthorityFor(value.store, value.accountId, "codex"),
+      { signedIn: false },
+    )).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await value.service.settled();
+
+    expect(value.store.requireProfileById(value.accountId).state).toBe("signed_out");
+    expect(value.store.requireSessionProviderAuthority(value.session.id)).toEqual(captured);
+    expect(value.store.readClaudeProcessAuthority(processSelector)).toEqual(processBefore);
+    expect(value.store.readProviderRuntimeAccountRevocation({
+      profileId: value.accountId, provider: "claude", runtimeScope: "managed",
+    })).toBeNull();
+    expect(value.managedClaude.endRequests).toEqual([]);
+    expect(value.managedClaude.endedProcessIdentities).toEqual([]);
+    await expect(value.service.readSessionProjectionForCloud(value.session.id, signal))
+      .resolves.toMatchObject({ providerThreadId: value.providerThreadId });
+    await value.service.close();
+  });
+
   test("durably revokes native Claude process authority after provider-observed signout", async () => {
     let providerThreadId = "native-claude-observed-signout";
     const identity: ClaudeProcessIdentity = {
@@ -8728,6 +9486,7 @@ describe("HraService personal-session adoption", () => {
     );
     providerThreadId = value.providerThreadId;
     const profile = value.store.requireProfileById(value.accountId);
+    const captured = value.store.requireProviderAccountAuthority(value.accountId, "claude");
     let markReleaseStarted!: () => void;
     const releaseStarted = new Promise<void>((resolve) => {
       markReleaseStarted = resolve;
@@ -8741,27 +9500,27 @@ describe("HraService personal-session adoption", () => {
       await releaseGate;
     };
 
-    await expect(value.service.observeCodexAccount({
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    }, { signedIn: false })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    value.managedClaude.accountProjection = { signedIn: false };
+    await expect(value.service.readSessionProjectionForCloud(value.session.id, signal))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
     await releaseStarted;
     try {
-      expect(value.store.readProfilePersonalAuthorityRevocation(value.accountId))
+      expect(value.store.readProviderRuntimeAccountRevocation({
+        profileId: value.accountId, provider: "claude", runtimeScope: "managed",
+      }))
         .toMatchObject({
           profileGeneration: profile.processGeneration,
           state: "releasing",
         });
       expect(value.store.requireProfileById(value.accountId).state)
-        .toBe("recovery_required");
+        .toBe(profile.state);
       expect(value.store.readClaudeProcessAuthority({
         providerThreadId,
         profileId: value.accountId,
         runtimeScope: "managed",
       })).toMatchObject({
         identity,
+        providerAuthority: captured,
         profileGeneration: profile.processGeneration,
         sessionId: value.session.id,
         state: "releasing",
@@ -8780,16 +9539,21 @@ describe("HraService personal-session adoption", () => {
       runtimeScope: "managed",
     })).toMatchObject({
       identity,
+      providerAuthority: captured,
       profileGeneration: profile.processGeneration,
       sessionId: value.session.id,
       state: "released",
     });
-    expect(value.store.readProfilePersonalAuthorityRevocation(value.accountId))
+    expect(value.store.readProviderRuntimeAccountRevocation({
+      profileId: value.accountId, provider: "claude", runtimeScope: "managed",
+    }))
       .toMatchObject({
         profileGeneration: profile.processGeneration,
         state: "completed",
       });
-    expect(value.store.requireProfileById(value.accountId).state).toBe("signed_out");
+    expect(value.store.requireProfileById(value.accountId)).toEqual(profile);
+    expect(value.store.requireProviderAccountAuthority(value.accountId, "codex").processGeneration)
+      .toBe(profile.processGeneration);
   });
 
   test("revokes managed Claude authority before accepting replaced or missing account identity", async () => {
@@ -8811,6 +9575,7 @@ describe("HraService personal-session adoption", () => {
       );
       providerThreadId = value.providerThreadId;
       const profile = value.store.requireProfileById(value.accountId);
+      const captured = value.store.requireProviderAccountAuthority(value.accountId, "claude");
       expect(profile.providerEmail).toBe("person@example.com");
       let markReleaseStarted!: () => void;
       const releaseStarted = new Promise<void>((resolve) => {
@@ -8825,19 +9590,18 @@ describe("HraService personal-session adoption", () => {
         await releaseGate;
       };
 
-      await expect(value.service.observeCodexAccount({
-        id: profile.id,
-        generation: profile.processGeneration,
-        codexHome: "unused",
-        desktopUserData: "unused",
-      }, observation)).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      value.managedClaude.accountProjection = observation;
+      await expect(value.service.readSessionProjectionForCloud(value.session.id, signal))
+        .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
       await releaseStarted;
       try {
         expect(value.store.requireProfileById(value.accountId)).toMatchObject({
           providerEmail: "person@example.com",
-          state: "recovery_required",
+          state: profile.state,
         });
-        expect(value.store.readProfilePersonalAuthorityRevocation(value.accountId))
+        expect(value.store.readProviderRuntimeAccountRevocation({
+          profileId: value.accountId, provider: "claude", runtimeScope: "managed",
+        }))
           .toMatchObject({
             profileGeneration: profile.processGeneration,
             state: "releasing",
@@ -8848,6 +9612,7 @@ describe("HraService personal-session adoption", () => {
           runtimeScope: "managed",
         })).toMatchObject({
           identity,
+          providerAuthority: captured,
           state: "releasing",
         });
       } finally {
@@ -8856,8 +9621,10 @@ describe("HraService personal-session adoption", () => {
       await value.service.settled();
 
       const retired = value.store.requireProfileById(value.accountId);
-      expect(retired.state).toBe("signed_out");
-      expect(retired.providerEmail).toBeUndefined();
+      expect(retired).toEqual(profile);
+      expect(value.store.readProviderRuntimeAccountRevocation({
+        profileId: value.accountId, provider: "claude", runtimeScope: "managed",
+      })).toMatchObject({ state: "completed", profileGeneration: profile.processGeneration });
       expect(value.store.readClaudeProcessAuthority({
         providerThreadId,
         profileId: value.accountId,
@@ -9029,6 +9796,7 @@ describe("HraService personal-session adoption", () => {
       { signal },
     ) as { account: { id: `acct_${string}` } };
     const profile = value.store.requireProfileById(added.account.id);
+    const capturedAuthority = liveAuthorityFor(value.store, profile.id, "codex", profilePaths(value.paths, profile.id));
     const priorAccountKey = codexProviderAccountKey("prior-owner@example.com");
     const direct = new Database(value.paths.database, { create: false, strict: true });
     try {
@@ -9073,10 +9841,7 @@ describe("HraService personal-session adoption", () => {
       });
     }
     expect(value.codex.releasedAuthorities).toContainEqual({
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: profilePaths(value.paths, profile.id).codexHome,
-      desktopUserData: profilePaths(value.paths, profile.id).desktopUserData,
+      ...capturedAuthority,
     });
   });
 
@@ -9184,6 +9949,9 @@ describe("HraService personal-session adoption", () => {
       provider: {
         profileId: value.accountId,
         processGeneration: authority.generation,
+        provider: authority.provider,
+        providerAccountId: authority.providerAccountId,
+        bindingGeneration: authority.bindingGeneration,
         connectionId: value.personalCodex.observationConnectionId,
         requestId: { type: "string", value: requestId },
         method: "item/commandExecution/requestApproval",
@@ -9260,7 +10028,7 @@ describe("HraService personal-session adoption", () => {
     // Simulate process loss after the sign-out fact was staged but before the
     // asynchronous controller release began. Recovery must finish from the
     // durable revocation row before it admits any session resubscriptions.
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store: value.store,
       paths: value.paths,
       codex: new FakeCodex(),
@@ -9384,7 +10152,7 @@ describe("HraService personal-session adoption", () => {
     await value.service.close();
 
     const personalCodex = new FakeCodex();
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store: value.store,
       paths: value.paths,
       codex: new FakeCodex(),
@@ -9407,7 +10175,307 @@ describe("HraService personal-session adoption", () => {
   });
 });
 
-describe("HraService", () => {
+describe("OompaService", () => {
+  test("original send ambiguity stays visible to doctor and cannot enter generic session recovery", async () => {
+    const value = await fixture();
+    const bootId = `boot_${"d".repeat(32)}`;
+    const daemonGeneration = value.store.nextDaemonGeneration(bootId);
+    const { sessionId } = await createIdleSession(value, "Owned send diagnostics");
+    const request = { kind: "session.send" as const, session: sessionId, message: "Original recovery input",
+      attachments: [], idempotencyKey: crypto.randomUUID() };
+    const owner = value.store.prepareOwnedSessionSend(request);
+    const runtimeProfile = value.store.latestSessionRuntimeProfile(sessionId)?.profile;
+    if (runtimeProfile === undefined) throw new Error("Expected a reviewed session runtime profile.");
+    const claim = value.store.beginOwnedDirectSendEffect({
+      attemptId: owner.owner.attemptId, ownerDigest: owner.ownerDigest, requestFingerprint: owner.owner.fingerprint,
+      daemonGeneration, bootId, expectedSessionRevision: owner.owner.sourceSessionRevision,
+      executionAuthority: owner.owner.sourceAuthority,
+      evidence: { kind: "session.send", providerThreadId: owner.owner.sourceThreadId,
+        baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+        clientMessageId: owner.owner.attemptId, messageDigest: owner.owner.fingerprint.inputDigest, runtimeProfile },
+    });
+    if (claim.claimDigest === null) throw new Error("Expected a durable direct send claim.");
+    const ambiguous = value.store.settleOwnedDirectSend({ attemptId: owner.owner.attemptId,
+      ownerDigest: owner.ownerDigest, claimDigest: claim.claimDigest,
+      outcome: { kind: "ambiguous", reason: "provider_outcome_unknown" } });
+    value.store.reconcileSessionFromProvider({ sessionId, state: "recovery_required" });
+    const doctor = await value.service.execute({ kind: "doctor", offline: true }, { signal });
+    expect(doctor).toMatchObject({ state: { database: "ready", unsettledMutations: 1 } });
+    expect(value.store.listUnsettledMutations({ sessionId })).toMatchObject([
+      { format: "original_send_v1", id: owner.owner.attemptId, state: "ambiguous" },
+    ]);
+    const providerCalls = [...value.codex.calls];
+    const current = value.store.requireSession(sessionId);
+    for (const kind of ["session.recover", "session.abandon"] as const) {
+      await expect(value.service.execute({ kind, session: sessionId }, { signal })).rejects.toMatchObject({
+        code: "RECOVERY_REQUIRED", details: { reason: "original_send_recovery_required" },
+      });
+    }
+    expect(value.codex.calls).toEqual(providerCalls);
+    expect(value.store.requireSession(sessionId)).toEqual(current);
+    expect(value.store.readOwnedSessionSend(request.idempotencyKey)).toEqual(ambiguous);
+    expect(value.codex.committedStartTurns).toBe(0);
+  });
+
+  describe("automatic policy commands", () => {
+    type Configuration = ReturnType<StateStore["readAutomaticUsagePolicyConfiguration"]>;
+    type Change = Parameters<StateStore["updateAutomaticUsagePolicyConfiguration"]>[0]["change"];
+    const initial: Configuration = { version: 1, defaultEnabled: true,
+      overrides: { codex: "inherit", claude: "inherit" }, automaticPolicyRevision: 1 };
+    const recoveryMessage = "Automatic usage policy could not be verified. No automatic setting was reinitialized; inspect local recovery before retrying.";
+    const revisionMessage = "Automatic usage policy changed since that revision. Run `oompa usage auto status` before submitting a new change.";
+    const keyMessage = "The automatic usage policy key belongs to a different request. Replay the original request or use a new key for a new change.";
+    const projection = (configuration: Configuration, providers: readonly ("codex" | "claude")[] = ["codex", "claude"]) => ({
+      version: 1, configuration,
+      effective: providers.map((provider) => ({ provider,
+        enabled: configuration.overrides[provider] === "inherit" ? configuration.defaultEnabled : configuration.overrides[provider] === "on",
+        source: configuration.overrides[provider] === "inherit" ? "default" : "override",
+        automaticPolicyRevision: configuration.automaticPolicyRevision,
+      })),
+    });
+    const request = (expectedAutomaticPolicyRevision = 1, change: Change = { kind: "set_default", enabled: false }) => ({
+      kind: "usage.auto.set", idempotencyKey: crypto.randomUUID(), expectedAutomaticPolicyRevision, change,
+    });
+    const execute = (service: OompaService, command: unknown) => service.execute(localCommandSchema.parse(command), { signal });
+    const setup = async () => {
+      const now = 1_800_000_000_000;
+      const claude = new FakeClaude("isolated", {
+        pid: 63_042, pidDomain: "darwin", procStart: "automatic-policy-command-fake-process",
+      });
+      const desktop = new FakeDesktop();
+      const value = await fixture(desktop, new FakeCloud(), () => undefined, () => now, undefined, { claude });
+      const profiles = ["primary", "secondary"].map((label) => {
+        const current = value.store.nextProfileGeneration(value.store.createProfile(`Automatic ${label}`).id);
+        expect(value.store.setProfileState(current.id, current.processGeneration, "signed_in", {
+          email: `automatic-${label}@example.com`, plan: "Plus",
+        })).toBe(true);
+        return value.store.requireProfileById(current.id);
+      });
+      const primary = profiles[0];
+      if (primary === undefined) throw new Error("Expected a seeded account.");
+      const session = value.store.createSession({ profileId: primary.id, provider: "codex", preset: "high", fastEnabled: false });
+      value.store.bindSession({ sessionId: session.id, expectedRevision: session.revision,
+        providerThreadId: "automatic-policy-preserved-thread", state: "idle" });
+      const resetInput = { profileId: primary.id, processGeneration: primary.processGeneration,
+        accountFingerprint: createHash("sha256").update("automatic-primary@example.com").digest("hex"),
+        weeklyWindowResetsAt: now + 86_400_000 };
+      expect(value.store.authorizeAccountRateLimitResetPolicy({ ...resetInput, weeklyWindowDurationMinutes: 10_080 }).decision).toBe("allow");
+      value.store.prepareAccountRateLimitReset({ ...resetInput, observedUsedPercent: 99 });
+      value.store.prepareMutation({ idempotencyKey: crypto.randomUUID(), kind: "test.policy-preserved",
+        authorityId: "test-policy-preserved", authorityGeneration: 1, request: { preserve: true } });
+      const snapshot = (unrelated = false) => {
+        const db = new Database(value.paths.database, { readonly: true, strict: true });
+        try {
+          const names = db.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all();
+          return {
+            version: db.query("PRAGMA user_version").get(),
+            schema: db.query("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name").all(),
+            tables: names.filter(({ name }) => !unrelated || name !== "automatic_usage_policy_revisions")
+              .map(({ name }) => ({ name, rows: db.query(`SELECT * FROM "${name.replaceAll('"', '""')}"${
+                unrelated && name === "mutation_attempts" ? " WHERE kind<>'usage.auto.configure'" : ""
+              }`).all() })),
+          };
+        } finally { db.close(false); }
+      };
+      const expectNoProviderWork = () => {
+        expect(value.codex.calls).toEqual([]);
+        expect(value.codex.resetIdempotencyKeys).toEqual([]);
+        expect(value.codex.turnEffectTrace).toEqual([]);
+        expect(claude.calls).toEqual([]);
+        expect(desktop.calls).toEqual([]);
+      };
+      return { ...value, claude, desktop, now, sessionId: session.id, snapshot, expectNoProviderWork };
+    };
+
+    test("reports defaults and exact provider filters without any write or provider call", async () => {
+      const value = await setup();
+      const before = value.snapshot();
+      expect(await execute(value.service, { kind: "usage.auto.status" })).toEqual(projection(initial));
+      for (const provider of ["codex", "claude"] as const) {
+        expect(await execute(value.service, { kind: "usage.auto.status", provider })).toEqual(projection(initial, [provider]));
+      }
+      expect(value.snapshot()).toEqual(before);
+      value.expectNoProviderWork();
+    });
+
+    test("updates the effective default and override matrix without touching existing sessions, resets or pointers", async () => {
+      const value = await setup();
+      const before = value.snapshot(true);
+      let configuration = initial;
+      const changes: Change[] = [
+        { kind: "set_default", enabled: false },
+        { kind: "set_override", provider: "codex", override: "on" },
+        { kind: "set_override", provider: "claude", override: "off" },
+        { kind: "set_default", enabled: true },
+        { kind: "set_override", provider: "codex", override: "off" },
+        { kind: "set_override", provider: "claude", override: "on" },
+        { kind: "set_override", provider: "codex", override: "inherit" },
+        { kind: "set_override", provider: "claude", override: "inherit" },
+        { kind: "set_default", enabled: true },
+      ];
+      for (const change of changes) {
+        const command = request(configuration.automaticPolicyRevision, change);
+        configuration = { ...configuration, overrides: { ...configuration.overrides },
+          automaticPolicyRevision: configuration.automaticPolicyRevision + 1 };
+        if (change.kind === "set_default") configuration.defaultEnabled = change.enabled;
+        else configuration.overrides[change.provider] = change.override;
+        expect(await execute(value.service, command)).toEqual(projection(configuration));
+        expect(await execute(value.service, { kind: "usage.auto.status", provider: "claude" }))
+          .toEqual(projection(configuration, ["claude"]));
+        expect(value.store.readMutation(command.idempotencyKey)).toMatchObject({
+          kind: "usage.auto.configure", authorityId: "automatic-usage-policy",
+          authorityGeneration: command.expectedAutomaticPolicyRevision, state: "applied",
+          result: { version: 1, automaticPolicyRevision: configuration.automaticPolicyRevision },
+        });
+        expect(value.snapshot(true)).toEqual(before);
+      }
+      value.expectNoProviderWork();
+    });
+
+    test("replays the original receipt before a changed live head without rewriting anything", async () => {
+      const value = await setup();
+      const original = request();
+      const first = await execute(value.service, original);
+      expect(first).toEqual(projection({ ...initial, defaultEnabled: false, automaticPolicyRevision: 2 }));
+      const latest = await execute(value.service, request(2, { kind: "set_override", provider: "codex", override: "on" }));
+      expect(latest).not.toEqual(first);
+      const before = value.snapshot();
+      Object.defineProperty(value.store, "readAutomaticUsagePolicyConfiguration", {
+        configurable: true, value: () => { throw new Error("A historical replay must not preflight the live head."); },
+      });
+      try { expect(await execute(value.service, original)).toEqual(first); }
+      finally { Reflect.deleteProperty(value.store, "readAutomaticUsagePolicyConfiguration"); }
+      expect(value.snapshot()).toEqual(before);
+      expect(await execute(value.service, { kind: "usage.auto.status" })).toEqual(latest);
+      value.expectNoProviderWork();
+    });
+
+    test("rejects conflicting keys and stale revisions without intent or state changes", async () => {
+      const value = await setup();
+      const accepted = request();
+      await execute(value.service, accepted);
+      const foreign = request(2);
+      value.store.prepareMutation({ idempotencyKey: foreign.idempotencyKey, kind: "test.other",
+        authorityId: "test-policy-key", authorityGeneration: 1, request: {} });
+      for (const [command, message] of [
+        [{ ...accepted, change: { kind: "set_default", enabled: true } }, keyMessage],
+        [{ ...accepted, expectedAutomaticPolicyRevision: 2 }, keyMessage],
+        [foreign, keyMessage],
+        [request(1), revisionMessage],
+      ] as const) {
+        const before = value.snapshot();
+        await expect(execute(value.service, command)).rejects.toMatchObject({ code: "CONFLICT", message, details: undefined });
+        expect(value.snapshot()).toEqual(before);
+      }
+      value.expectNoProviderWork();
+    });
+
+    test("reports an owned session-send key as an inert conflict", async () => {
+      const value = await setup();
+      const command = request();
+      const owner = value.store.prepareOwnedSessionSend({ kind: "session.send", session: value.sessionId,
+        message: "Preserve the original send owner", attachments: [], idempotencyKey: command.idempotencyKey });
+      const history = value.store.readOwnedSessionSend(command.idempotencyKey);
+      expect(history).toMatchObject({ kind: "owned", ownerDigest: owner.ownerDigest });
+      const before = value.snapshot();
+      await expect(execute(value.service, command)).rejects.toMatchObject({ code: "CONFLICT", message: keyMessage, details: undefined });
+      expect(value.snapshot()).toEqual(before);
+      expect(value.store.readOwnedSessionSend(command.idempotencyKey)).toEqual(history);
+      value.expectNoProviderWork();
+    });
+
+    test("keeps corrupt session-send ownership a sanitized recovery refusal", async () => {
+      const value = await setup();
+      const before = value.snapshot();
+      const failure = new SessionSendOwnershipError("SESSION_SEND_OWNER_CORRUPT");
+      failure.message = `${failure.code} ${privatePathRoot}/owner-private-sentinel`;
+      Object.defineProperty(value.store, "updateAutomaticUsagePolicyConfiguration", {
+        configurable: true, value: () => { throw failure; },
+      });
+      await expect(execute(value.service, request()))
+        .rejects.toMatchObject({ code: "RECOVERY_REQUIRED", message: recoveryMessage, details: undefined });
+      expect(value.snapshot()).toEqual(before);
+      value.expectNoProviderWork();
+    });
+
+    test("admits exactly one revision contender across two real service/store connections", async () => {
+      const value = await setup();
+      const contenderStore = new StateStore(value.paths, { now: () => value.now });
+      stores.push(contenderStore);
+      const contender = new OompaService({ store: contenderStore, paths: value.paths,
+        codex: value.codex, claude: value.claude, desktop: value.desktop, cloud: value.cloud,
+        daemonAuthority: new FakeDaemonAuthority(), daemonGeneration: value.daemonGeneration,
+        daemonBootId: value.daemonBootId, eventCursors: value.eventCursors, now: () => value.now,
+        requestStop: () => undefined,
+      });
+      const commands = [request(), request(1, { kind: "set_override", provider: "codex", override: "off" })];
+      const before = value.snapshot(true);
+      try {
+        const results = await Promise.allSettled(commands.map((command, index) => execute(index === 0 ? value.service : contender, command)));
+        expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+        expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+        for (const [index, result] of results.entries()) {
+          const command = commands[index];
+          if (command === undefined) throw new Error("Expected contender request.");
+          if (result.status === "rejected") {
+            expect(result.reason).toMatchObject({ code: "CONFLICT", message: revisionMessage, details: undefined });
+            expect(value.store.readMutation(command.idempotencyKey)).toBeNull();
+          } else expect(result.value).toMatchObject({ configuration: { automaticPolicyRevision: 2 } });
+        }
+        expect(value.store.readAutomaticUsagePolicyConfiguration().automaticPolicyRevision).toBe(2);
+        expect(contenderStore.readAutomaticUsagePolicyConfiguration()).toEqual(value.store.readAutomaticUsagePolicyConfiguration());
+        expect(value.snapshot(true)).toEqual(before);
+        value.expectNoProviderWork();
+      } finally { await contender.close(); }
+    });
+
+    for (const operation of ["status", "set"] as const) {
+      for (const failure of ["throw", "malformed_result"] as const) {
+        test(`sanitizes ${operation} ${failure} inside the policy boundary without reinitializing state`, async () => {
+          const value = await setup();
+          const sentinel = `${privatePathRoot}/policy-secret-sentinel`;
+          const before = value.snapshot();
+          Object.defineProperty(value.store, operation === "status" ? "readAutomaticUsagePolicyConfiguration" : "updateAutomaticUsagePolicyConfiguration", {
+            configurable: true,
+            value: () => {
+              if (failure === "throw") throw new Error(`AUTOMATIC_USAGE_POLICY_INVALID ${sentinel}`);
+              return { ...initial, automaticPolicyRevision: 0, privateDetail: sentinel };
+            },
+          });
+          await expect(execute(value.service, operation === "status" ? { kind: "usage.auto.status" } : request()))
+            .rejects.toMatchObject({ code: "RECOVERY_REQUIRED", message: recoveryMessage, details: undefined });
+          expect(value.snapshot()).toEqual(before);
+          value.expectNoProviderWork();
+        });
+      }
+    }
+
+    test("reports exhausted revision capacity as a closed inert conflict", async () => {
+      const value = await setup();
+      const before = value.snapshot();
+      Object.defineProperty(value.store, "updateAutomaticUsagePolicyConfiguration", {
+        configurable: true, value: () => { throw new Error("AUTOMATIC_USAGE_POLICY_REVISION_EXHAUSTED"); },
+      });
+      await expect(execute(value.service, request())).rejects.toMatchObject({ code: "CONFLICT", details: undefined,
+        message: "Automatic usage policy revision capacity is exhausted; this setting cannot be updated further." });
+      expect(value.snapshot()).toEqual(before);
+      value.expectNoProviderWork();
+    });
+
+    test("rejects unknown wire fields and unsupported providers before service admission", () => {
+      for (const command of [
+        { kind: "usage.auto.status", provider: "devin" },
+        { kind: "usage.auto.status", extra: true },
+        { ...request(), extra: true },
+        { ...request(), expectedAutomaticPolicyRevision: 0 },
+        { ...request(), expectedAutomaticPolicyRevision: Number.MAX_SAFE_INTEGER + 1 },
+        { ...request(), change: { kind: "set_default", enabled: false, extra: true } },
+        { ...request(), change: { kind: "set_override", provider: "codex", override: "disabled" } },
+        { ...request(), change: { kind: "set_override", provider: "devin", override: "off" } },
+      ]) expect(localCommandSchema.safeParse(command).success).toBe(false);
+    });
+  });
+
   test("reports and CAS-updates notification hours with the injected clock only", async () => {
     let now = Date.parse("2026-09-04T12:30:00.000Z");
     const value = await fixture(
@@ -9892,7 +10960,7 @@ describe("HraService", () => {
     expect(value.store.readMutation(idempotencyKey)).toBeNull();
 
     await value.service.close();
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store: value.store,
       paths: value.paths,
       codex: new FakeCodex(),
@@ -9960,7 +11028,6 @@ describe("HraService", () => {
         runtimeScope: "managed",
         accountKey: codexProviderAccountKey(),
       });
-      const profile = value.store.requireProfileById(target.profileId);
       const idempotencyKey = crypto.randomUUID();
       const message = "prepared peer restart message";
       const request = {
@@ -9975,12 +11042,15 @@ describe("HraService", () => {
         idempotencyKey,
       };
       const admitted = value.store.admitPeerSessionAction(request);
-      value.store.prepareMutation({
+      const prepared = value.store.prepareSessionInputMutation({
         kind: "session.send",
-        authorityId: target.id,
-        authorityGeneration: profile.processGeneration,
-        request: { message },
+        sessionId: target.id,
+        providerAuthority: value.store.requireProviderAccountAuthority(target.profileId, "codex"),
+        message,
+        attachments: [],
         idempotencyKey,
+        daemonGeneration: value.daemonGeneration,
+        bootId: value.daemonBootId,
       });
       if (peerEffectStarted) value.store.beginPeerSessionActionEffect(admitted.action.id);
       expect(value.store.requirePeerSessionAction(admitted.action.id).state)
@@ -9989,7 +11059,7 @@ describe("HraService", () => {
 
       await value.service.close();
       const restartedCodex = new FakeCodex();
-      const restarted = new HraService({
+      const restarted = new OompaService({
         store: value.store,
         paths: value.paths,
         codex: restartedCodex,
@@ -10002,12 +11072,16 @@ describe("HraService", () => {
 
       expect(value.store.requirePeerSessionAction(admitted.action.id).state).toBe("cancelled");
       expect(value.store.readMutation(idempotencyKey)).toMatchObject({
+        id: prepared.attempt.id,
+        kind: "session.send",
         state: "cancelled",
-        result: {
-          code: "PEER_SESSION_PROVIDER_EFFECT_NOT_STARTED",
-          peerActionId: admitted.action.id,
-          providerEffectStarted: false,
-        },
+      });
+      // Genuine retained input keeps its own no-effect custody receipt; the
+      // terminal peer action, not an invented mutation result, proves cancel.
+      expect(value.store.readMutation(idempotencyKey)?.result).toBeUndefined();
+      expect(value.store.readPeerSessionMutationJoin(idempotencyKey)).toMatchObject({
+        action: { id: admitted.action.id, state: "cancelled" },
+        attempt: { id: prepared.attempt.id, state: "cancelled" },
       });
       expect(providerMutationCalls(restartedCodex)).toEqual([]);
       await restarted.close();
@@ -10058,17 +11132,9 @@ describe("HraService", () => {
       status: "idle",
       providerUpdatedAt: 11,
     };
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority: ProfileAuthority = liveAuthorityFor(value.store, profile.id, "codex");
     const call = {
-      authority: {
-        profileId: profile.id,
-        processGeneration: profile.processGeneration,
-      },
+      authority: hostToolAuthorityFor(liveAuthorityFor(value.store, profile.id)),
       callId: "peer-prepared-live-replay",
       connectionId: value.codex.observationConnectionId,
       input: {
@@ -10083,7 +11149,7 @@ describe("HraService", () => {
       threadId: actor.providerThreadId,
       tool: "session_message" as const,
       turnId: actor.activeTurnId,
-    } satisfies HraHostToolCall;
+    } satisfies OompaHostToolCall;
     const originalBegin = value.store.beginSessionMutationEffect.bind(value.store);
     let injected = false;
     (value.store as unknown as {
@@ -10100,7 +11166,7 @@ describe("HraService", () => {
     };
     const providerWritesBefore = providerMutationCalls(value.codex);
 
-    await expect(value.service.handleHraHostToolCall(
+    await expect(value.service.handleOompaHostToolCall(
       authority,
       call,
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -10115,7 +11181,7 @@ describe("HraService", () => {
     (value.store as unknown as {
       beginSessionMutationEffect: StateStore["beginSessionMutationEffect"];
     }).beginSessionMutationEffect = originalBegin;
-    const replayed = await value.service.handleHraHostToolCall(
+    const replayed = await value.service.handleOompaHostToolCall(
       authority,
       call,
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -10176,17 +11242,9 @@ describe("HraService", () => {
       status: "idle",
       providerUpdatedAt: 11,
     };
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority: ProfileAuthority = liveAuthorityFor(value.store, profile.id, "codex");
     const call = {
-      authority: {
-        profileId: profile.id,
-        processGeneration: profile.processGeneration,
-      },
+      authority: hostToolAuthorityFor(liveAuthorityFor(value.store, profile.id)),
       callId: "peer-applied-receipt-restart",
       connectionId: value.codex.observationConnectionId,
       input: {
@@ -10201,7 +11259,7 @@ describe("HraService", () => {
       threadId: actor.providerThreadId,
       tool: "session_message" as const,
       turnId: actor.activeTurnId,
-    } satisfies HraHostToolCall;
+    } satisfies OompaHostToolCall;
     const originalSettle = value.store.settlePeerSessionAction.bind(value.store);
     let injectedSettlements = 0;
     (value.store as unknown as {
@@ -10215,7 +11273,7 @@ describe("HraService", () => {
     };
     const providerWritesBefore = providerMutationCalls(value.codex);
     try {
-      await expect(value.service.handleHraHostToolCall(
+      await expect(value.service.handleOompaHostToolCall(
         authority,
         call,
         MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -10254,7 +11312,7 @@ describe("HraService", () => {
       activeTurnId: actor.activeTurnId,
       providerUpdatedAt: 100,
     };
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store: restartedStore,
       paths: value.paths,
       codex: restartedCodex,
@@ -10282,8 +11340,8 @@ describe("HraService", () => {
         processGeneration: restartedProfile.processGeneration,
       },
       connectionId: restartedCodex.observationConnectionId,
-    } satisfies HraHostToolCall;
-    const replayed = await restarted.handleHraHostToolCall(
+    } satisfies OompaHostToolCall;
+    const replayed = await restarted.handleOompaHostToolCall(
       replayAuthority,
       replayCall,
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -10303,7 +11361,7 @@ describe("HraService", () => {
     for (let index = 0; index < 32; index += 1) {
       const call = callFor(index);
       lastAcceptedCall = call;
-      await expect(value.service.handleHraHostToolCall(
+      await expect(value.service.handleOompaHostToolCall(
         authority,
         call,
         MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -10324,7 +11382,7 @@ describe("HraService", () => {
     expect(value.codex.calls.filter((call) => call === "steer")).toHaveLength(32);
     const writesBeforeRefusal = providerMutationCalls(value.codex);
 
-    const refused = await value.service.handleHraHostToolCall(
+    const refused = await value.service.handleOompaHostToolCall(
       authority,
       callFor(32),
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -10341,7 +11399,7 @@ describe("HraService", () => {
       turnId: "turn-peer-boundary-target",
     })).toHaveLength(32);
     if (lastAcceptedCall === undefined) throw new Error("Expected a retained successful peer call.");
-    await expect(value.service.handleHraHostToolCall(
+    await expect(value.service.handleOompaHostToolCall(
       authority,
       lastAcceptedCall,
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -10368,7 +11426,7 @@ describe("HraService", () => {
           if (delivery === "send") value.codex.startTurnError = lostResponse;
           else value.codex.steerError = lostResponse;
           const writesBeforeEffect = providerMutationCalls(value.codex);
-          await expect(value.service.handleHraHostToolCall(
+          await expect(value.service.handleOompaHostToolCall(
             authority,
             call,
             MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -10451,315 +11509,346 @@ describe("HraService", () => {
     }
   }
 
-  test.each(["send", "steer", "queue"] as const)(
-    "refuses a return peer steer after abandoning an accepted uncertain peer %s",
-    async (delivery) => {
-      const value = await fixture();
-      try {
-        const { sessionId: actorId } = await createIdleSession(value, `Abandoned peer ${delivery} actor`);
-        await value.service.execute({
-          kind: "session.send",
-          session: actorId,
-          message: "Keep the original actor turn active.",
-        }, { signal });
-        const actor = value.store.requireSession(actorId);
-        const actorProjection = value.codex.readProjection;
-        const actorTurnId = actor.activeTurnId;
-        if (actorTurnId === undefined) throw new Error("Expected an active original actor turn.");
+  const prepareAbandonedPeerScenario = async (
+    delivery: "send" | "steer" | "queue",
+    { createFixture, signal }: ServiceCaseContext,
+  ) => {
+    const value = await createFixture();
+    signal.throwIfAborted();
+    const { sessionId: actorId } = await createIdleSession(value, `Abandoned peer ${delivery} actor`);
+    await value.service.execute({
+      kind: "session.send",
+      session: actorId,
+      message: "Keep the original actor turn active.",
+    }, { signal });
+    const actor = value.store.requireSession(actorId);
+    const actorProjection = value.codex.readProjection;
+    const actorTurnId = actor.activeTurnId;
+    if (actorTurnId === undefined) throw new Error("Expected an active original actor turn.");
 
-        // Both sessions obtain their host capability through real session.start.
-        // Separate managed profiles keep the fake's fixed thread name unambiguous.
-        const targetAccount = await value.service.execute({
-          kind: "account.add", label: `Abandoned peer ${delivery} target`,
-        }, { signal }) as { account: { id: string } };
-        await value.service.execute({
-          kind: "account.login", account: targetAccount.account.id, deviceCode: false,
-        }, { signal });
-        const targetStarted = await value.service.execute({
-          kind: "session.start", account: targetAccount.account.id, preset: "high", presetContract: 1, fast: false,
-        }, { signal }) as { session: { id: `sess_${string}` } };
-        const targetId = targetStarted.session.id;
-        if (delivery === "steer") {
+    // Both sessions obtain their host capability through real session.start.
+    // Separate managed profiles keep the fake's fixed thread name unambiguous.
+    const targetAccount = await value.service.execute({
+      kind: "account.add", label: `Abandoned peer ${delivery} target`,
+    }, { signal }) as { account: { id: string } };
+    await value.service.execute({
+      kind: "account.login", account: targetAccount.account.id, deviceCode: false,
+    }, { signal });
+    const targetStarted = await value.service.execute({
+      kind: "session.start", account: targetAccount.account.id, preset: "high", presetContract: 1, fast: false,
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const targetId = targetStarted.session.id;
+    if (delivery === "steer") {
+      await value.service.execute({
+        kind: "session.send",
+        session: targetId,
+        message: "Keep the receiving target turn active.",
+      }, { signal });
+    }
+    const target = value.store.requireSession(targetId);
+    return { value, actor, actorProjection, actorTurnId, target };
+  };
+
+  // Each scenario gets fresh real accounts and sessions in a separate bounded
+  // setup phase. The entire uncertain-effect causal proof remains one test.
+  // This adds a 5 s setup allowance; it does not preserve the old total budget.
+  for (const delivery of ["send", "steer", "queue"] as const) {
+    describe(`refuses a return peer steer after abandoning an accepted uncertain peer ${delivery}`, () => {
+      let owner: ReturnType<typeof createOwnedServiceCase> | undefined;
+      let prepared: Awaited<ReturnType<typeof prepareAbandonedPeerScenario>> | undefined;
+      beforeEach(() => {
+        owner = createOwnedServiceCase();
+        prepared = undefined;
+        return owner.run(async (context) => {
+          const value = await prepareAbandonedPeerScenario(delivery, context);
+          context.signal.throwIfAborted();
+          prepared = value;
+        });
+      }, 5_000);
+
+      test("retains the coupled abandonment, refusal, inspection, and fresh-turn proof", () => {
+        if (owner === undefined) throw new Error("Expected the prepared peer case owner.");
+        return owner.run(async ({ signal }) => {
+          if (prepared === undefined) throw new Error("Expected fresh prepared peer accounts and sessions.");
+          const { value, actor, actorProjection, actorTurnId, target } = prepared;
+          expect(target.profileId).not.toBe(actor.profileId);
+          expect(target.projectId).toBe(actor.projectId);
+          expect(value.store.readSessionHostCapabilityBinding(actor.id)).not.toBeNull();
+          expect(value.store.readSessionHostCapabilityBinding(target.id)).not.toBeNull();
+
+          const authorityFor = (source: SessionRecord): ProfileAuthority => {
+            return liveAuthorityFor(value.store, source.profileId);
+          };
+          const messageCall = (
+            source: SessionRecord,
+            turnId: string,
+            destination: SessionRecord,
+            messageDelivery: "send" | "steer" | "queue",
+            callId: string,
+          ): Extract<OompaHostToolCall, { tool: "session_message" }> => {
+            if (source.providerThreadId === undefined) throw new Error("Expected a bound provider thread.");
+            const authority = authorityFor(source);
+            const input = {
+              sessionId: destination.id,
+              expectedRevision: value.store.requireSession(destination.id).revision,
+              delivery: messageDelivery,
+              message: "Continue the same peer coordination chain.",
+              reason: "Preserve causal authority across owner abandonment",
+            };
+            return {
+              authority: hostToolAuthorityFor(authority),
+              callId,
+              connectionId: value.codex.observationConnectionId,
+              input,
+              requestDigest: createHash("sha256").update(JSON.stringify(input)).digest("hex"),
+              requestId: { type: "string", value: callId },
+              threadId: source.providerThreadId,
+              tool: "session_message",
+              turnId,
+            };
+          };
+          const firstCall = messageCall(actor, actorTurnId, target, delivery, `abandoned-${delivery}-outbound`);
+          const writesBeforeEffect = providerMutationCalls(value.codex);
+          const lostResponse = new IndeterminateCodexEffectError(
+            delivery === "steer" ? "turn/steer" : "turn/start",
+            82,
+          );
+          if (delivery === "steer") value.codex.steerError = lostResponse;
+          else value.codex.startTurnError = lostResponse;
+          const firstResult = await value.service.handleOompaHostToolCall(
+            authorityFor(actor), firstCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE,
+          );
+          if (delivery === "queue") {
+            expect(firstResult).toMatchObject({ ok: true, action: { state: "queued" } });
+            await value.service.settled();
+          } else {
+            expect(firstResult).toMatchObject({ ok: false, code: "RECOVERY_REQUIRED" });
+          }
+          delete value.codex.startTurnError;
+          delete value.codex.steerError;
+
+          const [outbound] = value.store.listUnsettledPeerSessionActions(10);
+          if (outbound === undefined) throw new Error("Expected the uncertain outbound peer action.");
+          const queue = delivery === "queue"
+            ? value.store.listQueue(target.id).find((entry) => entry.peerActionId === outbound.id)
+            : undefined;
+          const attempt = delivery === "queue" ? null : value.store.readMutation(outbound.idempotencyKey);
+          if (delivery === "queue") {
+            if (queue === undefined) throw new Error("Expected the attributed queued provider effect.");
+            expect(queue).toMatchObject({ state: "ambiguous", messageActor: "peer_session" });
+            expect(value.store.readQueueEffect(queue.id)?.resolution).toBeUndefined();
+          } else {
+            if (attempt === null) throw new Error("Expected the nested provider effect.");
+            expect(attempt).toMatchObject({ state: "ambiguous" });
+          }
+          const acceptedSourceId = queue?.id ?? attempt?.id;
+          if (acceptedSourceId === undefined) throw new Error("Expected the accepted source identity.");
+          const acceptedMessage = value.codex.readProjection.messages?.find((message) => message.clientId === acceptedSourceId);
+          if (acceptedMessage?.turnId === undefined) throw new Error("Expected the actually accepted target message.");
+          const targetTurnId = acceptedMessage.turnId;
+          expect(value.codex.readProjection).toMatchObject({ status: "active", activeTurnId: targetTurnId });
+          expect(providerMutationCalls(value.codex)).toHaveLength(writesBeforeEffect.length + 1);
+          expect(value.store.requireSession(target.id).state).toBe("recovery_required");
+
+          await expect(value.service.execute({ kind: "session.abandon", session: target.id }, { signal }))
+            .resolves.toMatchObject({
+              recovery: { resolved: true, resolution: "abandoned", providerEffectRetried: false },
+            });
+          if (queue !== undefined) {
+            expect(value.store.readQueueEffect(queue.id)).toMatchObject({ resolution: { kind: "abandoned" } });
+          } else {
+            expect(value.store.readMutation(outbound.idempotencyKey)).toMatchObject({
+              state: "reconciled",
+              resolution: { kind: "abandoned" },
+            });
+          }
+          expect(providerMutationCalls(value.codex)).toHaveLength(writesBeforeEffect.length + 1);
+          const abandonedTargetProjection = value.codex.readProjection;
+
+          // The provider already consumed the outbound message. A fresh callback
+          // from that same target turn must not restart its ancestry at hop one.
+          value.codex.readProjection = actorProjection;
+          const returnCall = messageCall(target, targetTurnId, actor, "steer", `abandoned-${delivery}-return`);
+          const writesBeforeReturn = providerMutationCalls(value.codex);
+          const returned = await value.service.handleOompaHostToolCall(
+            authorityFor(target), returnCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE,
+          );
+          expect({
+            providerWrites: providerMutationCalls(value.codex),
+            returnOrigins: value.store.readPeerSessionTurnOrigins({ sessionId: actor.id, turnId: actorTurnId })
+              .map((origin) => ({ hop: origin.hop, parentActionIds: origin.parentActionIds })),
+          }).toEqual({ providerWrites: writesBeforeReturn, returnOrigins: [] });
+          expect(returned).toMatchObject({ ok: false, code: "PEER_SESSION_ACTOR_TURN_REFUSED" });
+
+          const inspectionInput = {
+            sessionId: actor.id,
+            expectedRevision: value.store.requireSession(actor.id).revision,
+            limit: 10,
+          };
+          const inspectionCallId = `abandoned-${delivery}-inspect`;
+          await expect(value.service.handleOompaHostToolCall(authorityFor(target), {
+            ...returnCall,
+            callId: inspectionCallId,
+            input: inspectionInput,
+            requestDigest: createHash("sha256").update(JSON.stringify(inspectionInput)).digest("hex"),
+            requestId: { type: "string", value: inspectionCallId },
+            tool: "session_inspect",
+          }, MANAGED_CODEX_HOST_TOOL_PROVENANCE)).resolves.toMatchObject({ ok: true });
+          expect(providerMutationCalls(value.codex)).toEqual(writesBeforeReturn);
+
+          // The fence is not a session-wide loss of owner control. Stop the
+          // affected turn, then start a separately receipted human turn normally.
+          value.codex.readProjection = abandonedTargetProjection;
+          await expect(value.service.execute({ kind: "session.stop", session: target.id }, { signal }))
+            .resolves.toMatchObject({ stopped: true, session: { state: "idle" } });
+          expect(providerMutationCalls(value.codex)).toEqual([...writesBeforeReturn, "stop"]);
+          const humanKey = crypto.randomUUID();
           await value.service.execute({
             kind: "session.send",
-            session: targetId,
-            message: "Keep the receiving target turn active.",
+            idempotencyKey: humanKey,
+            session: target.id,
+            message: "Begin an independent owner-directed coordination turn.",
           }, { signal });
-        }
-        const target = value.store.requireSession(targetId);
-        expect(target.profileId).not.toBe(actor.profileId);
-        expect(target.projectId).toBe(actor.projectId);
-        expect(value.store.readSessionHostCapabilityBinding(actor.id)).not.toBeNull();
-        expect(value.store.readSessionHostCapabilityBinding(target.id)).not.toBeNull();
+          const freshTarget = value.store.requireSession(target.id);
+          const freshTargetTurnId = freshTarget.activeTurnId;
+          if (freshTargetTurnId === undefined) throw new Error("Expected a new human-started turn.");
+          expect(freshTargetTurnId).not.toBe(targetTurnId);
+          const humanAttempt = value.store.readMutation(humanKey);
+          if (humanAttempt === null) throw new Error("Expected the independent human mutation receipt.");
+          expect(humanAttempt).toMatchObject({ kind: "session.send", state: "applied" });
+          expect(value.store.sessionMessageActorForSource(target.id, humanAttempt.id)).toBe("human");
+          expect(value.store.readPeerSessionTurnOrigins({
+            sessionId: target.id, turnId: freshTargetTurnId,
+          })).toEqual([]);
 
-        const authorityFor = (source: SessionRecord): ProfileAuthority => {
-          const profile = value.store.requireProfileById(source.profileId);
-          return {
-            id: profile.id,
-            generation: profile.processGeneration,
-            codexHome: "unused",
-            desktopUserData: "unused",
-          };
-        };
-        const messageCall = (
-          source: SessionRecord,
-          turnId: string,
-          destination: SessionRecord,
-          messageDelivery: "send" | "steer" | "queue",
-          callId: string,
-        ): Extract<HraHostToolCall, { tool: "session_message" }> => {
-          if (source.providerThreadId === undefined) throw new Error("Expected a bound provider thread.");
-          const authority = authorityFor(source);
-          const input = {
-            sessionId: destination.id,
-            expectedRevision: value.store.requireSession(destination.id).revision,
-            delivery: messageDelivery,
-            message: "Continue the same peer coordination chain.",
-            reason: "Preserve causal authority across owner abandonment",
-          };
-          return {
-            authority: { profileId: authority.id, processGeneration: authority.generation },
-            callId,
-            connectionId: value.codex.observationConnectionId,
-            input,
-            requestDigest: createHash("sha256").update(JSON.stringify(input)).digest("hex"),
-            requestId: { type: "string", value: callId },
-            threadId: source.providerThreadId,
-            tool: "session_message",
-            turnId,
-          };
-        };
-        const firstCall = messageCall(actor, actorTurnId, target, delivery, `abandoned-${delivery}-outbound`);
-        const writesBeforeEffect = providerMutationCalls(value.codex);
-        const lostResponse = new IndeterminateCodexEffectError(
-          delivery === "steer" ? "turn/steer" : "turn/start",
-          82,
-        );
-        if (delivery === "steer") value.codex.steerError = lostResponse;
-        else value.codex.startTurnError = lostResponse;
-        const firstResult = await value.service.handleHraHostToolCall(
-          authorityFor(actor), firstCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE,
-        );
-        if (delivery === "queue") {
-          expect(firstResult).toMatchObject({ ok: true, action: { state: "queued" } });
-          await value.service.settled();
-        } else {
-          expect(firstResult).toMatchObject({ ok: false, code: "RECOVERY_REQUIRED" });
-        }
-        delete value.codex.startTurnError;
-        delete value.codex.steerError;
-
-        const [outbound] = value.store.listUnsettledPeerSessionActions(10);
-        if (outbound === undefined) throw new Error("Expected the uncertain outbound peer action.");
-        const queue = delivery === "queue"
-          ? value.store.listQueue(target.id).find((entry) => entry.peerActionId === outbound.id)
-          : undefined;
-        const attempt = delivery === "queue" ? null : value.store.readMutation(outbound.idempotencyKey);
-        if (delivery === "queue") {
-          if (queue === undefined) throw new Error("Expected the attributed queued provider effect.");
-          expect(queue).toMatchObject({ state: "ambiguous", messageActor: "peer_session" });
-          expect(value.store.readQueueEffect(queue.id)?.resolution).toBeUndefined();
-        } else {
-          if (attempt === null) throw new Error("Expected the nested provider effect.");
-          expect(attempt).toMatchObject({ state: "ambiguous" });
-        }
-        const acceptedSourceId = queue?.id ?? attempt?.id;
-        if (acceptedSourceId === undefined) throw new Error("Expected the accepted source identity.");
-        const acceptedMessage = value.codex.readProjection.messages?.find((message) => message.clientId === acceptedSourceId);
-        if (acceptedMessage?.turnId === undefined) throw new Error("Expected the actually accepted target message.");
-        const targetTurnId = acceptedMessage.turnId;
-        expect(value.codex.readProjection).toMatchObject({ status: "active", activeTurnId: targetTurnId });
-        expect(providerMutationCalls(value.codex)).toHaveLength(writesBeforeEffect.length + 1);
-        expect(value.store.requireSession(target.id).state).toBe("recovery_required");
-
-        await expect(value.service.execute({ kind: "session.abandon", session: target.id }, { signal }))
-          .resolves.toMatchObject({
-            recovery: { resolved: true, resolution: "abandoned", providerEffectRetried: false },
-          });
-        if (queue !== undefined) {
-          expect(value.store.readQueueEffect(queue.id)).toMatchObject({ resolution: { kind: "abandoned" } });
-        } else {
-          expect(value.store.readMutation(outbound.idempotencyKey)).toMatchObject({
-            state: "reconciled",
-            resolution: { kind: "abandoned" },
-          });
-        }
-        expect(providerMutationCalls(value.codex)).toHaveLength(writesBeforeEffect.length + 1);
-        const abandonedTargetProjection = value.codex.readProjection;
-
-        // The provider already consumed the outbound message. A fresh callback
-        // from that same target turn must not restart its ancestry at hop one.
-        value.codex.readProjection = actorProjection;
-        const returnCall = messageCall(target, targetTurnId, actor, "steer", `abandoned-${delivery}-return`);
-        const writesBeforeReturn = providerMutationCalls(value.codex);
-        const returned = await value.service.handleHraHostToolCall(
-          authorityFor(target), returnCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE,
-        );
-        expect({
-          providerWrites: providerMutationCalls(value.codex),
-          returnOrigins: value.store.readPeerSessionTurnOrigins({ sessionId: actor.id, turnId: actorTurnId })
-            .map((origin) => ({ hop: origin.hop, parentActionIds: origin.parentActionIds })),
-        }).toEqual({ providerWrites: writesBeforeReturn, returnOrigins: [] });
-        expect(returned).toMatchObject({ ok: false, code: "PEER_SESSION_ACTOR_TURN_REFUSED" });
-
-        const inspectionInput = {
-          sessionId: actor.id,
-          expectedRevision: value.store.requireSession(actor.id).revision,
-          limit: 10,
-        };
-        const inspectionCallId = `abandoned-${delivery}-inspect`;
-        await expect(value.service.handleHraHostToolCall(authorityFor(target), {
-          ...returnCall,
-          callId: inspectionCallId,
-          input: inspectionInput,
-          requestDigest: createHash("sha256").update(JSON.stringify(inspectionInput)).digest("hex"),
-          requestId: { type: "string", value: inspectionCallId },
-          tool: "session_inspect",
-        }, MANAGED_CODEX_HOST_TOOL_PROVENANCE)).resolves.toMatchObject({ ok: true });
-        expect(providerMutationCalls(value.codex)).toEqual(writesBeforeReturn);
-
-        // The fence is not a session-wide loss of owner control. Stop the
-        // affected turn, then start a separately receipted human turn normally.
-        value.codex.readProjection = abandonedTargetProjection;
-        await expect(value.service.execute({ kind: "session.stop", session: target.id }, { signal }))
-          .resolves.toMatchObject({ stopped: true, session: { state: "idle" } });
-        expect(providerMutationCalls(value.codex)).toEqual([...writesBeforeReturn, "stop"]);
-        const humanKey = crypto.randomUUID();
-        await value.service.execute({
-          kind: "session.send",
-          idempotencyKey: humanKey,
-          session: target.id,
-          message: "Begin an independent owner-directed coordination turn.",
-        }, { signal });
-        const freshTarget = value.store.requireSession(target.id);
-        const freshTargetTurnId = freshTarget.activeTurnId;
-        if (freshTargetTurnId === undefined) throw new Error("Expected a new human-started turn.");
-        expect(freshTargetTurnId).not.toBe(targetTurnId);
-        const humanAttempt = value.store.readMutation(humanKey);
-        if (humanAttempt === null) throw new Error("Expected the independent human mutation receipt.");
-        expect(humanAttempt).toMatchObject({ kind: "session.send", state: "applied" });
-        expect(value.store.sessionMessageActorForSource(target.id, humanAttempt.id)).toBe("human");
-        expect(value.store.readPeerSessionTurnOrigins({
-          sessionId: target.id, turnId: freshTargetTurnId,
-        })).toEqual([]);
-
-        value.codex.readProjection = actorProjection;
-        const freshCall = messageCall(
-          freshTarget, freshTargetTurnId, actor, "steer", `abandoned-${delivery}-fresh-turn`,
-        );
-        const writesBeforeFreshCoordination = providerMutationCalls(value.codex);
-        await expect(value.service.handleHraHostToolCall(
-          authorityFor(freshTarget), freshCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE,
-        )).resolves.toMatchObject({ ok: true, action: { state: "applied" } });
-        expect(providerMutationCalls(value.codex)).toEqual([...writesBeforeFreshCoordination, "steer"]);
-        expect(value.store.readPeerSessionTurnOrigins({ sessionId: actor.id, turnId: actorTurnId })
-          .map((origin) => ({ hop: origin.hop, parentActionIds: origin.parentActionIds })))
-          .toEqual([{ hop: 1, parentActionIds: [] }]);
-      } finally {
-        await value.service.close();
-      }
-    },
-  );
-
-  test("fences established and peer Claude targets with universally unavailable profiles", async () => {
-    for (const provider of ["claude"] as const) {
-      for (const profileState of ["recovery_required", "removed"] as const) {
-        const value = await claudeAccountFixture(true);
-        const fence = profileState === "removed" ? "removed" : "recovery-fenced";
-        const { sessionId: actorSessionId } = await createIdleSession(
-          value,
-          `${provider} ${fence} peer actor`,
-        );
-        const idleActor = value.store.requireSession(actorSessionId);
-        if (idleActor.projectId === undefined) throw new Error("Expected a project-bound actor.");
-        const targetProfile = value.store.createProfile(`${provider} ${fence} target`);
-        const targetBase = value.store.createSession({
-          profileId: targetProfile.id,
-          projectId: idleActor.projectId,
-          title: `${provider} ${fence} target`,
-          provider,
-          preset: "fable-max",
-          fastEnabled: false,
+          value.codex.readProjection = actorProjection;
+          const freshCall = messageCall(
+            freshTarget, freshTargetTurnId, actor, "steer", `abandoned-${delivery}-fresh-turn`,
+          );
+          const writesBeforeFreshCoordination = providerMutationCalls(value.codex);
+          await expect(value.service.handleOompaHostToolCall(
+            authorityFor(freshTarget), freshCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE,
+          )).resolves.toMatchObject({ ok: true, action: { state: "applied" } });
+          expect(providerMutationCalls(value.codex)).toEqual([...writesBeforeFreshCoordination, "steer"]);
+          expect(value.store.readPeerSessionTurnOrigins({ sessionId: actor.id, turnId: actorTurnId })
+            .map((origin) => ({ hop: origin.hop, parentActionIds: origin.parentActionIds })))
+            .toEqual([{ hop: 1, parentActionIds: [] }]);
         });
-        const target = value.store.bindSession({
-          sessionId: targetBase.id,
-          expectedRevision: targetBase.revision,
-          providerThreadId: `provider-${provider}-${fence}-target`,
-          state: "idle",
+      }, 5_000);
+    });
+  }
+
+  test.each(["recovery_required", "removed"] as const)(
+    "fences recovery-blocked Claude targets and terminal history under removed profiles (%s)",
+    (profileState) => ownedServiceCase(async ({ createFixture, signal }) => {
+      const provider = "claude";
+      const value = await claudeAccountFixture(true, "linux", createFixture);
+      signal.throwIfAborted();
+      const fence = profileState === "removed" ? "removed" : "recovery-fenced";
+      const { sessionId: actorSessionId } = await createIdleSession(
+        value,
+        `${provider} ${fence} peer actor`,
+      );
+      signal.throwIfAborted();
+      const idleActor = value.store.requireSession(actorSessionId);
+      if (idleActor.projectId === undefined) throw new Error("Expected a project-bound actor.");
+      const targetProfile = value.store.createProfile(`${provider} ${fence} target`);
+      const targetBase = value.store.createSession({
+        profileId: targetProfile.id,
+        projectId: idleActor.projectId,
+        title: `${provider} ${fence} target`,
+        provider,
+        preset: "fable-max",
+        fastEnabled: false,
+      });
+      const target = value.store.bindSession({
+        sessionId: targetBase.id,
+        expectedRevision: targetBase.revision,
+        providerThreadId: `provider-${provider}-${fence}-target`,
+        state: "idle",
+      });
+      if (profileState === "removed") {
+        // Removal requires all owned sessions to be terminal. Do not invent
+        // the impossible current state of a live session on a removed owner.
+        value.store.setSessionTurnState({
+          sessionId: target.id,
+          expectedRevision: target.revision,
+          state: "terminal",
         });
+        value.store.removeProfile(targetProfile.id);
+        expect(value.store.requireProfileById(targetProfile.id, { includeRemoved: true }).state).toBe("removed");
+      } else {
         expect(value.store.setProfileState(
           targetProfile.id,
           targetProfile.processGeneration,
           profileState,
         )).toBe(true);
-
-        const establishedCode = profileState === "removed" ? "NOT_FOUND" : "RECOVERY_REQUIRED";
-        await expect(value.service.execute({
-          kind: "session.send",
-          session: target.id,
-          message: `Do not dispatch while the profile is ${profileState}.`,
-        }, { signal })).rejects.toMatchObject({ code: establishedCode });
-        await expect(value.service.execute({
-          kind: "session.queue",
-          session: target.id,
-          message: `Do not enqueue while the profile is ${profileState}.`,
-        }, { signal })).rejects.toMatchObject({ code: establishedCode });
-        expect(value.store.listQueue(target.id)).toEqual([]);
-        expect(value.providerSessionCalls).toEqual([]);
-
-        await value.service.execute({
-          kind: "session.send",
-          session: actorSessionId,
-          message: "Start the peer actor.",
-        }, { signal });
-        const actor = value.store.requireSession(actorSessionId);
-        const actorProfile = value.store.requireProfileById(actor.profileId);
-        if (actor.providerThreadId === undefined || actor.activeTurnId === undefined) {
-          throw new Error("Expected an active bound peer actor.");
-        }
-        const authority: ProfileAuthority = {
-          id: actorProfile.id,
-          generation: actorProfile.processGeneration,
-          codexHome: "unused",
-          desktopUserData: "unused",
-        };
-        const base = {
-          authority: {
-            profileId: actorProfile.id,
-            processGeneration: actorProfile.processGeneration,
-          },
-          connectionId: value.codex.observationConnectionId,
-          requestId: { type: "string" as const, value: `${provider}-${fence}-peer` },
-          threadId: actor.providerThreadId,
-          tool: "session_message" as const,
-          turnId: actor.activeTurnId,
-        } as const;
-        for (const delivery of ["send", "queue"] as const) {
-          const result = await value.service.handleHraHostToolCall(authority, {
-            ...base,
-            callId: `${provider}-${fence}-peer-${delivery}`,
-            input: {
-              sessionId: target.id,
-              expectedRevision: target.revision,
-              delivery,
-              message: `Do not ${delivery} into a ${fence} target.`,
-              reason: `Target profile is ${profileState}`,
-            },
-            requestDigest: createHash("sha256")
-              .update(`${provider}-${fence}-peer-${delivery}`).digest("hex"),
-          } satisfies HraHostToolCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE);
-          expect(result).toEqual({
-            version: 1,
-            ok: false,
-            code: "RECOVERY_REQUIRED",
-          });
-        }
-        expect(value.store.listUnsettledPeerSessionActions(10)).toEqual([]);
-        expect(value.store.listQueue(target.id)).toEqual([]);
-        expect(value.providerSessionCalls).toEqual([]);
       }
-    }
-  });
+
+      // The terminal-session fence precedes profile selection on direct input.
+      const establishedCode = profileState === "removed" ? "CONFLICT" : "RECOVERY_REQUIRED";
+      await expect(value.service.execute({
+        kind: "session.send",
+        session: target.id,
+        message: `Do not dispatch while the profile is ${profileState}.`,
+      }, { signal })).rejects.toMatchObject({ code: establishedCode });
+      signal.throwIfAborted();
+      await expect(value.service.execute({
+        kind: "session.queue",
+        session: target.id,
+        message: `Do not enqueue while the profile is ${profileState}.`,
+      }, { signal })).rejects.toMatchObject({ code: establishedCode });
+      signal.throwIfAborted();
+      expect(value.store.listQueue(target.id)).toEqual([]);
+      expect(value.providerSessionCalls).toEqual([]);
+
+      await value.service.execute({
+        kind: "session.send",
+        session: actorSessionId,
+        message: "Start the peer actor.",
+      }, { signal });
+      signal.throwIfAborted();
+      const actor = value.store.requireSession(actorSessionId);
+      const actorProfile = value.store.requireProfileById(actor.profileId);
+      if (actor.providerThreadId === undefined || actor.activeTurnId === undefined) {
+        throw new Error("Expected an active bound peer actor.");
+      }
+      const authority: ProfileAuthority = liveAuthorityFor(value.store, actorProfile.id, "codex");
+      const base = {
+        authority: hostToolAuthorityFor(liveAuthorityFor(value.store, actorProfile.id)),
+        connectionId: value.codex.observationConnectionId,
+        requestId: { type: "string" as const, value: `${provider}-${fence}-peer` },
+        threadId: actor.providerThreadId,
+        tool: "session_message" as const,
+        turnId: actor.activeTurnId,
+      } as const;
+      for (const delivery of ["send", "queue"] as const) {
+        const result = await value.service.handleOompaHostToolCall(authority, {
+          ...base,
+          callId: `${provider}-${fence}-peer-${delivery}`,
+          input: {
+            sessionId: target.id,
+            expectedRevision: target.revision,
+            delivery,
+            message: `Do not ${delivery} into a ${fence} target.`,
+            reason: `Target profile is ${profileState}`,
+          },
+          requestDigest: createHash("sha256")
+            .update(`${provider}-${fence}-peer-${delivery}`).digest("hex"),
+        } satisfies OompaHostToolCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE);
+        signal.throwIfAborted();
+        expect(result).toEqual({
+          version: 1,
+          ok: false,
+          code: "RECOVERY_REQUIRED",
+        });
+      }
+      expect(value.store.listUnsettledPeerSessionActions(10)).toEqual([]);
+      expect(value.store.listQueue(target.id)).toEqual([]);
+      expect(value.providerSessionCalls).toEqual([]);
+    }),
+    5_000,
+  );
 
   test("revalidates peer actor account authority after its mutation locks are acquired", async () => {
     const cloud = new FakeCloud();
@@ -10794,17 +11883,9 @@ describe("HraService", () => {
     if (actor.providerThreadId === undefined || actor.activeTurnId === undefined) {
       throw new Error("Expected an active bound actor turn.");
     }
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority: ProfileAuthority = liveAuthorityFor(value.store, profile.id, "codex");
     const call = {
-      authority: {
-        profileId: profile.id,
-        processGeneration: profile.processGeneration,
-      },
+      authority: hostToolAuthorityFor(liveAuthorityFor(value.store, profile.id)),
       callId: "peer-actor-authority-race",
       connectionId: value.codex.observationConnectionId,
       input: {
@@ -10819,7 +11900,7 @@ describe("HraService", () => {
       threadId: actor.providerThreadId,
       tool: "session_message" as const,
       turnId: actor.activeTurnId,
-    } satisfies HraHostToolCall;
+    } satisfies OompaHostToolCall;
     const originalAdmission = value.store.admitPeerSessionAction.bind(value.store);
     let admissionCalls = 0;
     (value.store as unknown as {
@@ -10840,12 +11921,12 @@ describe("HraService", () => {
     };
     const providerWritesBefore = providerMutationCalls(value.codex);
 
-    await expect(value.service.handleHraHostToolCall(
+    await expect(value.service.handleOompaHostToolCall(
       authority,
       call,
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
     ))
-      .rejects.toThrow("HRA_HOST_TOOL_AUTHORITY_STALE");
+      .rejects.toThrow("OOMPA_HOST_TOOL_AUTHORITY_STALE");
     expect(authorityInvalidated).toBe(true);
     expect(admissionCalls).toBe(0);
     expect(value.store.listUnsettledPeerSessionActions(10)).toEqual([]);
@@ -10892,17 +11973,9 @@ describe("HraService", () => {
     if (actor.providerThreadId === undefined || actor.activeTurnId === undefined) {
       throw new Error("Expected an active bound actor turn.");
     }
-    const authority: ProfileAuthority = {
-      id: actorProfile.id,
-      generation: actorProfile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority: ProfileAuthority = liveAuthorityFor(value.store, actorProfile.id, "codex");
     const call = {
-      authority: {
-        profileId: actorProfile.id,
-        processGeneration: actorProfile.processGeneration,
-      },
+      authority: hostToolAuthorityFor(liveAuthorityFor(value.store, actorProfile.id)),
       callId: "peer-target-lock-freshness",
       connectionId: value.codex.observationConnectionId,
       input: {
@@ -10919,7 +11992,7 @@ describe("HraService", () => {
       threadId: actor.providerThreadId,
       tool: "session_message" as const,
       turnId: actor.activeTurnId,
-    } satisfies HraHostToolCall;
+    } satisfies OompaHostToolCall;
     const originalRequireSession = value.store.requireSession.bind(value.store);
     let targetMoved = false;
     (value.store as unknown as {
@@ -10943,7 +12016,7 @@ describe("HraService", () => {
     };
     const providerWritesBefore = providerMutationCalls(value.codex);
 
-    await expect(value.service.handleHraHostToolCall(
+    await expect(value.service.handleOompaHostToolCall(
       authority,
       call,
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -10989,6 +12062,7 @@ describe("HraService", () => {
     });
     const profile = value.store.requireProfileById(idleActor.profileId);
     value.store.appendSessionEvent({
+      providerAuthority: value.store.requireProviderAccountAuthority(profile.id, "codex"),
       sessionId: target.id,
       accountId: profile.id,
       providerGeneration: profile.processGeneration,
@@ -11002,6 +12076,7 @@ describe("HraService", () => {
       },
     });
     value.store.appendSessionEvent({
+      providerAuthority: value.store.requireProviderAccountAuthority(profile.id, "codex"),
       sessionId: target.id,
       accountId: profile.id,
       providerGeneration: profile.processGeneration,
@@ -11023,17 +12098,9 @@ describe("HraService", () => {
     if (actor.providerThreadId === undefined || actor.activeTurnId === undefined) {
       throw new Error("Expected an active bound actor turn.");
     }
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority: ProfileAuthority = liveAuthorityFor(value.store, profile.id, "codex");
     const base = {
-      authority: {
-        profileId: profile.id,
-        processGeneration: profile.processGeneration,
-      },
+      authority: hostToolAuthorityFor(liveAuthorityFor(value.store, profile.id)),
       connectionId: value.codex.observationConnectionId,
       requestId: { type: "string" as const, value: "peer-host-request" },
       requestDigest: createHash("sha256").update("peer-host-request").digest("hex"),
@@ -11041,12 +12108,12 @@ describe("HraService", () => {
       turnId: actor.activeTurnId,
     } as const;
 
-    const listed = await value.service.handleHraHostToolCall(authority, {
+    const listed = await value.service.handleOompaHostToolCall(authority, {
       ...base,
       callId: "peer-list",
       tool: "sessions_list",
       input: { limit: 10 },
-    } satisfies HraHostToolCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE) as {
+    } satisfies OompaHostToolCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE) as {
       ok: boolean;
       sessions: readonly Record<string, unknown>[];
     };
@@ -11070,12 +12137,12 @@ describe("HraService", () => {
       "title",
     ]);
 
-    const inspected = await value.service.handleHraHostToolCall(authority, {
+    const inspected = await value.service.handleOompaHostToolCall(authority, {
       ...base,
       callId: "peer-inspect",
       tool: "session_inspect",
       input: { sessionId: target.id, expectedRevision: target.revision, limit: 10 },
-    } satisfies HraHostToolCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE) as {
+    } satisfies OompaHostToolCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE) as {
       ok: boolean;
       transcript: { records: readonly { kind: string; text?: string }[] };
     };
@@ -11089,6 +12156,7 @@ describe("HraService", () => {
 
     for (let index = 0; index < 50; index += 1) {
       value.store.appendSessionEvent({
+        providerAuthority: value.store.requireProviderAccountAuthority(profile.id, "codex"),
         sessionId: target.id,
         accountId: profile.id,
         providerGeneration: profile.processGeneration,
@@ -11102,17 +12170,17 @@ describe("HraService", () => {
         },
       });
     }
-    const boundedInspection = await value.service.handleHraHostToolCall(authority, {
+    const boundedInspection = await value.service.handleOompaHostToolCall(authority, {
       ...base,
       callId: "peer-inspect-budgeted",
       tool: "session_inspect",
       input: { sessionId: target.id, expectedRevision: target.revision, limit: 50 },
-    } satisfies HraHostToolCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE) as {
+    } satisfies OompaHostToolCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE) as {
       nextCursor: string | null;
       transcript: { records: readonly { sequence: number }[] };
     };
     expect(new TextEncoder().encode(JSON.stringify(boundedInspection)).byteLength)
-      .toBeLessThanOrEqual(HRA_HOST_TOOL_PUBLIC_RESULT_MAX_BYTES);
+      .toBeLessThanOrEqual(OOMPA_HOST_TOOL_PUBLIC_RESULT_MAX_BYTES);
     expect(boundedInspection.transcript.records.length).toBeLessThan(50);
     expect(boundedInspection.nextCursor).toMatch(/^hra1\./u);
     const seenSequences = new Set(
@@ -11120,7 +12188,7 @@ describe("HraService", () => {
     );
     let budgetCursor = boundedInspection.nextCursor;
     for (let pageIndex = 1; budgetCursor !== null && pageIndex < 10; pageIndex += 1) {
-      const continuation = await value.service.handleHraHostToolCall(authority, {
+      const continuation = await value.service.handleOompaHostToolCall(authority, {
         ...base,
         callId: `peer-inspect-budgeted-${String(pageIndex)}`,
         tool: "session_inspect",
@@ -11130,12 +12198,12 @@ describe("HraService", () => {
           limit: 50,
           cursor: budgetCursor,
         },
-      } satisfies HraHostToolCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE) as {
+      } satisfies OompaHostToolCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE) as {
         nextCursor: string | null;
         transcript: { records: readonly { sequence: number }[] };
       };
       expect(new TextEncoder().encode(JSON.stringify(continuation)).byteLength)
-        .toBeLessThanOrEqual(HRA_HOST_TOOL_PUBLIC_RESULT_MAX_BYTES);
+        .toBeLessThanOrEqual(OOMPA_HOST_TOOL_PUBLIC_RESULT_MAX_BYTES);
       for (const record of continuation.transcript.records) {
         expect(seenSequences.has(record.sequence)).toBe(false);
         seenSequences.add(record.sequence);
@@ -11164,8 +12232,8 @@ describe("HraService", () => {
         message: "Review the authority boundary and report findings.",
         reason: "Independent peer review",
       },
-    } satisfies HraHostToolCall;
-    const messaged = await value.service.handleHraHostToolCall(
+    } satisfies OompaHostToolCall;
+    const messaged = await value.service.handleOompaHostToolCall(
       authority,
       messageCall,
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -11188,7 +12256,7 @@ describe("HraService", () => {
       actor: "peer_session",
     });
     expect(peerEvent?.body.type === "user_message" ? peerEvent.body.text : "")
-      .toContain("HRA peer-session message");
+      .toContain("Oompa peer-session message");
     const projectedActorTurnId = value.eventCursors.projectPublicProviderIdentifier(
       actor.activeTurnId,
     );
@@ -11201,7 +12269,7 @@ describe("HraService", () => {
 
     const activeTarget = value.store.requireSession(target.id);
     expect(activeTarget.state).toBe("active");
-    const steered = await value.service.handleHraHostToolCall(authority, {
+    const steered = await value.service.handleOompaHostToolCall(authority, {
       ...base,
       callId: "peer-steer",
       requestDigest: createHash("sha256").update("peer-steer").digest("hex"),
@@ -11213,7 +12281,7 @@ describe("HraService", () => {
         message: "Also check the exact in-turn authority.",
         reason: "Independent peer follow-up",
       },
-    } satisfies HraHostToolCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE) as {
+    } satisfies OompaHostToolCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE) as {
       ok: boolean;
       action: { state: string; targetSessionId: string };
       replay: boolean;
@@ -11225,7 +12293,7 @@ describe("HraService", () => {
     });
     expect(value.codex.calls.filter((call) => call === "steer")).toHaveLength(1);
 
-    const replayed = await value.service.handleHraHostToolCall(
+    const replayed = await value.service.handleOompaHostToolCall(
       authority,
       messageCall,
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -11248,10 +12316,7 @@ describe("HraService", () => {
       throw new Error("Expected an active host-tool actor.");
     }
     const call = {
-      authority: {
-        profileId: profile.id,
-        processGeneration: profile.processGeneration,
-      },
+      authority: hostToolAuthorityFor(liveAuthorityFor(value.store, profile.id)),
       callId: "host-provenance-list",
       connectionId: value.codex.observationConnectionId,
       input: { limit: 10 },
@@ -11260,23 +12325,18 @@ describe("HraService", () => {
       threadId: actor.providerThreadId,
       tool: "sessions_list" as const,
       turnId: actor.activeTurnId,
-    } satisfies HraHostToolCall;
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    } satisfies OompaHostToolCall;
+    const authority: ProfileAuthority = liveAuthorityFor(value.store, profile.id, "codex");
 
-    await expect(value.service.handleHraHostToolCall(authority, call, {
+    await expect(value.service.handleOompaHostToolCall(authority, call, {
       provider: "claude",
       source: "managed",
-    })).rejects.toThrow("HRA_HOST_TOOL_AUTHORITY_STALE");
-    await expect(value.service.handleHraHostToolCall(authority, call, {
+    })).rejects.toThrow("OOMPA_HOST_TOOL_AUTHORITY_STALE");
+    await expect(value.service.handleOompaHostToolCall(authority, call, {
       provider: "codex",
       source: "personal",
-    })).rejects.toThrow("HRA_HOST_TOOL_AUTHORITY_STALE");
-    await expect(value.service.handleHraHostToolCall(authority, call, {
+    })).rejects.toThrow("OOMPA_HOST_TOOL_AUTHORITY_STALE");
+    await expect(value.service.handleOompaHostToolCall(authority, call, {
       provider: "codex",
       source: "managed",
     })).resolves.toMatchObject({ ok: true, version: 1 });
@@ -11318,10 +12378,7 @@ describe("HraService", () => {
       paused: true,
     };
     const call = {
-      authority: {
-        profileId: profile.id,
-        processGeneration: profile.processGeneration,
-      },
+      authority: hostToolAuthorityFor(liveAuthorityFor(value.store, profile.id)),
       callId: "native-legacy-automation",
       connectionId: value.codex.observationConnectionId,
       input: operation,
@@ -11333,13 +12390,8 @@ describe("HraService", () => {
       threadId: actor.providerThreadId,
       tool: "automation_update" as const,
       turnId: actor.activeTurnId,
-    } satisfies HraHostToolCall;
-    await expect(value.service.handleHraHostToolCall({
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    }, call, MANAGED_CODEX_HOST_TOOL_PROVENANCE)).resolves.toMatchObject({
+    } satisfies OompaHostToolCall;
+    await expect(value.service.handleOompaHostToolCall(liveAuthorityFor(value.store, profile.id, "codex"), call, MANAGED_CODEX_HOST_TOOL_PROVENANCE)).resolves.toMatchObject({
       name: operation.name,
       sessionId: actor.id,
       status: "paused",
@@ -11348,12 +12400,7 @@ describe("HraService", () => {
       expect.objectContaining({ name: operation.name, status: "paused" }),
     ]);
 
-    await expect(value.service.handleHraHostToolCall({
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    }, {
+    await expect(value.service.handleOompaHostToolCall(liveAuthorityFor(value.store, profile.id, "codex"), {
       ...call,
       callId: "native-legacy-automation-stale-connection",
       connectionId: "30000000-0000-4000-8000-999999999999",
@@ -11394,13 +12441,8 @@ describe("HraService", () => {
         type: "string" as const,
         value: "native-legacy-automation-incompatible-binding",
       },
-    } satisfies HraHostToolCall;
-    await expect(value.service.handleHraHostToolCall({
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    }, incompatibleCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE)).rejects.toThrow(
+    } satisfies OompaHostToolCall;
+    await expect(value.service.handleOompaHostToolCall(liveAuthorityFor(value.store, profile.id, "codex"), incompatibleCall, MANAGED_CODEX_HOST_TOOL_PROVENANCE)).rejects.toThrow(
       "CONVERSATION_AUTOMATION_SESSION_UNAVAILABLE",
     );
     expect(value.store.createSessionTaskStore().list(actor.id)).toHaveLength(1);
@@ -11446,10 +12488,7 @@ describe("HraService", () => {
       throw new Error("Expected an active personal Claude host-tool actor.");
     }
     const callBase = {
-      authority: {
-        profileId: authority.id,
-        processGeneration: authority.generation,
-      },
+      authority: hostToolAuthorityFor(authority),
       connectionId: value.personalClaude.observationConnectionId,
       requestId: { type: "string" as const, value: "darwin-personal-claude-host" },
       threadId: actor.providerThreadId,
@@ -11463,20 +12502,20 @@ describe("HraService", () => {
         .update("darwin-personal-claude-list")
         .digest("hex"),
       tool: "sessions_list" as const,
-    } satisfies HraHostToolCall;
+    } satisfies OompaHostToolCall;
 
-    await expect(value.service.handleHraHostToolCall(authority, listCall, {
+    await expect(value.service.handleOompaHostToolCall(authority, listCall, {
       provider: "claude",
       source: "personal",
     })).rejects.toThrow("SESSION_HOST_CAPABILITY_BINDING_MISSING");
-    await expect(value.service.handleHraHostToolCall(authority, listCall, {
+    await expect(value.service.handleOompaHostToolCall(authority, listCall, {
       provider: "claude",
       source: "managed",
-    })).rejects.toThrow("HRA_HOST_TOOL_AUTHORITY_STALE");
-    await expect(value.service.handleHraHostToolCall(authority, listCall, {
+    })).rejects.toThrow("OOMPA_HOST_TOOL_AUTHORITY_STALE");
+    await expect(value.service.handleOompaHostToolCall(authority, listCall, {
       provider: "codex",
       source: "personal",
-    })).rejects.toThrow("HRA_HOST_TOOL_AUTHORITY_STALE");
+    })).rejects.toThrow("OOMPA_HOST_TOOL_AUTHORITY_STALE");
 
     const operation = {
       mode: "create" as const,
@@ -11495,7 +12534,7 @@ describe("HraService", () => {
         .digest("hex"),
       requestId: { type: "string" as const, value: "darwin-personal-claude-automation" },
       tool: "automation_update" as const,
-    } satisfies HraHostToolCall;
+    } satisfies OompaHostToolCall;
     const forgedAutomation = new Database(value.paths.database, { strict: true });
     try {
       forgedAutomation.query(
@@ -11508,11 +12547,11 @@ describe("HraService", () => {
       .toBe(true);
     expect(value.store.hasNativeConversationAutomationAuthority(actor.id, actor.providerThreadId))
       .toBe(false);
-    await expect(value.service.handleHraHostToolCall(authority, automationCall, {
+    await expect(value.service.handleOompaHostToolCall(authority, automationCall, {
       provider: "claude",
       source: "personal",
     })).rejects.toThrow("CONVERSATION_AUTOMATION_SESSION_UNAVAILABLE");
-    await expect(value.service.handleHraHostToolCall(authority, {
+    await expect(value.service.handleOompaHostToolCall(authority, {
       ...automationCall,
       callId: "darwin-personal-claude-automation-wrong-source",
       requestDigest: createHash("sha256")
@@ -11537,7 +12576,7 @@ describe("HraService", () => {
         key: "adopted.custody",
         title: "Adopted custody",
         summary: "Owner memory remains available without provider host tools.",
-        body: "The adopted provider snapshot grants no HRA callback capability.",
+        body: "The adopted provider snapshot grants no Oompa callback capability.",
       },
     }, { signal })).resolves.toMatchObject({ idempotencyKey: "00000000-0000-4000-8000-000000000606" });
     expect(memory.statuses).toEqual([{ actorSessionId: actor.id }]);
@@ -11562,23 +12601,23 @@ describe("HraService", () => {
       account: { id: value.accountId },
     });
     expect(value.store.requireProfileById(value.accountId).processGeneration).toBe(1);
-    const expectedRebind = {
-      expectedGeneration: authority.generation,
-      nextGeneration: 1,
-      profileId: value.accountId,
-    };
-    expect(value.managedClaude.rebindings).toEqual([expectedRebind]);
-    expect(value.personalClaude.rebindings).toEqual([expectedRebind]);
+    expect(value.store.requireProviderAccountAuthority(value.accountId, "claude").processGeneration)
+      .toBe(authority.generation);
+    expect(value.managedClaude.rebindings).toEqual([]);
+    expect(value.personalClaude.rebindings).toEqual([]);
   });
 
-  test("fences peer mutations when either account has durable projection recovery", async () => {
-    for (const recoverySide of ["actor", "target"] as const) {
+  test.each(["actor", "target"] as const)(
+    "fences peer mutations when either account has durable projection recovery (%s)",
+    (recoverySide) => ownedServiceCase(async ({ createFixture, signal }) => {
       const cloud = new FakeCloud();
-      const value = await fixture(undefined, cloud);
+      const value = await createFixture(undefined, cloud);
+      signal.throwIfAborted();
       const { sessionId: actorSessionId } = await createIdleSession(
         value,
         `Peer durable projection ${recoverySide} actor`,
       );
+      signal.throwIfAborted();
       const idleActor = value.store.requireSession(actorSessionId);
       if (idleActor.projectId === undefined) throw new Error("Expected a project-bound peer actor.");
       const targetEmail = `peer-durable-${recoverySide}@example.com`;
@@ -11614,6 +12653,7 @@ describe("HraService", () => {
         session: actorSessionId,
         message: `Start the durable projection ${recoverySide} peer actor.`,
       }, { signal });
+      signal.throwIfAborted();
       const actor = value.store.requireSession(actorSessionId);
       const actorProfile = value.store.requireProfileById(actor.profileId);
       if (actor.providerThreadId === undefined || actor.activeTurnId === undefined) {
@@ -11624,18 +12664,10 @@ describe("HraService", () => {
       );
       const providerWritesBefore = providerMutationCalls(value.codex);
       const requestLabel = `peer-durable-projection-${recoverySide}`;
-      const authority: ProfileAuthority = {
-        id: actorProfile.id,
-        generation: actorProfile.processGeneration,
-        codexHome: "unused",
-        desktopUserData: "unused",
-      };
+      const authority: ProfileAuthority = liveAuthorityFor(value.store, actorProfile.id, "codex");
 
-      await expect(value.service.handleHraHostToolCall(authority, {
-        authority: {
-          profileId: actorProfile.id,
-          processGeneration: actorProfile.processGeneration,
-        },
+      await expect(value.service.handleOompaHostToolCall(authority, {
+        authority: hostToolAuthorityFor(liveAuthorityFor(value.store, actorProfile.id)),
         callId: requestLabel,
         connectionId: value.codex.observationConnectionId,
         input: {
@@ -11650,19 +12682,23 @@ describe("HraService", () => {
         threadId: actor.providerThreadId,
         tool: "session_message",
         turnId: actor.activeTurnId,
-      } satisfies HraHostToolCall, {
+      } satisfies OompaHostToolCall, {
         provider: "codex",
         source: "managed",
       })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      signal.throwIfAborted();
       expect(value.store.listRecentPeerSessionActions()).toEqual([]);
       expect(providerMutationCalls(value.codex)).toEqual(providerWritesBefore);
-    }
-  });
+    }),
+    5_000,
+  );
 
-  test("fences peer mutations while a sibling projection recovery owns either account", async () => {
-    for (const recoverySide of ["actor", "target"] as const) {
+  test.each(["actor", "target"] as const)(
+    "fences peer mutations while a sibling projection recovery owns the %s account",
+    (recoverySide) => ownedServiceCase(async ({ createFixture, signal }) => {
       const cloud = new FakeCloud();
-      const value = await fixture(undefined, cloud);
+      const value = await createFixture(undefined, cloud);
+      signal.throwIfAborted();
       const { sessionId: actorSessionId } = await createIdleSession(
         value,
         `Peer in-flight projection ${recoverySide} actor`,
@@ -11733,34 +12769,42 @@ describe("HraService", () => {
         accountKey: recoverySide === "actor" ? actorAccountKey : targetAccountKey,
       });
       let entered!: () => void;
-      const recoveryEntered = new Promise<void>((resolve) => { entered = resolve; });
+      let rejectEntry!: (reason: unknown) => void;
+      let didEnter = false;
+      const recoveryEntered = new Promise<void>((resolve, reject) => {
+        entered = resolve;
+        rejectEntry = reject;
+      });
       let release!: () => void;
       const recoveryGate = new Promise<void>((resolve) => { release = resolve; });
       cloud.beforeProjectionRecoveryReturn = async () => {
+        didEnter = true;
         entered();
         await recoveryGate;
       };
+      signal.throwIfAborted();
+      // Cancellation can arrive before the cloud hook enters. Releasing now
+      // also admits that later hook, so joining the owned case cannot deadlock.
+      signal.addEventListener("abort", release, { once: true });
       const recovery = value.service.execute({
         acknowledgeGap: true,
         idempotencyKey: crypto.randomUUID(),
         kind: "sync.projection-recover",
         session: sibling.id,
       }, { signal });
-      await recoveryEntered;
-      const providerWritesBefore = providerMutationCalls(value.codex);
-      const requestLabel = `peer-in-flight-projection-${recoverySide}`;
-      const authority: ProfileAuthority = {
-        id: actorProfile.id,
-        generation: actorProfile.processGeneration,
-        codexHome: "unused",
-        desktopUserData: "unused",
-      };
+      // Observe the original task immediately, including rejection before the
+      // entry hook. The finally below still joins its real outcome.
+      void recovery.then(() => {
+        if (!didEnter) rejectEntry(new Error("Expected the projection recovery entry hook."));
+      }, rejectEntry);
       try {
-        await expect(value.service.handleHraHostToolCall(authority, {
-          authority: {
-            profileId: actorProfile.id,
-            processGeneration: actorProfile.processGeneration,
-          },
+        await recoveryEntered;
+        signal.throwIfAborted();
+        const providerWritesBefore = providerMutationCalls(value.codex);
+        const requestLabel = `peer-in-flight-projection-${recoverySide}`;
+        const authority: ProfileAuthority = liveAuthorityFor(value.store, actorProfile.id, "codex");
+        await expect(value.service.handleOompaHostToolCall(authority, {
+          authority: hostToolAuthorityFor(liveAuthorityFor(value.store, actorProfile.id)),
           callId: requestLabel,
           connectionId: value.codex.observationConnectionId,
           input: {
@@ -11775,18 +12819,19 @@ describe("HraService", () => {
           threadId: actor.providerThreadId,
           tool: "session_message",
           turnId: actor.activeTurnId,
-        } satisfies HraHostToolCall, {
+        } satisfies OompaHostToolCall, {
           provider: "codex",
           source: "managed",
         })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
         expect(value.store.listRecentPeerSessionActions()).toEqual([]);
         expect(providerMutationCalls(value.codex)).toEqual(providerWritesBefore);
       } finally {
+        signal.removeEventListener("abort", release);
         release();
         await recovery;
       }
-    }
-  });
+    }),
+  );
 
   test("dispatches memory host tools with session authority, deterministic mutation keys, and closed refusals", async () => {
     const memory = new FakeMemory();
@@ -11810,17 +12855,9 @@ describe("HraService", () => {
     if (actor.providerThreadId === undefined || actor.activeTurnId === undefined) {
       throw new Error("Expected an active memory host actor.");
     }
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority: ProfileAuthority = liveAuthorityFor(value.store, profile.id, "codex");
     const base = {
-      authority: {
-        profileId: profile.id,
-        processGeneration: profile.processGeneration,
-      },
+      authority: hostToolAuthorityFor(liveAuthorityFor(value.store, profile.id)),
       connectionId: value.codex.observationConnectionId,
       requestId: { type: "string" as const, value: "memory-host-request" },
       threadId: actor.providerThreadId,
@@ -11837,14 +12874,14 @@ describe("HraService", () => {
         summary: "The service revalidates actor authority under its lock.",
         body: "Memory mutations are attributed to the current actor session.",
       },
-    } satisfies HraHostToolCall;
-    expect(await value.service.handleHraHostToolCall(
+    } satisfies OompaHostToolCall;
+    expect(await value.service.handleOompaHostToolCall(
       authority,
       rememberCall,
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
     ))
       .toMatchObject({ ok: true, kind: "remember" });
-    expect(await value.service.handleHraHostToolCall(
+    expect(await value.service.handleOompaHostToolCall(
       authority,
       rememberCall,
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -11866,8 +12903,8 @@ describe("HraService", () => {
       requestDigest: createHash("sha256").update("memory-query").digest("hex"),
       tool: "memory_query" as const,
       input: { mode: "list" as const },
-    } satisfies HraHostToolCall;
-    expect(await value.service.handleHraHostToolCall(
+    } satisfies OompaHostToolCall;
+    expect(await value.service.handleOompaHostToolCall(
       authority,
       queryCall,
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -11881,8 +12918,8 @@ describe("HraService", () => {
       requestDigest: createHash("sha256").update("memory-explain").digest("hex"),
       tool: "memory_explain" as const,
       input: { queryId: `memq_${"1".repeat(32)}`, row: 0 },
-    } satisfies HraHostToolCall;
-    expect(await value.service.handleHraHostToolCall(
+    } satisfies OompaHostToolCall;
+    expect(await value.service.handleOompaHostToolCall(
       authority,
       explainCall,
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -11896,8 +12933,8 @@ describe("HraService", () => {
       requestDigest: createHash("sha256").update("memory-share").digest("hex"),
       tool: "memory_share" as const,
       input: { key: "architecture.boundary", reason: "Durable project context" },
-    } satisfies HraHostToolCall;
-    expect(await value.service.handleHraHostToolCall(
+    } satisfies OompaHostToolCall;
+    expect(await value.service.handleOompaHostToolCall(
       authority,
       shareCall,
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -11911,7 +12948,7 @@ describe("HraService", () => {
     expect(memory.shares.at(-1)?.idempotencyKey).not.toBe(memory.remembers[0]?.idempotencyKey);
 
     memory.queryError = new FakeMemoryRefusalError("MEMORY_QUERY_EXPIRED");
-    expect(await value.service.handleHraHostToolCall(authority, {
+    expect(await value.service.handleOompaHostToolCall(authority, {
       ...queryCall,
       callId: "memory-query-refusal",
     }, MANAGED_CODEX_HOST_TOOL_PROVENANCE)).toEqual({
@@ -12097,16 +13134,8 @@ describe("HraService", () => {
       enteredCheck?.();
       await blocked;
     };
-    const pending = value.service.handleHraHostToolCall({
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    }, {
-      authority: {
-        profileId: profile.id,
-        processGeneration: profile.processGeneration,
-      },
+    const pending = value.service.handleOompaHostToolCall(liveAuthorityFor(value.store, profile.id, "codex"), {
+      authority: hostToolAuthorityFor(liveAuthorityFor(value.store, profile.id)),
       callId: "memory-query-stale-actor",
       connectionId: value.codex.observationConnectionId,
       input: { mode: "list" },
@@ -12180,16 +13209,8 @@ describe("HraService", () => {
       await blocked;
     };
     const providerWritesBefore = providerMutationCalls(value.codex);
-    const pending = value.service.handleHraHostToolCall({
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    }, {
-      authority: {
-        profileId: profile.id,
-        processGeneration: profile.processGeneration,
-      },
+    const pending = value.service.handleOompaHostToolCall(liveAuthorityFor(value.store, profile.id, "codex"), {
+      authority: hostToolAuthorityFor(liveAuthorityFor(value.store, profile.id)),
       callId: "peer-actor-account-authority-stale",
       connectionId: value.codex.observationConnectionId,
       input: {
@@ -12217,7 +13238,7 @@ describe("HraService", () => {
     }
     expect(value.store.sessionAccountAuthorityMatches(actor.id, profile.id)).toBe(false);
     releaseCheck?.();
-    await expect(pending).rejects.toThrow("HRA_HOST_TOOL_AUTHORITY_STALE");
+    await expect(pending).rejects.toThrow("OOMPA_HOST_TOOL_AUTHORITY_STALE");
     expect(value.store.listRecentPeerSessionActions()).toEqual([]);
     expect(providerMutationCalls(value.codex)).toEqual(providerWritesBefore);
   });
@@ -12245,17 +13266,9 @@ describe("HraService", () => {
     if (actor.providerThreadId === undefined || actor.activeTurnId === undefined) {
       throw new Error("Expected an active runtime-authority actor.");
     }
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority: ProfileAuthority = liveAuthorityFor(value.store, profile.id, "codex");
     const call = {
-      authority: {
-        profileId: profile.id,
-        processGeneration: profile.processGeneration,
-      },
+      authority: hostToolAuthorityFor(liveAuthorityFor(value.store, profile.id)),
       callId: "memory-query-runtime-authority-stale",
       connectionId: value.codex.observationConnectionId,
       input: { mode: "list" as const },
@@ -12266,7 +13279,7 @@ describe("HraService", () => {
       threadId: actor.providerThreadId,
       tool: "memory_query" as const,
       turnId: actor.activeTurnId,
-    } satisfies HraHostToolCall;
+    } satisfies OompaHostToolCall;
     let releaseCheck: (() => void) | undefined;
     let enteredCheck: (() => void) | undefined;
     const entered = new Promise<void>((resolve) => { enteredCheck = resolve; });
@@ -12275,7 +13288,7 @@ describe("HraService", () => {
       enteredCheck?.();
       await blocked;
     };
-    const pending = value.service.handleHraHostToolCall(
+    const pending = value.service.handleOompaHostToolCall(
       authority,
       call,
       MANAGED_CODEX_HOST_TOOL_PROVENANCE,
@@ -12283,7 +13296,7 @@ describe("HraService", () => {
     await entered;
     value.codex.liveHostToolCall = false;
     releaseCheck?.();
-    await expect(pending).rejects.toThrow("HRA_HOST_TOOL_RUNTIME_AUTHORITY_STALE");
+    await expect(pending).rejects.toThrow("OOMPA_HOST_TOOL_RUNTIME_AUTHORITY_STALE");
     expect(memory.queries).toEqual([]);
     expect(value.codex.liveHostToolCallRequests).toEqual([
       {
@@ -12309,20 +13322,20 @@ describe("HraService", () => {
     const liveProbe = value.codex.hasLiveHostToolCall.bind(value.codex);
     (value.codex as { hasLiveHostToolCall?: CodexRuntimePort["hasLiveHostToolCall"] })
       .hasLiveHostToolCall = undefined;
-    await expect(value.service.handleHraHostToolCall(authority, {
+    await expect(value.service.handleOompaHostToolCall(authority, {
       ...call,
       callId: "memory-query-runtime-authority-missing",
       requestDigest: createHash("sha256")
         .update("memory-query-runtime-authority-missing")
         .digest("hex"),
     }, MANAGED_CODEX_HOST_TOOL_PROVENANCE)).rejects.toThrow(
-      "HRA_HOST_TOOL_RUNTIME_AUTHORITY_STALE",
+      "OOMPA_HOST_TOOL_RUNTIME_AUTHORITY_STALE",
     );
     expect(memory.queries).toEqual([]);
 
     (value.codex as { hasLiveHostToolCall?: CodexRuntimePort["hasLiveHostToolCall"] })
       .hasLiveHostToolCall = liveProbe;
-    await expect(value.service.handleHraHostToolCall(authority, {
+    await expect(value.service.handleOompaHostToolCall(authority, {
       ...call,
       callId: "memory-query-runtime-authority-current",
       requestDigest: createHash("sha256")
@@ -12424,32 +13437,32 @@ describe("HraService", () => {
       {
         failure: "signed_out",
         code: "INTERACTION_REQUIRED",
-        nextCommand: "hra auth login --input-stdin",
+        nextCommand: "oompa auth login --input-stdin",
       },
       {
         failure: "device_unregistered",
         code: "INTERACTION_REQUIRED",
-        nextCommand: "hra device pair",
+        nextCommand: "oompa device pair",
       },
       {
         failure: "observation_missing",
         code: "INTERACTION_REQUIRED",
-        nextCommand: "hra auth status",
+        nextCommand: "oompa auth status",
       },
       {
         failure: "already_ready",
         code: "CONFLICT",
-        nextCommand: "hra auth status",
+        nextCommand: "oompa auth status",
       },
       {
         failure: "auth_identity_unbound",
         code: "RECOVERY_REQUIRED",
-        nextCommand: "hra auth status",
+        nextCommand: "oompa auth status",
       },
       {
         failure: "authority_changed",
         code: "RECOVERY_REQUIRED",
-        nextCommand: "hra auth status",
+        nextCommand: "oompa auth status",
       },
     ] as const;
     const cloud = new FakeCloud();
@@ -12519,7 +13532,7 @@ describe("HraService", () => {
       switchGeneration: 1,
       targetProfileId: "acct_00000000000000000000000000000000",
       diagnostic: "PROCESS_SET_CHANGED",
-      action: "hra account switch-recover",
+      action: "oompa account switch-recover",
     };
     const { service } = await fixture(desktop);
 
@@ -12530,7 +13543,49 @@ describe("HraService", () => {
     };
     expect(desktop.calls).toEqual(["recover", "current"]);
     expect(doctor.desktop.recovery).toBe(desktop.current);
-    expect(doctor.problems).toContain("A desktop switch is unresolved. Run `hra account switch-recover`.");
+    expect(doctor.problems).toContain("A desktop switch is unresolved. Run `oompa account switch-recover`.");
+  });
+
+  test("does not claim the active provider default is the running desktop source", async () => {
+    const desktop = new FakeDesktop();
+    const { service, store } = await fixture(desktop);
+    const source = await service.execute(
+      { kind: "account.add", label: "New-work default" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await service.execute(
+      { account: source.account.id, deviceCode: false, kind: "account.login" },
+      { signal },
+    );
+    const target = await service.execute(
+      { kind: "account.add", label: "Desktop target" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await service.execute(
+      { account: target.account.id, deviceCode: false, kind: "account.login" },
+      { signal },
+    );
+    const state = store.readProviderAccountState("codex");
+    store.activateProviderAccount({
+      provider: "codex",
+      expectedPointerRevision: state.pointerRevision,
+      providerAccountId: source.account.id,
+    });
+
+    await service.execute({
+      account: target.account.id,
+      idempotencyKey: crypto.randomUUID(),
+      kind: "account.switch",
+    }, { signal });
+
+    expect(store.readProviderAccountState("codex").activeProviderAccountId).toBe(source.account.id);
+    expect(desktop.switchInputs).toHaveLength(1);
+    expect(desktop.switchInputs[0]?.source).toBeUndefined();
+    expect(desktop.switchInputs[0]?.target).toMatchObject({
+      id: target.account.id,
+      provider: "codex",
+      providerAccountId: target.account.id,
+    });
   });
 
   test("doctor closes dependency failures without repeating arbitrary runtime diagnostics", async () => {
@@ -12590,6 +13645,88 @@ describe("HraService", () => {
     expect(codex.calls).toEqual([]);
   });
 
+  describe.each(["claude"] as const)("exact %s login completion", (provider) => {
+    test.each(["missing", "provenance", "binding", "process"] as const)("refuses %s authority before any status read", async (corruption) => {
+      const value = await isolatedLoginCompletionFixture(provider);
+      const readAuthorities = value.store.readMutationProviderAuthorities.bind(value.store);
+      const captured = readAuthorities(value.prepared.login.attemptId);
+      const mutationBefore = value.store.readMutation(value.key);
+      const original = value.store.requireProviderAccountAuthority(value.profile.id, provider);
+      const readsBefore = value.providerReadCalls();
+      if (corruption === "binding") {
+        value.store.observeProviderAccountReadiness({
+          profileId: value.profile.id, provider,
+          expectedBindingGeneration: original.bindingGeneration, readiness: "signed_in",
+        });
+      } else if (corruption === "process") {
+        value.corruptProviderProcess();
+      } else {
+        Object.defineProperty(value.store, "readMutationProviderAuthorities", {
+          configurable: true,
+          value: (attemptId: Parameters<StateStore["readMutationProviderAuthorities"]>[0]) => {
+            const recorded = readAuthorities(attemptId);
+            if (attemptId !== value.prepared.login.attemptId) return recorded;
+            return corruption === "missing" ? [] : recorded.map((entry) => ({ ...entry, provenance: "unproved_login" }));
+          },
+        });
+      }
+      try {
+        await expect(value.service.execute(value.complete, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+        expect(value.providerReadCalls()).toBe(readsBefore);
+        expect(value.providerSessionCalls).toEqual([]);
+        expect(value.store.readMutation(value.key)).toEqual(mutationBefore);
+      } finally {
+        Object.defineProperty(value.store, "readMutationProviderAuthorities", { configurable: true, value: readAuthorities });
+      }
+      expect(readAuthorities(value.prepared.login.attemptId)).toEqual(captured);
+    });
+
+    test.each(["binding", "process"] as const)("refuses settlement when %s authority retires during status read", async (retirement) => {
+      const value = await isolatedLoginCompletionFixture(provider);
+      const original = value.store.requireProviderAccountAuthority(value.profile.id, provider);
+      const captured = value.store.readMutationProviderAuthorities(value.prepared.login.attemptId);
+      const mutationBefore = value.store.readMutation(value.key);
+      const readsBefore = value.providerReadCalls();
+      value.setProviderReadHook(() => {
+        if (retirement === "binding") value.store.observeProviderAccountReadiness({
+          profileId: value.profile.id, provider,
+          expectedBindingGeneration: original.bindingGeneration, readiness: "signed_in",
+        });
+        else value.corruptProviderProcess();
+      });
+      await expect(value.service.execute(value.complete, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+      expect(value.providerReadCalls()).toBe(readsBefore + 1);
+      expect(value.readAuthorities.at(-1)).toMatchObject({
+        id: original.profileId, provider, providerAccountId: original.providerAccountId,
+        bindingGeneration: original.bindingGeneration, generation: original.processGeneration,
+      });
+      expect(value.store.readMutation(value.key)).toEqual(mutationBefore);
+      expect(value.store.readMutationProviderAuthorities(value.prepared.login.attemptId)).toEqual(captured);
+      expect(value.providerSessionCalls).toEqual([]);
+    });
+
+    test("ignores sibling generation advances while settling the original provider authority", async () => {
+      const value = await isolatedLoginCompletionFixture(provider);
+      const original = value.store.requireProviderAccountAuthority(value.profile.id, provider);
+      const captured = value.store.readMutationProviderAuthorities(value.prepared.login.attemptId);
+      value.setProviderReadHook(() => {
+        for (const other of ["codex"] as const) {
+          const authority = value.store.requireProviderAccountAuthority(value.profile.id, other);
+          value.store.advanceProviderAccountProcessGeneration({
+            profileId: value.profile.id, provider: other, expectedProcessGeneration: authority.processGeneration,
+          });
+        }
+      });
+      await expect(value.service.execute(value.complete, { signal })).resolves.toMatchObject({
+        authentication: { provider, signedIn: true }, login: { status: "signed_in" },
+      });
+      expect(value.store.readMutation(value.key)).toMatchObject({ state: "applied" });
+      expect(value.store.requireProviderAccountAuthority(value.profile.id, provider)).toEqual(original);
+      expect(value.store.readMutationProviderAuthorities(value.prepared.login.attemptId)).toEqual(captured);
+      expect(value.providerSessionCalls).toEqual([]);
+    });
+  });
+
   test("reports retired Devin without authentication or provider effects", async () => {
     const value = await fixture();
     const profile = value.store.createProfile("Retired");
@@ -12607,29 +13744,11 @@ describe("HraService", () => {
   });
 
   test("preserves historical Devin login custody until exact acknowledged cleanup", async () => {
-    const value = await fixture();
-    const profile = value.store.createProfile("Retired grant");
-    const key = "00000000-0000-4000-8000-000000000711";
-    const attemptId = "attempt_00000000000000000000000000000711" as const;
-    const request = JSON.stringify({
-      kind: "account.devin-login", authorityId: profile.id,
-      authorityGeneration: profile.processGeneration, request: { provider: "devin" },
-    });
-    const evidence = JSON.stringify({
-      kind: "account.devin-login", provider: "devin", baselineSignedIn: false,
-    });
-    const digest = (text: string) => createHash("sha256").update(text).digest("hex");
-    const legacy = new Database(value.paths.database, { strict: true });
-    try {
-      legacy.query(
-        "INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at) VALUES (?,?,'account.devin-login',?,?,?,'effect_started',0,0)",
-      ).run(attemptId, key, profile.id, profile.processGeneration, digest(request));
-      legacy.query(
-        "INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,'account.devin-login',?,?,0)",
-      ).run(attemptId, evidence, digest(evidence));
-    } finally {
-      legacy.close();
-    }
+    const value = await archivedDevinFixture();
+    const profile = value.captured.profile;
+    const key = value.captured.idempotencyKey;
+    const attemptId = value.captured.mutation.id;
+    const original = value.store.readMutation(key);
     const status = await value.service.execute({
       kind: "account.show", account: profile.id, provider: "devin",
     }, { signal }) as { recovery: Record<string, unknown> };
@@ -12651,6 +13770,8 @@ describe("HraService", () => {
     expect(value.store.readMutation(key)).toMatchObject({
       state: "reconciled", resolution: { kind: "abandoned" },
     });
+    expect(value.store.readMutation(key)?.evidence).toEqual(original?.evidence);
+    expect(value.store.readMutation(key)?.requestDigest).toBe(original?.requestDigest);
     expect(value.codex.calls).toEqual([]);
   });
 
@@ -12695,7 +13816,7 @@ describe("HraService", () => {
         required: true,
         attemptId: prepared.login.attemptId,
         idempotencyKey: key,
-        abandonCommand: `hra account login-cancel ${added.account.id} --provider claude --attempt-id ${prepared.login.attemptId} --provider-generation 0 --idempotency-key ${key} --acknowledge-child-exited`,
+        abandonCommand: `oompa account login-cancel ${added.account.id} --provider claude --attempt-id ${prepared.login.attemptId} --provider-generation 0 --idempotency-key ${key} --acknowledge-child-exited`,
       },
     });
     expect(value.claudeReadCalls()).toBe(readsBeforeRecoveryStatus);
@@ -12785,23 +13906,41 @@ describe("HraService", () => {
     expect(value.store.readMutation(interruptedKey)).toMatchObject({ state: "failed" });
   });
 
-  test("accepts the original joined completion after restart made the Claude launch historical", async () => {
+  test("preserves the original foreground Claude authority across daemon restart and reconciles its joined completion", async () => {
     const value = await claudeAccountFixture();
     const added = await value.service.execute(
       { kind: "account.add", label: "Claude restart" },
       { signal },
     ) as { account: { id: `acct_${string}` } };
-    const launchedProfile = value.store.nextProfileGeneration(added.account.id);
+    const codexBefore = value.store.requireProviderAccountAuthority(added.account.id, "codex");
+    const launchedAuthority = value.store.advanceProviderAccountProcessGeneration({
+      profileId: added.account.id,
+      provider: "claude",
+      expectedProcessGeneration: 0,
+    });
     const key = "00000000-0000-4000-8000-000000000707";
     const prepared = await value.service.execute({
       kind: "account.claude-login.prepare",
       account: added.account.id,
       idempotencyKey: key,
     }, { signal }) as { login: { attemptId: `attempt_${string}`; providerGeneration: number } };
-    expect(prepared.login.providerGeneration).toBe(launchedProfile.processGeneration);
-    expect(value.store.nextDaemonGeneration(`boot_${"c".repeat(32)}`)).toBe(1);
-    expect(value.store.requireProfileById(added.account.id).processGeneration)
-      .toBe(launchedProfile.processGeneration + 1);
+    expect(prepared.login.providerGeneration).toBe(launchedAuthority.processGeneration);
+    const captured = value.store.readMutationProviderAuthorities(prepared.login.attemptId);
+    expect(captured).toMatchObject([{
+      role: "primary",
+      authority: {
+        profileId: added.account.id,
+        provider: "claude",
+        processGeneration: launchedAuthority.processGeneration,
+      },
+      provenance: "account_claude_login",
+    }]);
+    expect(value.store.nextDaemonGeneration(`boot_${"c".repeat(32)}`)).toBe(value.daemonGeneration + 1);
+    expect(value.store.requireProviderAccountAuthority(added.account.id, "claude").processGeneration)
+      .toBe(launchedAuthority.processGeneration);
+    expect(value.store.requireProviderAccountAuthority(added.account.id, "codex"))
+      .toEqual(codexBefore);
+    expect(value.store.readMutationProviderAuthorities(prepared.login.attemptId)).toEqual(captured);
     expect(value.store.recoverEffectStartedMutations()).toEqual({
       recovered: [prepared.login.attemptId],
       unresolved: [],
@@ -12826,7 +13965,7 @@ describe("HraService", () => {
     };
     await expect(value.service.execute(complete, { signal })).resolves.toMatchObject({
       authentication: { provider: "claude", signedIn: true },
-      login: { status: "signed_in", providerGeneration: launchedProfile.processGeneration },
+      login: { status: "signed_in", providerGeneration: launchedAuthority.processGeneration },
     });
     expect(value.store.readMutation(key)).toMatchObject({
       state: "reconciled",
@@ -12849,31 +13988,101 @@ describe("HraService", () => {
     });
   });
 
+  test.each(["missing", "binding", "provenance"] as const)(
+    "refuses historical Claude login recovery without its exact immutable authority (%s)",
+    (corruption) => ownedServiceCase(async ({ createFixture, signal }) => {
+      const value = await claudeAccountFixture(false, "linux", createFixture);
+      signal.throwIfAborted();
+      const added = await value.service.execute(
+        { kind: "account.add", label: "Claude immutable login" },
+        { signal },
+      ) as { account: { id: `acct_${string}` } };
+      value.store.advanceProviderAccountProcessGeneration({
+        profileId: added.account.id,
+        provider: "claude",
+        expectedProcessGeneration: 0,
+      });
+      const key = crypto.randomUUID();
+      const prepared = await value.service.execute({
+        kind: "account.claude-login.prepare",
+        account: added.account.id,
+        idempotencyKey: key,
+      }, { signal }) as { login: { attemptId: `attempt_${string}` } };
+      const readAuthorities = value.store.readMutationProviderAuthorities.bind(value.store);
+      const captured = readAuthorities(prepared.login.attemptId);
+      value.store.nextDaemonGeneration(`boot_${"e".repeat(32)}`);
+      const readsBeforeRecovery = value.claudeReadCalls();
+      Object.defineProperty(value.store, "readMutationProviderAuthorities", {
+        configurable: true,
+        value: (attemptId: Parameters<StateStore["readMutationProviderAuthorities"]>[0]) => {
+          const recorded = readAuthorities(attemptId);
+          if (attemptId !== prepared.login.attemptId) return recorded;
+          if (corruption === "missing") return [];
+          return recorded.map((entry) => corruption === "provenance"
+            ? { ...entry, provenance: "unproved_claude_login" }
+            : {
+                ...entry,
+                authority: {
+                  ...entry.authority,
+                  bindingGeneration: entry.authority.bindingGeneration + 1,
+                },
+              });
+        },
+      });
+      try {
+        expect(value.store.recoverEffectStartedMutations()).toEqual({
+          recovered: [],
+          unresolved: [{
+            id: prepared.login.attemptId,
+            kind: "account.claude-login",
+            authorityId: added.account.id,
+          }],
+        });
+        expect(value.store.readMutation(key)).toMatchObject({ state: "effect_started" });
+        expect(value.claudeReadCalls()).toBe(readsBeforeRecovery);
+        expect(value.providerSessionCalls).toEqual([]);
+      } finally {
+        Object.defineProperty(value.store, "readMutationProviderAuthorities", {
+          configurable: true,
+          value: readAuthorities,
+        });
+      }
+      expect(readAuthorities(prepared.login.attemptId)).toEqual(captured);
+    }),
+  );
+
   test("abandons only one exact unsettled Claude fence after explicit child-exit acknowledgement", async () => {
     const value = await claudeAccountFixture();
     const added = await value.service.execute(
       { kind: "account.add", label: "Claude abandon" },
       { signal },
     ) as { account: { id: `acct_${string}` } };
-    const profile = value.store.nextProfileGeneration(added.account.id);
+    const launchedAuthority = value.store.advanceProviderAccountProcessGeneration({
+      profileId: added.account.id,
+      provider: "claude",
+      expectedProcessGeneration: 0,
+    });
     const key = "00000000-0000-4000-8000-000000000709";
     const prepared = await value.service.execute({
       kind: "account.claude-login.prepare",
       account: added.account.id,
       idempotencyKey: key,
     }, { signal }) as { login: { attemptId: `attempt_${string}`; providerGeneration: number } };
-    expect(value.store.nextDaemonGeneration(`boot_${"d".repeat(32)}`)).toBe(1);
+    expect(prepared.login.providerGeneration).toBe(launchedAuthority.processGeneration);
+    const captured = value.store.readMutationProviderAuthorities(prepared.login.attemptId);
+    expect(value.store.nextDaemonGeneration(`boot_${"d".repeat(32)}`)).toBe(value.daemonGeneration + 1);
     expect(value.store.recoverEffectStartedMutations()).toEqual({
       recovered: [prepared.login.attemptId],
       unresolved: [],
     });
     value.setClaudeReadError(new Error("abandon must not inspect or mutate Claude"));
+    const readsBeforeAbandon = value.claudeReadCalls();
     const abandon = {
       kind: "account.claude-login.abandon" as const,
       account: added.account.id,
       attemptId: prepared.login.attemptId,
       idempotencyKey: key,
-      providerGeneration: profile.processGeneration,
+      providerGeneration: launchedAuthority.processGeneration,
       acknowledgeChildExited: true as const,
     };
     await expect(value.service.execute({
@@ -12882,7 +14091,7 @@ describe("HraService", () => {
     }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
     await expect(value.service.execute({
       ...abandon,
-      providerGeneration: profile.processGeneration + 1,
+      providerGeneration: launchedAuthority.processGeneration + 1,
     }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
     await expect(value.service.execute(abandon, { signal })).resolves.toMatchObject({
       account: { id: added.account.id, label: "Claude abandon" },
@@ -12917,9 +14126,11 @@ describe("HraService", () => {
       account: added.account.id,
       attemptId: prepared.login.attemptId,
       idempotencyKey: key,
-      providerGeneration: profile.processGeneration,
+      providerGeneration: launchedAuthority.processGeneration,
       outcome: { state: "joined", exitCode: 0, interruptedBy: null },
     }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(value.claudeReadCalls()).toBe(readsBeforeAbandon);
+    expect(value.store.readMutationProviderAuthorities(prepared.login.attemptId)).toEqual(captured);
   });
 
   test("refuses Claude login before provider status while a Claude session is starting", async () => {
@@ -13076,13 +14287,32 @@ describe("HraService", () => {
     });
 
     const profile = value.store.requireProfileById(added.account.id);
+    const claudeBefore = value.store.requireProviderAccountAuthority(profile.id, "claude");
+    expect(claudeBefore.processGeneration).toBe(0);
+    const firstClaudeProcess = value.store.advanceProviderAccountProcessGeneration({
+      expectedProcessGeneration: claudeBefore.processGeneration,
+      profileId: profile.id,
+      provider: "claude",
+    });
+    // Arrange historical recovery independently of the refused platform probes.
+    const claudeAuthority = value.store.advanceProviderAccountProcessGeneration({
+      expectedProcessGeneration: firstClaudeProcess.processGeneration,
+      profileId: profile.id,
+      provider: "claude",
+    });
+    expect(claudeAuthority.processGeneration).not.toBe(profile.processGeneration);
     const recoveryKey = "00000000-0000-4000-8000-000000000715";
     const attempt = value.store.prepareMutation({
-      authorityGeneration: profile.processGeneration,
+      authorityGeneration: claudeAuthority.processGeneration,
       authorityId: profile.id,
       idempotencyKey: recoveryKey,
       kind: "account.claude-login",
       request: { provider: "claude" },
+      providerAuthorities: [{
+        role: "primary",
+        authority: claudeAuthority,
+        provenance: "account_claude_login",
+      }],
     });
     value.store.beginClaudeLoginMutationEffect({
       attemptId: attempt.id,
@@ -13091,10 +14321,10 @@ describe("HraService", () => {
         kind: "account.claude-login",
         provider: "claude",
       },
-      profileGeneration: profile.processGeneration,
+      profileGeneration: claudeAuthority.processGeneration,
       profileId: profile.id,
     });
-    const abandonCommand = `hra account login-cancel ${profile.id} --provider claude --attempt-id ${attempt.id} --provider-generation ${String(profile.processGeneration)} --idempotency-key ${recoveryKey} --acknowledge-child-exited`;
+    const abandonCommand = `oompa account login-cancel ${profile.id} --provider claude --attempt-id ${attempt.id} --provider-generation ${String(claudeAuthority.processGeneration)} --idempotency-key ${recoveryKey} --acknowledge-child-exited`;
     await expect(value.service.execute({
       account: profile.id,
       kind: "account.show",
@@ -13106,7 +14336,7 @@ describe("HraService", () => {
         abandonCommand,
         attemptId: attempt.id,
         idempotencyKey: recoveryKey,
-        providerGeneration: profile.processGeneration,
+        providerGeneration: claudeAuthority.processGeneration,
         required: true,
       },
     });
@@ -13117,7 +14347,7 @@ describe("HraService", () => {
       idempotencyKey: recoveryKey,
       kind: "account.claude-login.complete",
       outcome: { state: "joined", exitCode: 0, interruptedBy: null },
-      providerGeneration: profile.processGeneration,
+      providerGeneration: claudeAuthority.processGeneration,
     }, { signal })).rejects.toMatchObject(expectedPlatformRefusal);
     expect(value.claudeReadCalls()).toBe(0);
     expect(value.providerSessionCalls).toEqual([]);
@@ -13128,7 +14358,7 @@ describe("HraService", () => {
       attemptId: attempt.id,
       idempotencyKey: recoveryKey,
       kind: "account.claude-login.abandon",
-      providerGeneration: profile.processGeneration,
+      providerGeneration: claudeAuthority.processGeneration,
     }, { signal })).resolves.toMatchObject({
       login: { localOnly: true, status: "abandoned" },
     });
@@ -13147,6 +14377,7 @@ describe("HraService", () => {
     }, { signal });
     const profile = value.store.requireProfileById(added.account.id);
     const idle = value.store.upsertProviderSession({
+      providerAuthority: value.store.requireProviderAccountAuthority(profile.id, "claude"),
       fastEnabled: false,
       preset: "fable-max",
       profileId: profile.id,
@@ -13166,11 +14397,13 @@ describe("HraService", () => {
         type: "user_message",
       },
       providerConnectionId: null,
-      providerGeneration: profile.processGeneration,
+      providerGeneration: value.store.requireProviderAccountAuthority(profile.id, "claude").processGeneration,
+      providerAuthority: value.store.requireProviderAccountAuthority(profile.id, "claude"),
       sessionId: idle.id,
     });
     const queued = value.store.enqueue(idle.id, "preserve pending queue");
     const active = value.store.upsertProviderSession({
+      providerAuthority: value.store.requireProviderAccountAuthority(profile.id, "claude"),
       fastEnabled: false,
       preset: "fable-max",
       profileId: profile.id,
@@ -13279,8 +14512,7 @@ describe("HraService", () => {
         connectionId: "10000000-0000-4000-8000-000000000091",
         itemId: "toolu_darwin",
         method: "claude/control_request/can_use_tool",
-        processGeneration: profile.processGeneration,
-        profileId: profile.id,
+        ...value.store.requireProviderAccountAuthority(profile.id, "claude"),
         requestDigest: "a".repeat(64),
         requestId: { type: "string", value: "darwin-request" },
         threadId: "claude-thread-darwin-idle",
@@ -13311,6 +14543,7 @@ describe("HraService", () => {
     });
 
     const recoveryBound = value.store.upsertProviderSession({
+      providerAuthority: value.store.requireProviderAccountAuthority(profile.id, "claude"),
       fastEnabled: false,
       preset: "fable-max",
       profileId: profile.id,
@@ -13387,7 +14620,7 @@ describe("HraService", () => {
       details: {
         accountSelector: added.account.id,
         accountState: "signed_out",
-        nextCommand: `hra account login ${added.account.id}`,
+        nextCommand: `oompa account login ${added.account.id}`,
       },
       name: "CommandFailure",
     });
@@ -13454,20 +14687,113 @@ describe("HraService", () => {
   });
 
   test("fails closed for an unrecognized provider-level interaction method", async () => {
-    const { service, store, codex } = await fixture();
+    const { store, codex, paths } = await fixture();
     const profile = store.createProfile("Unknown provider interaction");
-    const interaction = store.admitInteraction({
+    const snapshot = () => {
+      const database = new Database(paths.database, { strict: true });
+      try {
+        database.exec("PRAGMA query_only=ON");
+        return database.transaction(() => {
+          const tables = database.query<{ name: string }, []>(
+            "SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name",
+          ).all();
+          return {
+            schema: database.query("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name").all(),
+            rows: tables.map(({ name }) => {
+              if (!/^[A-Za-z0-9_]+$/u.test(name)) throw new Error("Unexpected fixture table name.");
+              return [name, database.query(`SELECT * FROM "${name}"`).all()
+                .map((row) => JSON.stringify(row)).sort()];
+            }),
+          };
+        }).deferred();
+      } finally { database.close(false); }
+    };
+    const before = snapshot();
+    const calls = [...codex.calls];
+    // Unbound unknown methods have no admitted provider source. Known foreign
+    // methods cannot borrow the explicitly captured Codex tuple either.
+    for (const [method, diagnostic] of [
+      ["future-provider/requestApproval", "provider interaction authority mismatch"],
+      ["claude/control_request/can_use_tool", "INTERACTION_PROVIDER_AUTHORITY_MISMATCH"],
+      ["devin/session/request_permission", "RETIRED_PROVIDER_ADMISSION_REFUSED"],
+    ] as const) {
+      expect(() => store.admitInteraction({
+        authority: {
+          ...codexInteractionBinding(store, profile.id),
+          approvalId: null,
+          connectionId: "30000000-0000-4000-8000-000000000004",
+          itemId: "unknown-item",
+          method,
+          processGeneration: profile.processGeneration,
+          profileId: profile.id,
+          requestDigest: "a".repeat(64),
+          requestId: { type: "string", value: "unknown-request" },
+          threadId: null,
+          turnId: null,
+        },
+        blocking: true,
+        display: {
+          availableDecisions: ["once", "decline", "cancel"],
+          commandClass: "unknown",
+          kind: "command_approval",
+          reason: null,
+          summary: "Unknown provider request",
+          workingDirectory: null,
+        },
+        kind: "command_approval",
+        publicId: "30000000-0000-4000-8000-000000000005",
+        sessionId: null,
+      })).toThrow(diagnostic);
+      expect(snapshot()).toEqual(before);
+    }
+    expect(codex.calls).toEqual(calls);
+    expect(codex.inspectedInteractions).toEqual([]);
+    expect(codex.validatedInteractions).toEqual([]);
+    expect(codex.resolvedInteractions).toEqual([]);
+    expect(codex.validatedInteractionTimeouts).toEqual([]);
+    expect(codex.timedOutInteractions).toEqual([]);
+  });
+
+  test("fails closed for unknown or cross-provider methods on a bound session", async () => {
+    let now = 50_000;
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const { sessionId } = await createIdleSession(value, "Provider-bound interaction");
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
+
+    const snapshot = () => {
+      const database = new Database(value.paths.database, { strict: true });
+      try {
+        database.exec("PRAGMA query_only=ON");
+        return database.transaction(() => {
+          const tables = database.query<{ name: string }, []>(
+            "SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name",
+          ).all();
+          return {
+            schema: database.query("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name").all(),
+            rows: tables.map(({ name }) => {
+              if (!/^[A-Za-z0-9_]+$/u.test(name)) throw new Error("Unexpected fixture table name.");
+              return [name, database.query(`SELECT * FROM "${name}"`).all()
+                .map((row) => JSON.stringify(row)).sort()];
+            }),
+          };
+        }).deferred();
+      } finally { database.close(false); }
+    };
+    const input: Parameters<StateStore["admitInteraction"]>[0] = {
       authority: {
+        ...codexInteractionBinding(value.store, profile.id),
         approvalId: null,
-        connectionId: "30000000-0000-4000-8000-000000000004",
-        itemId: "unknown-item",
+        connectionId: "30000000-0000-4000-8000-000000000014",
+        itemId: "provider-bound-item",
         method: "future-provider/requestApproval",
         processGeneration: profile.processGeneration,
         profileId: profile.id,
-        requestDigest: "a".repeat(64),
-        requestId: { type: "string", value: "unknown-request" },
-        threadId: null,
-        turnId: null,
+        requestDigest: "1".repeat(64),
+        requestId: { type: "string", value: "provider-bound-request" },
+        threadId: session.providerThreadId,
+        turnId: "provider-bound-turn",
       },
       blocking: true,
       display: {
@@ -13475,15 +14801,34 @@ describe("HraService", () => {
         commandClass: "unknown",
         kind: "command_approval",
         reason: null,
-        summary: "Unknown provider request",
+        summary: "Provider-bound request",
         workingDirectory: null,
       },
       kind: "command_approval",
-      publicId: "30000000-0000-4000-8000-000000000005",
-      sessionId: null,
-    }).record;
-
-    await expect(service.execute({
+      publicId: "30000000-0000-4000-8000-000000000015",
+      sessionId: session.id,
+    };
+    const beforeAdmission = snapshot();
+    for (const [method, diagnostic] of [
+      ["claude/control_request/can_use_tool", "INTERACTION_PROVIDER_AUTHORITY_MISMATCH"],
+      ["devin/session/request_permission", "RETIRED_PROVIDER_ADMISSION_REFUSED"],
+    ] as const) {
+      expect(() => value.store.admitInteraction({ ...input, authority: { ...input.authority, method } }))
+        .toThrow(diagnostic);
+      expect(snapshot()).toEqual(beforeAdmission);
+    }
+    // A bound unknown method can be retained, but it cannot dispatch through
+    // the session's otherwise valid captured provider-account authority.
+    const interaction = value.store.admitInteraction(input).record;
+    const before = snapshot();
+    const calls = [...value.codex.calls];
+    await expect(value.service.execute({
+      kind: "interaction.inspect", interaction: interaction.publicId, expectedRevision: interaction.revision,
+    }, { signal })).rejects.toMatchObject({
+      code: "RECOVERY_REQUIRED", details: { reason: "interaction_provider_unknown" },
+    });
+    expect(snapshot()).toEqual(before);
+    await expect(value.service.execute({
       expectedRevision: interaction.revision,
       interaction: interaction.publicId,
       kind: "interaction.resolve",
@@ -13492,81 +14837,17 @@ describe("HraService", () => {
       code: "RECOVERY_REQUIRED",
       details: { reason: "interaction_provider_unknown" },
     });
-
-    expect(codex.validatedInteractions).toEqual([]);
-    expect(codex.resolvedInteractions).toEqual([]);
-    expect(store.requireInteraction(interaction.publicId)).toMatchObject({
-      revision: interaction.revision,
-      state: "pending",
-    });
-  });
-
-  test("fails closed for unknown or cross-provider methods on a bound session", async () => {
-    const value = await fixture();
-    const { sessionId } = await createIdleSession(value, "Provider-bound interaction");
-    const session = value.store.requireSession(sessionId);
-    const profile = value.store.requireProfileById(session.profileId);
-    if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-
-    const cases = [
-      {
-        connectionId: "30000000-0000-4000-8000-000000000014",
-        method: "future-provider/requestApproval",
-        publicId: "30000000-0000-4000-8000-000000000015",
-        reason: "interaction_provider_unknown",
-      },
-      {
-        connectionId: "30000000-0000-4000-8000-000000000024",
-        method: "devin/session/request_permission",
-        publicId: "30000000-0000-4000-8000-000000000025",
-        reason: "interaction_provider_session_mismatch",
-      },
-    ] as const;
-    for (const [index, candidate] of cases.entries()) {
-      const interaction = value.store.admitInteraction({
-        authority: {
-          approvalId: null,
-          connectionId: candidate.connectionId,
-          itemId: `provider-bound-item-${String(index)}`,
-          method: candidate.method,
-          processGeneration: profile.processGeneration,
-          profileId: profile.id,
-          requestDigest: String(index + 1).repeat(64),
-          requestId: { type: "string", value: `provider-bound-request-${String(index)}` },
-          threadId: session.providerThreadId,
-          turnId: `provider-bound-turn-${String(index)}`,
-        },
-        blocking: true,
-        display: {
-          availableDecisions: ["once", "decline", "cancel"],
-          commandClass: "unknown",
-          kind: "command_approval",
-          reason: null,
-          summary: "Provider-bound request",
-          workingDirectory: null,
-        },
-        kind: "command_approval",
-        publicId: candidate.publicId,
-        sessionId: session.id,
-      }).record;
-
-      await expect(value.service.execute({
-        expectedRevision: interaction.revision,
-        interaction: interaction.publicId,
-        kind: "interaction.resolve",
-        resolution: { decision: "once", kind: "approval_decision" },
-      }, { signal })).rejects.toMatchObject({
-        code: "RECOVERY_REQUIRED",
-        details: { reason: candidate.reason },
-      });
-      expect(value.store.requireInteraction(interaction.publicId)).toMatchObject({
-        revision: interaction.revision,
-        state: "pending",
-      });
-    }
-
+    expect(snapshot()).toEqual(before);
+    now = interaction.deadlineAt;
+    expect(await value.service.maintainInteractionDeadlines()).toEqual({ examined: 1, failed: 1 });
+    expect(value.store.requireInteraction(interaction.publicId)).toEqual(interaction);
+    expect(snapshot()).toEqual(before);
+    expect(value.codex.calls).toEqual(calls);
+    expect(value.codex.inspectedInteractions).toEqual([]);
     expect(value.codex.validatedInteractions).toEqual([]);
     expect(value.codex.resolvedInteractions).toEqual([]);
+    expect(value.codex.validatedInteractionTimeouts).toEqual([]);
+    expect(value.codex.timedOutInteractions).toEqual([]);
   });
 
   test("archives and unarchives a session and filters the default listing", async () => {
@@ -13672,7 +14953,7 @@ describe("HraService", () => {
         localCompleteness: "complete",
         providerAccess: "not_attempted",
         providerCompleteness: "unknown",
-        nextCommand: `hra account login ${added.account.id}`,
+        nextCommand: `oompa account login ${added.account.id}`,
       },
     });
     expect(selected).toMatchObject({ sessions: [{ id: started.session.id }] });
@@ -13728,7 +15009,7 @@ describe("HraService", () => {
       localCompleteness: "complete",
       providerAccess: "not_attempted",
       providerCompleteness: "unknown",
-      nextCommand: `hra account login ${added.account.id}`,
+      nextCommand: `oompa account login ${added.account.id}`,
     });
     expect(codex.calls).toEqual([]);
 
@@ -13890,7 +15171,7 @@ describe("HraService", () => {
     }, { signal })).rejects.toMatchObject({
       code: "UNAVAILABLE",
       details: {
-        nextCommand: "hra doctor",
+        nextCommand: "oompa doctor",
         repair: "repair_or_select_project",
       },
       message: "The project directory is missing, unsafe, or not readable, writable, traversable, and canonical. Repair it or choose another directory before retrying.",
@@ -13927,7 +15208,7 @@ describe("HraService", () => {
     }, { signal })).rejects.toMatchObject({
       code: "UNAVAILABLE",
       details: {
-        nextCommand: "hra doctor",
+        nextCommand: "oompa doctor",
         repair: "repair_or_select_project",
       },
     });
@@ -13936,7 +15217,7 @@ describe("HraService", () => {
     expect(codex.calls.filter((call) => call.startsWith("start:"))).toHaveLength(0);
     expect(store.listSessions()).toHaveLength(0);
 
-    const expectedProblem = "A configured project directory is missing or unsafe. Run `hra project list`, then restore or repair every listed directory so it is readable, writable, traversable, and canonical.";
+    const expectedProblem = "A configured project directory is missing or unsafe. Run `oompa project list`, then restore or repair every listed directory so it is readable, writable, traversable, and canonical.";
     for (const offline of [true, false]) {
       const doctor = await service.execute({ kind: "doctor", offline }, { signal }) as {
         healthy: boolean;
@@ -13972,7 +15253,7 @@ describe("HraService", () => {
     };
     expect(unavailable.healthy).toBe(false);
     expect(unavailable.problems).toContain(
-      "The cloud projection cache is corrupt or unreadable. Run `hra session list`, choose each affected local session, then explicitly run `hra sync projection recover <session> --acknowledge-gap`.",
+      "The cloud projection cache is corrupt or unreadable. Run `oompa session list`, choose each affected local session, then explicitly run `oompa sync projection recover <session> --acknowledge-gap`.",
     );
 
     const affectedSession = `sess_${"3".repeat(32)}`;
@@ -14003,10 +15284,10 @@ describe("HraService", () => {
     };
     expect(unsettled.healthy).toBe(false);
     expect(unsettled.problems).not.toContain(
-      `Cloud transcript projection requires recovery for 1 session(s). Run \`hra sync projection recover ${affectedSession} --acknowledge-gap\`.`,
+      `Cloud transcript projection requires recovery for 1 session(s). Run \`oompa sync projection recover ${affectedSession} --acknowledge-gap\`.`,
     );
     expect(unsettled.problems).toContain(
-      `Cloud projection recovery is unsettled. Retry \`hra sync projection recover ${affectedSession} --acknowledge-gap --idempotency-key ${idempotencyKey}\`.`,
+      `Cloud projection recovery is unsettled. Retry \`oompa sync projection recover ${affectedSession} --acknowledge-gap --idempotency-key ${idempotencyKey}\`.`,
     );
 
     cloud.statusResult = {
@@ -14043,12 +15324,12 @@ describe("HraService", () => {
     };
     expect(impossibleShortPage.healthy).toBe(false);
     expect(impossibleShortPage.problems).toContain(
-      "Cloud projection recovery status is invalid or exceeds its local bound. Restart the daemon, then rerun `hra doctor`.",
+      "Cloud projection recovery status is invalid or exceeds its local bound. Restart the daemon, then rerun `oompa doctor`.",
     );
 
     cloud.statusResult = {
       configured: false,
-      diagnostic: "Cloud sync is disabled for this daemon. Unset HRA_CONVEX_URL and restart the daemon to use hosted sync.",
+      diagnostic: "Cloud sync is disabled for this daemon. Unset OOMPA_CONVEX_URL and HRA_CONVEX_URL and restart the daemon to use hosted sync.",
       projectionRecovery: {
         recoveries: [{
           cacheActivated: false,
@@ -14069,12 +15350,12 @@ describe("HraService", () => {
     };
     expect(disabledRecovery.healthy).toBe(false);
     expect(disabledRecovery.problems).toContain(
-      `Cloud projection recovery is unsettled. Unset HRA_CONVEX_URL and restart the daemon first. After restart, retry \`hra sync projection recover ${affectedSession} --acknowledge-gap --idempotency-key ${idempotencyKey}\`.`,
+      `Cloud projection recovery is unsettled. Unset OOMPA_CONVEX_URL and HRA_CONVEX_URL and restart the daemon first. After restart, retry \`oompa sync projection recover ${affectedSession} --acknowledge-gap --idempotency-key ${idempotencyKey}\`.`,
     );
 
     cloud.statusResult = {
       ...(cloud.statusResult as Record<string, unknown>),
-      diagnostic: "Cloud sync is disabled for this daemon. Restore this state root's bound HRA_CONVEX_URL deployment and restart the daemon.",
+      diagnostic: "Cloud sync is disabled for this daemon. Restore this state root's bound deployment with OOMPA_CONVEX_URL, unset HRA_CONVEX_URL, and restart the daemon.",
       reenable: {
         deploymentUrl: "https://bound.convex.cloud",
         kind: "restore_bound_deployment",
@@ -14086,12 +15367,12 @@ describe("HraService", () => {
     };
     expect(selfManagedRecovery.healthy).toBe(false);
     expect(selfManagedRecovery.problems).toContain(
-      `Cloud projection recovery is unsettled. Set HRA_CONVEX_URL to https://bound.convex.cloud and restart the daemon first. After restart, retry \`hra sync projection recover ${affectedSession} --acknowledge-gap --idempotency-key ${idempotencyKey}\`.`,
+      `Cloud projection recovery is unsettled. Set OOMPA_CONVEX_URL to https://bound.convex.cloud, unset HRA_CONVEX_URL, and restart the daemon first. After restart, retry \`oompa sync projection recover ${affectedSession} --acknowledge-gap --idempotency-key ${idempotencyKey}\`.`,
     );
 
     cloud.statusResult = {
       configured: false,
-      diagnostic: "Cloud sync is disabled for this daemon. Unset HRA_CONVEX_URL and restart the daemon to use hosted sync.",
+      diagnostic: "Cloud sync is disabled for this daemon. Unset OOMPA_CONVEX_URL and HRA_CONVEX_URL and restart the daemon to use hosted sync.",
       reenable: { kind: "use_hosted_default" },
       signedIn: false,
       unavailability: "disabled",
@@ -14112,7 +15393,7 @@ describe("HraService", () => {
     };
     expect(custody.healthy).toBe(false);
     expect(custody.problems).toContain(
-      "Cloud deployment custody is unavailable. Run `hra sync status --json`, correct the reported deployment configuration or custody state, then restart the daemon.",
+      "Cloud deployment custody is unavailable. Run `oompa sync status --json`, correct the reported deployment configuration or custody state, then restart the daemon.",
     );
   });
 
@@ -14231,11 +15512,9 @@ describe("HraService", () => {
   });
 
   test("pages every durable provider session before Codex discovery without duplicates", async () => {
-    const value = await fixture();
-    const added = await value.service.execute(
-      { kind: "account.add", label: "Mixed provider history" },
-      { signal },
-    ) as { account: { id: `acct_${string}` } };
+    const value = await archivedDevinFixture();
+    await abandonArchivedDevinLogin(value);
+    const added = { account: value.captured.profile };
     await value.service.execute({
       kind: "account.login",
       account: added.account.id,
@@ -14243,6 +15522,7 @@ describe("HraService", () => {
     }, { signal });
 
     const firstClaude = value.store.upsertProviderSession({
+      providerAuthority: value.store.requireProviderAccountAuthority(added.account.id, "claude"),
         profileId: added.account.id,
         provider: "claude",
         providerThreadId: "durable-claude-one",
@@ -14252,8 +15532,9 @@ describe("HraService", () => {
         state: "idle",
         title: "Durable Claude one",
       });
-    const durableDevin = legacyDevinSession(value, added.account.id);
+    const durableDevin = value.store.requireSession(value.captured.session.id);
     const secondClaude = value.store.upsertProviderSession({
+      providerAuthority: value.store.requireProviderAccountAuthority(added.account.id, "claude"),
         profileId: added.account.id,
         provider: "claude",
         providerThreadId: "durable-claude-two",
@@ -14265,6 +15546,7 @@ describe("HraService", () => {
       });
     const localSessions = [firstClaude, durableDevin, secondClaude];
     const existingCodex = value.store.upsertProviderSession({
+      providerAuthority: value.store.requireProviderAccountAuthority(added.account.id, "codex"),
       fastEnabled: false,
       profileId: added.account.id,
       preset: "high",
@@ -14544,6 +15826,39 @@ describe("HraService", () => {
     expect(await service.execute({ kind: "session.rename", session: started.session.id, name: "Release" }, { signal })).toMatchObject({ session: { title: "Release" } });
   });
 
+  test("scheduled task materialization dispatches through the sealed empty-attachment queue writer", async () => {
+    let now = 2_000;
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const { service, store, codex } = value;
+    try {
+      const { sessionId } = await createIdleSession(value, "Sealed scheduled task");
+      const tasks = store.createSessionTaskStore();
+      const task = tasks.create({
+        sessionId, name: "Scheduled check", prompt: "Check the scheduled work once.",
+        minutes: 15, status: "active", idempotencyKey: crypto.randomUUID(),
+      });
+      expect(task.nextDueAt).toBe(902_000);
+      now = task.nextDueAt ?? now;
+      expect(await service.maintainSessionTasks()).toEqual({ materialized: 1 });
+      await service.settled();
+      const queues = store.listQueue(sessionId);
+      expect(queues).toHaveLength(1);
+      const queue = queues[0];
+      if (queue === undefined) throw new Error("Scheduled task did not create its queue.");
+      expect(queue.state).toBe("applied");
+      expect(store.queueAttachmentManifest(queue.id)).toEqual([]);
+      expect(store.hasUnsettledQueueAttachmentQuarantineForSession(sessionId)).toBe(false);
+      expect(codex.startTurnAttachments).toEqual([{ clientMessageId: queue.id }]);
+      expect(codex.readProjection.messages?.at(-1)).toMatchObject({
+        text: "Check the scheduled work once.", clientId: queue.id,
+      });
+      expect(await service.maintainSessionTasks()).toEqual({ materialized: 0 });
+      expect(store.listQueue(sessionId)).toHaveLength(1);
+    } finally {
+      await service.close();
+    }
+  });
+
   test("carries attachments from a command to the provider, custody, and the projection", async () => {
     const value = await fixture();
     const { service, codex, documents, paths, store } = value;
@@ -14603,124 +15918,391 @@ describe("HraService", () => {
     expect(JSON.stringify(transcript)).not.toContain(Buffer.from(png).toString("base64"));
   });
 
-  test("projects predecessor attachment names only for an exact durable send or steer replay", async () => {
+  test.each(["send", "steer"] as const)(
+    "projects authentic predecessor attachment names only for its exact settled replay (%s)",
+    async (scenario) => {
+      const captured = canonical39AttachmentFixtures[scenario];
+      const { service, codex, store, paths } = await fixture(
+        undefined, new FakeCloud(), () => undefined, () => 40_000, undefined, {},
+        { canonical39Attachments: scenario },
+      );
+      const unsafeNames = [
+        "legacy\u2028notes.txt", "legacy\u2029notes.txt", "legacy�notes.txt",
+      ];
+      const projectedNames = ["legacy�notes~1.txt", "legacy�notes~2.txt", "legacy�notes.txt"];
+      expectHistoricalValue(captured.request.attachments.map(({ name }) => name), unsafeNames);
+      expectHistoricalValue(captured.manifest.map(({ name }) => name), unsafeNames);
+      expect(store.readMutation(captured.idempotencyKey)?.requestDigest).toBe(captured.mutation.requestDigest);
+      expectHistoricalValue(store.readMutation(captured.idempotencyKey)?.evidence, captured.mutation.evidence);
+      expectHistoricalValue(store.readMutation(captured.idempotencyKey)?.result, captured.mutation.result);
+      const expectedAttachments = captured.request.attachments.map((attachment, index) => ({
+        ...attachment, name: projectedNames[index],
+      }));
+      expectHistoricalValue(store.messageAttachmentManifest(captured.session.id, captured.mutation.id), expectedAttachments);
+      const blobs = AttachmentBlobStore.forStatePaths(paths);
+      // Only archived terminal receipts/manifests were imported. No blob file or
+      // renewed native authority is manufactured to make a settled replay work.
+      await expect(readFile(blobs.pathFor(captured.attachments[0].digest, "text/plain")))
+        .rejects.toMatchObject({ code: "ENOENT" });
+      const base = {
+        kind: scenario === "send" ? "session.send" as const : "session.steer" as const,
+        session: captured.session.id, message: captured.request.message,
+        attachments: captured.request.attachments.map((attachment) => ({ ...attachment })),
+      };
+      const command = { ...base, idempotencyKey: captured.idempotencyKey };
+      const before = serviceFixtureDatabaseSnapshot(paths.database);
+      for (let replay = 0; replay < 2; replay++) {
+        const replayed = await service.execute(command, { signal });
+        expect(replayed).toMatchObject({
+          idempotencyKey: captured.idempotencyKey, attachments: expectedAttachments,
+        });
+        expect(serviceFixtureDatabaseSnapshot(paths.database)).toEqual(before);
+      }
+      const absentKey = crypto.randomUUID();
+      for (const key of [undefined, absentKey]) {
+        await expect(service.execute({
+          ...base, ...(key === undefined ? {} : { idempotencyKey: key }),
+        }, { signal })).rejects.toMatchObject({ code: "INVALID_INPUT" });
+        expect(store.readMutation(absentKey)).toBeNull();
+        expect(serviceFixtureDatabaseSnapshot(paths.database)).toEqual(before);
+      }
+      for (const changed of [
+        { ...command, message: command.message + " changed" },
+        { ...command, attachments: command.attachments.map((attachment, index) => ({
+          ...attachment, name: index === 0 ? "different\u2028notes.txt" : attachment.name,
+        })) },
+      ]) {
+        await expect(service.execute(changed, { signal })).rejects.toMatchObject({ code: "INVALID_INPUT" });
+        expect(serviceFixtureDatabaseSnapshot(paths.database)).toEqual(before);
+      }
+      expect(codex.calls).toEqual([]);
+      expectHistoricalValue(store.readMutation(captured.idempotencyKey)?.result, captured.mutation.result);
+      expectHistoricalValue(store.readMutation(captured.idempotencyKey)?.evidence, captured.mutation.evidence);
+    },
+  );
+
+  test.each(["accounted", "unaccounted"] as const)("attachment cleanup rechecks a competing writer's reference after the %s snapshot", async (mode) => {
     const value = await fixture();
-    const { service, codex, documents, paths, store } = value;
-    const added = await service.execute(
-      { kind: "account.add", label: "Legacy attachment replay" },
-      { signal },
-    ) as { account: { id: string } };
-    await service.execute(
-      { kind: "account.login", account: added.account.id, deviceCode: false },
-      { signal },
-    );
-    await service.execute(
-      { kind: "project.add", label: "Legacy attachment docs", path: documents },
-      { signal },
-    );
-    const started = await service.execute({
-      account: added.account.id,
-      fast: false,
-      kind: "session.start",
-      preset: "high",
-      presetContract: 1,
-    }, { signal }) as { session: { id: `sess_${string}` } };
-    const session = store.requireSession(started.session.id);
-    const profile = store.requireProfileById(session.profileId);
-    const unsafeNames = [
-      `legacy${String.fromCodePoint(0x2028)}notes.txt`,
-      `legacy${String.fromCodePoint(0x2029)}notes.txt`,
-      "legacy�notes.txt",
-    ];
-    const projectedNames = [
-      "legacy�notes~1.txt",
-      "legacy�notes~2.txt",
-      "legacy�notes.txt",
-    ];
-    for (const name of unsafeNames) await writeFile(join(documents, name), "legacy body");
+    const { service, store, paths, documents } = value;
+    const { sessionId } = await createIdleSession(value, "Attachment cleanup race");
+    await writeFile(join(documents, "retained.txt"), "retain these exact bytes");
+    await writeFile(join(documents, "sent.txt"), "trigger bounded maintenance");
     const blobs = AttachmentBlobStore.forStatePaths(paths);
-    const legacyAttachments = await ingestAttachments(
-      blobs,
-      unsafeNames,
-      documents,
-      { allowLegacyReplayName: true },
-    );
-    const sendKey = "00000000-0000-4000-8000-00000000020a";
-    const sendMessage = "finish the prepared send";
-    const preparedSend = store.prepareMutation({
-      authorityGeneration: profile.processGeneration,
-      authorityId: session.id,
-      idempotencyKey: sendKey,
-      kind: "session.send",
-      request: { message: sendMessage, attachments: legacyAttachments },
-    });
+    const references = await ingestAttachments(blobs, ["retained.txt", "sent.txt"], documents);
+    const retained = references[0];
+    const sent = references[1];
+    if (retained === undefined || sent === undefined) throw new Error("Missing attachment race fixture.");
+    const stored = { ...retained, canonicalMediaType: "text/plain" as const };
+    await utimes(blobs.pathFor(retained.digest, "text/plain"), new Date(1_000), new Date(1_000));
+    if (mode === "accounted") {
+      store.recordMessageAttachments({ sessionId, sourceId: "old-display-source", attachments: [stored] });
+      const inspector = new Database(paths.database, { strict: true });
+      inspector.query("DELETE FROM message_attachments WHERE session_id=? AND source_id=?")
+        .run(sessionId, "old-display-source");
+      inspector.close(false);
+    }
+    expect(store.attachmentCustody(retained.digest)?.referenceCount).toBe(mode === "accounted" ? 0 : undefined);
+    const other = new StateStore(paths);
+    const listUnreferenced = store.listUnreferencedAttachments.bind(store);
+    // Restore the exact prototype method below; invoke it only with the
+    // actual blob-store receiver through apply.
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    const listCandidates = AttachmentBlobStore.prototype.listCleanupCandidates;
+    let injected = false;
+    store.listUnreferencedAttachments = (...input) => {
+      const candidates = listUnreferenced(...input);
+      if (mode === "accounted" && !injected && candidates.some((candidate) => candidate.digest === retained.digest)) {
+        injected = true;
+        other.recordMessageAttachments({ sessionId, sourceId: "competing-retained-source", attachments: [stored] });
+      }
+      return candidates;
+    };
+    AttachmentBlobStore.prototype.listCleanupCandidates = async function (...input) {
+      const snapshot = await listCandidates.apply(this, input);
+      if (mode === "unaccounted" && !injected
+        && snapshot.candidates.some((candidate) => candidate.kind === "blob" && candidate.digest === retained.digest)) {
+        injected = true;
+        other.recordMessageAttachments({ sessionId, sourceId: "competing-retained-source", attachments: [stored] });
+      }
+      return snapshot;
+    };
+    try {
+      await service.execute({ kind: "session.send", session: sessionId, message: "Use the second file.",
+        attachments: [sent], idempotencyKey: crypto.randomUUID() }, { signal });
+      expect(injected).toBe(true);
+      expect(store.attachmentCustody(retained.digest)?.referenceCount).toBe(1);
+      expect(store.messageAttachmentManifest(sessionId, "competing-retained-source")).toEqual([retained]);
+      expect(await blobs.read(retained.digest, "text/plain"))
+        .toEqual(new TextEncoder().encode("retain these exact bytes"));
+    } finally {
+      store.listUnreferencedAttachments = listUnreferenced;
+      AttachmentBlobStore.prototype.listCleanupCandidates = listCandidates;
+      other.close();
+    }
+  });
 
-    const sent = await service.execute({
-      attachments: [...legacyAttachments],
-      idempotencyKey: sendKey,
-      kind: "session.send",
-      message: sendMessage,
-      session: session.id,
-    }, { signal }) as { attachments: readonly { name: string }[] };
-    expect(sent.attachments.map(({ name }) => name)).toEqual(projectedNames);
-    expect(codex.startTurnAttachments.at(-1)?.attachments?.map(({ name }) => name))
-      .toEqual(projectedNames);
-    expect(store.messageAttachmentManifest(session.id, preparedSend.id)
-      .map(({ name }) => name)).toEqual(projectedNames);
+  test.each(["session.send", "session.steer", "session.queue"] as const)("attachment ingress protects %s before its first blob read", async (kind) => {
+    const value = await fixture();
+    const { service, store, paths, documents, daemonGeneration, daemonBootId } = value;
+    const { sessionId } = await createIdleSession(value, "Reserved attachment read");
+    if (kind !== "session.send") {
+      await service.execute({ kind: "session.send", session: sessionId, message: "Keep this turn active." }, { signal });
+    }
+    await writeFile(join(documents, "reserved-read.txt"), "protect bytes before reading them");
+    const blobs = AttachmentBlobStore.forStatePaths(paths);
+    const references = await ingestAttachments(blobs, ["reserved-read.txt"], documents);
+    const reference = references[0];
+    if (reference === undefined) throw new Error("Missing reserved read fixture.");
+    await utimes(blobs.pathFor(reference.digest, "text/plain"), new Date(1_000), new Date(1_000));
+    const other = new StateStore(paths);
+    // Preserve the prototype method for exact restoration; the hook invokes
+    // it only through apply(this, input), retaining the actual blob store.
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    const read = AttachmentBlobStore.prototype.read;
+    let cleanup: ReturnType<StateStore["cleanupAttachmentCandidate"]> | undefined;
+    AttachmentBlobStore.prototype.read = async function (...input) {
+      if (input[0] === reference.digest && cleanup === undefined) {
+        cleanup = other.cleanupAttachmentCandidate({ daemonGeneration, bootId: daemonBootId,
+          candidate: { kind: "blob", digest: reference.digest, canonicalMediaType: "text/plain" } });
+      }
+      return await read.apply(this, input);
+    };
+    try {
+      const result = await service.execute({ kind, session: sessionId, message: "Read the protected original input.",
+        attachments: [...references] }, { signal }) as { idempotencyKey: string };
+      expect(cleanup).toEqual({ kind: "retained", reason: "reserved" });
+      expect(store.readMutation(result.idempotencyKey)?.state).toBe("applied");
+      expect(await blobs.read(reference.digest, "text/plain"))
+        .toEqual(new TextEncoder().encode("protect bytes before reading them"));
+    } finally {
+      AttachmentBlobStore.prototype.read = read;
+      other.close();
+    }
+  });
 
-    const providerCallsAfterSend = [...codex.calls];
-    const replayedSend = await service.execute({
-      attachments: [...legacyAttachments],
-      idempotencyKey: sendKey,
-      kind: "session.send",
-      message: sendMessage,
-      session: session.id,
-    }, { signal }) as { attachments: readonly { name: string }[] };
-    expect(replayedSend.attachments.map(({ name }) => name)).toEqual(projectedNames);
-    expect(codex.calls).toEqual(providerCallsAfterSend);
+  test.each(["session.send", "session.steer", "session.queue"] as const)("attachment ingress releases only its %s invocation after a missing-byte refusal", async (kind) => {
+    const value = await fixture();
+    const { service, store, paths } = value;
+    const { sessionId } = await createIdleSession(value, "Missing attachment reservation");
+    if (kind !== "session.send") {
+      await service.execute({ kind: "session.send", session: sessionId, message: "Keep this turn active." }, { signal });
+    }
+    const reserve = store.reserveAttachmentIngress.bind(store);
+    const release = store.releaseAttachmentIngress.bind(store);
+    const reservations: ReturnType<StateStore["reserveAttachmentIngress"]>[] = [];
+    const releases: ReturnType<StateStore["releaseAttachmentIngress"]>[] = [];
+    store.reserveAttachmentIngress = (input) => {
+      const result = reserve(input);
+      reservations.push(result);
+      return result;
+    };
+    store.releaseAttachmentIngress = (input) => {
+      const result = release(input);
+      releases.push(result);
+      return result;
+    };
+    const key = crypto.randomUUID();
+    try {
+      await expect(service.execute({ kind, session: sessionId, message: "Do not dispatch missing bytes.", idempotencyKey: key,
+        attachments: [{ digest: "c".repeat(64), name: "missing.txt", mediaType: "text/plain", byteLength: 7 }] }, { signal }))
+        .rejects.toMatchObject({ code: "INVALID_INPUT" });
+      expect(reservations.map((reservation) => reservation.kind)).toEqual(["reserved"]);
+      expect(releases).toEqual([{ released: true, reason: "released" }]);
+      expect(store.readMutation(key)).toBeNull();
+      const inspector = new Database(paths.database, { readonly: true, strict: true });
+      try {
+        expect(inspector.query("SELECT COUNT(*) AS count FROM attachment_custody_slots").get()).toEqual({ count: 0 });
+      } finally {
+        inspector.close(false);
+      }
+    } finally {
+      store.reserveAttachmentIngress = reserve;
+      store.releaseAttachmentIngress = release;
+    }
+  });
 
-    const absentKey = "00000000-0000-4000-8000-00000000020b";
-    await expect(service.execute({
-      attachments: [...legacyAttachments],
-      idempotencyKey: absentKey,
-      kind: "session.send",
-      message: sendMessage,
-      session: session.id,
-    }, { signal })).rejects.toMatchObject({ code: "INVALID_INPUT" });
-    expect(store.readMutation(absentKey)).toBeNull();
-    expect(codex.calls).toEqual(providerCallsAfterSend);
+  test.each(["session.send", "session.steer"] as const)("completed %s attachment replay needs no live slot, blob or provider preflight", async (kind) => {
+    const value = await fixture();
+    const { service, store, paths, documents, codex, daemonGeneration, daemonBootId } = value;
+    const { sessionId } = await createIdleSession(value, "Historical attachment receipt");
+    if (kind === "session.steer") {
+      await service.execute({ kind: "session.send", session: sessionId, message: "Keep this turn active." }, { signal });
+    }
+    await writeFile(join(documents, "receipt.txt"), "the original accepted attachment");
+    const blobs = AttachmentBlobStore.forStatePaths(paths);
+    const references = await ingestAttachments(blobs, ["receipt.txt"], documents);
+    const reference = references[0];
+    if (reference === undefined) throw new Error("Missing accepted attachment fixture.");
+    const command = { kind, session: sessionId, message: "Keep this receipt replayable.",
+      attachments: [...references], idempotencyKey: crypto.randomUUID() };
+    const first = await service.execute(command, { signal }) as { turnId: string };
+    const session = store.requireSession(sessionId);
+    const providerAuthority = store.requireProviderAccountAuthority(session.profileId, session.provider);
+    const holds: Array<{ reservationId: string; reservationDigest: string }> = [];
+    try {
+      for (let index = 0; index < 64; index++) {
+        const hold = store.reserveAttachmentIngress({ kind, sessionId, message: "Occupy one independent slot.",
+          idempotencyKey: crypto.randomUUID(), attachments: references, providerAuthority, daemonGeneration, bootId: daemonBootId });
+        if (hold.kind !== "reserved") throw new Error("Expected an attached live slot.");
+        holds.push({ reservationId: hold.reservationId, reservationDigest: hold.reservationDigest });
+      }
+      const calls = [...codex.calls];
+      const events = store.listSessionEvents({ sessionId, afterSequence: 0 }).events;
+      const receipt = { turnId: first.turnId, attachments: references, idempotencyKey: command.idempotencyKey };
+      await expect(service.execute(command, { signal })).resolves.toMatchObject(receipt);
+      await blobs.remove(reference.digest, "text/plain");
+      store.setSessionTurnState({ sessionId, expectedRevision: session.revision, state: "recovery_required" });
+      await expect(service.execute(command, { signal })).resolves.toMatchObject(receipt);
+      expect(codex.calls).toEqual(calls);
+      expect(store.listSessionEvents({ sessionId, afterSequence: 0 }).events).toEqual(events);
+    } finally {
+      for (const hold of holds) store.releaseAttachmentIngress({ ...hold, daemonGeneration, bootId: daemonBootId });
+    }
+  });
 
-    const steerKey = "00000000-0000-4000-8000-00000000020c";
-    const steerMessage = "finish the prepared steer";
-    const preparedSteer = store.prepareMutation({
-      authorityGeneration: profile.processGeneration,
-      authorityId: session.id,
-      idempotencyKey: steerKey,
-      kind: "session.steer",
-      request: { message: steerMessage, attachments: legacyAttachments },
-    });
-    const steered = await service.execute({
-      attachments: [...legacyAttachments],
-      idempotencyKey: steerKey,
-      kind: "session.steer",
-      message: steerMessage,
-      session: session.id,
-    }, { signal }) as { attachments: readonly { name: string }[]; steered: boolean };
-    expect(steered.steered).toBe(true);
-    expect(steered.attachments.map(({ name }) => name)).toEqual(projectedNames);
-    expect(codex.steerAttachments.at(-1)?.attachments?.map(({ name }) => name))
-      .toEqual(projectedNames);
-    expect(store.messageAttachmentManifest(session.id, preparedSteer.id)
-      .map(({ name }) => name)).toEqual(projectedNames);
-    const providerCallsAfterSteer = [...codex.calls];
-    await expect(service.execute({
-      attachments: [...legacyAttachments],
-      idempotencyKey: steerKey,
-      kind: "session.steer",
-      message: `${steerMessage} changed`,
-      session: session.id,
-    }, { signal })).rejects.toMatchObject({ code: "INVALID_INPUT" });
-    expect(codex.calls).toEqual(providerCallsAfterSteer);
+  test.each(["session.send", "session.steer"] as const)("raced completed %s attachment replay has no post-receipt side effects", async (kind) => {
+    const value = await fixture();
+    const { service, store, paths, documents, codex } = value;
+    const { sessionId } = await createIdleSession(value, "Raced attachment receipt");
+    if (kind === "session.steer") {
+      await service.execute({ kind: "session.send", session: sessionId, message: "Keep this turn active." }, { signal });
+    } else codex.turnStatus = "completed";
+    await service.settled();
+    await writeFile(join(documents, "raced-receipt.txt"), "one attached native effect");
+    const references = await ingestAttachments(AttachmentBlobStore.forStatePaths(paths), ["raced-receipt.txt"], documents);
+    const reference = references[0];
+    if (reference === undefined) throw new Error("Missing raced attachment fixture.");
+    const command = { kind, session: sessionId, message: "Accept this exact original input once.",
+      attachments: [...references], idempotencyKey: crypto.randomUUID() };
+    const other = new StateStore(paths);
+    // A separate service has separate ranked locks, but the same persisted
+    // boot and exact runtime authority. It can complete while this caller is
+    // suspended in its first attachment read without a same-lock deadlock.
+    const winner = new OompaService({ store: other, paths, codex, cloud: value.cloud,
+      daemonAuthority: value.daemonAuthority, daemonGeneration: value.daemonGeneration,
+      daemonBootId: value.daemonBootId, eventCursors: value.eventCursors, platform: "linux", requestStop: () => undefined });
+    const readReplay = store.readSessionInputReplay.bind(store);
+    const listUnreferenced = store.listUnreferencedAttachments.bind(store);
+    const nextPendingQueue = store.nextPendingQueue.bind(store);
+    const resetCounter = store.resetAutorespondCounter.bind(store);
+    // The original method is invoked only with its actual blob-store receiver.
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    const readBlob = AttachmentBlobStore.prototype.read;
+    const observed = { nullPreflight: false, injected: false, sweepReads: 0, queueReads: 0, counterResets: 0 };
+    let accepted: { turnId: string } | undefined;
+    const original = { receipt: null as ReturnType<StateStore["readMutation"]> };
+    let nativeCalls: Array<"send" | "steer"> = [];
+    let userMessages: Array<ReturnType<StateStore["listSessionEvents"]>["events"][number]> = [];
+    store.readSessionInputReplay = (input) => {
+      const result = readReplay(input);
+      if (input.idempotencyKey === command.idempotencyKey && result === null) observed.nullPreflight = true;
+      return result;
+    };
+    store.listUnreferencedAttachments = (...input) => { observed.sweepReads += 1; return listUnreferenced(...input); };
+    store.nextPendingQueue = (...input) => { observed.queueReads += 1; return nextPendingQueue(...input); };
+    store.resetAutorespondCounter = (...input) => { observed.counterResets += 1; return resetCounter(...input); };
+    AttachmentBlobStore.prototype.read = async function (...input) {
+      if (input[0] === reference.digest && !observed.injected) {
+        observed.injected = true;
+        expect(observed.nullPreflight).toBe(true);
+        expect(other.readMutation(command.idempotencyKey)).toBeNull();
+        accepted = await winner.execute(command, { signal }) as { turnId: string };
+        await winner.settled();
+        original.receipt = other.readMutation(command.idempotencyKey);
+        expect(original.receipt?.state).toBe("applied");
+        other.bumpAutorespondCounter(sessionId);
+        nativeCalls = codex.calls.filter((call) => call === "send" || call === "steer");
+        userMessages = other.listSessionEvents({ sessionId, afterSequence: 0 }).events
+          .filter((event) => event.body.type === "user_message");
+        expect(userMessages.filter((event) => event.body.type === "user_message" && event.body.text === command.message)).toHaveLength(1);
+      }
+      return await readBlob.apply(this, input);
+    };
+    try {
+      const result = await service.execute(command, { signal });
+      await service.settled();
+      expect(observed.injected).toBe(true);
+      expect(accepted).toBeDefined();
+      expect(result).toMatchObject({ turnId: accepted?.turnId, attachments: references, idempotencyKey: command.idempotencyKey });
+      if (original.receipt === null) throw new Error("Missing competing terminal receipt.");
+      expect(store.readMutation(command.idempotencyKey)).toEqual(original.receipt);
+      expect({
+        nativeCalls: codex.calls.filter((call) => call === "send" || call === "steer"),
+        userMessages: store.listSessionEvents({ sessionId, afterSequence: 0 }).events.filter((event) => event.body.type === "user_message"),
+        sweepReads: observed.sweepReads, queueReads: observed.queueReads, counterResets: observed.counterResets,
+        consecutive: store.readAutorespondBudgets(sessionId).consecutive,
+      }).toEqual({ nativeCalls, userMessages, sweepReads: 0, queueReads: 0, counterResets: 0, consecutive: 1 });
+    } finally {
+      AttachmentBlobStore.prototype.read = readBlob;
+      store.readSessionInputReplay = readReplay;
+      store.listUnreferencedAttachments = listUnreferenced;
+      store.nextPendingQueue = nextPendingQueue;
+      store.resetAutorespondCounter = resetCounter;
+      await winner.close();
+      other.close();
+    }
+  });
+
+  test("attachment release diagnostics do not replace the original missing-byte refusal", async () => {
+    const value = await fixture();
+    const { service, store } = value;
+    const { sessionId } = await createIdleSession(value, "Attachment release diagnostics");
+    const release = store.releaseAttachmentIngress.bind(store);
+    store.releaseAttachmentIngress = (input) => {
+      release(input);
+      throw new Error("private attachment release detail");
+    };
+    try {
+      await expect(service.execute({ kind: "session.send", session: sessionId, message: "Keep the original refusal.",
+        attachments: [{ digest: "d".repeat(64), name: "missing.txt", mediaType: "text/plain", byteLength: 7 }] }, { signal }))
+        .rejects.toMatchObject({ code: "INVALID_INPUT" });
+      expect(service.backgroundDiagnostics().last).toMatchObject({
+        code: "attachment_ingress_release_failed", cause: "error", count: 1,
+      });
+      expect(JSON.stringify(service.backgroundDiagnostics())).not.toContain("private attachment release detail");
+    } finally {
+      store.releaseAttachmentIngress = release;
+    }
+  });
+
+  test.each(["session.send", "session.steer"] as const)("attachment admission rolls back %s begin and preserves exact prepared retry", async (kind) => {
+    const value = await fixture();
+    const { service, store, paths, documents, codex } = value;
+    const { sessionId } = await createIdleSession(value, "Atomic attachment begin");
+    if (kind === "session.steer") {
+      await service.execute({ kind: "session.send", session: sessionId, message: "Keep this turn active." }, { signal });
+    }
+    await writeFile(join(documents, "atomic-input.txt"), "read exactly once at provider dispatch");
+    const blobs = AttachmentBlobStore.forStatePaths(paths);
+    const references = await ingestAttachments(blobs, ["atomic-input.txt"], documents);
+    const reference = references[0];
+    if (reference === undefined) throw new Error("Missing atomic attachment fixture.");
+    const command = { kind, session: sessionId, message: "Preserve this original input.",
+      attachments: [...references], idempotencyKey: crypto.randomUUID() };
+    const providerCall = kind === "session.send" ? "send" : "steer";
+    const calls = codex.calls.filter((call) => call === providerCall).length;
+    const inspector = new Database(paths.database, { strict: true });
+    try {
+      inspector.exec("CREATE TRIGGER fail_session_input_manifest BEFORE INSERT ON message_attachments BEGIN SELECT RAISE(ABORT,'injected_session_input_manifest_failure'); END");
+      await expect(service.execute(command, { signal })).rejects.toThrow("injected_session_input_manifest_failure");
+      const prepared = store.readMutation(command.idempotencyKey);
+      expect(prepared?.state).toBe("prepared");
+      expect(prepared?.evidence).toBeUndefined();
+      expect(store.messageAttachmentManifest(sessionId, prepared?.id ?? "missing")).toEqual([]);
+      expect(codex.calls.filter((call) => call === providerCall)).toHaveLength(calls);
+      expect(await blobs.read(reference.digest, "text/plain"))
+        .toEqual(new TextEncoder().encode("read exactly once at provider dispatch"));
+      inspector.exec("DROP TRIGGER fail_session_input_manifest");
+      await service.execute(command, { signal });
+      const accepted = store.readMutation(command.idempotencyKey);
+      expect(accepted?.id).toBe(prepared?.id);
+      expect(accepted?.state).toBe("applied");
+      expect(store.messageAttachmentManifest(sessionId, accepted?.id ?? "missing")).toEqual(references);
+      expect(codex.calls.filter((call) => call === providerCall)).toHaveLength(calls + 1);
+    } finally {
+      inspector.exec("DROP TRIGGER IF EXISTS fail_session_input_manifest");
+      inspector.close(false);
+    }
   });
 
   test("refuses a message whose attachment is not in local custody", async () => {
@@ -14743,6 +16325,177 @@ describe("HraService", () => {
     }, { signal })).rejects.toMatchObject({ code: "INVALID_INPUT" });
   });
 
+  test.each(["rename", "reorder", "omit", "append"] as const)("queue attachment identity rejects a %s retry without changing custody", async (change) => {
+    const { service, codex, documents, paths, store } = await fixture();
+    const added = await service.execute({ kind: "account.add", label: "Queue identity" }, { signal }) as { account: { id: string } };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    await service.execute({ kind: "project.add", label: "Documents", path: documents }, { signal });
+    const started = await service.execute({ presetContract: legacyPresetContract, kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    await service.execute({ kind: "session.send", session: started.session.id, message: "Keep the provider busy." }, { signal });
+    await writeFile(join(documents, "first.txt"), "first attachment");
+    await writeFile(join(documents, "second.txt"), "second attachment");
+    const references = await ingestAttachments(AttachmentBlobStore.forStatePaths(paths), ["first.txt", "second.txt"], documents);
+    const one = references[0];
+    if (one === undefined) throw new Error("Missing queue attachment fixture.");
+    const command = { kind: "session.queue" as const, session: started.session.id, message: "Use both files.",
+      attachments: [...references], idempotencyKey: crypto.randomUUID() };
+    const first = await service.execute(command, { signal }) as { queued: { id: string } };
+    const manifest = store.messageAttachmentManifest(started.session.id, first.queued.id);
+    const custody = references.map((reference) => store.attachmentCustody(reference.digest));
+    const calls = [...codex.calls];
+    const attachments = change === "rename" ? [{ ...one, name: "renamed.txt" }, ...references.slice(1)]
+      : change === "reorder" ? [...references].reverse()
+        : change === "omit" ? [] : [...references, { ...one, name: "extra.txt" }];
+    await expect(service.execute({ ...command, attachments }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(store.listQueue(started.session.id)).toHaveLength(1);
+    expect(store.messageAttachmentManifest(started.session.id, first.queued.id)).toEqual(manifest);
+    expect(references.map((reference) => store.attachmentCustody(reference.digest))).toEqual(custody);
+    expect(codex.calls).toEqual(calls);
+  });
+
+  test("queue attachment identity rolls back enqueue when manifest admission fails", async () => {
+    const { service, documents, paths, store } = await fixture();
+    const added = await service.execute({ kind: "account.add", label: "Queue rollback" }, { signal }) as { account: { id: string } };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    await service.execute({ kind: "project.add", label: "Documents", path: documents }, { signal });
+    const started = await service.execute({ presetContract: legacyPresetContract, kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    await service.execute({ kind: "session.send", session: started.session.id, message: "Keep the provider busy." }, { signal });
+    await writeFile(join(documents, "atomic.txt"), "atomic attachment");
+    const references = await ingestAttachments(AttachmentBlobStore.forStatePaths(paths), ["atomic.txt"], documents);
+    const command = { kind: "session.queue" as const, session: started.session.id, message: "All or nothing.",
+      attachments: [...references], idempotencyKey: crypto.randomUUID() };
+    const inspector = new Database(paths.database, { strict: true });
+    try {
+      inspector.exec("CREATE TRIGGER fail_queue_manifest BEFORE INSERT ON message_attachments BEGIN SELECT RAISE(ABORT,'injected_queue_manifest_failure'); END");
+      await expect(service.execute(command, { signal })).rejects.toThrow("injected_queue_manifest_failure");
+      expect(store.listQueue(started.session.id)).toEqual([]);
+      expect(store.readMutation(command.idempotencyKey)).toBeNull();
+    } finally {
+      inspector.exec("DROP TRIGGER fail_queue_manifest");
+      inspector.close(false);
+    }
+  });
+
+  test("queue attachment identity replays before blob and live session preflight", async () => {
+    const { service, codex, documents, paths, store } = await fixture();
+    const added = await service.execute({ kind: "account.add", label: "Queue historical replay" }, { signal }) as { account: { id: string } };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    await service.execute({ kind: "project.add", label: "Documents", path: documents }, { signal });
+    const started = await service.execute({ presetContract: legacyPresetContract, kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    await service.execute({ kind: "session.send", session: started.session.id, message: "Keep the provider busy." }, { signal });
+    await writeFile(join(documents, "historical.txt"), "historical attachment");
+    const blobs = AttachmentBlobStore.forStatePaths(paths);
+    const references = await ingestAttachments(blobs, ["historical.txt"], documents);
+    const reference = references[0];
+    if (reference === undefined) throw new Error("Missing queue replay fixture.");
+    const command = { kind: "session.queue" as const, session: started.session.id, message: "Keep the original receipt.",
+      attachments: [...references], idempotencyKey: crypto.randomUUID() };
+    const first = await service.execute(command, { signal });
+    await blobs.remove(reference.digest, "text/plain");
+    const current = store.requireSession(started.session.id);
+    store.setSessionTurnState({ sessionId: current.id, expectedRevision: current.revision, state: "recovery_required" });
+    const calls = [...codex.calls];
+    await expect(service.execute(command, { signal })).resolves.toEqual(first);
+    expect(store.listQueue(started.session.id)).toHaveLength(1);
+    expect(codex.calls).toEqual(calls);
+  });
+
+  test("queue attachment identity does not sweep or schedule when another writer wins after replay preflight", async () => {
+    const value = await fixture();
+    const { service, store, paths, documents, codex } = value;
+    const { sessionId } = await createIdleSession(value, "Queue replay race");
+    await writeFile(join(documents, "race.txt"), "shared queue attachment");
+    const references = await ingestAttachments(AttachmentBlobStore.forStatePaths(paths), ["race.txt"], documents);
+    const captured = store.requireSessionProviderAuthority(sessionId);
+    const authority = { provider: captured.provider, providerAccountId: captured.providerAccountId, profileId: captured.profileId,
+      bindingGeneration: captured.bindingGeneration, processGeneration: captured.processGeneration };
+    const command = { kind: "session.queue" as const, session: sessionId, message: "One accepted queue item.",
+      attachments: [...references], idempotencyKey: crypto.randomUUID() };
+    const other = new StateStore(paths);
+    const readReplay = store.readQueueEnqueueReplay.bind(store);
+    const listUnreferenced = store.listUnreferencedAttachments.bind(store);
+    let injected = false;
+    let sweepReads = 0;
+    store.readQueueEnqueueReplay = (input) => {
+      const result = readReplay(input);
+      if (!injected && result === null && input.idempotencyKey === command.idempotencyKey) {
+        injected = true;
+        const reservation = other.reserveAttachmentIngress({ kind: "session.queue", sessionId,
+          idempotencyKey: command.idempotencyKey, message: command.message, attachments: references,
+          providerAuthority: authority, daemonGeneration: value.daemonGeneration, bootId: value.daemonBootId });
+        if (reservation.kind !== "reserved") throw new Error("Missing competing queue reservation.");
+        other.enqueueIdempotent({ sessionId, message: command.message, idempotencyKey: command.idempotencyKey,
+          profileGeneration: authority.processGeneration, providerAuthority: authority,
+          attachmentReservation: { reservationId: reservation.reservationId, reservationDigest: reservation.reservationDigest,
+            daemonGeneration: value.daemonGeneration, bootId: value.daemonBootId },
+          attachments: references,
+          storedAttachments: references.map((reference) => ({ ...reference, canonicalMediaType: "text/plain" as const })) });
+      }
+      return result;
+    };
+    store.listUnreferencedAttachments = (...input) => {
+      sweepReads += 1;
+      return listUnreferenced(...input);
+    };
+    const calls = [...codex.calls];
+    try {
+      await expect(service.execute(command, { signal })).resolves.toMatchObject({ queued: { state: "pending" } });
+      await service.settled();
+      expect(injected).toBe(true);
+      expect(store.listQueue(sessionId)).toHaveLength(1);
+      expect(sweepReads).toBe(0);
+      // The null preflight still requires fresh account identity before the
+      // atomic enqueue discovers the competing receipt. No other work runs.
+      expect(codex.calls).toEqual([...calls, "readAccount"]);
+    } finally {
+      store.readQueueEnqueueReplay = readReplay;
+      store.listUnreferencedAttachments = listUnreferenced;
+      other.close();
+    }
+  });
+
+  test("queue attachment identity quarantines an unproved legacy FIFO head until explicit abandonment", async () => {
+    const value = await fixture(undefined, new FakeCloud(), () => undefined,
+      () => 1_900_000_001_000, undefined, {}, { canonical40Queues: true });
+    const { service, store, paths, codex } = value;
+    const archived = canonical40QueuesFixture.queues.find((entry) => entry.state === "pending");
+    if (archived === undefined) throw new Error("Missing archived pending queue.");
+    const { sessionId, queueId: legacyId } = archived;
+    const inspector = new Database(paths.database, { strict: true });
+    try {
+      // Released canonical40 kept no immutable queue tuple or attachment seal.
+      // Migration must quarantine that history, not borrow the session's tuple.
+      expect(inspector.query("SELECT * FROM queue_provider_authorities WHERE queue_id=?").get(legacyId)).toBeNull();
+      expect(inspector.query("SELECT * FROM queue_attachment_identities WHERE queue_id=?").get(legacyId)).toBeNull();
+    } finally {
+      inspector.close(false);
+    }
+    const calls = [...codex.calls];
+    const originalQueue = store.listQueue(sessionId);
+    expect(originalQueue.map((entry) => entry.id)).toEqual([legacyId]);
+    const laterKey = crypto.randomUUID();
+    await expect(service.execute({ kind: "session.queue", session: sessionId, message: "A later proved request.",
+      idempotencyKey: laterKey }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await service.settled();
+    expect(store.listQueue(sessionId)).toEqual(originalQueue);
+    expect(store.readMutation(laterKey)).toBeNull();
+    expect(store.requireQueue(legacyId)).toMatchObject({ state: "pending", message: archived.originalMessage });
+    expect(store.requireSession(sessionId).state).toBe("recovery_required");
+    expect(codex.calls).toEqual(calls);
+    await expect(service.execute({ kind: "session.recover", session: sessionId }, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED", details: { reason: "queue_attachment_identity_unproved" } });
+    expect(codex.calls).toEqual(calls);
+    expect(store.requireQueue(legacyId).message).toBe(archived.originalMessage);
+    await expect(service.execute({ kind: "session.abandon", session: sessionId }, { signal }))
+      .resolves.toMatchObject({ recovery: { resolved: true, resolution: "abandoned", providerEffectRetried: false, providerStateDeleted: false } });
+    await service.settled();
+    expect(store.requireQueue(legacyId)).toMatchObject({ state: "cancelled", message: "[queue message removed after settlement]" });
+    expect(store.hasUnsettledQueueAttachmentQuarantineForSession(sessionId)).toBe(false);
+    expect(store.listQueue(sessionId)).toHaveLength(1);
+    expect(store.requireSession(sessionId).state).toBe("terminal");
+    expect(codex.calls).toEqual(calls);
+  });
+
   test("pages neutral transcript records without skipping and reports retained-history loss", async () => {
     let currentTime = 1_000;
     const value = await fixture(
@@ -14757,6 +16510,7 @@ describe("HraService", () => {
     const append = (text: string): void => {
       currentTime += 1;
       value.store.appendSessionEvent({
+        providerAuthority: value.store.requireProviderAccountAuthority(profile.id, "codex"),
         accountId: profile.id,
         body: {
           actor: "human",
@@ -14808,7 +16562,6 @@ describe("HraService", () => {
       expect(retained.retentionGapReason).toBe("retention_age");
     }
   });
-
   test("hooks host-owned facts memory into start, resume, terminal archive, and expiry without a model command", async () => {
     const factsMemory = new FakeFactsMemoryLifecycle();
     const now = () => 10_000;
@@ -14852,7 +16605,7 @@ describe("HraService", () => {
     }).success).toBe(false);
   });
 
-  test("refuses a cross-account provider switch before effects once working memory is bound", async () => {
+  test.each([false, true])("honors bound working-memory ownership during a cross-account switch (unsettled=%s)", async (unsettled) => {
     const factsMemory = new FakeFactsMemoryLifecycle();
     const value = await fixture(
       undefined,
@@ -14879,7 +16632,7 @@ describe("HraService", () => {
       preset: "high",
       presetContract: legacyPresetContract,
       fast: false,
-    }, { signal }) as { session: { id: string } };
+    }, { signal }) as { session: { id: `sess_${string}` } };
     const target = await value.service.execute(
       { kind: "account.add", label: "Memory switch target" },
       { signal },
@@ -14889,20 +16642,52 @@ describe("HraService", () => {
       { signal },
     );
     const callsBeforeSwitch = [...value.codex.calls];
-
-    const refused = await value.service.execute({
-      account: target.account.id,
+    const memoryBefore = factsMemory.readSession(started.session.id);
+    if (memoryBefore === null) throw new Error("Expected an existing facts-memory owner.");
+    expect(memoryBefore.ownerId).toBe(source.account.id);
+    const session = value.store.requireSession(started.session.id);
+    if (session.projectId === undefined) throw new Error("Expected a project-bound session.");
+    const prepared = unsettled ? value.store.prepareMemorySubmission({
+      actorSessionId: session.id, projectId: session.projectId, kind: "remember",
+      requestDigest: "1".repeat(64), contentDigest: "2".repeat(64), keyDigest: "3".repeat(64),
+      workingBindingDigest: memoryBefore.bindingDigest, workingEpoch: memoryBefore.epoch,
+      expectedHead: { sequence: 0, operationSha256: null, headDigest: PROJECT_MEMORY_EMPTY_HEAD.headDigest },
       idempotencyKey: crypto.randomUUID(),
-      kind: "session.switch",
+    }).record : null;
+    const before = serviceFixtureDatabaseSnapshot(value.paths.database);
+    const key = crypto.randomUUID();
+    const command = {
+      account: target.account.id,
+      idempotencyKey: key,
+      kind: "session.switch" as const,
       presetContract: legacyPresetContract,
-      provider: "codex",
+      provider: "codex" as const,
       session: started.session.id,
-    }, { signal }).catch((error: unknown) => error);
-
-    expect(refused).toMatchObject({ code: "CONFLICT", name: "CommandFailure" });
-    expect(String(refused)).toContain("working memory bound to its current account");
-    expect(value.codex.calls).toEqual(callsBeforeSwitch);
-    expect(value.store.requireSession(started.session.id).profileId).toBe(source.account.id);
+    };
+    if (prepared !== null) {
+      await expect(value.service.execute(command, { signal })).rejects.toMatchObject({
+        code: "RECOVERY_REQUIRED", details: { sessionId: session.id, submissionId: prepared.id, submissionState: "prepared" },
+      });
+      expect(value.codex.calls).toEqual(callsBeforeSwitch);
+      expect(serviceFixtureDatabaseSnapshot(value.paths.database)).toEqual(before);
+      expect(factsMemory.readSession(session.id)).toEqual(memoryBefore);
+      expect(factsMemory.transfers).toEqual([]);
+    } else {
+      await value.service.execute(command, { signal });
+      const record = value.store.readSessionSwitchByIdempotencyKey(key);
+      if (record === null) throw new Error("Expected the committed switch journal.");
+      const digest = createHash("sha256").update(JSON.stringify({
+        domain: "hra:session-switch-facts-memory-owner:v1", attemptId: record.attemptId,
+        sourceAuthority: record.sourceAuthority, targetAuthority: record.targetAuthority,
+      })).digest("hex");
+      expect(factsMemory.transfers).toHaveLength(1);
+      expect(factsMemory.transfers[0]).toMatchObject({ sessionId: session.id,
+        fromOwnerId: source.account.id, toOwnerId: target.account.id, operationKey: `session-switch-owner:${digest}` });
+      expect(factsMemory.readSession(session.id)).toEqual({ ...memoryBefore,
+        ownerId: target.account.id, epoch: memoryBefore.epoch + 1 });
+      expect(value.store.requireSession(session.id).profileId).toBe(target.account.id);
+    }
+    expect(factsMemory.cleanups).toEqual([]);
   });
 
   test("cancels pre-effect memory submissions before terminal facts-memory purge", async () => {
@@ -14972,12 +16757,7 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      codexHome: "unused",
-      desktopUserData: "unused",
-      generation: profile.processGeneration,
-      id: profile.id,
-    };
+    const authority: ProfileAuthority = liveAuthorityFor(value.store, profile.id, "codex");
     let entered!: () => void;
     const memoryEntered = new Promise<void>((resolve) => { entered = resolve; });
     let release!: () => void;
@@ -15358,6 +17138,10 @@ describe("HraService", () => {
 
     const crashFactsMemory = new FakeFactsMemoryLifecycle();
     const otherSession = value.store.upsertProviderSession({
+      providerAuthority: value.store.requireProviderAccountAuthority(
+        session.profileId,
+        "codex",
+      ),
       profileId: session.profileId,
       provider: "codex",
       providerThreadId: "provider-thread-crash-terminal",
@@ -15370,6 +17154,10 @@ describe("HraService", () => {
     });
     if (otherSession.providerThreadId === undefined) throw new Error("Expected provider binding.");
     value.store.upsertProviderSession({
+      providerAuthority: value.store.requireProviderAccountAuthority(
+        otherSession.profileId,
+        "codex",
+      ),
       profileId: otherSession.profileId,
       provider: "codex",
       providerThreadId: otherSession.providerThreadId,
@@ -15380,7 +17168,7 @@ describe("HraService", () => {
       state: "terminal",
       title: otherSession.title,
     });
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store: value.store,
       paths: value.paths,
       codex: new FakeCodex(),
@@ -15444,8 +17232,7 @@ describe("HraService", () => {
       preset: "high",
       session: sessionId,
     }, {
-      processGeneration: profile.processGeneration,
-      profileId: profile.id,
+      ...value.store.requireProviderAccountAuthority(profile.id, quarantined.provider),
       providerThreadId: quarantined.providerThreadId,
       sessionId,
     }, { signal })).rejects.toMatchObject(refusal);
@@ -15513,12 +17300,7 @@ describe("HraService", () => {
       enabled: true,
       kind: "session.fast",
       session: session.id,
-    }, {
-      processGeneration: profile.processGeneration,
-      profileId: profile.id,
-      providerThreadId: session.providerThreadId,
-      sessionId: session.id,
-    }, { signal });
+    }, remoteAuthorityFor(value.store, session.id), { signal });
     expect(factsMemory.sweeps).toContain(now);
     expect(factsMemory.ensures.at(-1)).toEqual({
       expiresAt: now + FACTS_MEMORY_SESSION_TTL_MS,
@@ -15567,12 +17349,7 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected provider binding.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     await value.service.observeCodexFact(authority, {
       type: "threadStatusChanged",
       threadId: session.providerThreadId,
@@ -15596,6 +17373,7 @@ describe("HraService", () => {
     });
 
     const poisoned = value.store.upsertProviderSession({
+      providerAuthority: value.store.requireProviderAccountAuthority(profile.id, "codex"),
       profileId: profile.id,
       provider: "codex",
       providerThreadId: "provider-terminal-poisoned",
@@ -15607,6 +17385,7 @@ describe("HraService", () => {
       title: "Poisoned terminal memory",
     });
     const healthy = value.store.upsertProviderSession({
+      providerAuthority: value.store.requireProviderAccountAuthority(profile.id, "codex"),
       profileId: profile.id,
       provider: "codex",
       providerThreadId: "provider-terminal-healthy",
@@ -15619,7 +17398,7 @@ describe("HraService", () => {
     });
     const restartMemory = new FakeFactsMemoryLifecycle();
     restartMemory.cleanupErrors.add(poisoned.id);
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store: value.store,
       paths: value.paths,
       codex: new FakeCodex(),
@@ -15701,7 +17480,7 @@ describe("HraService", () => {
     }
     expect(details).toBeDefined();
     if (details === undefined) throw new Error("Expected memory recovery details.");
-    expect(details.nextCommand).toBe(`hra session show ${details.sessionId}`);
+    expect(details.nextCommand).toBe(`oompa session show ${details.sessionId}`);
     await expect(value.service.execute({
       kind: "session.show",
       session: details.sessionId,
@@ -15796,12 +17575,7 @@ describe("HraService", () => {
       throw new Error("Expected a provider-bound started session.");
     }
     const profile = value.store.requireProfileById(first.session.profileId);
-    await value.service.observeCodexFact({
-      codexHome: "unused",
-      desktopUserData: "unused",
-      generation: profile.processGeneration,
-      id: profile.id,
-    }, {
+    await value.service.observeCodexFact(liveAuthorityFor(value.store, profile.id, "codex"), {
       ...parseFact("thread/deleted", { threadId: first.session.providerThreadId }),
       connectionId: value.codex.observationConnectionId,
     });
@@ -15921,6 +17695,191 @@ describe("HraService", () => {
     expect(codex.resetIdempotencyKeys).toEqual([]);
   });
 
+  test("rejects an initial usage identity proof when its exact provider binding is replaced", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({
+      kind: "account.add",
+      label: "Usage initial authority race",
+    }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    const captured = store.requireProviderAccountAuthority(added.account.id, "codex");
+    codex.beforeReadAccountReturn = async () => {
+      expect(store.setProfileState(
+        added.account.id,
+        captured.processGeneration,
+        "signed_out",
+      )).toBe(true);
+    };
+
+    await expect(service.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: true,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+
+    expect(codex.readAccountAuthorities.slice(-1)[0]).toMatchObject({
+      bindingGeneration: captured.bindingGeneration,
+      generation: captured.processGeneration,
+      id: captured.profileId,
+      provider: "codex",
+      providerAccountId: captured.providerAccountId,
+    });
+    expect(codex.readUsageAuthorities).toEqual([]);
+    expect(store.requireProviderAccountAuthority(added.account.id, "codex")).toMatchObject({
+      bindingGeneration: captured.bindingGeneration + 1,
+      processGeneration: captured.processGeneration,
+    });
+    expect(store.latestUsage(added.account.id)).toBeNull();
+  });
+
+  test("does not cross to a replacement binding after a successful Codex usage read", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({
+      kind: "account.add",
+      label: "Usage success authority race",
+    }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    const captured = store.requireProviderAccountAuthority(added.account.id, "codex");
+    const accountReadsBefore = codex.readAccountAuthorities.length;
+    codex.beforeReadUsageReturn = async () => {
+      expect(store.setProfileState(
+        added.account.id,
+        captured.processGeneration,
+        "signed_out",
+      )).toBe(true);
+    };
+
+    await expect(service.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: true,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+
+    const dispatched = [
+      ...codex.readAccountAuthorities.slice(accountReadsBefore),
+      ...codex.readUsageAuthorities,
+    ];
+    expect(dispatched).toHaveLength(2);
+    for (const authority of dispatched) {
+      expect(authority).toMatchObject({
+        bindingGeneration: captured.bindingGeneration,
+        generation: captured.processGeneration,
+        id: captured.profileId,
+        provider: "codex",
+        providerAccountId: captured.providerAccountId,
+      });
+    }
+    expect(store.requireProviderAccountAuthority(added.account.id, "codex")).toMatchObject({
+      bindingGeneration: captured.bindingGeneration + 1,
+      processGeneration: captured.processGeneration,
+    });
+    expect(store.latestUsage(added.account.id)).toBeNull();
+  });
+
+  test("preserves the original read failure and writes no failure row after authority replacement", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({
+      kind: "account.add",
+      label: "Usage failure authority race",
+    }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    const captured = store.requireProviderAccountAuthority(added.account.id, "codex");
+    const readFailure = new Error("provider usage exploded");
+    codex.usageError = readFailure;
+    codex.beforeReadUsageReturn = async () => {
+      expect(store.setProfileState(
+        added.account.id,
+        captured.processGeneration,
+        "signed_out",
+      )).toBe(true);
+    };
+
+    let rejected: unknown;
+    try {
+      await service.execute({
+        kind: "account.usage",
+        account: added.account.id,
+        refresh: true,
+      }, { signal });
+    } catch (error: unknown) {
+      rejected = error;
+    }
+    expect(rejected).toBe(readFailure);
+    expect(codex.readUsageAuthorities.slice(-1)[0]).toMatchObject({
+      bindingGeneration: captured.bindingGeneration,
+      generation: captured.processGeneration,
+      providerAccountId: captured.providerAccountId,
+    });
+    const fingerprint = createHash("sha256").update("person@example.com").digest("hex");
+    expect(store.latestUsagePollFailure(added.account.id, fingerprint)).toBeNull();
+    expect(store.latestUsage(added.account.id)).toBeNull();
+  });
+
+  test("rejects a replacement that lands during the exact post-read identity proof", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({
+      kind: "account.add",
+      label: "Usage second proof authority race",
+    }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    const captured = store.requireProviderAccountAuthority(added.account.id, "codex");
+    const accountReadsBefore = codex.readAccountAuthorities.length;
+    let usageProofReads = 0;
+    codex.beforeReadAccountReturn = async () => {
+      usageProofReads += 1;
+      if (usageProofReads === 2) {
+        expect(store.setProfileState(
+          added.account.id,
+          captured.processGeneration,
+          "signed_out",
+        )).toBe(true);
+      }
+    };
+
+    await expect(service.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: true,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+
+    expect(usageProofReads).toBe(2);
+    const dispatched = [
+      ...codex.readAccountAuthorities.slice(accountReadsBefore),
+      ...codex.readUsageAuthorities,
+    ];
+    expect(dispatched).toHaveLength(3);
+    for (const authority of dispatched) {
+      expect(authority).toMatchObject({
+        bindingGeneration: captured.bindingGeneration,
+        generation: captured.processGeneration,
+        id: captured.profileId,
+        provider: "codex",
+        providerAccountId: captured.providerAccountId,
+      });
+    }
+    expect(store.requireProviderAccountAuthority(added.account.id, "codex")).toMatchObject({
+      bindingGeneration: captured.bindingGeneration + 1,
+      processGeneration: captured.processGeneration,
+    });
+    expect(store.latestUsage(added.account.id)).toBeNull();
+  });
+
   test("keeps below-threshold usage polling to the identity sandwich", async () => {
     const { service, codex } = await fixture();
     const added = await service.execute({
@@ -15970,6 +17929,299 @@ describe("HraService", () => {
       "readAccount",
     ]);
     expect(codex.resetIdempotencyKeys).toEqual([]);
+  });
+
+  describe("automatic policy reset admission", () => {
+    const fingerprint = createHash("sha256").update("person@example.com").digest("hex");
+    const limits = (usedPercent = 99, credits = 1, resetsAt = automaticResetWindowResetsAtSeconds) => ({
+      rateLimits: {
+        primary: {
+          limitId: "codex",
+          primary: { usedPercent, windowDurationMins: 10_080, resetsAt },
+          secondary: null,
+        },
+        byLimitId: null,
+        resetCreditsAvailable: credits,
+      },
+    });
+    const configure = (
+      store: StateStore,
+      change: Parameters<StateStore["updateAutomaticUsagePolicyConfiguration"]>[0]["change"],
+    ) => store.updateAutomaticUsagePolicyConfiguration({
+      idempotencyKey: crypto.randomUUID(),
+      expectedAutomaticPolicyRevision: store.readAutomaticUsagePolicyConfiguration().automaticPolicyRevision,
+      change,
+    });
+    const setup = async () => {
+      const value = await fixture(undefined, new FakeCloud(), () => undefined,
+        () => automaticResetWindowResetsAt - 3 * 24 * 60 * 60_000);
+      const added = await value.service.execute({ kind: "account.add", label: "Policy reset" }, { signal }) as {
+        account: { id: `acct_${string}` };
+      };
+      await value.service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+      value.codex.usageResult = { revision: 1, observedAt: 2_000, payload: limits() };
+      return { ...value, profileId: added.account.id };
+    };
+    const refresh = (value: Awaited<ReturnType<typeof setup>>) => value.service.execute({
+      kind: "account.usage", account: value.profileId, refresh: true,
+    }, { signal });
+    const effectRows = (value: Awaited<ReturnType<typeof setup>>) => {
+      const db = new Database(value.paths.database, { readonly: true, strict: true });
+      try {
+        return {
+          attempts: db.query("SELECT * FROM account_rate_limit_reset_attempts ORDER BY idempotency_key").all(),
+          authorities: db.query("SELECT * FROM account_rate_limit_reset_provider_authorities ORDER BY idempotency_key,process_generation,policy_revision").all(),
+          rebinds: db.query("SELECT * FROM account_rate_limit_reset_rebinds ORDER BY idempotency_key,from_process_generation").all(),
+          policies: db.query("SELECT * FROM account_rate_limit_reset_policies ORDER BY profile_id").all(),
+          sessions: db.query("SELECT * FROM sessions ORDER BY id").all(),
+          mutations: db.query("SELECT * FROM mutation_attempts ORDER BY id").all(),
+          pointers: db.query("SELECT * FROM provider_account_states ORDER BY provider").all(),
+        };
+      } finally { db.close(false); }
+    };
+
+    for (const scenario of [
+      { name: "inherited default off", defaultEnabled: false, codex: "inherit", claude: "inherit", enabled: false },
+      { name: "Codex off overrides default on", defaultEnabled: true, codex: "off", claude: "on", enabled: false },
+      { name: "Codex on overrides default off", defaultEnabled: false, codex: "on", claude: "off", enabled: true },
+      { name: "Claude off does not disable Codex", defaultEnabled: true, codex: "inherit", claude: "off", enabled: true },
+      { name: "inherited default on", defaultEnabled: true, codex: "inherit", claude: "inherit", enabled: true },
+    ] as const) {
+      test(`honors effective policy: ${scenario.name}`, async () => {
+        const value = await setup();
+        configure(value.store, { kind: "set_default", enabled: scenario.defaultEnabled });
+        configure(value.store, { kind: "set_override", provider: "codex", override: scenario.codex });
+        configure(value.store, { kind: "set_override", provider: "claude", override: scenario.claude });
+        const before = effectRows(value);
+        const callsBefore = value.codex.calls.length;
+        const response = await refresh(value);
+        expect(response).toMatchObject({ usage: [{ automaticReset: { refresh: scenario.enabled
+          ? { state: "settled", outcome: "reset" }
+          : { state: "suppressed", reason: "automatic_policy_disabled" } } }] });
+        expect(value.codex.resetIdempotencyKeys).toHaveLength(scenario.enabled ? 1 : 0);
+        expect(value.codex.committedStartTurns).toBe(0);
+        expect(value.codex.turnEffectTrace).toEqual([]);
+        expect(value.store.usageRange({ profileId: value.profileId })).toHaveLength(scenario.enabled ? 2 : 1);
+        expect(effectRows(value).pointers).toEqual(before.pointers);
+        expect(effectRows(value).sessions).toEqual(before.sessions);
+        if (!scenario.enabled) {
+          expect(value.codex.calls.slice(callsBefore)).toEqual(["readAccount", "usage", "readAccount"]);
+          expect(effectRows(value)).toEqual(before);
+          const passiveCalls = value.codex.calls.length;
+          await value.service.execute({ kind: "account.usage", account: value.profileId, refresh: false }, { signal });
+          expect(value.codex.calls).toHaveLength(passiveCalls);
+          expect(effectRows(value)).toEqual(before);
+        }
+      });
+    }
+
+    for (const state of ["prepared", "retryable", "ambiguous", "effect_started"] as const) {
+      test(`keeps disabled ${state} attempt immutable without reset or turn`, async () => {
+        const value = await setup();
+        const profile = value.store.requireProfileById(value.profileId);
+        expect(value.store.authorizeAccountRateLimitResetPolicy({
+          profileId: profile.id, processGeneration: profile.processGeneration,
+          accountFingerprint: fingerprint, weeklyWindowDurationMinutes: 10_080,
+          weeklyWindowResetsAt: automaticResetWindowResetsAt,
+        }).decision).toBe("allow");
+        const attempt = value.store.prepareAccountRateLimitReset({
+          profileId: profile.id, processGeneration: profile.processGeneration,
+          accountFingerprint: fingerprint, weeklyWindowResetsAt: automaticResetWindowResetsAt,
+          observedUsedPercent: 99,
+        });
+        if (state !== "prepared") {
+          value.store.beginAccountRateLimitReset(attempt.idempotencyKey,
+            value.store.requireProviderAccountAuthority(profile.id, "codex"));
+          if (state !== "effect_started") value.store.deferAccountRateLimitReset(attempt.idempotencyKey, state);
+        }
+        configure(value.store, { kind: "set_override", provider: "codex", override: "off" });
+        const before = effectRows(value);
+        const callsBefore = value.codex.calls.length;
+        for (const payload of [limits(), limits(0, 0, automaticResetWindowResetsAtSeconds + 86_400)]) {
+          value.codex.usageResult = { revision: 2, observedAt: 2_001, payload };
+          expect(await refresh(value)).toMatchObject({ usage: [{ automaticReset: { refresh:
+            state === "ambiguous" || state === "effect_started"
+              ? { state: "recovery_pending" }
+              : { state: "suppressed", reason: "automatic_policy_disabled" },
+          } }] });
+          expect(effectRows(value)).toEqual(before);
+          expect(value.store.readRecoverableAccountRateLimitReset(profile.id, fingerprint))
+            .toMatchObject({ idempotencyKey: attempt.idempotencyKey, state, outcome: null, localResolution: null });
+        }
+        expect(value.codex.resetIdempotencyKeys).toEqual([]);
+        expect(value.codex.calls.slice(callsBefore)).toEqual([
+          "readAccount", "usage", "readAccount", "readAccount", "usage", "readAccount",
+        ]);
+        expect(value.codex.committedStartTurns).toBe(0);
+        expect(value.codex.turnEffectTrace).toEqual([]);
+      });
+    }
+
+    test("re-enabling reconciles the same disabled ambiguous key after rollover", async () => {
+      const value = await setup();
+      value.codex.resetError = new IndeterminateCodexEffectError("account/rateLimitResetCredit/consume", 99);
+      expect(await refresh(value)).toMatchObject({ usage: [{ automaticReset: { refresh: { state: "recovery_pending" } } }] });
+      const key = value.codex.resetIdempotencyKeys[0];
+      if (key === undefined) throw new Error("Expected original ambiguous key.");
+      configure(value.store, { kind: "set_default", enabled: false });
+      const before = effectRows(value);
+      value.codex.resetError = undefined;
+      value.codex.resetOutcome = "alreadyRedeemed";
+      value.codex.usageResult = { revision: 2, observedAt: 2_001,
+        payload: limits(0, 0, automaticResetWindowResetsAtSeconds + 86_400) };
+      expect(await refresh(value)).toMatchObject({ usage: [{ automaticReset: {
+        lastAttempt: { state: "recovery_pending" }, refresh: { state: "recovery_pending" },
+      } }] });
+      expect(value.codex.resetIdempotencyKeys).toEqual([key]);
+      expect(effectRows(value)).toEqual(before);
+      configure(value.store, { kind: "set_override", provider: "codex", override: "on" });
+      const usageBefore = value.store.usageRange({ profileId: value.profileId }).length;
+      expect(await refresh(value)).toMatchObject({ usage: [{ automaticReset: {
+        lastAttempt: { state: "settled", outcome: "alreadyRedeemed" },
+        refresh: { state: "settled", outcome: "alreadyRedeemed" },
+      } }] });
+      expect(value.codex.resetIdempotencyKeys).toEqual([key, key]);
+      expect(value.store.latestAccountRateLimitResetAttempt(value.profileId, fingerprint))
+        .toMatchObject({ idempotencyKey: key, state: "settled", outcome: "alreadyRedeemed" });
+      expect(value.store.usageRange({ profileId: value.profileId })).toHaveLength(usageBefore + 2);
+      expect(effectRows(value).pointers).toEqual(before.pointers);
+      expect(effectRows(value).sessions).toEqual(before.sessions);
+      expect(value.codex.committedStartTurns).toBe(0);
+    });
+
+    test("rechecks disable after the awaited final identity proof", async () => {
+      const value = await setup();
+      let accountReads = 0;
+      let disabled = false;
+      value.codex.beforeReadAccountReturn = async () => {
+        accountReads += 1;
+        if (accountReads === 3) {
+          await Promise.resolve();
+          configure(value.store, { kind: "set_override", provider: "codex", override: "off" });
+          disabled = true;
+        }
+      };
+      const pointer = value.store.readProviderAccountState("codex");
+      expect(await refresh(value)).toMatchObject({ usage: [{ automaticReset: {
+        refresh: { state: "suppressed", reason: "automatic_policy_disabled" },
+      } }] });
+      expect(disabled).toBe(true);
+      expect(accountReads).toBe(3);
+      expect(value.codex.resetIdempotencyKeys).toEqual([]);
+      expect(value.store.latestAccountRateLimitResetAttempt(value.profileId, fingerprint)).toBeNull();
+      expect(value.store.readProviderAccountState("codex")).toEqual(pointer);
+      expect(value.codex.committedStartTurns).toBe(0);
+      expect(effectRows(value).sessions).toEqual([]);
+    });
+
+    for (const state of ["fresh", "ambiguous"] as const) {
+      test(`handles a final begin refusal for ${state} without rewriting recovery evidence`, async () => {
+        const value = await setup();
+        if (state === "ambiguous") {
+          value.codex.resetError = new IndeterminateCodexEffectError("account/rateLimitResetCredit/consume", 99);
+          expect(await refresh(value)).toMatchObject({ usage: [{ automaticReset: { refresh: { state: "recovery_pending" } } }] });
+          value.codex.resetError = undefined;
+        }
+        const originalKeys = [...value.codex.resetIdempotencyKeys];
+        const begin = value.store.beginAccountRateLimitReset.bind(value.store);
+        const begins: ReturnType<typeof effectRows>[] = [];
+        Object.defineProperty(value.store, "beginAccountRateLimitReset", {
+          configurable: true,
+          value: (...args: Parameters<StateStore["beginAccountRateLimitReset"]>) => {
+            // Commit through the real configuration API at the final boundary.
+            // The real begin transaction, not a synthetic thrown error, refuses.
+            configure(value.store, { kind: "set_override", provider: "codex", override: "off" });
+            begins.push(effectRows(value));
+            return begin(...args);
+          },
+        });
+        expect(await refresh(value)).toMatchObject({ usage: [{ automaticReset: { refresh: state === "ambiguous"
+          ? { state: "recovery_pending" }
+          : { state: "suppressed", reason: "automatic_policy_disabled" },
+        } }] });
+        expect(begins).toHaveLength(1);
+        const before = begins[0];
+        if (before === undefined) throw new Error("Expected the real final begin boundary.");
+        expect(effectRows(value)).toEqual(before);
+        expect(value.codex.resetIdempotencyKeys).toEqual(originalKeys);
+        expect(value.store.readRecoverableAccountRateLimitReset(value.profileId, fingerprint))
+          .toMatchObject({ state: state === "ambiguous" ? "ambiguous" : "prepared", outcome: null, localResolution: null });
+        expect(value.codex.committedStartTurns).toBe(0);
+        expect(value.codex.turnEffectTrace).toEqual([]);
+      });
+    }
+
+    test("settles and rereads an admitted in-flight success after disable", async () => {
+      const value = await setup();
+      let signalReset!: () => void;
+      const resetStarted = new Promise<void>((resolve) => { signalReset = resolve; });
+      let releaseReset!: () => void;
+      const resetGate = new Promise<void>((resolve) => { releaseReset = resolve; });
+      value.codex.beforeResetReturn = async () => { signalReset(); await resetGate; };
+      const pointer = value.store.readProviderAccountState("codex");
+      const pending = refresh(value);
+      try {
+        await resetStarted;
+        expect(value.store.readRecoverableAccountRateLimitReset(value.profileId, fingerprint))
+          .toMatchObject({ state: "effect_started" });
+        configure(value.store, { kind: "set_default", enabled: false });
+        value.codex.usageResult = { revision: 2, observedAt: 2_001, payload: limits(0, 0) };
+      } finally { releaseReset(); }
+      expect(await pending).toMatchObject({ usage: [{
+        automaticReset: { lastAttempt: { state: "settled", outcome: "reset" }, refresh: { state: "settled", outcome: "reset" } },
+        snapshot: { sourceRevision: 2, payload: limits(0, 0) },
+      }] });
+      const key = value.codex.resetIdempotencyKeys[0];
+      if (key === undefined) throw new Error("Expected admitted reset key.");
+      expect(value.store.latestAccountRateLimitResetAttempt(value.profileId, fingerprint))
+        .toMatchObject({ idempotencyKey: key, state: "settled", outcome: "reset" });
+      expect(value.store.usageRange({ profileId: value.profileId }).map((row) => row.sourceRevision)).toEqual([1, 2]);
+      expect(await refresh(value)).toMatchObject({ usage: [{ automaticReset: {
+        refresh: { state: "suppressed", reason: "automatic_policy_disabled" },
+      } }] });
+      expect(value.codex.resetIdempotencyKeys).toEqual([key]);
+      expect(value.store.readProviderAccountState("codex")).toEqual(pointer);
+      expect(value.codex.committedStartTurns).toBe(0);
+      expect(effectRows(value).sessions).toEqual([]);
+    });
+
+    test("automatic policy commands disable Codex before an exhausted usage refresh", async () => {
+      const value = await setup();
+      const command = { kind: "usage.auto.set", idempotencyKey: crypto.randomUUID(), expectedAutomaticPolicyRevision: 1,
+        change: { kind: "set_override", provider: "codex", override: "off" } };
+      expect(await value.service.execute(localCommandSchema.parse(command), { signal })).toMatchObject({
+        configuration: { automaticPolicyRevision: 2, overrides: { codex: "off", claude: "inherit" } },
+        effective: [{ provider: "codex", enabled: false, source: "override", automaticPolicyRevision: 2 },
+          { provider: "claude", enabled: true, source: "default", automaticPolicyRevision: 2 }],
+      });
+      expect(await value.service.execute(localCommandSchema.parse({ kind: "usage.auto.status", provider: "codex" }), { signal }))
+        .toMatchObject({ effective: [{ provider: "codex", enabled: false, source: "override", automaticPolicyRevision: 2 }] });
+      const before = effectRows(value);
+      const callsBefore = value.codex.calls.length;
+      expect(await refresh(value)).toMatchObject({ usage: [{ automaticReset: {
+        refresh: { state: "suppressed", reason: "automatic_policy_disabled" },
+      } }] });
+      expect(value.codex.calls.slice(callsBefore)).toEqual(["readAccount", "usage", "readAccount"]);
+      expect(value.store.usageRange({ profileId: value.profileId })).toHaveLength(1);
+      expect(value.codex.resetIdempotencyKeys).toEqual([]);
+      expect(effectRows(value)).toEqual(before);
+    });
+
+    test("fails closed before reset when automatic policy cannot be read", async () => {
+      const value = await setup();
+      const before = effectRows(value);
+      Object.defineProperty(value.store, "readAutomaticUsagePolicyConfiguration", {
+        configurable: true,
+        value: () => { throw new Error("test automatic policy unavailable"); },
+      });
+      await expect(refresh(value)).rejects.toMatchObject({
+        code: "UNAVAILABLE",
+        message: "A required local or provider capability is unavailable.",
+      });
+      expect(value.codex.resetIdempotencyKeys).toEqual([]);
+      expect(effectRows(value)).toEqual(before);
+      expect(value.codex.committedStartTurns).toBe(0);
+    });
   });
 
   test("automatically consumes one reset at one percent remaining and rereads limits", async () => {
@@ -16309,204 +18561,47 @@ describe("HraService", () => {
   });
 
   test("migrates a signed-in v24 profile and suppresses its first valid window across restart and notification", async () => {
-    const now = 3_000_000_000;
+    const now = canonical24ResetFixture.now;
     const firstWindow = now + 3 * 24 * 60 * 60 * 1_000;
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
-      () => undefined,
-      () => now,
-    );
-    const added = await value.service.execute({
-      kind: "account.add",
-      label: "V24 reset reconciliation",
-    }, { signal }) as { account: { id: `acct_${string}` } };
-    await value.service.execute({
-      kind: "account.login",
-      account: added.account.id,
-      deviceCode: false,
-    }, { signal });
-
-    await value.service.close();
-    value.store.close();
-    stores.splice(stores.indexOf(value.store), 1);
-    const legacy = new Database(value.paths.database, { create: false, strict: true });
-    try {
-      legacy.exec("PRAGMA foreign_keys=OFF");
-      removeCanonicalProfileFixtureOverlay(legacy);
-      const adoptionTables = [
-        "session_claude_process_authorities",
-        "session_claude_process_launch_intents",
-        "session_personal_runtime_bindings",
-        "session_adoption_candidates",
-        "session_adoption_policies",
-        "session_adoption_profile_generation_permits",
-        "profile_personal_authority_revocations",
-        "provider_runtime_account_revocations",
-        "session_provider_account_authorities",
-        "session_account_authorities",
-      ] as const;
-      const adoptionObjects = legacy.query(`
-        SELECT name,type FROM sqlite_master
-        WHERE name NOT LIKE 'sqlite_%' AND (
-          (type='index' AND (
-            tbl_name IN (${adoptionTables.map(() => "?").join(",")})
-            OR name='sessions_profile_created'
-          ))
-          OR (type='trigger' AND (
-            sql LIKE '%session_account_authorit%'
-            OR sql LIKE '%provider_runtime_account_revocation%'
-            OR sql LIKE '%session_adoption_%'
-            OR sql LIKE '%session_personal_runtime_%'
-            OR sql LIKE '%session_claude_process_%'
-            OR sql LIKE '%profile_personal_authority_%'
-            OR sql LIKE '%codex_account_key%'
-          ))
-        )
-        ORDER BY CASE type WHEN 'trigger' THEN 0 ELSE 1 END,name
-      `).all(...adoptionTables) as Array<{
-        name: string;
-        type: "index" | "trigger";
-      }>;
-      for (const object of adoptionObjects) {
-        if (!/^[a-z0-9_]+$/u.test(object.name) || !["index", "trigger"].includes(object.type)) {
-          throw new Error("Unexpected session-adoption schema object.");
-        }
-        legacy.exec(`DROP ${object.type.toUpperCase()} IF EXISTS "${object.name}"`);
-      }
-      for (const table of adoptionTables) {
-        legacy.exec(`DROP TABLE IF EXISTS "${table}"`);
-      }
-      const presetContractTriggers = legacy.query(`
-        SELECT name FROM sqlite_master
-        WHERE type='trigger' AND sql LIKE '%preset_contract%'
-        ORDER BY name
-      `).all() as Array<{ name: string }>;
-      for (const { name } of presetContractTriggers) {
-        if (!/^[a-z0-9_]+$/u.test(name)) {
-          throw new Error("Unexpected preset-contract trigger name.");
-        }
-        legacy.exec(`DROP TRIGGER IF EXISTS "${name}"`);
-      }
-      legacy.exec(`
-        ALTER TABLE profiles DROP COLUMN codex_account_key;
-        ALTER TABLE sessions DROP COLUMN preset_contract;
-        ALTER TABLE works DROP COLUMN preset_contract;
-        DROP TABLE IF EXISTS attention_email_policy;
-        DROP TABLE IF EXISTS notification_hours;
-        DROP TABLE IF EXISTS session_provider_switch_source_releases;
-        DROP TABLE IF EXISTS session_provider_switch_seed_results;
-        DROP TABLE IF EXISTS session_provider_switch_seed_intents;
-        DROP TABLE IF EXISTS session_provider_switch_target_releases;
-        DROP TABLE IF EXISTS session_provider_switch_targets;
-        DROP TABLE IF EXISTS session_mutation_authority_rebinds;
-      `);
-      const resetTriggers = legacy.query(
-        `SELECT name FROM sqlite_master
-         WHERE type='trigger' AND name GLOB 'account_rate_limit_reset_*'
-         ORDER BY name`,
-      ).all() as Array<{ name: string }>;
-      for (const { name } of resetTriggers) {
-        if (!/^account_rate_limit_reset_[a-z_]+$/u.test(name)) {
-          throw new Error("Unexpected reset trigger name.");
-        }
-        legacy.exec(`DROP TRIGGER "${name}"`);
-      }
-      legacy.exec(`
-        DROP TABLE account_rate_limit_reset_rebinds;
-        DROP TABLE account_rate_limit_reset_attempts;
-        DROP TABLE account_rate_limit_reset_policies;
-        DROP INDEX IF EXISTS usage_poll_failures_identity_recent;
-        ALTER TABLE session_events DROP COLUMN projection_version;
-        ALTER TABLE usage_poll_failures DROP COLUMN account_fingerprint;
-      `);
-      const workTriggers = legacy.query(
-        `SELECT name FROM sqlite_master
-         WHERE type='trigger'
-           AND (name GLOB 'work_*' OR name GLOB 'works_*')
-         ORDER BY name`,
-      ).all() as Array<{ name: string }>;
-      for (const { name } of workTriggers) {
-        if (!/^(?:work|works)_[a-z_]+$/u.test(name)) {
-          throw new Error("Unexpected v26 work trigger name.");
-        }
-        legacy.exec(`DROP TRIGGER "${name}"`);
-      }
-      const workTables = legacy.query(
-        `SELECT name FROM sqlite_master
-         WHERE type='table' AND (name='works' OR name GLOB 'work_*')
-         ORDER BY name`,
-      ).all() as Array<{ name: string }>;
-      for (const { name } of workTables) {
-        if (!/^(?:works|work_[a-z_]+)$/u.test(name)) {
-          throw new Error("Unexpected v26 work table name.");
-        }
-        legacy.exec(`DROP TABLE "${name}"`);
-      }
-      legacy.exec(`
-        DROP TRIGGER sessions_autorespond_after_hours_history;
-        DROP TABLE autorespond_after_hours_history;
-        DROP TABLE autorespond_after_hours_policy;
-        DROP TRIGGER IF EXISTS sessions_autorespond_budget_history;
-        DROP TABLE IF EXISTS autorespond_budget_history;
-        DROP TABLE IF EXISTS autorespond_budget_reservations;
-        DELETE FROM migrations WHERE version>=25;
-        DROP TRIGGER IF EXISTS mutation_resolutions_timestamp_proof_insert; DROP TABLE IF EXISTS account_mutation_authority_rebinds; PRAGMA user_version=24;
-        PRAGMA foreign_keys=ON;
-      `);
-    } finally {
-      legacy.close(false);
-    }
-
-    const store = new StateStore(value.paths, { now: () => now });
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-service-v24-reset-")));
+    serviceRoots.push(home);
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    await writeFile(paths.database, canonical24ResetDatabaseBytes(), { mode: 0o600 });
+    const accountId = canonical24ResetFixture.profile.id;
+    const store = new StateStore(paths, { now: () => now });
     stores.push(store);
-    expect(store.requireAccountRateLimitResetPolicy(added.account.id)).toMatchObject({
+    expect(store.requireProfileById(accountId)).toMatchObject(canonical24ResetFixture.profile);
+    expect(store.requireAccountRateLimitResetPolicy(accountId)).toMatchObject({
       state: "reconciliation_required",
       accountFingerprint: null,
       weeklyWindowResetsAt: null,
     });
-    const inspector = new Database(value.paths.database, { readonly: true, strict: true });
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 50 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 60 });
+      expect(inspector.query(
+        "SELECT id,label,state,process_generation,provider_email,provider_plan,created_at,updated_at,label_key FROM profiles WHERE id=?",
+      ).get(accountId)).toEqual(canonical24ResetFixture.profileRow);
+      expect(inspector.query(
+        "SELECT version,applied_at FROM migrations WHERE version<=24 ORDER BY version",
+      ).all()).toEqual([...canonical24ResetFixture.migrations]);
       expect(inspector.query(
         "SELECT version FROM migrations WHERE version>=25 ORDER BY version",
-      ).all()).toEqual([
-        { version: 25 },
-        { version: 26 },
-        { version: 27 },
-        { version: 28 },
-        { version: 29 },
-        { version: 30 },
-        { version: 31 },
-        { version: 32 },
-        { version: 33 },
-        { version: 34 },
-        { version: 35 },
-        { version: 36 },
-        { version: 37 },
-        { version: 38 },
-        { version: 39 },
-        { version: 40 },
-        { version: 41 },
-        { version: 42 },
-        { version: 43 },
-        { version: 44 },
-        { version: 45 },
-        { version: 46 },
-        { version: 47 },
-        { version: 48 },
-        { version: 49 },
-        { version: 50 },
-      ]);
+      ).all()).toEqual(Array.from({ length: 36 }, (_, index) => ({ version: index + 25 })));
     } finally {
       inspector.close(false);
     }
 
+    const daemonBootId = `boot_${"3".repeat(32)}`;
+    const daemonGeneration = store.nextDaemonGeneration(daemonBootId);
     const codex = new FakeCodex();
-    const migrated = new HraService({
+    const migrated = new OompaService({
       store,
-      paths: value.paths,
+      paths,
       codex,
+      daemonGeneration,
+      daemonBootId,
       cloud: new FakeCloud(),
       daemonAuthority: new FakeDaemonAuthority(),
       now: () => now,
@@ -16519,7 +18614,7 @@ describe("HraService", () => {
     };
     await expect(migrated.execute({
       kind: "account.usage",
-      account: added.account.id,
+      account: accountId,
       refresh: true,
     }, { signal })).resolves.toMatchObject({
       usage: [{ automaticReset: {
@@ -16546,7 +18641,7 @@ describe("HraService", () => {
     codex.usageResult = { revision: 2, observedAt: 3_000, payload: eligiblePayload };
     await expect(migrated.execute({
       kind: "account.usage",
-      account: added.account.id,
+      account: accountId,
       refresh: true,
     }, { signal })).resolves.toMatchObject({
       usage: [{ automaticReset: {
@@ -16557,30 +18652,32 @@ describe("HraService", () => {
     expect(codex.resetIdempotencyKeys).toEqual([]);
 
     await migrated.close();
+    const restartedDaemonBootId = `boot_${"4".repeat(32)}`;
+    const restartedDaemonGeneration = store.nextDaemonGeneration(restartedDaemonBootId);
     const restartedCodex = new FakeCodex();
     restartedCodex.usageResult = {
       revision: 3,
       observedAt: 4_000,
       payload: eligiblePayload,
     };
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store,
-      paths: value.paths,
+      paths,
       codex: restartedCodex,
+      daemonGeneration: restartedDaemonGeneration,
+      daemonBootId: restartedDaemonBootId,
       cloud: new FakeCloud(),
       daemonAuthority: new FakeDaemonAuthority(),
       now: () => now,
       requestStop: () => undefined,
     });
     await restarted.recover();
-    const profile = store.requireProfileById(added.account.id);
-    const owned = profilePaths(value.paths, profile.id);
-    await restarted.observeCodexFact({
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: owned.codexHome,
-      desktopUserData: owned.desktopUserData,
-    }, { type: "rateLimitsUpdated" });
+    const profile = store.requireProfileById(accountId);
+    const owned = profilePaths(paths, profile.id);
+    await restarted.observeCodexFact(
+      liveAuthorityFor(store, profile.id, "codex", owned),
+      { type: "rateLimitsUpdated" },
+    );
     await restarted.settled();
     expect(restartedCodex.calls).toEqual(["readAccount", "usage", "readAccount"]);
     expect(restartedCodex.resetIdempotencyKeys).toEqual([]);
@@ -16667,12 +18764,10 @@ describe("HraService", () => {
     );
     const profile = store.requireProfileById(added.account.id);
     const owned = profilePaths(paths, profile.id);
-    await service.observeCodexFact({
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: owned.codexHome,
-      desktopUserData: owned.desktopUserData,
-    }, { type: "rateLimitsUpdated" });
+    await service.observeCodexFact(
+      liveAuthorityFor(store, profile.id, "codex", owned),
+      { type: "rateLimitsUpdated" },
+    );
     await service.settled();
 
     const passive = await service.execute({
@@ -17207,7 +19302,7 @@ describe("HraService", () => {
     const replacementCodex = new FakeCodex();
     replacementCodex.usageResult = { revision: 2, observedAt: 3_000, payload };
     replacementCodex.resetOutcome = "alreadyRedeemed";
-    const replacement = new HraService({
+    const replacement = new OompaService({
       store: value.store,
       paths: value.paths,
       codex: replacementCodex,
@@ -17575,12 +19670,7 @@ describe("HraService", () => {
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     const profile = store.requireProfileById(added.account.id);
     const owned = profilePaths(paths, profile.id);
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: owned.codexHome,
-      desktopUserData: owned.desktopUserData,
-    };
+    const authority = liveAuthorityFor(store, profile.id, "codex", owned);
     codex.usageResult = {
       revision: 1,
       observedAt: 2_000,
@@ -17676,6 +19766,10 @@ describe("HraService", () => {
       account: added.account.id,
       deviceCode: false,
     }, { signal });
+    const providerAuthority = value.store.requireProviderAccountAuthority(
+      added.account.id,
+      "codex",
+    );
     const accountFingerprint = createHash("sha256")
       .update("person@example.com")
       .digest("hex");
@@ -17689,7 +19783,7 @@ describe("HraService", () => {
       observedAt: now - 180_000,
       receivedAt: now - 179_000,
       accountFingerprint,
-      providerGeneration: 0,
+      providerGeneration: providerAuthority.processGeneration,
       daemonGeneration: 1,
       previousPayload: null,
     });
@@ -17702,23 +19796,37 @@ describe("HraService", () => {
       observedAt: now - 60_000,
       receivedAt: now - 59_000,
       accountFingerprint,
-      providerGeneration: 0,
+      providerGeneration: providerAuthority.processGeneration,
       daemonGeneration: 1,
       previousPayload: first,
     });
-    value.store.recordUsage(added.account.id, 1, first.observation.observedAt, first);
+    value.store.recordUsage(
+      added.account.id,
+      1,
+      first.observation.observedAt,
+      first,
+      providerAuthority,
+    );
     value.store.recordUsagePollFailure(
       added.account.id,
       accountFingerprint,
       2,
       now - 120_000,
+      providerAuthority,
     );
-    value.store.recordUsage(added.account.id, 3, third.observation.observedAt, third);
+    value.store.recordUsage(
+      added.account.id,
+      3,
+      third.observation.observedAt,
+      third,
+      providerAuthority,
+    );
     value.store.recordUsagePollFailure(
       added.account.id,
       accountFingerprint,
       4,
       now - 30_000,
+      providerAuthority,
     );
 
     const firstPage = await value.service.execute({
@@ -17812,6 +19920,10 @@ describe("HraService", () => {
       account: added.account.id,
       deviceCode: false,
     }, { signal });
+    const providerAuthority = value.store.requireProviderAccountAuthority(
+      added.account.id,
+      "codex",
+    );
     const firstFingerprint = createHash("sha256")
       .update("person@example.com")
       .digest("hex");
@@ -17821,16 +19933,23 @@ describe("HraService", () => {
       observedAt: now - 2_000,
       receivedAt: now - 1_900,
       accountFingerprint: firstFingerprint,
-      providerGeneration: 1,
+      providerGeneration: providerAuthority.processGeneration,
       daemonGeneration: 1,
       previousPayload: null,
     });
-    value.store.recordUsage(added.account.id, 1, first.observation.observedAt, first);
+    value.store.recordUsage(
+      added.account.id,
+      1,
+      first.observation.observedAt,
+      first,
+      providerAuthority,
+    );
     value.store.recordUsagePollFailure(
       added.account.id,
       firstFingerprint,
       2,
       now - 1_000,
+      providerAuthority,
     );
     const firstPage = await value.service.execute({
       kind: "account.usage-history",
@@ -17978,13 +20097,405 @@ describe("HraService", () => {
     });
   });
 
+  test.each([
+    { prefix: 1, suffix: 1, barrier: true, sample: "regression" },
+    { prefix: 0, suffix: 2, barrier: true, sample: "leading-barrier" },
+    ...fc.sample(fc.record({
+      prefix: fc.integer({ min: 0, max: 3 }),
+      suffix: fc.integer({ min: 1, max: 3 }),
+      barrier: fc.boolean(),
+    }), { seed: 893041, numRuns: 8 }).map((value, index) => ({ ...value, sample: String(index) })),
+  ])("preserves the Claude input fact prefix ordering law for %j", async ({ prefix, suffix, barrier }) => {
+    const value = await nativeClaudeFixture("Claude input fact barrier", "claude-input-barrier", {
+      pid: 63_091, pidDomain: "darwin", procStart: "claude-input-barrier-process",
+    });
+    const authority = liveAuthorityFor(value.store, value.accountId, "claude");
+    const connectionId = value.managedClaude.observationConnectionId;
+    value.managedClaude.beforeStartTurnReturn = async () => {
+      delete value.managedClaude.beforeStartTurnReturn;
+      for (let index = 0; index < prefix; index += 1) {
+        await value.service.observeClaudeFact(authority, {
+          connectionId, providerThreadId: value.providerThreadId,
+          type: "turnCompleted", turnId: `captured-prefix-${String(index)}`, status: "completed",
+        });
+      }
+      // This session-wide notification reserves its normal ordered slot, but
+      // the input operation does not own authority to apply it inline.
+      if (barrier) {
+        await value.service.observeClaudeFact(authority, {
+          connectionId, providerThreadId: value.providerThreadId,
+          type: "protocolNotice", event: "test/ordered_barrier",
+        });
+      }
+      for (let index = 0; index < suffix; index += 1) {
+        await value.service.observeClaudeFact(authority, {
+          connectionId, providerThreadId: value.providerThreadId,
+          type: "turnCompleted", turnId: `captured-suffix-${String(index)}`, status: "completed",
+        });
+      }
+      throw new IndeterminateClaudeEffectError("turn/start",
+        new Error("test-only failure after captured facts"));
+    };
+    const idempotencyKey = crypto.randomUUID();
+    const command = {
+      kind: "session.send" as const, session: value.session.id,
+      message: "Retain only the safe ordered prefix", idempotencyKey,
+    };
+    await expect(value.service.execute(command, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await value.service.settled();
+    const page = value.store.listSessionEvents({ sessionId: value.session.id, afterSequence: null });
+    const expectedTurns = [
+      ...Array.from({ length: prefix }, (_, index) => `captured-prefix-${String(index)}`),
+      ...Array.from({ length: barrier ? 0 : suffix }, (_, index) => `captured-suffix-${String(index)}`),
+    ];
+    expect(page.events.map((event) => event.body).filter((body) => body.type === "turn_completed"))
+      .toEqual(expectedTurns.map((turnId) => ({
+        type: "turn_completed", status: "completed",
+        turnId: value.store.projectPublicProviderIdentifier(turnId),
+      })));
+    expect(page.events.some((event) => event.body.type === "user_message")).toBe(false);
+    expect(value.store.readMutation(idempotencyKey)).toMatchObject({ state: "ambiguous" });
+    expect(value.store.requireSession(value.session.id).state).toBe("recovery_required");
+    const eventsBeforeReplay = page.events;
+    await expect(value.service.execute(command, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await expect(value.service.execute({ ...command, idempotencyKey: crypto.randomUUID() }, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await value.service.settled();
+    expect(value.managedClaude.turnRequests).toHaveLength(1);
+    expect(value.store.listSessionEvents({ sessionId: value.session.id, afterSequence: null }).events)
+      .toEqual(eventsBeforeReplay);
+  }, 5_000);
+
+  test.each(["binding", "process"] as const)(
+    "refuses a captured Claude input fact after its provider %s authority changes", async (retirement) => {
+      const value = await nativeClaudeFixture("Claude stale input fact", "claude-input-stale", {
+        pid: 63_092, pidDomain: "darwin", procStart: "claude-input-stale-process",
+      });
+      const authority = liveAuthorityFor(value.store, value.accountId, "claude");
+      const captured = value.store.requireProviderAccountAuthority(value.accountId, "claude");
+      value.managedClaude.beforeStartTurnReturn = async () => {
+        delete value.managedClaude.beforeStartTurnReturn;
+        await value.service.observeClaudeFact(authority, {
+          connectionId: value.managedClaude.observationConnectionId,
+          providerThreadId: value.providerThreadId,
+          type: "turnCompleted", turnId: "retired-captured-turn", status: "completed",
+        });
+        if (retirement === "binding") {
+          value.store.observeProviderAccountReadiness({
+            profileId: value.accountId, provider: "claude",
+            expectedBindingGeneration: captured.bindingGeneration, readiness: "signed_out",
+          });
+        } else {
+          value.store.advanceProviderAccountProcessGeneration({
+            profileId: value.accountId, provider: "claude",
+            expectedProcessGeneration: captured.processGeneration,
+          });
+        }
+        throw new IndeterminateClaudeEffectError("turn/start",
+          new Error("test-only failure after authority retirement"));
+      };
+      const idempotencyKey = crypto.randomUUID();
+      await expect(value.service.execute({
+        kind: "session.send", session: value.session.id,
+        message: "Do not retain stale authority", idempotencyKey,
+      }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      await value.service.settled();
+      expect(value.store.requireProviderAccountAuthority(value.accountId, "claude")).not.toEqual(captured);
+      expect(value.store.listSessionEvents({ sessionId: value.session.id, afterSequence: null }).events
+        .some((event) => event.body.type === "turn_completed" || event.body.type === "user_message"))
+        .toBe(false);
+      expect(value.store.readMutation(idempotencyKey)).toMatchObject({ state: "ambiguous" });
+      expect(value.store.requireSession(value.session.id).state).toBe("recovery_required");
+      expect(value.managedClaude.turnRequests).toHaveLength(1);
+    },
+  );
+
+  test("seals retained Claude input fact routing before its producer mutates callback arguments", async () => {
+    const value = await nativeClaudeFixture("Claude captured input snapshot", "claude-input-snapshot", {
+      pid: 63_093, pidDomain: "darwin", procStart: "claude-input-snapshot-process",
+    });
+    value.managedClaude.beforeStartTurnReturn = async () => {
+      delete value.managedClaude.beforeStartTurnReturn;
+      const authority = { ...liveAuthorityFor(value.store, value.accountId, "claude") };
+      const fact = {
+        connectionId: value.managedClaude.observationConnectionId,
+        providerThreadId: value.providerThreadId,
+        type: "turnCompleted" as const, turnId: "sealed-captured-turn", status: "completed" as const,
+      };
+      await value.service.observeClaudeFact(authority, fact);
+      // The callback has reserved its original FIFO slot. Its caller may no
+      // longer mutate the routing or payload retained for the later drain.
+      authority.generation += 1;
+      fact.connectionId = "30000000-0000-4000-8000-0000000000ff";
+      fact.providerThreadId = "mutated-unrelated-thread";
+      fact.turnId = "mutated-unrelated-turn";
+      throw new IndeterminateClaudeEffectError("turn/start",
+        new Error("test-only failure after caller mutation"));
+    };
+    const idempotencyKey = crypto.randomUUID();
+    await expect(value.service.execute({
+      kind: "session.send", session: value.session.id,
+      message: "Retain the observed immutable routing", idempotencyKey,
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await value.service.settled();
+    const bodies = value.store.listSessionEvents({ sessionId: value.session.id, afterSequence: null })
+      .events.map((event) => event.body);
+    expect(bodies.filter((body) => body.type === "turn_completed"))
+      .toEqual([{
+        type: "turn_completed", status: "completed",
+        turnId: value.store.projectPublicProviderIdentifier("sealed-captured-turn"),
+      }]);
+    expect(bodies.some((body) => body.type === "user_message")).toBe(false);
+    expect(value.store.readMutation(idempotencyKey)).toMatchObject({ state: "ambiguous" });
+    expect(value.store.requireSession(value.session.id).state).toBe("recovery_required");
+    expect(value.managedClaude.turnRequests).toHaveLength(1);
+  });
+
+  test.each(["queued", "reentrant"] as const)(
+    "bounds the lifetime of retained Claude input facts across %s arrivals", async (arrival) => {
+      const value = await nativeClaudeFixture("Claude input fact bound", "claude-input-bound", {
+        pid: 63_094, pidDomain: "darwin", procStart: "claude-input-bound-process",
+      });
+      const authority = liveAuthorityFor(value.store, value.accountId, "claude");
+      const capturedLimit = 256;
+      let observed = 0;
+      const observeNext = async (): Promise<void> => {
+        const index = observed++;
+        await value.service.observeClaudeFact(authority, {
+          connectionId: value.managedClaude.observationConnectionId,
+          providerThreadId: value.providerThreadId,
+          type: "turnCompleted", turnId: `bounded-turn-${String(index)}`, status: "completed",
+        });
+      };
+      value.managedClaude.beforeStartTurnReturn = async () => {
+        delete value.managedClaude.beforeStartTurnReturn;
+        if (arrival === "queued") {
+          for (let index = 0; index <= capturedLimit; index += 1) await observeNext();
+        } else {
+          await observeNext();
+          value.cloud.beforeProjectionUnsettledSessionReturn = async (sessionId) => {
+            if (sessionId !== value.session.id || observed > capturedLimit) return;
+            // Admit another real callback while the previous closure drains.
+            // Removing jobs must not replenish lifetime count capacity.
+            await observeNext();
+          };
+        }
+        throw new IndeterminateClaudeEffectError("turn/start",
+          new Error("test-only failure before a bounded fact drain"));
+      };
+      const idempotencyKey = crypto.randomUUID();
+      try {
+        await expect(value.service.execute({
+          kind: "session.send", session: value.session.id,
+          message: "Keep callback retention finite", idempotencyKey,
+        }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+        await value.service.settled();
+      } finally {
+        delete value.cloud.beforeProjectionUnsettledSessionReturn;
+      }
+      expect(observed).toBe(capturedLimit + 1);
+      const first = value.store.listSessionEvents({ sessionId: value.session.id, afterSequence: null });
+      const lastSequence = first.events.at(-1)?.sequence;
+      if (lastSequence === undefined) throw new Error("Expected retained events before the bound.");
+      const second = value.store.listSessionEvents({ sessionId: value.session.id, afterSequence: lastSequence });
+      const bodies = [...first.events, ...second.events].map((event) => event.body);
+      const completed = bodies.filter((body) => body.type === "turn_completed");
+      expect(completed.map((body) => body.turnId)).toEqual(Array.from({ length: capturedLimit },
+        (_, index) => value.store.projectPublicProviderIdentifier(`bounded-turn-${String(index)}`)));
+      expect(bodies.some((body) => body.type === "user_message")).toBe(false);
+      expect(value.store.readMutation(idempotencyKey)).toMatchObject({ state: "ambiguous" });
+      expect(value.store.requireSession(value.session.id).state).toBe("recovery_required");
+      expect(value.managedClaude.turnRequests).toHaveLength(1);
+    },
+  );
+
+  test("does not invent a Claude input barrier after the preceding ordered fact releases its locks", async () => {
+    const value = await nativeClaudeFixture("Claude prior fact release", "claude-input-prior-fact", {
+      pid: 63_095, pidDomain: "darwin", procStart: "claude-input-prior-fact-process",
+    });
+    const authority = liveAuthorityFor(value.store, value.accountId, "claude");
+    const connectionId = value.managedClaude.observationConnectionId;
+    value.managedClaude.beforeStartTurnReturn = async () => {
+      delete value.managedClaude.beforeStartTurnReturn;
+      await value.service.observeClaudeFact(authority, {
+        connectionId, providerThreadId: value.providerThreadId,
+        type: "turnCompleted", turnId: "following-input-fact", status: "completed",
+      });
+      throw new IndeterminateClaudeEffectError("turn/start",
+        new Error("test-only failure after preceding locks released"));
+    };
+    const idempotencyKey = crypto.randomUUID();
+    const following: { outcome?: Promise<Readonly<{ status: string; error?: unknown }>> } = {};
+    value.cloud.beforeProjectionUnsettledSessionReturn = async (sessionId) => {
+      if (sessionId !== value.session.id) return;
+      delete value.cloud.beforeProjectionUnsettledSessionReturn;
+      // Queue the next input while the preceding fact still owns its locks.
+      // Do not await that input from its predecessor's held authority.
+      following.outcome = value.service.execute({
+        kind: "session.send", session: value.session.id,
+        message: "Wait behind the preceding fact", idempotencyKey,
+      }, { signal }).then(
+        () => ({ status: "fulfilled" }),
+        (error: unknown) => ({ status: "rejected", error }),
+      );
+    };
+    await value.service.observeClaudeFact(authority, {
+      connectionId, providerThreadId: value.providerThreadId,
+      type: "turnCompleted", turnId: "preceding-fact", status: "completed",
+    });
+    if (following.outcome === undefined) throw new Error("Expected preceding fact to queue the next input.");
+    expect(await following.outcome).toMatchObject({ status: "rejected", error: { code: "RECOVERY_REQUIRED" } });
+    await value.service.settled();
+    const completed = value.store.listSessionEvents({ sessionId: value.session.id, afterSequence: null })
+      .events.map((event) => event.body).filter((body) => body.type === "turn_completed");
+    expect(completed.map((body) => body.turnId)).toEqual([
+      value.store.projectPublicProviderIdentifier("preceding-fact"),
+      value.store.projectPublicProviderIdentifier("following-input-fact"),
+    ]);
+    expect(value.store.readMutation(idempotencyKey)).toMatchObject({ state: "ambiguous" });
+    expect(value.store.requireSession(value.session.id).state).toBe("recovery_required");
+    expect(value.managedClaude.turnRequests).toHaveLength(1);
+  });
+
+  test.each([
+    { payload: "single", outcome: "rejected" },
+    { payload: "cumulative", outcome: "rejected" },
+    { payload: "single", outcome: "accepted" },
+  ] as const)(
+    "bounds retained Claude input fact bytes before a later completion: %j", async ({ payload, outcome }) => {
+      const value = await nativeClaudeFixture("Claude input fact byte bound", "claude-input-byte-bound", {
+        pid: 63_096, pidDomain: "darwin", procStart: "claude-input-byte-bound-process",
+      });
+      const authority = liveAuthorityFor(value.store, value.accountId, "claude");
+      const connectionId = value.managedClaude.observationConnectionId;
+      let providerReturns = 0;
+      const startTurn = value.managedClaude.startTurn.bind(value.managedClaude);
+      value.managedClaude.startTurn = async (input) => {
+        const result = await startTurn(input);
+        providerReturns += 1;
+        return result;
+      };
+      value.managedClaude.beforeStartTurnReturn = async () => {
+        delete value.managedClaude.beforeStartTurnReturn;
+        await value.service.observeClaudeFact(authority, {
+          connectionId, providerThreadId: value.providerThreadId,
+          type: "turnCompleted", turnId: "byte-prefix", status: "completed",
+        });
+        const text = "a".repeat(payload === "single" ? 1024 * 1024 : 64 * 1024);
+        // Both variants stay far below the independent 256-fact count cap.
+        // The second crosses the byte budget only through cumulative input.
+        for (let index = 0; index < (payload === "single" ? 1 : 17); index += 1) {
+          await value.service.observeClaudeFact(authority, {
+            connectionId, providerThreadId: value.providerThreadId,
+            type: "assistantDelta", turnId: "byte-payload", itemId: "byte-item", text,
+          });
+        }
+        await value.service.observeClaudeFact(authority, {
+          connectionId, providerThreadId: value.providerThreadId,
+          type: "turnCompleted", turnId: "byte-suffix", status: "completed",
+        });
+        if (outcome === "rejected") {
+          throw new IndeterminateClaudeEffectError("turn/start",
+            new Error("test-only failure after the byte budget is exceeded"));
+        }
+      };
+      const idempotencyKey = crypto.randomUUID();
+      await expect(value.service.execute({
+        kind: "session.send", session: value.session.id,
+        message: "Bound retained callback bytes", idempotencyKey,
+      }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      await value.service.settled();
+      expect(providerReturns).toBe(outcome === "accepted" ? 1 : 0);
+      const completed: string[] = [];
+      let afterSequence: number | null = null;
+      let reachedEnd = false;
+      for (let pageIndex = 0; pageIndex < 8; pageIndex += 1) {
+        const page = value.store.listSessionEvents({ sessionId: value.session.id, afterSequence });
+        for (const event of page.events) {
+          if (event.body.type === "turn_completed") completed.push(event.body.turnId);
+          expect(event.body.type).not.toBe("user_message");
+        }
+        const lastSequence = page.events.at(-1)?.sequence;
+        if (lastSequence === undefined || lastSequence >= page.observedThroughSequence) {
+          reachedEnd = true;
+          break;
+        }
+        afterSequence = lastSequence;
+      }
+      expect(reachedEnd).toBe(true);
+      expect(completed).toEqual([value.store.projectPublicProviderIdentifier("byte-prefix")]);
+      expect(value.store.readMutation(idempotencyKey)).toMatchObject({ state: "ambiguous" });
+      expect(value.store.requireSession(value.session.id).state).toBe("recovery_required");
+      expect(value.managedClaude.turnRequests).toHaveLength(1);
+      await expect(value.service.execute({
+        kind: "session.send", session: value.session.id, message: "Do not replay overflowing input",
+      }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      expect(value.managedClaude.turnRequests).toHaveLength(1);
+    },
+  );
+
+  test("never retries a retained Claude input fact closure after its local drain fails", async () => {
+    const value = await nativeClaudeFixture("Claude input fact drain failure", "claude-input-drain-failure", {
+      pid: 63_097, pidDomain: "darwin", procStart: "claude-input-drain-failure-process",
+    });
+    const authority = liveAuthorityFor(value.store, value.accountId, "claude");
+    let attemptedDrains = 0;
+    value.managedClaude.beforeStartTurnReturn = async () => {
+      delete value.managedClaude.beforeStartTurnReturn;
+      await value.service.observeClaudeFact(authority, {
+        connectionId: value.managedClaude.observationConnectionId,
+        providerThreadId: value.providerThreadId,
+        type: "turnCompleted", turnId: "partially-drained-turn", status: "completed",
+      });
+      value.cloud.beforeProjectionUnsettledSessionReturn = async (sessionId) => {
+        if (sessionId !== value.session.id) return;
+        attemptedDrains += 1;
+        throw new Error("test-only local retention failure after the event was appended");
+      };
+      throw new IndeterminateClaudeEffectError("turn/start",
+        new Error("test-only provider input uncertainty before the drain"));
+    };
+    const idempotencyKey = crypto.randomUUID();
+    const command = {
+      kind: "session.send" as const, session: value.session.id,
+      message: "Do not retry a partially applied local fact", idempotencyKey,
+    };
+    try {
+      await expect(value.service.execute(command, { signal }))
+        .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      await value.service.settled();
+    } finally {
+      delete value.cloud.beforeProjectionUnsettledSessionReturn;
+    }
+    expect(attemptedDrains).toBe(1);
+    const page = value.store.listSessionEvents({ sessionId: value.session.id, afterSequence: null });
+    expect(page.events.map((event) => event.body).filter((body) => body.type === "turn_completed"))
+      .toEqual([{
+        type: "turn_completed", status: "completed",
+        turnId: value.store.projectPublicProviderIdentifier("partially-drained-turn"),
+      }]);
+    expect(value.store.readMutation(idempotencyKey)).toMatchObject({ state: "ambiguous" });
+    expect(value.store.requireSession(value.session.id).state).toBe("recovery_required");
+    await expect(value.service.execute(command, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await expect(value.service.execute({ ...command, idempotencyKey: crypto.randomUUID() }, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await value.service.settled();
+    expect(value.managedClaude.turnRequests).toHaveLength(1);
+    expect(attemptedDrains).toBe(1);
+    expect(value.store.listSessionEvents({ sessionId: value.session.id, afterSequence: null }).events)
+      .toEqual(page.events);
+  });
+
   test("accepts provider notifications that arrive before mutation responses", async () => {
     const { service, codex, documents, store } = await fixture();
     const added = await service.execute({ kind: "account.add", label: "Race" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: string; providerThreadId: string } };
-    const authority = { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" };
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: legacyPresetContract, fast: false }, { signal }) as { session: { id: string; providerThreadId: string } };
+    const authority = liveAuthorityFor(store, added.account.id as `acct_${string}`);
     codex.beforeStartTurnReturn = async () => service.observeCodexFact(authority, { type: "turnStarted", threadId: started.session.providerThreadId, turn: { id: "turn-next", items: [], status: "inProgress", startedAt: 1, completedAt: null, durationMs: null } });
     expect(await service.execute({ kind: "session.send", session: started.session.id, message: "race" }, { signal })).toMatchObject({ session: { state: "active", activeTurnId: "turn-next" } });
     expect(store.latestSessionRuntimeProfile(started.session.id as `sess_${string}`)).toMatchObject({ revision: 2, sourceKind: "turn_start" });
@@ -17995,7 +20506,7 @@ describe("HraService", () => {
   });
 
   test("refreshes the exact turn profile after the provider baseline and immediately before dispatch", async () => {
-    const { service, codex, documents } = await fixture();
+    const { service, codex, documents, store } = await fixture();
     const added = await service.execute({ kind: "account.add", label: "Review order" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
@@ -18010,7 +20521,7 @@ describe("HraService", () => {
     delete (codex.readProjection as { activeTurnId?: string }).activeTurnId;
     codex.turnEffectTrace.length = 0;
     await service.observeCodexFact(
-      { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" },
+      liveAuthorityFor(store, added.account.id as `acct_${string}`),
       { type: "turnCompleted", threadId: started.session.providerThreadId, turn: { id: "active-turn", items: [], status: "completed", startedAt: 1, completedAt: 2, durationMs: 1 } },
     );
     await service.settled();
@@ -18054,6 +20565,7 @@ describe("HraService", () => {
     if (recoveryRuntime === undefined) throw new Error("Expected a recovery runtime profile.");
     const pendingReplayKey = "00000000-0000-4000-8000-000000000807";
     const pendingReplayMessage = "settled before compact recovery";
+    let pendingReplayAttempt: ReturnType<StateStore["prepareSessionInputMutation"]>["attempt"] | undefined;
     const peerCreated = value.store.createSession({
       profileId: recoveryProfile.id,
       title: "Same-account recovery peer",
@@ -18085,23 +20597,23 @@ describe("HraService", () => {
       )).resolves.toMatchObject({
         providerThreadId: recoverySession.providerThreadId,
       });
-      await value.service.observeCodexFact({
-        codexHome: "unused",
-        desktopUserData: "unused",
-        generation: recoveryProfile.processGeneration,
-        id: recoveryProfile.id,
-      }, {
+      const recoveryAuthority = liveAuthorityFor(value.store, recoveryProfile.id);
+      await value.service.observeCodexFact(recoveryAuthority, {
         name: "must not cross the recovery fence",
         threadId: recoverySession.providerThreadId as string,
         type: "threadNameUpdated",
       });
-      const pendingReplay = value.store.prepareMutation({
-        authorityGeneration: recoveryProfile.processGeneration,
-        authorityId: sessionId,
+      const { attempt: pendingReplay } = value.store.prepareSessionInputMutation({
+        sessionId,
+        providerAuthority: value.store.requireProviderAccountAuthority(recoveryProfile.id, "codex"),
+        message: pendingReplayMessage,
+        attachments: [],
+        daemonGeneration: value.daemonGeneration,
+        bootId: value.daemonBootId,
         idempotencyKey: pendingReplayKey,
         kind: "session.send",
-        request: { message: pendingReplayMessage },
       });
+      pendingReplayAttempt = pendingReplay;
       value.store.beginSessionMutationEffect({
         attemptId: pendingReplay.id,
         evidence: {
@@ -18116,6 +20628,10 @@ describe("HraService", () => {
           providerThreadId: recoveryProviderThreadId,
           runtimeProfile: recoveryRuntime,
         },
+        providerAuthority: value.store.requireProviderAccountAuthority(recoveryProfile.id, "codex"),
+        attachments: [],
+        daemonGeneration: value.daemonGeneration,
+        bootId: value.daemonBootId,
         message: pendingReplayMessage,
         profileGeneration: recoveryProfile.processGeneration,
         sessionId,
@@ -18127,12 +20643,9 @@ describe("HraService", () => {
           providerGeneration: recoveryProfile.processGeneration,
         },
       });
-      expect(value.store.transitionMutation(pendingReplay.id, "effect_started", "applied", {
-        effectiveRuntimeProfile: recoveryRuntime,
-        sourceId: pendingReplay.id,
-        status: "inProgress",
-        turnId: "turn-pending-compact-recovery",
-      })).toBe(true);
+      // The admitted turn remains in flight while projection recovery holds
+      // the fence; no applied receipt or source runtime is fabricated.
+      await value.service.observeCodexAccount(recoveryAuthority, { signedIn: false });
       entered();
       await recoveryGate;
     };
@@ -18192,6 +20705,18 @@ describe("HraService", () => {
 
     release();
     await expect(recovery).resolves.toBe(cloud.projectionRecoveryResult);
+    if (pendingReplayAttempt === undefined) throw new Error("Expected the admitted in-flight turn.");
+    value.store.completeSessionTurnEffect({
+      attemptId: pendingReplayAttempt.id, sessionId,
+      accountId: recoveryProfile.id, providerGeneration: recoveryProfile.processGeneration,
+      providerAuthority: value.store.requireProviderAccountAuthority(recoveryProfile.id, "codex"),
+      providerConnectionId: "30000000-0000-4000-8000-00000000000d",
+      expectedSessionRevision: value.store.requireSession(sessionId).revision, applyResponseState: false,
+      turnId: "turn-pending-compact-recovery", turnStatus: "inProgress",
+      runtimeProfile: recoveryRuntime, message: pendingReplayMessage,
+      receipt: { effectiveRuntimeProfile: recoveryRuntime, sourceId: pendingReplayAttempt.id,
+        status: "inProgress", turnId: "turn-pending-compact-recovery" },
+    });
     await expect(value.service.execute({
       idempotencyKey: pendingReplayKey,
       kind: "session.send",
@@ -18329,14 +20854,16 @@ describe("HraService", () => {
       throw new Error("Expected a bound session with a runtime profile.");
     }
     const message = "accepted before transcript commit";
-    const attempt = value.store.prepareMutation({
+    const { attempt } = value.store.prepareSessionInputMutation({
       kind: "session.send",
-      authorityId: session.id,
-      authorityGeneration: profile.processGeneration,
-      request: { message },
+      sessionId: session.id,
+      providerAuthority: value.store.requireProviderAccountAuthority(profile.id, "codex"),
+      message, attachments: [], daemonGeneration: value.daemonGeneration, bootId: value.daemonBootId,
       idempotencyKey: "00000000-0000-4000-8000-000000000806",
     });
     value.store.beginSessionMutationEffect({
+      providerAuthority: value.store.requireProviderAccountAuthority(profile.id, "codex"),
+      attachments: [], daemonGeneration: value.daemonGeneration, bootId: value.daemonBootId,
       attemptId: attempt.id,
       message,
       sessionId: session.id,
@@ -18467,7 +20994,7 @@ describe("HraService", () => {
     );
     await expect(value.service.execute(command, { signal })).rejects.toMatchObject({
       code: "RECOVERY_REQUIRED",
-      details: { nextCommand: "hra sync status --json" },
+      details: { nextCommand: "oompa sync status --json" },
       message: expect.stringContaining("replay the exact idempotency key"),
     });
     expect(cloud.projectionRecoveries).toEqual([]);
@@ -18519,25 +21046,22 @@ describe("HraService", () => {
       archived: false,
       limit: 25,
     }, { signal })).resolves.toMatchObject({ recovery: { required: true } });
+    const observerAuthority = liveAuthorityFor(value.store, profile.id);
     await value.service.observeCodexFact(
-      {
-        codexHome: "unused",
-        desktopUserData: "unused",
-        generation: profile.processGeneration,
-        id: profile.id,
-      },
+      observerAuthority,
       {
         name: "must not mutate the session",
         threadId: sessionBefore.providerThreadId as string,
         type: "threadNameUpdated",
       },
     );
-    const observerAuthority = {
-      codexHome: "unused",
-      desktopUserData: "unused",
-      generation: profile.processGeneration,
-      id: profile.id,
-    } as const;
+    if (profile.providerEmail === undefined) throw new Error("Expected the signed-in profile identity.");
+    // Exercise the projection-recovery fence under the same account. A
+    // replacement identity has its own earlier controller-revocation fence.
+    await value.service.observeCodexAccount(observerAuthority, {
+      signedIn: true,
+      email: profile.providerEmail,
+    });
     value.codex.readProjection = {
       ...value.codex.readProjection,
       activeTurnId: "foreign-active-turn",
@@ -18592,12 +21116,7 @@ describe("HraService", () => {
     cloud.unsettledProjectionProfiles.add(profile.id);
     const providerWritesBefore = providerMutationCalls(value.codex);
 
-    await value.service.observeCodexFact({
-      codexHome: "unused",
-      desktopUserData: "unused",
-      generation: profile.processGeneration,
-      id: profile.id,
-    }, {
+    await value.service.observeCodexFact(liveAuthorityFor(value.store, profile.id), {
       threadId: session.providerThreadId,
       turn: {
         completedAt: 2,
@@ -18633,12 +21152,9 @@ describe("HraService", () => {
       signalRead();
       await readGate;
     };
-    const staleFact = value.service.observeCodexFact({
-      codexHome: "unused",
-      desktopUserData: "unused",
-      generation: profile.processGeneration,
-      id: profile.id,
-    }, {
+    const staleFact = value.service.observeCodexFact(
+      liveAuthorityFor(value.store, profile.id),
+      {
       threadId: session.providerThreadId,
       turn: {
         completedAt: null,
@@ -18649,7 +21165,8 @@ describe("HraService", () => {
         status: "inProgress",
       },
       type: "turnStarted",
-    });
+      },
+    );
 
     await readStarted;
     value.store.advanceProfileGeneration(profile.id, profile.processGeneration);
@@ -18680,16 +21197,14 @@ describe("HraService", () => {
       signalRead();
       await readGate;
     };
-    const staleFact = value.service.observeCodexFact({
-      codexHome: "unused",
-      desktopUserData: "unused",
-      generation: profile.processGeneration,
-      id: profile.id,
-    }, {
+    const staleFact = value.service.observeCodexFact(
+      liveAuthorityFor(value.store, profile.id),
+      {
       name: "must not apply after logout",
       threadId: session.providerThreadId,
       type: "threadNameUpdated",
-    });
+      },
+    );
 
     await readStarted;
     expect(value.store.setProfileState(profile.id, profile.processGeneration, "signed_out")).toBe(true);
@@ -18710,12 +21225,7 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound recovery session.");
-    const authority: ProfileAuthority = {
-      codexHome: "unused",
-      desktopUserData: "unused",
-      generation: profile.processGeneration,
-      id: profile.id,
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const connectionId = value.codex.observationConnectionId;
     let entered!: () => void;
     const recoveryEntered = new Promise<void>((resolve) => { entered = resolve; });
@@ -18747,18 +21257,16 @@ describe("HraService", () => {
         workingDirectory: null,
       },
       kind: "command_approval",
-      provider: {
+      provider: interactionAuthorityFor(authority, {
         approvalId: null,
         connectionId,
         itemId: "item-delete-race",
         method: "item/commandExecution/requestApproval",
-        processGeneration: profile.processGeneration,
-        profileId: profile.id,
         requestDigest: "9".repeat(64),
         requestId: { type: "number", value: 99 },
         threadId: session.providerThreadId,
         turnId: "turn-delete-race",
-      },
+      }),
       type: "interactionRequested",
     });
     await value.service.observeCodexFact(authority, {
@@ -18835,6 +21343,7 @@ describe("HraService", () => {
       accountId: profile.id,
       providerConnectionId: null,
       providerGeneration: profile.processGeneration,
+      providerAuthority: value.store.requireProviderAccountAuthority(profile.id, "codex"),
       sessionId: session.id,
     }).changed).toBe(true);
     await value.service.close();
@@ -18842,7 +21351,7 @@ describe("HraService", () => {
       isSessionTerminal: (sessionPublicId) =>
         value.store.requireSession(sessionPublicId).state === "terminal",
     });
-    const reopened = new HraService({
+    const reopened = new OompaService({
       cloud: new UnavailableCloudControl(blocker),
       codex: value.codex,
       daemonAuthority: new FakeDaemonAuthority(),
@@ -18909,6 +21418,7 @@ describe("HraService", () => {
     const unrelatedSessionId = unrelatedStarted.session.id;
     const affectedSession = value.store.requireSession(affectedSessionId);
     const affectedProfile = value.store.requireProfile(affectedSession.profileId);
+    const affectedAuthority = liveAuthorityFor(value.store, affectedProfile.id);
     if (affectedSession.providerThreadId === undefined) throw new Error("Expected a bound test session.");
     const idempotencyKey = "018bcfe5-6800-7000-8000-000000000881";
     const epochPublicId = "018bcfe5-6800-7000-8000-000000000882";
@@ -18922,8 +21432,11 @@ describe("HraService", () => {
       idempotencyKey,
       lineageCommitment: "b".repeat(64),
       localAuthority: {
-        profileGeneration: affectedProfile.processGeneration,
+        bindingGeneration: affectedAuthority.bindingGeneration,
+        processGeneration: affectedAuthority.generation,
         profileId: affectedProfile.id,
+        provider: affectedAuthority.provider,
+        providerAccountId: affectedAuthority.providerAccountId,
         providerUpdatedAt: 10,
         providerThreadId: affectedSession.providerThreadId,
         sessionRevision: affectedSession.revision,
@@ -18949,12 +21462,16 @@ describe("HraService", () => {
     const blocker = new CloudDaemonJournalRecoveryBlocker(journal);
     const providerWritesBefore = providerMutationCalls(value.codex);
     await value.service.close();
+    const offlineDaemonGeneration = value.store.nextDaemonGeneration(
+      `boot_${"8".repeat(32)}`,
+    );
 
     const offlineAuthority = new FakeDaemonAuthority();
-    const offlineService = new HraService({
+    const offlineService = new OompaService({
       cloud: new UnavailableCloudControl(blocker),
       codex: value.codex,
       daemonAuthority: offlineAuthority,
+      daemonGeneration: offlineDaemonGeneration,
       paths: value.paths,
       requestStop: () => undefined,
       store: value.store,
@@ -18970,11 +21487,12 @@ describe("HraService", () => {
       kind: "session.fast",
       session: affectedSessionId,
     }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
-    await expect(offlineService.execute({
+    const offlineShow = await offlineService.execute({
       detail: false,
       kind: "session.show",
       session: affectedSessionId,
-    }, { signal })).resolves.toBeDefined();
+    }, { signal });
+    expect(offlineShow).toBeDefined();
     await expect(offlineService.execute({
       enabled: true,
       kind: "session.fast",
@@ -18989,6 +21507,9 @@ describe("HraService", () => {
     expect(providerMutationCalls(value.codex)).toEqual(providerWritesBefore);
     expect(await blocker.isCompactProjectionRecoveryUnsettled(affectedSessionId)).toBe(true);
     await offlineService.close();
+    const restoredDaemonGeneration = value.store.nextDaemonGeneration(
+      `boot_${"9".repeat(32)}`,
+    );
 
     const configuredCloud = new FakeCloud();
     configuredCloud.projectionRecoveryBlocker = blocker;
@@ -19028,20 +21549,22 @@ describe("HraService", () => {
       );
       if (committed === null) throw new Error("Recovery journal authority changed.");
     };
-    const restoredService = new HraService({
+    const restoredService = new OompaService({
       cloud: configuredCloud,
       codex: value.codex,
       daemonAuthority: new FakeDaemonAuthority(),
+      daemonGeneration: restoredDaemonGeneration,
       paths: value.paths,
       requestStop: () => undefined,
       store: value.store,
     });
-    await expect(restoredService.execute({
+    const restoredProjection = await restoredService.execute({
       acknowledgeGap: true,
       idempotencyKey,
       kind: "sync.projection-recover",
       session: affectedSessionId,
-    }, { signal })).resolves.toBe(configuredCloud.projectionRecoveryResult);
+    }, { signal });
+    expect(restoredProjection).toBe(configuredCloud.projectionRecoveryResult);
     expect(configuredCloud.projectionRecoveries).toHaveLength(1);
     expect(await blocker.isCompactProjectionRecoveryUnsettled(affectedSessionId)).toBe(false);
     await expect(restoredService.execute({
@@ -19140,7 +21663,7 @@ describe("HraService", () => {
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
     const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const queued = store.enqueue(started.session.id, "after completion");
-    const authority = { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" };
+    const authority = liveAuthorityFor(store, added.account.id as `acct_${string}`);
     codex.beforeStartTurnReturn = async () => {
       delete codex.beforeStartTurnReturn;
       codex.readProjection = { ...codex.readProjection, status: "idle", providerUpdatedAt: (codex.readProjection.providerUpdatedAt ?? 10) + 1 };
@@ -19178,7 +21701,7 @@ describe("HraService", () => {
     const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const first = store.enqueue(started.session.id, "first queued");
     const second = store.enqueue(started.session.id, "second queued");
-    const authority = { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" };
+    const authority = liveAuthorityFor(store, added.account.id as `acct_${string}`);
     codex.beforeStartTurnReturn = async () => {
       delete codex.beforeStartTurnReturn;
       codex.readProjection = { ...codex.readProjection, status: "idle", providerUpdatedAt: (codex.readProjection.providerUpdatedAt ?? 10) + 1 };
@@ -19207,7 +21730,10 @@ describe("HraService", () => {
     const show = service.execute({ kind: "session.show", session: started.session.id, detail: false }, { signal });
     await readStarted;
     delete codex.beforeReadSessionReturn;
-    codex.runtimeProfileOverride = { ...runtimeProfile({ id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" }), observedAt: 3_000 };
+    codex.runtimeProfileOverride = {
+      ...runtimeProfile(liveAuthorityFor(store, added.account.id as `acct_${string}`)),
+      observedAt: 3_000,
+    };
     const send = service.execute({ kind: "session.send", session: started.session.id, message: "after read" }, { signal });
     await new Promise((resolve) => setTimeout(resolve, 5));
     expect(codex.calls.filter((call) => call === "send")).toHaveLength(0);
@@ -19227,7 +21753,10 @@ describe("HraService", () => {
     await service.execute({ kind: "session.queue", session: started.session.id, message: "second" }, { signal });
     codex.readProjection = { ...codex.readProjection, status: "idle", providerUpdatedAt: (codex.readProjection.providerUpdatedAt ?? 10) + 1 };
     delete (codex.readProjection as { activeTurnId?: string }).activeTurnId;
-    await service.observeCodexFact({ id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" }, { type: "turnCompleted", threadId: started.session.providerThreadId, turn: { id: "turn-initial", items: [], status: "completed", startedAt: 1, completedAt: 2, durationMs: 1 } });
+    await service.observeCodexFact(
+      liveAuthorityFor(store, added.account.id as `acct_${string}`),
+      { type: "turnCompleted", threadId: started.session.providerThreadId, turn: { id: "turn-initial", items: [], status: "completed", startedAt: 1, completedAt: 2, durationMs: 1 } },
+    );
     await service.settled();
     expect(store.listQueue(started.session.id as `sess_${string}`)[0]).toMatchObject({ state: "applied" });
     expect(store.requireSession(started.session.id)).toMatchObject({ state: "active", activeTurnId: "turn-next-2" });
@@ -19247,7 +21776,7 @@ describe("HraService", () => {
     const second = await service.execute({ kind: "session.queue", session: started.session.id, message: "continues" }, { signal }) as { queued: { id: `queue_${string}` } };
     expect(store.requireQueue(first.queued.id)).toMatchObject({ state: "pending" });
     expect(store.requireQueue(second.queued.id)).toMatchObject({ state: "pending" });
-    const authority = { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" };
+    const authority = liveAuthorityFor(store, added.account.id as `acct_${string}`);
     codex.turnStatus = "completed";
     codex.startTurnErrorOnce = new Error("determinate rejection");
     codex.readProjection = { ...codex.readProjection, status: "idle", providerUpdatedAt: (codex.readProjection.providerUpdatedAt ?? 10) + 1 };
@@ -19273,6 +21802,7 @@ describe("HraService", () => {
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     const project = await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal }) as { project: { id: string } };
     const imported = store.upsertProviderSession({
+      providerAuthority: store.requireProviderAccountAuthority(added.account.id, "codex"),
       profileId: added.account.id,
       provider: "codex",
       providerThreadId: "provider-thread",
@@ -19311,8 +21841,9 @@ describe("HraService", () => {
     const project = store.listProjects()[0];
     if (project === undefined) throw new Error("Expected the imported session project.");
     const imported = store.upsertProviderSession({
-      profileId: added.account.id,
+      providerAuthority: store.requireProviderAccountAuthority(added.account.id, "codex"),
       projectId: project.id,
+      profileId: added.account.id,
       provider: "codex",
       providerThreadId: "provider-thread-imported-send",
       providerAccountKey: codexProviderAccountKey(),
@@ -19345,9 +21876,11 @@ describe("HraService", () => {
     });
   });
 
-  test("retries bounded pre-evidence baseline and capability failures without replaying a provider effect", async () => {
-    for (const failure of ["baseline", "capability"] as const) {
-      const { service, codex, documents, store } = await fixture();
+  test.each(["baseline", "capability"] as const)(
+    "retries bounded pre-evidence baseline and capability failures without replaying a provider effect (%s)",
+    (failure) => ownedServiceCase(async ({ createFixture, signal }) => {
+      const { service, codex, documents, store } = await createFixture();
+      signal.throwIfAborted();
       const added = await service.execute({ kind: "account.add", label: `Transient ${failure}` }, { signal }) as { account: { id: string } };
       await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
       await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
@@ -19362,15 +21895,15 @@ describe("HraService", () => {
       expect(store.readQueueEffect(queued.queued.id)).toMatchObject({ evidence: { queueId: queued.queued.id } });
       expect(codex.calls.filter((call) => call === "send")).toHaveLength(1);
       expect(codex.maximumConcurrentStartTurns).toBe(1);
-    }
-  });
+    }),
+  );
 
   describe("maps bounded Codex failures to phase-specific safe guidance before dispatch", () => {
     const failures = [
       {
         code: "HOME_MISMATCH",
         reason: "codex_home_mismatch",
-        message: "The Codex home does not match this account's isolated runtime. Run `hra doctor --json` and repair the reported configuration before retrying.",
+        message: "The Codex home does not match this account's isolated runtime. Run `oompa doctor --json` and repair the reported configuration before retrying.",
       },
       {
         code: "PROCESS_EXITED",
@@ -19380,12 +21913,12 @@ describe("HraService", () => {
       {
         code: "PROTOCOL_ERROR",
         reason: "codex_protocol_error",
-        message: "Codex returned data that violates HRA's pinned protocol. Run `hra doctor --json` and repair or update HRA before retrying.",
+        message: "Codex returned data that violates Oompa's pinned protocol. Run `oompa doctor --json` and repair or update Oompa before retrying.",
       },
       {
         code: "PROTOCOL_LIMIT",
         reason: "codex_protocol_limit",
-        message: "Codex data exceeded HRA's bounded protocol limits. Narrow the request where possible or update HRA before trying again.",
+        message: "Codex data exceeded Oompa's bounded protocol limits. Narrow the request where possible or update Oompa before trying again.",
       },
       {
         code: "REMOTE_ERROR",
@@ -19395,17 +21928,17 @@ describe("HraService", () => {
       {
         code: "RUNTIME_MISMATCH",
         reason: "codex_runtime_mismatch",
-        message: "HRA's pinned Codex runtime is missing or incompatible. Run `hra doctor --json` and repair or reinstall HRA before retrying.",
+        message: "Oompa's pinned Codex runtime is missing or incompatible. Run `oompa doctor --json` and repair or reinstall Oompa before retrying.",
       },
       {
         code: "TIMEOUT",
         reason: "codex_timeout",
-        message: "Codex did not complete the operation within HRA's bounded deadline. Inspect current state before deciding whether to start a fresh attempt.",
+        message: "Codex did not complete the operation within Oompa's bounded deadline. Inspect current state before deciding whether to start a fresh attempt.",
       },
       {
         code: "UNSUPPORTED_CAPABILITY",
         reason: "codex_capability_unsupported",
-        message: "The pinned Codex runtime does not support a capability required for this operation. Run `hra doctor --json` and update or reconfigure HRA before retrying.",
+        message: "The pinned Codex runtime does not support a capability required for this operation. Run `oompa doctor --json` and update or reconfigure Oompa before retrying.",
       },
     ] as const;
     for (const [index, failure] of failures.entries()) {
@@ -19519,7 +22052,7 @@ describe("HraService", () => {
     await entered;
     const remote = service.executeRemote(
       { kind: "session.send", session: session.id, message: "must remain fenced", idempotencyKey: "00000000-0000-4000-8000-000000000702" },
-      { sessionId: session.id, profileId: profile.id, processGeneration: profile.processGeneration, providerThreadId: session.providerThreadId },
+      remoteAuthorityFor(store, session.id),
       { signal },
     );
     releaseLogout();
@@ -19535,7 +22068,6 @@ describe("HraService", () => {
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
     const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const session = store.requireSession(started.session.id);
-    const profile = store.requireProfile(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("The provider binding is missing.");
     let entered!: () => void;
     const providerVisible = new Promise<void>((resolve) => { entered = resolve; });
@@ -19555,13 +22087,8 @@ describe("HraService", () => {
       idempotencyKey: "00000000-0000-4000-8000-000000000712",
       kind: "session.fast",
       session: session.id,
-    }, {
-      processGeneration: profile.processGeneration,
-      profileId: profile.id,
-      providerThreadId: session.providerThreadId,
-      sessionId: session.id,
-    }, { signal }).finally(() => { remoteSettled = true; });
-    await Bun.sleep(5);
+    }, remoteAuthorityFor(store, session.id), { signal }).finally(() => { remoteSettled = true; });
+    await Bun.sleep(0);
     expect(remoteSettled).toBe(false);
     expect(store.requireSession(session.id).fastEnabled).toBe(false);
     release();
@@ -19578,7 +22105,6 @@ describe("HraService", () => {
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
     const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const session = store.requireSession(started.session.id);
-    const profile = store.requireProfile(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("The provider binding is missing.");
     let entered!: () => void;
     const providerVisible = new Promise<void>((resolve) => { entered = resolve; });
@@ -19592,12 +22118,7 @@ describe("HraService", () => {
       kind: "session.preset",
       preset: "ultra",
       session: session.id,
-    }, {
-      processGeneration: profile.processGeneration,
-      profileId: profile.id,
-      providerThreadId: session.providerThreadId,
-      sessionId: session.id,
-    }, { signal }).then(() => null, (error: unknown) => error);
+    }, remoteAuthorityFor(store, session.id), { signal }).then(() => null, (error: unknown) => error);
     await Bun.sleep(0);
     daemonAuthority.invalidate();
     release();
@@ -19617,7 +22138,7 @@ describe("HraService", () => {
     expect(replay.login).toEqual({
       status: "pending",
       loginId: "provider-login-1",
-      next: `hra account login-cancel ${added.account.id}`,
+      next: `oompa account login-cancel ${added.account.id}`,
     });
     expect(replay.account.processGeneration).toBe(1);
     expect(codex.calls.filter((call) => call.startsWith("login:"))).toHaveLength(1);
@@ -19670,12 +22191,7 @@ describe("HraService", () => {
       idempotencyKey,
     }, { signal });
 
-    await service.observeCodexAccount({
-      id: added.account.id,
-      generation: 1,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    }, {
+    await service.observeCodexAccount(liveAuthorityFor(store, added.account.id), {
       signedIn: true,
       email: "completed@example.com",
       plan: "Plus",
@@ -19894,6 +22410,225 @@ describe("HraService", () => {
     expect(codex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(2);
   });
 
+  test.each(["missing_primary", "wrong_provenance", "second_owner", "extra_binding", "missing_login_successor"] as const)(
+    "account recovery refuses %s without settling an uncertain cancellation",
+    async (damage) => {
+      const { service, codex, store, paths } = await fixture();
+      const profile = store.createProfile(`Recovery ${damage}`);
+      codex.loginResult = { status: "pending", loginId: "recovery-proof-login" };
+      await service.execute({ kind: "account.login", account: profile.id, deviceCode: false }, { signal });
+      codex.accountProjection = { signedIn: false };
+      codex.beforeCancelLoginReturn = async () => {
+        throw new IndeterminateCodexEffectError("account/cancelLogin", 71);
+      };
+      const key = "00000000-0000-4000-8000-000000000138";
+      const second = damage === "second_owner" ? store.prepareMutation({
+        kind: "account.login-cancel", authorityId: profile.id,
+        authorityGeneration: 1, request: { loginId: "recovery-proof-login" },
+        idempotencyKey: "00000000-0000-4000-8000-000000000139",
+      }) : null;
+      await expect(service.execute({ kind: "account.login-cancel", account: profile.id, idempotencyKey: key }, { signal }))
+        .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      const attempt = store.readMutation(key);
+      if (attempt === null) throw new Error("Missing cancellation fixture.");
+      if (damage === "second_owner") {
+        if (second === null) throw new Error("Missing second owner fixture.");
+        store.beginLoginCancelMutationEffect({ attemptId: second.id, profileId: profile.id,
+          processGeneration: 1, loginId: "recovery-proof-login",
+          providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex") });
+      } else if (damage === "missing_login_successor") {
+        store.nextDaemonGeneration(`boot_${"6".repeat(32)}`);
+        const database = new Database(paths.database);
+        try {
+          const name = "session_mutation_authority_rebinds_v39_immutable_delete";
+          const guard = database.query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?").get(name) as { sql: string };
+          database.exec(`DROP TRIGGER ${name}`);
+          try {
+            expect(database.query("DELETE FROM session_mutation_authority_rebinds_v39 WHERE profile_id=? AND provider='codex'").run(profile.id).changes).toBe(1);
+          } finally { database.exec(guard.sql); }
+        } finally { database.close(false); }
+      } else if (damage === "extra_binding") {
+        // A same-process replacement followed by quarantine is two binding
+        // changes, not the one admitted recovery transition.
+        store.setProfileState(profile.id, 1, "login_pending", { email: "replacement@example.com" });
+        store.setProfileState(profile.id, 1, "recovery_required");
+      } else {
+        const database = new Database(paths.database);
+        try {
+          const name = damage === "missing_primary"
+            ? "mutation_provider_authorities_immutable_delete"
+            : "mutation_provider_authorities_immutable_update";
+          const guard = database.query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?").get(name) as { sql: string };
+          database.exec(`DROP TRIGGER ${name}`);
+          try {
+            if (damage === "missing_primary") database.query("DELETE FROM mutation_provider_authorities WHERE attempt_id=?").run(attempt.id);
+            else database.query("UPDATE mutation_provider_authorities SET provenance='account_logout' WHERE attempt_id=?").run(attempt.id);
+          } finally { database.exec(guard.sql); }
+        } finally { database.close(false); }
+      }
+      const before = store.listUnsettledMutations({ authorityId: profile.id });
+      const captured = store.readMutationProviderAuthorities(attempt.id);
+      const profileBefore = store.requireProfile(profile.id);
+      const calls = codex.calls.length;
+      await expect(service.execute({ kind: "account.show", account: profile.id }, { signal }))
+        .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      expect(store.listUnsettledMutations({ authorityId: profile.id })).toEqual(before);
+      expect(store.readMutationProviderAuthorities(attempt.id)).toEqual(captured);
+      expect(store.requireProfile(profile.id)).toEqual(profileBefore);
+      expect(codex.calls.slice(calls)).toEqual(["readAccount"]);
+      const current = store.requireProviderAccountAuthority(profile.id, "codex");
+      expect(() => store.resolveLoginCancelMutation({ attemptId: attempt.id, expectedOriginalState: "ambiguous",
+        expectedProviderAuthority: current, provider: { signedIn: false } })).toThrow();
+      expect(() => store.reconcileProfileRecoveryFromAccountRead({ profileId: profile.id,
+        expectedGeneration: current.processGeneration, expectedProviderAuthority: current,
+        provider: { signedIn: false } })).toThrow();
+      expect(store.listUnsettledMutations({ authorityId: profile.id })).toEqual(before);
+      expect(store.requireProfile(profile.id)).toEqual(profileBefore);
+    },
+  );
+
+  test.each(["binding", "identity", "process"] as const)(
+    "account recovery rejects a captured %s race after the provider read",
+    async (changedPart) => {
+      const { service, codex, store } = await fixture();
+      const profile = store.createProfile(`Read race ${changedPart}`);
+      codex.loginResult = { status: "pending", loginId: "raced-recovery-login" };
+      await service.execute({ kind: "account.login", account: profile.id, deviceCode: false }, { signal });
+      codex.accountProjection = { signedIn: false };
+      codex.beforeCancelLoginReturn = async () => { throw new IndeterminateCodexEffectError("account/cancelLogin", 72); };
+      const key = "00000000-0000-4000-8000-000000000140";
+      await expect(service.execute({ kind: "account.login-cancel", account: profile.id, idempotencyKey: key }, { signal }))
+        .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      const attempt = store.readMutation(key);
+      if (attempt === null) throw new Error("Missing read race fixture.");
+      const frozen = store.readMutationProviderAuthorities(attempt.id);
+      const captured = store.requireProviderAccountAuthority(profile.id, "codex");
+      let changedProfile = store.requireProfile(profile.id);
+      codex.beforeReadAccountReturn = async () => {
+        if (changedPart === "process") store.nextProfileGeneration(profile.id);
+        else store.setProfileState(profile.id, 1, changedPart === "binding" ? "recovery_required" : "login_pending",
+          changedPart === "identity" ? { email: "changed-during-read@example.com" } : undefined);
+        changedProfile = store.requireProfile(profile.id);
+      };
+      const calls = codex.calls.length;
+      await expect(service.execute({ kind: "account.show", account: profile.id }, { signal }))
+        .rejects.toMatchObject({ code: "CONFLICT" });
+      expect(store.readMutation(key)).toEqual(attempt);
+      expect(store.readMutationProviderAuthorities(attempt.id)).toEqual(frozen);
+      expect(store.requireProfile(profile.id)).toEqual(changedProfile);
+      expect(codex.calls.slice(calls)).toEqual(["readAccount"]);
+      expect(() => store.resolveLoginCancelMutation({ attemptId: attempt.id,
+        expectedOriginalState: "ambiguous", expectedProviderAuthority: captured,
+        provider: { signedIn: false } })).toThrow();
+      expect(store.readMutation(key)).toEqual(attempt);
+    },
+  );
+
+  test.each(["binding", "retired_controller"] as const)(
+    "account recovery refuses a pre-read %s change during the cloud check",
+    async (changedPart) => {
+      const value = await fixture();
+      const { service, codex, cloud, store, paths } = value;
+      const profile = store.createProfile(`Pre-read race ${changedPart}`);
+      await service.execute({ kind: "account.login", account: profile.id, deviceCode: false }, { signal });
+      const frozen = store.requireProviderAccountAuthority(profile.id, "codex");
+      const unused = (): never => { throw new Error("No Work capability expected."); };
+      const work = store.createWorkStore(value.daemonGeneration, unused, { issue: unused, verify: unused });
+      cloud.beforeProjectionUnsettledProfileReturn = async () => {
+        if (changedPart === "binding") store.setProfileState(profile.id, 1, "recovery_required", { email: "person@example.com" });
+        else {
+          const started = store.beginProviderRuntimeAccountRevocation({ profileId: profile.id,
+            expectedGeneration: 1, provider: "codex", runtimeScope: "managed", currentAccountKey: null, workStore: work });
+          expect(started.sessionIds).toEqual([]);
+          await codex.releaseOwnedAuthority({ authority: liveAuthorityFor(store, profile.id, "codex", profilePaths(paths, profile.id)), signal });
+          store.completeProviderRuntimeAccountRevocation({ profileId: profile.id, expectedGeneration: 1,
+            provider: "codex", runtimeScope: "managed", expectedRevision: started.revocation.revision });
+        }
+      };
+      const calls = codex.calls.length;
+      await expect(service.execute({ kind: "account.show", account: profile.id }, { signal }))
+        .rejects.toMatchObject({ code: "CONFLICT" });
+      expect(codex.calls.slice(calls)).toEqual([]);
+      expect(store.requireProviderAccountAuthority(profile.id, "codex").processGeneration).toBe(frozen.processGeneration);
+      expect(store.requireProfile(profile.id).state).toBe(changedPart === "binding" ? "recovery_required" : "signed_in");
+    },
+  );
+
+  test("account recovery keeps an exact uncompleted login unresolved on a signed-out read", async () => {
+    const { service, codex, store } = await fixture();
+    const profile = store.createProfile("Exact uncompleted login");
+    const key = "00000000-0000-4000-8000-000000000143";
+    codex.beforeLoginReturn = async () => { throw new IndeterminateCodexEffectError("account/login/start", 74); };
+    await expect(service.execute({ kind: "account.login", account: profile.id,
+      deviceCode: false, idempotencyKey: key }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    const original = store.readMutation(key);
+    if (original === null) throw new Error("Missing uncompleted login fixture.");
+    const captured = store.readMutationProviderAuthorities(original.id);
+    const before = store.requireProfile(profile.id);
+    const revocations = ["managed", "personal"].map((runtimeScope) => store.readProviderRuntimeAccountRevocation({
+      profileId: profile.id, provider: "codex", runtimeScope: runtimeScope === "managed" ? "managed" : "personal",
+    }));
+    codex.accountProjection = { signedIn: false };
+    const calls = codex.calls.length;
+    const releases = codex.releasedAuthorities.length;
+    await expect(service.execute({ kind: "account.show", account: profile.id }, { signal })).resolves.toMatchObject({
+      account: { state: "recovery_required" },
+      recovery: { required: true, cleared: false, diagnostic: "The exact provider read does not prove that login completed." },
+    });
+    await service.settled();
+    expect(store.readMutation(key)).toEqual(original);
+    expect(store.readMutationProviderAuthorities(original.id)).toEqual(captured);
+    expect(store.requireProfile(profile.id)).toEqual(before);
+    expect(codex.calls.slice(calls)).toEqual(["readAccount"]);
+    expect(codex.releasedAuthorities).toHaveLength(releases);
+    expect(codex.resetIdempotencyKeys).toEqual([]);
+    expect(["managed", "personal"].map((runtimeScope) => store.readProviderRuntimeAccountRevocation({
+      profileId: profile.id, provider: "codex", runtimeScope: runtimeScope === "managed" ? "managed" : "personal",
+    }))).toEqual(revocations);
+  });
+
+  test("account recovery blocks a fresh cancellation after restart until the original read reconciliation", async () => {
+    const value = await fixture();
+    const { store, service, codex, paths } = value;
+    const profile = store.createProfile("Retired uncertain cancellation");
+    codex.loginResult = { status: "pending", loginId: "retired-uncertain-login" };
+    await service.execute({ kind: "account.login", account: profile.id, deviceCode: false }, { signal });
+    codex.beforeCancelLoginReturn = async () => { throw new IndeterminateCodexEffectError("account/cancelLogin", 73); };
+    const oldKey = "00000000-0000-4000-8000-000000000141";
+    const newKey = "00000000-0000-4000-8000-000000000142";
+    await expect(service.execute({ kind: "account.login-cancel", account: profile.id, idempotencyKey: oldKey }, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    const original = store.readMutation(oldKey);
+    if (original === null) throw new Error("Missing uncertain cancellation.");
+    const frozen = store.readMutationProviderAuthorities(original.id);
+    const bootId = `boot_${"7".repeat(32)}`;
+    const generation = store.nextDaemonGeneration(bootId);
+    const currentCodex = new FakeCodex();
+    currentCodex.accountProjection = { signedIn: false };
+    const restarted = new OompaService({ store, paths, codex: currentCodex,
+      cloud: new FakeCloud(), daemonAuthority: new FakeDaemonAuthority(),
+      daemonGeneration: generation, daemonBootId: bootId, requestStop: () => undefined });
+    await restarted.recover();
+    expect(store.requireProfile(profile.id)).toMatchObject({ state: "login_pending", processGeneration: 2 });
+    const calls = currentCodex.calls.length;
+    await expect(restarted.execute({ kind: "account.login-cancel", account: profile.id, idempotencyKey: newKey }, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(currentCodex.calls.slice(calls)).toEqual([]);
+    expect(store.readMutation(newKey)).toBeNull();
+    expect(store.readMutation(oldKey)).toEqual(original);
+    expect(store.readMutationProviderAuthorities(original.id)).toEqual(frozen);
+    await expect(restarted.execute({ kind: "account.show", account: profile.id }, { signal }))
+      .resolves.toMatchObject({ account: { state: "login_pending" }, login: { loginId: "retired-uncertain-login" } });
+    expect(store.readMutation(oldKey)).toMatchObject({ state: "reconciled",
+      resolution: { kind: "provider_state_reconciled" } });
+    expect(store.readMutation(oldKey)?.resolution?.receipt).toBeUndefined();
+    await expect(restarted.execute({ kind: "account.login-cancel", account: profile.id, idempotencyKey: newKey }, { signal }))
+      .resolves.toMatchObject({ status: "canceled", account: { state: "signed_out" } });
+    expect(currentCodex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(1);
+    expect(store.readMutationProviderAuthorities(original.id)).toEqual(frozen);
+    await restarted.close();
+  });
+
   test("preserves an accepted cancellation when its following account read fails", async () => {
     const { service, codex, store } = await fixture();
     const added = await service.execute({ kind: "account.add", label: "Cancel read failure" }, { signal }) as { account: { id: `acct_${string}` } };
@@ -19986,36 +22721,184 @@ describe("HraService", () => {
       profileId: added.account.id,
       processGeneration: 1,
       loginId: "provider-login-crashed-cancel",
+      providerAuthority: store.requireProviderAccountAuthority(added.account.id, "codex"),
     });
+    const capturedAuthority = store.readMutationProviderAuthorities(attempt.id);
     expect(store.readMutation(idempotencyKey)).toMatchObject({
       state: "effect_started",
       evidence: { evidence: { kind: "account.login-cancel", loginId: "provider-login-crashed-cancel" } },
     });
-    // A crash leaves the effect-started attempt behind without the graceful
-    // close that retires the profile generation, so the first service is not
-    // closed before the restarted one recovers over the same store.
+    // A crash advances the live provider process fence. Recovery must still
+    // classify and reconcile the immutable old-generation cancellation
+    // without replaying it or rebinding its sidecar.
+    const daemonGeneration = store.nextDaemonGeneration(`boot_${"c".repeat(32)}`);
     const restartedCodex = new FakeCodex();
     restartedCodex.accountProjection = { signedIn: false };
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store,
       paths: value.paths,
       codex: restartedCodex,
       cloud: new FakeCloud(),
       daemonAuthority: new FakeDaemonAuthority(),
+      daemonGeneration,
       requestStop: () => undefined,
     });
     await restarted.recover();
-    expect(store.requireProfile(added.account.id)).toMatchObject({ processGeneration: 1, state: "recovery_required" });
+    expect(store.requireProfile(added.account.id)).toMatchObject({ processGeneration: 2, state: "recovery_required" });
     expect(store.readMutation(idempotencyKey)).toMatchObject({ state: "ambiguous", result: { code: "DAEMON_RESTART" } });
+    expect(store.readMutationProviderAuthorities(attempt.id)).toEqual(capturedAuthority);
 
     const shown = await restarted.execute({ kind: "account.show", account: added.account.id }, { signal });
     expect(shown).toMatchObject({
-      account: { processGeneration: 1, state: "login_pending" },
+      account: { processGeneration: 2, state: "login_pending" },
+      login: { status: "pending", loginId: "provider-login-crashed-cancel" },
       recovery: { cleared: true, required: false, resolution: "provider_state_reconciled" },
     });
     expect(store.readMutation(idempotencyKey)).toMatchObject({ state: "reconciled", originalState: "ambiguous" });
-    expect(store.readPendingLoginAuthority(added.account.id, 1)?.loginId).toBe("provider-login-crashed-cancel");
+    expect(() => store.readPendingLoginAuthority(added.account.id, 1)).toThrow("PROVIDER_LOGIN_BINDING_PROOF_INVALID");
+    expect(store.readPendingLoginAuthority(added.account.id, 2)).toMatchObject({ loginId: "provider-login-crashed-cancel" });
+    expect(store.listUnsettledMutations({ authorityId: added.account.id })).toEqual([]);
+    expect(store.readMutationProviderAuthorities(attempt.id)).toEqual(capturedAuthority);
     expect(restartedCodex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(0);
+    expect(restartedCodex.calls.filter((call) => call.startsWith("login:"))).toHaveLength(0);
+    expect(restartedCodex.calls.filter((call) => call === "logout")).toHaveLength(0);
+    expect(restartedCodex.calls.filter((call) => call === "readAccount")).toHaveLength(1);
+    await restarted.close();
+    await service.close();
+  });
+
+  test("reconciles retired-generation login and logout attempts from current exact account reads without replay", async () => {
+    const value = await fixture();
+    const { service, store } = value;
+    const unusedCapability = (): never => { throw new Error("No Work capability expected in account-only fixture."); };
+    const work = store.createWorkStore(value.daemonGeneration, unusedCapability,
+      { issue: unusedCapability, verify: unusedCapability });
+    const retireEmptyCodexScopes = (profileId: `acct_${string}`, generation: number): void => {
+      // These profiles own no sessions or runtime children. Model the actual
+      // two-scope retirement before the direct write-ahead account admission.
+      for (const runtimeScope of ["personal", "managed"] as const) {
+        const retired = store.beginProviderRuntimeAccountRevocation({ profileId,
+          expectedGeneration: generation, provider: "codex", runtimeScope,
+          currentAccountKey: null, workStore: work });
+        expect(retired.sessionIds).toEqual([]);
+        store.completeProviderRuntimeAccountRevocation({ profileId, expectedGeneration: generation,
+          provider: "codex", runtimeScope, expectedRevision: retired.revocation.revision });
+      }
+    };
+    const loginProfile = await service.execute(
+      { kind: "account.add", label: "Crashed login rollover" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    const loginSource = store.requireProviderAccountAuthority(loginProfile.account.id, "codex");
+    retireEmptyCodexScopes(loginProfile.account.id, loginSource.processGeneration);
+    const loginKey = "00000000-0000-4000-8000-000000000135";
+    const login = store.prepareMutation({
+      kind: "account.login",
+      authorityId: loginProfile.account.id,
+      authorityGeneration: 1,
+      request: { deviceCode: false },
+      idempotencyKey: loginKey,
+      providerAuthorities: [{
+        role: "source",
+        authority: loginSource,
+        provenance: "account_login_source",
+      }],
+    });
+    store.beginAccountMutationEffect({
+      attemptId: login.id,
+      profileId: loginProfile.account.id,
+      profileGeneration: 1,
+      providerAuthority: loginSource,
+      evidence: { kind: "account.login", method: "browser" },
+    });
+
+    const logoutProfile = await service.execute(
+      { kind: "account.add", label: "Crashed logout rollover" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await service.execute(
+      { kind: "account.login", account: logoutProfile.account.id, deviceCode: false },
+      { signal },
+    );
+    const logoutAuthority = store.requireProviderAccountAuthority(logoutProfile.account.id, "codex");
+    retireEmptyCodexScopes(logoutProfile.account.id, logoutAuthority.processGeneration);
+    const logoutKey = "00000000-0000-4000-8000-000000000136";
+    const logout = store.prepareMutation({
+      kind: "account.logout",
+      authorityId: logoutProfile.account.id,
+      authorityGeneration: logoutAuthority.processGeneration,
+      request: {},
+      idempotencyKey: logoutKey,
+      providerAuthorities: [{
+        role: "primary",
+        authority: logoutAuthority,
+        provenance: "account_logout",
+      }],
+    });
+    store.beginAccountMutationEffect({
+      attemptId: logout.id,
+      profileId: logoutProfile.account.id,
+      profileGeneration: logoutAuthority.processGeneration,
+      providerAuthority: logoutAuthority,
+      evidence: { kind: "account.logout", baselineSignedIn: true },
+    });
+    const captured = {
+      login: store.readMutationProviderAuthorities(login.id),
+      logout: store.readMutationProviderAuthorities(logout.id),
+    };
+
+    const daemonGeneration = store.nextDaemonGeneration(`boot_${"f".repeat(32)}`);
+    const restartedCodex = new FakeCodex();
+    const restarted = new OompaService({
+      store,
+      paths: value.paths,
+      codex: restartedCodex,
+      cloud: new FakeCloud(),
+      daemonAuthority: new FakeDaemonAuthority(),
+      daemonGeneration,
+      requestStop: () => undefined,
+    });
+    await restarted.recover();
+    expect(store.requireProfile(loginProfile.account.id)).toMatchObject({
+      processGeneration: 2,
+      state: "recovery_required",
+    });
+    expect(store.requireProfile(logoutProfile.account.id)).toMatchObject({
+      processGeneration: 2,
+      state: "recovery_required",
+    });
+
+    restartedCodex.accountProjection = {
+      signedIn: true,
+      email: "recovered-login@example.com",
+      plan: "Plus",
+    };
+    await expect(restarted.execute({ kind: "account.show", account: loginProfile.account.id }, { signal }))
+      .resolves.toMatchObject({
+        account: { processGeneration: 2, state: "signed_in" },
+        recovery: { cleared: true, required: false, resolution: "proven_applied" },
+      });
+    restartedCodex.accountProjection = { signedIn: false };
+    await expect(restarted.execute({ kind: "account.show", account: logoutProfile.account.id }, { signal }))
+      .resolves.toMatchObject({
+        account: { processGeneration: 2, state: "signed_out" },
+        recovery: { cleared: true, required: false, resolution: "proven_applied" },
+      });
+    expect(store.readMutation(loginKey)).toMatchObject({
+      state: "reconciled",
+      originalState: "ambiguous",
+      resolution: { kind: "proven_applied" },
+    });
+    expect(store.readMutation(logoutKey)).toMatchObject({
+      state: "reconciled",
+      originalState: "ambiguous",
+      resolution: { kind: "proven_applied" },
+    });
+    expect(store.readMutationProviderAuthorities(login.id)).toEqual(captured.login);
+    expect(store.readMutationProviderAuthorities(logout.id)).toEqual(captured.logout);
+    expect(restartedCodex.calls.filter((call) => call.startsWith("login:"))).toHaveLength(0);
+    expect(restartedCodex.calls.filter((call) => call === "logout")).toHaveLength(0);
+    expect(restartedCodex.calls.filter((call) => call === "readAccount")).toHaveLength(2);
     await restarted.close();
     await service.close();
   });
@@ -20035,6 +22918,7 @@ describe("HraService", () => {
       idempotencyKey,
     });
     store.beginLoginCancelMutationEffect({
+      providerAuthority: store.requireProviderAccountAuthority(added.account.id, "codex"),
       attemptId: attempt.id,
       profileId: added.account.id,
       processGeneration: 1,
@@ -20043,7 +22927,7 @@ describe("HraService", () => {
     store.nextDaemonGeneration(`boot_${"b".repeat(32)}`);
     const restartedCodex = new FakeCodex();
     restartedCodex.accountProjection = { signedIn: false };
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store, paths, codex: restartedCodex, cloud: new FakeCloud(),
       daemonAuthority: new FakeDaemonAuthority(), requestStop: () => undefined,
     });
@@ -20053,7 +22937,7 @@ describe("HraService", () => {
     // A second crash before status reconciliation must preserve the same
     // immutable cancellation instead of rejecting its retained login fence.
     store.nextDaemonGeneration(`boot_${"c".repeat(32)}`);
-    const again = new HraService({
+    const again = new OompaService({
       store, paths, codex: restartedCodex, cloud: new FakeCloud(),
       daemonAuthority: new FakeDaemonAuthority(), requestStop: () => undefined,
     });
@@ -20074,11 +22958,13 @@ describe("HraService", () => {
     await expect(service.execute({ kind: "account.login-cancel", account: added.account.id, idempotencyKey }, { signal }))
       .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
     store.recoverEffectStartedMutations();
-    // Recovery may already have quarantined a cancellation at startup.
-    store.setProfileState(added.account.id, 1, "recovery_required");
+    // Keep the original pending binding: a generic readiness transition is not
+    // the dedicated cancellation-quarantine witness produced at real restart.
     codex.accountProjection = { signedIn: true, email: "race@example.com" };
-    await expect(service.execute({ kind: "account.show", account: added.account.id }, { signal }))
-      .resolves.toMatchObject({ account: { state: "signed_in", processGeneration: 1, providerEmail: "race@example.com" }, recovery: { required: false, cleared: true } });
+    const shown = await service.execute({ kind: "account.show", account: added.account.id }, { signal });
+    expect(shown).toMatchObject({ account: {
+      state: "signed_in", processGeneration: 1, providerEmail: "race@example.com" } });
+    expect(shown).not.toHaveProperty("recovery");
     await service.settled();
     expect(store.requireProfile(added.account.id)).toMatchObject({ state: "signed_in", processGeneration: 1 });
     expect(store.readMutation(idempotencyKey)?.state).toBe("reconciled");
@@ -20097,7 +22983,7 @@ describe("HraService", () => {
     store.nextDaemonGeneration(`boot_${"d".repeat(32)}`);
     const restartedCodex = new FakeCodex();
     restartedCodex.accountProjection = { signedIn: false };
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store, paths, codex: restartedCodex, cloud: new FakeCloud(),
       daemonAuthority: new FakeDaemonAuthority(), requestStop: () => undefined,
     });
@@ -20141,52 +23027,43 @@ describe("HraService", () => {
   });
 
   test("keeps unrelated accounts usable across a legacy schema 43 unbound login upgrade", async () => {
-    const value = await fixture();
-    const { service, codex, store, paths } = value;
-    const added = await service.execute({ kind: "account.add", label: "Legacy login upgrade" }, { signal }) as { account: { id: `acct_${string}` } };
-    const other = await service.execute({ kind: "account.add", label: "Unaffected login" }, { signal }) as { account: { id: `acct_${string}` } };
-    await service.execute({ kind: "account.login", account: other.account.id, deviceCode: false }, { signal });
-    codex.beforeLoginReturn = async () => { throw new IndeterminateCodexEffectError("account/login/start", 11); };
-    const idempotencyKey = "00000000-0000-4000-8000-000000000139";
-    await expect(service.execute({ kind: "account.login", account: added.account.id, deviceCode: true, idempotencyKey }, { signal }))
-      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
-    store.nextProfileGeneration(added.account.id);
-    const original = store.readMutation(idempotencyKey);
-    // v43 advanced the profile without any account successor ledger. Build
-    // that exact predecessor surface; the v45 migration must not backfill it.
-    const legacy = new Database(paths.database, { strict: true });
-    removeCanonicalProfileFixtureOverlay(legacy);
-    const evidenceSql = z.object({ sql: z.string() }).strict().parse(legacy.query(
-      "SELECT sql FROM sqlite_master WHERE type='table' AND name='autorespond_evidence'",
-    ).get()).sql;
-    expect(evidenceSql).toContain("'accepted','refused','unknown','sent'");
-    legacy.exec(evidenceSql
-      .replace("autorespond_evidence", "autorespond_evidence_v43")
-      .replace("'accepted','refused','unknown','sent'", "'accepted','refused','sent'"));
-    legacy.exec(`
-      INSERT INTO autorespond_evidence_v43 SELECT * FROM autorespond_evidence;
-      DROP TABLE autorespond_evidence;
-      ALTER TABLE autorespond_evidence_v43 RENAME TO autorespond_evidence;
-      CREATE INDEX autorespond_evidence_session ON autorespond_evidence(session_id, occurred_at DESC, id DESC);
-      CREATE INDEX autorespond_evidence_recent ON autorespond_evidence(occurred_at DESC, id DESC);
-      DROP TRIGGER sessions_autorespond_after_hours_history;
-      DROP TABLE autorespond_after_hours_history;
-      DROP TABLE autorespond_after_hours_policy;
-      DROP TABLE account_mutation_authority_rebinds;
-      DROP TRIGGER sessions_autorespond_budget_history;
-      DROP TABLE autorespond_budget_history;
-      DROP TABLE autorespond_budget_reservations;
-      DELETE FROM migrations WHERE version>43;
-      DROP TRIGGER work_session_project_authority_guard;
-      PRAGMA user_version=43;
-    `);
-    legacy.close(false);
-    store.close();
-    stores.splice(stores.indexOf(store), 1);
+    // This archived binary actually advanced an ambiguous login's profile from
+    // generation 1 to 2 without a successor ledger; no current rows are restamped.
+    const captured = canonicalLoginLedgerFixtures[43];
+    const original = captured.retained.login;
+    const added = { account: captured.retained.loginProfile };
+    const other = { account: captured.retained.profile };
+    const idempotencyKey = captured.retained.loginKey;
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-service-canonical43-login-")));
+    serviceRoots.push(home);
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    await writeFile(paths.database, canonicalLoginLedgerDatabaseBytes(43), { mode: 0o600 });
+    const retainedEvidence = () => {
+      const database = new Database(paths.database, { strict: true });
+      try {
+        database.exec("PRAGMA query_only=ON");
+        return {
+          attempt: database.query(`SELECT id,idempotency_key,kind,authority_id,authority_generation,
+            request_digest,state,result_json,created_at,updated_at FROM mutation_attempts WHERE id=?`).get(original.id),
+          effect: database.query("SELECT * FROM mutation_effect_evidence WHERE attempt_id=?").get(original.id),
+        };
+      } finally { database.close(false); }
+    };
+    const before = retainedEvidence();
     const upgraded = new StateStore(paths);
     stores.push(upgraded);
+    expect(upgraded.requireProfileById(added.account.id)).toMatchObject(added.account);
+    expect(upgraded.requireProfileById(other.account.id)).toMatchObject(other.account);
+    expect(upgraded.readMutation(idempotencyKey)).toMatchObject(original);
+    expect(retainedEvidence()).toEqual(before);
     const restartedCodex = new FakeCodex();
-    const restarted = new HraService({
+    restartedCodex.accountProjection = {
+      signedIn: true,
+      email: other.account.providerEmail,
+      plan: other.account.providerPlan,
+    };
+    const restarted = new OompaService({
       store: upgraded, paths, codex: restartedCodex, cloud: new FakeCloud(),
       daemonAuthority: new FakeDaemonAuthority(), requestStop: () => undefined,
     });
@@ -20199,22 +23076,20 @@ describe("HraService", () => {
       await expect(restarted.execute({ kind: "account.login", account: added.account.id, deviceCode: true }, { signal }))
         .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
       expect(restartedCodex.calls).toEqual(beforeRead);
-      await restarted.observeCodexAccount({
-        id: added.account.id, generation: upgraded.requireProfile(added.account.id).processGeneration,
-        codexHome: "unused", desktopUserData: "unused",
-      }, { signedIn: true, email: "unsolicited@example.com" });
+      await restarted.observeCodexAccount(liveAuthorityFor(upgraded, added.account.id, "codex"), { signedIn: true, email: "unsolicited@example.com" });
       expect(upgraded.requireProfile(added.account.id).state).toBe("recovery_required");
       await expect(restarted.execute({ kind: "account.usage", account: added.account.id, refresh: true }, { signal }))
         .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
       expect(restartedCodex.calls).toEqual(beforeRead);
       await expect(restarted.execute({ kind: "account.show", account: other.account.id }, { signal }))
         .resolves.toMatchObject({ account: { state: "signed_in" } });
-      expect(upgraded.readMutation(idempotencyKey)).toMatchObject({ authorityGeneration: 1, state: "ambiguous", evidence: original?.evidence });
+      expect(upgraded.readMutation(idempotencyKey)).toMatchObject({ authorityGeneration: 1, state: "ambiguous", evidence: original.evidence });
+      expect(retainedEvidence()).toEqual(before);
     }
     const inspector = new Database(paths.database, { readonly: true });
     try {
       expect(inspector.query("SELECT COUNT(*) AS count FROM account_mutation_authority_rebinds").get()).toEqual({ count: 0 });
-      expect(inspector.query("SELECT COUNT(*) AS count FROM mutation_resolutions WHERE attempt_id=?").get(original?.id ?? "")).toEqual({ count: 0 });
+      expect(inspector.query("SELECT COUNT(*) AS count FROM mutation_resolutions WHERE attempt_id=?").get(original.id)).toEqual({ count: 0 });
     } finally { inspector.close(false); }
   });
 
@@ -20322,12 +23197,7 @@ describe("HraService", () => {
       deviceCode: false,
       idempotencyKey,
     }, { signal });
-    const authority = {
-      id: added.account.id,
-      generation: 1,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    } as const;
+    const authority = liveAuthorityFor(store, added.account.id);
 
     await service.observeCodexFact(authority, {
       type: "loginCompleted",
@@ -20440,12 +23310,7 @@ describe("HraService", () => {
       deviceCode: false,
     }, { signal });
     await Bun.sleep(0);
-    const fact = service.observeCodexFact({
-      id: added.account.id,
-      generation: 1,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    }, {
+    const fact = service.observeCodexFact(liveAuthorityFor(store, added.account.id), {
       type: "loginCompleted",
       loginId: "provider-login-race",
       success: false,
@@ -20464,7 +23329,8 @@ describe("HraService", () => {
       providerStatus: "canceled",
       status: "canceled",
     });
-    await expect(freshLogin).resolves.toMatchObject({
+    const freshLoginResult = await freshLogin;
+    expect(freshLoginResult).toMatchObject({
       account: { processGeneration: 2, state: "signed_in" },
       login: { status: "signed_in" },
     });
@@ -20502,12 +23368,7 @@ describe("HraService", () => {
       accountReadStarted();
       await accountReadGate;
     };
-    const authority = {
-      id: added.account.id,
-      generation: 1,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    } as const;
+    const authority = liveAuthorityFor(store, added.account.id);
 
     const accountShow = service.execute({
       kind: "account.show",
@@ -20545,17 +23406,8 @@ describe("HraService", () => {
   test("reads retired Devin history locally and refuses further provider effects", async () => {
     const factsMemory = new FakeFactsMemoryLifecycle();
     const memory = new FakeMemory();
-    const value = await fixture(
-      undefined,
-      new FakeCloud(),
-      () => undefined,
-      Date.now,
-      factsMemory,
-      {},
-      memory,
-    );
-    const profile = value.store.createProfile("Retired session");
-    const session = legacyDevinSession(value, profile.id);
+    const value = await archivedDevinFixture(new FakeCloud(), { factsMemory, memory });
+    const session = value.store.requireSession(value.captured.session.id);
     const before = value.store.requireSession(session.id);
     await expect(value.service.execute({
       kind: "session.show", session: session.id, detail: true,
@@ -20620,9 +23472,8 @@ describe("HraService", () => {
 
   test("keeps retired note changes from minting facts-memory authority", async () => {
     const memory = new FakeFactsMemoryLifecycle();
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, Date.now, memory);
-    const profile = value.store.createProfile("Retired note authority");
-    const session = legacyDevinSession(value, profile.id);
+    const value = await archivedDevinFixture(new FakeCloud(), { factsMemory: memory });
+    const session = value.store.requireSession(value.captured.session.id);
     const beforeMutations = value.store.listUnsettledMutations({ sessionId: session.id });
     try {
       for (const command of [
@@ -20652,9 +23503,8 @@ describe("HraService", () => {
     { kind: "autorespond.set", mode: "auto:all" },
     { kind: "autorespond.set", mode: null },
   ] as const)("rejects retired session policy writes %j without changing history", async (change) => {
-    const value = await fixture();
-    const profile = value.store.createProfile("Retired session policy");
-    const session = legacyDevinSession(value, profile.id);
+    const value = await archivedDevinFixture();
+    const session = value.store.requireSession(value.captured.session.id);
     const approval = value.store.readSessionApprovalMode(session.id);
     try {
       await expect(value.service.execute({ ...change, session: session.id }, { signal }))
@@ -20676,8 +23526,7 @@ describe("HraService", () => {
     const profile = value.store.createProfile("Stale retired cloud account");
     try {
       await expect(value.service.readProviderAccountProjectionForCloud({
-        profileId: profile.id, provider: "devin" as never,
-        processGeneration: profile.processGeneration, signal,
+        authority: value.store.requireProviderAccountAuthority(profile.id, "devin"), signal,
       })).rejects.toMatchObject({
         code: "UNAVAILABLE", details: { reason: "provider_retired" },
       });
@@ -20685,8 +23534,7 @@ describe("HraService", () => {
       expect(value.codex.calls).toEqual([]);
       expect(value.store.requireProfileById(profile.id)).toEqual(profile);
       await expect(value.service.readProviderAccountProjectionForCloud({
-        profileId: profile.id, provider: "claude",
-        processGeneration: profile.processGeneration, signal,
+        authority: value.store.requireProviderAccountAuthority(profile.id, "claude"), signal,
       })).resolves.toEqual({ signedIn: true });
       expect(value.claudeReadCalls()).toBe(1);
     } finally {
@@ -20695,9 +23543,8 @@ describe("HraService", () => {
   });
 
   test("reports retired provider admission for new scheduled tasks without changing history", async () => {
-    const value = await fixture();
-    const profile = value.store.createProfile("Retired task admission");
-    const session = legacyDevinSession(value, profile.id);
+    const value = await archivedDevinFixture();
+    const session = value.store.requireSession(value.captured.session.id);
     const before = value.store.requireSession(session.id);
     try {
       await expect(value.service.execute({
@@ -20717,99 +23564,138 @@ describe("HraService", () => {
     }
   });
 
-  test.each(["bound", "source", "target"] as const)(
-    "quarantines retired %s recovery without changing evidence or causing provider or facts-memory effects",
-    async (side) => {
-      const memory = new FakeFactsMemoryLifecycle();
-      const value = await fixture(undefined, new FakeCloud(), () => undefined, Date.now, memory);
-      const profile = value.store.createProfile(`Retired recovery ${side}`);
-      const session = side === "target"
-        ? (() => {
-            const created = value.store.createSession({
-              profileId: profile.id, provider: "codex", preset: "high", fastEnabled: false,
-            });
-            return value.store.bindSession({
-              sessionId: created.id, expectedRevision: created.revision,
-              providerThreadId: "historical-source-thread", state: "idle",
-            });
-          })()
-        : legacyDevinSession(value, profile.id);
-      const attemptId = `attempt_${crypto.randomUUID().replaceAll("-", "")}`;
-      const key = crypto.randomUUID();
-      const kind = side === "bound" ? "session.send" : "session.switch";
-      const targetRuntimeProfile = side === "target"
-        ? {
-            profileId: profile.id, processGeneration: profile.processGeneration,
-            observedAt: 2_000, preset: "astra", model: "gpt-6-astra",
-            reasoningEffort: "provider-default", devinVersion: "3000.6.14",
-            protocolVersion: 1, isolatedHome: true,
-          }
-        : runtimeProfile({
-            id: profile.id, generation: profile.processGeneration,
-            codexHome: "unused", desktopUserData: "unused",
-          });
-      const evidence = side === "bound"
-        ? {
-            kind, providerThreadId: session.providerThreadId,
-            baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
-            clientMessageId: attemptId, messageDigest: "a".repeat(64),
-          }
-        : {
-            kind, requestedAccountId: null, requestedPreset: null,
-            sourceProfileId: profile.id, sourceProcessGeneration: profile.processGeneration,
-            sourceProvider: side === "source" ? "devin" : "codex",
-            sourceProviderThreadId: session.providerThreadId,
-            sourcePreset: side === "source" ? "astra" : "high",
-            targetProfileId: profile.id, targetProcessGeneration: profile.processGeneration,
-            targetProvider: side === "target" ? "devin" : "codex",
-            targetPreset: side === "target" ? "astra" : "high",
-            transcriptDigest: "b".repeat(64), seedDigest: "c".repeat(64),
-            seedIncludedRecords: 0, seedOmittedRecords: 0, runtimeProfile: targetRuntimeProfile,
-          };
-      const encodedEvidence = JSON.stringify(evidence);
-      const legacy = new Database(value.paths.database, { strict: true });
-      try {
-        legacy.query(
-          "INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at) VALUES (?,?,?,?,?,?,'effect_started',0,0)",
-        ).run(attemptId, key, kind, session.id, profile.processGeneration, "d".repeat(64));
-        legacy.query(
-          "INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,0)",
-        ).run(attemptId, kind, encodedEvidence, createHash("sha256").update(encodedEvidence).digest("hex"));
-        if (side !== "bound") {
-          // A started, unseeded opposite-provider target is exactly the old
-          // cleanup branch that must not end another runtime after retirement.
-          legacy.query(
-            "INSERT INTO session_provider_switch_targets(attempt_id,provider_thread_id,recorded_at) VALUES (?,?,0)",
-          ).run(attemptId, "historical-target-thread");
-        }
-      } finally {
-        legacy.close();
-      }
-      const immutableEvidence = value.store.readMutation(key)?.evidence;
-      try {
-        await expect(value.service.recover()).resolves.toBeUndefined();
-        expect(value.store.requireSession(session.id).state).toBe("recovery_required");
-        expect(value.store.readMutation(key)).toMatchObject({
-          state: "ambiguous",
-          evidence: immutableEvidence,
-          result: { code: "DAEMON_RESTART" },
-        });
+  test("quarantines retired bound recovery without changing evidence or causing provider or facts-memory effects", async () => {
+    const memory = new FakeFactsMemoryLifecycle();
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, Date.now,
+      memory, {}, { canonical39RetiredRecovery: "bound_send" });
+    const captured = canonical39RetiredRecoveryFixtures.bound_send.retained;
+    const sessionId = captured.session.id;
+    const key = captured.idempotencyKey;
+    // The released39 producer admitted this actual uncertain send. Current
+    // migration/boot may contain it, but cannot rewrite its original proof.
+    expect(value.store.readMutation(key)?.evidence).toEqual(captured.effect);
+    try {
+      await expect(value.service.recover()).resolves.toBeUndefined();
+      expect(value.store.requireSession(sessionId)).toMatchObject({ provider: "devin", state: "recovery_required" });
+      expect(value.store.readMutation(key)).toMatchObject({
+        ...captured.mutation, state: "ambiguous",
+        result: { code: "DAEMON_RESTART" },
+      });
+      expect(value.store.readMutation(key)?.evidence).toEqual(captured.effect);
+      expect(value.codex.calls).toEqual([]);
+      expect(memory.ensures).toEqual([]);
+      expect(memory.cleanups).toEqual([]);
+      const beforeSession = value.store.requireSession(sessionId);
+      const beforeMutation = value.store.readMutation(key);
+      await expect(value.service.recover()).resolves.toBeUndefined();
+      expect(value.store.requireSession(sessionId)).toEqual(beforeSession);
+      expect(value.store.readMutation(key)).toEqual(beforeMutation);
+      for (const kind of ["session.recover", "session.abandon"] as const) {
+        await expect(value.service.execute({ kind, session: sessionId }, { signal }))
+          .rejects.toMatchObject({ code: "UNAVAILABLE", details: { reason: "provider_retired" } });
+        expect(value.store.requireSession(sessionId)).toEqual(beforeSession);
+        expect(value.store.readMutation(key)).toEqual(beforeMutation);
         expect(value.codex.calls).toEqual([]);
         expect(memory.ensures).toEqual([]);
         expect(memory.cleanups).toEqual([]);
+      }
+      const supported = await createIdleSession(value, "Supported after retired bound");
+      expect(value.store.requireSession(supported.sessionId).provider).toBe("codex");
+    } finally {
+      await value.service.close();
+    }
+  });
+
+  test.each(["source", "target"] as const)(
+    "quarantines retired %s recovery without changing evidence or causing provider or facts-memory effects",
+    async (side) => {
+      const memory = new FakeFactsMemoryLifecycle();
+      const scenario = side === "source" ? "source_switch" : "target_switch";
+      const archive = canonical39RetiredTargetFixtures[scenario];
+      const captured = archive.retained;
+      const value = await fixture(undefined, new FakeCloud(), () => undefined, () => archive.fixedTime,
+        memory, {}, { canonical39RetiredTarget: scenario });
+      const session = value.store.requireSession(captured.session.id);
+      const key = captured.idempotencyKey;
+      const attemptId = captured.mutation.id;
+      const immutableEvidence = captured.effect;
+      // A real archived target-start receipt, with no seed/release receipt,
+      // exercises the obsolete cleanup branch without fabricating live proof.
+      expectHistoricalValue(value.store.readMutation(key)?.evidence, immutableEvidence);
+      expect(value.store.readSessionProviderSwitchProgress(attemptId)).toEqual(captured.progress);
+      try {
+        await expect(value.service.recover()).resolves.toBeUndefined();
+        expect(value.store.requireSession(session.id).state).toBe("recovery_required");
+        // A Codex source without native account-key proof is contained during
+        // migration, before effect recovery can append a result. A retired
+        // source is contained by the mutation-quarantine recovery branch.
+        expect(value.store.readMutation(key)).toMatchObject({
+          ...captured.mutation,
+          state: "ambiguous",
+          evidence: immutableEvidence,
+          providerAuthorityQuarantine: {
+            scopeKind: "mutation", scopeId: attemptId,
+            reason: "unsettled_provider_authority_unproved", recordedAt: archive.fixedTime,
+          },
+        });
+        expect(value.store.readMutation(key)?.result).toEqual(side === "source"
+          ? { code: "LEGACY_PROVIDER_AUTHORITY_QUARANTINED" }
+          : undefined);
+        expect(value.codex.calls).toEqual([]);
+        expect(memory.ensures).toEqual([]);
+        expect(memory.cleanups).toEqual([]);
+        expect(value.store.readSessionProviderSwitchProgress(attemptId)).toEqual(captured.progress);
         const beforeSession = value.store.requireSession(session.id);
         const beforeMutation = value.store.readMutation(key);
         await expect(value.service.recover()).resolves.toBeUndefined();
         expect(value.store.requireSession(session.id)).toEqual(beforeSession);
         expect(value.store.readMutation(key)).toEqual(beforeMutation);
+        expect(value.store.readSessionProviderSwitchProgress(attemptId)).toEqual(captured.progress);
         for (const kind of ["session.recover", "session.abandon"] as const) {
           await expect(value.service.execute({ kind, session: session.id }, { signal }))
-            .rejects.toMatchObject({ code: "UNAVAILABLE", details: { reason: "provider_retired" } });
+            .rejects.toMatchObject(side === "source"
+              ? { code: "UNAVAILABLE", details: { reason: "provider_retired" } }
+              : { code: "RECOVERY_REQUIRED", details: { sessionId: session.id, accountId: captured.profile.id } });
           expect(value.store.requireSession(session.id)).toEqual(beforeSession);
           expect(value.store.readMutation(key)).toEqual(beforeMutation);
+          expect(value.store.readSessionProviderSwitchProgress(attemptId)).toEqual(captured.progress);
           expect(memory.cleanups).toEqual([]);
           expect(memory.ensures).toEqual([]);
           expect(value.codex.calls).toEqual([]);
+        }
+        if (side === "target") {
+          // The original signed-in Codex source correctly fails the earlier
+          // native-account check. A public signed-out observation removes only
+          // that precheck; it cannot invent the missing original account key.
+          const profile = value.store.requireProfileById(captured.profile.id);
+          expect(profile.state).toBe("signed_in");
+          expect(value.store.setProfileState(profile.id, profile.processGeneration, "signed_out")).toBe(true);
+          const signedOut = value.store.requireProfileById(profile.id);
+          expect(signedOut).toMatchObject({
+            id: profile.id, state: "signed_out", processGeneration: profile.processGeneration,
+          });
+          expect(signedOut.providerEmail).toBeUndefined();
+          expect(value.store.sessionAccountAuthorityMatches(session.id, profile.id)).toBe(false);
+          const historyAfterReadiness = {
+            session: value.store.requireSession(session.id),
+            mutation: value.store.readMutation(key),
+            progress: value.store.readSessionProviderSwitchProgress(attemptId),
+          };
+          expect(historyAfterReadiness).toEqual({
+            session: beforeSession, mutation: beforeMutation, progress: captured.progress,
+          });
+          for (const kind of ["session.recover", "session.abandon"] as const) {
+            await expect(value.service.execute({ kind, session: session.id }, { signal }))
+              .rejects.toMatchObject({ code: "UNAVAILABLE", details: { reason: "provider_retired" } });
+            expect(value.store.requireProfileById(profile.id)).toEqual(signedOut);
+            expect(value.store.requireSession(session.id)).toEqual(historyAfterReadiness.session);
+            expect(value.store.readMutation(key)).toEqual(historyAfterReadiness.mutation);
+            expect(value.store.readSessionProviderSwitchProgress(attemptId)).toEqual(captured.progress);
+            expectHistoricalValue(value.store.readMutation(key)?.evidence, immutableEvidence);
+            expect(memory.cleanups).toEqual([]);
+            expect(memory.ensures).toEqual([]);
+            expect(value.codex.calls).toEqual([]);
+          }
         }
         const supported = await createIdleSession(value, `Supported after retired ${side}`);
         expect(value.store.requireSession(supported.sessionId).provider).toBe("codex");
@@ -20821,44 +23707,15 @@ describe("HraService", () => {
 
   test("quarantines an exact retired in-flight start without blocking supported startup", async () => {
     const memory = new FakeFactsMemoryLifecycle();
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, Date.now, memory);
-    const profile = value.store.createProfile("Retired start recovery");
-    await value.service.execute({ kind: "project.add", label: "Historical start project", path: value.documents }, { signal });
-    const project = value.store.listProjects()[0];
-    if (project === undefined) throw new Error("Expected a registered project.");
-    const session = value.store.createSession({
-      profileId: profile.id, projectId: project.id,
-      provider: "codex", preset: "ultra", fastEnabled: false,
-    });
-    const key = crypto.randomUUID();
-    const attemptId = `attempt_${crypto.randomUUID().replaceAll("-", "")}`;
-    const evidence = JSON.stringify({
-      kind: "session.start", projectId: project.id,
-      clientMessageId: null, messageDigest: null,
-      runtimeProfile: {
-        profileId: profile.id, processGeneration: profile.processGeneration,
-        observedAt: 2_000, preset: "astra", model: "gpt-6-astra",
-        reasoningEffort: "provider-default", devinVersion: "3000.6.14",
-        protocolVersion: 1, isolatedHome: true,
-      },
-    });
-    const legacy = new Database(value.paths.database, { strict: true });
-    try {
-      legacy.query(
-        "UPDATE sessions SET provider_v39='devin',preset_contract=?,canonical_profile_key='devin:gpt-6-astra:provider-default' WHERE id=?",
-      ).run(devinPresetContract, session.id);
-      legacy.query(
-        "INSERT INTO mutation_attempts(id,idempotency_key,kind,authority_id,authority_generation,request_digest,state,created_at,updated_at) VALUES (?,?,'session.start',?,?,?,'effect_started',0,0)",
-      ).run(attemptId, key, profile.id, profile.processGeneration, "d".repeat(64));
-      legacy.query(
-        "INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,'session.start',?,?,0)",
-      ).run(attemptId, evidence, createHash("sha256").update(evidence).digest("hex"));
-      legacy.query("INSERT INTO session_start_attempts(attempt_id,session_id,created_at) VALUES (?,?,0)")
-        .run(attemptId, session.id);
-    } finally {
-      legacy.close();
-    }
-    const immutableEvidence = value.store.readMutation(key)?.evidence;
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, Date.now,
+      memory, {}, { canonical39RetiredRecovery: "inflight_start" });
+    const captured = canonical39RetiredRecoveryFixtures.inflight_start.retained;
+    const session = value.store.requireSession(captured.session.id);
+    const key = captured.idempotencyKey;
+    const immutableEvidence = captured.mutation.evidence;
+    expect(value.store.readMutation(key)?.evidence).toEqual(immutableEvidence);
+    expect(value.store.readMutation(key)?.sessionStartId).toBe(captured.session.id);
+    expect(value.store.requireProject(captured.project.id)).toEqual(captured.project);
     try {
       await expect(value.service.recover()).resolves.toBeUndefined();
       expect(value.store.requireSession(session.id)).toMatchObject({
@@ -20868,6 +23725,9 @@ describe("HraService", () => {
       expect(value.codex.calls).toEqual([]);
       expect(memory.ensures).toEqual([]);
       expect(memory.cleanups).toEqual([]);
+      // The archived public project root is metadata only. Fresh supported
+      // work must use this test's own directory, never that historical root.
+      const project = await value.store.createProject("Supported startup project", value.documents);
       const added = await value.service.execute({
         kind: "account.add", label: "Supported after retired start",
       }, { signal }) as { account: { id: string } };
@@ -20885,38 +23745,17 @@ describe("HraService", () => {
 
   test("quarantines a retired queued send after restart without redispatching or blocking supported work", async () => {
     const memory = new FakeFactsMemoryLifecycle();
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, Date.now, memory);
-    const profile = value.store.createProfile("Retired queue restart");
-    const session = legacyDevinSession(value, profile.id);
-    const queueId = createQueueId();
-    const message = "Historical uncertain queued send";
-    const evidence = JSON.stringify({
-      kind: "queue.dispatch", queueId, sessionId: session.id,
-      providerThreadId: session.providerThreadId, profileGeneration: profile.processGeneration,
-      baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
-      clientMessageId: queueId, messageDigest: createHash("sha256").update(message).digest("hex"),
-      runtimeProfile: {
-        profileId: profile.id, processGeneration: profile.processGeneration,
-        observedAt: 1_000, preset: "astra", model: "gpt-6-astra",
-        reasoningEffort: "provider-default", devinVersion: "3000.6.14",
-        protocolVersion: 1, isolatedHome: true,
-      },
-    });
-    const legacy = new Database(value.paths.database, { strict: true });
-    try {
-      legacy.transaction(() => {
-        legacy.query(
-          "INSERT INTO queue_entries(id,session_id,message,state,enqueue_sequence,created_at,updated_at) VALUES (?,?,?,'dispatching',(SELECT next_sequence FROM queue_sequence_authority WHERE singleton=1),1000,1000)",
-        ).run(queueId, session.id, message);
-        legacy.query("UPDATE queue_sequence_authority SET next_sequence=next_sequence+1 WHERE singleton=1").run();
-        legacy.query("INSERT INTO queue_effect_evidence(queue_id,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,1000)")
-          .run(queueId, evidence, createHash("sha256").update(evidence).digest("hex"));
-      }).immediate();
-    } finally {
-      legacy.close();
-    }
-    const immutableEvidence = value.store.readQueueEffect(queueId);
-    value.store.nextDaemonGeneration(`boot_${"c".repeat(32)}`);
+    // The archived39 writer really admitted this dispatch and its runtime
+    // evidence. The fixture performs the current migration and one real boot;
+    // no current queue or provider authority is retagged as historical input.
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, Date.now,
+      memory, {}, { canonical39Retired: "queue_dispatch" });
+    const captured = canonical39RetiredFixtures.queue_dispatch.retained;
+    const session = value.store.requireSession(captured.session.id);
+    const queueId = captured.queue.id;
+    const message = captured.queue.message;
+    const immutableEvidence = captured.queueEffect;
+    expect(value.store.readQueueEffect(queueId)).toEqual(immutableEvidence);
     try {
       await expect(value.service.recover()).resolves.toBeUndefined();
       await value.service.settled();
@@ -20934,7 +23773,7 @@ describe("HraService", () => {
     }
   });
 
-  test("rebinds exact idle Claude authority on Codex login and disconnect", async () => {
+  test("keeps independent Claude authority unchanged on Codex login and disconnect", async () => {
     const claude = new TrackingClaudeAuthority();
     const { codex, documents, service, store } = await fixture(
       undefined,
@@ -20956,11 +23795,8 @@ describe("HraService", () => {
       account: added.account.id,
       deviceCode: false,
     }, { signal });
-    expect(claude.rebindings).toEqual([{
-      profileId: added.account.id,
-      expectedGeneration: 0,
-      nextGeneration: 1,
-    }]);
+    const claudeAuthority = store.requireProviderAccountAuthority(added.account.id, "claude");
+    expect(claude.rebindings).toEqual([]);
     await service.execute({
       kind: "project.add",
       label: "Rebind authority docs",
@@ -20975,25 +23811,17 @@ describe("HraService", () => {
     }, { signal });
 
     const generationOne = store.requireProfileById(added.account.id);
-    await service.observeCodexFact({
-      id: generationOne.id,
-      generation: generationOne.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    }, {
+    await service.observeCodexFact(liveAuthorityFor(store, generationOne.id), {
       type: "providerDisconnected",
       connectionId: codex.observationConnectionId,
       reason: "process_exit",
     });
     expect(store.requireProfileById(added.account.id).processGeneration).toBe(2);
-    expect(claude.rebindings)
-      .toEqual([
-        { profileId: added.account.id, expectedGeneration: 0, nextGeneration: 1 },
-        { profileId: added.account.id, expectedGeneration: 1, nextGeneration: 2 },
-      ]);
+    expect(claude.rebindings).toEqual([]);
+    expect(store.requireProviderAccountAuthority(added.account.id, "claude")).toEqual(claudeAuthority);
   });
 
-  test("fails closed when a runtime rebind fails after durable generation advance", async () => {
+  test("does not call an unrelated Claude rebind during Codex generation advance", async () => {
     let stopCalls = 0;
     const claude = new TrackingClaudeAuthority();
     const { codex, daemonAuthority, documents, service, store } = await fixture(
@@ -21028,31 +23856,24 @@ describe("HraService", () => {
       fast: false,
     }, { signal });
     const before = store.requireProfileById(added.account.id);
+    const claudeAuthority = store.requireProviderAccountAuthority(added.account.id, "claude");
     claude.rebindError = new Error("injected Claude authority rebind failure");
 
-    await expect(service.observeCodexFact({
-      id: before.id,
-      generation: before.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    }, {
+    await expect(service.observeCodexFact(liveAuthorityFor(store, before.id), {
       type: "providerDisconnected",
       connectionId: codex.observationConnectionId,
       reason: "process_exit",
-    })).rejects.toThrow("injected Claude authority rebind failure");
+    })).resolves.toBeUndefined();
 
     expect(store.requireProfileById(added.account.id).processGeneration)
       .toBe(before.processGeneration + 1);
-    expect(claude.rebindings.at(-1)).toEqual({
-      profileId: before.id,
-      expectedGeneration: before.processGeneration,
-      nextGeneration: before.processGeneration + 1,
-    });
-    expect(daemonAuthority.closeCalls).toBe(1);
+    expect(claude.rebindings).toEqual([]);
+    expect(store.requireProviderAccountAuthority(added.account.id, "claude")).toEqual(claudeAuthority);
+    expect(daemonAuthority.closeCalls).toBe(0);
     await Bun.sleep(5);
-    expect(stopCalls).toBe(1);
+    expect(stopCalls).toBe(0);
     await expect(service.execute({ kind: "account.list" }, { signal }))
-      .rejects.toMatchObject({ code: "UNAVAILABLE" });
+      .resolves.toBeDefined();
   });
 
   test("leaves a restarted Claude schedule due until this daemon has its live binding", async () => {
@@ -21107,12 +23928,7 @@ describe("HraService", () => {
     clock.value = task.nextDueAt;
 
     expect(claude.hasLiveSession({
-      authority: {
-        codexHome: "unused",
-        desktopUserData: "unused",
-        generation: 0,
-        id: added.account.id,
-      },
+      authority: { ...liveAuthorityFor(store, added.account.id, "claude"), generation: 0 },
       providerThreadId,
     })).toBe(false);
     await expect(service.maintainSessionTasks()).resolves.toEqual({ materialized: 0 });
@@ -21133,21 +23949,11 @@ describe("HraService", () => {
       () => clock.value,
     );
     expect(value.managedClaude.hasLiveSession({
-      authority: {
-        codexHome: "unused",
-        desktopUserData: "unused",
-        generation: value.store.requireProfileById(value.accountId).processGeneration,
-        id: value.accountId,
-      },
+      authority: liveAuthorityFor(value.store, value.accountId, "claude"),
       providerThreadId: value.session.providerThreadId ?? "missing",
     })).toBe(false);
     expect(value.personalClaude.hasLiveSession({
-      authority: {
-        codexHome: "unused",
-        desktopUserData: "unused",
-        generation: value.store.requireProfileById(value.accountId).processGeneration,
-        id: value.accountId,
-      },
+      authority: liveAuthorityFor(value.store, value.accountId, "claude"),
       providerThreadId: value.session.providerThreadId ?? "missing",
     })).toBe(true);
 
@@ -21236,8 +24042,14 @@ describe("HraService", () => {
       afterSequence: 0,
       limit: 100,
     }).events;
+    expect(retiredBeforeLogin.flatMap((event) =>
+      event.body.type === "assistant_delta" ? [event.body.text] : []))
+      .toEqual(["[protected]"]);
     expect(retiredBeforeLogin.filter((event) =>
       event.body.type === "connection" && event.body.state === "disconnected"))
+      .toHaveLength(1);
+    expect(retiredBeforeLogin.filter((event) =>
+      event.body.type === "gap" && event.body.reason === "provider_disconnect"))
       .toHaveLength(1);
     let releaseFreshLogin!: () => void;
     let freshLoginPreflightStarted!: () => void;
@@ -21278,7 +24090,8 @@ describe("HraService", () => {
       limit: 100,
     }).events).toEqual(retiredBeforeLogin);
     releaseFreshLogin();
-    await expect(freshLogin).resolves.toMatchObject({
+    const retiredFreshLoginResult = await freshLogin;
+    expect(retiredFreshLoginResult).toMatchObject({
       account: { processGeneration: 2, state: "signed_in" },
       login: { status: "signed_in" },
     });
@@ -21365,11 +24178,12 @@ describe("HraService", () => {
       status: "signed_in",
       account: { signedIn: true, email: "fresh@example.com", plan: "Plus" },
     };
-    await expect(value.service.execute({
+    const terminalLoginResult = await value.service.execute({
       kind: "account.login",
       account: profile.id,
       deviceCode: false,
-    }, { signal })).resolves.toMatchObject({
+    }, { signal });
+    expect(terminalLoginResult).toMatchObject({
       account: { processGeneration: profile.processGeneration + 1, state: "signed_in" },
       login: { status: "signed_in" },
     });
@@ -21392,7 +24206,7 @@ describe("HraService", () => {
     ));
   });
 
-  test("recovers a lost pending-login response across daemon generation rollover by exact cancellation and fresh login", async () => {
+  test("preserves a lost pending-login response across daemon rollover for exact cancellation without replay", async () => {
     const { service, codex, store, paths } = await fixture();
     const added = await service.execute({ kind: "account.add", label: "Restart login" }, { signal }) as { account: { id: `acct_${string}` } };
     const idempotencyKey = "00000000-0000-4000-8000-000000000119";
@@ -21414,23 +24228,37 @@ describe("HraService", () => {
       loginId: "provider-login-restart",
       processGeneration: 1,
     });
+    const originalAttempt = store.readMutation(idempotencyKey);
+    if (originalAttempt === null) throw new Error("Expected the pending login mutation.");
+    const capturedProviderAuthorities = store.readMutationProviderAuthorities(originalAttempt.id);
 
-    store.nextDaemonGeneration(`boot_${"a".repeat(32)}`);
-    const rebound = store.readPendingLoginAuthority(added.account.id, 2);
-    expect(rebound).toMatchObject({ loginId: "provider-login-restart", processGeneration: 2 });
-    expect(store.readPendingLoginAuthority(added.account.id, 1)).toBeNull();
+    const daemonGeneration = store.nextDaemonGeneration(`boot_${"a".repeat(32)}`);
+    expect(store.requireProfile(added.account.id)).toMatchObject({
+      processGeneration: 2,
+      state: "login_pending",
+    });
+    expect(store.readPendingLoginAuthority(added.account.id, 2)).toMatchObject({
+      attemptId: originalAttempt.id,
+      loginId: "provider-login-restart",
+      processGeneration: 2,
+    });
+    const beforeStaleRead = serviceFixtureDatabaseSnapshot(paths.database);
+    expect(() => store.readPendingLoginAuthority(added.account.id, 1)).toThrow("PROVIDER_LOGIN_BINDING_PROOF_INVALID");
+    expect(serviceFixtureDatabaseSnapshot(paths.database)).toEqual(beforeStaleRead);
 
     const restartedCodex = new FakeCodex();
     restartedCodex.accountProjection = { signedIn: false };
     restartedCodex.cancelLoginResult = { status: "not_found" };
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store,
       paths,
       codex: restartedCodex,
       cloud: new FakeCloud(),
       daemonAuthority: new FakeDaemonAuthority(),
+      daemonGeneration,
       requestStop: () => undefined,
     });
+    await restarted.recover();
     expect(await restarted.execute({
       kind: "account.show",
       account: added.account.id,
@@ -21439,7 +24267,7 @@ describe("HraService", () => {
       login: {
         status: "pending",
         loginId: "provider-login-restart",
-        next: `hra account login-cancel ${added.account.id}`,
+        next: `oompa account login-cancel ${added.account.id}`,
       },
     });
     const replay = await restarted.execute({
@@ -21452,12 +24280,11 @@ describe("HraService", () => {
     expect(replay.login).toEqual({
       status: "pending",
       loginId: "provider-login-restart",
-      next: `hra account login-cancel ${added.account.id}`,
+      next: `oompa account login-cancel ${added.account.id}`,
     });
     expect(JSON.stringify(replay)).not.toContain("PRIVATE-CODE");
     expect(JSON.stringify(replay)).not.toContain("private=handoff");
     expect(restartedCodex.calls.filter((call) => call.startsWith("login:"))).toHaveLength(0);
-
     expect(() => store.settlePendingLogin({
       profileId: added.account.id,
       processGeneration: 2,
@@ -21465,12 +24292,10 @@ describe("HraService", () => {
       providerStatus: "not_found",
       provider: { signedIn: false },
     })).toThrow("LOGIN_CANCEL_AUTHORITY_MISMATCH");
-
-    const canceled = await restarted.execute({
+    expect(await restarted.execute({
       kind: "account.login-cancel",
       account: added.account.id,
-    }, { signal }) as { account: { state: string }; providerStatus: string; status: string };
-    expect(canceled).toMatchObject({
+    }, { signal })).toMatchObject({
       account: { state: "signed_out" },
       providerStatus: "not_found",
       status: "canceled",
@@ -21481,6 +24306,9 @@ describe("HraService", () => {
       account: added.account.id,
     }, { signal })).toMatchObject({ status: "already_settled" });
     expect(restartedCodex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(1);
+    const attempt = store.readMutation(idempotencyKey);
+    if (attempt === null) throw new Error("Expected the retired login mutation.");
+    expect(store.readMutationProviderAuthorities(attempt.id)).toEqual(capturedProviderAuthorities);
 
     restartedCodex.loginResult = {
       status: "signed_in",
@@ -21495,29 +24323,29 @@ describe("HraService", () => {
   });
 
   test("rejects login cancellation after an unbound profile generation change", async () => {
-    const { service, codex, store } = await fixture();
+    const { service, codex, store, paths } = await fixture();
     const added = await service.execute({ kind: "account.add", label: "Stale login" }, { signal }) as { account: { id: `acct_${string}` } };
     codex.loginResult = { status: "pending", loginId: "provider-login-stale" };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     store.nextProfileGeneration(added.account.id);
+    const before = serviceFixtureDatabaseSnapshot(paths.database);
+    const calls = [...codex.calls];
     await expect(service.execute({
       kind: "account.login-cancel",
       account: added.account.id,
-    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED",
+      message: "The pending login authority cannot be proved. Inspect the account before changing provider state." });
+    expect(serviceFixtureDatabaseSnapshot(paths.database)).toEqual(before);
+    expect(codex.calls).toEqual(calls);
     expect(codex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(0);
   });
 
   test("preserves exact pending-login cancellation authority across an unexpected provider disconnect", async () => {
-    const { service, codex, store } = await fixture();
+    const { service, codex, store, paths } = await fixture();
     const added = await service.execute({ kind: "account.add", label: "Disconnected login" }, { signal }) as { account: { id: `acct_${string}` } };
     codex.loginResult = { status: "pending", loginId: "provider-login-disconnected" };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
-    await service.observeCodexFact({
-      id: added.account.id,
-      generation: 1,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    }, {
+    await service.observeCodexFact(liveAuthorityFor(store, added.account.id), {
       type: "providerDisconnected",
       connectionId: "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b",
       reason: "process_exit",
@@ -21529,8 +24357,12 @@ describe("HraService", () => {
       processGeneration: 2,
       state: "login_pending",
     });
+    const beforeStaleRead = serviceFixtureDatabaseSnapshot(paths.database);
+    expect(() => store.readPendingLoginAuthority(added.account.id, 1)).toThrow("PROVIDER_LOGIN_BINDING_PROOF_INVALID");
+    expect(serviceFixtureDatabaseSnapshot(paths.database)).toEqual(beforeStaleRead);
     expect(store.readPendingLoginAuthority(added.account.id, 2)).toMatchObject({
       loginId: "provider-login-disconnected",
+      processGeneration: 2,
     });
     codex.accountProjection = { signedIn: false };
     codex.cancelLoginResult = { status: "not_found" };
@@ -21542,6 +24374,13 @@ describe("HraService", () => {
       status: "canceled",
     });
     expect(codex.calls).toContain(`login-cancel:${added.account.id}:2:provider-login-disconnected`);
+    await expect(service.execute({
+      kind: "account.show",
+      account: added.account.id,
+    }, { signal })).resolves.toMatchObject({
+      account: { processGeneration: 2, state: "signed_out" },
+    });
+    expect(codex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(1);
   });
 
   test("rejects an idempotency key reused across account authorities without mutating the second account", async () => {
@@ -21589,8 +24428,9 @@ describe("HraService", () => {
     expect(codex.calls.filter((call) => call === "stop")).toHaveLength(1);
   });
 
-  test("fences pending transcript replay behind projection recovery but keeps settled replay authority-independent", async () => {
-    const { service, codex, cloud, documents, store } = await fixture();
+  test("fences incomplete pending transcript replay without manufacturing source runtime authority", async () => {
+    const value = await fixture();
+    const { service, codex, cloud, documents, store, paths } = value;
     const added = await service.execute(
       { kind: "account.add", label: "Transcript-first replay" },
       { signal },
@@ -21616,14 +24456,16 @@ describe("HraService", () => {
     if (runtime === undefined) throw new Error("Expected the session-start runtime profile.");
     const key = "00000000-0000-4000-8000-00000000010a";
     const message = "finish only the durable transcript";
-    const attempt = store.prepareMutation({
+    const { attempt } = store.prepareSessionInputMutation({
       kind: "session.send",
-      authorityId: session.id,
-      authorityGeneration: profile.processGeneration,
-      request: { message },
+      sessionId: session.id,
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      message, attachments: [], daemonGeneration: value.daemonGeneration, bootId: value.daemonBootId,
       idempotencyKey: key,
     });
     store.beginSessionMutationEffect({
+      providerAuthority: store.requireProviderAccountAuthority(profile.id, "codex"),
+      attachments: [], daemonGeneration: value.daemonGeneration, bootId: value.daemonBootId,
       attemptId: attempt.id,
       message,
       sessionId: session.id,
@@ -21654,12 +24496,9 @@ describe("HraService", () => {
       sourceId: attempt.id,
       effectiveRuntimeProfile: runtime,
     })).toBe(true);
-    store.updateSessionMetadata({
-      sessionId: session.id,
-      expectedRevision: session.revision,
-      preset: "ultra",
-    });
-    store.nextProfileGeneration(profile.id);
+    // This intentionally incomplete current source has a receipt but no
+    // source turn/runtime binding. It proves refusal, not an accepted recovery.
+    const before = serviceFixtureDatabaseSnapshot(paths.database);
     cloud.beforeProjectionUnsettledSessionReturn = () => {
       throw new Error("A digest conflict must not observe current cloud recovery state.");
     };
@@ -21674,6 +24513,7 @@ describe("HraService", () => {
       message: `${message} changed`,
       idempotencyKey: key,
     }, { signal })).rejects.toThrow("IDEMPOTENCY_CONFLICT");
+    expect(serviceFixtureDatabaseSnapshot(paths.database)).toEqual(before);
     delete cloud.beforeProjectionUnsettledSessionReturn;
     delete cloud.beforeProjectionUnsettledProfileReturn;
     cloud.unsettledProjectionSessions.add(session.id);
@@ -21684,6 +24524,7 @@ describe("HraService", () => {
       message,
       idempotencyKey: key,
     }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(serviceFixtureDatabaseSnapshot(paths.database)).toEqual(before);
     expect(store.readSessionUserMessageSource(session.id, "mutation", key))
       .toMatchObject({ status: "pending" });
     expect(store.listSessionEvents({ sessionId: session.id, afterSequence: 0 }).events
@@ -21692,37 +24533,68 @@ describe("HraService", () => {
     cloud.unsettledProjectionSessions.clear();
     cloud.unsettledProjectionProfiles.clear();
 
-    const replayed = await service.execute({
+    await expect(service.execute({
       kind: "session.send",
       session: session.id,
       message,
       idempotencyKey: key,
-    }, { signal });
-    expect(replayed).toMatchObject({
-      idempotencyKey: key,
-      turnId: "turn-transcript-first-replay",
-    });
+    }, { signal })).rejects.toThrow();
+    expect(serviceFixtureDatabaseSnapshot(paths.database)).toEqual(before);
     expect(codex.calls).toEqual(providerCalls);
     expect(store.readSessionUserMessageSource(session.id, "mutation", key))
-      .toMatchObject({ status: "finalized", intent: { actor: "human" } });
+      .toMatchObject({ status: "pending", intent: { actor: "human" } });
     expect(store.listSessionEvents({ sessionId: session.id, afterSequence: 0 }).events
       .filter((event) => event.body.type === "user_message"
-        && event.body.sourceId === key)).toHaveLength(1);
+        && event.body.sourceId === key)).toHaveLength(0);
+  });
+
+  test("keeps a genuinely settled send replay independent of current projection and process authority", async () => {
+    const value = await fixture();
+    const { service, store, paths } = value;
+    const { sessionId } = await createIdleSession(value, "Settled original-authority replay");
+    const originalSession = store.requireSession(sessionId);
+    const authority = store.requireProviderAccountAuthority(originalSession.profileId, "codex");
+    const key = "00000000-0000-4000-8000-00000000010a";
+    const message = "genuinely settled before the process restart";
+    const command = { kind: "session.send" as const, session: sessionId, message, idempotencyKey: key };
+    const first = await service.execute(command, { signal });
+    if (typeof first !== "object" || first === null || Array.isArray(first)) throw new Error("Expected a structured send receipt.");
+    const original = store.readMutation(key);
+    if (original === null) throw new Error("Expected an actual completed provider receipt.");
+    expect(original.state).toBe("applied");
+    const originalAuthorities = store.readMutationProviderAuthorities(original.id);
+    const originalSource = store.readSessionUserMessageSource(sessionId, "mutation", key);
+    expect(originalSource.status).toBe("finalized");
+    const originalRuntime = store.latestSessionRuntimeProfile(sessionId);
+    expect(originalRuntime).toMatchObject({ sourceKind: "turn_start", sourceId: original.id });
+    const originalEvents = store.listSessionEvents({ sessionId, afterSequence: 0 }).events;
+    expect(originalEvents.filter((event) => event.body.type === "user_message" && event.body.sourceId === key)).toHaveLength(1);
+    await service.close();
+    const bootId = `boot_${crypto.randomUUID().replaceAll("-", "")}`;
+    const daemonGeneration = store.nextDaemonGeneration(bootId);
+    expect(store.requireProviderAccountAuthority(authority.profileId, "codex").processGeneration)
+      .toBeGreaterThan(authority.processGeneration);
+    const cloud = new FakeCloud();
+    const codex = new FakeCodex();
+    const restarted = new OompaService({ store, paths, codex, cloud, daemonGeneration, daemonBootId: bootId,
+      daemonAuthority: new FakeDaemonAuthority(), requestStop: () => undefined });
+    const before = serviceFixtureDatabaseSnapshot(paths.database);
     cloud.beforeProjectionUnsettledSessionReturn = () => {
       throw new Error("A settled replay must not observe current cloud recovery state.");
     };
     cloud.beforeProjectionUnsettledProfileReturn = () => {
       throw new Error("A settled replay must not observe current account recovery state.");
     };
-    await expect(service.execute({
-      kind: "session.send",
-      session: session.id,
-      message,
-      idempotencyKey: key,
-    }, { signal })).resolves.toMatchObject({
-      idempotencyKey: key,
-      turnId: "turn-transcript-first-replay",
-    });
+    const replay = await restarted.execute(command, { signal });
+    expect(replay).toMatchObject({ idempotencyKey: key });
+    expectHistoricalValue(replay, { ...first, session: store.requireSession(sessionId) });
+    expect(store.readMutation(key)).toEqual(original);
+    expect(store.readMutationProviderAuthorities(original.id)).toEqual(originalAuthorities);
+    expect(store.readSessionUserMessageSource(sessionId, "mutation", key)).toEqual(originalSource);
+    expect(store.latestSessionRuntimeProfile(sessionId)).toEqual(originalRuntime);
+    expect(serviceFixtureDatabaseSnapshot(paths.database)).toEqual(before);
+    expect(codex.calls).toEqual([]);
+    await restarted.close();
   });
 
   test("does not resurrect a retained-out send transcript record on exact replay", async () => {
@@ -21888,45 +24760,54 @@ describe("HraService", () => {
     store.completeSessionTurnEffect = originalComplete;
   });
 
-  test("quarantines lost provider responses for send, steer, stop, and rename before another key can dispatch", async () => {
-    for (const operation of ["send", "steer", "stop", "rename"] as const) {
-      const { service, codex, documents, store } = await fixture();
-      const added = await service.execute({ kind: "account.add", label: `Lost ${operation}` }, { signal }) as { account: { id: string } };
-      await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
-      await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-      const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: string } };
-      if (operation === "steer" || operation === "stop") {
-        await service.execute({ kind: "session.send", session: started.session.id, message: "activate" }, { signal });
-      }
-      const lost = new IndeterminateCodexEffectError(`turn/${operation}`, 41);
-      if (operation === "send") codex.startTurnError = lost;
-      if (operation === "steer") codex.steerError = lost;
-      if (operation === "stop") codex.interruptError = lost;
-      if (operation === "rename") codex.renameError = lost;
-      const firstKey = `00000000-0000-4000-8000-0000000002${operation === "send" ? "01" : operation === "steer" ? "02" : operation === "stop" ? "03" : "04"}`;
-      const secondKey = `00000000-0000-4000-8000-0000000003${operation === "send" ? "01" : operation === "steer" ? "02" : operation === "stop" ? "03" : "04"}`;
-      const first = operation === "send"
-        ? { kind: "session.send" as const, session: started.session.id, message: "lost", idempotencyKey: firstKey }
-        : operation === "steer"
-          ? { kind: "session.steer" as const, session: started.session.id, message: "lost", idempotencyKey: firstKey }
-          : operation === "stop"
-            ? { kind: "session.stop" as const, session: started.session.id, idempotencyKey: firstKey }
-            : { kind: "session.rename" as const, session: started.session.id, name: "Lost", idempotencyKey: firstKey };
-      const second = operation === "send"
-        ? { kind: "session.send" as const, session: started.session.id, message: "different", idempotencyKey: secondKey }
-        : operation === "steer"
-          ? { kind: "session.steer" as const, session: started.session.id, message: "different", idempotencyKey: secondKey }
-          : operation === "stop"
-            ? { kind: "session.stop" as const, session: started.session.id, idempotencyKey: secondKey }
-            : { kind: "session.rename" as const, session: started.session.id, name: "Different", idempotencyKey: secondKey };
+  test.each(["send", "steer", "stop", "rename"] as const)(
+    "quarantines a lost %s provider response before another key can dispatch",
+    (operation) => {
+      const caseTask: Promise<void> = ownedServiceFixtureWithClose(async (value) => {
+        // Timeout cancellation joins the complete test continuation before
+        // service/store cleanup, including assertions after an admitted call.
+        await Promise.allSettled([caseTask]);
+        await value.service.close();
+      }).then(async ({ execute, codex, documents, store }) => {
+        const added = await execute({ kind: "account.add", label: `Lost ${operation}` }) as { account: { id: string } };
+        await execute({ kind: "account.login", account: added.account.id, deviceCode: false });
+        await execute({ kind: "project.add", label: "Docs", path: documents });
+        const started = await execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }) as { session: { id: string } };
+        if (operation === "steer" || operation === "stop") {
+          await execute({ kind: "session.send", session: started.session.id, message: "activate" });
+        }
+        const lost = new IndeterminateCodexEffectError(`turn/${operation}`, 41);
+        if (operation === "send") codex.startTurnError = lost;
+        if (operation === "steer") codex.steerError = lost;
+        if (operation === "stop") codex.interruptError = lost;
+        if (operation === "rename") codex.renameError = lost;
+        const firstKey = `00000000-0000-4000-8000-0000000002${operation === "send" ? "01" : operation === "steer" ? "02" : operation === "stop" ? "03" : "04"}`;
+        const secondKey = `00000000-0000-4000-8000-0000000003${operation === "send" ? "01" : operation === "steer" ? "02" : operation === "stop" ? "03" : "04"}`;
+        const first = operation === "send"
+          ? { kind: "session.send" as const, session: started.session.id, message: "lost", idempotencyKey: firstKey }
+          : operation === "steer"
+            ? { kind: "session.steer" as const, session: started.session.id, message: "lost", idempotencyKey: firstKey }
+            : operation === "stop"
+              ? { kind: "session.stop" as const, session: started.session.id, idempotencyKey: firstKey }
+              : { kind: "session.rename" as const, session: started.session.id, name: "Lost", idempotencyKey: firstKey };
+        const second = operation === "send"
+          ? { kind: "session.send" as const, session: started.session.id, message: "different", idempotencyKey: secondKey }
+          : operation === "steer"
+            ? { kind: "session.steer" as const, session: started.session.id, message: "different", idempotencyKey: secondKey }
+            : operation === "stop"
+              ? { kind: "session.stop" as const, session: started.session.id, idempotencyKey: secondKey }
+              : { kind: "session.rename" as const, session: started.session.id, name: "Different", idempotencyKey: secondKey };
 
-      await expect(service.execute(first, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
-      expect(store.requireSession(started.session.id)).toMatchObject({ state: "recovery_required" });
-      const providerCalls = codex.calls.filter((call) => call === operation).length;
-      await expect(service.execute(second, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
-      expect(codex.calls.filter((call) => call === operation)).toHaveLength(providerCalls);
-    }
-  });
+        await expect(execute(first)).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+        expect(store.requireSession(started.session.id)).toMatchObject({ state: "recovery_required" });
+        const providerCalls = codex.calls.filter((call) => call === operation).length;
+        await expect(execute(second)).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+        expect(codex.calls.filter((call) => call === operation)).toHaveLength(providerCalls);
+      });
+      void caseTask.catch(() => undefined);
+      return caseTask;
+    },
+  );
 
   test("quarantines a bound session when the session-start receipt cannot commit", async () => {
     const { service, codex, documents, store } = await fixture();
@@ -21949,103 +24830,46 @@ describe("HraService", () => {
     expect(codex.calls.filter((call) => call === "send")).toHaveLength(0);
   });
 
-  test("replays an applied v0.5 Codex high default across restart only under its matching source contract", async () => {
-    const { service, codex, documents, paths, store } = await fixture();
-    const added = await service.execute(
-      { kind: "account.add", label: "v0.5 applied start" },
-      { signal },
-    ) as { account: { id: string } };
-    await service.execute(
-      { kind: "account.login", account: added.account.id, deviceCode: false },
-      { signal },
-    );
-    const project = await service.execute(
-      { kind: "project.add", label: "v0.5 start docs", path: documents },
-      { signal },
-    ) as { project: { id: string } };
-    const key = "00000000-0000-4000-8000-000000000409";
-    const command = {
-      account: added.account.id,
-      fast: false,
-      idempotencyKey: key,
-      kind: "session.start" as const,
-      preset: "high" as const,
-      presetContract: 1 as const,
-    };
-    const first = await service.execute(command, { signal }) as {
-      effectiveRuntimeProfile: EffectiveRuntimeProfile;
-      session: { id: `sess_${string}`; state: string };
-    };
-
-    const profile = store.requireProfileById(added.account.id);
-    // v0.5 resolved an omitted CLI preset to High before dispatch, while its
-    // stored request digest still omitted the then-implicit Codex provider.
-    const releasedRequest = {
-      projectId: project.project.id,
-      preset: "high" as const,
-      fast: false,
-    };
-    const historical = rewriteSessionStartAttemptAsHistoricalFixture({
-      idempotencyKey: key,
-      request: releasedRequest,
-      store,
-    });
-    expect(store.readMutation(key)).toMatchObject({
-      authorityGeneration: profile.processGeneration,
-      requestDigest: historical.requestDigest,
-      evidence: { evidence: historical.evidence },
-      state: "applied",
-    });
-    expect(store.readMutation(key)?.evidence?.evidence).not.toHaveProperty("presetContract");
-    expect(codex.calls.filter((call) => call === "review-session")).toHaveLength(1);
-    expect(codex.calls.filter((call) => call === "start:high")).toHaveLength(1);
-
-    await service.close();
-    expect(store.requireProfileById(profile.id).processGeneration)
-      .toBe(profile.processGeneration + 1);
-    expect(store.nextDaemonGeneration(`boot_${"b".repeat(32)}`)).toBe(1);
-    expect(store.requireProfileById(profile.id).processGeneration)
-      .toBe(profile.processGeneration + 2);
-    const restartedCodex = new FakeCodex();
-    const restarted = new HraService({
-      store,
-      paths,
-      codex: restartedCodex,
-      cloud: new FakeCloud(),
-      daemonAuthority: new FakeDaemonAuthority(),
-      requestStop: () => undefined,
-    });
-    await restarted.recover();
-
-    const replayCommand = {
-      account: added.account.id,
-      fast: false,
-      idempotencyKey: key,
-      kind: "session.start" as const,
-      preset: "high" as const,
-      presetContract: 1 as const,
-    };
-    const providerCallsBeforeReplay = restartedCodex.calls.length;
-    await expect(restarted.execute({
-      account: replayCommand.account,
-      fast: replayCommand.fast,
-      idempotencyKey: replayCommand.idempotencyKey,
-      kind: replayCommand.kind,
-      preset: replayCommand.preset,
-    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
-    expect(restartedCodex.calls).toHaveLength(providerCallsBeforeReplay);
-    await expect(restarted.execute({ ...replayCommand, presetContract: 2 }, { signal }))
-      .rejects.toMatchObject({ code: "CONFLICT" });
-    expect(restartedCodex.calls).toHaveLength(providerCallsBeforeReplay);
-    await expect(restarted.execute(replayCommand, { signal })).resolves.toMatchObject({
-      effectiveRuntimeProfile: first.effectiveRuntimeProfile,
-      idempotencyKey: key,
-      session: { id: first.session.id },
-    });
-    expect(restartedCodex.calls.filter((call) => call === "review-session")).toHaveLength(0);
-    expect(restartedCodex.calls.filter((call) => call === "start:high")).toHaveLength(0);
-    await restarted.close();
-  });
+  test.each(["canonical33_applied", "canonical39_applied"] as const)(
+    "replays an authentic archived start only under its captured source contract (%s)",
+    async (scenario) => {
+      const captured = canonicalSessionStartFixtures[scenario];
+      const { service, codex, store, paths } = await fixture(
+        undefined, new FakeCloud(), () => undefined, () => 40_000, undefined, {},
+        { canonicalSessionStart: scenario },
+      );
+      // The fixture is imported before migration and a real new daemon boot.
+      // Its synthetic provider receipt proves replay, not renewed native custody.
+      expect(store.requireProfileById(captured.profile.id).processGeneration)
+        .toBeGreaterThan(captured.profile.processGeneration);
+      expectHistoricalValue(store.readMutation(captured.idempotencyKey)?.evidence, captured.mutation.evidence);
+      expectHistoricalValue(store.readMutation(captured.idempotencyKey)?.result, captured.mutation.result);
+      expect(store.readMutation(captured.idempotencyKey)?.requestDigest).toBe(captured.mutation.requestDigest);
+      const command = {
+        kind: "session.start" as const,
+        account: captured.profile.id,
+        preset: "high" as const,
+        fast: false,
+        idempotencyKey: captured.idempotencyKey,
+      };
+      const before = serviceFixtureDatabaseSnapshot(paths.database);
+      await expect(service.execute(command, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+      await expect(service.execute({
+        ...command, presetContract: captured.interpretedPresetContract === 1 ? 2 : 1,
+      }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+      await expect(service.execute({
+        ...command, presetContract: captured.interpretedPresetContract,
+      }, { signal })).resolves.toMatchObject({
+        idempotencyKey: captured.idempotencyKey,
+        session: { id: captured.session.id, projectId: captured.project.id },
+        effectiveRuntimeProfile: { model: captured.model, reasoningEffort: "max", processGeneration: 1 },
+      });
+      expectHistoricalValue(store.readMutation(captured.idempotencyKey)?.result, captured.mutation.result);
+      expectHistoricalValue(store.readMutation(captured.idempotencyKey)?.evidence, captured.mutation.evidence);
+      expect(serviceFixtureDatabaseSnapshot(paths.database)).toEqual(before);
+      expect(codex.calls).toEqual([]);
+    },
+  );
 
   test("replays a settled source-bound start against its original project after the default changes", async () => {
     const { service, codex, cloud, documents } = await fixture();
@@ -22145,146 +24969,88 @@ describe("HraService", () => {
     expect(codex.calls).toEqual(providerCalls);
   });
 
-  test("keeps an effect-started v0.5 Codex high start recoverable across authority rebinding", async () => {
-    const { service, documents, paths, store } = await fixture();
-    const added = await service.execute(
-      { kind: "account.add", label: "v0.5 unsettled start" },
-      { signal },
-    ) as { account: { id: `acct_${string}` } };
-    await service.execute(
-      { kind: "account.login", account: added.account.id, deviceCode: false },
-      { signal },
-    );
-    const project = await service.execute(
-      { kind: "project.add", label: "v0.5 unsettled docs", path: documents },
-      { signal },
-    ) as { project: { id: `proj_${string}` } };
-    const profile = store.requireProfileById(added.account.id);
-    const key = "00000000-0000-4000-8000-000000000415";
-    const attempt = store.prepareMutation({
-      authorityGeneration: profile.processGeneration,
-      authorityId: profile.id,
-      idempotencyKey: key,
-      kind: "session.start",
-      request: sessionStartMutationRequest({
+  test.each(["canonical33_effect_started", "canonical39_effect_started"] as const)(
+    "retains an authentic indeterminate start across boot, checking source authority only when its captured root is usable (%s)",
+    async (scenario) => {
+      const captured = canonicalSessionStartFixtures[scenario];
+      const { service, codex, store, paths } = await fixture(
+        undefined, new FakeCloud(), () => undefined, () => 40_000, undefined, {},
+        { canonicalSessionStart: scenario },
+      );
+      expect(store.requireProfileById(captured.profile.id).processGeneration)
+        .toBeGreaterThan(captured.profile.processGeneration);
+      expect(store.readMutation(captured.idempotencyKey)).toMatchObject({
+        authorityId: captured.profile.id,
+        authorityGeneration: captured.profile.processGeneration,
+        requestDigest: captured.mutation.requestDigest,
+        state: "ambiguous",
+      });
+      expectHistoricalValue(store.readMutation(captured.idempotencyKey)?.evidence, captured.mutation.evidence);
+      expect(store.requireSession(captured.session.id).state).toBe("recovery_required");
+      const command = {
+        kind: "session.start" as const,
+        account: captured.profile.id,
+        preset: "high" as const,
         fast: false,
-        preset: "high",
-        presetContract: 1,
-        projectId: project.project.id,
-        provider: "codex",
-      }),
-    });
-    const effectiveRuntimeProfile = runtimeProfile({
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    });
-    const starting = store.beginSessionStartEffect({
-      attemptId: attempt.id,
-      profileId: profile.id,
-      profileGeneration: profile.processGeneration,
-      projectId: project.project.id,
-      provider: "codex",
-      providerAccountKey: codexProviderAccountKey(),
-      providerAuthentication: {
-        profileId: profile.id,
-        processGeneration: profile.processGeneration,
-        provider: "codex",
-        signedIn: true,
-      },
-      preset: "high",
-      fastEnabled: false,
-      evidence: {
-        kind: "session.start",
-        projectId: project.project.id,
-        clientMessageId: null,
-        messageDigest: null,
-        presetContract: 1,
-        runtimeProfile: effectiveRuntimeProfile,
-      },
-    });
-    const releasedRequest = {
-      projectId: project.project.id,
-      preset: "high" as const,
-      fast: false,
-    };
-    const historical = rewriteSessionStartAttemptAsHistoricalFixture({
-      idempotencyKey: key,
-      request: releasedRequest,
-      store,
-    });
-    expect(store.readMutation(key)).toMatchObject({
-      authorityGeneration: profile.processGeneration,
-      evidence: { evidence: historical.evidence },
-      requestDigest: historical.requestDigest,
-      sessionStartId: starting.id,
-      state: "effect_started",
-    });
-    expect(store.readMutation(key)?.evidence?.evidence).not.toHaveProperty("presetContract");
+        idempotencyKey: captured.idempotencyKey,
+      };
+      const before = serviceFixtureDatabaseSnapshot(paths.database);
+      // The authentic capture retains its original /opt/homebrew project.
+      // Observe that exact path independently before invocation; never relocate
+      // historical authority or derive an expected refusal from the response.
+      const capturedRootUsable = await resolveUsableCanonicalProjectDirectory(captured.project.rootPath) !== null;
+      if (capturedRootUsable) {
+        await expect(service.execute(command, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+        await expect(service.execute({
+          ...command, presetContract: captured.interpretedPresetContract === 1 ? 2 : 1,
+        }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+        await expect(service.execute({
+          ...command, presetContract: captured.interpretedPresetContract,
+        }, { signal })).rejects.toMatchObject({
+          code: "RECOVERY_REQUIRED", details: { idempotencyKey: captured.idempotencyKey },
+        });
+      } else {
+        for (const requested of [
+          command,
+          { ...command, presetContract: captured.interpretedPresetContract === 1 ? 2 as const : 1 as const },
+          { ...command, presetContract: captured.interpretedPresetContract },
+        ]) {
+          await expect(service.execute(requested, { signal })).rejects.toMatchObject({
+            code: "UNAVAILABLE",
+            details: { nextCommand: "oompa doctor", repair: "repair_or_select_project" },
+          });
+        }
+      }
+      expect(serviceFixtureDatabaseSnapshot(paths.database)).toEqual(before);
+      expectHistoricalValue(store.readMutation(captured.idempotencyKey)?.evidence, captured.mutation.evidence);
+      expect(codex.calls).toEqual([]);
+    },
+  );
 
-    await service.close();
-    expect(store.requireProfileById(profile.id).processGeneration)
-      .toBe(profile.processGeneration + 1);
-    expect(store.isSessionMutationProviderAuthorityCurrent({
-      attemptId: attempt.id,
-      profileId: profile.id,
-      provider: "codex",
-      originGeneration: profile.processGeneration,
-    })).toBe(true);
-    expect(store.nextDaemonGeneration(`boot_${"c".repeat(32)}`)).toBe(1);
-    expect(store.requireProfileById(profile.id).processGeneration)
-      .toBe(profile.processGeneration + 2);
-    expect(store.isSessionMutationProviderAuthorityCurrent({
-      attemptId: attempt.id,
-      profileId: profile.id,
-      provider: "codex",
-      originGeneration: profile.processGeneration,
-    })).toBe(true);
-    const restartedCodex = new FakeCodex();
-    const restarted = new HraService({
-      store,
-      paths,
-      codex: restartedCodex,
-      cloud: new FakeCloud(),
-      daemonAuthority: new FakeDaemonAuthority(),
-      requestStop: () => undefined,
-    });
-    await restarted.recover();
-    expect(store.readMutation(key)).toMatchObject({
-      authorityGeneration: profile.processGeneration,
-      authorityId: profile.id,
-      evidence: {
-        evidence: {
-          kind: "session.start",
-          runtimeProfile: {
-            model: "gpt-5.6-sol",
-            reasoningEffort: "max",
-          },
-        },
-      },
-      requestDigest: historical.requestDigest,
-      state: "ambiguous",
-    });
-    expect(store.requireSession(starting.id)).toMatchObject({ state: "recovery_required" });
-
-    const replayCommand = {
-      account: profile.id,
-      fast: false,
-      idempotencyKey: key,
-      kind: "session.start" as const,
-      preset: "high" as const,
-      presetContract: 1 as const,
+  test("refuses new starts after the registered project root disappears without changing authority", async () => {
+    const { service, codex, documents, store, paths } = await fixture();
+    const added = await service.execute({ kind: "account.add", label: "Missing start root" }, { signal }) as {
+      account: { id: `acct_${string}` };
     };
-    const providerCallsBeforeReplay = restartedCodex.calls.length;
-    await expect(restarted.execute({ ...replayCommand, presetContract: 2 }, { signal }))
-      .rejects.toMatchObject({ code: "CONFLICT" });
-    expect(restartedCodex.calls).toHaveLength(providerCallsBeforeReplay);
-    await expect(restarted.execute(replayCommand, { signal }))
-      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
-    expect(restartedCodex.calls.filter((call) => call === "review-session")).toHaveLength(0);
-    expect(restartedCodex.calls.filter((call) => call === "start:high")).toHaveLength(0);
-    await restarted.close();
+    expect(store.setProfileState(added.account.id, 0, "signed_in", {
+      email: "missing-start-root@example.com", plan: "Plus",
+    })).toBe(true);
+    await service.execute({ kind: "project.add", label: "Missing root", path: documents }, { signal });
+    await rename(documents, `${documents}-unavailable`);
+    expect(await resolveUsableCanonicalProjectDirectory(documents)).toBeNull();
+    const before = serviceFixtureDatabaseSnapshot(paths.database);
+    for (const presetContract of [undefined, 2, 1] as const) {
+      await expect(service.execute({
+        kind: "session.start", account: added.account.id, preset: "high", fast: false,
+        ...(presetContract === undefined ? {} : { presetContract }),
+      }, { signal })).rejects.toMatchObject({
+        code: "UNAVAILABLE",
+        details: { nextCommand: "oompa doctor", repair: "repair_or_select_project" },
+      });
+    }
+    expect(serviceFixtureDatabaseSnapshot(paths.database)).toEqual(before);
+    expect(store.listSessions()).toEqual([]);
+    expect(codex.calls).toEqual([]);
   });
 
   test("refuses fresh absent or stale rebound sources before provider contact or mutation preparation", async () => {
@@ -22357,7 +25123,7 @@ describe("HraService", () => {
     expect(codex.calls).toHaveLength(providerCallsAfterCurrent);
   });
 
-  test("resumes only current prepared rebound starts while preserving historical recovery lookups", async () => {
+  test("resumes only currently admitted prepared rebound starts", async () => {
     const { service, codex, documents, store } = await fixture();
     const added = await service.execute(
       { kind: "account.add", label: "Prepared source admission" },
@@ -22375,6 +25141,7 @@ describe("HraService", () => {
     const prepare = (idempotencyKey: string, presetContract?: 1 | 2) => store.prepareMutation({
       authorityGeneration: profile.processGeneration,
       authorityId: profile.id,
+      providerAuthorities: [{ role: "primary", authority: store.requireProviderAccountAuthority(profile.id, "codex"), provenance: "session_start" }],
       idempotencyKey,
       kind: "session.start",
       request: sessionStartMutationRequest({
@@ -22385,7 +25152,7 @@ describe("HraService", () => {
         provider: "codex",
       }),
     });
-    const prepareReleasedV05 = (idempotencyKey: string) => store.prepareMutation({
+    const prepareContractless = (idempotencyKey: string) => store.prepareMutation({
       authorityGeneration: profile.processGeneration,
       authorityId: profile.id,
       idempotencyKey,
@@ -22396,35 +25163,6 @@ describe("HraService", () => {
         fast: false,
       },
     });
-    const recordHistoricalStartEvidence = (
-      attemptId: string,
-      runtime: EffectiveRuntimeProfile,
-      presetContract?: 1 | 2,
-    ): void => {
-      const evidence = {
-        kind: "session.start",
-        projectId: project.project.id,
-        clientMessageId: null,
-        messageDigest: null,
-        ...(presetContract === undefined ? {} : { presetContract }),
-        runtimeProfile: runtime,
-      };
-      const evidenceJson = JSON.stringify(evidence);
-      const inspector = new Database(store.paths.database, { create: false, strict: true });
-      try {
-        inspector.query(
-          "INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,?)",
-        ).run(
-          attemptId,
-          evidence.kind,
-          evidenceJson,
-          createHash("sha256").update(evidenceJson).digest("hex"),
-          2_000,
-        );
-      } finally {
-        inspector.close(false);
-      }
-    };
     const base = {
       account: profile.id,
       fast: false,
@@ -22432,8 +25170,9 @@ describe("HraService", () => {
       preset: "high" as const,
     };
 
+    // These are deliberately unadmitted current prepared requests, not historical writer output.
     const legacyPreparedKey = "00000000-0000-4000-8000-00000000040e";
-    prepareReleasedV05(legacyPreparedKey);
+    prepareContractless(legacyPreparedKey);
     const stalePreparedKey = "00000000-0000-4000-8000-00000000040f";
     prepare(stalePreparedKey, 2);
     const providerCallsBefore = codex.calls.length;
@@ -22460,59 +25199,6 @@ describe("HraService", () => {
     expect(store.readMutation(legacyPreparedKey)).toMatchObject({ state: "prepared" });
     expect(store.readMutation(stalePreparedKey)).toMatchObject({ state: "prepared" });
 
-    const legacyStartedKey = "00000000-0000-4000-8000-000000000410";
-    const legacyStarted = prepare(legacyStartedKey);
-    const historicalAstraProfile = {
-      ...runtimeProfile({
-        id: profile.id,
-        generation: profile.processGeneration,
-        codexHome: "unused",
-        desktopUserData: "unused",
-      }),
-      model: "gpt-6-astra",
-      reasoningEffort: "max" as const,
-    };
-    recordHistoricalStartEvidence(legacyStarted.id, historicalAstraProfile);
-    expect(store.transitionMutation(legacyStarted.id, "prepared", "effect_started")).toBe(true);
-    await expect(service.execute({
-      ...base,
-      idempotencyKey: legacyStartedKey,
-    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
-    expect(codex.calls).toHaveLength(providerCallsBefore);
-    await expect(service.execute({
-      ...base,
-      idempotencyKey: legacyStartedKey,
-      presetContract: 2,
-    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
-    await expect(service.execute({
-      ...base,
-      idempotencyKey: legacyStartedKey,
-      presetContract: 1,
-    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
-    expect(store.transitionMutation(
-      legacyStarted.id,
-      "effect_started",
-      "failed",
-      { code: "test_settled" },
-    )).toBe(true);
-
-    const staleStartedKey = "00000000-0000-4000-8000-000000000411";
-    const staleStarted = prepare(staleStartedKey, 2);
-    recordHistoricalStartEvidence(staleStarted.id, historicalAstraProfile, 2);
-    expect(store.transitionMutation(staleStarted.id, "prepared", "effect_started")).toBe(true);
-    await expect(service.execute({
-      ...base,
-      idempotencyKey: staleStartedKey,
-      presetContract: 2,
-    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
-    expect(store.transitionMutation(
-      staleStarted.id,
-      "effect_started",
-      "failed",
-      { code: "test_settled" },
-    )).toBe(true);
-    expect(codex.calls).toHaveLength(providerCallsBefore);
-
     const currentPreparedKey = "00000000-0000-4000-8000-000000000412";
     prepare(currentPreparedKey, 1);
     await expect(service.execute({
@@ -22523,26 +25209,233 @@ describe("HraService", () => {
     expect(store.readMutation(currentPreparedKey)).toMatchObject({ state: "applied" });
     expect(codex.calls.filter((call) => call === "review-session")).toHaveLength(1);
     expect(codex.calls.filter((call) => call === "start:high")).toHaveLength(1);
+  });
 
-    const currentReceipt = store.readMutation(currentPreparedKey)?.result;
-    if (currentReceipt === undefined) throw new Error("Expected the current start receipt.");
-    const staleAppliedKey = "00000000-0000-4000-8000-000000000413";
-    const staleApplied = prepare(staleAppliedKey, 2);
-    expect(store.transitionMutation(staleApplied.id, "prepared", "effect_started")).toBe(true);
-    expect(store.transitionMutation(staleApplied.id, "effect_started", "applied", currentReceipt))
-      .toBe(true);
-    await expect(service.execute({
-      ...base,
-      idempotencyKey: staleAppliedKey,
-      presetContract: 2,
-    }, { signal })).resolves.toMatchObject({ session: { preset: "high", state: "idle" } });
-    const providerCallsAfterStaleReplay = codex.calls.length;
-    await expect(service.execute({
-      ...base,
-      idempotencyKey: staleAppliedKey,
-      presetContract: 1,
-    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
-    expect(codex.calls).toHaveLength(providerCallsAfterStaleReplay);
+
+  async function terminalInputCustodyFixture(
+    source: "provider_thread_deleted" | "provider_transport_lost" = "provider_thread_deleted",
+    withInput = true,
+  ) {
+    const factsMemory = new FakeFactsMemoryLifecycle();
+    const memory = new FakeMemory();
+    const value = await fixture(undefined, new FakeCloud(), () => undefined,
+      () => 1_800_000_000_000, factsMemory, {}, { memory });
+    const { sessionId } = await createIdleSession(value, "Terminal local acknowledgment");
+    const current = value.store.requireSession(sessionId);
+    const authority = value.store.requireProviderAccountAuthority(current.profileId, "codex");
+    const runtime = value.store.latestSessionRuntimeProfile(sessionId)?.profile;
+    if (current.providerThreadId === undefined || runtime === undefined) throw new Error("Expected an exact current runtime.");
+    const reference = { digest: "a".repeat(64), name: "retained.txt", byteLength: 4, mediaType: "text/plain" as const };
+    let attemptId: ReturnType<StateStore["prepareSessionInputMutation"]>["attempt"]["id"] | undefined;
+    let idempotencyKey: string | undefined;
+    if (withInput) {
+      idempotencyKey = crypto.randomUUID();
+      const input = {
+        kind: "session.send" as const, sessionId, providerAuthority: authority,
+        idempotencyKey, message: "Retained terminal input", attachments: [reference],
+        daemonGeneration: value.daemonGeneration, bootId: value.daemonBootId,
+      };
+      const reservation = value.store.reserveAttachmentIngress(input);
+      if (reservation.kind !== "reserved") throw new Error("Expected a current reservation.");
+      const prepared = value.store.prepareSessionInputMutation({ ...input, reservation });
+      if (prepared.custody.kind !== "mutation_owned") throw new Error("Expected current mutation custody.");
+      attemptId = prepared.attempt.id;
+      const stored = [{ ...reference, canonicalMediaType: reference.mediaType }];
+      value.store.beginSessionMutationEffect({
+        attemptId, sessionId, providerAuthority: authority, profileGeneration: authority.processGeneration,
+        daemonGeneration: value.daemonGeneration, bootId: value.daemonBootId,
+        message: input.message, attachments: stored,
+        custody: { custodyId: prepared.custody.custodyId, custodyDigest: prepared.custody.custodyDigest },
+        transcript: { accountId: current.profileId, providerGeneration: authority.processGeneration,
+          providerConnectionId: crypto.randomUUID(), actor: "human", message: input.message,
+          attachments: [reference], storedAttachments: stored },
+        evidence: { kind: "session.send", providerThreadId: current.providerThreadId,
+          baseline: { status: "idle", activeTurnId: null, providerUpdatedAt: current.providerUpdatedAt ?? null },
+          clientMessageId: attemptId, messageDigest: createHash("sha256").update(input.message).digest("hex"),
+          messageActor: "human", runtimeProfile: runtime },
+      });
+    }
+    value.store.terminalizeSessionFromProviderDeletion({
+      sessionId, accountId: current.profileId, providerGeneration: authority.processGeneration,
+      providerAuthority: authority, providerConnectionId: null, source,
+    });
+    const terminal = value.store.requireSession(sessionId);
+    expect(terminal.state).toBe("terminal");
+    // Actual service-created memory is still active after the direct storage
+    // terminalization. A newly composed service has a pending cleanup scan.
+    const memoryReceipt = factsMemory.readSession(sessionId);
+    expect(memoryReceipt).toMatchObject({ state: "active", ownerId: current.profileId });
+    const daemonAuthority = new FakeDaemonAuthority();
+    const afterResponse: Array<() => void> = [];
+    let stopCalls = 0;
+    const local = new OompaService({
+      store: value.store, paths: value.paths, codex: value.codex, cloud: value.cloud,
+      daemonAuthority, daemonGeneration: value.daemonGeneration, daemonBootId: value.daemonBootId,
+      factsMemory, memory, now: () => 1_800_000_000_000, requestStop: () => { stopCalls++; },
+    });
+    const callsBefore = {
+      provider: [...value.codex.calls], ensures: [...factsMemory.ensures],
+      cleanups: [...factsMemory.cleanups], sweeps: [...factsMemory.sweeps],
+      transfers: [...factsMemory.transfers], forgotten: [...memory.forgottenSessions],
+    };
+    const assertNoExternalWork = () => {
+      expect(value.codex.calls).toEqual(callsBefore.provider);
+      expect(factsMemory.ensures).toEqual(callsBefore.ensures);
+      expect(factsMemory.cleanups).toEqual(callsBefore.cleanups);
+      expect(factsMemory.sweeps).toEqual(callsBefore.sweeps);
+      expect(factsMemory.transfers).toEqual(callsBefore.transfers);
+      expect(memory.forgottenSessions).toEqual(callsBefore.forgotten);
+      expect(factsMemory.readSession(sessionId)).toEqual(memoryReceipt);
+    };
+    value.cloud.beforeProjectionUnsettledSessionReturn = async () => { throw new Error("Local acknowledgment must not inspect cloud authority."); };
+    value.cloud.beforeProjectionUnsettledProfileReturn = async () => { throw new Error("Local acknowledgment must not inspect cloud authority."); };
+    return { ...value, local, terminal, reference, attemptId, idempotencyKey, factsMemory,
+      daemonAuthority, afterResponse, stopCalls: () => stopCalls, assertNoExternalWork };
+  }
+
+  test.each(["provider_thread_deleted", "provider_transport_lost"] as const)(
+    "acknowledges terminal input custody locally without outer memory maintenance (%s)",
+    async (source) => {
+      const f = await terminalInputCustodyFixture(source);
+      if (f.attemptId === undefined || f.idempotencyKey === undefined) throw new Error("Expected retained input.");
+      const original = f.store.readMutation(f.idempotencyKey);
+      const authority = f.store.readMutationProviderAuthorities(f.attemptId);
+      expect(original?.resolution).toMatchObject({ kind: "abandoned", evidence: { source } });
+      expect(f.store.messageAttachmentManifest(f.terminal.id, f.attemptId)).toEqual([f.reference]);
+      const command = { kind: "session.abandon" as const, session: f.terminal.id };
+      await expect(f.local.execute(command, { signal })).resolves.toMatchObject({
+        session: f.terminal,
+        recovery: { resolved: true, resolution: "abandoned", localInputCustodyAcknowledged: true,
+          releasedInputCount: 1, alreadyAcknowledgedInputCount: 0,
+          providerEffectRetried: false, providerStateDeleted: false, providerOutcomeKnown: false },
+      });
+      expect(f.store.readMutation(f.idempotencyKey)).toEqual(original);
+      expect(f.store.readMutationProviderAuthorities(f.attemptId)).toEqual(authority);
+      expect(f.store.messageAttachmentManifest(f.terminal.id, f.attemptId)).toEqual([]);
+      expect(f.store.attachmentCustody(f.reference.digest)).toMatchObject({ referenceCount: 0 });
+      f.assertNoExternalWork();
+      const after = serviceFixtureDatabaseSnapshot(f.paths.database);
+      await expect(f.local.execute(command, { signal })).resolves.toMatchObject({
+        recovery: { releasedInputCount: 0, alreadyAcknowledgedInputCount: 1, providerOutcomeKnown: false },
+      });
+      expect(serviceFixtureDatabaseSnapshot(f.paths.database)).toEqual(after);
+      f.assertNoExternalWork();
+    },
+  );
+
+  test("refuses terminal abandon without an acknowledgment candidate and leaves local history unchanged", async () => {
+    const f = await terminalInputCustodyFixture("provider_thread_deleted", false);
+    const before = serviceFixtureDatabaseSnapshot(f.paths.database);
+    await expect(f.local.execute({ kind: "session.abandon", session: f.terminal.id }, { signal }))
+      .rejects.toMatchObject({ code: "CONFLICT" });
+    expect(serviceFixtureDatabaseSnapshot(f.paths.database)).toEqual(before);
+    f.assertNoExternalWork();
+  });
+
+  test.each(["revision", "daemon"] as const)(
+    "rechecks selected terminal acknowledgment authority before local commit (%s)",
+    async (changed) => {
+      const f = await terminalInputCustodyFixture();
+      let assertions = 0;
+      let afterConcurrentChange = serviceFixtureDatabaseSnapshot(f.paths.database);
+      f.daemonAuthority.beforeAssert = async () => {
+        assertions++;
+        // Entry, account serializer, session serializer, then the final local
+        // commit fence. Cross the last await, not an earlier lock acquisition.
+        if (assertions !== 4) return;
+        if (changed === "daemon") f.daemonAuthority.current = false;
+        else f.store.setSessionTurnState({
+          sessionId: f.terminal.id, expectedRevision: f.terminal.revision, state: "terminal",
+        });
+        afterConcurrentChange = serviceFixtureDatabaseSnapshot(f.paths.database);
+      };
+      const command = f.local.execute({ kind: "session.abandon", session: f.terminal.id }, { signal });
+      if (changed === "daemon") await expect(command).rejects.toBeInstanceOf(DaemonAuthoritySafetyError);
+      else await expect(command).rejects.toMatchObject({ code: "CONFLICT" });
+      expect(assertions).toBe(4);
+      expect(serviceFixtureDatabaseSnapshot(f.paths.database)).toEqual(afterConcurrentChange);
+      f.assertNoExternalWork();
+    },
+  );
+
+  test("maps a closed terminal acknowledgment refusal without leaking storage diagnostics", async () => {
+    const f = await terminalInputCustodyFixture();
+    f.store.acknowledgeTerminalSessionInputCustody = () => { throw new Error("ATTACHMENT_TERMINAL_ACKNOWLEDGMENT_INVALID"); };
+    const before = serviceFixtureDatabaseSnapshot(f.paths.database);
+    await expect(f.local.execute({ kind: "session.abandon", session: f.terminal.id }, { signal }))
+      .rejects.toMatchObject({
+        code: "RECOVERY_REQUIRED",
+        message: "The retained terminal input custody cannot be proved. Inspect the session before acknowledging local cleanup.",
+      });
+    expect(serviceFixtureDatabaseSnapshot(f.paths.database)).toEqual(before);
+    f.assertNoExternalWork();
+  });
+
+  test("refuses an aborted terminal acknowledgment without changing custody or memory", async () => {
+    const f = await terminalInputCustodyFixture();
+    const controller = new AbortController();
+    const reason = new Error("Synthetic terminal acknowledgment cancelled.");
+    controller.abort(reason);
+    const before = serviceFixtureDatabaseSnapshot(f.paths.database);
+    await expect(f.local.execute({ kind: "session.abandon", session: f.terminal.id }, { signal: controller.signal }))
+      .rejects.toBe(reason);
+    expect(serviceFixtureDatabaseSnapshot(f.paths.database)).toEqual(before);
+    f.assertNoExternalWork();
+  });
+
+  test("preserves admitted selection errors and normal maintenance when terminal lookup fails", async () => {
+    const f = await terminalInputCustodyFixture();
+    await expect(f.local.execute({ kind: "session.abandon", session: `sess_${"0".repeat(32)}` }, { signal }))
+      .rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(f.factsMemory.cleanups).toContainEqual({
+      ownerId: f.terminal.profileId, sessionId: f.terminal.id, reason: "archive",
+    });
+    if (f.attemptId === undefined) throw new Error("Expected retained input.");
+    expect(f.store.messageAttachmentManifest(f.terminal.id, f.attemptId)).toEqual([f.reference]);
+  });
+
+  test.each(["recover", "nonterminal_abandon"] as const)(
+    "preserves ordinary memory maintenance outside terminal-only acknowledgment (%s)",
+    async (action) => {
+      const f = await terminalInputCustodyFixture();
+      delete f.cloud.beforeProjectionUnsettledSessionReturn;
+      delete f.cloud.beforeProjectionUnsettledProfileReturn;
+      const live = action === "recover" ? null : f.store.upsertProviderSession({
+        profileId: f.terminal.profileId, provider: "codex",
+        providerAuthority: f.store.requireProviderAccountAuthority(f.terminal.profileId, "codex"),
+        providerAccountKey: codexProviderAccountKey(), providerThreadId: "ordinary-abandon-control",
+        title: "Ordinary live refusal", preset: "high", fastEnabled: false, state: "idle",
+      });
+      const command = action === "recover"
+        ? { kind: "session.recover" as const, session: f.terminal.id }
+        : { kind: "session.abandon" as const, session: live?.id ?? "" };
+      await expect(f.local.execute(command, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+      expect(f.factsMemory.cleanups).toContainEqual({
+        ownerId: f.terminal.profileId, sessionId: f.terminal.id, reason: "archive",
+      });
+      expect(f.factsMemory.sweeps.length).toBeGreaterThan(0);
+      if (f.attemptId === undefined) throw new Error("Expected retained input.");
+      expect(f.store.messageAttachmentManifest(f.terminal.id, f.attemptId)).toEqual([f.reference]);
+      expect(f.store.attachmentCustody(f.reference.digest)).toMatchObject({ referenceCount: 1 });
+    },
+  );
+
+  test("preserves the committed security-scrub lifecycle after terminal-only acknowledgment", async () => {
+    const f = await terminalInputCustodyFixture();
+    const acknowledge = f.store.acknowledgeTerminalSessionInputCustody.bind(f.store);
+    f.store.acknowledgeTerminalSessionInputCustody = (input) => {
+      acknowledge(input);
+      throw new StateSecurityScrubRequiredError(true);
+    };
+    await expect(f.local.execute({ kind: "session.abandon", session: f.terminal.id }, {
+      signal, afterResponse: (callback) => { f.afterResponse.push(callback); },
+    })).rejects.toMatchObject({ code: "UNAVAILABLE", details: { operationCommitted: true } });
+    expect(f.stopCalls()).toBe(0);
+    expect(f.afterResponse).toHaveLength(1);
+    f.afterResponse[0]?.();
+    expect(f.stopCalls()).toBe(1);
+    expect(f.store.attachmentCustody(f.reference.digest)).toMatchObject({ referenceCount: 0 });
+    f.assertNoExternalWork();
   });
 
   test("quarantines an unbound session-start lost response without blind replay", async () => {
@@ -22592,46 +25485,53 @@ describe("HraService", () => {
     }
   });
 
-  test("requires marked safe advancement for stop and rename recovery and strips internal provenance", async () => {
-    for (const operation of ["stop", "rename"] as const) {
-      const value = await fixture();
-      const { service, codex, store } = value;
-      const { sessionId } = await createIdleSession(value, `Marked ${operation}`);
-      if (operation === "stop") await service.execute({ kind: "session.send", session: sessionId, message: "activate" }, { signal });
-      codex.readProjection = { ...codex.readProjection, providerUpdatedAt: 10_000, providerTimestampUnit: "unix_milliseconds_v1" };
-      const key = crypto.randomUUID();
-      if (operation === "stop") codex.interruptError = new IndeterminateCodexEffectError("turn/interrupt", 63);
-      else codex.renameError = new IndeterminateCodexEffectError("thread/name/set", 64);
-      const command = operation === "stop"
-        ? { kind: "session.stop" as const, session: sessionId, idempotencyKey: key }
-        : { kind: "session.rename" as const, session: sessionId, name: "Recovered", idempotencyKey: key };
-      await expect(service.execute(command, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
-      expect(store.readMutation(key)?.evidence?.evidence).toMatchObject({ providerTimestampUnit: "unix_milliseconds_v1" });
-      const observed = codex.readProjection;
-      for (const invalid of [
-        { providerUpdatedAt: 10_000 }, { providerUpdatedAt: 9_999 },
-        { providerUpdatedAt: -1 }, { providerUpdatedAt: 10_000.5 },
-        { providerUpdatedAt: Number.MAX_SAFE_INTEGER + 1 },
-        { providerUpdatedAt: null }, { providerUpdatedAt: undefined },
-        { providerTimestampUnit: undefined }, { providerTimestampUnit: "unix_seconds" },
-      ]) {
-        // Foreign adapters can return invalid runtime values despite their local type.
-        codex.readProjection = { ...observed, ...invalid } as CodexSessionProjection;
-        await expect(service.execute({ kind: "session.recover", session: sessionId }, { signal }))
-          .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
-        expect(store.readMutation(key)?.state).toBe("ambiguous");
-      }
-      codex.readProjection = observed;
-      const recovered = await service.execute({ kind: "session.recover", session: sessionId }, { signal });
-      expect(recovered).toMatchObject({ recovery: { resolution: "proven_applied", providerEffectRetried: false } });
-      expect(recovered).not.toHaveProperty("projection.providerTimestampUnit");
-      expect(store.readMutation(key)?.resolution?.evidence).toMatchObject({ providerTimestampUnit: "unix_milliseconds_v1", providerUpdatedAt: 10_001 });
-      expect(codex.calls.filter((call) => call === operation)).toHaveLength(1);
-      expect(await service.execute({ kind: "session.show", session: sessionId, detail: false }, { signal }))
-        .not.toHaveProperty("projection.providerTimestampUnit");
-      expect(await service.readSessionProjectionForCloud(sessionId, signal)).not.toHaveProperty("providerTimestampUnit");
-    }
-  });
+  test.each(["stop", "rename"] as const)(
+    "requires marked safe advancement for %s recovery and strips internal provenance",
+    (operation) => {
+      const caseTask: Promise<void> = ownedServiceFixtureWithClose(async (value) => {
+        await Promise.allSettled([caseTask]);
+        await value.service.close();
+      }).then(async (value) => {
+        const { service, execute, codex, store } = value;
+        const { sessionId } = await createIdleSession(value, `Marked ${operation}`);
+        if (operation === "stop") await execute({ kind: "session.send", session: sessionId, message: "activate" });
+        codex.readProjection = { ...codex.readProjection, providerUpdatedAt: 10_000, providerTimestampUnit: "unix_milliseconds_v1" };
+        const key = crypto.randomUUID();
+        if (operation === "stop") codex.interruptError = new IndeterminateCodexEffectError("turn/interrupt", 63);
+        else codex.renameError = new IndeterminateCodexEffectError("thread/name/set", 64);
+        const command = operation === "stop"
+          ? { kind: "session.stop" as const, session: sessionId, idempotencyKey: key }
+          : { kind: "session.rename" as const, session: sessionId, name: "Recovered", idempotencyKey: key };
+        await expect(execute(command)).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+        expect(store.readMutation(key)?.evidence?.evidence).toMatchObject({ providerTimestampUnit: "unix_milliseconds_v1" });
+        const observed = codex.readProjection;
+        for (const invalid of [
+          { providerUpdatedAt: 10_000 }, { providerUpdatedAt: 9_999 },
+          { providerUpdatedAt: -1 }, { providerUpdatedAt: 10_000.5 },
+          { providerUpdatedAt: Number.MAX_SAFE_INTEGER + 1 },
+          { providerUpdatedAt: null }, { providerUpdatedAt: undefined },
+          { providerTimestampUnit: undefined }, { providerTimestampUnit: "unix_seconds" },
+        ]) {
+          // Foreign adapters can return invalid runtime values despite their local type.
+          codex.readProjection = { ...observed, ...invalid } as CodexSessionProjection;
+          await expect(execute({ kind: "session.recover", session: sessionId }))
+            .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+          expect(store.readMutation(key)?.state).toBe("ambiguous");
+        }
+        codex.readProjection = observed;
+        const recovered = await execute({ kind: "session.recover", session: sessionId });
+        expect(recovered).toMatchObject({ recovery: { resolution: "proven_applied", providerEffectRetried: false } });
+        expect(recovered).not.toHaveProperty("projection.providerTimestampUnit");
+        expect(store.readMutation(key)?.resolution?.evidence).toMatchObject({ providerTimestampUnit: "unix_milliseconds_v1", providerUpdatedAt: 10_001 });
+        expect(codex.calls.filter((call) => call === operation)).toHaveLength(1);
+        expect(await execute({ kind: "session.show", session: sessionId, detail: false }))
+          .not.toHaveProperty("projection.providerTimestampUnit");
+        expect(await service.readSessionProjectionForCloud(sessionId, signal)).not.toHaveProperty("providerTimestampUnit");
+      });
+      void caseTask.catch(() => undefined);
+      return caseTask;
+    },
+  );
 
   test("causally reconciles a lost send by exact client id within one provider timestamp tick", async () => {
     const { service, codex, documents, store } = await fixture();
@@ -22658,6 +25558,119 @@ describe("HraService", () => {
     expect(codex.calls.filter((call) => call === "send")).toHaveLength(1);
     expect(await service.execute({ kind: "session.stop", session: started.session.id, idempotencyKey: "00000000-0000-4000-8000-000000000406" }, { signal })).toMatchObject({ stopped: true });
   });
+
+  test("reconciles a retired-generation send from immutable evidence after daemon rollover without replay", async () => {
+    const value = await fixture();
+    const { service, codex, documents, store } = value;
+    const added = await service.execute({ kind: "account.add", label: "Rollover causal send" }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    await service.execute({ kind: "project.add", label: "Rollover docs", path: documents }, { signal });
+    const started = await service.execute({ presetContract: legacyPresetContract, kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const key = "00000000-0000-4000-8000-00000000040a";
+    codex.startTurnError = new IndeterminateCodexEffectError("turn/start", 44);
+    await expect(service.execute({ kind: "session.send", session: started.session.id, message: "causal across rollover", idempotencyKey: key }, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    const attempt = store.readMutation(key);
+    if (attempt === null) throw new Error("Expected the ambiguous send attempt.");
+    const capturedAttemptAuthority = store.readMutationProviderAuthorities(attempt.id);
+    const oldSessionAuthority = store.requireSessionProviderAuthority(started.session.id);
+    const providerProjection = codex.readProjection;
+
+    const daemonGeneration = store.nextDaemonGeneration(`boot_${"d".repeat(32)}`);
+    expect(store.requireSessionProviderAuthority(started.session.id)).toMatchObject({
+      bindingGeneration: oldSessionAuthority.bindingGeneration,
+      processGeneration: oldSessionAuthority.processGeneration + 1,
+      providerAccountId: oldSessionAuthority.providerAccountId,
+    });
+    expect(store.readMutationProviderAuthorities(attempt.id)).toEqual(capturedAttemptAuthority);
+    const restartedCodex = new FakeCodex();
+    restartedCodex.readProjection = { ...providerProjection, providerUpdatedAt: 10 };
+    const restarted = new OompaService({
+      store,
+      paths: value.paths,
+      codex: restartedCodex,
+      cloud: new FakeCloud(),
+      daemonAuthority: new FakeDaemonAuthority(),
+      daemonGeneration,
+      requestStop: () => undefined,
+    });
+    await restarted.recover();
+    expect(restartedCodex.calls.filter((call) => call === "send")).toHaveLength(0);
+
+    expect(await restarted.execute({ kind: "session.recover", session: started.session.id }, { signal }))
+      .toMatchObject({
+        idempotencyKey: key,
+        session: { state: "active", activeTurnId: "turn-next" },
+        recovery: { resolved: true, resolution: "proven_applied", providerEffectRetried: false },
+      });
+    expect(store.readMutation(key)).toMatchObject({
+      state: "reconciled",
+      originalState: "ambiguous",
+      resolution: { kind: "proven_applied" },
+    });
+    expect(store.readMutationProviderAuthorities(attempt.id)).toEqual(capturedAttemptAuthority);
+    expect(restartedCodex.calls.filter((call) => call === "send")).toHaveLength(0);
+    expect(restartedCodex.calls.filter((call) => call === "read")).toHaveLength(1);
+    await restarted.close();
+  });
+
+  test.each(["missing", "binding"] as const)("rejects missing or replaced immutable send authority after rollover before a provider read (%s)", (corruption) =>
+    ownedServiceCase(async ({ createFixture, signal, resources }) => {
+      const value = await createFixture();
+      signal.throwIfAborted();
+      const { service, codex, documents, store } = value;
+      const added = await service.execute({ kind: "account.add", label: "Fenced rollover" }, { signal }) as { account: { id: `acct_${string}` } };
+      await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+      await service.execute({ kind: "project.add", label: "Fenced docs", path: documents }, { signal });
+      const started = await service.execute({ presetContract: legacyPresetContract, kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+      const key = crypto.randomUUID();
+      codex.startTurnError = new IndeterminateCodexEffectError("turn/start", 44);
+      await expect(service.execute({ kind: "session.send", session: started.session.id, message: "immutable", idempotencyKey: key }, { signal }))
+        .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      signal.throwIfAborted();
+      const attempt = store.readMutation(key);
+      if (attempt === null) throw new Error("Expected the uncertain send.");
+      const readAuthorities = store.readMutationProviderAuthorities.bind(store);
+      const original = readAuthorities(attempt.id);
+      const daemonGeneration = store.nextDaemonGeneration(`boot_${"e".repeat(32)}`);
+      const restartedCodex = new FakeCodex();
+      restartedCodex.readProjection = codex.readProjection;
+      const restarted = new OompaService({
+        store,
+        paths: value.paths,
+        codex: restartedCodex,
+        cloud: new FakeCloud(),
+        daemonAuthority: new FakeDaemonAuthority(),
+        daemonGeneration,
+        requestStop: () => undefined,
+      });
+      resources.services.push(restarted);
+      signal.throwIfAborted();
+      await restarted.recover();
+      signal.throwIfAborted();
+      Object.defineProperty(store, "readMutationProviderAuthorities", {
+        configurable: true,
+        value: (attemptId: Parameters<StateStore["readMutationProviderAuthorities"]>[0]) => {
+          const recorded = readAuthorities(attemptId);
+          if (attemptId !== attempt.id) return recorded;
+          return corruption === "missing" ? [] : recorded.map((entry) => ({
+            ...entry,
+            authority: { ...entry.authority, bindingGeneration: entry.authority.bindingGeneration + 1 },
+          }));
+        },
+      });
+      try {
+        await expect(restarted.execute({ kind: "session.recover", session: started.session.id }, { signal }))
+          .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+        expect(restartedCodex.calls.filter((call) => call === "read" || call === "send")).toHaveLength(0);
+        expect(store.requireSession(started.session.id).state).toBe("recovery_required");
+      } finally {
+        Object.defineProperty(store, "readMutationProviderAuthorities", { configurable: true, value: readAuthorities });
+        await restarted.close();
+      }
+      expect(readAuthorities(attempt.id)).toEqual(original);
+    }),
+  );
 
   test("rejects noncausal recovery proof and releases an unbound start only by explicit abandon", async () => {
     const { service, codex, documents, store } = await fixture();
@@ -22687,8 +25700,8 @@ describe("HraService", () => {
     const added = await service.execute({ kind: "account.add", label: "Status recovery" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
-    const authority = { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" };
+    const started = await service.execute({ presetContract: legacyPresetContract, kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
+    const authority = liveAuthorityFor(store, added.account.id as `acct_${string}`);
     await service.observeCodexFact(authority, { type: "threadStatusChanged", threadId: started.session.providerThreadId, status: { type: "systemError" } });
     expect(store.requireSession(started.session.id)).toMatchObject({ state: "recovery_required" });
     expect(store.listUnsettledMutations({ sessionId: started.session.id })).toHaveLength(0);
@@ -22710,7 +25723,7 @@ describe("HraService", () => {
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
     const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const pending = store.enqueue(started.session.id, "continue after recovery");
-    const authority = { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" };
+    const authority = liveAuthorityFor(store, added.account.id as `acct_${string}`);
     await service.observeCodexFact(authority, { type: "threadStatusChanged", threadId: started.session.providerThreadId, status: { type: "systemError" } });
     codex.readProjection = { ...codex.readProjection, status: "idle", providerUpdatedAt: 12 };
 
@@ -22730,7 +25743,7 @@ describe("HraService", () => {
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
     const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: `sess_${string}`; providerThreadId: string } };
     const pending = store.enqueue(started.session.id, "never dispatched");
-    const authority = { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" };
+    const authority = liveAuthorityFor(store, added.account.id as `acct_${string}`);
     await service.observeCodexFact(authority, { type: "threadStatusChanged", threadId: started.session.providerThreadId, status: { type: "systemError" } });
     const readsBefore = codex.calls.filter((call) => call === "read").length;
 
@@ -22739,6 +25752,58 @@ describe("HraService", () => {
       recovery: { resolved: true, resolution: "abandoned", providerEffectRetried: false, providerStateDeleted: false },
     });
     expect(store.requireQueue(pending.id)).toMatchObject({ state: "cancelled" });
+    expect(codex.calls.filter((call) => call === "read")).toHaveLength(readsBefore);
+  });
+
+  test("abandons quarantined legacy queue authority locally without a provider read", async () => {
+    const value = await fixture();
+    const { service, codex, store, paths } = value;
+    const { sessionId } = await createIdleSession(value, "Legacy queue abandon");
+    const pending = store.enqueue(sessionId, "cancel locally");
+    const ambiguous = store.enqueue(sessionId, "preserve ambiguous evidence");
+    const injector = new Database(paths.database, { create: false, strict: true });
+    try {
+      injector.query(
+        `INSERT INTO legacy_provider_authority_quarantines(
+           scope_kind,scope_id,reason,recorded_at
+         ) VALUES ('queue',?,'unsettled_provider_authority_unproved',?)`,
+      ).run(pending.id, Date.now());
+      injector.query(
+        `INSERT INTO legacy_provider_authority_quarantines(
+           scope_kind,scope_id,reason,recorded_at
+         ) VALUES ('queue',?,'unsettled_provider_authority_unproved',?)`,
+      ).run(ambiguous.id, Date.now());
+      injector.query(
+        "UPDATE queue_entries SET state='dispatching' WHERE id=?",
+      ).run(ambiguous.id);
+      injector.query(
+        "UPDATE queue_entries SET state='ambiguous' WHERE id=?",
+      ).run(ambiguous.id);
+    } finally {
+      injector.close(false);
+    }
+    store.quarantineSession(sessionId);
+    const readsBefore = codex.calls.filter((call) => call === "read").length;
+
+    await expect(service.execute({
+      kind: "session.recover",
+      session: sessionId,
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(codex.calls.filter((call) => call === "read")).toHaveLength(readsBefore);
+    await expect(service.execute({
+      kind: "session.abandon",
+      session: sessionId,
+    }, { signal })).resolves.toMatchObject({
+      session: { state: "terminal" },
+      recovery: {
+        resolved: true,
+        resolution: "abandoned",
+        providerEffectRetried: false,
+        providerStateDeleted: false,
+      },
+    });
+    expect(store.requireQueue(pending.id)).toMatchObject({ state: "cancelled" });
+    expect(store.requireQueue(ambiguous.id)).toMatchObject({ state: "ambiguous" });
     expect(codex.calls.filter((call) => call === "read")).toHaveLength(readsBefore);
   });
 
@@ -22909,70 +25974,60 @@ describe("HraService", () => {
     expect(store.listQueue(started.session.id)[0]).toMatchObject({ state: "applied" });
   });
 
-  test("pages recovery across the session quota and bounds eager active observations", async () => {
-    let fixtureValue: Awaited<ReturnType<typeof fixture>> | undefined;
-    // Register the entire setup/body before it can start, so timeout cleanup
-    // joins recovery observations before the shared teardown closes storage.
-    const pending = Promise.resolve().then(async () => {
-      const value = await fixture();
-      fixtureValue = value;
-      const { service, codex, documents, store } = value;
-      const added = await service.execute({
-        kind: "account.add",
-        label: "Paged active recovery",
-      }, { signal }) as { account: { id: `acct_${string}` } };
-      await service.execute({
-        kind: "account.login",
-        account: added.account.id,
-        deviceCode: false,
-      }, { signal });
-      const project = await service.execute({
-        kind: "project.add",
-        label: "Paged recovery docs",
-        path: documents,
-      }, { signal }) as { project: { id: `proj_${string}` } };
-      const created = Array.from({ length: 103 }, (_, index) => {
-        const active = index >= 100;
-        const session = store.upsertProviderSession({
-          profileId: added.account.id,
-          projectId: project.project.id,
-          provider: "codex",
-          providerThreadId: `provider-recovery-${String(index)}`,
-          title: `Recovery ${String(index)}`,
-          preset: "high",
-          fastEnabled: false,
-          state: active ? "active" : "idle",
-          ...(active ? { activeTurnId: `turn-${String(index)}` } : {}),
-          providerAccountKey: codexProviderAccountKey(),
-        });
-        return { active, index, session };
-      }).toSorted((left, right) => left.session.id.localeCompare(right.session.id));
-      codex.beforeObserveReturn = async () => await Bun.sleep(2);
+  test("pages recovery across the session quota and bounds eager active observations", () => ownedServiceCase(async ({ createFixture, signal }) => {
+    const { service, codex, documents, store } = await createFixture();
+    signal.throwIfAborted();
+    const added = await service.execute({
+      kind: "account.add",
+      label: "Paged active recovery",
+    }, { signal }) as { account: { id: `acct_${string}` } };
+    signal.throwIfAborted();
+    await service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    signal.throwIfAborted();
+    const project = await service.execute({
+      kind: "project.add",
+      label: "Paged recovery docs",
+      path: documents,
+    }, { signal }) as { project: { id: `proj_${string}` } };
+    signal.throwIfAborted();
+    const created = Array.from({ length: 103 }, (_, index) => {
+      const active = index >= 100;
+      const session = store.upsertProviderSession({
+        providerAuthority: store.requireProviderAccountAuthority(added.account.id, "codex"),
+        profileId: added.account.id,
+        projectId: project.project.id,
+        provider: "codex",
+        providerThreadId: `provider-recovery-${String(index)}`,
+        title: `Recovery ${String(index)}`,
+        preset: "high",
+        fastEnabled: false,
+        state: active ? "active" : "idle",
+        ...(active ? { activeTurnId: `turn-${String(index)}` } : {}),
+        providerAccountKey: codexProviderAccountKey(),
+      });
+      return { active, index, session };
+    }).toSorted((left, right) => left.session.id.localeCompare(right.session.id));
+    codex.beforeObserveReturn = async () => await Bun.sleep(2);
 
-      const readiness = await Promise.race([
-        service.recover().then(() => "ready" as const),
-        new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 100)),
-      ]);
-      expect(readiness).toBe("ready");
-      await service.settled();
-      for (const { active, index } of created.filter((entry) => entry.active)) {
-        expect(codex.observedThreads).toContain(`provider-recovery-${String(index)}`);
-        expect(active).toBe(true);
-      }
-      expect(codex.maximumConcurrentObservations).toBe(1);
-    });
-    let cleanup: Promise<void> | undefined;
-    const joinCleanup = (): Promise<void> => cleanup ??= (async () => {
-      await Promise.allSettled([pending]);
-      if (fixtureValue !== undefined) await fixtureValue.service.close();
-    })();
-    ownedFixtureTeardowns.push(joinCleanup);
-    try {
-      await pending;
-    } finally {
-      await joinCleanup();
+    signal.throwIfAborted();
+    const readiness = await Promise.race([
+      service.recover().then(() => "ready" as const),
+      new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 100)),
+    ]);
+    expect(readiness).toBe("ready");
+    signal.throwIfAborted();
+    await service.settled();
+    signal.throwIfAborted();
+    for (const { active, index } of created.filter((entry) => entry.active)) {
+      expect(codex.observedThreads).toContain(`provider-recovery-${String(index)}`);
+      expect(active).toBe(true);
     }
-  });
+    expect(codex.maximumConcurrentObservations).toBe(1);
+  }));
 
   test("dispatches a durable queue immediately for an idle session", async () => {
     const { service, codex, documents, store } = await fixture();
@@ -23099,6 +26154,10 @@ describe("HraService", () => {
       queueId: queued.id,
       sessionId: started.session.id,
       profileGeneration: 1,
+      providerAuthority: store.requireProviderAccountAuthority(
+        added.account.id as `acct_${string}`,
+        "codex",
+      ),
       providerConnectionId: "10000000-0000-4000-8000-000000000003",
       evidence: {
         kind: "queue.dispatch",
@@ -23109,7 +26168,7 @@ describe("HraService", () => {
         baseline: { providerUpdatedAt: 10, status: "idle", activeTurnId: null },
         clientMessageId: queued.id,
         messageDigest: createHash("sha256").update("uncertain").digest("hex"),
-        runtimeProfile: runtimeProfile({ id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" }),
+        runtimeProfile: runtimeProfile(liveAuthorityFor(store, added.account.id as `acct_${string}`)),
       },
     });
     await service.recover();
@@ -23119,7 +26178,7 @@ describe("HraService", () => {
   });
 
   test("causally recovers an ambiguous queued dispatch with its reviewed runtime profile", async () => {
-    const { service, codex, documents, store } = await fixture();
+    const { service, codex, documents, store, paths } = await fixture();
     const added = await service.execute({ kind: "account.add", label: "Queue causal recovery" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
@@ -23130,35 +26189,72 @@ describe("HraService", () => {
     expect(store.requireQueue(queued.queued.id)).toMatchObject({ state: "ambiguous" });
     expect(store.requireSession(started.session.id)).toMatchObject({ state: "recovery_required" });
     delete codex.startTurnError;
-    codex.readProjection = {
+    const complete = {
       ...codex.readProjection,
       providerUpdatedAt: 10,
-      messages: [
-        ...(codex.readProjection.messages ?? []),
-        {
-          clientId: queued.queued.id,
-          role: "user",
-          text: "different queue body under the same client id",
-        },
-      ],
     };
-    await expect(service.execute({
-      kind: "session.recover",
-      session: started.session.id,
-    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
-    expect(store.readQueueEffect(queued.queued.id)?.resolution).toBeUndefined();
-    codex.readProjection = {
-      ...codex.readProjection,
-      messages: (codex.readProjection.messages ?? []).filter(
-        (message) => message.text !== "different queue body under the same client id",
-      ),
+    const omission = complete.omission;
+    const exactMessage = complete.messages?.find((message) => message.clientId === queued.queued.id);
+    if (omission === undefined || exactMessage === undefined) throw new Error("Expected the fake's exact committed queue projection.");
+    const absentCompleteness = { ...complete };
+    delete absentCompleteness.omission;
+    const variants: readonly CodexSessionProjection[] = [
+      absentCompleteness,
+      { ...complete, messages: [] },
+      { ...complete, omission: { ...omission, incompleteTurnIds: ["synthetic-incomplete-turn"] } },
+      { ...complete, omission: { ...omission, truncatedMessages: 1 } },
+      { ...complete, messages: [...(complete.messages ?? []), { ...exactMessage }] },
+      { ...complete, messages: (complete.messages ?? []).map((message) => message === exactMessage
+        ? { ...message, text: "different queue body under the same client id" } : message) },
+      { ...complete, messages: (complete.messages ?? []).map((message) => message === exactMessage
+        ? { ...message, omission: {
+          omittedUtf8Bytes: 1,
+          originalUtf8Bytes: new TextEncoder().encode(message.text).byteLength + 1,
+          returnedUtf8Bytes: new TextEncoder().encode(message.text).byteLength,
+        } } : message) },
+    ];
+    const requestedDetails: boolean[] = [];
+    const port: CodexRuntimePort = codex;
+    const read = port.readSession.bind(port);
+    port.readSession = async (input) => {
+      requestedDetails.push(input.detail);
+      return await read(input);
     };
+    const snapshot = () => {
+      const database = new Database(paths.database, { strict: true });
+      try {
+        database.exec("PRAGMA query_only=ON");
+        return database.transaction(() => ({
+          schema: database.query("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name").all(),
+          tables: database.query<{ name: string }, []>("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name").all()
+            .map(({ name }) => {
+              if (!/^[A-Za-z0-9_]+$/u.test(name)) throw new Error("Unexpected fixture table name.");
+              const rows = database.query(`SELECT * FROM "${name}" LIMIT 4097`).all();
+              if (rows.length > 4096) throw new Error("Queue recovery fixture exceeded row bound.");
+              return { name, rows: rows.map((row) => JSON.stringify(row)).sort() };
+            }),
+        })).deferred();
+      } finally { database.close(false); }
+    };
+    const before = snapshot();
+    const providerWrites = providerMutationCalls(codex);
+    for (const projection of variants) {
+      codex.readProjection = projection;
+      await expect(service.execute({ kind: "session.recover", session: started.session.id }, { signal }))
+        .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      expect(requestedDetails.splice(0)).toEqual([true]);
+      expect(store.readQueueEffect(queued.queued.id)?.resolution).toBeUndefined();
+      expect(snapshot()).toEqual(before);
+      expect(providerMutationCalls(codex)).toEqual(providerWrites);
+    }
+    codex.readProjection = complete;
 
     expect(await service.execute({ kind: "session.recover", session: started.session.id }, { signal })).toMatchObject({
       queueId: queued.queued.id,
       session: { state: "active", activeTurnId: "turn-next" },
       recovery: { resolution: "proven_applied", providerEffectRetried: false },
     });
+    expect(requestedDetails.splice(0)).toEqual([true]);
     expect(store.readQueueEffect(queued.queued.id)).toMatchObject({ resolution: { kind: "proven_applied" } });
     expect(store.latestSessionRuntimeProfile(started.session.id)).toMatchObject({ revision: 2, sourceKind: "queue_start", sourceId: queued.queued.id });
     expect(codex.calls.filter((call) => call === "send")).toHaveLength(1);
@@ -23174,11 +26270,87 @@ describe("HraService", () => {
       text: "uncertain queue",
       type: "user_message",
     });
-    const authority = { id: added.account.id as `acct_${string}`, generation: 1, codexHome: "unused", desktopUserData: "unused" };
+    const authority = liveAuthorityFor(store, added.account.id as `acct_${string}`);
     await service.observeCodexFact(authority, { type: "threadStatusChanged", threadId: started.session.providerThreadId, status: { type: "systemError" } });
     expect(await service.execute({ kind: "session.recover", session: started.session.id }, { signal })).toMatchObject({
       recovery: { resolution: "provider_state_reconciled" },
     });
+  });
+
+  test("abandons an ambiguous queued dispatch using metadata without claiming a complete message set", async () => {
+    const value = await fixture();
+    const { service, store, codex } = value;
+    const { sessionId } = await createIdleSession(value, "Queue metadata abandonment");
+    codex.startTurnError = new IndeterminateCodexEffectError("turn/start", 48);
+    const queued = await service.execute({
+      kind: "session.queue", session: sessionId, message: "Uncertain metadata-only abandonment",
+    }, { signal }) as { queued: { id: `queue_${string}` } };
+    await service.settled();
+    expect(store.requireQueue(queued.queued.id).state).toBe("ambiguous");
+    const original = store.readQueueEffect(queued.queued.id);
+    const providerWrites = providerMutationCalls(codex);
+    codex.readProjection = {
+      providerThreadId: codex.readProjection.providerThreadId,
+      title: codex.readProjection.title,
+      status: "idle",
+    };
+    const details: boolean[] = [];
+    const port: CodexRuntimePort = codex;
+    const read = port.readSession.bind(port);
+    port.readSession = async (input) => { details.push(input.detail); return await read(input); };
+    await expect(service.execute({ kind: "session.abandon", session: sessionId }, { signal }))
+      .resolves.toMatchObject({ queueId: queued.queued.id,
+        recovery: { resolution: "abandoned", providerEffectRetried: false, providerStateDeleted: false } });
+    expect(details).toEqual([false]);
+    expect(store.readQueueEffect(queued.queued.id)).toMatchObject({ resolution: { kind: "abandoned" } });
+    expect(store.readQueueEffect(queued.queued.id)?.evidence).toEqual(original?.evidence);
+    expect(store.listSessionEvents({ sessionId, afterSequence: 0 }).events
+      .filter((event) => event.body.type === "user_message" && event.body.sourceId === queued.queued.id)).toEqual([]);
+    expect(providerMutationCalls(codex)).toEqual(providerWrites);
+  });
+
+  test("reconciles a retired-generation queued dispatch after daemon rollover without replay", async () => {
+    const value = await fixture();
+    const { service, codex, documents, store } = value;
+    const added = await service.execute({ kind: "account.add", label: "Rollover queue" }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    await service.execute({ kind: "project.add", label: "Rollover queue docs", path: documents }, { signal });
+    const started = await service.execute({ presetContract: legacyPresetContract, kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    codex.startTurnError = new IndeterminateCodexEffectError("turn/start", 47);
+    const queued = await service.execute({ kind: "session.queue", session: started.session.id, message: "queue across rollover" }, { signal }) as { queued: { id: `queue_${string}` } };
+    await service.settled();
+    const capturedQueueAuthority = store.readQueueProviderAuthority(queued.queued.id);
+    const providerProjection = codex.readProjection;
+
+    const daemonGeneration = store.nextDaemonGeneration(`boot_${"e".repeat(32)}`);
+    expect(store.readQueueProviderAuthority(queued.queued.id)).toEqual(capturedQueueAuthority);
+    const restartedCodex = new FakeCodex();
+    restartedCodex.readProjection = { ...providerProjection, providerUpdatedAt: 10 };
+    const restarted = new OompaService({
+      store,
+      paths: value.paths,
+      codex: restartedCodex,
+      cloud: new FakeCloud(),
+      daemonAuthority: new FakeDaemonAuthority(),
+      daemonGeneration,
+      requestStop: () => undefined,
+    });
+    await restarted.recover();
+    expect(restartedCodex.calls.filter((call) => call === "send")).toHaveLength(0);
+
+    await expect(restarted.execute({ kind: "session.recover", session: started.session.id }, { signal }))
+      .resolves.toMatchObject({
+        queueId: queued.queued.id,
+        session: { state: "active", activeTurnId: "turn-next" },
+        recovery: { resolution: "proven_applied", providerEffectRetried: false },
+      });
+    expect(store.readQueueEffect(queued.queued.id)).toMatchObject({
+      resolution: { kind: "proven_applied" },
+    });
+    expect(store.readQueueProviderAuthority(queued.queued.id)).toEqual(capturedQueueAuthority);
+    expect(restartedCodex.calls.filter((call) => call === "send")).toHaveLength(0);
+    expect(restartedCodex.calls.filter((call) => call === "read")).toHaveLength(1);
+    await restarted.close();
   });
 
   test("rejects signed-out runtime effects before creating sessions or usage observations", async () => {
@@ -23243,11 +26415,17 @@ describe("HraService", () => {
   });
 
   test("retires the exact Codex client only after logout dispatch and requires a fresh generation to reconcile ambiguity", async () => {
-    const { service, codex, documents, store, paths } = await fixture();
+    const value = await fixture();
+    const { service, codex, documents, store, paths } = value;
     const added = await service.execute({ kind: "account.add", label: "Logout recovery" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
     await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
-    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", presetContract: 1, fast: false }, { signal }) as { session: { id: string } };
+    const started = await service.execute({ presetContract: legacyPresetContract, kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: string } };
+    const seeded = await seedResolvableInteraction(
+      value,
+      started.session.id as `sess_${string}`,
+      "ambiguous-logout-retirement",
+    );
     const releasesBeforeLogout = codex.releasedAuthorities.length;
     codex.logoutError = new IndeterminateCodexEffectError("account/logout", 43);
     codex.beforeLogoutReturn = async () => {
@@ -23268,6 +26446,31 @@ describe("HraService", () => {
     await expect(service.execute(command, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
     const quarantined = store.requireProfile(added.account.id);
     expect(quarantined).toMatchObject({ state: "recovery_required", processGeneration: 1, providerEmail: "person@example.com" });
+    expect(store.requireInteraction(seeded.interaction.publicId).state).toBe("expired");
+    const quarantinedEvents = store.listSessionEvents({
+      sessionId: started.session.id as `sess_${string}`,
+      afterSequence: 0,
+      limit: 100,
+    }).events;
+    expect(quarantinedEvents.filter((event) =>
+      event.body.type === "connection" && event.body.state === "disconnected"))
+      .toHaveLength(1);
+    expect(quarantinedEvents.filter((event) =>
+      event.body.type === "gap" && event.body.reason === "provider_disconnect"))
+      .toHaveLength(1);
+    await service.observeCodexFact(seeded.authority, {
+      type: "providerDisconnected",
+      connectionId: seeded.interaction.authority.connectionId,
+      reason: "closed",
+    });
+    await service.settled();
+    expect(store.listSessionEvents({
+      sessionId: started.session.id as `sess_${string}`,
+      afterSequence: 0,
+      limit: 100,
+    }).events.filter((event) =>
+      event.body.type === "connection" && event.body.state === "disconnected"))
+      .toHaveLength(1);
     expect(store.setProfileState(quarantined.id, quarantined.processGeneration, "signed_in", { email: "notification@example.com" })).toBe(false);
 
     await expect(service.execute({ kind: "session.send", session: started.session.id, message: "blocked", idempotencyKey: "00000000-0000-4000-8000-000000000502" }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
@@ -23298,7 +26501,7 @@ describe("HraService", () => {
       email: "person@example.com",
       plan: "Pro",
     };
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store,
       paths,
       codex: restartedCodex,
@@ -23377,7 +26580,7 @@ describe("HraService", () => {
     store.nextDaemonGeneration(`boot_${"8".repeat(32)}`);
     const restartedCodex = new FakeCodex();
     restartedCodex.accountProjection = { signedIn: false };
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store,
       paths,
       codex: restartedCodex,
@@ -23479,13 +26682,9 @@ describe("HraService", () => {
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
     const providerThreadId = session.providerThreadId;
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const connectionId = value.codex.observationConnectionId;
+    value.codex.observationConnectionId = connectionId;
     await value.service.observeCodexFact(authority, {
       type: "turnStarted",
       connectionId,
@@ -23556,13 +26755,9 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const connectionId = value.codex.observationConnectionId;
+    value.codex.observationConnectionId = connectionId;
     await value.service.observeCodexFact(authority, {
       type: "itemStarted",
       connectionId,
@@ -23729,6 +26924,7 @@ describe("HraService", () => {
         sessionId,
         accountId: profile.id,
         providerGeneration: profile.processGeneration,
+        providerAuthority: value.store.requireProviderAccountAuthority(profile.id, "codex"),
         providerConnectionId: null,
         body: {
           type: "warning",
@@ -23736,13 +26932,7 @@ describe("HraService", () => {
           message: `age ${localState} without append`,
         },
       });
-      if (localState === "idle_signed_out") {
-        expect(value.store.setProfileState(
-          profile.id,
-          profile.processGeneration,
-          "signed_out",
-        )).toBe(true);
-      } else {
+      if (localState === "terminal") {
         value.store.setSessionTurnState({
           sessionId,
           expectedRevision: session.revision,
@@ -23756,6 +26946,28 @@ describe("HraService", () => {
         sequence: 0,
       });
       const providerReadsBefore = value.codex.observedThreads.length;
+      let observedThroughBeforeRead = event.sequence;
+
+      // A signed-out historical stream is readable only after an exact
+      // disconnect retirement was durably recorded under its captured
+      // authority. The subsequent readiness change is local and must not
+      // cause a provider observation.
+      if (localState === "idle_signed_out") {
+        const authority = liveAuthorityFor(value.store, profile.id);
+        await value.service.observeCodexFact(authority, {
+          type: "providerDisconnected",
+          connectionId: value.codex.observationConnectionId,
+          reason: "process_exit",
+        });
+        const retired = value.store.requireProfileById(profile.id);
+        expect(value.store.setProfileState(
+          retired.id,
+          retired.processGeneration,
+          "signed_out",
+        )).toBe(true);
+        observedThroughBeforeRead = value.store
+          .eventStreamPosition(sessionId).observedThroughSequence;
+      }
 
       currentTime += SESSION_EVENT_RETAIN_AGE_MS + 1;
 
@@ -23770,18 +26982,18 @@ describe("HraService", () => {
       expect(page.gap).toEqual({
         reason: "retention_age",
         requestedSequence: 0,
-        retainedFromSequence: event.sequence + 1,
+        retainedFromSequence: observedThroughBeforeRead + 1,
       });
       expect(value.eventCursors.decode(page.nextCursor)).toEqual({
         version: 1,
         sessionId,
         streamEpoch: event.streamEpoch,
-        sequence: event.sequence,
+        sequence: observedThroughBeforeRead,
       });
       expect(value.store.eventStreamPosition(sessionId)).toEqual({
         streamEpoch: event.streamEpoch,
-        floorSequence: event.sequence + 1,
-        observedThroughSequence: event.sequence,
+        floorSequence: observedThroughBeforeRead + 1,
+        observedThroughSequence: observedThroughBeforeRead,
       });
       expect(value.codex.observedThreads).toHaveLength(providerReadsBefore);
     }
@@ -23910,6 +27122,7 @@ describe("HraService", () => {
     // it while the selected Codex identity is established, then prove that
     // terminal observation remains local after the profile signs out.
     const terminalSession = value.store.upsertProviderSession({
+      providerAuthority: value.store.requireProviderAccountAuthority(profile.id, "codex"),
       profileId: profile.id,
       provider: "codex",
       providerThreadId: "provider-terminal-observation",
@@ -23922,7 +27135,17 @@ describe("HraService", () => {
     const observeCallsBeforeNonLiveStatuses = value.codex.calls.filter(
       (call) => call === "observe",
     ).length;
-    expect(value.store.setProfileState(profile.id, profile.processGeneration, "signed_out")).toBe(true);
+    await value.service.observeCodexFact(liveAuthorityFor(value.store, profile.id), {
+      type: "providerDisconnected",
+      connectionId: value.codex.observationConnectionId,
+      reason: "process_exit",
+    });
+    const retiredProfile = value.store.requireProfileById(profile.id);
+    expect(value.store.setProfileState(
+      retiredProfile.id,
+      retiredProfile.processGeneration,
+      "signed_out",
+    )).toBe(true);
     const signedOut = sessionStatusSchema.parse(await value.service.execute({
       kind: "session.status",
       session: sessionId,
@@ -23982,6 +27205,32 @@ describe("HraService", () => {
     );
   });
 
+  test("rejects a stale local observation without exact historical retirement evidence", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Unproved retired observation");
+    const session = value.store.requireSession(sessionId);
+    const captured = value.store.requireSessionProviderAuthority(sessionId);
+    value.store.advanceProfileGeneration(session.profileId, captured.processGeneration);
+    const advanced = value.store.requireProfileById(session.profileId);
+    expect(value.store.setProfileState(
+      advanced.id,
+      advanced.processGeneration,
+      "signed_out",
+    )).toBe(true);
+    const providerReadsBefore = value.codex.observedThreads.length;
+
+    await expect(value.service.execute({
+      kind: "session.status",
+      session: sessionId,
+    }, { signal })).rejects.toMatchObject({
+      code: "RECOVERY_REQUIRED",
+      details: { reason: "SESSION_PROVIDER_AUTHORITY_STALE" },
+    });
+    expect(value.codex.observedThreads).toHaveLength(providerReadsBefore);
+    expect(value.store.requireCapturedSessionProviderAuthority(sessionId))
+      .toMatchObject(captured);
+  });
+
   test("does not append an old-generation warning when resume retirement advances authority", async () => {
     const value = await fixture();
     const { sessionId } = await createIdleSession(value, "Retired observation generation");
@@ -24009,12 +27258,7 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const connectionId = value.codex.observationConnectionId;
     const providerArgumentsSecret = "MCP-ARGUMENT-SECRET-MUST-NOT-PERSIST";
     const providerResultSecret = "MCP-RESULT-SECRET-MUST-NOT-PERSIST";
@@ -24134,12 +27378,7 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const connectionId = value.codex.observationConnectionId;
     factsMemory.ensures.length = 0;
     await value.service.observeCodexFact(authority, {
@@ -24193,6 +27432,9 @@ describe("HraService", () => {
       provider: {
         profileId: profile.id,
         processGeneration: profile.processGeneration,
+        provider: authority.provider,
+        providerAccountId: authority.providerAccountId,
+        bindingGeneration: authority.bindingGeneration,
         connectionId,
         requestId: { type: "number", value: 41 },
         method: "item/commandExecution/requestApproval",
@@ -24249,12 +27491,7 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const privatePath = ["", "Users", "alice", "private", "key"].join("/");
     const sentinel = `Bearer PROVIDER_EVENT_SECRET at ${privatePath}`;
     const parsed = parseFact("warning", {
@@ -24291,12 +27528,7 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const connectionId = value.codex.observationConnectionId;
     const observe = async (fact: CodexFact): Promise<void> =>
       await value.service.observeCodexFact(authority, { ...fact, connectionId });
@@ -24364,6 +27596,9 @@ describe("HraService", () => {
       provider: {
         profileId: profile.id,
         processGeneration: profile.processGeneration,
+        provider: authority.provider,
+        providerAccountId: authority.providerAccountId,
+        bindingGeneration: authority.bindingGeneration,
         connectionId,
         requestId: { type: "string", value: "confidentiality-request" },
         method: "item/tool/requestUserInput",
@@ -24439,12 +27674,7 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const connectionId = value.codex.observationConnectionId;
     const turnId = "turn-heartbeat-echo";
     const itemId = "assistant-heartbeat-echo";
@@ -24515,12 +27745,7 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const connectionId = value.codex.observationConnectionId;
     await expect(value.service.observeCodexFact(authority, {
       type: "interactionRequested",
@@ -24528,6 +27753,9 @@ describe("HraService", () => {
       provider: {
         profileId: profile.id,
         processGeneration: profile.processGeneration,
+        provider: authority.provider,
+        providerAccountId: authority.providerAccountId,
+        bindingGeneration: authority.bindingGeneration,
         connectionId,
         requestId: { type: "string", value: "unsafe-exact-key" },
         method: "item/tool/requestUserInput",
@@ -24817,17 +28045,15 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const privateTurnId = `${["", "Users", "person", "private"].join("/")}/api_key=INTERACTION-TURN-SECRET`;
     const privateItemId = "token=INTERACTION-ITEM-SECRET";
     const provider = {
       profileId: profile.id,
       processGeneration: profile.processGeneration,
+      provider: authority.provider,
+      providerAccountId: authority.providerAccountId,
+      bindingGeneration: authority.bindingGeneration,
       connectionId: value.codex.observationConnectionId,
       requestId: { type: "string" as const, value: "approval-request-1" },
       method: "item/commandExecution/requestApproval",
@@ -24910,6 +28136,7 @@ describe("HraService", () => {
       sessionId,
       accountId: profile.id,
       providerGeneration: profile.processGeneration,
+      providerAuthority: value.store.requireProviderAccountAuthority(profile.id, "codex"),
       providerConnectionId: provider.connectionId,
       body: { type: "turn_started", turnId: privateTurnId },
     });
@@ -25350,6 +28577,7 @@ describe("HraService", () => {
         authority: {
           profileId: profile.id,
           processGeneration: profile.processGeneration,
+          ...codexInteractionBinding(value.store, profile.id),
           connectionId: "74000000-0000-4000-8000-999999999999",
           requestId: { type: "number", value: index },
           method: "item/commandExecution/requestApproval",
@@ -25550,71 +28778,91 @@ describe("HraService", () => {
     expect(responseInFlightOnly.advisory.attention).toBe("response_in_flight");
   });
 
-  test("expires retired pending interactions locally without starving supported deadlines or clearing uncertainty", async () => {
-    let now = 1_000;
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
-    const { sessionId: supportedSessionId } = await createIdleSession(value, "Historical deadlines");
-    const supportedSession = value.store.requireSession(supportedSessionId);
-    const profile = value.store.requireProfileById(supportedSession.profileId);
-    const retiredSession = legacyDevinSession(value, profile.id);
-    value.codex.calls.length = 0;
-    const admit = (requestId: string, sessionId: Parameters<StateStore["admitInteraction"]>[0]["sessionId"], method: string, deadlineAt = 1_000) =>
-      value.store.admitInteraction({
+  test("preserves quarantined retired interactions without starving supported deadlines or clearing uncertainty", async () => {
+    const archive = canonical39RetiredRecoveryFixtures.interaction_deadlines;
+    const captured = archive.retained;
+    let now = archive.fixedTime;
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now,
+      undefined, {}, { canonical39RetiredRecovery: "interaction_deadlines" });
+    // Keep the archived byte image independently readable. The current fixture
+    // already performed the real migration and boot, not a restamped downgrade.
+    const originalPath = join(value.documents, "canonical39-original.sqlite");
+    await writeFile(originalPath, canonical39RetiredRecoveryDatabaseBytes("interaction_deadlines"), { mode: 0o600 });
+    const original = new Database(originalPath, { create: false, strict: true });
+    original.exec("PRAGMA query_only=ON");
+    const inspected = new Database(value.paths.database, { create: false, strict: true });
+    inspected.exec("PRAGMA query_only=ON");
+    try {
+      const columns = original.query("PRAGMA table_info(provider_interactions)").all() as { name: string }[];
+      expect(columns.length).toBeGreaterThan(0);
+      expect(columns.length).toBeLessThan(64);
+      for (const column of columns) expect(column.name).toMatch(/^[a-z_]+$/);
+      const select = columns.map(({ name }) => `"${name}"`).join(",");
+      const sql = `SELECT ${select} FROM provider_interactions WHERE profile_id=? ORDER BY public_id LIMIT 35`;
+      const originalRows = original.query(sql).all(captured.profile.id) as Array<Record<string, unknown> & {
+        state: string; session_id: string | null; revision: number;
+      }>;
+      expect(originalRows).toHaveLength(34);
+      const expectedRows = originalRows.map((row) => row.state === "pending" && row.session_id === null
+        ? { ...row, state: "expired", revision: row.revision + 1, updated_at: now, terminal_at: now }
+        : row);
+      // Only exact-method orphan pending callbacks gain a sidecar and expire
+      // at boot. Bound callbacks lack an original turn authority: quarantine
+      // retains every cell, including prepared responses and unknown outcomes.
+      const retainedRows = () => JSON.stringify(inspected.query(sql).all(captured.profile.id));
+      const expectedBytes = JSON.stringify(expectedRows);
+      expect(retainedRows()).toBe(expectedBytes);
+      expect(value.store.requireInteraction(captured.unknown.publicId)).toMatchObject(captured.unknown);
+      expect(value.codex.calls).toEqual([]);
+      expect(value.codex.validatedInteractionTimeouts).toEqual([]);
+      expect(value.codex.timedOutInteractions).toEqual([]);
+
+      // Quarantined records are not live capacity, an armed deadline timer, or
+      // an attention notification. Exclusion must happen before each limit.
+      expect(value.store.listDueInteractions({ now: now + 1_000, limit: 1 })).toEqual([]);
+      expect(value.store.nextInteractionDeadlineAt()).toBeNull();
+      expect(value.store.readAttentionNotificationSnapshot({ now, limit: 1 })).toEqual({
+        interactions: [], observedAt: now, status: "complete",
+      });
+      const { sessionId } = await createIdleSession(value, "Supported historical deadlines");
+      const session = value.store.requireSession(sessionId);
+      const supported = value.store.admitInteraction({
         publicId: crypto.randomUUID(), sessionId,
         authority: {
-          profileId: profile.id, processGeneration: profile.processGeneration,
+          ...value.store.requireProviderAccountAuthority(session.profileId, "codex"),
           connectionId: value.codex.observationConnectionId,
-          requestId: { type: "string", value: requestId }, method,
-          requestDigest: createHash("sha256").update(requestId).digest("hex"),
-          threadId: sessionId === supportedSession.id ? supportedSession.providerThreadId ?? null : "historical-devin-thread",
+          requestId: { type: "string", value: "supported-after-retired" },
+          method: "item/commandExecution/requestApproval",
+          requestDigest: createHash("sha256").update("supported-after-retired").digest("hex"),
+          threadId: session.providerThreadId ?? null,
           turnId: null, itemId: null, approvalId: null,
         },
         kind: "command_approval", blocking: true,
         display: {
-          kind: "command_approval", summary: "Historical pending approval", reason: null,
+          kind: "command_approval", summary: "Supported pending approval", reason: null,
           commandClass: "test", workingDirectory: null,
           availableDecisions: ["once", "decline", "cancel"],
         },
-        requestedAt: 1_000, deadlineAt,
+        requestedAt: now, deadlineAt: now + 1_001,
       }).record;
-    try {
-      // Fill the first bounded batch: session-bound old methods and orphaned
-      // Devin methods both identify retired authority without a live runtime.
-      const pending = Array.from({ length: 32 }, (_, index) => admit(
-        `retired-${index}`,
-        index % 2 === 0 ? retiredSession.id : null,
-        index % 2 === 0 ? "item/commandExecution/requestApproval" : "devin/session/request_permission",
-      ));
-      const prepared = value.store.prepareInteractionResponse({
-        id: admit("retired-prepared", retiredSession.id, "devin/session/request_permission").publicId,
-        expectedRevision: 1, responseDigest: "a".repeat(64),
+      expect(value.store.readAttentionNotificationSnapshot({ now, limit: 1 })).toEqual({
+        interactions: [supported], observedAt: now, status: "complete",
       });
-      const unknown = value.store.markInteractionResolutionUnknown({
-        id: admit("retired-unknown", null, "devin/session/request_permission").publicId,
-        expectedRevision: 1,
-      });
-      const supported = admit(
-        "supported-after-retired", supportedSession.id,
-        "item/commandExecution/requestApproval", 1_001,
-      );
-      now = 2_000;
-      expect(await value.service.maintainInteractionDeadlines()).toEqual({ examined: 32, failed: 0 });
-      for (const record of pending) {
-        expect(value.store.requireInteraction(record.publicId)).toMatchObject({
-          state: "expired", revision: 2, responseDigest: null,
-        });
-      }
-      expect(value.codex.validatedInteractionTimeouts).toHaveLength(0);
-      expect(value.codex.timedOutInteractions).toHaveLength(0);
-      expect(value.codex.calls).toEqual([]);
+      expect(value.store.nextInteractionDeadlineAt()).toBe(supported.deadlineAt);
+      value.codex.calls.length = 0;
+      now += 2_000;
+      expect(value.store.listDueInteractions({ now, limit: 1 })).toEqual([supported]);
       expect(await value.service.maintainInteractionDeadlines()).toEqual({ examined: 1, failed: 0 });
       expect(value.store.requireInteraction(supported.publicId).state).toBe("expired");
       expect(value.codex.validatedInteractionTimeouts).toHaveLength(1);
       expect(value.codex.timedOutInteractions).toHaveLength(1);
-      expect(value.store.requireInteraction(prepared.publicId)).toEqual(prepared);
-      expect(value.store.requireInteraction(unknown.publicId)).toEqual(unknown);
+      expect(value.store.nextInteractionDeadlineAt()).toBeNull();
+      expect(await value.service.maintainInteractionDeadlines()).toEqual({ examined: 0, failed: 0 });
+      expect(retainedRows()).toBe(expectedBytes);
       expect(value.codex.calls.every((call) => call === "readAccount")).toBe(true);
     } finally {
+      original.close(false);
+      inspected.close(false);
       await value.service.close();
     }
   });
@@ -25626,12 +28874,7 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const connectionId = value.codex.observationConnectionId;
     const requests = [
       {
@@ -25706,6 +28949,9 @@ describe("HraService", () => {
         provider: {
           profileId: profile.id,
           processGeneration: profile.processGeneration,
+          provider: authority.provider,
+          providerAccountId: authority.providerAccountId,
+          bindingGeneration: authority.bindingGeneration,
           connectionId,
           requestId: { type: "number", value: index + 1 },
           method: request.method,
@@ -25750,12 +28996,7 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const providerThreadId = session.providerThreadId;
     const connectionId = value.codex.observationConnectionId;
     const cases = [
@@ -25855,6 +29096,9 @@ describe("HraService", () => {
           provider: {
             profileId: profile.id,
             processGeneration: profile.processGeneration,
+            provider: authority.provider,
+            providerAccountId: authority.providerAccountId,
+            bindingGeneration: authority.bindingGeneration,
             connectionId,
             requestId: { type: "string", value: requestId },
             method: interactionCase.method,
@@ -25938,12 +29182,7 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const connectionId = value.codex.observationConnectionId;
     await value.service.observeCodexFact(authority, {
       type: "interactionRequested",
@@ -25951,6 +29190,9 @@ describe("HraService", () => {
       provider: {
         profileId: profile.id,
         processGeneration: profile.processGeneration,
+        provider: authority.provider,
+        providerAccountId: authority.providerAccountId,
+        bindingGeneration: authority.bindingGeneration,
         connectionId,
         requestId: { type: "string", value: "validation-deadline" },
         method: "item/commandExecution/requestApproval",
@@ -26000,24 +29242,24 @@ describe("HraService", () => {
   });
 
   test("does not dispatch a response prepared on the deadline clock edge", async () => {
-    let now = 90_000;
-    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    let baseNow = 90_000;
+    const now = () => baseNow;
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, now);
     const { sessionId } = await createIdleSession(value, "Deadline prepare edge");
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
     const connectionId = value.codex.observationConnectionId;
-    await value.service.observeCodexFact({
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    }, {
+    const authority = liveAuthorityFor(value.store, profile.id);
+    await value.service.observeCodexFact(authority, {
       type: "interactionRequested",
       connectionId,
       provider: {
         profileId: profile.id,
         processGeneration: profile.processGeneration,
+        provider: authority.provider,
+        providerAccountId: authority.providerAccountId,
+        bindingGeneration: authority.bindingGeneration,
         connectionId,
         requestId: { type: "string", value: "prepare-deadline" },
         method: "item/commandExecution/requestApproval",
@@ -26042,16 +29284,19 @@ describe("HraService", () => {
     });
     const interaction = value.store.listInteractions({ sessionId, pendingOnly: true })[0];
     if (interaction === undefined) throw new Error("Expected a pending interaction.");
-    now = 90_999;
-    const prepare = value.store.prepareInteractionResponse.bind(value.store);
-    Object.defineProperty(value.store, "prepareInteractionResponse", {
-      configurable: true,
-      value: (input: Parameters<typeof prepare>[0]): ReturnType<typeof prepare> => {
-        const prepared = prepare(input);
-        if (input.intendedTerminalState === "resolved") now = 91_000;
-        return prepared;
-      },
-    });
+    baseNow = 90_999;
+    const prepareResponse = value.store.prepareInteractionResponse.bind(value.store);
+    let preparedAtBoundary = false;
+    value.store.prepareInteractionResponse = (input) => {
+      const prepared = prepareResponse(input);
+      if (input.id === interaction.publicId && input.intendedTerminalState === "resolved") {
+        expect(prepared.state).toBe("response_prepared");
+        expect(prepared.updatedAt).toBe(90_999);
+        preparedAtBoundary = true;
+        baseNow = 91_000;
+      }
+      return prepared;
+    };
     const deadlineFailure = await value.service.execute({
       kind: "interaction.resolve",
       interaction: interaction.publicId,
@@ -26061,6 +29306,8 @@ describe("HraService", () => {
       () => null,
       (error: unknown) => error,
     );
+    value.store.prepareInteractionResponse = prepareResponse;
+    expect(preparedAtBoundary).toBe(true);
     expect(deadlineFailure).toBeInstanceOf(CommandFailure);
     expect(deadlineFailure).toMatchObject({ code: "CONFLICT" });
     expect((deadlineFailure as CommandFailure).details).toMatchObject({
@@ -26234,12 +29481,7 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const connectionId = value.codex.observationConnectionId;
     const admit = async (requestId: string, requestedAt: number, deadlineAt: number) => {
       await value.service.observeCodexFact(authority, {
@@ -26248,6 +29490,9 @@ describe("HraService", () => {
         provider: {
           profileId: profile.id,
           processGeneration: profile.processGeneration,
+          provider: authority.provider,
+          providerAccountId: authority.providerAccountId,
+          bindingGeneration: authority.bindingGeneration,
           connectionId,
           requestId: { type: "string", value: requestId },
           method: "item/commandExecution/requestApproval",
@@ -26342,6 +29587,7 @@ describe("HraService", () => {
       authority: {
         profileId: profile.id,
         processGeneration: profile.processGeneration,
+        ...codexInteractionBinding(value.store, profile.id),
         connectionId: "46100000-0000-4000-8000-000000000001",
         requestId: { type: "string", value: "automatic-timeout-persistence" },
         method: "item/commandExecution/requestApproval",
@@ -26411,6 +29657,7 @@ describe("HraService", () => {
       authority: {
         profileId: profile.id,
         processGeneration: profile.processGeneration,
+        ...codexInteractionBinding(value.store, profile.id),
         connectionId: "46150000-0000-4000-8000-000000000001",
         requestId: { type: "string", value: "automatic-timeout-terminal-event" },
         method: "item/commandExecution/requestApproval",
@@ -26560,12 +29807,7 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const originalExpire = value.store.expireInteraction.bind(value.store);
     (value.store as unknown as { expireInteraction: StateStore["expireInteraction"] }).expireInteraction = () => {
       throw new Error("injected durable terminalization fault");
@@ -26581,6 +29823,9 @@ describe("HraService", () => {
       provider: {
         profileId: profile.id,
         processGeneration: profile.processGeneration,
+        provider: authority.provider,
+        providerAccountId: authority.providerAccountId,
+        bindingGeneration: authority.bindingGeneration,
         connectionId,
         requestId: { type: "number", value: 1 },
         method: "item/commandExecution/requestApproval",
@@ -26618,17 +29863,15 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const connectionId = value.codex.observationConnectionId;
     const request = async (requestId: string) => {
       const provider = {
         profileId: profile.id,
         processGeneration: profile.processGeneration,
+        provider: authority.provider,
+        providerAccountId: authority.providerAccountId,
+        bindingGeneration: authority.bindingGeneration,
         connectionId,
         requestId: { type: "string" as const, value: requestId },
         method: "item/permissions/requestApproval",
@@ -26744,17 +29987,15 @@ describe("HraService", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const connectionId = value.codex.observationConnectionId;
     const request = async (requestId: string) => {
       const provider = {
         profileId: profile.id,
         processGeneration: profile.processGeneration,
+        provider: authority.provider,
+        providerAccountId: authority.providerAccountId,
+        bindingGeneration: authority.bindingGeneration,
         connectionId,
         requestId: { type: "string" as const, value: requestId },
         method: "item/commandExecution/requestApproval",
@@ -26819,6 +30060,11 @@ describe("HraService", () => {
       ...authority,
       generation: authority.generation + 1,
     };
+    const eventsAfterDisconnect = value.store.listSessionEvents({
+      sessionId,
+      afterSequence: null,
+      limit: 200,
+    }).events;
     const replacementConnectionId = "50000000-0000-4000-8000-000000000099";
     value.codex.observationConnectionId = replacementConnectionId;
     await value.service.observeCodexFact(replacementAuthority, {
@@ -26851,6 +30097,7 @@ describe("HraService", () => {
       afterSequence: null,
       limit: 200,
     }).events;
+    expect(eventsAfterReplacement).toEqual(eventsAfterDisconnect);
     await value.service.observeCodexFact(authority, {
       type: "assistantDelta",
       connectionId,
@@ -26864,8 +30111,10 @@ describe("HraService", () => {
       afterSequence: null,
       limit: 200,
     }).events).toEqual(eventsAfterReplacement);
-    expect(JSON.stringify(eventsAfterReplacement)).toContain("new generation visible");
+    expect(JSON.stringify(eventsAfterReplacement)).not.toContain("new generation visible");
     expect(JSON.stringify(eventsAfterReplacement)).not.toContain("stale generation hidden");
+    expect(() => value.store.requireSessionProviderAuthority(sessionId))
+      .toThrow("SESSION_PROVIDER_AUTHORITY_STALE");
     expect(value.store.requireInteraction(second.publicId)).toMatchObject({
       state: "expired",
       revision: 2,
@@ -26890,12 +30139,7 @@ describe("HraService", () => {
       "clean-shutdown",
     );
     const originalGeneration = seeded.profile.processGeneration;
-    const authority: ProfileAuthority = {
-      id: seeded.profile.id,
-      generation: originalGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, seeded.profile.id);
     await value.service.observeCodexFact(authority, {
       type: "assistantDelta",
       connectionId,
@@ -26932,7 +30176,7 @@ describe("HraService", () => {
       });
 
     const restartedCodex = new FakeCodex();
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store: value.store,
       paths: value.paths,
       codex: restartedCodex,
@@ -26959,6 +30203,10 @@ describe("HraService", () => {
       ...authority,
       generation: originalGeneration + 1,
     };
+    const eventsAfterShutdown = value.store.listSessionEvents({
+      sessionId,
+      afterSequence: 0,
+    }).events;
     await restarted.observeCodexFact(replacementAuthority, {
       type: "itemStarted",
       connectionId: replacementConnectionId,
@@ -26988,6 +30236,7 @@ describe("HraService", () => {
       sessionId,
       afterSequence: 0,
     }).events;
+    expect(afterReplacement).toEqual(eventsAfterShutdown);
     await restarted.observeCodexFact(authority, {
       type: "assistantDelta",
       connectionId,
@@ -26998,8 +30247,10 @@ describe("HraService", () => {
     });
     expect(value.store.listSessionEvents({ sessionId, afterSequence: 0 }).events)
       .toEqual(afterReplacement);
-    expect(JSON.stringify(afterReplacement)).toContain("replacement generation visible");
+    expect(JSON.stringify(afterReplacement)).not.toContain("replacement generation visible");
     expect(JSON.stringify(afterReplacement)).not.toContain("stale generation hidden");
+    expect(() => value.store.requireSessionProviderAuthority(sessionId))
+      .toThrow("SESSION_PROVIDER_AUTHORITY_STALE");
     await restarted.close();
   });
 
@@ -27066,6 +30317,36 @@ describe("HraService", () => {
       "crash-restart",
     );
     const originalGeneration = seeded.profile.processGeneration;
+    const originalSessionAuthority = value.store.requireSessionProviderAuthority(sessionId);
+    const originalProviderAuthority = {
+      provider: originalSessionAuthority.provider,
+      providerAccountId: originalSessionAuthority.providerAccountId,
+      profileId: originalSessionAuthority.profileId,
+      bindingGeneration: originalSessionAuthority.bindingGeneration,
+      processGeneration: originalSessionAuthority.processGeneration,
+    } as const;
+    const originalRuntimeAuthority = liveAuthorityFor(
+      value.store,
+      seeded.profile.id,
+    );
+    const stalePreparedKey = "52000000-0000-4000-8000-000000000099";
+    const { attempt: stalePrepared } = value.store.prepareSessionInputMutation({
+      kind: "session.send",
+      sessionId,
+      providerAuthority: originalProviderAuthority,
+      message: "must remain fenced after restart",
+      attachments: [],
+      idempotencyKey: stalePreparedKey,
+      daemonGeneration: value.daemonGeneration,
+      bootId: value.daemonBootId,
+    });
+    expect(stalePrepared).toMatchObject({ state: "prepared", replay: false });
+    const staleQueue = value.store.enqueue(
+      sessionId,
+      "queued input must remain fenced after restart",
+    );
+    expect(value.store.readQueueProviderAuthority(staleQueue.id))
+      .toMatchObject(originalProviderAuthority);
     const oldStoreIndex = stores.indexOf(value.store);
     if (oldStoreIndex < 0) throw new Error("Expected the fixture store to be tracked.");
     value.daemonAuthority.invalidate();
@@ -27077,9 +30358,23 @@ describe("HraService", () => {
     const daemonGeneration = restartedStore.nextDaemonGeneration(
       `boot_${"f".repeat(32)}`,
     );
-    expect(daemonGeneration).toBe(1);
+    expect(daemonGeneration).toBe(value.daemonGeneration + 1);
     expect(restartedStore.requireProfileById(seeded.profile.id).processGeneration)
       .toBe(originalGeneration + 1);
+    const reboundSessionAuthority = restartedStore.requireSessionProviderAuthority(sessionId);
+    expect(reboundSessionAuthority).toMatchObject({
+      provider: originalSessionAuthority.provider,
+      providerAccountId: originalSessionAuthority.providerAccountId,
+      profileId: originalSessionAuthority.profileId,
+      bindingGeneration: originalSessionAuthority.bindingGeneration,
+      processGeneration: originalSessionAuthority.processGeneration + 1,
+    });
+    expect(restartedStore.readMutation(stalePreparedKey))
+      .toMatchObject({ state: "cancelled" });
+    expect(restartedStore.requireQueue(staleQueue.id))
+      .toMatchObject({ state: "cancelled" });
+    expect(restartedStore.readQueueProviderAuthority(staleQueue.id))
+      .toMatchObject(originalProviderAuthority);
     expect(restartedStore.requireInteraction(seeded.pending.publicId)).toMatchObject({
       state: "expired",
       revision: 2,
@@ -27095,7 +30390,7 @@ describe("HraService", () => {
     expect(restartedStore.listInteractions({ sessionId, pendingOnly: true })).toEqual([]);
 
     const restartedCodex = new FakeCodex();
-    const restarted = new HraService({
+    const restarted = new OompaService({
       store: restartedStore,
       paths: value.paths,
       codex: restartedCodex,
@@ -27134,6 +30429,34 @@ describe("HraService", () => {
       limit: 200,
       waitMs: 0,
     }, { signal })).resolves.toMatchObject({ events: [] });
+    const eventsBeforeOldCallback = restartedStore.listSessionEvents({
+      sessionId,
+      afterSequence: 0,
+    }).events;
+    await restarted.observeCodexFact(
+      originalRuntimeAuthority,
+      {
+        type: "assistantDelta",
+        connectionId: "52000000-0000-4000-8000-000000000001",
+        threadId: seeded.session.providerThreadId as string,
+        turnId: "old-restart-turn",
+        itemId: "old-restart-item",
+        text: "stale callback must stay fenced",
+      },
+    );
+    expect(restartedStore.listSessionEvents({
+      sessionId,
+      afterSequence: 0,
+    }).events).toEqual(eventsBeforeOldCallback);
+    const providerCallsBeforeStalePrepared = restartedCodex.calls.length;
+    await expect(restarted.execute({
+      kind: "session.send",
+      session: sessionId,
+      message: "must remain fenced after restart",
+      idempotencyKey: stalePreparedKey,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(restartedCodex.calls.slice(providerCallsBeforeStalePrepared))
+      .not.toContain("send");
     const restartEvents = restartedStore.listSessionEvents({
       sessionId,
       afterSequence: 0,
@@ -27146,6 +30469,7 @@ describe("HraService", () => {
     expect(resubscribed).toMatchObject({
       body: { type: "connection", state: "resubscribed" },
       providerConnectionId: restartedCodex.observationConnectionId,
+      providerGeneration: originalSessionAuthority.processGeneration + 1,
     });
     await restarted.close();
   });
@@ -27169,12 +30493,7 @@ describe("HraService", () => {
       signalFactAdmitted();
       await factGate;
     };
-    const authority: ProfileAuthority = {
-      id: added.account.id,
-      generation: 1,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(store, added.account.id);
     const fact = service.observeCodexFact(authority, {
       type: "turnCompleted",
       threadId: started.session.providerThreadId,
@@ -27204,7 +30523,7 @@ describe("HraService", () => {
   });
 });
 
-describe("HraService autorespond", () => {
+describe("OompaService autorespond", () => {
   const waitFor = async (predicate: () => boolean, timeoutMs = 2_000): Promise<void> => {
     const startedAt = Date.now();
     while (!predicate()) {
@@ -27222,12 +30541,7 @@ describe("HraService autorespond", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     const connectionId = value.codex.observationConnectionId;
     await value.service.observeCodexFact(authority, {
       type: "interactionRequested",
@@ -27235,6 +30549,9 @@ describe("HraService autorespond", () => {
       provider: {
         profileId: profile.id,
         processGeneration: profile.processGeneration,
+        provider: authority.provider,
+        providerAccountId: authority.providerAccountId,
+        bindingGeneration: authority.bindingGeneration,
         connectionId,
         requestId: { type: "string" as const, value: requestId },
         method: "item/commandExecution/requestApproval",
@@ -27272,17 +30589,16 @@ describe("HraService autorespond", () => {
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
     const connectionId = value.codex.observationConnectionId;
-    await value.service.observeCodexFact({
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    }, {
+    const authority = liveAuthorityFor(value.store, profile.id);
+    await value.service.observeCodexFact(authority, {
       type: "interactionRequested",
       connectionId,
       provider: {
         profileId: profile.id,
         processGeneration: profile.processGeneration,
+        provider: authority.provider,
+        providerAccountId: authority.providerAccountId,
+        bindingGeneration: authority.bindingGeneration,
         connectionId,
         requestId: { type: "string" as const, value: requestId },
         method: "item/permissions/requestApproval",
@@ -27317,17 +30633,16 @@ describe("HraService autorespond", () => {
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
     const connectionId = value.codex.observationConnectionId;
-    await value.service.observeCodexFact({
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    }, {
+    const authority = liveAuthorityFor(value.store, profile.id);
+    await value.service.observeCodexFact(authority, {
       type: "interactionRequested",
       connectionId,
       provider: {
         profileId: profile.id,
         processGeneration: profile.processGeneration,
+        provider: authority.provider,
+        providerAccountId: authority.providerAccountId,
+        bindingGeneration: authority.bindingGeneration,
         connectionId,
         requestId: { type: "string" as const, value: requestId },
         method: "item/fileChange/requestApproval",
@@ -27803,12 +31118,7 @@ describe("HraService autorespond", () => {
         resolution: { kind: "approval_decision", decision: "decline" },
       }, { signal });
       const profile = value.store.requireProfileById(interaction.authority.profileId);
-      await value.service.observeCodexFact({
-        id: profile.id,
-        generation: profile.processGeneration,
-        codexHome: "unused",
-        desktopUserData: "unused",
-      }, {
+      await value.service.observeCodexFact(liveAuthorityFor(value.store, profile.id), {
         type: "interactionResolved",
         connectionId: interaction.authority.connectionId,
         provider: interaction.authority,
@@ -27877,12 +31187,7 @@ describe("HraService autorespond", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     await value.service.observeCodexFact(authority, {
       type: "turnStarted",
       threadId: session.providerThreadId,
@@ -27928,7 +31233,7 @@ describe("HraService autorespond", () => {
   });
 });
 
-describe("HraService prose autorespond", () => {
+describe("OompaService prose autorespond", () => {
   // Twenty-four printable characters, built rather than written, so no
   // credential-shaped literal enters the repository.
   const testGatewayKey = ["gw", "k".repeat(22)].join("");
@@ -27947,10 +31252,10 @@ describe("HraService prose autorespond", () => {
     now?: () => number;
     onStopRequested?: () => void;
     responder?: ProseResponder;
-  }> = {}) => {
+  }> = {}, createFixture: ServiceFixtureFactory = fixture) => {
     const responder = options.responder ?? new DeterministicProseResponder();
     const gatewayKeys = options.gatewayKeys ?? new InMemoryGatewayKeyStore(testGatewayKey);
-    const value = await fixture(
+    const value = await createFixture(
       undefined,
       new FakeCloud(),
       options.onStopRequested ?? (() => undefined),
@@ -27974,12 +31279,7 @@ describe("HraService prose autorespond", () => {
     const profile = value.store.requireProfileById(session.profileId);
     const threadId = session.providerThreadId;
     if (threadId === undefined) throw new Error("Expected a bound session.");
-    const authority: ProfileAuthority = {
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    };
+    const authority = liveAuthorityFor(value.store, profile.id);
     await value.service.observeCodexFact(authority, {
       type: "turnStarted",
       threadId,
@@ -28321,15 +31621,11 @@ describe("HraService prose autorespond", () => {
     const profile = value.store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
     const connectionId = value.codex.observationConnectionId;
-    await value.service.observeCodexFact({
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    }, {
+    await value.service.observeCodexFact(liveAuthorityFor(value.store, profile.id, "codex"), {
       type: "interactionRequested",
       connectionId,
       provider: {
+        ...codexInteractionBinding(value.store, profile.id),
         profileId: profile.id,
         processGeneration: profile.processGeneration,
         connectionId,
@@ -28615,56 +31911,82 @@ describe("HraService prose autorespond", () => {
     });
   });
 
-  test.each([
+  for (const { afterHoursEnabled, label } of [
     { afterHoursEnabled: false, label: "disabled" },
     { afterHoursEnabled: true, label: "enabled" },
-  ])("keeps prose at three approvals with after-hours consent $label and resumes only after a human send", async ({ afterHoursEnabled }) => {
-    const now = Date.parse("2026-09-04T09:59:59.999Z");
-    const value = await proseFixture({ now: () => now });
-    const { sessionId } = await createIdleSession(value, "Prose budget");
-    await value.service.execute({
-      kind: "notification-hours.set", expectedRevision: 1, version: 1,
-      startMinute: 600, endMinute: 1_320, timeZone: "UTC",
-    }, { signal });
-    if (afterHoursEnabled) {
-      await value.service.execute({ kind: "autorespond-after-hours.enable", expectedRevision: 1 }, { signal });
-      expect(value.store.readAutorespondAfterHoursSelection(sessionId, "protocol", "eligible").tier).toBe("after_hours");
-    }
-    value.store.setSessionApprovalMode(sessionId, "auto:all");
+  ]) {
+    describe(`keeps prose at three approvals with after-hours consent ${label} and resumes only after a human send`, () => {
+      let owner: ReturnType<typeof createOwnedServiceCase> | undefined;
+      let prepared: {
+        value: Awaited<ReturnType<typeof proseFixture>>;
+        sessionId: `sess_${string}`;
+      } | undefined;
+      // Only fresh fixture and idle-session creation moves to setup. This adds
+      // a separate 5 s allowance, not an unchanged end-to-end test deadline.
+      beforeEach(() => {
+        owner = createOwnedServiceCase();
+        prepared = undefined;
+        return owner.run(async ({ createFixture, signal }) => {
+          const now = Date.parse("2026-09-04T09:59:59.999Z");
+          const value = await proseFixture({ now: () => now }, createFixture);
+          signal.throwIfAborted();
+          const { sessionId } = await createIdleSession(value, "Prose budget");
+          signal.throwIfAborted();
+          prepared = { value, sessionId };
+        });
+      }, 5_000);
 
-    // Each autoresponse must leave the fake provider idle so the next turn can
-    // start; the daemon refuses to send into an active turn.
-    value.codex.turnStatus = "completed";
-    const sent = () => proseEvidence(value, sessionId).filter((row) => row.outcome === "sent").length;
-    let expected = 0;
-    for (const turn of ["budget-1", "budget-2", "budget-3"]) {
-      expected += 1;
-      await completeTurn(value, sessionId, turn, "Ready to apply. Should I proceed?");
-      await waitFor(() => sent() === expected);
-    }
-    expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(3);
+      test("retains the coupled three-approval cap, refusal, and human-reset proof", () => {
+        if (owner === undefined) throw new Error("Expected the prose budget case owner.");
+        return owner.run(async ({ signal }) => {
+          if (prepared === undefined) throw new Error("Expected a fresh prepared prose budget session.");
+          const { value, sessionId } = prepared;
+          await value.service.execute({
+            kind: "notification-hours.set", expectedRevision: 1, version: 1,
+            startMinute: 600, endMinute: 1_320, timeZone: "UTC",
+          }, { signal });
+          if (afterHoursEnabled) {
+            await value.service.execute({ kind: "autorespond-after-hours.enable", expectedRevision: 1 }, { signal });
+            expect(value.store.readAutorespondAfterHoursSelection(sessionId, "protocol", "eligible").tier).toBe("after_hours");
+          }
+          value.store.setSessionApprovalMode(sessionId, "auto:all");
 
-    await completeTurn(value, sessionId, "budget-4", "Ready to apply. Should I proceed?");
-    await waitFor(() => proseEvidence(value, sessionId).length === 4);
-    expect(proseEvidence(value, sessionId)[0]).toMatchObject({
-      outcome: "gate_failed:consecutive_limit",
+          // Each autoresponse must leave the fake provider idle so the next turn can
+          // start; the daemon refuses to send into an active turn.
+          value.codex.turnStatus = "completed";
+          const sent = () => proseEvidence(value, sessionId).filter((row) => row.outcome === "sent").length;
+          let expected = 0;
+          for (const turn of ["budget-1", "budget-2", "budget-3"]) {
+            expected += 1;
+            await completeTurn(value, sessionId, turn, "Ready to apply. Should I proceed?");
+            await waitFor(() => sent() === expected);
+          }
+          expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(3);
+
+          await completeTurn(value, sessionId, "budget-4", "Ready to apply. Should I proceed?");
+          await waitFor(() => proseEvidence(value, sessionId).length === 4);
+          expect(proseEvidence(value, sessionId)[0]).toMatchObject({
+            outcome: "gate_failed:consecutive_limit",
+          });
+          expect(value.store.readSessionState(sessionId)).toMatchObject({
+            attention: true,
+            state: "needs_approval",
+            reason: "prose_autorespond_consecutive_limit",
+          });
+          expect(sent()).toBe(3);
+          expect(value.store.readAutorespondBudgets(sessionId)).toEqual({ consecutive: 3, lastHour: 3, lastDay: 3 });
+
+          // Only a human-authored send clears the consecutive counter.
+          await value.service.execute(
+            { kind: "session.send", session: sessionId, message: "carry on" },
+            { signal },
+          );
+          expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(0);
+          expect(value.store.readAutorespondBudgets(sessionId)).toEqual({ consecutive: 0, lastHour: 3, lastDay: 3 });
+        });
+      }, 5_000);
     });
-    expect(value.store.readSessionState(sessionId)).toMatchObject({
-      attention: true,
-      state: "needs_approval",
-      reason: "prose_autorespond_consecutive_limit",
-    });
-    expect(sent()).toBe(3);
-    expect(value.store.readAutorespondBudgets(sessionId)).toEqual({ consecutive: 3, lastHour: 3, lastDay: 3 });
-
-    // Only a human-authored send clears the consecutive counter.
-    await value.service.execute(
-      { kind: "session.send", session: sessionId, message: "carry on" },
-      { signal },
-    );
-    expect(value.store.readAutorespondBudgets(sessionId).consecutive).toBe(0);
-    expect(value.store.readAutorespondBudgets(sessionId)).toEqual({ consecutive: 0, lastHour: 3, lastDay: 3 });
-  });
+  }
 
   test("does not reset the consecutive budget for a rejected human send", async () => {
     const value = await proseFixture();
@@ -28716,12 +32038,7 @@ describe("HraService prose autorespond", () => {
       providerUpdatedAt: (value.codex.readProjection.providerUpdatedAt ?? 10) + 1,
     };
     delete (value.codex.readProjection as { activeTurnId?: string }).activeTurnId;
-    await value.service.observeCodexFact({
-      id: profile.id,
-      generation: profile.processGeneration,
-      codexHome: "unused",
-      desktopUserData: "unused",
-    }, {
+    await value.service.observeCodexFact(liveAuthorityFor(value.store, profile.id, "codex"), {
       type: "turnCompleted",
       threadId: session.providerThreadId as string,
       turn: {
@@ -28791,7 +32108,7 @@ describe("HraService prose autorespond", () => {
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
     await value.service.observeCodexFact(
-      { id: profile.id, generation: profile.processGeneration, codexHome: "unused", desktopUserData: "unused" },
+      liveAuthorityFor(value.store, profile.id),
       {
         type: "turnCompleted",
         threadId: session.providerThreadId as string,

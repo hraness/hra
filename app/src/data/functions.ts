@@ -1,7 +1,7 @@
 import { makeFunctionReference } from "convex/server";
 import type { PaginationOptions, PaginationResult } from "convex/server";
 
-import type { CloudAction, CloudMutation, CloudQuery } from "../hra/cloud";
+import type { CloudAction, CloudMutation, CloudQuery } from "../oompa/cloud";
 import type { WireEncryptedEnvelope } from "./wire";
 
 /*

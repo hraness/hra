@@ -62,7 +62,7 @@ if (
 const archiveBytes = await readFile(archive);
 const checksumBytes = await readFile(checksum);
 const sha256 = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
-const expectedTitle = `HRA ${tag}`;
+const expectedTitle = `Oompa ${tag}`;
 const maximumArtifactBytes = 64 * 1024 * 1024;
 const maximumGitHubJsonBytes = 4 * 1024 * 1024;
 const releaseRun = githubReleaseRun(tag, process.env);
@@ -568,4 +568,4 @@ if (latest.tag_name !== tag || releaseId(latest, "Latest GitHub Release") !== pu
 parseReleaseBody(latest.body, releaseIdentity, "published");
 assertNoResidualDraft();
 verifyRemoteAnnotatedTag();
-console.log(`GitHub Release ${tag} contains the exact immutable HRA artifacts.`);
+console.log(`GitHub Release ${tag} contains the exact immutable Oompa artifacts.`);

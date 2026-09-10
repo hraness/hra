@@ -3,23 +3,23 @@ import { isCanonicalAuthEmail } from "../src/cloud/authCredentials";
 import { sha256Hex } from "../src/cloud/crypto";
 import { authOtpLifetimeMs } from "./authPolicy";
 import {
-  hraOtpEmailFrom,
-  resolveHraOtpReplyTo,
+  oompaOtpEmailFrom,
+  resolveOompaOtpReplyTo,
 } from "./otpEmailConfig";
-import { requireHraResendApiKey } from "./resendApiKey";
+import { requireOompaResendApiKey } from "./resendApiKey";
 
 const resendEndpoint = "https://api.resend.com/emails";
 const deliveryTimeoutMs = 8_000;
 
-export type HraOtpEmailPayload = Readonly<{
-  from: typeof hraOtpEmailFrom;
+export type OompaOtpEmailPayload = Readonly<{
+  from: typeof oompaOtpEmailFrom;
   reply_to: CanonicalAuthEmail;
-  subject: "Your HRA sign-in code";
+  subject: "Your Oompa sign-in code";
   text: string;
   to: readonly [CanonicalAuthEmail];
 }>;
 
-export function buildHraOtpEmailPayload(
+export function buildOompaOtpEmailPayload(
   input: Readonly<{
     email: CanonicalAuthEmail;
     expiresAt: number;
@@ -29,7 +29,7 @@ export function buildHraOtpEmailPayload(
     environment?: Readonly<Record<string, string | undefined>>;
     now?: number;
   }> = {},
-): HraOtpEmailPayload {
+): OompaOtpEmailPayload {
   const now = options.now ?? Date.now();
   if (
     !isCanonicalAuthEmail(input.email)
@@ -40,11 +40,11 @@ export function buildHraOtpEmailPayload(
   ) throw new Error("Email delivery is unavailable.");
 
   return {
-    from: hraOtpEmailFrom,
-    reply_to: resolveHraOtpReplyTo(options.environment),
-    subject: "Your HRA sign-in code",
+    from: oompaOtpEmailFrom,
+    reply_to: resolveOompaOtpReplyTo(options.environment),
+    subject: "Your Oompa sign-in code",
     text: [
-      `Your HRA sign-in code is ${input.token}.`,
+      `Your Oompa sign-in code is ${input.token}.`,
       "",
       "It expires in 10 minutes. If you did not request it, you can ignore this email.",
     ].join("\n"),
@@ -57,7 +57,7 @@ export async function sendOtpEmail(input: Readonly<{
   expiresAt: number;
   token: string;
 }>): Promise<void> {
-  const body = buildHraOtpEmailPayload(input);
+  const body = buildOompaOtpEmailPayload(input);
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), deliveryTimeoutMs);
@@ -65,7 +65,7 @@ export async function sendOtpEmail(input: Readonly<{
     const response = await fetch(resendEndpoint, {
       body: JSON.stringify(body),
       headers: {
-        Authorization: `Bearer ${requireHraResendApiKey()}`,
+        Authorization: `Bearer ${requireOompaResendApiKey()}`,
         "Content-Type": "application/json",
         "Idempotency-Key": await sha256Hex(
           `hra-control-plane-resend-otp:v1:${input.email}:${input.token}:${String(input.expiresAt)}`,

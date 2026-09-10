@@ -1,0 +1,241 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { existsSync, lstatSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdir } from "node:fs/promises";
+import { join, relative } from "node:path";
+import { gzipSync } from "node:zlib";
+import { Database } from "bun:sqlite";
+
+// PREPARATION ONLY: the integration owner must review the complete recipe and
+// exact archived API contracts, stage the pinned tree/dependencies, then run it
+// through the host scheduler. Never overwrite or resume an earlier capture.
+// All database row/schema writes use archived public StateStore APIs. Synthetic
+// provider results are explicitly component fixtures, not observed native work.
+// There are no provider processes, native calls, network requests, credentials,
+// current StateStore imports, raw SQL mutation, or facts-memory operations.
+const root = import.meta.dir;
+const output = join(root, "capture");
+const sourceRoot = join(root, "canonical39");
+const hash = (value: string | Uint8Array) => createHash("sha256").update(value).digest("hex");
+assert.equal(Bun.version, "1.3.14");
+assert.equal(lstatSync(root).mode & 0o777, 0o700);
+assert.equal(existsSync(output), false, "Never overwrite or resume an existing capture.");
+
+const definition = {
+  sourceCommit: "5f2735191640037c86d9949bc1d7f04b2ef09ffe",
+  sourceTree: "12b4cec2c26b328e41d763ecca41c9a844d3dec3",
+  sourceManifestSha256: "b4a34de0517950f4dc6bb2288c3f5ca79274551095a1aa63436c1099181e71fc",
+  sourceFileCount: 282,
+  sourceHashes: {
+    "src/storage/state-store.ts": "bde901608092489d89aa9acdfde320a0cf2959a6bd3659879cf7ac9dfab43e89",
+    "src/domain/runtime-profile.ts": "49305314d5619f828b685a8e45d5bd055719c7661e77db8ea9e44924de4f85b2",
+    "src/domain/transcript.ts": "10ec6d15209eae962c9c7d2abba595fe8f6691a0a54555d49c3a800a126c2da8",
+    "src/domain/presets.ts": "cde66c4106ee7f2961b8c959327cc277e056b761cf282d53738792d9d99e66de",
+    "package.json": "ef8779bd5fa796f395ad3d064710e247a89eb0cbd4023dc069b4daaad8e12d3c",
+    "bun.lock": "5a2b90063d8eb1aa55e18be71abbca59c1f051a9358a2a36ff89698d066b182a",
+  },
+  dependencies: { "@agentclientprotocol/sdk": "1.4.0", "@hraness/oh": "0.2.7",
+    "@openai/codex": "0.153.2", convex: "1.45.0", zod: "4.4.3" },
+} as const;
+
+const readBounded = (path: string, maximumBytes = 8 * 1024 * 1024) => {
+  const stat = lstatSync(path);
+  assert.equal(stat.isFile(), true);
+  assert.ok(stat.size <= maximumBytes);
+  return readFileSync(path);
+};
+const verifySource = () => {
+  assert.equal(lstatSync(sourceRoot).isDirectory(), true);
+  for (const [path, expected] of Object.entries(definition.sourceHashes)) {
+    assert.equal(hash(readBounded(join(sourceRoot, path))), expected, path);
+  }
+  const sourceFiles: { path: string; sha256: string }[] = [];
+  const visit = (directory: string) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      assert.match(entry.name, /^[A-Za-z0-9_.-]+$/);
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) visit(path);
+      else if (entry.isFile()) sourceFiles.push({ path: relative(sourceRoot, path), sha256: hash(readBounded(path)) });
+      else throw new Error("Unexpected archived source entry.");
+    }
+  };
+  assert.equal(lstatSync(join(sourceRoot, "src")).isDirectory(), true);
+  visit(join(sourceRoot, "src"));
+  sourceFiles.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+  assert.equal(sourceFiles.length, definition.sourceFileCount);
+  assert.equal(hash(JSON.stringify(sourceFiles)), definition.sourceManifestSha256);
+  const manifest = JSON.parse(readBounded(join(sourceRoot, "package.json")).toString("utf8"));
+  assert.deepEqual(manifest.dependencies, definition.dependencies);
+  for (const [name, expected] of Object.entries(definition.dependencies)) {
+    const installed = JSON.parse(readBounded(join(sourceRoot, "node_modules", name, "package.json")).toString("utf8"));
+    assert.equal(installed.version, expected);
+  }
+  return sourceFiles;
+};
+
+const snapshot = (path: string) => {
+  const database = new Database(path, { create: false, strict: true });
+  database.exec("PRAGMA query_only=ON");
+  try {
+    return database.transaction(() => {
+      const schema = database.query("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name LIMIT 2049").all();
+      assert.ok(schema.length <= 2048);
+      const tables = database.query("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name LIMIT 257").all() as { name: string }[];
+      assert.ok(tables.length <= 256);
+      const rows: Record<string, unknown[]> = {};
+      for (const { name } of tables) {
+        assert.match(name, /^[A-Za-z0-9_]+$/);
+        rows[name] = database.query(`SELECT * FROM "${name}" LIMIT 4097`).all().sort((a, b) => {
+          const left = JSON.stringify(a), right = JSON.stringify(b);
+          return left < right ? -1 : left > right ? 1 : 0;
+        });
+        assert.ok(rows[name].length <= 4096);
+      }
+      const result = { userVersion: database.query("PRAGMA user_version").get(), schema, rows,
+        foreignKeyCheck: database.query("PRAGMA foreign_key_check").all(),
+        inspectionChanges: database.query("SELECT total_changes() AS count").get() };
+      assert.deepEqual(result.foreignKeyCheck, []);
+      assert.deepEqual(result.inspectionChanges, { count: 0 });
+      assert.ok(Buffer.byteLength(JSON.stringify(result)) < 8 * 1024 * 1024);
+      return result;
+    }).deferred();
+  } finally { database.close(false); }
+};
+
+
+// The start capture reads only the public, canonical package-manager directory's
+// metadata. It never opens its contents, creates files there, or runs a provider.
+const sourceFiles = verifySource();
+const { StateStore } = await import("./canonical39/src/storage/state-store");
+const { initializeStatePaths, resolveStatePaths } = await import("./canonical39/src/storage/paths");
+const { effectiveDevinRuntimeProfileSchema } = await import("./canonical39/src/domain/runtime-profile");
+await mkdir(output, { mode: 0o700 });
+const generatorSource = readBounded(import.meta.path).toString("utf8");
+const summaries: unknown[] = [];
+for (const scenario of ["bound_send", "inflight_start", "interaction_deadlines"] as const) {
+  const directory = join(output, scenario);
+  await mkdir(directory, { mode: 0o700 });
+  const paths = resolveStatePaths({ rootDirectory: join(directory, "state") });
+  await initializeStatePaths(paths);
+  const fixedTime = 39_003;
+  const store = new StateStore(paths, { now: () => fixedTime });
+  const bootId = "boot_" + crypto.randomUUID().replaceAll("-", "");
+  const daemonGeneration = store.nextDaemonGeneration(bootId);
+  assert.equal(daemonGeneration, 1);
+  const initial = snapshot(paths.database);
+  const profile = store.createProfile("Canonical39 retired " + scenario);
+  assert.equal(store.allocateNextUsageRevision(profile.id), 1);
+  const runtimeProfile = effectiveDevinRuntimeProfileSchema.parse({
+    profileId: profile.id, processGeneration: profile.processGeneration,
+    observedAt: fixedTime, preset: "astra", model: "gpt-6-astra",
+    reasoningEffort: "provider-default", devinVersion: "3000.6.14",
+    protocolVersion: 1, isolatedHome: true,
+  });
+  let session: ReturnType<typeof store.requireSession>;
+  let extra: Record<string, unknown>;
+  if (scenario === "inflight_start") {
+    const project = await store.createProject("Canonical39 public metadata only", "/opt/homebrew");
+    assert.equal(project.rootPath, "/opt/homebrew");
+    const idempotencyKey = crypto.randomUUID();
+    const request = { projectId: project.id, preset: "astra", provider: "devin", fast: false };
+    const attempt = store.prepareMutation({ kind: "session.start", authorityId: profile.id,
+      authorityGeneration: profile.processGeneration, request, idempotencyKey });
+    session = store.beginSessionStartEffect({
+      attemptId: attempt.id, profileId: profile.id, profileGeneration: profile.processGeneration,
+      projectId: project.id, provider: "devin", preset: "astra", fastEnabled: false,
+      providerAuthentication: { profileId: profile.id, processGeneration: profile.processGeneration,
+        provider: "devin", signedIn: true },
+      evidence: { kind: "session.start", projectId: project.id,
+        clientMessageId: null, messageDigest: null, runtimeProfile },
+    });
+    assert.equal(session.state, "starting");
+    extra = { project, request, idempotencyKey, mutation: store.readMutation(idempotencyKey),
+      syntheticProviderAuthentication: true };
+  } else {
+    const created = store.createSession({ profileId: profile.id, provider: "devin",
+      preset: "astra", fastEnabled: false });
+    session = store.bindSession({ sessionId: created.id, expectedRevision: created.revision,
+      providerThreadId: "canonical39-retired-" + scenario, state: "idle" });
+    const runtime = store.recordSessionRuntimeProfile({ sessionId: session.id,
+      sourceKind: "session_start", sourceId: "canonical39-retired-runtime-" + scenario,
+      profile: runtimeProfile });
+    if (scenario === "bound_send") {
+      const message = "Historical uncertain retired message";
+      const idempotencyKey = crypto.randomUUID();
+      const request = { message };
+      const attempt = store.prepareMutation({ kind: "session.send", authorityId: session.id,
+        authorityGeneration: profile.processGeneration, request, idempotencyKey });
+      const effect = store.beginSessionMutationEffect({ attemptId: attempt.id,
+        sessionId: session.id, profileGeneration: profile.processGeneration,
+        evidence: { kind: "session.send", providerThreadId: session.providerThreadId!,
+          baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+          clientMessageId: attempt.id, messageDigest: hash(message), runtimeProfile } });
+      extra = { runtime, message, request, idempotencyKey, effect, mutation: store.readMutation(idempotencyKey) };
+    } else {
+      const connectionId = crypto.randomUUID();
+      const admit = (index: number, bound: boolean, method: string) => store.admitInteraction({
+        publicId: crypto.randomUUID(), sessionId: bound ? session.id : null,
+        authority: { profileId: profile.id, processGeneration: profile.processGeneration,
+          connectionId, requestId: { type: "string", value: "retired-request-" + index },
+          method, requestDigest: hash("retired-request-" + index),
+          threadId: session.providerThreadId!, turnId: null, itemId: null, approvalId: null },
+        kind: "command_approval", blocking: true,
+        display: { kind: "command_approval", summary: "Historical pending approval",
+          reason: null, commandClass: "test", workingDirectory: null,
+          availableDecisions: ["once", "decline", "cancel"] },
+        requestedAt: fixedTime, deadlineAt: fixedTime + 1_000,
+      }).record;
+      const pending = Array.from({ length: 32 }, (_, index) => admit(index, index % 2 === 0,
+        index % 2 === 0 ? "item/commandExecution/requestApproval" : "devin/session/request_permission"));
+      const prepared = store.prepareInteractionResponse({
+        id: admit(32, true, "devin/session/request_permission").publicId,
+        expectedRevision: 1, responseDigest: hash("synthetic-prepared-response"),
+      });
+      const unknown = store.markInteractionResolutionUnknown({
+        id: admit(33, false, "devin/session/request_permission").publicId, expectedRevision: 1,
+      });
+      extra = { runtime, connectionId, pending, prepared, unknown };
+    }
+  }
+  const retained = { profile, session, runtimeProfile, bootId, daemonGeneration, ...extra };
+  const finalSnapshot = snapshot(paths.database);
+  assert.deepEqual(finalSnapshot.rows.migrations, initial.rows.migrations);
+  assert.deepEqual(finalSnapshot.userVersion, { user_version: 39 });
+  store.close();
+  const reopened = new StateStore(paths, { now: () => fixedTime });
+  assert.deepEqual(reopened.requireSession(session.id), session);
+  assert.deepEqual(snapshot(paths.database), finalSnapshot);
+  reopened.close();
+  const checkpoint = new Database(paths.database, { create: false, strict: true });
+  const checkpointResult = checkpoint.query("PRAGMA wal_checkpoint(TRUNCATE)").get() as { busy: number };
+  checkpoint.close(false);
+  assert.equal(checkpointResult.busy, 0);
+  const beforeReadonly = hash(readBounded(paths.database));
+  const readonly = new StateStore(paths, { readonly: true });
+  assert.deepEqual(readonly.requireSession(session.id), session);
+  assert.deepEqual(snapshot(paths.database), finalSnapshot);
+  readonly.close();
+  const bytes = readBounded(paths.database, 4 * 1024 * 1024);
+  assert.equal(hash(bytes), beforeReadonly);
+  const metadata = { ...definition, schemaVersion: 39, scenario, generatorSha256: hash(generatorSource),
+    bunVersion: Bun.version, sourceManifestOrdering: "ASCII relative paths", fixedTime,
+    provenance: { syntheticControlPlaneOnly: true, archivedPublicApisOnly: true, nativeProviderEffects: 0,
+      networkEffects: 0, rawSqlRowOrSchemaWrites: false, randomizedIdentifiers: true,
+      reservedUsageRevisionForEveryNewProfile: true, writableReopenUnchanged: true, readonlyReopenUnchanged: true,
+      readonlyDatabaseHashUnchanged: true, providerRuntimeObservationClaim: false, currentMergedAdmissionClaim: false,
+      nativeProcessCustody: false, factsMemoryAuthority: false, projectDirectoryWrites: 0 },
+    databaseSha256: hash(bytes), databaseBytes: bytes.length, checkpointResult, retained, snapshot: finalSnapshot };
+  const text = JSON.stringify(metadata);
+  assert.ok(Buffer.byteLength(text) < 8 * 1024 * 1024);
+  for (const forbidden of [root, "/Users/", "/private/", "/tmp/", "/home/", "/Volumes/"]) {
+    assert.equal(text.includes(forbidden), false);
+    assert.equal(bytes.includes(Buffer.from(forbidden)), false);
+  }
+  writeFileSync(join(directory, "state.sqlite.gz"), gzipSync(bytes), { mode: 0o600, flag: "wx" });
+  writeFileSync(join(directory, "fixture.json"), JSON.stringify(metadata, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+  writeFileSync(join(directory, "source-manifest.json"), JSON.stringify(sourceFiles, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+  verifySource();
+  summaries.push({ scenario, sourceCommit: definition.sourceCommit, databaseSha256: hash(bytes),
+    databaseBytes: bytes.length, archivedReopensUnchanged: true });
+}
+console.log(JSON.stringify({ generatorSha256: hash(generatorSource), summaries, earlierCapturesOpened: false }));

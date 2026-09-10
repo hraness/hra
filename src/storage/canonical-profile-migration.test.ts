@@ -8,7 +8,10 @@ import { Database, type SQLQueryBindings } from "bun:sqlite";
 import { z } from "zod";
 
 import { createAttemptId } from "../domain/values";
-import { workApplyResultSchema, workOperationSchema } from "../domain/work";
+import {
+  workApplyResultSchema, workEventPageSchema, workOperationSchema, workSnapshotSchema,
+  workTaskDetailSchema, workTaskHistoryPageSchema,
+} from "../domain/work";
 import { LEGACY_CANONICAL_PROFILE_GUARDS_SQL } from "./canonical-profile-storage";
 import { initializeStatePaths, resolveStatePaths } from "./paths";
 import { StateStore } from "./state-store";
@@ -58,8 +61,7 @@ function inspect<T>(store: Pick<StateStore, "paths">, read: (database: Database)
   try { return read(database); } finally { database.close(false); }
 }
 
-function snapshot(store: Pick<StateStore, "paths">): string {
-  return inspect(store, (database) => {
+function snapshotDatabase(database: Database): string {
     const schema = query(database, "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name");
     const rows = Object.fromEntries(schema.filter((row) => row.type === "table").map((row) => {
       const name = z.string().parse(row.name);
@@ -67,7 +69,10 @@ function snapshot(store: Pick<StateStore, "paths">): string {
         .sort((left, right) => canonicalWorkJson(left).localeCompare(canonicalWorkJson(right)))];
     }));
     return canonicalWorkJson({ schema, rows, version: query(database, "PRAGMA user_version") });
-  });
+}
+
+function snapshot(store: Pick<StateStore, "paths">): string {
+  return inspect(store, snapshotDatabase);
 }
 
 const createWorkStore = (store: StateStore) => store.createWorkStore(1,
@@ -84,7 +89,7 @@ const createWorkStore = (store: StateStore) => store.createWorkStore(1,
   });
 
 async function fixture(state: AttemptState) {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-canonical-migration-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-canonical-migration-")));
   roots.push(root);
   const paths = resolveStatePaths({ homeDirectory: root, platform: "linux", rootDirectory: join(root, "state") });
   await initializeStatePaths(paths);
@@ -94,11 +99,12 @@ async function fixture(state: AttemptState) {
   const profile = store.nextProfileGeneration(createdProfile.id);
   const email = "canonical-fixture@example.invalid";
   expect(store.setProfileState(profile.id, profile.processGeneration, "signed_in", { email, plan: "Plus" })).toBe(true);
+  const providerAuthority = store.requireProviderAccountAuthority(profile.id, "codex");
   const projectPath = join(root, "synthetic-project");
   await mkdir(projectPath);
   const project = await store.createProject("Synthetic canonical project", projectPath, true);
   const session = store.upsertProviderSession({
-    profileId: profile.id, projectId: project.id, provider: "codex",
+    profileId: profile.id, projectId: project.id, provider: "codex", providerAuthority,
     providerThreadId: "synthetic-canonical-worker", title: "Synthetic canonical worker",
     providerAccountKey: `v1:codex:${createHash("sha256").update(email).digest("hex")}`,
     preset: "ultra", fastEnabled: false, state: "idle",
@@ -211,7 +217,7 @@ describe("canonical profile real-StateStore integration", () => {
   test.each(["archive", "bind", "turn", "quarantine"] as const)(
     "session projection keeps %s mutation atomic on canonical corruption", async (operation) => {
       for (const corrupt of [false, true]) {
-        const root = await realpath(await mkdtemp(join(tmpdir(), "hra-canonical-writer-")));
+        const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-canonical-writer-")));
         roots.push(root);
         const paths = resolveStatePaths({ homeDirectory: root, platform: "linux", rootDirectory: join(root, "state") });
         await initializeStatePaths(paths);
@@ -374,17 +380,31 @@ const fixture49Schema = z.object({
   payload: storedSnapshotSchema,
 }).strict();
 const sha256 = (value: string | Uint8Array) => createHash("sha256").update(value).digest("hex");
+const archivedWorkProjectionSchema = z.object({
+  task: workTaskDetailSchema, history: workTaskHistoryPageSchema,
+  events: workEventPageSchema, snapshot: workSnapshotSchema,
+}).strict();
 
 async function source49Fixture() {
   const bytes = await readFile(join(import.meta.dir, "canonical-profile-v49.fixture.json"));
   expect(bytes.byteLength).toBe(481_688);
   expect(sha256(bytes)).toBe("ac96da7af133d3980438991a36b6051de2dfcfd764d03343f47f5f75d7f0e887");
   const fixture = fixture49Schema.parse(JSON.parse(bytes.toString("utf8")) as unknown);
-  expect(sha256(await readFile(join(import.meta.dir, "../../scripts/fixtures/canonical-profile-v49-generator.ts"))))
-    .toBe(fixture.generatorSha256);
+  const originalRecipe = await readFile(join(import.meta.dir,
+    "../../scripts/fixtures/canonical-profile-v49-generator.original.ts.txt"), "utf8");
+  const currentRecipe = await readFile(join(import.meta.dir,
+    "../../scripts/fixtures/canonical-profile-v49-generator.ts"), "utf8");
+  // The fixture is bound to its exact archived recipe. Current type-only API
+  // adaptations must preserve that recipe's emitted runtime, without importing
+  // or executing either generator and without rewriting captured evidence.
+  expect(sha256(originalRecipe)).toBe(fixture.generatorSha256);
+  const transpiler = new Bun.Transpiler({ loader: "ts", minifyWhitespace: true });
+  const originalRuntime = transpiler.transformSync(originalRecipe);
+  expect(sha256(originalRuntime)).toBe("f03c5a3feaca15e037d636fe08cf5db866313a869170cb6cf0f7b8ec829ba3af");
+  expect(transpiler.transformSync(currentRecipe)).toBe(originalRuntime);
   expect(sha256(canonicalWorkJson(fixture.payload))).toBe(fixture.payloadSha256);
   expect(fixture.payload.version).toEqual([{ user_version: 49 }]);
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-source49-migration-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-source49-migration-")));
   roots.push(root);
   const paths = resolveStatePaths({ homeDirectory: root, platform: "linux", rootDirectory: join(root, "state") });
   await initializeStatePaths(paths);
@@ -422,24 +442,47 @@ async function source49Fixture() {
 }
 
 describe("canonical migration from authentic source-created schema49", () => {
-  test("adds only four keys and its ledger entry while preserving every original row and settled replay", async () => {
+  test("proves the additive canonical-key substep before joined60 preserves history and quarantines unproved runtime", async () => {
     const { paths, fixture } = await source49Fixture();
     const predecessor = snapshot({ paths });
     const previousColumns = inspect({ paths }, (database) => Object.fromEntries(identityTables.map((table) => [table,
       query(database, `PRAGMA table_xinfo(${table})`),
     ])));
-    expect(() => openStore(paths, true)).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:49:50");
+    expect(() => openStore(paths, true)).toThrow("STATE_SCHEMA_MIGRATION_REQUIRED:49:60");
     expect(snapshot({ paths })).toBe(predecessor);
-    const store = openStore(paths);
-    const current = storedSnapshotSchema.parse(JSON.parse(snapshot(store)) as unknown);
-    expect(current.version).toEqual([{ user_version: 50 }]);
-    expect(current.rows.migrations).toHaveLength(50);
+    let keyOnlySnapshot: string | undefined;
+    let keyOnlyColumns: Record<string, Record<string, unknown>[]> | undefined;
+    let substeps = 0;
+    const originalExec = z.custom<Database["exec"]>((value) => typeof value === "function")
+      .parse(Object.getOwnPropertyDescriptor(Database.prototype, "exec")?.value);
+    const exec = spyOn(Database.prototype, "exec").mockImplementation(function (
+      this: Database, ...args: Parameters<Database["exec"]>
+    ) {
+      const result = originalExec.apply(this, args);
+      if (this.filename === paths.database && args[0] === LEGACY_CANONICAL_PROFILE_GUARDS_SQL) {
+        expect(this.inTransaction).toBe(true);
+        keyOnlySnapshot = snapshotDatabase(this);
+        keyOnlyColumns = Object.fromEntries(identityTables.map((table) => [table, query(this, `PRAGMA table_xinfo(${table})`)]));
+        substeps += 1;
+      }
+      return result;
+    });
+    let store: StateStore;
+    try { store = openStore(paths); } finally { exec.mockRestore(); }
+    expect(Object.getOwnPropertyDescriptor(Database.prototype, "exec")?.value).toBe(originalExec);
+    expect(substeps).toBe(1);
+    if (keyOnlySnapshot === undefined || keyOnlyColumns === undefined) throw new Error("Expected the exact canonical key substep.");
+    // This is an uncommitted key-only substep, not a schema50 endpoint or a
+    // claim that the complete joined60 upgrade adds only these four columns.
+    const current = storedSnapshotSchema.parse(JSON.parse(keyOnlySnapshot) as unknown);
+    expect(current.version).toEqual([{ user_version: 49 }]);
+    expect(current.rows.migrations).toEqual(fixture.payload.rows.migrations);
+    expect(current.schema).toHaveLength(fixture.payload.schema.length + 7);
     expect(keys(store)).toEqual(Object.fromEntries(identityTables.map((table) => [table,
       Array.from({ length: 3 }, () => ({ canonical_profile_key: solUltra })),
     ])));
     const originalColumns = Object.fromEntries(Object.entries(current.rows).map(([table, rows]) => [table,
-      table === "migrations" ? rows.filter((row) => row.version !== 50)
-        : identityTables.includes(table as IdentityTable)
+      identityTables.includes(table as IdentityTable)
           ? rows.map((row) => Object.fromEntries(Object.entries(row).filter(([name]) => name !== "canonical_profile_key"))) : rows,
     ]));
     expect(canonicalWorkJson(originalColumns)).toBe(canonicalWorkJson(fixture.payload.rows));
@@ -450,27 +493,123 @@ describe("canonical migration from authentic source-created schema49", () => {
         expect(sql.split(", canonical_profile_key TEXT")).toHaveLength(2);
         expect({ ...after, sql: sql.replace(", canonical_profile_key TEXT", "") })
           .toEqual({ ...object, sql: z.string().parse(object.sql) });
-        const columns = inspect(store, (database) => query(database, `PRAGMA table_xinfo(${object.name})`));
+        const columns = keyOnlyColumns[object.name];
         const previous = previousColumns[object.name];
-        if (previous === undefined) throw new Error("Expected the exact predecessor column metadata.");
+        if (previous === undefined || columns === undefined) throw new Error("Expected the exact predecessor column metadata.");
         expect(columns.filter((column) => column.name !== "canonical_profile_key")).toEqual(previous);
         expect(columns.filter((column) => column.name === "canonical_profile_key")).toHaveLength(1);
       } else {
         expect(after).toEqual(object);
       }
     }
+    expect(inspect(store, (database) => query(database, "PRAGMA user_version"))).toEqual([{ user_version: 60 }]);
+    expect(inspect(store, (database) => query(database, "SELECT version FROM migrations ORDER BY version")))
+      .toEqual(Array.from({ length: 60 }, (_, index) => ({ version: index + 1 })));
+    for (const [table, rows] of Object.entries(fixture.payload.rows)) {
+      const first = rows[0];
+      const columns = first === undefined ? "*" : Object.keys(first).map((column) => `"${column.replaceAll('"', '""')}"`).join(",");
+      const after = inspect(store, (database) => query(database,
+        `SELECT ${columns} FROM "${table}"${table === "migrations" ? " WHERE version<50" : ""}`)
+        .sort((left, right) => canonicalWorkJson(left).localeCompare(canonicalWorkJson(right))));
+      expect(after).toEqual(rows);
+    }
+    // Archived adoption proof remains intact, so no session or Work row is
+    // retired. Missing immutable runtime permits only these quarantine facts,
+    // never a newly invented captured provider tuple or dispatch authority.
+    expect(fixture.payload.rows.session_runtime_profiles).toEqual([]);
+    expect(fixture.payload.rows.mutation_effect_evidence).toEqual([]);
+    expect(inspect(store, (database) => query(database, "SELECT * FROM legacy_provider_authority_quarantines ORDER BY scope_id")))
+      .toEqual(fixture.cases.map((entry) => ({ scope_kind: "session", scope_id: entry.sessionId,
+        reason: "missing_immutable_runtime_authority", recorded_at: fixture.fixedNow }))
+        .sort((left, right) => left.scope_id.localeCompare(right.scope_id)));
+    expect(inspect(store, (database) => query(database, "SELECT * FROM session_provider_authorities"))).toEqual([]);
+    for (const entry of fixture.cases) {
+      expect(() => store.requireSessionProviderAuthority(entry.sessionId))
+        .toThrow("SESSION_PROVIDER_AUTHORITY_QUARANTINED:missing_immutable_runtime_authority");
+    }
     const preserved = snapshot(store);
     for (const entry of fixture.cases) {
       const work = createWorkStore(store);
-      expect(canonicalWorkJson({ task: work.task(entry.taskId), history: work.taskHistory(entry.taskId),
-        events: work.events(entry.workId), snapshot: work.snapshot(entry.workId) })).toBe(canonicalWorkJson(entry.projection));
+      const projection = archivedWorkProjectionSchema.parse(entry.projection);
+      expect(canonicalWorkJson(work.events(entry.workId))).toBe(canonicalWorkJson(projection.events));
       expect(canonicalWorkJson(work.apply(entry.claim))).toBe(canonicalWorkJson(entry.replay));
+      if (entry.state !== "claimed") {
+        expect(canonicalWorkJson({ task: work.task(entry.taskId), history: work.taskHistory(entry.taskId),
+          events: work.events(entry.workId), snapshot: work.snapshot(entry.workId) })).toBe(canonicalWorkJson(entry.projection));
+      }
     }
     expect(snapshot(store)).toBe(preserved);
     closeStore(store);
     for (const readonly of [true, false]) {
       const reopened = openStore(paths, readonly);
       expect(snapshot(reopened)).toBe(preserved);
+      closeStore(reopened);
+    }
+
+    // Live task access is not a passive archive read: it sweeps unproved
+    // controller authority. Prove that later transition separately from the
+    // exact migration/reopen preservation above, without inventing a runtime.
+    const claimed = fixture.cases.find((entry) => entry.state === "claimed");
+    if (claimed === undefined) throw new Error("Expected the archived claimed case.");
+    const beforeRead = archivedWorkProjectionSchema.parse(claimed.projection);
+    const priorAttempt = beforeRead.task.latestAttempt;
+    if (priorAttempt === null) throw new Error("Expected the original claimed attempt.");
+    expect(beforeRead.task.activeAttempt).toEqual(priorAttempt);
+    expect(priorAttempt.status).toBe("claimed");
+    expect(beforeRead.history.items).toEqual([{ kind: "attempt", value: priorAttempt }]);
+    expect(beforeRead.snapshot.tasks).toEqual([beforeRead.task.task]);
+    const currentStore = openStore(paths);
+    const work = createWorkStore(currentStore);
+    const releasedAttempt = { ...priorAttempt, status: "released", revision: priorAttempt.revision + 1,
+      leaseExpiresAt: null };
+    const readyTask = { ...beforeRead.task.task, activeAttemptId: null, status: "ready",
+      revision: beforeRead.task.task.revision + 1 };
+    expect(canonicalWorkJson(work.task(claimed.taskId))).toBe(canonicalWorkJson({ ...beforeRead.task,
+      activeAttempt: null, latestAttempt: releasedAttempt, task: readyTask }));
+    const releaseReason = "Pinned session or account authority changed before dispatch.";
+    const releaseDigest = sha256(canonicalWorkJson(releaseReason));
+    expect(releaseDigest).toBe("2f811f5c6f8fc0f23acaee8ad4447323aa1a144226acd0999e1ab3725566a484");
+    const sequence = beforeRead.events.events.length + 1;
+    const cursor = `hra1.${Buffer.from(JSON.stringify({ version: 1, type: "work", workId: claimed.workId,
+      streamEpoch: beforeRead.events.streamEpoch, sequence }), "utf8").toString("base64url")}.${"A".repeat(43)}`;
+    const releaseEvent = { version: 1, workId: claimed.workId, streamEpoch: beforeRead.events.streamEpoch,
+      sequence, occurredAt: fixture.fixedNow, actorSessionId: claimed.sessionId,
+      body: { type: "attempt.released", attemptId: claimed.attemptId, summaryDigest: releaseDigest } };
+    expect(canonicalWorkJson(work.events(claimed.workId))).toBe(canonicalWorkJson({ ...beforeRead.events,
+      events: [...beforeRead.events.events, releaseEvent], nextCursor: cursor, observedThroughCursor: cursor }));
+    expect(canonicalWorkJson(work.taskHistory(claimed.taskId))).toBe(canonicalWorkJson({ ...beforeRead.history,
+      items: [{ kind: "attempt", value: releasedAttempt }], taskRevision: readyTask.revision,
+      observedThroughCursor: cursor }));
+    expect(canonicalWorkJson(work.snapshot(claimed.workId))).toBe(canonicalWorkJson({ ...beforeRead.snapshot,
+      cursor, tasks: [readyTask], work: { ...beforeRead.snapshot.work,
+        revision: beforeRead.snapshot.work.revision + 1, activeTaskCount: 0, readyTaskCount: 1 } }));
+    // Terminal projection removes live lease authority, while the durable
+    // attempt retains its original deadline as historical evidence.
+    expect(inspect(currentStore, (database) => query(database,
+      "SELECT state,revision,lease_expires_at,terminal_at FROM work_attempts WHERE id=?", claimed.attemptId)))
+      .toEqual([{ state: "released", revision: priorAttempt.revision + 1, lease_expires_at: priorAttempt.leaseExpiresAt,
+        terminal_at: fixture.fixedNow }]);
+    expect(inspect(currentStore, (database) => query(database,
+      "SELECT state,revision,retry_not_before FROM work_task_states WHERE task_id=?", claimed.taskId)))
+      .toEqual([{ state: "pending", revision: readyTask.revision, retry_not_before: null }]);
+    for (const table of ["work_idempotency_intents", "work_prepared_effects", "mutation_attempts",
+      "mutation_effect_evidence", "queue_effect_evidence"]) {
+      const original = fixture.payload.rows[table];
+      if (original === undefined) throw new Error("Expected the original effect/receipt table.");
+      expect(inspect(currentStore, (database) => query(database, `SELECT * FROM ${table}`)
+        .sort((left, right) => canonicalWorkJson(left).localeCompare(canonicalWorkJson(right)))))
+        .toEqual(original);
+    }
+    const afterRelease = snapshot(currentStore);
+    // Stored intent JSON/digests above remain immutable. Public replay overlays
+    // current liveness, so it must not revive the original claimed projection.
+    expect(canonicalWorkJson(work.apply(claimed.claim))).toBe(canonicalWorkJson({ ...claimed.replay,
+      attempt: releasedAttempt, task: readyTask, workRevision: beforeRead.snapshot.work.revision + 1 }));
+    expect(snapshot(currentStore)).toBe(afterRelease);
+    closeStore(currentStore);
+    for (const readonly of [true, false]) {
+      const reopened = openStore(paths, readonly);
+      expect(snapshot(reopened)).toBe(afterRelease);
       closeStore(reopened);
     }
   });
@@ -554,7 +693,7 @@ describe("canonical migration from authentic source-created schema49", () => {
     expect(snapshot({ paths })).toBe(before);
     expect(allColumns()).toBe(beforeColumns);
     const store = openStore(paths);
-    expect(inspect(store, (database) => query(database, "PRAGMA user_version"))).toEqual([{ user_version: 50 }]);
+    expect(inspect(store, (database) => query(database, "PRAGMA user_version"))).toEqual([{ user_version: 60 }]);
     expect(inspect(store, (database) => query(database,
       "SELECT name FROM main.sqlite_master WHERE type='trigger' AND name GLOB 'canonical_profile_*'"))).toHaveLength(7);
     expect(keys(store)).toEqual(Object.fromEntries(identityTables.map((table) => [table,

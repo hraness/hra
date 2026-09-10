@@ -13,7 +13,7 @@ import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { z } from "zod";
 
 import { canonicalCloudDeploymentUrl } from "../src/cloud/identity-custody";
-import type { HraInstallation } from "../src/installation";
+import type { OompaInstallation } from "../src/installation";
 import {
   ensurePrivateDirectory,
   personalProviderPaths,
@@ -196,7 +196,7 @@ function assertDirectChild(parent: string, child: string, label: string): void {
 
 export function createAcceptanceInstallation(
   descriptorInput: AcceptanceInstallationDescriptor,
-): HraInstallation {
+): OompaInstallation {
   const descriptor = acceptanceInstallationDescriptorSchema.parse(descriptorInput);
   const runRoot = resolve(descriptor.rootDirectory, "..");
   assertDirectChild(runRoot, descriptor.rootDirectory, "Acceptance state root");
@@ -213,7 +213,7 @@ export function createAcceptanceInstallation(
   if (
     privatePathsOverlap(runRoot, productionRoot)
     || privatePathsOverlap(runRoot, descriptor.expectedHomeDirectory)
-  ) throw new Error("Acceptance state must not overlap production HRA state or the invoking home.");
+  ) throw new Error("Acceptance state must not overlap production Oompa state or the invoking home.");
 
   const cloudDeploymentUrl = descriptor.cloudDeploymentUrl === undefined
     ? undefined

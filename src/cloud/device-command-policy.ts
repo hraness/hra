@@ -3,7 +3,7 @@ import { supportedProviderSchema, type Provider } from "../domain/presets";
 
 /*
  * The guards that stand between a browser and this machine. Every one of them
- * is local: the switches are set with `hra remote allow|deny`, the cap is
+ * is local: the switches are set with `oompa remote allow|deny`, the cap is
  * counted in the local store, and none of them can be changed from the hosted
  * deployment. Each refusal has its own closed code so an operator can tell
  * "you turned this off" apart from "you have run out for today".

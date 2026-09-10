@@ -1,5 +1,5 @@
 import { liveTailChunkLimit } from "../env";
-import { decryptDetailEvents, type DetailSessionEvent } from "../hra/cloud";
+import { decryptDetailEvents, type DetailSessionEvent } from "../oompa/cloud";
 import { useStreamTail, type StreamTail } from "./stream-tail";
 
 export type LiveTail = StreamTail<DetailSessionEvent>;

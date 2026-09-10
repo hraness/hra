@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, realpath } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join as joinPath } from "node:path";
 
 import {
   createAttemptId,
@@ -33,6 +36,8 @@ import {
   type WorkTaskSpec,
 } from "../domain/work";
 import { workReadSuccessWireBytes } from "../domain/terminal-json";
+import { presetRequirements } from "../domain/presets";
+import { effectiveRuntimeProfileSchema } from "../domain/runtime-profile";
 import {
   LEGACY_CANONICAL_PROFILE_COLUMNS_SQL,
   LEGACY_CANONICAL_PROFILE_GUARDS_SQL,
@@ -40,20 +45,27 @@ import {
   deriveLegacySessionProfileKey,
   deriveLegacyWorkProfileKey,
 } from "./canonical-profile-storage";
+import { initializeStatePaths, resolveStatePaths } from "./paths";
+import { applySessionSendOwnerSchema, SESSION_SEND_REQUEST_FORMAT } from "./session-send-owner";
+import { StateStore } from "./state-store";
 import {
   WORK_PROJECT_AUTHORITY_SCHEMA_SQL,
   WORK_SCHEMA_SQL,
+  WORK_SIGNAL_PROVIDER_AUTHORITY_SCHEMA_SQL,
   WorkStore,
   WorkStoreError,
   assertProviderVersion40WorkSchema,
   assertReadonlyWorkSchema,
+  assertWorkSignalProviderAuthorities,
   assertWorkSchema,
+  backfillLegacyWorkSignalProviderAuthorities,
   canonicalWorkJson,
   installProviderVersion40WorkAuthoritySchema,
   workPreparedEffectMessage,
 } from "./work-store";
 
 const databases: Database[] = [];
+const stateStores: StateStore[] = [];
 const capability = `hrac1_${"A".repeat(43)}`;
 const codexAccountKey = (email: string): string =>
   `v1:codex:${createHash("sha256").update(email.trim().toLowerCase()).digest("hex")}`;
@@ -180,6 +192,7 @@ function turnStartedReceipt(accountGeneration = 1) {
 }
 
 afterEach(() => {
+  for (const store of stateStores.splice(0)) store.close();
   for (const database of databases.splice(0)) database.close(false);
 });
 
@@ -216,6 +229,54 @@ CREATE TABLE sessions(
   fast_enabled INTEGER NOT NULL,
   state TEXT NOT NULL
 ) STRICT;
+CREATE TABLE provider_accounts(
+  id TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL REFERENCES profiles(id),
+  provider TEXT NOT NULL,
+  binding_generation INTEGER NOT NULL,
+  process_generation INTEGER NOT NULL,
+  readiness TEXT NOT NULL,
+  UNIQUE(profile_id,provider)
+) STRICT;
+CREATE TABLE session_provider_authorities(
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id),
+  provider_account_id TEXT NOT NULL REFERENCES provider_accounts(id),
+  profile_id TEXT NOT NULL REFERENCES profiles(id),
+  provider TEXT NOT NULL,
+  binding_generation INTEGER NOT NULL,
+  process_generation INTEGER NOT NULL,
+  authority_revision INTEGER NOT NULL,
+  routing_provenance TEXT NOT NULL DEFAULT 'explicit'
+) STRICT;
+CREATE TRIGGER fixture_session_authority_insert AFTER INSERT ON sessions BEGIN
+  INSERT OR IGNORE INTO provider_accounts
+    SELECT NEW.profile_id,NEW.profile_id,'codex',1,p.process_generation,'signed_in'
+    FROM profiles p WHERE p.id=NEW.profile_id;
+  INSERT OR IGNORE INTO provider_accounts
+    SELECT 'pact_'||substr(p.id,6),p.id,'claude',1,1,'signed_in'
+    FROM profiles p WHERE p.id=NEW.profile_id;
+  INSERT OR IGNORE INTO provider_accounts
+    SELECT 'dact_'||substr(p.id,6),p.id,'devin',1,1,'signed_in'
+    FROM profiles p WHERE p.id=NEW.profile_id;
+  INSERT INTO session_provider_authorities
+    SELECT NEW.id,a.id,a.profile_id,a.provider,a.binding_generation,a.process_generation,1,'explicit'
+    FROM provider_accounts a WHERE a.profile_id=NEW.profile_id AND a.provider=NEW.provider_v39;
+END;
+CREATE TRIGGER fixture_session_authority_update AFTER UPDATE OF provider_v39 ON sessions
+WHEN NEW.provider_v39!=OLD.provider_v39 BEGIN
+  UPDATE session_provider_authorities SET
+    provider_account_id=(SELECT id FROM provider_accounts WHERE profile_id=NEW.profile_id AND provider=NEW.provider_v39),
+    provider=NEW.provider_v39,
+    binding_generation=(SELECT binding_generation FROM provider_accounts WHERE profile_id=NEW.profile_id AND provider=NEW.provider_v39),
+    process_generation=(SELECT process_generation FROM provider_accounts WHERE profile_id=NEW.profile_id AND provider=NEW.provider_v39),
+    authority_revision=authority_revision+1
+  WHERE session_id=NEW.id;
+END;
+CREATE TRIGGER fixture_codex_process_mirror AFTER UPDATE OF process_generation ON profiles BEGIN
+  UPDATE provider_accounts SET process_generation=NEW.process_generation WHERE profile_id=NEW.id AND provider='codex';
+  UPDATE session_provider_authorities SET process_generation=NEW.process_generation,authority_revision=authority_revision+1
+    WHERE profile_id=NEW.id AND provider='codex';
+END;
 CREATE TABLE session_account_authorities(
   session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
   profile_id TEXT NOT NULL REFERENCES profiles(id),
@@ -286,12 +347,29 @@ CREATE TABLE mutation_attempts(
 ) STRICT;
 CREATE TABLE mutation_effect_evidence(
   attempt_id TEXT PRIMARY KEY,
-  evidence_json TEXT
+  kind TEXT,
+  evidence_json TEXT,
+  evidence_digest TEXT,
+  recorded_at INTEGER
 ) STRICT;
 CREATE TABLE mutation_resolutions(
   attempt_id TEXT PRIMARY KEY,
   resolution_kind TEXT,
-  receipt_json TEXT
+  receipt_json TEXT,
+  evidence_json TEXT,
+  created_at INTEGER
+) STRICT;
+CREATE TABLE session_runtime_profiles(source_id TEXT) STRICT;
+CREATE TABLE session_turn_runtime_profiles(source_id TEXT) STRICT;
+CREATE TABLE legacy_provider_authority_quarantines(
+  scope_kind TEXT NOT NULL,scope_id TEXT NOT NULL,reason TEXT NOT NULL,recorded_at INTEGER NOT NULL,
+  PRIMARY KEY(scope_kind,scope_id)
+) STRICT;
+CREATE TABLE mutation_provider_authorities(
+  attempt_id TEXT NOT NULL REFERENCES mutation_attempts(id),role TEXT NOT NULL,
+  provider_account_id TEXT NOT NULL,profile_id TEXT NOT NULL,provider TEXT NOT NULL,
+  binding_generation INTEGER NOT NULL,process_generation INTEGER NOT NULL,provenance TEXT NOT NULL,
+  PRIMARY KEY(attempt_id,role)
 ) STRICT;
 `;
 
@@ -315,7 +393,9 @@ function fixture(): Fixture {
   databases.push(database);
   database.exec("PRAGMA foreign_keys=ON;");
   database.exec(parentSchema);
+  applySessionSendOwnerSchema(database);
   database.exec(WORK_SCHEMA_SQL);
+  database.exec(WORK_SIGNAL_PROVIDER_AUTHORITY_SCHEMA_SQL);
   database.exec(WORK_PROJECT_AUTHORITY_SCHEMA_SQL);
   database.exec(LEGACY_CANONICAL_PROFILE_COLUMNS_SQL);
   assertWorkSchema(database);
@@ -354,6 +434,131 @@ function fixture(): Fixture {
     reviewerSessionId,
     store,
   };
+}
+
+async function originalSendOwnerFixture(): Promise<Fixture & Readonly<{
+  stateStore: StateStore;
+  daemonGeneration: number;
+  bootId: string;
+}>> {
+  const home = await realpath(await mkdtemp(joinPath(tmpdir(), "oompa-work-send-owner-")));
+  const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+  await initializeStatePaths(paths);
+  const now = { value: 10_000 };
+  const stateStore = new StateStore(paths, {
+    now: () => now.value,
+    resolveMachineTimeZone: () => "America/Puerto_Rico",
+    publicProviderIdentifierProjector: projectProviderIdentifier,
+  });
+  stateStores.push(stateStore);
+  const bootId = `boot_${randomUUID().replaceAll("-", "")}`;
+  const daemonGeneration = stateStore.nextDaemonGeneration(bootId);
+  const profile = stateStore.createProfile("Original send owner");
+  const account = stateStore.nextProfileGeneration(profile.id);
+  if (!stateStore.setProfileState(account.id, account.processGeneration, "signed_in", {
+    email: "work-owner@example.com",
+    plan: "Plus",
+  })) throw new Error("work owner fixture account was not admitted");
+  const projectRoot = joinPath(home, "project");
+  await mkdir(projectRoot);
+  const project = await stateStore.createProject("Owner fixture", projectRoot, true);
+  const bindSession = (thread: string): SessionId => {
+    const created = stateStore.createSession({
+      profileId: account.id,
+      projectId: project.id,
+      provider: "codex",
+      preset: "high",
+      fastEnabled: false,
+    });
+    const bound = stateStore.bindSession({
+      sessionId: created.id,
+      expectedRevision: created.revision,
+      providerThreadId: thread,
+      state: "idle",
+    });
+    stateStore.bindSessionProviderAccountAuthority({
+      sessionId: bound.id,
+      provider: "codex",
+      runtimeScope: "managed",
+      accountKey: `v1:codex:${createHash("sha256").update("work-owner@example.com").digest("hex")}`,
+    });
+    return bound.id;
+  };
+  const actorSessionId = bindSession("work-owner-actor");
+  const reviewerSessionId = bindSession("work-owner-reviewer");
+  const database = new Database(paths.database, { strict: true });
+  databases.push(database);
+  database.exec("PRAGMA foreign_keys=ON");
+  const store = stateStore.createWorkStore(7, encodeCursor, {
+    issue: issueCapability,
+    verify: verifyCapability,
+  });
+  return {
+    accountId: account.id,
+    actorSessionId,
+    database,
+    now,
+    projectId: project.id,
+    reviewerSessionId,
+    stateStore,
+    store,
+    daemonGeneration,
+    bootId,
+  };
+}
+
+function prepareOriginalSendOwner(
+  value: Awaited<ReturnType<typeof originalSendOwnerFixture>>,
+  key: string,
+  message = "One original human request.",
+) {
+  return value.stateStore.prepareOwnedSessionSend({
+    kind: "session.send",
+    idempotencyKey: key,
+    session: value.actorSessionId,
+    message,
+    attachments: [],
+  });
+}
+
+function claimOriginalSendOwner(
+  value: Awaited<ReturnType<typeof originalSendOwnerFixture>>,
+  prepared: ReturnType<typeof prepareOriginalSendOwner>,
+) {
+  const authority = prepared.owner.sourceAuthority;
+  const runtimeProfile = effectiveRuntimeProfileSchema.parse({
+    approvalPolicy: "on-request",
+    computerUse: true,
+    enabledApps: [],
+    fast: false,
+    model: presetRequirements.high.model,
+    observedAt: value.now.value,
+    permissionProfile: ":workspace",
+    pluginCapability: true,
+    preset: "high",
+    processGeneration: authority.processGeneration,
+    profileId: authority.profileId,
+    reasoningEffort: "max",
+    reviewMode: "auto_review",
+    serviceTier: null,
+  });
+  return value.stateStore.beginOwnedDirectSendEffect({
+    attemptId: prepared.owner.attemptId,
+    ownerDigest: prepared.ownerDigest,
+    requestFingerprint: prepared.owner.fingerprint,
+    daemonGeneration: value.daemonGeneration,
+    bootId: value.bootId,
+    expectedSessionRevision: prepared.owner.sourceSessionRevision,
+    executionAuthority: authority,
+    evidence: {
+      kind: "session.send",
+      providerThreadId: prepared.owner.sourceThreadId,
+      baseline: { providerUpdatedAt: null, status: "idle", activeTurnId: null },
+      clientMessageId: prepared.owner.attemptId,
+      messageDigest: prepared.owner.fingerprint.inputDigest,
+      runtimeProfile,
+    },
+  });
 }
 
 function bindPersonalProviderAuthority(
@@ -620,6 +825,41 @@ function claim(
   return result;
 }
 
+function prepareOwnerGuardDispatch(value: Fixture, idempotencyKey = randomUUID()) {
+  const created = createWork(value);
+  join(value, created.work.id, created.work.revision, value.actorSessionId);
+  const task = created.tasks[0];
+  if (task === undefined) throw new Error("owner guard task missing");
+  const claimed = claim(value, {
+    workId: created.work.id,
+    taskId: task.id,
+    revision: task.revision,
+  });
+  const operation = {
+    kind: "attempt.dispatch" as const,
+    idempotencyKey,
+    workId: created.work.id,
+    attemptId: claimed.attempt.id,
+    expectedAttemptRevision: claimed.attempt.revision,
+    fence: claimed.attempt.fence,
+    actorSessionId: value.actorSessionId,
+    attemptCapability: capability,
+    targetSessionId: value.actorSessionId,
+    mode: "send" as const,
+  };
+  value.store.apply(operation);
+  const effect = value.store.preparedEffect(idempotencyKey)?.effect;
+  if (effect?.kind !== "dispatch") throw new Error("owner guard dispatch missing");
+  return { created, claimed, operation, effect };
+}
+
+function markNestedRequestAsOwned(value: Fixture, effect: WorkPreparedEffect): void {
+  value.database.exec("DROP TRIGGER session_send_format_immutable; DROP TRIGGER session_send_mutation_guard");
+  value.database.query("UPDATE mutation_attempts SET request_format=? WHERE idempotency_key=?")
+    .run(SESSION_SEND_REQUEST_FORMAT, effect.nestedMutationKey);
+  applySessionSendOwnerSchema(value.database);
+}
+
 function insertNestedDispatchMutation(
   value: Fixture,
   effect: Extract<WorkPreparedEffect, { kind: "dispatch" }>,
@@ -651,13 +891,14 @@ function insertAppliedNestedMutation(
   value: Fixture,
   effect: WorkPreparedEffect,
 ): void {
+  const generation = nestedMutationGeneration(value, effect);
   const kind = effect.kind === "dispatch"
     ? "session.send"
     : effect.mode === "queue" ? "session.queue" : "session.steer";
   const requestDigest = createHash("sha256").update(JSON.stringify({
     kind,
     authorityId: effect.targetSessionId,
-    authorityGeneration: effect.accountGeneration,
+    authorityGeneration: generation,
     request: { message: workPreparedEffectMessage(effect) },
   })).digest("hex");
   const result = effect.kind === "dispatch"
@@ -674,23 +915,45 @@ function insertAppliedNestedMutation(
     effect.nestedMutationKey,
     kind,
     effect.targetSessionId,
-    effect.accountGeneration,
+    generation,
     requestDigest,
     JSON.stringify(result),
   );
+  insertNestedSignalAuthority(value, effect);
+}
+
+function nestedMutationGeneration(value: Fixture, effect: WorkPreparedEffect): number {
+  if (effect.kind !== "signal") return effect.accountGeneration;
+  const authority = value.database.query(
+    "SELECT process_generation FROM work_signal_provider_authorities WHERE signal_id=?",
+  ).get(effect.signalId) as { process_generation: number } | null;
+  if (authority === null) throw new Error("signal authority missing");
+  return authority.process_generation;
+}
+
+function insertNestedSignalAuthority(value: Fixture, effect: WorkPreparedEffect): void {
+  if (effect.kind !== "signal") return;
+  value.database.query(`INSERT INTO mutation_provider_authorities
+    SELECT mutation.id,'primary',authority.provider_account_id,authority.profile_id,
+      authority.provider,authority.binding_generation,authority.process_generation,
+      CASE WHEN mutation.kind='session.queue' THEN 'session_queue' ELSE 'session_steer' END
+    FROM mutation_attempts mutation JOIN work_signal_provider_authorities authority
+      ON authority.signal_id=? WHERE mutation.idempotency_key=?`)
+    .run(effect.signalId, effect.nestedMutationKey);
 }
 
 function insertFailedNestedMutation(
   value: Fixture,
   effect: WorkPreparedEffect,
 ): void {
+  const generation = nestedMutationGeneration(value, effect);
   const kind = effect.kind === "dispatch"
     ? "session.send"
     : effect.mode === "queue" ? "session.queue" : "session.steer";
   const requestDigest = createHash("sha256").update(JSON.stringify({
     kind,
     authorityId: effect.targetSessionId,
-    authorityGeneration: effect.accountGeneration,
+    authorityGeneration: generation,
     request: { message: workPreparedEffectMessage(effect) },
   })).digest("hex");
   value.database.query(
@@ -702,9 +965,32 @@ function insertFailedNestedMutation(
     effect.nestedMutationKey,
     kind,
     effect.targetSessionId,
-    effect.accountGeneration,
+    generation,
     requestDigest,
   );
+  insertNestedSignalAuthority(value, effect);
+}
+
+function prepareSignal(value: Fixture, provider: "codex" | "claude" = "codex") {
+  if (provider !== "codex") {
+    setSessionProfile(value, value.reviewerSessionId, { provider, preset: "ultra" });
+    value.database.query("DELETE FROM session_provider_account_authorities WHERE session_id=?")
+      .run(value.reviewerSessionId);
+    value.database.query(`INSERT INTO session_provider_account_authorities(
+      session_id,provider,runtime_scope,account_key,recorded_at
+    ) VALUES (?,'claude','managed',?,0)`).run(value.reviewerSessionId, `v1:claude:${"c".repeat(64)}`);
+  }
+  const created = createWork(value);
+  join(value, created.work.id, created.work.revision, value.reviewerSessionId);
+  const key = randomUUID();
+  value.store.apply({
+    kind: "signal.send", idempotencyKey: key, workId: created.work.id,
+    senderSessionId: value.actorSessionId, senderCapability: capability,
+    targetSessionId: value.reviewerSessionId, mode: "queue", body: "Keep this exact authority.",
+  });
+  const effect = value.store.preparedEffect(key)?.effect;
+  if (effect?.kind !== "signal") throw new Error("signal effect missing");
+  return { key, effect, workId: created.work.id };
 }
 
 describe("WorkStore canonical profile runtime", () => {
@@ -1099,6 +1385,239 @@ describe("WorkStore canonical profile runtime", () => {
 });
 
 describe("WorkStore schema and atomic plans", () => {
+  test("fences Claude Work signals under scoped revocation despite a different Codex shadow", () => {
+    for (const state of ["releasing", "completed"] as const) {
+      const value = fixture();
+      value.database.query("UPDATE provider_accounts SET process_generation=2 WHERE profile_id=? AND provider='claude'")
+        .run(value.accountId);
+      const { key, workId } = prepareSignal(value, "claude");
+      expect(value.store.authorizePreparedEffect(key).executable).toBe(true);
+      value.database.query(`INSERT INTO provider_runtime_account_revocations(
+        profile_id,profile_generation,provider,runtime_scope,current_account_key,state
+      ) VALUES (?,1,'claude','managed',?,?)`).run(value.accountId,
+        `v1:claude:${(state === "releasing" ? "c" : "d").repeat(64)}`, state);
+      expect(value.store.authorizePreparedEffect(key)).toMatchObject({ executable: false });
+      expect(() => value.store.apply({
+        kind: "signal.send", idempotencyKey: randomUUID(), workId,
+        senderSessionId: value.actorSessionId, senderCapability: capability,
+        targetSessionId: value.reviewerSessionId, mode: "queue", body: "Must not reach revoked Claude.",
+      })).toThrow(new WorkStoreError("ROUTE_MISMATCH"));
+    }
+  });
+
+  test("work signal authority survives a sibling process restart but rejects its own provider generation", () => {
+    for (const changedProvider of ["codex", "claude"] as const) {
+      const value = fixture();
+      const { key } = prepareSignal(value, "claude");
+      if (changedProvider === "codex") {
+        value.database.query("UPDATE profiles SET process_generation=2 WHERE id=?").run(value.accountId);
+      } else {
+        value.database.query("UPDATE provider_accounts SET process_generation=2 WHERE profile_id=? AND provider='claude'").run(value.accountId);
+      }
+      expect(value.store.authorizePreparedEffect(key).executable).toBe(changedProvider === "codex");
+    }
+  });
+
+  test("work signal authority rejects a same-counter provider switch after preparation", () => {
+    const value = fixture();
+    const created = createWork(value);
+    join(value, created.work.id, created.work.revision, value.reviewerSessionId);
+    const key = randomUUID();
+    value.store.apply({
+      kind: "signal.send", idempotencyKey: key, workId: created.work.id,
+      senderSessionId: value.actorSessionId, senderCapability: capability,
+      targetSessionId: value.reviewerSessionId, mode: "queue", body: "Keep this provider binding.",
+    });
+    setSessionProfile(value, value.reviewerSessionId, { provider: "claude", preset: "ultra" });
+    value.database.query(`UPDATE session_provider_account_authorities
+      SET provider='claude',runtime_scope='managed',account_key=? WHERE session_id=?`)
+      .run(claudeAccountKey("same-counter-switch"), value.reviewerSessionId);
+    expect(value.store.authorizePreparedEffect(key).executable).toBe(false);
+  });
+
+  test("work signal authority rejects a replaced binding or session revision with unchanged process counters", () => {
+    for (const changed of ["binding", "revision", "account"] as const) {
+      const value = fixture();
+      const { key } = prepareSignal(value, "claude");
+      if (changed === "binding") {
+        value.database.query("UPDATE provider_accounts SET binding_generation=2 WHERE profile_id=? AND provider='claude'")
+          .run(value.accountId);
+        value.database.query("UPDATE session_provider_authorities SET binding_generation=2 WHERE session_id=?")
+          .run(value.reviewerSessionId);
+      } else if (changed === "revision") {
+        value.database.query("UPDATE session_provider_authorities SET authority_revision=authority_revision+1 WHERE session_id=?")
+          .run(value.reviewerSessionId);
+      } else {
+        value.database.query("UPDATE provider_accounts SET readiness='removed' WHERE profile_id=? AND provider='claude'")
+          .run(value.accountId);
+      }
+      expect(value.store.authorizePreparedEffect(key).executable).toBe(false);
+    }
+  });
+
+  test("work signal authority is immutable and current-format missing or altered rows fail closed", () => {
+    for (const corruption of ["missing", "generation", "digest"] as const) {
+      const value = fixture();
+      const { key, effect } = prepareSignal(value, "claude");
+      expect(() => value.database.query("UPDATE work_signal_provider_authorities SET process_generation=2 WHERE signal_id=?")
+        .run(effect.signalId)).toThrow("WORK_SIGNAL_PROVIDER_AUTHORITY_IMMUTABLE");
+      expect(() => value.database.query("DELETE FROM work_signal_provider_authorities WHERE signal_id=?")
+        .run(effect.signalId)).toThrow("WORK_SIGNAL_PROVIDER_AUTHORITY_IMMUTABLE");
+      value.database.exec("DROP TRIGGER work_signal_provider_authority_no_delete; DROP TRIGGER work_signal_provider_authority_no_update");
+      if (corruption === "missing") {
+        value.database.query("DELETE FROM work_signal_provider_authorities WHERE signal_id=?").run(effect.signalId);
+      } else if (corruption === "generation") {
+        value.database.query("UPDATE work_signal_provider_authorities SET process_generation=2 WHERE signal_id=?").run(effect.signalId);
+      } else {
+        value.database.query("UPDATE work_signal_provider_authorities SET authority_digest=? WHERE signal_id=?")
+          .run("0".repeat(64), effect.signalId);
+      }
+      value.database.exec(WORK_SIGNAL_PROVIDER_AUTHORITY_SCHEMA_SQL);
+      expect(() => assertWorkSignalProviderAuthorities(value.database)).toThrow(
+        corruption === "missing" ? "WORK_SIGNAL_PROVIDER_AUTHORITY_MISSING" : "WORK_SIGNAL_PROVIDER_AUTHORITY_CORRUPT",
+      );
+      expect(value.store.authorizePreparedEffect(key).executable).toBe(false);
+    }
+  });
+
+  test("work signal authority audit refuses altered guard structure without repairing it", () => {
+    const value = fixture();
+    prepareSignal(value);
+    value.database.exec(`DROP TRIGGER work_signal_provider_authority_no_update;
+      CREATE TRIGGER work_signal_provider_authority_no_update
+      BEFORE UPDATE ON work_signal_provider_authorities BEGIN SELECT 1; END;`);
+    expect(() => assertWorkSignalProviderAuthorities(value.database)).toThrow("WORK_SIGNAL_PROVIDER_AUTHORITY_SCHEMA_INVALID");
+    expect(value.database.query("SELECT sql FROM sqlite_master WHERE name='work_signal_provider_authority_no_update'").get())
+      .toEqual({ sql: expect.stringContaining("SELECT 1") });
+  });
+
+  test("work signal schema audit preserves IF NOT EXISTS inside a digest GLOB", () => {
+    const value = fixture();
+    const original = "*[^a-f0-9]*";
+    const altered = "*[IF NOT EXISTS^a-f0-9]*";
+    value.database.exec("DROP TABLE work_signal_provider_authorities");
+    value.database.exec(WORK_SIGNAL_PROVIDER_AUTHORITY_SCHEMA_SQL.replace(original, altered));
+    expect(value.database.query("SELECT ?1 NOT GLOB ?2 AS valid, ?1 NOT GLOB ?3 AS weakened")
+      .get("g".repeat(64), original, altered)).toEqual({ valid: 0, weakened: 1 });
+    const before = value.database.query("SELECT sql FROM sqlite_master WHERE name='work_signal_provider_authorities'").get();
+    const changes = value.database.query("SELECT total_changes() AS count").get();
+    expect(() => assertWorkSignalProviderAuthorities(value.database)).toThrow("WORK_SIGNAL_PROVIDER_AUTHORITY_SCHEMA_INVALID");
+    expect(value.database.query("SELECT sql FROM sqlite_master WHERE name='work_signal_provider_authorities'").get()).toEqual(before);
+    expect(value.database.query("SELECT total_changes() AS count").get()).toEqual(changes);
+  });
+
+  test("work authority schema audit preserves phrase bytes inside frozen comments", () => {
+    const value = fixture();
+    const original = value.database.query<{ sql: string }, []>(
+      "SELECT sql FROM sqlite_master WHERE name='work_attempt_route_guard'",
+    ).get();
+    if (original === null) throw new Error("Expected the current route guard.");
+    const altered = original.sql.replace("the exact Luna/max tuple.", "the exact IF NOT EXISTS Luna/max tuple.");
+    expect(altered).not.toBe(original.sql);
+    value.database.exec("DROP TRIGGER work_attempt_route_guard");
+    value.database.exec(altered);
+    const changes = value.database.query("SELECT total_changes() AS count").get();
+    expect(() => assertWorkSchema(value.database)).toThrow("WORK_SCHEMA_STALE_TRIGGER:work_attempt_route_guard");
+    expect(() => assertReadonlyWorkSchema(value.database)).toThrow("WORK_SCHEMA_STALE_TRIGGER:work_attempt_route_guard");
+    expect(value.database.query("SELECT sql FROM sqlite_master WHERE name='work_attempt_route_guard'").get()).toEqual({ sql: altered });
+    expect(value.database.query("SELECT total_changes() AS count").get()).toEqual(changes);
+  });
+
+  test("legacy work signals retain their instruction bytes and quarantine without inferring current authority", () => {
+    const value = fixture();
+    const { key, effect } = prepareSignal(value);
+    const instruction = value.database.query("SELECT instruction_json,instruction_digest FROM work_prepared_effects WHERE idempotency_key=?").get(key);
+    value.database.exec("DROP TRIGGER work_signal_provider_authority_no_delete");
+    value.database.query("DELETE FROM work_signal_provider_authorities WHERE signal_id=?").run(effect.signalId);
+    value.database.exec(WORK_SIGNAL_PROVIDER_AUTHORITY_SCHEMA_SQL);
+    setSessionProfile(value, value.reviewerSessionId, { provider: "devin", preset: "ultra", contract: 2 });
+    expect(() => assertWorkSignalProviderAuthorities(value.database)).toThrow("WORK_SIGNAL_PROVIDER_AUTHORITY_MISSING");
+    backfillLegacyWorkSignalProviderAuthorities(value.database, 12_000);
+    backfillLegacyWorkSignalProviderAuthorities(value.database, 13_000);
+    expect(() => assertWorkSignalProviderAuthorities(value.database)).not.toThrow();
+    expect(value.database.query("SELECT * FROM work_signal_provider_authorities WHERE signal_id=?").get(effect.signalId)).toBeNull();
+    expect(value.database.query("SELECT reason,recorded_at FROM legacy_provider_authority_quarantines WHERE scope_kind='work_signal' AND scope_id=?")
+      .get(effect.signalId)).toEqual({ reason: "missing_immutable_runtime_authority", recorded_at: 12_000 });
+    expect(value.database.query("SELECT instruction_json,instruction_digest FROM work_prepared_effects WHERE idempotency_key=?").get(key)).toEqual(instruction);
+    expect(value.store.authorizePreparedEffect(key).executable).toBe(false);
+  });
+
+  test("work signal preparation rolls back the entire operation if authority capture fails", () => {
+    const value = fixture();
+    const created = createWork(value);
+    join(value, created.work.id, created.work.revision, value.reviewerSessionId);
+    const before = value.database.query("SELECT revision,next_sequence,head_hash FROM works WHERE id=?").get(created.work.id);
+    value.database.exec(`CREATE TRIGGER test_refuse_signal_authority BEFORE INSERT ON work_signal_provider_authorities
+      BEGIN SELECT RAISE(ABORT,'TEST_AUTHORITY_CAPTURE_FAILURE'); END;`);
+    const key = randomUUID();
+    expect(() => value.store.apply({
+      kind: "signal.send", idempotencyKey: key, workId: created.work.id,
+      senderSessionId: value.actorSessionId, senderCapability: capability,
+      targetSessionId: value.reviewerSessionId, mode: "queue", body: "Do not leave an unbound signal.",
+    })).toThrow("TEST_AUTHORITY_CAPTURE_FAILURE");
+    expect(value.database.query("SELECT revision,next_sequence,head_hash FROM works WHERE id=?").get(created.work.id)).toEqual(before);
+    expect(value.database.query("SELECT * FROM work_signals WHERE work_id=?").all(created.work.id)).toEqual([]);
+    expect(value.store.preparedEffect(key)).toBeNull();
+  });
+
+  test("work signal receipts use frozen provider generation while released wire retains the Codex mirror", () => {
+    for (const useNestedReceipt of [false, true]) {
+      const value = fixture();
+      value.database.query("UPDATE provider_accounts SET process_generation=3 WHERE profile_id=? AND provider='claude'").run(value.accountId);
+      const { key, effect } = prepareSignal(value, "claude");
+      expect(effect.accountGeneration).toBe(1);
+      expect(value.database.query("SELECT process_generation FROM work_signal_provider_authorities WHERE signal_id=?").get(effect.signalId))
+        .toEqual({ process_generation: 3 });
+      if (useNestedReceipt) {
+        insertAppliedNestedMutation(value, effect);
+        expect(value.store.authorizePreparedEffect(key).status.state).toBe("accepted");
+      } else {
+        expect(value.store.authorizePreparedEffect(key).executable).toBe(true);
+        expect(() => value.store.finalizeSignal(key, { kind: "accepted", receipt: queueReceipt(1) })).toThrow("ROUTE_MISMATCH");
+        expect(value.store.finalizeSignal(key, { kind: "accepted", receipt: queueReceipt(3) }).deliveryState).toBe("accepted");
+      }
+    }
+  });
+
+  test("work signal reconciliation rejects a borrowed same-counter nested provider authority", () => {
+    for (const corruption of ["provider", "provenance", "missing"] as const) {
+      const value = fixture();
+      const { key, effect } = prepareSignal(value, "claude");
+      insertAppliedNestedMutation(value, effect);
+      if (corruption === "provider") {
+        value.database.query(`UPDATE mutation_provider_authorities SET provider='codex',provider_account_id=?
+          WHERE attempt_id=(SELECT id FROM mutation_attempts WHERE idempotency_key=?)`)
+          .run(value.accountId, effect.nestedMutationKey);
+      } else if (corruption === "provenance") {
+        value.database.query("UPDATE mutation_provider_authorities SET provenance='legacy_runtime' WHERE attempt_id=(SELECT id FROM mutation_attempts WHERE idempotency_key=?)")
+          .run(effect.nestedMutationKey);
+      } else {
+        value.database.query("DELETE FROM mutation_provider_authorities WHERE attempt_id=(SELECT id FROM mutation_attempts WHERE idempotency_key=?)")
+          .run(effect.nestedMutationKey);
+      }
+      const result = value.store.authorizePreparedEffect(key);
+      expect(result.executable).toBe(false);
+      expect(result.status.state).toBe("unknown");
+    }
+  });
+
+  test("legacy work signal settled receipt replay remains historical after execution quarantine", () => {
+    const value = fixture();
+    const { key, effect } = prepareSignal(value);
+    expect(value.store.authorizePreparedEffect(key).executable).toBe(true);
+    const outcome = { kind: "accepted" as const, receipt: queueReceipt() };
+    const accepted = value.store.finalizeSignal(key, outcome);
+    value.database.exec("DROP TRIGGER work_signal_provider_authority_no_delete");
+    value.database.query("DELETE FROM work_signal_provider_authorities WHERE signal_id=?").run(effect.signalId);
+    value.database.exec(WORK_SIGNAL_PROVIDER_AUTHORITY_SCHEMA_SQL);
+    backfillLegacyWorkSignalProviderAuthorities(value.database, 12_000);
+    expect(() => assertWorkSignalProviderAuthorities(value.database)).not.toThrow();
+    expect(value.store.finalizeSignal(key, outcome)).toEqual(accepted);
+    expect(value.store.authorizePreparedEffect(key).executable).toBe(false);
+    expect(() => value.store.finalizeSignal(key, { kind: "accepted", receipt: queueReceipt(2) }))
+      .toThrow("IDEMPOTENCY_CONFLICT");
+  });
+
   test("creates strict append-only state with a verified event hash chain", () => {
     const value = fixture();
     const created = createWork(value);
@@ -1642,8 +2161,212 @@ describe("WorkStore schema and atomic plans", () => {
   });
 });
 
+describe("WorkStore original send ownership", () => {
+  test.each(["input_required", "effect_started", "accepted", "ambiguous", "abandoned", "cancelled"] as const)("original send ownership: rejects coherent %s owner without changing either journal", async (stage) => {
+    const value = await originalSendOwnerFixture();
+    const prepared = prepareOwnerGuardDispatch(value);
+    const owner = prepareOriginalSendOwner(value, prepared.effect.nestedMutationKey, workPreparedEffectMessage(prepared.effect));
+    if (stage === "cancelled") {
+      value.stateStore.cancelOwnedSessionSend({ attemptId: owner.owner.attemptId, ownerDigest: owner.ownerDigest });
+    } else if (stage !== "input_required") {
+      const claim = claimOriginalSendOwner(value, owner);
+      if (claim.claim === null || claim.claimDigest === null) throw new Error("owned direct claim missing");
+      const settlement = {
+        attemptId: owner.owner.attemptId,
+        ownerDigest: owner.ownerDigest,
+        claimDigest: claim.claimDigest,
+      };
+      if (stage === "accepted") {
+        value.stateStore.settleOwnedDirectSend({
+          ...settlement,
+          outcome: { kind: "accepted", receipt: {
+            sourceId: owner.owner.attemptId,
+            turnId: "original-owned-turn",
+            status: "completed",
+            effectiveRuntimeProfile: claim.claim.evidence.runtimeProfile,
+          } },
+        });
+      } else if (stage === "ambiguous" || stage === "abandoned") {
+        value.stateStore.settleOwnedDirectSend({ ...settlement, outcome: { kind: "ambiguous", reason: "provider_outcome_unknown" } });
+        if (stage === "abandoned") {
+          value.stateStore.settleOwnedDirectSend({ ...settlement, outcome: { kind: "abandoned", acknowledgeOutcomeUnknown: true } });
+        }
+      }
+    }
+    const before = value.stateStore.readOwnedSessionSend(prepared.effect.nestedMutationKey);
+    expect(before?.state).toBe(stage);
+    const workBefore = value.store.snapshot(prepared.created.work.id);
+    const rejected = new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED");
+    expect(() => value.store.authorizePreparedEffect(prepared.operation.idempotencyKey)).toThrow(rejected);
+    expect(() => value.store.reprojectPreparedEffect(prepared.operation.idempotencyKey)).toThrow(rejected);
+    expect(() => value.store.settlePreparedEffectNoEffect(prepared.operation.idempotencyKey, "not_dispatched")).toThrow(rejected);
+    expect(() => value.store.apply(prepared.operation)).toThrow(rejected);
+    expect(value.stateStore.readOwnedSessionSend(prepared.effect.nestedMutationKey)).toEqual(before);
+    expect(value.store.snapshot(prepared.created.work.id)).toEqual(workBefore);
+    expect(value.store.effectStatus(prepared.operation.idempotencyKey)?.state).toBe("prepared");
+    expect(value.database.query("SELECT COUNT(*) AS count FROM work_nested_effect_settlements").get()).toEqual({ count: 0 });
+  });
+
+  test("original send ownership: keeps the independent top-level Work intent namespace usable", async () => {
+    const value = await originalSendOwnerFixture();
+    const key = randomUUID();
+    const owner = prepareOriginalSendOwner(value, key);
+    const prepared = prepareOwnerGuardDispatch(value, key);
+    expect(prepared.effect.nestedMutationKey).not.toBe(key);
+    expect(value.store.authorizePreparedEffect(key).executable).toBe(true);
+    expect(value.store.apply(prepared.operation).kind).toBe("attempt.dispatch");
+    expect(value.stateStore.readOwnedSessionSend(key)).toEqual({
+      kind: owner.kind,
+      owner: owner.owner,
+      ownerDigest: owner.ownerDigest,
+      claim: null,
+      claimDigest: null,
+      outcomes: [],
+      state: "input_required",
+    });
+    expect(value.stateStore.readMutation(prepared.effect.nestedMutationKey)).toBeNull();
+  });
+
+  test.each(["marker", "owner", "anchor", "orphan", "relocated"] as const)(
+    "original send ownership: rejects %s ownership corruption without legacy fallback",
+    async (corruption) => {
+      const value = await originalSendOwnerFixture();
+      const prepared = prepareOwnerGuardDispatch(value);
+      const owner = prepareOriginalSendOwner(value, prepared.effect.nestedMutationKey, workPreparedEffectMessage(prepared.effect));
+      value.database.exec("PRAGMA foreign_keys=OFF");
+      try {
+        if (corruption === "marker") {
+          value.database.exec("DROP TRIGGER session_send_format_immutable; DROP TRIGGER session_send_mutation_guard");
+          value.database.query("UPDATE mutation_attempts SET request_format=NULL WHERE id=?").run(owner.owner.attemptId);
+        } else if (corruption === "owner") {
+          value.database.exec("DROP TRIGGER session_send_owners_immutable_delete");
+          value.database.query("DELETE FROM session_send_owners WHERE attempt_id=?").run(owner.owner.attemptId);
+        } else if (corruption === "anchor") {
+          value.database.exec("DROP TRIGGER session_send_owner_anchors_immutable_delete");
+          value.database.query("DELETE FROM session_send_owner_anchors WHERE attempt_id=?").run(owner.owner.attemptId);
+        } else if (corruption === "orphan") {
+          const attachmentGuard = value.database.query("SELECT sql FROM sqlite_master WHERE name='attachment_parent_delete_guard'").get() as { sql: string };
+          value.database.exec("DROP TRIGGER session_send_mutation_delete_guard; DROP TRIGGER attachment_parent_delete_guard");
+          try {
+            value.database.query("DELETE FROM mutation_attempts WHERE id=?").run(owner.owner.attemptId);
+          } finally {
+            value.database.exec(attachmentGuard.sql);
+          }
+        } else {
+          const attachmentGuard = value.database.query("SELECT sql FROM sqlite_master WHERE name='attachment_parent_immutable'").get() as { sql: string };
+          value.database.exec("DROP TRIGGER session_send_mutation_guard; DROP TRIGGER attachment_parent_immutable");
+          try {
+            value.database.query("UPDATE mutation_attempts SET idempotency_key=? WHERE id=?")
+              .run(randomUUID(), owner.owner.attemptId);
+          } finally {
+            value.database.exec(attachmentGuard.sql);
+          }
+        }
+        applySessionSendOwnerSchema(value.database);
+      } finally {
+        value.database.exec("PRAGMA foreign_keys=ON");
+      }
+      const workBefore = value.store.snapshot(prepared.created.work.id);
+      const mutationBefore = value.database.query("SELECT * FROM mutation_attempts WHERE id=?").get(owner.owner.attemptId);
+      const rejected = new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED");
+      expect(() => value.store.authorizePreparedEffect(prepared.operation.idempotencyKey)).toThrow(rejected);
+      expect(() => value.store.reprojectPreparedEffect(prepared.operation.idempotencyKey)).toThrow(rejected);
+      expect(() => value.store.settlePreparedEffectNoEffect(prepared.operation.idempotencyKey, "not_dispatched")).toThrow(rejected);
+      expect(() => value.store.apply(prepared.operation)).toThrow(rejected);
+      expect(value.store.snapshot(prepared.created.work.id)).toEqual(workBefore);
+      expect(value.database.query("SELECT * FROM mutation_attempts WHERE id=?").get(owner.owner.attemptId)).toEqual(mutationBefore);
+      expect(value.database.query("SELECT COUNT(*) AS count FROM work_nested_effect_settlements").get()).toEqual({ count: 0 });
+    },
+  );
+
+  test("original send ownership: rejects marker-only nested receipts without accepting Work effects", () => {
+    const value = fixture();
+    const prepared = prepareOwnerGuardDispatch(value);
+    insertAppliedNestedMutation(value, prepared.effect);
+    markNestedRequestAsOwned(value, prepared.effect);
+    const before = value.database.query("SELECT * FROM mutation_attempts WHERE idempotency_key=?")
+      .get(prepared.effect.nestedMutationKey);
+
+    expect(() => value.store.authorizePreparedEffect(prepared.operation.idempotencyKey))
+      .toThrow(new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED"));
+    expect(() => value.store.reprojectPreparedEffect(prepared.operation.idempotencyKey))
+      .toThrow(new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED"));
+    expect(value.store.effectStatus(prepared.operation.idempotencyKey)?.state).toBe("prepared");
+    expect(value.store.snapshot(prepared.created.work.id).tasks).toHaveLength(1);
+    expect(value.database.query("SELECT * FROM mutation_attempts WHERE idempotency_key=?")
+      .get(prepared.effect.nestedMutationKey)).toEqual(before);
+    expect(value.database.query("SELECT COUNT(*) AS count FROM work_nested_effect_settlements").get())
+      .toEqual({ count: 0 });
+  });
+
+  test("original send ownership: rejects settled Work dispatch and signal replay while retaining history", () => {
+    for (const kind of ["dispatch", "signal"] as const) {
+      const value = fixture();
+      const dispatch = kind === "dispatch" ? prepareOwnerGuardDispatch(value) : null;
+      const signal = kind === "signal" ? prepareSignal(value) : null;
+      const effect = dispatch?.effect ?? signal?.effect;
+      const key = dispatch?.operation.idempotencyKey ?? signal?.key;
+      const workId = dispatch?.created.work.id ?? signal?.workId;
+      if (effect === undefined || key === undefined || workId === undefined) {
+        throw new Error("settled owner guard fixture missing");
+      }
+      expect(value.store.authorizePreparedEffect(key).executable).toBe(true);
+      const dispatchOutcome = { kind: "accepted" as const, receipt: turnStartedReceipt() };
+      const signalOutcome = { kind: "accepted" as const, receipt: queueReceipt() };
+      const finalize = () => kind === "dispatch"
+        ? value.store.finalizeDispatch(key, dispatchOutcome)
+        : value.store.finalizeSignal(key, signalOutcome);
+      finalize();
+      insertAppliedNestedMutation(value, effect);
+      markNestedRequestAsOwned(value, effect);
+      const history = value.store.snapshot(workId);
+
+      expect(() => finalize()).toThrow(new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED"));
+      expect(() => value.store.authorizePreparedEffect(key))
+        .toThrow(new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED"));
+      expect(() => value.store.reprojectPreparedEffect(key))
+        .toThrow(new WorkStoreError("ATTEMPT_RECOVERY_REQUIRED"));
+      expect(value.store.effectStatus(key)?.state).toBe("accepted");
+      expect(value.store.snapshot(workId)).toEqual(history);
+    }
+  });
+
+  test("original send ownership: rejects redirected settled instruction keys even with a replaced digest", () => {
+    for (const kind of ["dispatch", "signal"] as const) {
+      for (const replaceDigest of [false, true]) {
+        const value = fixture();
+        const dispatch = kind === "dispatch" ? prepareOwnerGuardDispatch(value) : null;
+        const signal = kind === "signal" ? prepareSignal(value) : null;
+        const effect = dispatch?.effect ?? signal?.effect;
+        const key = dispatch?.operation.idempotencyKey ?? signal?.key;
+        if (effect === undefined || key === undefined) throw new Error("redirected owner fixture missing");
+        value.store.authorizePreparedEffect(key);
+        const dispatchOutcome = { kind: "accepted" as const, receipt: turnStartedReceipt() };
+        const signalOutcome = { kind: "accepted" as const, receipt: queueReceipt() };
+        const finalize = () => kind === "dispatch"
+          ? value.store.finalizeDispatch(key, dispatchOutcome)
+          : value.store.finalizeSignal(key, signalOutcome);
+        finalize();
+        insertAppliedNestedMutation(value, effect);
+        markNestedRequestAsOwned(value, effect);
+        const redirected = JSON.stringify({ ...effect, nestedMutationKey: randomUUID() });
+        value.database.exec("DROP TRIGGER work_effect_identity_immutable");
+        value.database.query(`UPDATE work_prepared_effects SET instruction_json=?,
+          instruction_digest=CASE WHEN ? THEN ? ELSE instruction_digest END WHERE idempotency_key=?`)
+          .run(redirected, replaceDigest ? 1 : 0, createHash("sha256").update(redirected).digest("hex"), key);
+        value.database.exec(WORK_SCHEMA_SQL);
+
+        expect(() => finalize()).toThrow("WORK_EFFECT_INSTRUCTION_CORRUPT");
+        expect(() => value.store.authorizePreparedEffect(key)).toThrow("WORK_EFFECT_INSTRUCTION_CORRUPT");
+        expect(() => value.store.reprojectPreparedEffect(key)).toThrow("WORK_EFFECT_INSTRUCTION_CORRUPT");
+        expect(value.store.effectStatus(key)?.state).toBe("accepted");
+      }
+    }
+  });
+});
+
 describe("WorkStore claims, fences, and prepared effects", () => {
-  test("requires signed-in HRA account authority for established Claude work", () => {
+  test("requires signed-in Oompa account authority for established Claude work", () => {
     const value = fixture();
     value.database.query("UPDATE sessions SET provider='claude' WHERE profile_id=?")
       .run(value.accountId);
@@ -2264,7 +2987,7 @@ describe("WorkStore claims, fences, and prepared effects", () => {
     expect(claimTask()).toMatchObject({ kind: "task.claim" });
   });
 
-  test("refuses Codex work admission while the HRA profile is signed out", () => {
+  test("refuses Codex work admission while the Oompa profile is signed out", () => {
     const value = fixture();
     value.database.query("UPDATE profiles SET state='signed_out',process_generation=0 WHERE id=?")
       .run(value.accountId);
@@ -4353,6 +5076,8 @@ describe("WorkStore submissions, reviews, and signals", () => {
     expect(value.database.query("SELECT COUNT(*) AS count FROM work_task_history_versions").get())
       .toEqual({ count: 0 });
     expect(value.database.query("SELECT COUNT(*) AS count FROM work_events").get()).toEqual({ count: 0 });
+    expect(value.database.query("SELECT COUNT(*) AS count FROM work_signal_provider_authorities").get()).toEqual({ count: 0 });
+    expect(() => assertWorkSignalProviderAuthorities(value.database)).not.toThrow();
     expect(value.database.query("SELECT COUNT(*) AS count FROM work_idempotency_intents").get())
       .toEqual({ count: 0 });
     expect(value.database.query(
@@ -4625,6 +5350,25 @@ describe("WorkStore submissions, reviews, and signals", () => {
 });
 
 describe("WorkStore cancellation and recovery", () => {
+  test("session retirement uses the captured provider process and never the sibling mirror", () => {
+    const value = fixture();
+    setSessionProfile(value, value.reviewerSessionId, { provider: "claude", preset: "ultra" });
+    value.database.query("UPDATE provider_accounts SET process_generation=3 WHERE profile_id=? AND provider='claude'")
+      .run(value.accountId);
+    value.database.query("UPDATE session_provider_authorities SET process_generation=3 WHERE session_id=?")
+      .run(value.reviewerSessionId);
+    expect(value.store.prepareSessionAuthorityChange([value.reviewerSessionId], 3)).toEqual([]);
+    expect(() => value.store.prepareSessionAuthorityChange([value.reviewerSessionId], 1))
+      .toThrow("REVISION_CONFLICT");
+    value.database.query("UPDATE provider_accounts SET process_generation=4 WHERE profile_id=? AND provider='claude'")
+      .run(value.accountId);
+    expect(value.store.prepareSessionAuthorityChange([value.reviewerSessionId], 3)).toEqual([]);
+    value.database.query("DELETE FROM session_provider_authorities WHERE session_id=?")
+      .run(value.reviewerSessionId);
+    expect(() => value.store.prepareSessionAuthorityChange([value.reviewerSessionId], 3))
+      .toThrow("REVISION_CONFLICT");
+  });
+
   test("retires only attempts owned by the exact bounded session set", () => {
     const value = fixture();
     const created = createWork(value, [

@@ -10,7 +10,7 @@ const collector = createStylexTransformCollector(repositoryRoot);
 // The test process uses the same public compiler as the production graph.
 // Domain, provider, CLI, and package tests remain outside this load hook.
 Bun.plugin({
-  name: "hra-app-stylex-test-transform",
+  name: "oompa-app-stylex-test-transform",
   setup(build) {
     build.onLoad(
       { filter: new RegExp(`^${escapedSourceRoot}/.*\\.[cm]?[jt]sx?$`, "u") },

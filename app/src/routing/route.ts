@@ -7,7 +7,7 @@
  * total, so an unknown or malformed fragment resolves to the grid rather than
  * rendering nothing.
  */
-import { isOpaqueIdentifier } from "../hra/cloud";
+import { isOpaqueIdentifier } from "../oompa/cloud";
 
 export type Route =
   | Readonly<{ kind: "grid" }>

@@ -95,7 +95,7 @@ export class OhCanonicalDatabaseInspectionError extends Error {
   }
 }
 
-export const HRA_OH_FACTS_MEMORY_LIMITS_V1 = Object.freeze({
+export const OOMPA_OH_FACTS_MEMORY_LIMITS_V1 = Object.freeze({
   forkSnapshotBytes: OH_MEMORY_LIMITS_V1.snapshotBytesPerLane,
   // Oh persists an operation, its live records, search documents, and FTS
   // materialization. Keep bounded room for that storage amplification while
@@ -407,7 +407,7 @@ const maximumBoundedSqlitePages = (pageSize: number): number => {
   // frame keeps the durable database plus WAL below the public byte ceiling,
   // including a checkpointed WAL file that retains its high-water size.
   const pages = Math.floor(
-    (HRA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes - sqliteWalHeaderBytes)
+    (OOMPA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes - sqliteWalHeaderBytes)
       / (2 * pageSize + sqliteWalFrameHeaderBytes),
   );
   if (pages < 1) throw new Error("FACTS_MEMORY_OH_DATABASE_LIMIT_UNAVAILABLE");
@@ -717,7 +717,7 @@ const createBoundedOhAuthority = (input: Readonly<{
 }>): BoundedOhStoreAuthority => {
   // Reject existing symlinked, linked, or foreign-owned SQLite files before
   // the driver can follow or mutate them. The post-open pass covers files the
-  // driver created and the residual same-UID race documented by HRA's custody
+  // driver created and the residual same-UID race documented by Oompa's custody
   // model remains outside this process boundary.
   const databasePath = join(input.directory, databaseName);
   if (input.requireExisting === true && !existsSync(databasePath)) {
@@ -988,7 +988,7 @@ const assertBoundedLogicalDatabase = (directory: string): void => {
         || (owner !== undefined && metadata.uid !== owner)
       ) throw new Error("FACTS_MEMORY_OH_DATABASE_UNSAFE");
       if (
-        metadata.size > HRA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes - logicalBytes
+        metadata.size > OOMPA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes - logicalBytes
       ) throw new Error("FACTS_MEMORY_OH_DATABASE_TOO_LARGE");
       logicalBytes += metadata.size;
     } finally {
@@ -1005,7 +1005,7 @@ const assertBoundedForkSnapshot = (records: readonly unknown[]): void => {
     const recordBytes = Buffer.byteLength(encoded, "utf8");
     if (
       recordBytes + separatorBytes
-      > HRA_OH_FACTS_MEMORY_LIMITS_V1.forkSnapshotBytes - encodedBytes
+      > OOMPA_OH_FACTS_MEMORY_LIMITS_V1.forkSnapshotBytes - encodedBytes
     ) throw new Error("FACTS_MEMORY_OH_FORK_SNAPSHOT_TOO_LARGE");
     encodedBytes += recordBytes + separatorBytes;
   }
@@ -2200,7 +2200,7 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
     const authority = createBoundedOhAuthority({
       directory,
       profile: OH_WORKING_STORE_PROFILE_V1,
-      realmId: `hra:${binding.bindingDigest}`,
+      realmId: `oompa:${binding.bindingDigest}`,
       spaceId: this.#spaceId(binding),
     });
     try {
@@ -2210,7 +2210,7 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
       if (
         persisted === null
         || persisted.profile.profileSha256 !== OH_WORKING_STORE_PROFILE_V1.profileSha256
-        || persisted.realmId !== `hra:${binding.bindingDigest}`
+        || persisted.realmId !== `oompa:${binding.bindingDigest}`
         || persisted.spaceId !== this.#spaceId(binding)
         || authority.host.binding.bindingSha256 !== persisted.bindingSha256
         || authority.host.replication !== null
@@ -2551,8 +2551,8 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
 
   #spaceId(binding: FactsMemoryBinding): string {
     return binding.epoch === 1
-      ? `hra:${binding.sessionId}`
-      : `hra:${binding.sessionId}:epoch:${String(binding.epoch)}`;
+      ? `oompa:${binding.sessionId}`
+      : `oompa:${binding.sessionId}:epoch:${String(binding.epoch)}`;
   }
 
   #metadata(input: Readonly<{

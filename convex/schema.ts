@@ -725,7 +725,7 @@ export default defineSchema({
       attemptCount: v.number(),
       body: v.optional(v.object({
         text: v.string(),
-        version: v.literal(1),
+        version: v.union(v.literal(1), v.literal(2)),
       })),
       bodyDigest: v.string(),
       claimedAt: v.number(),

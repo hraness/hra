@@ -46,7 +46,7 @@ import {
 import { DaemonLock, readDaemonAuthorityReceipt } from "../src/daemon/daemon-lock";
 import { DEFAULT_CLOUD_DEPLOYMENT_URL } from "../src/cloud/identity-custody";
 import { resolveStatePaths } from "../src/storage/paths";
-import { HRA_VERSION } from "../src/version";
+import { OOMPA_VERSION } from "../src/version";
 import { createBoundedAuthorityFetch } from "./bounded-authority-fetch";
 import {
   isBoundedProcessCleanupUnprovenError,
@@ -86,7 +86,7 @@ import {
   type ClaudeLiveAcceptancePrivateReceipt,
   type ClaudeLiveAcceptanceProvisionalPrivateReceipt,
 } from "./claude-live-acceptance-proof";
-import { parseHraHostToolRequest, type HraMemoryRememberInput } from "../src/domain/host-tools";
+import { parseOompaHostToolRequest, type OompaMemoryRememberInput } from "../src/domain/host-tools";
 import {
   profileIdSchema,
   sessionIdSchema,
@@ -136,7 +136,7 @@ const claudeWorkerArmSchema = z.object({
   sessionId: sessionIdSchema,
 }).strict().transform((value, context): ClaudeLiveAcceptanceWorkerArm | typeof z.NEVER => {
   try {
-    const request = parseHraHostToolRequest("memory_remember", value.memory);
+    const request = parseOompaHostToolRequest("memory_remember", value.memory);
     if (request.tool !== "memory_remember") throw new Error("unreachable");
     return Object.freeze({
       ...value,
@@ -150,7 +150,7 @@ const claudeWorkerArmSchema = z.object({
 
 export type ClaudeLiveAcceptanceWorkerArm = Readonly<{
   daemonGeneration: number;
-  memory: HraMemoryRememberInput;
+  memory: OompaMemoryRememberInput;
   profileGeneration: number;
   profileId: ProfileId;
   sendIdempotencyKey: string;
@@ -498,7 +498,7 @@ export class LiveAcceptanceSourceGitError extends LiveAcceptanceError {
 export const assertCurrentLiveAcceptancePackageVersion = (
   packageVersion: string,
 ): void => {
-  if (packageVersion !== HRA_VERSION) throw new LiveAcceptanceError("input_invalid");
+  if (packageVersion !== OOMPA_VERSION) throw new LiveAcceptanceError("input_invalid");
 };
 
 export class LiveAcceptanceStartError extends LiveAcceptanceError {
@@ -734,7 +734,7 @@ function assertReceiptLayoutShape(receipt: LiveAcceptanceRecoveryReceipt): void 
       const quarantine = assertNormalizedAbsolute(resource.quarantinePath);
       if (
         !isContainedDirectChild(runRoot, quarantine)
-        || !basename(quarantine).startsWith(`.hra-quarantine-${resource.role}-`)
+        || !basename(quarantine).startsWith(`.oompa-quarantine-${resource.role}-`)
         || paths.has(quarantine)
       ) throw new LiveAcceptanceError("layout_changed");
       paths.add(quarantine);
@@ -2152,7 +2152,7 @@ async function reconcileAndDeleteResource(
     await assertDirectoryIdentity(current.identity);
     const quarantinePath = join(
       runRoot,
-      `.hra-quarantine-${role}-${randomUUID()}`,
+      `.oompa-quarantine-${role}-${randomUUID()}`,
     );
     if (!isContainedDirectChild(runRoot, quarantinePath) || await pathExists(quarantinePath)) {
       throw new LiveAcceptanceError("layout_changed");
@@ -2894,7 +2894,7 @@ export const liveAcceptanceSourceAttestation = async (
     cloudTargetDigest: createHash("sha256")
       .update(cloudDeploymentUrlInput, "utf8")
       .digest("hex"),
-    packageVersion: HRA_VERSION,
+    packageVersion: OOMPA_VERSION,
     sourceRevision,
   };
 };
@@ -3026,7 +3026,7 @@ export const liveAcceptanceMain = async (
   try {
     parsedOutput = parseLiveAcceptanceEvidenceOutput(arguments_);
   } catch {
-    process.stderr.write("hra live acceptance: invalid evidence output\n");
+    process.stderr.write("oompa live acceptance: invalid evidence output\n");
     return 2;
   }
   const recoverBeforeLiveEffect = async (): Promise<number | null> => {
@@ -3058,27 +3058,27 @@ export const liveAcceptanceMain = async (
         }).catch(() => undefined);
         return 75;
       }
-      process.stderr.write("hra live acceptance: process recovery journal unavailable\n");
+      process.stderr.write("oompa live acceptance: process recovery journal unavailable\n");
       return 1;
     }
   };
   const scenarioArguments = parsedOutput.scenarioArguments;
   if (scenarioArguments.length === 2 && scenarioArguments[0] === "--resume-fd") {
     if (parsedOutput.evidenceOutput !== undefined) {
-      process.stderr.write("hra live acceptance: evidence output is unavailable during recovery\n");
+      process.stderr.write("oompa live acceptance: evidence output is unavailable during recovery\n");
       return 2;
     }
     const rawFd = scenarioArguments[1];
     const fd = Number(rawFd);
     if (rawFd === undefined || !/^[0-9]+$/u.test(rawFd) || !isProtectedRecoveryDescriptor(fd)) {
-      process.stderr.write("hra live acceptance: invalid protected descriptor\n");
+      process.stderr.write("oompa live acceptance: invalid protected descriptor\n");
       return 2;
     }
     let receipt: LiveAcceptanceRecoveryReceipt;
     try {
       receipt = readLiveAcceptanceRecoveryReceiptFromFd(fd);
     } catch {
-      process.stderr.write("hra live acceptance: invalid protected recovery receipt\n");
+      process.stderr.write("oompa live acceptance: invalid protected recovery receipt\n");
       return 1;
     }
     const recoveryExit = await recoverBeforeLiveEffect();
@@ -3092,7 +3092,7 @@ export const liveAcceptanceMain = async (
       await writeStandardOutputFrame({ ok: true, status: "cleanup_complete", version: 1 });
       return 0;
     } catch {
-      process.stderr.write("hra live acceptance: cleanup remains recovery-required\n");
+      process.stderr.write("oompa live acceptance: cleanup remains recovery-required\n");
       return 1;
     } finally {
       process.off("SIGINT", stopResume);
@@ -3107,7 +3107,7 @@ export const liveAcceptanceMain = async (
     && /^[0-9]+$/u.test(scenarioArguments[1]);
   if (!standardStreamScenario && !descriptorScenario) {
     process.stderr.write(
-      "hra live acceptance: use --scenario-fd <nonterminal-fd> for a terminal run or --scenario-stdin for a JSONL agent run\n",
+      "oompa live acceptance: use --scenario-fd <nonterminal-fd> for a terminal run or --scenario-stdin for a JSONL agent run\n",
     );
     return 2;
   }
@@ -3116,12 +3116,12 @@ export const liveAcceptanceMain = async (
     parsedOutput.evidenceOutput?.kind === "descriptor"
     && parsedOutput.evidenceOutput.descriptor === scenarioFd
   ) {
-    process.stderr.write("hra live acceptance: scenario and evidence descriptors must differ\n");
+    process.stderr.write("oompa live acceptance: scenario and evidence descriptors must differ\n");
     return 2;
   }
   const deployEvidencePath = parsedOutput.deployEvidencePath;
   if (deployEvidencePath === undefined) {
-    process.stderr.write("hra live acceptance: --deploy-evidence is required for the current memory gate\n");
+    process.stderr.write("oompa live acceptance: --deploy-evidence is required for the current memory gate\n");
     return 2;
   }
   let run: LiveAcceptanceRun | undefined;
@@ -3347,7 +3347,7 @@ export const liveAcceptanceMain = async (
         status: "startup_failed",
         version: 1,
       }).catch(() => undefined);
-      process.stderr.write("hra live acceptance: startup failed safely\n");
+      process.stderr.write("oompa live acceptance: startup failed safely\n");
     }
     return operatorInterrupted ? 75 : 1;
   } finally {

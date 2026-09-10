@@ -26,7 +26,7 @@ function inlineContent(content: readonly InlineContent[], styleLinks: boolean): 
   return content.map((part, index) => {
     switch (part.kind) {
       case "code":
-        return <code className={classes("hra-inline-code", "inlineCode")} key={index}>{part.value}</code>;
+        return <code className={classes("oompa-inline-code", "inlineCode")} key={index}>{part.value}</code>;
       case "link":
         return <a className={styleLinks ? sitePresentationClasses("proseLink") : undefined} href={part.href} key={index}>{part.label}</a>;
       case "text":
@@ -40,7 +40,7 @@ export function renderMarketingHeader(content: PublicContent, currentPath: strin
     <MarketingSiteHeader
       className={mobileHeaderFlowClassName()}
       trailing={<SiteAppearanceMenu />}
-      action={{ emphasis: "primary", href: content.links.app, label: "Open HRA" }}
+      action={{ emphasis: "primary", href: content.links.app, label: "Open Oompa" }}
       brand={content.productName}
       brandHref="/"
       links={[
@@ -68,9 +68,9 @@ export function renderMarketingPage(content: PublicContent): string {
         eyebrow={content.hero.eyebrow}
         frame={<ProductPreview />}
         heading={content.hero.heading}
-        headingId="hra-title"
+        headingId="oompa-title"
         name={content.productName}
-        notice={<p className={sitePresentationClasses("installNote")}><strong>New machine setup is temporarily paused.</strong> <a href="/docs/status/">Check current availability</a></p>}
+        notice={<p className={sitePresentationClasses("installNote")}><strong>New machine setup is temporarily paused.</strong> This release candidate is not yet admitted, and current daemon and hosted command-writer rollout remains blocked on capacity. <a href="/docs/status/">Check current availability</a></p>}
         summary={content.hero.summary}
         tone="paper"
       />
@@ -83,7 +83,7 @@ export function renderMarketingPage(content: PublicContent): string {
         layout="split"
         summary="Use the web workspace when you want to see the work. Use the CLI when you want to script it. Both address the same sessions."
       >
-        <p>These commands run on an initialized, authorized machine. <a href="/docs/start/">Complete setup first.</a></p>
+        <p>These commands run only on an initialized, authorized machine after the capacity rollout prerequisites are satisfied. <a href="/docs/start/">Complete setup first.</a></p>
         <MarketingFlow
           ariaLabel={`First ${content.productName} request`}
           steps={content.hero.steps.map((step) => ({ code: step.command, detail: step.detail, label: step.label }))}
@@ -117,13 +117,13 @@ export function renderMarketingPage(content: PublicContent): string {
       <MarketingCallToAction
         actions={[
           { emphasis: "primary", href: "/docs/start/", label: "Set up your first machine" },
-          { emphasis: "secondary", href: content.links.app, label: "Open HRA" },
+          { emphasis: "secondary", href: content.links.app, label: "Open Oompa" },
         ]}
         footnote={content.hero.boundary}
         heading="Keep the work in view."
         headingId="closing-heading"
         id="closing"
-        summary="Start with one machine and one provider account. The setup guide explains what is available now and walks you through each step."
+        summary="The setup guide starts with the admitted predecessor and this candidate's unavailable install command. Wait for exact artifact admission and the capacity rollout prerequisites before starting a new machine."
         tone="paper"
       />
     </MarketingPage>,

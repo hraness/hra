@@ -4,6 +4,7 @@ import type {
   DesktopSwitchJournalEntry,
   DesktopSwitchStage,
 } from "../domain/desktop-switch.ts";
+import { providerAccountAuthoritySchema } from "../domain/provider-accounts.ts";
 import type { ChatGptBundleCapability } from "./bundle.ts";
 import { CODEX_ELECTRON_USER_DATA_PATH, CODEX_HOME } from "./bundle.ts";
 import { DesktopSwitchError } from "./errors.ts";
@@ -25,8 +26,7 @@ export interface DesktopProcessIdentity {
 export interface DesktopSwitchJournalPort {
   prepare(entry: DesktopSwitchJournalEntry): Promise<void>;
   advance(
-    idempotencyKey: string,
-    switchGeneration: number,
+    binding: DesktopSwitchGeneration & { readonly idempotencyKey: string },
     stage: DesktopSwitchStage,
     details?: { readonly launchedPid?: number; readonly safeReason?: string },
   ): Promise<void>;
@@ -64,6 +64,7 @@ export interface DesktopAccountVerificationPort {
   readAccountKey(input: {
     readonly profileId: string;
     readonly processGeneration: number;
+    readonly providerAuthority: DesktopSwitchGeneration["targetProviderAuthority"];
     readonly instance: {
       readonly pid: number;
       readonly executablePath: string;
@@ -160,8 +161,10 @@ export class DesktopSwitchController {
       switchGeneration: request.switchGeneration,
       sourceProfileId: request.sourceProfileId,
       sourceProcessGeneration: request.sourceProcessGeneration,
+      sourceProviderAuthority: request.sourceProviderAuthority,
       targetProfileId: request.targetProfileId,
       targetProcessGeneration: request.targetProcessGeneration,
+      targetProviderAuthority: request.targetProviderAuthority,
       bundleCdHash: capability.cdHash,
       sourcePid: source?.pid ?? null,
       targetPaths,
@@ -172,8 +175,7 @@ export class DesktopSwitchController {
     if (source !== null) {
       await this.#assertCurrent(request);
       await this.#ports.journal.advance(
-        request.idempotencyKey,
-        request.switchGeneration,
+        request,
         "quit-requested",
       );
       try {
@@ -188,8 +190,7 @@ export class DesktopSwitchController {
         throw recovery("ChatGPT did not quit cleanly");
       }
       await this.#ports.journal.advance(
-        request.idempotencyKey,
-        request.switchGeneration,
+        request,
         "source-quiesced",
       );
     }
@@ -201,8 +202,7 @@ export class DesktopSwitchController {
       throw error;
     }
     await this.#ports.journal.advance(
-      request.idempotencyKey,
-      request.switchGeneration,
+      request,
       "launch-requested",
     );
     let launched: DesktopProcessIdentity;
@@ -225,8 +225,7 @@ export class DesktopSwitchController {
       throw recovery("ChatGPT relaunch could not be verified");
     }
     await this.#ports.journal.advance(
-      request.idempotencyKey,
-      request.switchGeneration,
+      request,
       "target-observed",
       { launchedPid: observed.pid },
     );
@@ -235,6 +234,7 @@ export class DesktopSwitchController {
     const accountKey = await this.#ports.account.readAccountKey({
       profileId: request.targetProfileId,
       processGeneration: request.targetProcessGeneration,
+      providerAuthority: request.targetProviderAuthority,
       instance: {
         pid: observed.pid,
         executablePath: observed.executablePath,
@@ -248,8 +248,7 @@ export class DesktopSwitchController {
       throw recovery("ChatGPT opened with an unexpected account");
     }
     await this.#ports.journal.advance(
-      request.idempotencyKey,
-      request.switchGeneration,
+      request,
       "verified",
       { launchedPid: observed.pid },
     );
@@ -280,8 +279,7 @@ export class DesktopSwitchController {
 
   async #recovery(request: DesktopSwitchRequest, safeReason: string): Promise<void> {
     await this.#ports.journal.advance(
-      request.idempotencyKey,
-      request.switchGeneration,
+      request,
       "recovery-required",
       { safeReason },
     );
@@ -340,10 +338,27 @@ function validateSwitchRequest(request: DesktopSwitchRequest): void {
   }
   if (
     (request.sourceProfileId === null) !== (request.sourceProcessGeneration === null) ||
+    (request.sourceProfileId === null) !== (request.sourceProviderAuthority === null) ||
     (request.sourceProcessGeneration !== null &&
       (!Number.isSafeInteger(request.sourceProcessGeneration) || request.sourceProcessGeneration < 1))
   ) {
     throw new DesktopSwitchError("GENERATION_STALE", "source authority is incomplete");
+  }
+  const targetAuthority = providerAccountAuthoritySchema.parse(request.targetProviderAuthority);
+  const sourceAuthority = request.sourceProviderAuthority === null
+    ? null
+    : providerAccountAuthoritySchema.parse(request.sourceProviderAuthority);
+  if (
+    targetAuthority.provider !== "codex" ||
+    targetAuthority.profileId !== request.targetProfileId ||
+    targetAuthority.processGeneration !== request.targetProcessGeneration ||
+    (sourceAuthority !== null && (
+      sourceAuthority.provider !== "codex" ||
+      sourceAuthority.profileId !== request.sourceProfileId ||
+      sourceAuthority.processGeneration !== request.sourceProcessGeneration
+    ))
+  ) {
+    throw new DesktopSwitchError("GENERATION_STALE", "provider authority is inconsistent");
   }
   for (const [label, value, max] of [
     ["idempotency key", request.idempotencyKey, 256],

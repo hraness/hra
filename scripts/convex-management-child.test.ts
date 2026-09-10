@@ -6,9 +6,9 @@ import {
   type ManagementFetcher,
 } from "./convex-management-child";
 import {
-  HRA_CONVEX_PROJECT_ID,
-  HRA_CONVEX_TEAM_ID,
-  HRA_CONVEX_TEAM_SLUG,
+  OOMPA_CONVEX_PROJECT_ID,
+  OOMPA_CONVEX_TEAM_ID,
+  OOMPA_CONVEX_TEAM_SLUG,
   type ConvexTarget,
 } from "./convex-target";
 
@@ -16,19 +16,19 @@ const previousTarget: ConvexTarget = {
   deploymentId: 7_654_321,
   deploymentName: "steady-otter-321",
   deploymentUrl: "https://steady-otter-321.convex.cloud",
-  projectId: HRA_CONVEX_PROJECT_ID,
-  teamId: HRA_CONVEX_TEAM_ID,
+  projectId: OOMPA_CONVEX_PROJECT_ID,
+  teamId: OOMPA_CONVEX_TEAM_ID,
 };
 
 const replacementTarget: ConvexTarget = {
   deploymentId: 7_654_322,
   deploymentName: "patient-lynx-322",
   deploymentUrl: "https://patient-lynx-322.convex.cloud",
-  projectId: HRA_CONVEX_PROJECT_ID,
-  teamId: HRA_CONVEX_TEAM_ID,
+  projectId: OOMPA_CONVEX_PROJECT_ID,
+  teamId: OOMPA_CONVEX_TEAM_ID,
 };
 
-const replacementReference = "hra-replace-018f6c9a24d77a12a45f06d1e3c5b7a9";
+const replacementReference = "oompa-replace-018f6c9a24d77a12a45f06d1e3c5b7a9";
 
 type RecordedRequest = Readonly<{ init: RequestInit; url: URL }>;
 type DeploymentState = Readonly<{
@@ -85,24 +85,24 @@ const fixture = (options: Readonly<{
       return deployment === undefined
         ? json({ error: "missing" }, 404)
         : json({
-          project: "hra",
-          projectId: HRA_CONVEX_PROJECT_ID,
-          team: HRA_CONVEX_TEAM_SLUG,
-          teamId: HRA_CONVEX_TEAM_ID,
+          project: "oompa",
+          projectId: OOMPA_CONVEX_PROJECT_ID,
+          team: OOMPA_CONVEX_TEAM_SLUG,
+          teamId: OOMPA_CONVEX_TEAM_ID,
         });
     }
-    if (url.pathname === `/v1/projects/${String(HRA_CONVEX_PROJECT_ID)}` && init.method === "GET") {
+    if (url.pathname === `/v1/projects/${String(OOMPA_CONVEX_PROJECT_ID)}` && init.method === "GET") {
       const currentDefault = [...state.values()].find((deployment) => deployment.isDefault);
       return json({
-        id: HRA_CONVEX_PROJECT_ID,
+        id: OOMPA_CONVEX_PROJECT_ID,
         prodDeploymentName: currentDefault?.name ?? null,
-        slug: "hra",
-        teamId: HRA_CONVEX_TEAM_ID,
+        slug: "oompa",
+        teamId: OOMPA_CONVEX_TEAM_ID,
       });
     }
     if (
       url.pathname
-        === `/v1/projects/${String(HRA_CONVEX_PROJECT_ID)}/create_deployment`
+        === `/v1/projects/${String(OOMPA_CONVEX_PROJECT_ID)}/create_deployment`
       && init.method === "POST"
     ) {
       state.set(replacementTarget.deploymentName, replacementDeployment(false));
@@ -110,7 +110,7 @@ const fixture = (options: Readonly<{
     }
     if (
       url.pathname
-        === `/v1/projects/${String(HRA_CONVEX_PROJECT_ID)}/deployment`
+        === `/v1/projects/${String(OOMPA_CONVEX_PROJECT_ID)}/deployment`
       && init.method === "GET"
     ) {
       if (url.searchParams.get("reference") !== replacementReference) return json({}, 404);
@@ -129,7 +129,7 @@ const fixture = (options: Readonly<{
           id: deployment.id,
           isDefault: deployment.isDefault,
           name: deployment.name,
-          projectId: HRA_CONVEX_PROJECT_ID,
+          projectId: OOMPA_CONVEX_PROJECT_ID,
         });
     }
     if (deploymentPath !== null && init.method === "PATCH") {
@@ -177,7 +177,7 @@ describe("Convex target replacement management child", () => {
 
     const creation = management.calls.find((request) => request.init.method === "POST");
     expect(creation?.url.pathname).toBe(
-      `/v1/projects/${String(HRA_CONVEX_PROJECT_ID)}/create_deployment`,
+      `/v1/projects/${String(OOMPA_CONVEX_PROJECT_ID)}/create_deployment`,
     );
     expect(creation?.init.body).toBe(JSON.stringify({
       isDefault: false,
@@ -188,7 +188,7 @@ describe("Convex target replacement management child", () => {
     expect(management.calls.some((request) => request.init.method === "PATCH")).toBe(false);
     const reconciliation = management.calls.find((request) => (
       request.url.pathname
-        === `/v1/projects/${String(HRA_CONVEX_PROJECT_ID)}/deployment`
+        === `/v1/projects/${String(OOMPA_CONVEX_PROJECT_ID)}/deployment`
     ));
     expect(reconciliation?.url.searchParams.get("reference")).toBe(replacementReference);
     expect(management.state.get(previousTarget.deploymentName)?.isDefault).toBe(true);

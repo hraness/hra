@@ -33,6 +33,7 @@ import {
   MemoryCloudDaemonJournal,
   MemoryCloudSessionSyncCursor,
   parseCloudDaemonJournal,
+  unprovableProviderAuthorityProjectionRecoveryCode,
   bindCloudAttentionNotificationReconciliationState,
   emptyCloudAttentionNotificationReconciliationState,
   setCloudAttentionNotificationPending,
@@ -97,6 +98,7 @@ function doneLocalSessionPage(
 }
 const usageServerAdmissionMinIntervalMs = 24 * 60 * 60 * 1_000;
 const userPublicId = "user_12345678";
+const providerAccountId = "acct_00000000000000000000000000000001" as const;
 const key = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
 const testDeviceRegistry: DeviceRegistryPayload = {
   accounts: [],
@@ -1546,7 +1548,8 @@ class FakeLocal implements CloudDaemonLocalSourcePort {
   readonly events: CompactSessionEvent[];
   readonly sessionPublicId: string;
   readonly state: "idle" | "terminal";
-  profileGeneration = 1;
+  bindingGeneration = 1;
+  processGeneration = 1;
 
   constructor(
     sessionPublicId: string,
@@ -1594,9 +1597,12 @@ class FakeLocal implements CloudDaemonLocalSourcePort {
   async resolveCommandAuthority(input: { sessionPublicId: string }) {
     if (input.sessionPublicId !== this.sessionPublicId) return null;
     return {
+      bindingGeneration: this.bindingGeneration,
       localSessionId: this.sessionPublicId,
-      profileGeneration: this.profileGeneration,
-      profileId: "account_12345678",
+      processGeneration: this.processGeneration,
+      profileId: providerAccountId,
+      provider: "codex" as const,
+      providerAccountId,
       providerThreadId: "thread_12345678",
     };
   }
@@ -1629,9 +1635,12 @@ class EmptyLocal implements CloudDaemonLocalSourcePort {
   async resolveCommandAuthority(input: { sessionPublicId: string }) {
     if (input.sessionPublicId !== this.sessionPublicId) return null;
     return {
+      bindingGeneration: 1,
       localSessionId: input.sessionPublicId,
-      profileGeneration: 1,
-      profileId: "account_12345678",
+      processGeneration: 1,
+      profileId: providerAccountId,
+      provider: "codex" as const,
+      providerAccountId,
       providerThreadId: "thread_12345678",
     };
   }
@@ -1755,9 +1764,12 @@ class StalledProjectionLocal implements CloudDaemonLocalSourcePort {
   async resolveCommandAuthority(input: { sessionPublicId: string }) {
     if (input.sessionPublicId !== this.sessionPublicId) return null;
     return {
+      bindingGeneration: 1,
       localSessionId: this.sessionPublicId,
-      profileGeneration: 1,
-      profileId: "account_12345678",
+      processGeneration: 1,
+      profileId: providerAccountId,
+      provider: "codex" as const,
+      providerAccountId,
       providerThreadId: "thread_12345678",
     };
   }
@@ -1831,8 +1843,11 @@ class RecoveryLocal extends EmptyLocal {
       baselineCompletedTurns: [{ bodyDigest: "a".repeat(64), turnId: "turn_12345678" }],
       baselineInteractions: this.baselineInteractions,
       localAuthority: {
-        profileGeneration: 1,
-        profileId: "account_12345678",
+        bindingGeneration: 1,
+        processGeneration: 1,
+        profileId: providerAccountId,
+        provider: "codex" as const,
+        providerAccountId,
         providerThreadId: "thread_12345678",
         providerUpdatedAt: fixedNow,
         sessionRevision: 1,
@@ -2453,9 +2468,13 @@ function saturatedCommandJournal(
 }
 
 describe("cloud daemon bridge", () => {
-  test("control and daemon factories converge on one bound deployment before transport", async () => {
+  test.each(["legacy", "forward", "both"] as const)("control and daemon factories converge on one bound deployment before transport with %s aliases", async (alias) => {
     const custody = new DeploymentCustody();
-    const environment = { HRA_CONVEX_URL: "https://shared.convex.cloud/" };
+    const url = "https://shared.convex.cloud/";
+    const environment = {
+      ...(alias === "forward" ? {} : { HRA_CONVEX_URL: url }),
+      ...(alias === "legacy" ? {} : { OOMPA_CONVEX_URL: url }),
+    };
     let transportCalls = 0;
     const transport: CloudTransport = {
       action: async () => { transportCalls += 1; throw new Error("unexpected transport"); },
@@ -2486,6 +2505,43 @@ describe("cloud daemon bridge", () => {
       deploymentUrl: "https://shared.convex.cloud",
       version: 1,
     });
+    const before = [...custody.values];
+    let custodyCalls = 0;
+    const rejectCustody = async (): Promise<never> => { custodyCalls++; throw new Error("Unexpected custody access."); };
+    for (const deploymentUrl of [undefined, "https://shared.convex.cloud"]) {
+      await expect(createLocalCloudDaemonBridgeFromEnvironment({
+        daemonAuthority: { bootGeneration: 1, bootId: "boot_shared_target_12345678" },
+        daemonAuthorityFence: { assertCurrent: () => Promise.resolve() },
+        ...(deploymentUrl === undefined ? {} : { deploymentUrl }),
+        environment: { OOMPA_CONVEX_URL: url, HRA_CONVEX_URL: "https://shared.convex.cloud" },
+        executor: new RecordingExecutor(), local: new EmptyLocal(), registration: control,
+        secretCustody: { read: rejectCustody, compareAndSwap: rejectCustody, clearIfGeneration: rejectCustody },
+        transport,
+      })).rejects.toThrow("must be byte-identical");
+    }
+    expect(custodyCalls).toBe(0);
+    expect(transportCalls).toBe(0);
+    expect([...custody.values]).toEqual(before);
+    const ambientForward = process.env.OOMPA_CONVEX_URL;
+    const ambientLegacy = process.env.HRA_CONVEX_URL;
+    try {
+      process.env.OOMPA_CONVEX_URL = "https://unrelated-forward.convex.cloud";
+      process.env.HRA_CONVEX_URL = "https://unrelated-legacy.convex.cloud";
+      expect(await createLocalCloudDaemonBridgeFromEnvironment({
+        daemonAuthority: { bootGeneration: 1, bootId: "boot_shared_target_12345678" },
+        daemonAuthorityFence: { assertCurrent: () => Promise.resolve() },
+        deploymentUrl: "https://shared.convex.cloud",
+        executor: new RecordingExecutor(), local: new EmptyLocal(), registration: control,
+        secretCustody: custody, transport,
+      })).toBeInstanceOf(LocalCloudDaemonBridge);
+      expect(transportCalls).toBe(0);
+      expect([...custody.values]).toEqual(before);
+    } finally {
+      if (ambientForward === undefined) delete process.env.OOMPA_CONVEX_URL;
+      else process.env.OOMPA_CONVEX_URL = ambientForward;
+      if (ambientLegacy === undefined) delete process.env.HRA_CONVEX_URL;
+      else process.env.HRA_CONVEX_URL = ambientLegacy;
+    }
   });
 
   test("refuses stale deployment authority before identity credentials or transport", async () => {
@@ -3701,7 +3757,7 @@ describe("cloud daemon bridge", () => {
       .toBe("effect_started");
   });
 
-  test("rejects recovery custody under a different HRA user or source device", async () => {
+  test("rejects recovery custody under a different Oompa user or source device", async () => {
     for (const mismatch of ["user", "device"] as const) {
       const cloud = new FakeCloud();
       cloud.failEpochAfterEffectOnce = true;
@@ -3744,6 +3800,59 @@ describe("cloud daemon bridge", () => {
       expect((await journal.read()).state.projectionRecoveries[0]?.phase)
         .toBe("effect_started");
     }
+  });
+
+  test("quarantines provider-unbound legacy recovery evidence without replay", async () => {
+    const cloud = new FakeCloud();
+    cloud.failEpochAfterEffectOnce = true;
+    const sessionPublicId = "session_recover_legacy_provider_0001";
+    await installRecoverableHead(cloud, sessionPublicId);
+    const local = new RecoveryLocal(sessionPublicId);
+    const journal = new MemoryCloudDaemonJournal();
+    const daemon = bridge({ cloud, device: "device_11111111", journal, local });
+    const input = {
+      acknowledgeGap: true as const,
+      idempotencyKey: uuidV7(910),
+      sessionPublicId,
+      signal: new AbortController().signal,
+    };
+    await expect(daemon.recoverCompactProjection(input)).rejects.toThrow(
+      "lost compact epoch response",
+    );
+    const observed = await journal.read();
+    const current = observed.state.projectionRecoveries[0];
+    if (current === undefined) throw new Error("missing recovery fixture");
+    if (!("processGeneration" in current.localAuthority)) {
+      throw new Error("missing provider-bound recovery fixture");
+    }
+    const legacyLocalAuthority = {
+      profileGeneration: current.localAuthority.processGeneration,
+      profileId: current.localAuthority.profileId,
+      providerThreadId: current.localAuthority.providerThreadId,
+      providerUpdatedAt: current.localAuthority.providerUpdatedAt,
+      sessionRevision: current.localAuthority.sessionRevision,
+    };
+    expect(await journal.compareAndSwap(observed.generation, {
+      ...observed.state,
+      projectionRecoveries: [{
+        ...current,
+        localAuthority: legacyLocalAuthority,
+      } as typeof current],
+    })).not.toBeNull();
+    const mutationCalls = cloud.epochMutationCalls;
+
+    const cycled = await daemon.cycle(new AbortController().signal);
+    expect(cycled.errors.join(" ")).toContain("provider-unbound legacy effect");
+    expect(cloud.epochMutationCalls).toBe(mutationCalls);
+    expect(local.discardedRecoveryKeys).toContain(input.idempotencyKey);
+    expect((await journal.read()).state).toMatchObject({
+      projectionRecoveries: [],
+      projectionRecoveryReceipts: [{
+        idempotencyKey: input.idempotencyKey,
+        phase: "rejected",
+        rejectionCode: unprovableProviderAuthorityProjectionRecoveryCode,
+      }],
+    });
   });
 
   test("keeps remote provider commands pending while exact projection recovery is unsettled", async () => {
@@ -5405,7 +5514,16 @@ describe("cloud daemon bridge", () => {
     test(`drains a legacy ${serverState} session command without a provider effect`, async () => {
       const cloud = new FakeCloud();
       const executor = new RecordingExecutor();
-      const journal = new MemoryCloudDaemonJournal();
+      const recordedCommands: CloudCommandJournalEntry[] = [];
+      const journal = new class extends MemoryCloudDaemonJournal {
+        override async compareAndSwap(
+          ...args: Parameters<MemoryCloudDaemonJournal["compareAndSwap"]>
+        ) {
+          const committed = await super.compareAndSwap(...args);
+          if (committed !== null) recordedCommands.push(...committed.state.commands);
+          return committed;
+        }
+      }();
       const sessionPublicId = `session_legacy_${serverState}`;
       cloud.heads.set(sessionPublicId, {
         compactHeadSequence: 0,
@@ -5455,6 +5573,8 @@ describe("cloud daemon bridge", () => {
       expect(result.commandsApplied).toBe(0);
       expect(executor.calls).toEqual([]);
       expect(cloud.commandEffectStartCalls).toEqual([]);
+      expect(recordedCommands.length).toBeGreaterThan(0);
+      expect(recordedCommands.every((entry) => entry.localAuthority === null)).toBe(true);
       expect(cloud.requireCommand(commandPublicId)).toMatchObject({
         resultCode: serverState === "effect_started"
           ? "LOCAL_EFFECT_RECOVERY_REQUIRED"
@@ -6080,7 +6200,7 @@ describe("cloud daemon bridge", () => {
     expect(JSON.stringify(result)).not.toContain("\u001b");
   });
 
-  test("fails a no-effect prepared command after authority changes, then releases FIFO", async () => {
+  test("fails a no-effect prepared command after provider process authority changes, then releases FIFO", async () => {
     const cloud = new FakeCloud();
     const executor = new RecordingExecutor();
     const journal = new MemoryCloudDaemonJournal();
@@ -6103,7 +6223,20 @@ describe("cloud daemon bridge", () => {
     );
     cloud.failPrepareOnce = true;
     await adapter.cycle(new AbortController().signal);
-    expect((await journal.read()).state.commands[0]).toMatchObject({ phase: "prepared" });
+    const preparedEntry = (await journal.read()).state.commands[0];
+    expect(preparedEntry).toMatchObject({
+      localAuthority: {
+        bindingGeneration: 1,
+        localSessionId: sessionPublicId,
+        processGeneration: 1,
+        profileId: providerAccountId,
+        provider: "codex",
+        providerAccountId,
+        providerThreadId: "thread_12345678",
+      },
+      phase: "prepared",
+    });
+    expect(preparedEntry?.localAuthority).not.toHaveProperty("profileGeneration");
     const laterCommandPublicId = uuidV7(6);
     await cloud.enqueue(
       "device_22222222",
@@ -6129,7 +6262,7 @@ describe("cloud daemon bridge", () => {
       });
       await refreshRemoteCommandRequestDigest(cloud.requireCommand(publicId));
     }
-    local.profileGeneration = 2;
+    local.processGeneration = 2;
     const changed = await adapter.cycle(new AbortController().signal);
     expect(changed.errors).toEqual([]);
     expect(executor.calls).toHaveLength(0);
@@ -7282,7 +7415,7 @@ describe("device registry publication", () => {
         enrollment: "not_enrolled",
         head: { digest: digest("c"), operationSha256: null, sequence: 0 },
         lastExchangeAt: null,
-        projectLabel: "HRA",
+        projectLabel: "Oompa",
         recentRecords: [],
         recordCount: 0,
         remoteHead: null,

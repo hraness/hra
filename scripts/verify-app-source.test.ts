@@ -18,11 +18,11 @@ import {
   appSourceProofEvidenceSchema,
   executeAppSourceProof,
   executeRetainedAppSourceProofVerification,
-  hraAppAlias,
-  hraAppBuildSettingsDigest,
-  hraAppProjectId,
-  hraAppRepositoryId,
-  hraAppTeamId,
+  oompaAppAlias,
+  oompaAppBuildSettingsDigest,
+  oompaAppProjectId,
+  oompaAppRepositoryId,
+  oompaAppTeamId,
   parseAppSourceProofArguments,
   parseRetainedAppSourceProofArguments,
   readRetainedAppSourceProof,
@@ -66,30 +66,30 @@ const arguments_ = [
 
 const project = {
   ...buildSettings,
-  accountId: hraAppTeamId,
+  accountId: oompaAppTeamId,
   commandForIgnoringBuildStep: null,
-  id: hraAppProjectId,
+  id: oompaAppProjectId,
   link: {
     org: "hraness",
     productionBranch: "main",
-    repo: "hra",
-    repoId: hraAppRepositoryId,
+    repo: "oompa",
+    repoId: oompaAppRepositoryId,
     type: "github",
   },
-  name: "hra-app",
+  name: "oompa-app",
   skewProtectionMaxAge: 0,
 };
 
 const deployment = {
   gitSource: {
     ref: "main",
-    repoId: hraAppRepositoryId,
+    repoId: oompaAppRepositoryId,
     sha: sourceCommit,
     type: "github",
   },
   id: deploymentId,
   projectSettings: deploymentSettings,
-  projectId: hraAppProjectId,
+  projectId: oompaAppProjectId,
   readyState: "READY",
   source: "git",
   target: "production",
@@ -97,7 +97,7 @@ const deployment = {
 };
 const deploymentSnapshot = {
   prebuilt: false,
-  projectId: hraAppProjectId,
+  projectId: oompaAppProjectId,
   projectSettings: buildSettings,
   readyState: "READY",
   source: "git",
@@ -111,20 +111,20 @@ const deploymentList = {
 };
 
 const alias = {
-  alias: hraAppAlias,
+  alias: oompaAppAlias,
   deployment: { id: deploymentId, url: deploymentUrl },
   deploymentId,
-  projectId: hraAppProjectId,
-  uid: "alias-app-hra-sh",
+  projectId: oompaAppProjectId,
+  uid: "alias-app-oompa-sh",
   updatedAt: 1_788_706_800_000,
 };
 
 const projectDomain = {
-  apexName: "hra.sh",
+  apexName: "oompa.dev",
   customEnvironmentId: null,
   gitBranch: null,
-  name: hraAppAlias,
-  projectId: hraAppProjectId,
+  name: oompaAppAlias,
+  projectId: oompaAppProjectId,
   redirect: null,
   redirectStatusCode: null,
   verified: true,
@@ -146,8 +146,8 @@ const firewall = {
   firewallEnabled: true,
   id: "firewall-config-production",
   ips: [],
-  ownerId: hraAppTeamId,
-  projectKey: hraAppProjectId,
+  ownerId: oompaAppTeamId,
+  projectKey: oompaAppProjectId,
   rules: [],
   rulesets: [],
   updatedAt: "2026-09-06T14:00:00.000Z",
@@ -157,8 +157,8 @@ const routeVersions = { versions: [] };
 
 const marker = {
   generation: 1,
-  product: "HRA App",
-  repository: { id: hraAppRepositoryId, path: "hraness/hra" },
+  product: "Oompa App",
+  repository: { id: oompaAppRepositoryId, path: "hraness/oompa" },
   schemaVersion: 1,
   source: { commit: sourceCommit },
   version: releaseVersion,
@@ -187,13 +187,13 @@ const redigestProof = (
 
 const providerUrl = (path: string): string => {
   const url = new URL(path, "https://api.vercel.com");
-  url.searchParams.set("teamId", hraAppTeamId);
+  url.searchParams.set("teamId", oompaAppTeamId);
   return url.href;
 };
 
-const markerUrl = `https://${hraAppAlias}/.well-known/hra-app.json?proof=${nonce}`;
+const markerUrl = `https://${oompaAppAlias}/.well-known/oompa-app.json?proof=${nonce}`;
 const deploymentListUrl = (until?: number): string => providerUrl(
-  `/v7/deployments?projectId=${hraAppProjectId}`
+  `/v7/deployments?projectId=${oompaAppProjectId}`
     + "&target=production&state=READY&branch=main"
     + `&sha=${sourceCommit}&limit=20${until === undefined ? "" : `&until=${until}`}`,
 );
@@ -262,42 +262,42 @@ const providerSample = (
   return [
     {
       document: documents.projectDocument,
-      url: providerUrl(`/v9/projects/${hraAppProjectId}`),
+      url: providerUrl(`/v9/projects/${oompaAppProjectId}`),
     },
     {
       document: documents.projectDomainDocument,
-      url: providerUrl(`/v9/projects/${hraAppProjectId}/domains/${hraAppAlias}`),
+      url: providerUrl(`/v9/projects/${oompaAppProjectId}/domains/${oompaAppAlias}`),
     },
     {
       document: documents.domainConfigDocument,
       url: providerUrl(
-        `/v6/domains/${hraAppAlias}/config?projectIdOrName=${hraAppProjectId}`,
+        `/v6/domains/${oompaAppAlias}/config?projectIdOrName=${oompaAppProjectId}`,
       ),
     },
     {
       document: documents.rollingReleaseDocument,
-      url: providerUrl(`/v1/projects/${hraAppProjectId}/rolling-release`),
+      url: providerUrl(`/v1/projects/${oompaAppProjectId}/rolling-release`),
     },
     {
       document: documents.bulkRedirectDocument,
       url: providerUrl(
-        `/v1/bulk-redirects?projectId=${hraAppProjectId}&page=1&per_page=1`,
+        `/v1/bulk-redirects?projectId=${oompaAppProjectId}&page=1&per_page=1`,
       ),
     },
     {
       document: documents.firewallDocument,
       url: providerUrl(
-        `/v1/security/firewall/config/active?projectId=${hraAppProjectId}`,
+        `/v1/security/firewall/config/active?projectId=${oompaAppProjectId}`,
       ),
     },
     {
       document: documents.routeVersionsDocument,
-      url: providerUrl(`/v1/projects/${hraAppProjectId}/routes/versions`),
+      url: providerUrl(`/v1/projects/${oompaAppProjectId}/routes/versions`),
     },
     ...(overrides.exactRoutes === undefined ? [] : [{
       document: overrides.exactRoutes.document,
       url: providerUrl(
-        `/v1/projects/${hraAppProjectId}/routes?versionId=${overrides.exactRoutes.versionId}`,
+        `/v1/projects/${oompaAppProjectId}/routes?versionId=${overrides.exactRoutes.versionId}`,
       ),
     }]),
     ...deploymentListPages.map((page) => ({
@@ -310,7 +310,7 @@ const providerSample = (
     },
     {
       document: documents.aliasDocument,
-      url: providerUrl(`/v4/aliases/${hraAppAlias}`),
+      url: providerUrl(`/v4/aliases/${oompaAppAlias}`),
     },
   ];
 };
@@ -388,33 +388,33 @@ const execute = async (
   };
 };
 
-describe("HRA browser app source proof", () => {
+describe("Oompa browser app source proof", () => {
   test("sandwiches the strict public marker between complete authenticated provider samples", async () => {
     const result = await execute(completePlan());
     expect(result.code).toBe(0);
     expect(result.stderr).toBe("");
     expect(result.requests.map((request) => request.url)).toEqual([
-      providerUrl(`/v9/projects/${hraAppProjectId}`),
-      providerUrl(`/v9/projects/${hraAppProjectId}/domains/${hraAppAlias}`),
-      providerUrl(`/v6/domains/${hraAppAlias}/config?projectIdOrName=${hraAppProjectId}`),
-      providerUrl(`/v1/projects/${hraAppProjectId}/rolling-release`),
-      providerUrl(`/v1/bulk-redirects?projectId=${hraAppProjectId}&page=1&per_page=1`),
-      providerUrl(`/v1/security/firewall/config/active?projectId=${hraAppProjectId}`),
-      providerUrl(`/v1/projects/${hraAppProjectId}/routes/versions`),
+      providerUrl(`/v9/projects/${oompaAppProjectId}`),
+      providerUrl(`/v9/projects/${oompaAppProjectId}/domains/${oompaAppAlias}`),
+      providerUrl(`/v6/domains/${oompaAppAlias}/config?projectIdOrName=${oompaAppProjectId}`),
+      providerUrl(`/v1/projects/${oompaAppProjectId}/rolling-release`),
+      providerUrl(`/v1/bulk-redirects?projectId=${oompaAppProjectId}&page=1&per_page=1`),
+      providerUrl(`/v1/security/firewall/config/active?projectId=${oompaAppProjectId}`),
+      providerUrl(`/v1/projects/${oompaAppProjectId}/routes/versions`),
       deploymentListUrl(),
       providerUrl(`/v13/deployments/${deploymentId}?withGitRepoInfo=true`),
-      providerUrl(`/v4/aliases/${hraAppAlias}`),
+      providerUrl(`/v4/aliases/${oompaAppAlias}`),
       markerUrl,
-      providerUrl(`/v9/projects/${hraAppProjectId}`),
-      providerUrl(`/v9/projects/${hraAppProjectId}/domains/${hraAppAlias}`),
-      providerUrl(`/v6/domains/${hraAppAlias}/config?projectIdOrName=${hraAppProjectId}`),
-      providerUrl(`/v1/projects/${hraAppProjectId}/rolling-release`),
-      providerUrl(`/v1/bulk-redirects?projectId=${hraAppProjectId}&page=1&per_page=1`),
-      providerUrl(`/v1/security/firewall/config/active?projectId=${hraAppProjectId}`),
-      providerUrl(`/v1/projects/${hraAppProjectId}/routes/versions`),
+      providerUrl(`/v9/projects/${oompaAppProjectId}`),
+      providerUrl(`/v9/projects/${oompaAppProjectId}/domains/${oompaAppAlias}`),
+      providerUrl(`/v6/domains/${oompaAppAlias}/config?projectIdOrName=${oompaAppProjectId}`),
+      providerUrl(`/v1/projects/${oompaAppProjectId}/rolling-release`),
+      providerUrl(`/v1/bulk-redirects?projectId=${oompaAppProjectId}&page=1&per_page=1`),
+      providerUrl(`/v1/security/firewall/config/active?projectId=${oompaAppProjectId}`),
+      providerUrl(`/v1/projects/${oompaAppProjectId}/routes/versions`),
       deploymentListUrl(),
       providerUrl(`/v13/deployments/${deploymentId}?withGitRepoInfo=true`),
-      providerUrl(`/v4/aliases/${hraAppAlias}`),
+      providerUrl(`/v4/aliases/${oompaAppAlias}`),
     ]);
     for (const [index, request] of result.requests.entries()) {
       const headers = new Headers(request.init?.headers);
@@ -429,14 +429,14 @@ describe("HRA browser app source proof", () => {
     expect(Buffer.byteLength(result.stdout, "utf8")).toBeLessThan(4_096);
     expect(result.stdout).not.toContain(accessToken);
     expect(JSON.parse(result.stdout)).toEqual({
-      alias: hraAppAlias,
+      alias: oompaAppAlias,
       aliasUid: alias.uid,
       aliasUpdatedAt: alias.updatedAt,
       branch: "main",
       bulkRedirectVersionId: null,
       cacheControl: "no-store",
       completedAt: "2026-09-06T14:00:01.000Z",
-      deploymentBuildSettingsDigest: hraAppBuildSettingsDigest,
+      deploymentBuildSettingsDigest: oompaAppBuildSettingsDigest,
       deploymentId,
       deploymentUrl,
       domainConfiguredBy: "CNAME",
@@ -447,11 +447,11 @@ describe("HRA browser app source proof", () => {
       marker,
       observationBoundary: "sequential-readback-without-provider-lock",
       projectBuildSettingsDigest: expect.stringMatching(/^[a-f0-9]{64}$/u),
-      projectId: hraAppProjectId,
+      projectId: oompaAppProjectId,
       projectRouteVersionId: null,
       readyState: "READY",
       releaseVersion,
-      repositoryId: hraAppRepositoryId,
+      repositoryId: oompaAppRepositoryId,
       rollingReleaseState: null,
       schemaVersion: 2,
       selfDigest: expect.stringMatching(/^[a-f0-9]{64}$/u),
@@ -461,7 +461,7 @@ describe("HRA browser app source proof", () => {
       sourceRemoteMainCommit: sourceCommit,
       startedAt: "2026-09-06T14:00:00.000Z",
       target: "production",
-      teamId: hraAppTeamId,
+      teamId: oompaAppTeamId,
       verifierIndexTransparent: true,
       verifierSourceCommit: sourceCommit,
       verifierTrackedAndUntrackedClean: true,
@@ -517,7 +517,7 @@ describe("HRA browser app source proof", () => {
   });
 
   test("publishes optional operator evidence as one protected no-replace file", async () => {
-    const root = mkdtempSync(join(realpathSync(tmpdir()), "hra-app-source-evidence-"));
+    const root = mkdtempSync(join(realpathSync(tmpdir()), "oompa-app-source-evidence-"));
     const path = join(root, "proof.json");
     const proofArguments = [...arguments_];
     proofArguments[proofArguments.indexOf("--evidence-path") + 1] = path;
@@ -579,7 +579,7 @@ describe("HRA browser app source proof", () => {
   test("strictly revalidates retained proof digest, bindings, and requested source", async () => {
     const generated = await execute(completePlan());
     const proof = generated.evidence[0] as AppSourceProofEvidence;
-    const root = mkdtempSync(join(realpathSync(tmpdir()), "hra-app-source-retained-"));
+    const root = mkdtempSync(join(realpathSync(tmpdir()), "oompa-app-source-retained-"));
     const path = join(root, "proof.json");
     try {
       writeFileSync(path, `${JSON.stringify(proof)}\n`, { mode: 0o600 });
@@ -654,7 +654,7 @@ describe("HRA browser app source proof", () => {
   test("strictly recovers an interrupted no-replace proof publication", async () => {
     const generated = await execute(completePlan());
     const proof = generated.evidence[0] as AppSourceProofEvidence;
-    const root = mkdtempSync(join(realpathSync(tmpdir()), "hra-app-source-interrupted-"));
+    const root = mkdtempSync(join(realpathSync(tmpdir()), "oompa-app-source-interrupted-"));
     const path = join(root, "proof.json");
     const temporary = join(root, ".proof.json.0123456789abcdef0123456789abcdef.tmp");
     try {
@@ -826,7 +826,7 @@ describe("HRA browser app source proof", () => {
     const otherDeployment = {
       ...deploymentSnapshot,
       uid: "dpl_OtherSourceProof123456789012345",
-      url: "hra-app-other-source-proof-hraness.vercel.app",
+      url: "oompa-app-other-source-proof-hraness.vercel.app",
     };
     const sample = (): readonly PlannedResponse[] => providerSample({
       deploymentListPages: [{
@@ -917,7 +917,7 @@ describe("HRA browser app source proof", () => {
         ...alias,
         microfrontends: {
           applications: [{ fallbackHost: "other.vercel.app", projectId: "prj_other" }],
-          defaultApp: { projectId: hraAppProjectId },
+          defaultApp: { projectId: oompaAppProjectId },
         },
       } }),
     ]) {
@@ -1134,11 +1134,11 @@ describe("HRA browser app source proof", () => {
     for (const planned of [{
         document: { secret: "provider-private-document" },
         responseUrl: "https://attacker.invalid/project",
-        url: providerUrl(`/v9/projects/${hraAppProjectId}`),
+        url: providerUrl(`/v9/projects/${oompaAppProjectId}`),
       }, {
         document: { secret: "provider-private-document" },
         redirected: true,
-        url: providerUrl(`/v9/projects/${hraAppProjectId}`),
+        url: providerUrl(`/v9/projects/${oompaAppProjectId}`),
       }]) {
       const hostile = await execute([planned]);
       expect(hostile.code).toBe(1);
@@ -1154,7 +1154,7 @@ describe("HRA browser app source proof", () => {
   test("bounds provider and public marker response bodies", async () => {
     const oversizedProvider = await execute([{
       document: "x".repeat(128 * 1024 + 1),
-      url: providerUrl(`/v9/projects/${hraAppProjectId}`),
+      url: providerUrl(`/v9/projects/${oompaAppProjectId}`),
     }]);
     expect(oversizedProvider.code).toBe(1);
     expect(oversizedProvider.stdout).toBe("");

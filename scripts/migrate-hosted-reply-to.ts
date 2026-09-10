@@ -6,8 +6,8 @@ import { makeFunctionReference } from "convex/server";
 import { z } from "zod";
 
 import {
-  defaultHraOtpReplyTo,
-  hraOtpReplyToEnvironmentName,
+  defaultOompaOtpReplyTo,
+  oompaOtpReplyToEnvironmentName,
 } from "../convex/otpEmailConfig";
 import { createBoundedAuthorityFetch, type AuthorityFetcher } from "./bounded-authority-fetch";
 import {
@@ -61,7 +61,7 @@ const digestPattern = /^[0-9a-f]{64}$/u;
 type HostedEnvironmentName = (typeof HOSTED_ENVIRONMENT_NAMES)[number];
 type ReplyToMigrationPrerequisite = Exclude<
   HostedEnvironmentName,
-  typeof hraOtpReplyToEnvironmentName
+  typeof oompaOtpReplyToEnvironmentName
 >;
 
 export const HOSTED_REPLY_TO_MIGRATION_PREREQUISITES:
@@ -69,20 +69,20 @@ readonly ReplyToMigrationPrerequisite[] = [
   "SITE_URL",
   "JWT_PRIVATE_KEY",
   "JWKS",
-  "HRA_AUTH_HMAC_SECRET",
-  "HRA_RESEND_API_KEY",
+  "OOMPA_AUTH_HMAC_SECRET",
+  "OOMPA_RESEND_API_KEY",
 ];
 
-export const HOSTED_REPLY_TO_LEGACY_PREREQUISITE = "HRA_AUTH_EMAIL_FROM" as const;
+export const HOSTED_REPLY_TO_LEGACY_PREREQUISITE = "OOMPA_AUTH_EMAIL_FROM" as const;
 
 const hostedReplyToMigrationRequiredNames = [
   ...HOSTED_REPLY_TO_MIGRATION_PREREQUISITES,
   HOSTED_REPLY_TO_LEGACY_PREREQUISITE,
-  hraOtpReplyToEnvironmentName,
+  oompaOtpReplyToEnvironmentName,
 ] as const;
 
 export const HOSTED_REPLY_TO_VALUE_DIGEST = createHash("sha256")
-  .update(defaultHraOtpReplyTo, "utf8")
+  .update(defaultOompaOtpReplyTo, "utf8")
   .digest("hex");
 
 const bindingFields = {
@@ -254,13 +254,13 @@ const setArguments = (deployment: string): readonly string[] => [
 const getArguments = (deployment: string): readonly string[] => [
   "env",
   "get",
-  hraOtpReplyToEnvironmentName,
+  oompaOtpReplyToEnvironmentName,
   "--deployment",
   deployment,
 ];
 
 export const serializeHostedReplyToMigration = (): string =>
-  `${hraOtpReplyToEnvironmentName}='${defaultHraOtpReplyTo}'\n`;
+  `${oompaOtpReplyToEnvironmentName}='${defaultOompaOtpReplyTo}'\n`;
 
 type ReleaseAttestationReader = (
   target: ConvexTarget,
@@ -352,7 +352,7 @@ export async function migrateHostedReplyTo(
     ?? readRuntimeReleaseAttestation(options.authorityFetch ?? fetch);
   const environment = buildConvexChildEnvironment(
     options.environment ?? process.env,
-    [defaultHraOtpReplyTo],
+    [defaultOompaOtpReplyTo],
   );
   const guard = new BoundedProcessInvocationGuard();
   const invokeGit = async (
@@ -447,7 +447,7 @@ export async function migrateHostedReplyTo(
     if (
       result.exitCode !== 0
       || result.stderr !== ""
-      || result.stdout !== `${defaultHraOtpReplyTo}\n`
+      || result.stdout !== `${defaultOompaOtpReplyTo}\n`
     ) throw new HostedReplyToMigrationError("reply_to_value_conflict");
   };
   const requireCompleteEnvironment = async (): Promise<void> => {
@@ -598,7 +598,7 @@ export async function migrateHostedReplyTo(
   await proveBinding();
   const preflightNames = await readNames("hosted-reply-to-preflight-names");
   requirePrerequisites(preflightNames);
-  if (preflightNames.has(hraOtpReplyToEnvironmentName)) {
+  if (preflightNames.has(oompaOtpReplyToEnvironmentName)) {
     throw new HostedReplyToMigrationError("reply_to_already_configured");
   }
   writeProtectedJsonNoReplace(
@@ -613,7 +613,7 @@ export async function migrateHostedReplyTo(
   await proveBinding();
   const freshNames = await readNames("hosted-reply-to-prewrite-names");
   requirePrerequisites(freshNames);
-  if (freshNames.has(hraOtpReplyToEnvironmentName)) {
+  if (freshNames.has(oompaOtpReplyToEnvironmentName)) {
     await requireCompleteEnvironment();
   } else {
     await proveBinding();

@@ -39,10 +39,10 @@ import {
 } from "@hraness/oh/store";
 
 import {
-  type HraMemoryExplainInput,
-  type HraMemoryQueryInput,
-  type HraMemoryRememberInput,
-  type HraMemoryShareInput,
+  type OompaMemoryExplainInput,
+  type OompaMemoryQueryInput,
+  type OompaMemoryRememberInput,
+  type OompaMemoryShareInput,
 } from "../domain/host-tools.ts";
 import {
   memoryPageContentDigest,
@@ -54,7 +54,7 @@ import { createFactsMemoryBinding, type FactsMemoryHead } from "../domain/facts-
 import {
   createPortableProjectMemoryCanonicalIdentity,
   deriveProjectMemoryCanonicalIdentity,
-  HRA_CANONICAL_MEMORY_OPERATION_MAX_BYTES,
+  OOMPA_CANONICAL_MEMORY_OPERATION_MAX_BYTES,
   PROJECT_MEMORY_DESTINATION_PURPOSE,
   PROJECT_MEMORY_EMPTY_HEAD,
 } from "../domain/project-memory.ts";
@@ -80,8 +80,8 @@ import {
   type ProjectMemoryHeadRef,
   type StateStore,
 } from "../storage/state-store.ts";
-import type { HraFactsMemoryLifecyclePort } from "./facts-memory-lifecycle.ts";
-import type { HraCanonicalMemorySyncPort } from "./canonical-memory-sync.ts";
+import type { OompaFactsMemoryLifecyclePort } from "./facts-memory-lifecycle.ts";
+import type { OompaCanonicalMemorySyncPort } from "./canonical-memory-sync.ts";
 import { ProjectMemorySerialExecutor } from "./project-memory-serial.ts";
 
 const MEMORY_QUERY_CACHE_LIMIT = 128;
@@ -110,7 +110,7 @@ const MEMORY_SEARCH_POLICY = Object.freeze({
   maximumQueryTerms: MEMORY_QUERY_TOKEN_LIMIT,
 });
 
-export type HraMemoryRefusalCode =
+export type OompaMemoryRefusalCode =
   | "MEMORY_CONTINUATION_REFUSED"
   | "MEMORY_CANONICAL_FROZEN"
   | "MEMORY_PROJECT_REFUSED"
@@ -121,14 +121,14 @@ export type HraMemoryRefusalCode =
   | "MEMORY_SHARE_ATTESTATION_REFUSED"
   | "MEMORY_SHARE_CLOSURE_REFUSED";
 
-export class HraMemoryRefusalError extends Error {
-  constructor(readonly code: HraMemoryRefusalCode) {
+export class OompaMemoryRefusalError extends Error {
+  constructor(readonly code: OompaMemoryRefusalCode) {
     super(code);
-    this.name = "HraMemoryRefusalError";
+    this.name = "OompaMemoryRefusalError";
   }
 }
 
-export interface HraMemoryPort {
+export interface OompaMemoryPort {
   status(input: Readonly<{
     actorSessionId: string;
   }>): Promise<Readonly<Record<string, unknown>>>;
@@ -136,21 +136,21 @@ export interface HraMemoryPort {
     actorSessionId: string;
     idempotencyKey: string;
     requestDigest: string;
-    value: HraMemoryRememberInput;
+    value: OompaMemoryRememberInput;
   }>): Promise<Readonly<Record<string, unknown>>>;
   query(input: Readonly<{
     actorSessionId: string;
-    value: HraMemoryQueryInput;
+    value: OompaMemoryQueryInput;
   }>): Promise<Readonly<Record<string, unknown>>>;
   explain(input: Readonly<{
     actorSessionId: string;
-    value: HraMemoryExplainInput;
+    value: OompaMemoryExplainInput;
   }>): Promise<Readonly<Record<string, unknown>>>;
   share(input: Readonly<{
     actorSessionId: string;
     idempotencyKey: string;
     requestDigest: string;
-    value: HraMemoryShareInput;
+    value: OompaMemoryShareInput;
   }>): Promise<Readonly<Record<string, unknown>>>;
   recover(): Promise<void>;
   forgetSession(actorSessionId: string): void;
@@ -884,10 +884,10 @@ const adoptionReceiptDigest = (input: Readonly<{
   v: 1,
 });
 
-export class HraOhMemoryCoordinator implements HraMemoryPort {
+export class OompaOhMemoryCoordinator implements OompaMemoryPort {
   readonly #continuationKey: Uint8Array;
   readonly #engine: OhSqliteFactsMemoryEngine;
-  readonly #factsMemory: HraFactsMemoryLifecyclePort;
+  readonly #factsMemory: OompaFactsMemoryLifecyclePort;
   readonly #monotonicNow: () => number;
   readonly #now: () => number;
   readonly #paths: StatePaths;
@@ -898,7 +898,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
   readonly #getDatasets = new Map<string, GetDataset>();
   #getBytes = 0;
   readonly #store: StateStore;
-  readonly #sync: HraCanonicalMemorySyncPort | undefined;
+  readonly #sync: OompaCanonicalMemorySyncPort | undefined;
   readonly #projectSerial: ProjectMemorySerialExecutor;
   readonly #workingTtlMs: number;
   #closed = false;
@@ -906,13 +906,13 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
   constructor(input: Readonly<{
     continuationKey?: Uint8Array;
     engine: OhSqliteFactsMemoryEngine;
-    factsMemory: HraFactsMemoryLifecyclePort;
+    factsMemory: OompaFactsMemoryLifecyclePort;
     monotonicNow?: () => number;
     now?: () => number;
     paths: StatePaths;
     projectSerial?: ProjectMemorySerialExecutor;
     store: StateStore;
-    sync?: HraCanonicalMemorySyncPort;
+    sync?: OompaCanonicalMemorySyncPort;
     workingTtlMs?: number;
   }>) {
     this.#continuationKey = Uint8Array.from(input.continuationKey ?? randomBytes(32));
@@ -992,7 +992,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
         ? null
         : projectIdSchema.parse(currentSession.projectId);
       if (currentProjectId !== projectId) {
-        throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+        throw new OompaMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
       }
       const lifecycle = this.#factsMemory.readSession(actorSessionId);
       const control = projectId === null
@@ -1069,7 +1069,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
     actorSessionId: string;
     idempotencyKey: string;
     requestDigest: string;
-    value: HraMemoryRememberInput;
+    value: OompaMemoryRememberInput;
   }>): Promise<Readonly<Record<string, unknown>>> {
     const actorSessionId = sessionIdSchema.parse(input.actorSessionId);
     const contentDigest = memoryContentDigest(input.value);
@@ -1100,12 +1100,12 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
             return { terminal: prepared.record } as const;
           }
           if (prepared.record.state !== "prepared") {
-            throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+            throw new OompaMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
           }
           if (!projectHeadsEqual(
             prepared.record.expectedHead,
             toProjectHead(stores.working.expectedHead),
-          )) throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+          )) throw new OompaMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
           const authority = await this.#authority(context, stores, prepared.record.createdAt);
           const snapshot = await stores.working.store.snapshot({
             head: {
@@ -1253,7 +1253,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
 
   query(input: Readonly<{
     actorSessionId: string;
-    value: HraMemoryQueryInput;
+    value: OompaMemoryQueryInput;
   }>): Promise<Readonly<Record<string, unknown>>> {
     const actorSessionId = sessionIdSchema.parse(input.actorSessionId);
     const scope = input.value.scope ?? "composite";
@@ -1267,7 +1267,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
   async #queryScoped(
     context: WorkingMemoryContext,
     actorSessionId: string,
-    value: HraMemoryQueryInput,
+    value: OompaMemoryQueryInput,
     scope: MemoryQueryScope,
   ): Promise<Readonly<Record<string, unknown>>> {
       if (scope === "composite") this.#assertProjectRecovered(context.projectId);
@@ -1286,13 +1286,13 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
             ? memoryQueryTokens(value.text)
             : [];
           if (tokens.length > MEMORY_QUERY_TOKEN_LIMIT) {
-            throw new HraMemoryRefusalError("MEMORY_SEARCH_TERM_LIMIT");
+            throw new OompaMemoryRefusalError("MEMORY_SEARCH_TERM_LIMIT");
           }
           if (
             value.mode === "search"
             && tokens.length === 0
             && value.continuation !== undefined
-          ) throw new HraMemoryRefusalError("MEMORY_CONTINUATION_REFUSED");
+          ) throw new OompaMemoryRefusalError("MEMORY_CONTINUATION_REFUSED");
           if (value.mode === "search" && tokens.length === 0) {
             return { emptySearch: true, explanations: [], query: null } as const;
           }
@@ -1450,7 +1450,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
         };
       } catch (error: unknown) {
         if (error instanceof OhMemoryContinuationError) {
-          throw new HraMemoryRefusalError("MEMORY_CONTINUATION_REFUSED");
+          throw new OompaMemoryRefusalError("MEMORY_CONTINUATION_REFUSED");
         }
         throw error;
       }
@@ -1477,7 +1477,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
         opened.control.head,
       )) {
         this.#recordCanonicalDivergence(context.projectId);
-        throw new HraMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
+        throw new OompaMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
       }
     } else if (opened.control !== null || opened.canonicalHead !== null) {
       throw new Error("MEMORY_WORKING_ONLY_CANONICAL_EXPOSURE");
@@ -1486,12 +1486,12 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
       headDigest: context.working.expectedHead.digest,
       operationSha256: context.working.expectedHead.operationSha256,
       sequence: context.working.expectedHead.sequence,
-    })) throw new HraMemoryRefusalError("MEMORY_CONTINUATION_REFUSED");
+    })) throw new OompaMemoryRefusalError("MEMORY_CONTINUATION_REFUSED");
   }
 
   async explain(input: Readonly<{
     actorSessionId: string;
-    value: HraMemoryExplainInput;
+    value: OompaMemoryExplainInput;
   }>): Promise<Readonly<Record<string, unknown>>> {
     if (this.#closed) throw new Error("MEMORY_COORDINATOR_CLOSED");
     const actorSessionId = sessionIdSchema.parse(input.actorSessionId);
@@ -1510,10 +1510,10 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
         || query.projectId !== context.projectId
         || query.expiresAtMonotonic <= this.#monotonicNow()
         || explanation === undefined
-      ) throw new HraMemoryRefusalError("MEMORY_QUERY_EXPIRED");
+      ) throw new OompaMemoryRefusalError("MEMORY_QUERY_EXPIRED");
       if (query.scope === "composite") this.#assertProjectRecovered(context.projectId);
       if (context.working.binding.bindingDigest !== query.workingBindingDigest) {
-        throw new HraMemoryRefusalError("MEMORY_QUERY_EXPIRED");
+        throw new OompaMemoryRefusalError("MEMORY_QUERY_EXPIRED");
       }
       return {
         version: 1,
@@ -1537,18 +1537,18 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
     actorSessionId: string;
     idempotencyKey: string;
     requestDigest: string;
-    value: HraMemoryShareInput;
+    value: OompaMemoryShareInput;
   }>): Promise<Readonly<Record<string, unknown>>> {
     const actorSessionId = sessionIdSchema.parse(input.actorSessionId);
     const initialSession = this.#store.requireSession(actorSessionId);
     if (initialSession.state === "terminal") {
-      throw new HraMemoryRefusalError("MEMORY_SESSION_REFUSED");
+      throw new OompaMemoryRefusalError("MEMORY_SESSION_REFUSED");
     }
     if (initialSession.state === "recovery_required") {
-      throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+      throw new OompaMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
     }
     if (initialSession.projectId === undefined) {
-      throw new HraMemoryRefusalError("MEMORY_PROJECT_REFUSED");
+      throw new OompaMemoryRefusalError("MEMORY_PROJECT_REFUSED");
     }
     const initialProjectId = projectIdSchema.parse(initialSession.projectId);
     const contentDigest = canonicalSha256({ reason: input.value.reason, v: 1 });
@@ -1592,12 +1592,12 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
       || initialAttachment?.state === "error"
       || initialAuthority?.syncState === "conflict"
       || initialAuthority?.syncState === "error"
-    ) throw new HraMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
+    ) throw new OompaMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
     if (
       initialAttachment !== null
       && initialAttachment.state !== "detached"
       && this.#sync === undefined
-    ) throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+    ) throw new OompaMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
     await this.#sync?.synchronizeProject({
       projectId: initialProjectId,
       reason: "before_canonical_mutation",
@@ -1618,7 +1618,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
             const observedProjectHead = toProjectHead(observedHead);
             if (!projectHeadsEqual(observedProjectHead, control.head)) {
               this.#recordCanonicalDivergence(context.projectId);
-              throw new HraMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
+              throw new OompaMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
             }
           }
           const prepared = this.#prepareSubmission({
@@ -1646,20 +1646,20 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
             } as const;
           }
           if (prepared.record.state !== "prepared") {
-            throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+            throw new OompaMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
           }
           if (control.syncState === "conflict" || control.syncState === "error") {
-            throw new HraMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
+            throw new OompaMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
           }
           // A prepared share is replayable, but it is not yet authorized to
           // cross a hosted-sync fence. Recheck after loading that durable row:
           // a sync intent may have won after preparation and before dispatch.
           if (this.#store.isCanonicalMemoryMutationFenced(context.projectId)) {
-            throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+            throw new OompaMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
           }
           this.#assertHostedCanonicalHeadCurrent(context.projectId);
           if (!projectHeadsEqual(prepared.record.expectedHead, control.head)) {
-            throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+            throw new OompaMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
           }
           const authority = await this.#authority(context, stores, prepared.record.createdAt);
           const nomination = await authority.agent.nominate({
@@ -1676,22 +1676,22 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
             || nomination.closure.roots.length !== 1
             || nomination.closure.roots[0] !== physicalKey(input.value.key)
             || nomination.closure.records.length !== 1
-          ) throw new HraMemoryRefusalError("MEMORY_SHARE_CLOSURE_REFUSED");
+          ) throw new OompaMemoryRefusalError("MEMORY_SHARE_CLOSURE_REFUSED");
           const page = parseOhMemoryPageRecordV1(nomination.closure.records[0]);
           if (
             page === null
             || page.key !== physicalKey(input.value.key)
             || page.dependencies.length !== 0
-          ) throw new HraMemoryRefusalError("MEMORY_SHARE_CLOSURE_REFUSED");
+          ) throw new OompaMemoryRefusalError("MEMORY_SHARE_CLOSURE_REFUSED");
           if (!this.#isAttestedPage(context, page, keyDigest, "working")) {
-            throw new HraMemoryRefusalError("MEMORY_SHARE_ATTESTATION_REFUSED");
+            throw new OompaMemoryRefusalError("MEMORY_SHARE_ATTESTATION_REFUSED");
           }
           const dispatchHead = parseOhHeadV1(await stores.canonical.store.head());
           if (dispatchHead === null) throw new Error("MEMORY_CANONICAL_HEAD_INVALID");
           const dispatchProjectHead = toProjectHead(dispatchHead);
           if (!projectHeadsEqual(dispatchProjectHead, control.head)) {
             this.#recordCanonicalDivergence(context.projectId);
-            throw new HraMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
+            throw new OompaMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
           }
           const operationId = adoptionOperationId({
             bindingSha256: stores.canonical.bindingSha256,
@@ -1765,11 +1765,11 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
         if (opened.result.sizeRefusal !== null) {
           if (
             opened.result.sizeRefusal.maximumOperationBytes
-              !== HRA_CANONICAL_MEMORY_OPERATION_MAX_BYTES
+              !== OOMPA_CANONICAL_MEMORY_OPERATION_MAX_BYTES
             || !projectHeadsEqual(canonicalHead, submission.expectedHead)
           ) {
             this.#recordCanonicalDivergence(context.projectId);
-            throw new HraMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
+            throw new OompaMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
           }
           const failed = this.#store.settleMemorySubmission({
             expectedState,
@@ -1886,14 +1886,14 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
   #assertProjectRecovered(projectId: string): void {
     const parsed = projectIdSchema.parse(projectId);
     if (this.#quarantinedProjects.has(parsed)) {
-      throw new HraMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
+      throw new OompaMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
     }
     if (this.#store.readUnsettledMemorySubmissionForProject(parsed) !== null) {
-      throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+      throw new OompaMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
     }
     const control = this.#store.readProjectMemoryAuthority(parsed);
     if (control?.syncState === "conflict" || control?.syncState === "error") {
-      throw new HraMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
+      throw new OompaMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
     }
   }
 
@@ -1901,7 +1901,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
     const parsed = projectIdSchema.parse(projectId);
     this.#assertProjectRecovered(parsed);
     if (this.#store.isCanonicalMemoryMutationFenced(parsed)) {
-      throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+      throw new OompaMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
     }
     this.#assertHostedCanonicalHeadCurrent(parsed);
   }
@@ -1918,10 +1918,10 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
     const attachment = this.#store.readCanonicalMemoryHostedAttachment(parsed);
     if (attachment === null || attachment.state === "detached") return;
     if (attachment.state !== "attached") {
-      throw new HraMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
+      throw new OompaMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
     }
     if (this.#sync === undefined) {
-      throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+      throw new OompaMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
     }
     const authority = this.#store.readProjectMemoryAuthority(parsed);
     if (
@@ -1931,7 +1931,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
       || !projectHeadsEqual(authority.head, authority.lastExchangeHead)
       || !projectHeadsEqual(authority.head, attachment.remote.head)
     ) {
-      throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+      throw new OompaMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
     }
   }
 
@@ -2532,7 +2532,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
     if (this.#closed) throw new Error("MEMORY_COORDINATOR_CLOSED");
     const session = this.#store.requireSession(sessionIdSchema.parse(actorSessionId));
     if (session.projectId === undefined) {
-      throw new HraMemoryRefusalError("MEMORY_PROJECT_REFUSED");
+      throw new OompaMemoryRefusalError("MEMORY_PROJECT_REFUSED");
     }
     const projectId = projectIdSchema.parse(session.projectId);
     const expiresAt = Math.min(Number.MAX_SAFE_INTEGER, this.#now() + this.#workingTtlMs);
@@ -2545,13 +2545,13 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
     if (
       currentSession.profileId !== session.profileId
       || currentSession.projectId !== projectId
-    ) throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+    ) throw new OompaMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
     if (!allowNonoperationalSession) {
       if (currentSession.state === "terminal") {
-        throw new HraMemoryRefusalError("MEMORY_SESSION_REFUSED");
+        throw new OompaMemoryRefusalError("MEMORY_SESSION_REFUSED");
       }
       if (currentSession.state === "recovery_required") {
-        throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+        throw new OompaMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
       }
     }
     if (lifecycle.state !== "active" || lifecycle.handleHash === null || lifecycle.head === null) {
@@ -2604,10 +2604,10 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
         && error.failure === "unsafe") {
         control ??= this.#store.reserveLegacyProjectMemoryAuthorityForRecovery(projectId);
         this.#recordCanonicalDivergence(projectId);
-        throw new HraMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
+        throw new OompaMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
       }
       if (error instanceof OhCanonicalDatabaseInspectionError) {
-        throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+        throw new OompaMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
       }
       throw error;
     }
@@ -2626,13 +2626,13 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
     }
     if (control.physicalState === "rejected") {
       this.#quarantinedProjects.add(projectId);
-      throw new HraMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
+      throw new OompaMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
     }
     const canonicalRequireExisting = control.physicalState === "initialized"
       || control.identityContract === 1;
     if (canonicalRequireExisting && databaseInspection.state !== "present") {
       this.#recordCanonicalDivergence(projectId);
-      throw new HraMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
+      throw new OompaMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
     }
     if (!canonicalRequireExisting) {
       await ensurePrivateDirectory(canonicalRoot);
@@ -2701,10 +2701,10 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
     } catch (error: unknown) {
       if (canonicalCustodyFailure(error)) {
         this.#recordCanonicalDivergence(context.projectId);
-        throw new HraMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
+        throw new OompaMemoryRefusalError("MEMORY_CANONICAL_FROZEN");
       }
       if (retryableMemoryStoreFailure(error)) {
-        throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+        throw new OompaMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
       }
       throw error;
     }
@@ -2724,7 +2724,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
       );
     } catch (error: unknown) {
       if (retryableMemoryStoreFailure(error)) {
-        throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+        throw new OompaMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
       }
       throw error;
     }
@@ -2822,7 +2822,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
         destinationPurpose: PROJECT_MEMORY_DESTINATION_PURPOSE,
         nominationId: MEMORY_NOMINATION_ID,
       }],
-      maximumCanonicalOperationBytes: HRA_CANONICAL_MEMORY_OPERATION_MAX_BYTES,
+      maximumCanonicalOperationBytes: OOMPA_CANONICAL_MEMORY_OPERATION_MAX_BYTES,
       now: () => new Date(clockMs),
       programs: MEMORY_PROGRAMS,
       working: {
@@ -2866,7 +2866,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
         projectIdSchema.parse(input.projectId),
       );
       if (unsettled !== null) {
-        throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+        throw new OompaMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
       }
       return this.#store.prepareMemorySubmission({
         actorSessionId: sessionIdSchema.parse(input.actorSessionId),
@@ -2893,13 +2893,13 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
       return operation();
     } catch (error: unknown) {
       if (error instanceof Error && error.message === "MEMORY_SUBMISSION_ACTOR_TERMINAL") {
-        throw new HraMemoryRefusalError("MEMORY_SESSION_REFUSED");
+        throw new OompaMemoryRefusalError("MEMORY_SESSION_REFUSED");
       }
       if (
         error instanceof Error
         && error.message === "MEMORY_SUBMISSION_ACTOR_RECOVERY_REQUIRED"
       ) {
-        throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+        throw new OompaMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
       }
       throw error;
     }
@@ -3084,7 +3084,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
         || !projectHeadsEqual(dataset.canonicalHead, context.control.head)
       ))
       || (scope === "working" && dataset.canonicalHead !== null)
-    ) throw new HraMemoryRefusalError("MEMORY_CONTINUATION_REFUSED");
+    ) throw new OompaMemoryRefusalError("MEMORY_CONTINUATION_REFUSED");
     return this.#getPage(context, dataset, continuation.offset);
   }
 
@@ -3255,21 +3255,21 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
     const session = this.#store.requireSession(sessionIdSchema.parse(actorSessionId));
     if (options.allowNonoperationalSession !== true) {
       if (session.state === "terminal") {
-        return Promise.reject(new HraMemoryRefusalError("MEMORY_SESSION_REFUSED"));
+        return Promise.reject(new OompaMemoryRefusalError("MEMORY_SESSION_REFUSED"));
       }
       if (session.state === "recovery_required") {
-        return Promise.reject(new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED"));
+        return Promise.reject(new OompaMemoryRefusalError("MEMORY_RECOVERY_REQUIRED"));
       }
     }
     if (session.projectId === undefined) {
-      return Promise.reject(new HraMemoryRefusalError("MEMORY_PROJECT_REFUSED"));
+      return Promise.reject(new OompaMemoryRefusalError("MEMORY_PROJECT_REFUSED"));
     }
     const key = projectIdSchema.parse(session.projectId);
     const expectedProjectId = options.expectedProjectId === undefined
       ? undefined
       : projectIdSchema.parse(options.expectedProjectId);
     if (expectedProjectId !== undefined && key !== expectedProjectId) {
-      return Promise.reject(new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED"));
+      return Promise.reject(new OompaMemoryRefusalError("MEMORY_RECOVERY_REQUIRED"));
     }
     return this.#projectSerial.run(key, async () => {
       const currentSession = this.#store.requireSession(sessionIdSchema.parse(actorSessionId));
@@ -3277,14 +3277,14 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
         currentSession.projectId !== key
         || (expectedProjectId !== undefined && currentSession.projectId !== expectedProjectId)
       ) {
-        throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+        throw new OompaMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
       }
       if (options.allowNonoperationalSession !== true) {
         if (currentSession.state === "terminal") {
-          throw new HraMemoryRefusalError("MEMORY_SESSION_REFUSED");
+          throw new OompaMemoryRefusalError("MEMORY_SESSION_REFUSED");
         }
         if (currentSession.state === "recovery_required") {
-          throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+          throw new OompaMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
         }
       }
       const context = await contextFor();
@@ -3292,7 +3292,7 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
       // project. A queued operation may not follow a concurrent project move
       // while still holding the old project's serialization position.
       if (context.projectId !== key) {
-        throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+        throw new OompaMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
       }
       // Context selection opens the working-memory lifecycle asynchronously.
       // Revalidate the durable actor after that boundary so a concurrent
@@ -3302,14 +3302,14 @@ export class HraOhMemoryCoordinator implements HraMemoryPort {
         sessionIdSchema.parse(actorSessionId),
       );
       if (selectedSession.projectId !== key) {
-        throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+        throw new OompaMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
       }
       if (options.allowNonoperationalSession !== true) {
         if (selectedSession.state === "terminal") {
-          throw new HraMemoryRefusalError("MEMORY_SESSION_REFUSED");
+          throw new OompaMemoryRefusalError("MEMORY_SESSION_REFUSED");
         }
         if (selectedSession.state === "recovery_required") {
-          throw new HraMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
+          throw new OompaMemoryRefusalError("MEMORY_RECOVERY_REQUIRED");
         }
       }
       return await operation(context);

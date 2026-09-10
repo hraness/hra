@@ -29,12 +29,14 @@ const allowedPublicScopedPackages = new Set([
   "@hraness/direct",
   "@hraness/hra",
   "@hraness/oh",
+  "@hraness/oompa",
   "@hraness/posthog",
   "@hraness/site-footer",
   "@hraness/slopcamera",
   "@hraness/ui",
   "@stylexjs/babel-plugin",
   "@stylexjs/stylex",
+  "@vercel/routing-utils",
 ]);
 
 const secretPatterns = [
@@ -47,7 +49,7 @@ const secretPatterns = [
   /\bnpm_[A-Za-z0-9]{30,}\b/u,
   /\bxox[baprs]-[A-Za-z0-9-]{20,}\b/u,
   /\bAIza[0-9A-Za-z_-]{30,}\b/u,
-  /\b(?:AUTH_SECRET|CONVEX_DEPLOY_KEY|HRA_AUTH_HMAC_SECRET|HRA_RESEND_API_KEY|OTP_HMAC_SECRET|RESEND_API_KEY)\s*[:=]\s*["']?[^\s"']{16,}/u,
+  /\b(?:AUTH_SECRET|CONVEX_DEPLOY_KEY|HRA_AUTH_HMAC_SECRET|HRA_RESEND_API_KEY|OOMPA_AUTH_HMAC_SECRET|OOMPA_RESEND_API_KEY|OTP_HMAC_SECRET|RESEND_API_KEY)\s*[:=]\s*["']?[^\s"']{16,}/u,
 ] as const;
 
 const absoluteUserPaths = [

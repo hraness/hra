@@ -12,13 +12,13 @@ tags:
   - npm
   - release
 relations:
-  related-to: [ plans/hra-v1, plans/hra-v2 ]
+  related-to: [ plans/oompa-v1, plans/oompa-v2 ]
 ---
 
 # Hraness delivery autonomy
 
 Status: active, revision 8 (2026-09-09). The machine-confidence foundation, current-Mac
-bootstrap and HRA, Oh and personal-monorepo-template pilots are delivered. Wider fleet
+bootstrap and Oompa, Oh and personal-monorepo-template pilots are delivered. Wider fleet
 adoption and provider-specific rollout remain separately tracked; they do not reopen the
 completed foundation or block an independently admitted artifact.
 
@@ -56,19 +56,19 @@ The broader roadmap is complete when:
 ## Evidence
 
 The reviewed machine-confidence policy merged through
-[HRA PR156](https://github.com/hraness/hra/pull/156) as
+[Oompa PR156](https://github.com/hraness/oompa/pull/156) as
 `b856c66113c9a8752dbb431fc578287c23279cfe`. Its canonical policy assets,
 operator guidance and regression tests preserve the distinction between artifact
 admission, live qualification and operational activation. The installed
-`hra-local-efficiency` 0.4.0 baseline passed its local apply/check and subsequent
+`oompa-local-efficiency` 0.4.0 baseline passed its local apply/check and subsequent
 readback on 2026-09-08. This proves that Mac's configuration, not runtime account
 eligibility or every development machine.
 
 The data-preserving delivery policy, complete-CI source-validation policy and
 delivery reliability repairs subsequently merged through
-[HRA PR160](https://github.com/hraness/hra/pull/160) as
+[Oompa PR160](https://github.com/hraness/oompa/pull/160) as
 `4d4447a99bb08b3469e620f7f179b9a7d3e8bf62`. Its
-[required PR CI](https://github.com/hraness/hra/actions/runs/34305011130)
+[required PR CI](https://github.com/hraness/oompa/actions/runs/34305011130)
 passed all eight macOS/Linux matrix jobs and browser acceptance on the exact
 current-base integration tree `98c4ddaa699f943503248a81b084f748fc2be878`.
 The reviewed 0.4.1 plugin was then installed on this Mac: all 37 installed files
@@ -76,7 +76,7 @@ matched the merged source, bootstrap apply/check and doctor passed, and fresh
 readback preserved unmanaged instructions and configuration. This supersedes
 the earlier 0.4.0 current-Mac checkpoint without implying adoption by other
 machines. The separate
-[automatic main run](https://github.com/hraness/hra/actions/runs/34306305523)
+[automatic main run](https://github.com/hraness/oompa/actions/runs/34306305523)
 finished cancelled; its Required result failed on that cancelled dependency.
 That run is not claimed as a pass, and its cancellation cause was not established.
 
@@ -92,19 +92,19 @@ squash-only delivery and protected refs remain. That change was not needed for
 the guidance pilot's merge and did not alter its source.
 
 These are completed foundation and pilot receipts, not fleet-wide completion,
-package admission or hosted activation. HRA's exact artifact status and per-release
+package admission or hosted activation. Oompa's exact artifact status and per-release
 evidence remain in the [release record](../../docs/beta-release.md).
 
 ### Historical audit basis
 
-The fleet audit found that repository guidance already has one HRA-managed insertion point, but
+The fleet audit found that repository guidance already has one Oompa-managed insertion point, but
 Claude did not consume it in most repositories because Claude Code reads `CLAUDE.md`, not
 `AGENTS.md`. The machine bootstrap managed Codex guidance and scheduling but not Codex's reviewer
 default, Claude's permission mode, or Claude's global instructions.
 
 The release audit found three distinct interruption sources:
 
-- HRA already uses npm OIDC but added a mutable repository-variable approval for every version.
+- Oompa already uses npm OIDC but added a mutable repository-variable approval for every version.
 - Wrench uses npm staged publishing, whose public admission deliberately requires human 2FA for
   every version.
 - Soundfish documents a local `npm publish`, binding routine release to a maintainer session.
@@ -195,7 +195,7 @@ into a blanket artifact-release hold. Explicit user acceptance requirements rema
 the user changes them. Replace an obsolete repository gate through a reviewed policy/source change,
 never by silently skipping a failing gate during delivery.
 
-For HRA v0.7.0, the owner's 2026-09-08 policy change removes authenticated Claude and two-device
+For Oompa v0.7.0, the owner's 2026-09-08 policy change removes authenticated Claude and two-device
 hosted-memory qualification from tag/publication prerequisites. It does not claim those proofs
 passed or permit hosted activation, a daemon upgrade, or new Claude platform support. The current
 [release procedure](../../docs/beta-release.md) is authoritative; older checkpoint holds are history.
@@ -215,7 +215,7 @@ coordination or safety need. Prefer current integration-candidate checks, indepe
 review, and atomic or conditional integration. Replace redundant waits and checks through
 reviewed policy changes with evidence for the integrated result; do not skip an existing gate.
 
-HRA's [final validation policy](../../CONTRIBUTING.md#final-validation) assigns the complete
+Oompa's [final validation policy](../../CONTRIBUTING.md#final-validation) assigns the complete
 required CI gate as the final source aggregate, including executable changes, when its command
 coverage and shard equivalence are established. Independent review covers the complete diff and
 its impact. Focused local contracts and existing CI coverage/equivalence tests still run. The
@@ -256,7 +256,7 @@ publication, trust setup, or staged promotion must not become a prerequisite for
 artifact. Build dependencies and applicable source, native, installation and provider readback
 gates remain required.
 
-HRA keeps its exact reviewed source, native supervisor and both-platform tarball gates ahead
+Oompa keeps its exact reviewed source, native supervisor and both-platform tarball gates ahead
 of canonical publication. Its separate read-only npm preflight owns the existing tag-only
 environment assertion and exact registry-state observation before the mirror obtains OIDC.
 The mirror retains exact archive identity, pinned-client verification, same-run/attempt
@@ -274,17 +274,17 @@ adoption, a package release, or operational activation.
 | Workstream | State | Acceptance evidence |
 | --- | --- | --- |
 | Machine baseline on the current Mac | Complete | PR165 delivered local-efficiency 0.4.2; all 37 installed files and both managed global blocks match merged source `e1edb585`. The earlier 0.4.1 installation evidence remains below. Other machines and runtime eligibility remain separate. |
-| Canonical repository policy and pilots | Complete | Managed-block tests preserve custom guidance and Claude imports; HRA PR156, Oh PR45 and template PR12 delivered through their own gates. |
-| Canonical artifact independence | In progress | [PR164](https://github.com/hraness/hra/pull/164) joins PR165 source `e1edb585`, preserving its provisioning policy and the v0.7.1 package and activation controls. The combined global canonical-artifact guidance advances to 0.4.3. Prior candidate `1cacc254` passed complete Required CI and CodeQL; the joined candidate needs fresh focused evidence, final review and complete current-base CI. The release owner has released the v0.7.1 merge hold. PR164 delivery and 0.4.3 installation/readback are not yet proved. |
-| HRA npm path | Delivered | The machine publication path is delivered without the mutable publication variable; exact tag, artifact, OIDC, provenance and final admission remain required for each release in [the release record](../../docs/beta-release.md). |
+| Canonical repository policy and pilots | Complete | Managed-block tests preserve custom guidance and Claude imports; Oompa PR156, Oh PR45 and template PR12 delivered through their own gates. |
+| Canonical artifact independence | In progress | [PR164](https://github.com/hraness/oompa/pull/164) joins PR165 source `e1edb585`, preserving its provisioning policy and the v0.7.1 package and activation controls. The combined global canonical-artifact guidance advances to 0.4.3. Prior candidate `1cacc254` passed complete Required CI and CodeQL; the joined candidate needs fresh focused evidence, final review and complete current-base CI. The release owner has released the v0.7.1 merge hold. PR164 delivery and 0.4.3 installation/readback are not yet proved. |
+| Oompa npm path | Delivered | The machine publication path is delivered without the mutable publication variable; exact tag, artifact, OIDC, provenance and final admission remain required for each release in [the release record](../../docs/beta-release.md). |
 | Wrench npm path | Provider-constrained | Preserve its dual-use declaration and exact staged-artifact approval with required authentication. Automate preparation, validation, staging, and readback; direct OIDC publication is not an available replacement for the provider gate. |
 | Soundfish npm path | Delivered | The direct OIDC workflow completed in [release run 34059355173](https://github.com/hraness/soundfish/actions/runs/34059355173). Routine publication has a supported workload identity; future releases retain their exact-artifact gates. |
-| Agentic service provisioning | Delivered on the current Mac | [PR165](https://github.com/hraness/hra/pull/165) merged the 0.4.2 preference across all three canonical guidance assets and this repository adoption target. Installed plugin and managed global bytes match its merged source. Wider fleet adoption and any actual service provisioning remain separate. |
+| Agentic service provisioning | Delivered on the current Mac | [PR165](https://github.com/hraness/oompa/pull/165) merged the 0.4.2 preference across all three canonical guidance assets and this repository adoption target. Installed plugin and managed global bytes match its merged source. Wider fleet adoption and any actual service provisioning remain separate. |
 | Wider fleet rollout | Continuing | Remaining repositories and machines require their own scoped adoption and gates. No all-fleet current-state claim is made; preserve dirty primary worktrees. |
 | Provider setup | Evidence-driven | Ordinary npm publication workflows are present. Change trust, account, GitHub App, or ruleset configuration only for an individually verified remaining gap; no blanket trust update is pending. |
-| Machine-confidence foundation | Complete | HRA PR156 delivered the reviewed canonical global/repository assets, operator guidance and regression tests separating artifact admission from operational activation. |
-| Bounded foundation propagation | Complete | Current-Mac installation and readback plus owner-coordinated HRA, Oh and template delivery are proved. Further fleet propagation is the separate workstream above. |
-| Data-preserving delivery policy | Complete | [PR160](https://github.com/hraness/hra/pull/160) merged as `4d4447a` after independent review and [complete required PR CI34305011130](https://github.com/hraness/hra/actions/runs/34305011130); exact CI and merged trees match. The 0.4.1 installation and current-Mac readback passed. Later main CI34306305523 was cancelled and is not a passing receipt. |
+| Machine-confidence foundation | Complete | Oompa PR156 delivered the reviewed canonical global/repository assets, operator guidance and regression tests separating artifact admission from operational activation. |
+| Bounded foundation propagation | Complete | Current-Mac installation and readback plus owner-coordinated Oompa, Oh and template delivery are proved. Further fleet propagation is the separate workstream above. |
+| Data-preserving delivery policy | Complete | [PR160](https://github.com/hraness/oompa/pull/160) merged as `4d4447a` after independent review and [complete required PR CI34305011130](https://github.com/hraness/oompa/actions/runs/34305011130); exact CI and merged trees match. The 0.4.1 installation and current-Mac readback passed. Later main CI34306305523 was cancelled and is not a passing receipt. |
 
 ## Guardrails
 
@@ -302,17 +302,17 @@ adoption, a package release, or operational activation.
 
 ## Progress log
 
-- 2026-09-09, revision 8: [PR165](https://github.com/hraness/hra/pull/165)
+- 2026-09-09, revision 8: [PR165](https://github.com/hraness/oompa/pull/165)
   delivered the provisioning policy as `e1edb585`. All 37 installed 0.4.2
   plugin files and both managed global blocks match that merged source on the
   current Mac. This does not prove fleet adoption or provision a service.
   PR164's earlier reviewed candidate `1cacc254`, tree `e199cce7`, passed all ten
-  jobs in [CI34366815474/1](https://github.com/hraness/hra/actions/runs/34366815474)
-  and [CodeQL34366813242/1](https://github.com/hraness/hra/actions/runs/34366813242)
+  jobs in [CI34366815474/1](https://github.com/hraness/oompa/actions/runs/34366815474)
+  and [CodeQL34366813242/1](https://github.com/hraness/oompa/actions/runs/34366813242)
   on integration `9307bed`. Those receipts remain historical evidence; the
   new main requires fresh final admission. The v0.7.1 release owner reported
   all four jobs passing in the same-run
-  [recovery34367591503/2](https://github.com/hraness/hra/actions/runs/34367591503/attempts/2)
+  [recovery34367591503/2](https://github.com/hraness/oompa/actions/runs/34367591503/attempts/2)
   and released PR164's main-merge hold. The release owner then completed
   final exact GitHub/npm and original-publication-attempt provenance readback
   at 15:38:01Z. This join preserves incoming D8 and adds the canonical policy as
@@ -330,7 +330,7 @@ adoption, a package release, or operational activation.
   Focused release boundary checks passed 32 tests / 258 assertions, workflow and
   CI-equivalence checks passed 47 tests / 1,077 assertions, and plugin checks
   passed 108 tests / 421 assertions; independent source review approved.
-  [Initial CI34354678392](https://github.com/hraness/hra/actions/runs/34354678392)
+  [Initial CI34354678392](https://github.com/hraness/oompa/actions/runs/34354678392)
   failed the existing paged-recovery case at its unchanged five-second deadline.
   The separately reviewed `service.test.ts` custody fix, blob `bd498513`, passed
   the focused case with all eight assertions, plus typecheck and targeted lint.
@@ -377,7 +377,7 @@ adoption, a package release, or operational activation.
   complete CI passed for these repairs. The revision 5 final-source policy
   governs the updated candidate; delivery remains pending its named evidence.
 
-- 2026-09-08: HRA's reviewed documentation/guidance validation path now uses
+- 2026-09-08: Oompa's reviewed documentation/guidance validation path now uses
   focused local contracts plus fresh complete required CI as its final source
   aggregate. CI still covers every full-gate command on macOS and Linux, with
   command-coverage and shard-equivalence regressions unchanged. This initial
@@ -389,23 +389,23 @@ adoption, a package release, or operational activation.
   approval. The Wrench direct-publication proposal is withdrawn because its dual-use
   policy requires interactive admission. Source delivery and installation are pending.
 
-- 2026-09-08, foundation and pilot closeout: HRA PR156 merged the reviewed D6
+- 2026-09-08, foundation and pilot closeout: Oompa PR156 merged the reviewed D6
   policy and tests; local-efficiency 0.4.0 installation, bootstrap check and fresh
   current-Mac readback passed. Oh PR45 and personal-monorepo-template PR12 merged
   through their required checks and passed fresh main CI. Oh issue46 separately
   aligned code-owner sign-off after the pilot merge without changing source or
   the remaining controls. This completes the scoped foundation and pilots, not
   every fleet or provider workstream. Per-release artifact status remains in the
-  HRA release record; explicit live and operational guards are unchanged.
+  Oompa release record; explicit live and operational guards are unchanged.
 
-- 2026-09-08: adopted D6 at the owner's direction. HRA's mandatory pre-publication live qualification
+- 2026-09-08: adopted D6 at the owner's direction. Oompa's mandatory pre-publication live qualification
   is being separated from machine-gated artifact admission. Shared policy assets propagate the same
   principle without changing sandbox, automatic-review, scheduler, or provider authority boundaries.
 
 - 2026-09-04: audited the local Codex and Claude approval posture, the Hraness repository fleet,
   and every observed npm publication path; adopted D1-D5.
 - 2026-09-04: began the managed machine baseline, repository adoption extension, and removal of
-  HRA's redundant publication variable.
+  Oompa's redundant publication variable.
 - 2026-09-04: rejected a same-repository Actions tag broker after review proved that its generic
   integration bypass was reachable by collaborator-controlled workflow files. Replaced it with a
   fail-closed owner-local tag command for exact CI-green current `main`; tag creation has only the

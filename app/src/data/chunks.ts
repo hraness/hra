@@ -5,7 +5,7 @@
  * data the writer used, so every field of `sessionChunkAad` has to be rebuilt
  * from the row and the reader's own identity. Nothing here touches React.
  */
-import { sessionChunkAad, type SessionChunkAuthority, type SyncStream } from "../hra/cloud";
+import { sessionChunkAad, type SessionChunkAuthority, type SyncStream } from "../oompa/cloud";
 import type { SessionChunk } from "./wire";
 
 export function chunkAuthority(input: Readonly<{

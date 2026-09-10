@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 
 import { useCustody } from "../custody/custody-context";
-import { decryptSessionMetadata, type SessionMetadataPayload } from "../hra/cloud";
+import { decryptSessionMetadata, type SessionMetadataPayload } from "../oompa/cloud";
 import { createCancellation } from "../lib/cancellation";
 import type { SessionHead } from "./wire";
 

@@ -2,7 +2,16 @@ import { describe, expect, test } from "bun:test";
 
 import fc from "fast-check";
 
-import { redactCompleteSensitiveText, unlabelledSecretPatterns } from "./sensitive-text";
+import {
+  redactCanonicalSensitiveText,
+  unlabelledSecretPattern as canonicalSecretPattern,
+  unlabelledSecretPatterns as canonicalSecretPatterns,
+} from "./domain/sensitive-text-patterns";
+import {
+  redactCompleteSensitiveText,
+  unlabelledSecretPattern,
+  unlabelledSecretPatterns,
+} from "./sensitive-text";
 import { StreamingSensitiveRedactor } from "./streaming-sensitive-text";
 
 const replacement = "[redacted]";
@@ -37,6 +46,36 @@ const secretArbitrary = fc.constantFrom(...unlabelledSecretFixtures.map((fixture
 const fillerArbitrary = fc.stringMatching(/^[A-Za-z0-9 .,:;()\n\t_-]{0,24}$/u);
 
 describe("unlabelled secret redaction", () => {
+  test("retains the same pattern exports through the complete redactor", () => {
+    expect(unlabelledSecretPatterns).toBe(canonicalSecretPatterns);
+    expect(unlabelledSecretPattern).toBe(canonicalSecretPattern);
+  });
+
+  test("shares canonical ASCII behavior without leaking global-regex state", () => {
+    const values = [
+      ...unlabelledSecretFixtures.map((fixture) => fixture.secret),
+      ...benignValues,
+      "token:synthetic-value",
+      "Cookie:synthetic-value",
+      "Bearer synthetic-value",
+    ];
+    for (let repetition = 0; repetition < 3; repetition += 1) {
+      for (const value of values) {
+        expect(redactCanonicalSensitiveText(value, replacement))
+          .toBe(redactCompleteSensitiveText(value, replacement));
+        expect(redactCanonicalSensitiveText(value, replacement))
+          .toBe(redactCompleteSensitiveText(value, replacement));
+      }
+    }
+    fc.assert(fc.property(
+      fc.stringMatching(/^[\x20-\x7e]{0,256}$/u),
+      (value) => {
+        expect(redactCanonicalSensitiveText(value, replacement))
+          .toBe(redactCompleteSensitiveText(value, replacement));
+      },
+    ), { numRuns: 400 });
+  });
+
   test("redacts each vendor shape in prose", () => {
     for (const fixture of unlabelledSecretFixtures) {
       const redacted = redactCompleteSensitiveText(`log: ${fixture.secret} done`, replacement);

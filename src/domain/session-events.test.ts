@@ -231,7 +231,7 @@ describe("session events", () => {
       type: "user_message",
       turnId: null,
       actor: "peer_session",
-      text: "Untrusted coordination from another HRA session.",
+      text: "Untrusted coordination from another Oompa session.",
       omittedCharacters: 0,
     })).toMatchObject({ actor: "peer_session" });
     expect(() => sessionEventBodySchema.parse({
@@ -487,7 +487,7 @@ describe("session events", () => {
       nextCursor: "old-3",
       events: [event(3)],
     }))).toThrow("SESSION_EVENT_CONTINUITY_SEQUENCE_MISMATCH");
-    // `hra session switch` can move one conversation to another account, so a
+    // `oompa session switch` can move one conversation to another account, so a
     // page under a new account continues the same stream instead of failing.
     // Sequence and epoch continuity are still enforced across that boundary.
     const switched = advanceSessionEventContinuity(first, page({

@@ -1,6 +1,6 @@
 const stableSemver = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u;
 const exactRegistryVersion = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$/u;
-export const HRA_RELEASE_OH_VERSION = "0.4.1";
+export const OOMPA_RELEASE_OH_VERSION = "0.4.1";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -23,41 +23,41 @@ function stringRecord(value: unknown, label: string): Readonly<Record<string, st
 
 export type ReleasePackageInspection = Readonly<{
   blockers: readonly string[];
-  name: "@hraness/hra";
+  name: "@hraness/oompa";
   version: string;
 }>;
 
 export function releaseArchiveName(version: string): string {
-  if (!stableSemver.test(version)) throw new Error("The HRA release version must be stable semantic versioning.");
-  return `hraness-hra-${version}.tgz`;
+  if (!stableSemver.test(version)) throw new Error("The Oompa release version must be stable semantic versioning.");
+  return `hraness-oompa-${version}.tgz`;
 }
 
 export function inspectReleasePackage(value: unknown): ReleasePackageInspection {
-  const manifest = record(value, "HRA package manifest");
-  const publishConfig = record(manifest.publishConfig, "HRA publishConfig");
-  const bin = record(manifest.bin, "HRA bin");
-  const dependencies = stringRecord(manifest.dependencies, "HRA runtime dependency");
+  const manifest = record(value, "Oompa package manifest");
+  const publishConfig = record(manifest.publishConfig, "Oompa publishConfig");
+  const bin = record(manifest.bin, "Oompa bin");
+  const dependencies = stringRecord(manifest.dependencies, "Oompa runtime dependency");
   if (
-    manifest.name !== "@hraness/hra"
+    manifest.name !== "@hraness/oompa"
     || typeof manifest.version !== "string"
     || !stableSemver.test(manifest.version)
     || manifest.license !== "MIT"
     || publishConfig.access !== "public"
     || publishConfig.registry !== "https://registry.npmjs.org"
     || Object.keys(bin).length !== 1
-    || bin.hra !== "./src/cli.ts"
-  ) throw new Error("The HRA public package identity, license, registry, version, or binary is invalid.");
+    || bin.oompa !== "./src/cli.ts"
+  ) throw new Error("The Oompa public package identity, license, registry, version, or binary is invalid.");
 
   const blockers = Object.entries(dependencies)
     .filter(([name, version]) => name === "@hraness/oh"
-      ? version !== HRA_RELEASE_OH_VERSION
+      ? version !== OOMPA_RELEASE_OH_VERSION
       : !exactRegistryVersion.test(version))
     .map(([name, version]) => `${name}=${version}`);
   if (!Object.hasOwn(dependencies, "@hraness/oh")) blockers.push("@hraness/oh=<missing>");
   blockers.sort();
   return Object.freeze({
     blockers: Object.freeze(blockers),
-    name: "@hraness/hra",
+    name: "@hraness/oompa",
     version: manifest.version,
   });
 }
@@ -65,7 +65,7 @@ export function inspectReleasePackage(value: unknown): ReleasePackageInspection 
 export function assertReleasePackageReady(value: unknown): ReleasePackageInspection {
   const inspection = inspectReleasePackage(value);
   if (inspection.blockers.length > 0) {
-    throw new Error(`HRA release is blocked by runtime dependency policy: ${inspection.blockers.join(", ")}`);
+    throw new Error(`Oompa release is blocked by runtime dependency policy: ${inspection.blockers.join(", ")}`);
   }
   return inspection;
 }

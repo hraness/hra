@@ -1,50 +1,50 @@
 import { designPaletteLabels, designPalettes, designThemes, parseDesignPalettePreference } from "@hraness/design-kit";
 import { initDesignPalette } from "@hraness/design-kit/browser";
 
-export const hraAppearanceStorageKey = "hraness-design-palette-v1";
+export const oompaAppearanceStorageKey = "hraness-design-palette-v1";
 const maximumPreferenceLength = 256;
 type AppearanceStorage = Pick<Storage, "getItem" | "setItem">;
 
 /** This adapter can persist only the bounded, non-sensitive appearance key. */
-export function hraAppearanceStorage(storage: AppearanceStorage | null): AppearanceStorage | null {
+export function oompaAppearanceStorage(storage: AppearanceStorage | null): AppearanceStorage | null {
   if (storage === null) return null;
   return {
     getItem(key) {
-      if (key !== hraAppearanceStorageKey) return null;
+      if (key !== oompaAppearanceStorageKey) return null;
       const value = storage.getItem(key);
       if (value === null || value.length > maximumPreferenceLength) return null;
       const preference = parseDesignPalettePreference(value);
       return preference === null ? null : JSON.stringify(preference);
     },
     setItem(key, value) {
-      if (key !== hraAppearanceStorageKey || value.length > maximumPreferenceLength) return;
+      if (key !== oompaAppearanceStorageKey || value.length > maximumPreferenceLength) return;
       const preference = parseDesignPalettePreference(value);
       if (preference !== null) storage.setItem(key, JSON.stringify(preference));
     },
   };
 }
 
-export function initializeHraAppearance(document: Document) {
+export function initializeOompaAppearance(document: Document) {
   let storage: AppearanceStorage | null = null;
   try { storage = document.defaultView?.localStorage ?? null; } catch { /* Appearance remains available in memory. */ }
   return initDesignPalette({
     document,
     legacyStorageKey: null,
-    storage: hraAppearanceStorage(storage),
-    storageKey: hraAppearanceStorageKey,
+    storage: oompaAppearanceStorage(storage),
+    storageKey: oompaAppearanceStorageKey,
   });
 }
 
 /** Static controls are bound once after parsing; React owns its mounted menus. */
-export function bindHraAppearanceMenus(
+export function bindOompaAppearanceMenus(
   document: Document,
-  controller: ReturnType<typeof initializeHraAppearance>,
+  controller: ReturnType<typeof initializeOompaAppearance>,
   mountedMenu?: HTMLDetailsElement,
 ): () => void {
   const view = document.defaultView;
   if (view === null) return () => undefined;
   const menus = mountedMenu === undefined
-    ? [...document.querySelectorAll<HTMLDetailsElement>("details[data-hra-appearance]:not([data-hra-managed])")]
+    ? [...document.querySelectorAll<HTMLDetailsElement>("details[data-oompa-appearance]:not([data-oompa-managed])")]
     : [mountedMenu];
   if (menus.some((menu) => menu.ownerDocument !== document)) throw new Error("Appearance menu belongs to another document.");
   if (menus.length === 0) return () => undefined;
@@ -52,8 +52,8 @@ export function bindHraAppearanceMenus(
     const { preference } = controller.getSnapshot();
     const modeLabel = preference.mode === "system" ? "System" : preference.mode === "dark" ? "Dark" : "Light";
     for (const menu of menus) {
-      const palette = menu.querySelector<HTMLSelectElement>("select[data-hra-palette]");
-      const mode = menu.querySelector<HTMLSelectElement>("select[data-hra-mode]");
+      const palette = menu.querySelector<HTMLSelectElement>("select[data-oompa-palette]");
+      const mode = menu.querySelector<HTMLSelectElement>("select[data-oompa-mode]");
       if (palette !== null) palette.value = preference.palette;
       if (mode !== null) mode.value = preference.mode;
       const summary = menu.querySelector("summary");
@@ -67,8 +67,8 @@ export function bindHraAppearanceMenus(
     const { preference } = controller.getSnapshot();
     const palette = designPalettes.find((value) => value === target.value);
     const mode = designThemes.find((value) => value === target.value);
-    if (target.hasAttribute("data-hra-palette") && palette !== undefined) controller.setPreference({ ...preference, palette });
-    if (target.hasAttribute("data-hra-mode") && mode !== undefined) controller.setPreference({ ...preference, mode });
+    if (target.hasAttribute("data-oompa-palette") && palette !== undefined) controller.setPreference({ ...preference, palette });
+    if (target.hasAttribute("data-oompa-mode") && mode !== undefined) controller.setPreference({ ...preference, mode });
   };
   const onPointerDown = (event: Event): void => {
     const target = event.target;
@@ -124,10 +124,10 @@ export function bindHraAppearanceMenus(
 }
 
 /** Own one controller reference for exactly the lifetime of a mounted menu. */
-export function mountHraAppearanceMenu(menu: HTMLDetailsElement): () => void {
-  const controller = initializeHraAppearance(menu.ownerDocument);
+export function mountOompaAppearanceMenu(menu: HTMLDetailsElement): () => void {
+  const controller = initializeOompaAppearance(menu.ownerDocument);
   let unbind: () => void;
-  try { unbind = bindHraAppearanceMenus(menu.ownerDocument, controller, menu); }
+  try { unbind = bindOompaAppearanceMenus(menu.ownerDocument, controller, menu); }
   catch (error) { controller.dispose(); throw error; }
   let disposed = false;
   return () => {

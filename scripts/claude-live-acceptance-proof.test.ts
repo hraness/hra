@@ -2,9 +2,9 @@ import { describe, expect, test } from "bun:test";
 
 import type { ClaudeHostToolResponseWritten } from "../src/claude/index";
 import { digestClaudeHostToolInvocation } from "../src/claude/index";
-import type { HraHostToolCall } from "../src/codex/protocol";
+import type { OompaHostToolCall } from "../src/codex/protocol";
 import type { ProfileAuthority } from "../src/daemon/ports";
-import { HRA_VERSION } from "../src/version";
+import { OOMPA_VERSION } from "../src/version";
 import type { LiveAcceptanceCandidate } from "./live-acceptance-installation";
 import {
   ClaudeLiveAcceptanceProofCollector,
@@ -17,16 +17,20 @@ import {
 
 const runId = "00000000-0000-4000-8000-000000000801";
 const profileId = `acct_${"1".repeat(32)}` as const;
+const providerAccountId = `pact_${"1".repeat(32)}` as const;
 const sessionId = `sess_${"2".repeat(32)}` as const;
 const profileAuthority = {
   codexHome: "/tmp/claude-proof-synthetic/codex",
   desktopUserData: "/tmp/claude-proof-synthetic/desktop",
   generation: 7,
   id: profileId,
+  provider: "claude",
+  providerAccountId,
+  bindingGeneration: 1,
 } satisfies ProfileAuthority;
 const candidate: LiveAcceptanceCandidate = {
   cloudTargetDigest: "3".repeat(64),
-  packageVersion: HRA_VERSION,
+  packageVersion: OOMPA_VERSION,
   sourceRevision: "4".repeat(40),
 };
 const memory = {
@@ -38,8 +42,8 @@ const memory = {
 const request = { input: memory, tool: "memory_remember" } as const;
 const callId = "acceptance-call-one";
 const requestDigest = digestClaudeHostToolInvocation(callId, request);
-const call: HraHostToolCall = {
-  authority: { processGeneration: 7, profileId },
+const call: OompaHostToolCall = {
+  authority: { processGeneration: 7, profileId, provider: "claude", providerAccountId, bindingGeneration: 1 },
   callId,
   connectionId: "acceptance-connection-one",
   input: memory,
@@ -109,7 +113,7 @@ const arm = (value: ClaudeLiveAcceptanceProofCollector, corroborate = true): voi
 
 const capture = async (
   value: ClaudeLiveAcceptanceProofCollector,
-  inputCall: HraHostToolCall = call,
+  inputCall: OompaHostToolCall = call,
   result: unknown = response,
 ): Promise<unknown> => await value.handleManagedHostToolCall({
   authority: profileAuthority,
@@ -118,6 +122,36 @@ const capture = async (
 });
 
 describe("Claude live-acceptance one-shot proof", () => {
+  test.each(["provider", "account", "binding"] as const)("refuses a mismatched full %s authority before dispatch", async (field) => {
+    const value = collector(); arm(value);
+    const foreign = structuredClone(call);
+    if (field === "provider") Object.assign(foreign.authority, { provider: "codex" });
+    if (field === "account") Object.assign(foreign.authority, { providerAccountId: `pact_${"f".repeat(32)}` });
+    if (field === "binding") Object.assign(foreign.authority, { bindingGeneration: 2 });
+    let dispatches = 0;
+    await expect(value.handleManagedHostToolCall({ authority: profileAuthority, call: foreign,
+      dispatch: async () => { dispatches += 1; return response; } })).rejects.toThrow("call_mismatch");
+    expect(dispatches).toBe(0);
+  });
+
+  test("detaches the admitted call before dispatch without extending the V1 receipt", async () => {
+    const value = collector(); arm(value);
+    const mutableCall = structuredClone(call);
+    const mutableAuthority = { ...profileAuthority };
+    await value.handleManagedHostToolCall({ authority: mutableAuthority, call: mutableCall, dispatch: async () => {
+      Object.assign(mutableCall, { callId: "changed-after-admission", turnId: "changed-after-admission" });
+      Object.assign(mutableCall.authority, { bindingGeneration: 2 });
+      mutableAuthority.bindingGeneration += 1;
+      await Promise.resolve();
+      return response;
+    } });
+    value.handleManagedHostToolResponseWritten(written);
+    const receipt = value.readProvisionalPrivateReceipt();
+    expect(receipt).toMatchObject({ callId, turnId: call.turnId, profileGeneration: 7 });
+    expect(receipt).not.toHaveProperty("providerAccountId");
+    expect(receipt).not.toHaveProperty("bindingGeneration");
+  });
+
   test("retains one immutable private receipt only after response-written and lifecycle close", async () => {
     const value = collector();
     arm(value);

@@ -21,7 +21,7 @@ export const siteTestBuildTerminal = z.discriminatedUnion("status", [
   z.object({ status: z.literal("success"), mismatches: z.array(z.string().max(4096)).max(64) }).strict(),
   z.object({ status: z.literal("failure"), name: z.string().max(256), message: z.string().max(65_536), stack: z.string().max(131_072).optional() }).strict(),
 ]);
-export const siteTestBuildTerminalPrefix = "HRA_SITE_TEST_RESULT_V1 ";
+export const siteTestBuildTerminalPrefix = "OOMPA_SITE_TEST_RESULT_V1 ";
 
 export function readSiteTestBuildTerminal(stdout: Buffer): z.infer<typeof siteTestBuildTerminal> {
   const lines = stdout.toString("utf8").split("\n");

@@ -6,13 +6,13 @@ import { isatty } from "node:tty";
 import { z } from "zod";
 
 import {
-  isHraOtpReplyTo,
-  hraOtpReplyToEnvironmentName,
+  isOompaOtpReplyTo,
+  oompaOtpReplyToEnvironmentName,
 } from "../convex/otpEmailConfig";
 import {
-  hraAttentionResendApiKeyEnvironmentName,
-  hraResendApiKeyEnvironmentName,
-  requireHraAttentionResendApiKey,
+  oompaAttentionResendApiKeyEnvironmentName,
+  oompaResendApiKeyEnvironmentName,
+  requireOompaAttentionResendApiKey,
 } from "../convex/resendApiKey";
 
 import {
@@ -39,13 +39,13 @@ export const HOSTED_ENVIRONMENT_NAMES = [
   "SITE_URL",
   "JWT_PRIVATE_KEY",
   "JWKS",
-  "HRA_AUTH_HMAC_SECRET",
-  "HRA_RESEND_API_KEY",
-  hraOtpReplyToEnvironmentName,
-  hraAttentionResendApiKeyEnvironmentName,
+  "OOMPA_AUTH_HMAC_SECRET",
+  "OOMPA_RESEND_API_KEY",
+  oompaOtpReplyToEnvironmentName,
+  oompaAttentionResendApiKeyEnvironmentName,
 ] as const;
 
-export const HRA_SITE_URL = "https://hra.sh" as const;
+export const OOMPA_SITE_URL = "https://oompa.dev" as const;
 
 const protectedInputMaximumBytes = 8 * 1024;
 const convexOutputMaximumBytes = 64 * 1024;
@@ -65,17 +65,17 @@ const hasControlCharacter = (value: string): boolean => {
 const hostedInputSchema = z.object({
   attentionResendApiKey: z.string(),
   authEmailReplyTo: z.string()
-    .refine(isHraOtpReplyTo),
+    .refine(isOompaOtpReplyTo),
   resendApiKey: z.string()
     .min(8)
     .max(512)
     .regex(/^re_[A-Za-z0-9_-]+$/u),
-  siteUrl: z.literal(HRA_SITE_URL),
+  siteUrl: z.literal(OOMPA_SITE_URL),
 }).strict().superRefine((input, context) => {
   try {
-    requireHraAttentionResendApiKey({
-      [hraAttentionResendApiKeyEnvironmentName]: input.attentionResendApiKey,
-      [hraResendApiKeyEnvironmentName]: input.resendApiKey,
+    requireOompaAttentionResendApiKey({
+      [oompaAttentionResendApiKeyEnvironmentName]: input.attentionResendApiKey,
+      [oompaResendApiKeyEnvironmentName]: input.resendApiKey,
     });
   } catch {
     context.addIssue({ code: "custom", message: "attention_resend_key_invalid" });
@@ -246,10 +246,10 @@ export function serializeHostedEnvironment(
   const hmac = generated.hmacSecret;
   const resend = parsed.resendApiKey;
   const values: Record<(typeof HOSTED_ENVIRONMENT_NAMES)[number], string> = {
-    HRA_ATTENTION_RESEND_API_KEY: parsed.attentionResendApiKey,
-    HRA_AUTH_EMAIL_REPLY_TO: parsed.authEmailReplyTo,
-    HRA_AUTH_HMAC_SECRET: hmac,
-    HRA_RESEND_API_KEY: resend,
+    OOMPA_ATTENTION_RESEND_API_KEY: parsed.attentionResendApiKey,
+    OOMPA_AUTH_EMAIL_REPLY_TO: parsed.authEmailReplyTo,
+    OOMPA_AUTH_HMAC_SECRET: hmac,
+    OOMPA_RESEND_API_KEY: resend,
     JWKS: generated.jwks,
     JWT_PRIVATE_KEY: generated.jwtPrivateKey,
     SITE_URL: parsed.siteUrl,

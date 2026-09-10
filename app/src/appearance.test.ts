@@ -12,9 +12,9 @@ async function assertDefaultShell(source: string): Promise<void> {
     } })
     .on('meta[name="color-scheme"]', { element(element) { schemes.push(element.getAttribute("content")); } })
     .transform(new Response(source)).arrayBuffer();
-  assert.deepEqual(palettes, ["catppuccin"], "HRA must select its default palette before bootstrap delivery");
-  assert.deepEqual(themes, ["dark"], "HRA must select dark until a saved preference is applied");
-  assert.deepEqual(schemes, ["dark light"], "HRA must support both selectable appearances");
+  assert.deepEqual(palettes, ["catppuccin"], "Oompa must select its default palette before bootstrap delivery");
+  assert.deepEqual(themes, ["dark"], "Oompa must select dark until a saved preference is applied");
+  assert.deepEqual(schemes, ["dark light"], "Oompa must support both selectable appearances");
 }
 
 test("the authored shell names Catppuccin dark before the saved preference bootstrap", async () => {

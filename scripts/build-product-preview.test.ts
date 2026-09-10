@@ -11,7 +11,7 @@ const planSha256 = hash("preview-plan");
 const entry = "/fixture/app/fixtures/product/main.tsx";
 const htmlTag = '<html lang="en" data-theme="dark">';
 const themedTag = `<html lang="en" data-theme="dark" data-palette="catppuccin" class="${getDesignPaletteTheme("catppuccin", "dark").className}">`;
-const shell = `<!doctype html>${htmlTag}<head><meta http-equiv="Content-Security-Policy" content="${PRODUCT_PREVIEW_CSP}"><title>HRA example</title></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>`;
+const shell = `<!doctype html>${htmlTag}<head><meta http-equiv="Content-Security-Policy" content="${PRODUCT_PREVIEW_CSP}"><title>Oompa example</title></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>`;
 const sourceEntry = '<script type="module" src="/src/main.tsx"></script>';
 
 function bundle() {
@@ -29,7 +29,7 @@ function fixture() {
   const finalCss = { path: "stylex.css", bytes: Buffer.byteLength(".compiled{color:red}"), sha256: hash(".compiled{color:red}") };
   const complete = {
     artifacts: [shellArtifact, ...graph.artifacts.map((item) => ({ ...item, path: `graphs/client/${item.path}` }))],
-    compilerSha256, finalCss, generationId: "hra-product-preview",
+    compilerSha256, finalCss, generationId: "oompa-product-preview",
     graphs: [{ id: "client", receiptSha256: hash("client") }],
     kind: "hraness-stylex-complete-generation",
     packages: [{ manifestSha256: hash("design-manifest"), name: "@hraness/design-kit", version: "0.6.2" },
@@ -137,7 +137,7 @@ describe("closed product preview publication", () => {
     const { complete, project } = fixture();
     for (const mutation of [
       { compilerSha256: hash("other") }, { unionPolicySha256: hash("other") },
-      { planSha256: hash("other") }, { generationId: "hra-app" }, { state: "building" }, { schemaVersion: 1 },
+      { planSha256: hash("other") }, { generationId: "oompa-app" }, { state: "building" }, { schemaVersion: 1 },
       { graphs: [{ id: "other", receiptSha256: hash("other") }] }, { graphs: [...complete.graphs, ...complete.graphs] },
       { packages: [{ ...complete.packages[0], name: ["@other", "ui"].join("/") }] },
       { packages: complete.packages.slice(1) }, { packages: [...complete.packages].reverse() },

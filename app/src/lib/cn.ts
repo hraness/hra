@@ -22,7 +22,7 @@ export function staticStylexClassName(
   className?: string,
 ): string {
   if (presentation.style !== undefined) {
-    throw new Error("HRA primitives accept only extracted static StyleX styles.");
+    throw new Error("Oompa primitives accept only extracted static StyleX styles.");
   }
   return cn(presentation.className, className);
 }

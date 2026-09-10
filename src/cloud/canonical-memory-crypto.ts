@@ -26,7 +26,7 @@ import {
   CANONICAL_MEMORY_TERMINAL_HEAD_PROOF_PURPOSE,
   canonicalMemoryCiphertextLimits,
   canonicalMemoryPlaintextLimits,
-  HRA_CANONICAL_MEMORY_OPERATION_MAX_BYTES,
+  OOMPA_CANONICAL_MEMORY_OPERATION_MAX_BYTES,
   parseCanonicalMemoryHostedSpaceId,
 } from "../domain/canonical-memory-sync";
 import { hasExactKeys, isRecord, snapshotForeignJson } from "../domain/guards";
@@ -58,7 +58,7 @@ const portableCanonicalSpaceIdPattern = /^hra:project:space-[a-f0-9]{32}$/u;
 const canonicalMemoryOwnerDeviceQuota = 16;
 
 // NIST's random-nonce bound is shared by every device holding a space key.
-// The minus one leaves the aggregate strictly below the 2^31 HRA ceiling.
+// The minus one leaves the aggregate strictly below the 2^31 Oompa ceiling.
 export const canonicalMemoryGcmMessageBudgetPerDevice = Math.floor(
   (gcmMessageBudgetPerKey - 1) / canonicalMemoryOwnerDeviceQuota,
 );
@@ -1102,7 +1102,7 @@ export async function encryptCanonicalMemoryOperation(input: Readonly<{
     || operation.parentOperationSha256 !== priorHead.operationSha256
   ) reject("OPERATION_INVALID");
   const operationBytes = utf8ByteLength(canonicalJson(operation));
-  if (operationBytes > HRA_CANONICAL_MEMORY_OPERATION_MAX_BYTES) {
+  if (operationBytes > OOMPA_CANONICAL_MEMORY_OPERATION_MAX_BYTES) {
     reject("OPERATION_TOO_LARGE");
   }
   const head = headFromOperation(operation);
@@ -1227,7 +1227,7 @@ export async function decryptCanonicalMemoryOperation(input: Readonly<{
       || operation.spaceId !== authority.canonicalSpaceId
       || operation.sequence !== wire.sequence
       || operation.parentOperationSha256 !== expectedPriorHead.operationSha256
-      || utf8ByteLength(canonicalJson(operation)) > HRA_CANONICAL_MEMORY_OPERATION_MAX_BYTES
+      || utf8ByteLength(canonicalJson(operation)) > OOMPA_CANONICAL_MEMORY_OPERATION_MAX_BYTES
     ) reject("OPERATION_BUNDLE_INVALID");
     const head = headFromOperation(operation);
     const expectedHeadToken = await tokenForHead(spaceKey, authority, head);

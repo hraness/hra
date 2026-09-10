@@ -2410,7 +2410,7 @@ function shortDeviceId(publicId: string): string {
 }
 
 function automaticDeviceLabel(publicId: string): string {
-  return `HRA device ${shortDeviceId(publicId)}`;
+  return `Oompa device ${shortDeviceId(publicId)}`;
 }
 
 function fallbackDeviceLabel(
@@ -3237,7 +3237,7 @@ export class LocalCloudControl implements CloudControlPort, CanonicalMemoryCloud
       let account = await this.#readAccount(true);
       let deviceSecret = await this.#readDevice();
       if (deviceSecret !== null && deviceSecret.userPublicId !== account.userPublicId) {
-        throw new Error("This local state belongs to a different HRA identity. Re-authenticate that identity to preserve and recover its exact cloud custody.");
+        throw new Error("This local state belongs to a different Oompa identity. Re-authenticate that identity to preserve and recover its exact cloud custody.");
       }
       const pendingRegistration = await this.#readPendingRegistration();
       const replacement = await this.#readDeviceReplacement();
@@ -3271,7 +3271,7 @@ export class LocalCloudControl implements CloudControlPort, CanonicalMemoryCloud
           // A first-device bootstrap owns the account key it wrapped during
           // registration. Recovering that exact lost response may therefore
           // promote the same key automatically. A later approved device still
-          // requires `hra device pair` to retrieve its envelope.
+          // requires `oompa device pair` to retrieve its envelope.
           if (
             account.device.status === "active"
             && pendingRegistration.value.bootstrapKeyEnvelope !== undefined
@@ -3331,7 +3331,7 @@ export class LocalCloudControl implements CloudControlPort, CanonicalMemoryCloud
       let account = await this.#readAccount(true);
       let deviceSecret = await this.#readDevice();
       if (deviceSecret !== null && deviceSecret.userPublicId !== account.userPublicId) {
-        throw new Error("This local state belongs to a different HRA identity. Re-authenticate that identity to preserve and recover its exact cloud custody.");
+        throw new Error("This local state belongs to a different Oompa identity. Re-authenticate that identity to preserve and recover its exact cloud custody.");
       }
       const pendingRegistration = await this.#readPendingRegistration();
       let replacement = await this.#readDeviceReplacement();

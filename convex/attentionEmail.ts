@@ -8,26 +8,35 @@ import {
 } from "../src/cloud/contracts";
 import type { InteractionKind } from "../src/domain/interactions";
 import {
-  hraAttentionResendApiKeyEnvironmentName,
-  hraResendApiKeyEnvironmentName,
-  requireHraAttentionResendApiKey,
+  oompaAttentionResendApiKeyEnvironmentName,
+  oompaResendApiKeyEnvironmentName,
+  requireOompaAttentionResendApiKey,
 } from "./resendApiKey";
 
-export const hraAttentionEmailFrom =
-  "HRA attention <notifications@news.hraness.com>" as const;
-export const hraAttentionEmailSubject = "HRA needs your attention" as const;
-export const hraAttentionEmailEndpoint = "https://api.resend.com/emails" as const;
-export const hraAttentionEmailUserAgent = "hra-attention-email/1" as const;
-export const hraAttentionEmailDeliveryTimeoutMs = 8_000;
+/*
+ * Body version 1 is the immutable HRA-era wire vocabulary; version 2 is the
+ * Oompa presentation. Each version binds its own sender, subject, review line
+ * and session URL so an effect-started outbox row retries byte-identically.
+ */
+export const attentionEmailFromV1 = "HRA attention <notifications@news.hraness.com>" as const;
+export const attentionEmailSubjectV1 = "HRA needs your attention" as const;
+export const oompaAttentionEmailFrom =
+  "Oompa attention <notifications@news.hraness.com>" as const;
+export const oompaAttentionEmailSubject = "Oompa needs your attention" as const;
+export const oompaAttentionEmailEndpoint = "https://api.resend.com/emails" as const;
+export const oompaAttentionEmailUserAgent = "oompa-attention-email/1" as const;
+export const oompaAttentionEmailDeliveryTimeoutMs = 8_000;
 
 const attentionEmailBodyV1Version = 1 as const;
+const attentionEmailBodyV2Version = 2 as const;
+export type AttentionEmailBodyVersion = typeof attentionEmailBodyV1Version | typeof attentionEmailBodyV2Version;
 const attentionEmailBodyV1MaximumBodyBytes = 8 * 1_024;
 const attentionEmailBodyV1MaximumItems = 8;
-const attentionEmailBodyV1SubjectLine = "HRA needs your attention" as const;
+const attentionEmailBodyV1SubjectLine = attentionEmailSubjectV1;
 
-export const hraAttentionEmailMaximumBodyBytes = attentionEmailBodyV1MaximumBodyBytes;
-export const hraAttentionEmailMaximumItems = attentionEmailBodyV1MaximumItems;
-export const hraAttentionEmailBodyVersion = attentionEmailBodyV1Version;
+export const oompaAttentionEmailMaximumBodyBytes = attentionEmailBodyV1MaximumBodyBytes;
+export const oompaAttentionEmailMaximumItems = attentionEmailBodyV1MaximumItems;
+export const oompaAttentionEmailBodyVersion = attentionEmailBodyV2Version;
 
 const maximumProviderResponseBytes = 4 * 1_024;
 const maximumProviderMessageIdCharacters = 256;
@@ -52,6 +61,36 @@ const attentionEmailBodyV1InteractionKindLabels = Object.freeze({
 const attentionEmailBodyV1ReviewLine = "Open HRA to review:" as const;
 const attentionEmailBodyV1SessionUrl = "https://app.hra.sh/#/session/" as const;
 
+type AttentionEmailBodyGrammar = Readonly<{
+  from: typeof attentionEmailFromV1 | typeof oompaAttentionEmailFrom;
+  reviewLine: string;
+  sessionUrl: string;
+  subject: typeof attentionEmailSubjectV1 | typeof oompaAttentionEmailSubject;
+  subjectLine: string;
+}>;
+
+const attentionEmailBodyGrammars: Readonly<Record<AttentionEmailBodyVersion, AttentionEmailBodyGrammar>> =
+  Object.freeze({
+    [attentionEmailBodyV1Version]: Object.freeze({
+      from: attentionEmailFromV1,
+      reviewLine: attentionEmailBodyV1ReviewLine,
+      sessionUrl: attentionEmailBodyV1SessionUrl,
+      subject: attentionEmailSubjectV1,
+      subjectLine: attentionEmailBodyV1SubjectLine,
+    }),
+    [attentionEmailBodyV2Version]: Object.freeze({
+      from: oompaAttentionEmailFrom,
+      reviewLine: "Open Oompa to review:",
+      sessionUrl: "https://app.oompa.dev/#/session/",
+      subject: oompaAttentionEmailSubject,
+      subjectLine: oompaAttentionEmailSubject,
+    }),
+  });
+
+function isAttentionEmailBodyVersion(value: unknown): value is AttentionEmailBodyVersion {
+  return value === attentionEmailBodyV1Version || value === attentionEmailBodyV2Version;
+}
+
 const interactionKinds = new Set<InteractionKind>(
   Object.keys(attentionEmailBodyV1InteractionKindLabels) as InteractionKind[],
 );
@@ -59,7 +98,7 @@ const interactionKindLabelV1Values = new Set<string>(
   Object.values(attentionEmailBodyV1InteractionKindLabels),
 );
 
-export type HraAttentionEmailRefusalType =
+export type OompaAttentionEmailRefusalType =
   | "invalid_access"
   | "invalid_api_key"
   | "invalid_attachment"
@@ -74,7 +113,7 @@ export type HraAttentionEmailRefusalType =
   | "restricted_api_key"
   | "validation_error";
 
-const documentedNoEffectPairs = new Map<number, ReadonlySet<HraAttentionEmailRefusalType>>([
+const documentedNoEffectPairs = new Map<number, ReadonlySet<OompaAttentionEmailRefusalType>>([
   [400, new Set(["invalid_idempotency_key", "validation_error"])],
   [401, new Set(["missing_api_key", "restricted_api_key"])],
   [403, new Set([
@@ -93,31 +132,31 @@ const documentedNoEffectPairs = new Map<number, ReadonlySet<HraAttentionEmailRef
   ])],
 ]);
 
-export type HraAttentionEmailItem = Readonly<{
+export type OompaAttentionEmailItem = Readonly<{
   interactionKind: InteractionKind;
   sessionPublicId: string;
 }>;
 
-export type HraAttentionEmailBody = Readonly<{
+export type OompaAttentionEmailBody = Readonly<{
   text: string;
-  version: typeof attentionEmailBodyV1Version;
+  version: AttentionEmailBodyVersion;
 }>;
 
-export type HraAttentionEmailPayload = Readonly<{
-  from: typeof hraAttentionEmailFrom;
-  subject: typeof hraAttentionEmailSubject;
+export type OompaAttentionEmailPayload = Readonly<{
+  from: AttentionEmailBodyGrammar["from"];
+  subject: AttentionEmailBodyGrammar["subject"];
   text: string;
   to: readonly [CanonicalAuthEmail];
 }>;
 
-export type HraAttentionEmailResult =
+export type OompaAttentionEmailResult =
   | Readonly<{
       kind: "accepted";
       providerMessageId: string;
     }>
   | Readonly<{
       kind: "refused";
-      providerErrorType: HraAttentionEmailRefusalType;
+      providerErrorType: OompaAttentionEmailRefusalType;
       status: number;
     }>
   | Readonly<{
@@ -137,16 +176,16 @@ export type HraAttentionEmailResult =
         | "unknown_or_incoherent_response";
     }>;
 
-export type HraAttentionEmailFetch = (
+export type OompaAttentionEmailFetch = (
   resource: string,
   init: RequestInit,
 ) => Promise<Response>;
 
 const retryable = (
-  reason: Extract<HraAttentionEmailResult, { kind: "retryable" }>["reason"],
-): HraAttentionEmailResult => Object.freeze({ kind: "retryable", reason });
+  reason: Extract<OompaAttentionEmailResult, { kind: "retryable" }>["reason"],
+): OompaAttentionEmailResult => Object.freeze({ kind: "retryable", reason });
 
-function requireAttentionEmailItem(value: unknown): HraAttentionEmailItem {
+function requireAttentionEmailItem(value: unknown): OompaAttentionEmailItem {
   const snapshot = snapshotForeignJson(value);
   if (
     !snapshot.ok
@@ -172,44 +211,48 @@ function requireAttentionEmailIdempotencyKey(value: unknown): string {
   return value;
 }
 
-export function buildHraAttentionEmailBody(
-  input: readonly HraAttentionEmailItem[],
-): HraAttentionEmailBody {
+export function buildOompaAttentionEmailBody(
+  input: readonly OompaAttentionEmailItem[],
+  version: AttentionEmailBodyVersion = attentionEmailBodyV2Version,
+): OompaAttentionEmailBody {
   if (
     !Array.isArray(input)
     || input.length < 1
     || input.length > attentionEmailBodyV1MaximumItems
   ) throw new Error("Attention email delivery is unavailable.");
 
+  if (!isAttentionEmailBodyVersion(version)) throw new Error("Attention email delivery is unavailable.");
+  const grammar = attentionEmailBodyGrammars[version];
   const items = input.map(requireAttentionEmailItem);
   const text = [
-    attentionEmailBodyV1SubjectLine,
+    grammar.subjectLine,
     "",
-    attentionEmailBodyV1ReviewLine,
+    grammar.reviewLine,
     ...items.map((item) =>
-      `- ${attentionEmailBodyV1InteractionKindLabels[item.interactionKind]}: ${attentionEmailBodyV1SessionUrl}${item.sessionPublicId}`),
+      `- ${attentionEmailBodyV1InteractionKindLabels[item.interactionKind]}: ${grammar.sessionUrl}${item.sessionPublicId}`),
   ].join("\n");
   if (utf8Encoder.encode(text).byteLength > attentionEmailBodyV1MaximumBodyBytes) {
     throw new Error("Attention email delivery is unavailable.");
   }
 
-  return Object.freeze({ text, version: attentionEmailBodyV1Version });
+  return Object.freeze({ text, version });
 }
 
-function isAttentionEmailBodyV1Text(text: string): boolean {
+function isAttentionEmailBodyText(text: string, version: AttentionEmailBodyVersion): boolean {
+  const grammar = attentionEmailBodyGrammars[version];
   if (utf8Encoder.encode(text).byteLength > attentionEmailBodyV1MaximumBodyBytes) return false;
   const lines = text.split("\n");
   if (
     lines.length < 4
     || lines.length > 3 + attentionEmailBodyV1MaximumItems
-    || lines[0] !== attentionEmailBodyV1SubjectLine
+    || lines[0] !== grammar.subjectLine
     || lines[1] !== ""
-    || lines[2] !== attentionEmailBodyV1ReviewLine
+    || lines[2] !== grammar.reviewLine
   ) return false;
 
   return lines.slice(3).every((line) => {
     if (!line.startsWith("- ")) return false;
-    const marker = `: ${attentionEmailBodyV1SessionUrl}`;
+    const marker = `: ${grammar.sessionUrl}`;
     const markerIndex = line.indexOf(marker, 2);
     if (markerIndex < 3 || line.indexOf(marker, markerIndex + marker.length) !== -1) return false;
     const label = line.slice(2, markerIndex);
@@ -219,37 +262,38 @@ function isAttentionEmailBodyV1Text(text: string): boolean {
 }
 
 /**
- * Revalidates the versioned body stored by the hosted claim. Version 1 stays a
- * fixed grammar so later template versions cannot rewrite an in-flight effect.
+ * Revalidates the versioned body stored by the hosted claim. Every version is
+ * a fixed grammar so a later template version cannot rewrite an in-flight effect.
  */
-export function parseHraAttentionEmailBody(value: unknown): HraAttentionEmailBody | null {
+export function parseOompaAttentionEmailBody(value: unknown): OompaAttentionEmailBody | null {
   const snapshot = snapshotForeignJson(value);
   if (
     !snapshot.ok
     || !isRecord(snapshot.value)
     || !hasExactKeys(snapshot.value, ["text", "version"])
-    || snapshot.value.version !== attentionEmailBodyV1Version
+    || !isAttentionEmailBodyVersion(snapshot.value.version)
     || typeof snapshot.value.text !== "string"
-    || !isAttentionEmailBodyV1Text(snapshot.value.text)
+    || !isAttentionEmailBodyText(snapshot.value.text, snapshot.value.version)
   ) return null;
   return Object.freeze({
     text: snapshot.value.text,
-    version: attentionEmailBodyV1Version,
+    version: snapshot.value.version,
   });
 }
 
-export function buildHraAttentionEmailPayload(input: Readonly<{
-  body: HraAttentionEmailBody;
+export function buildOompaAttentionEmailPayload(input: Readonly<{
+  body: OompaAttentionEmailBody;
   recipient: CanonicalAuthEmail;
-}>): HraAttentionEmailPayload {
-  const body = parseHraAttentionEmailBody(input.body);
+}>): OompaAttentionEmailPayload {
+  const body = parseOompaAttentionEmailBody(input.body);
   if (body === null || !isCanonicalAuthEmail(input.recipient)) {
     throw new Error("Attention email delivery is unavailable.");
   }
 
+  const grammar = attentionEmailBodyGrammars[body.version];
   return Object.freeze({
-    from: hraAttentionEmailFrom,
-    subject: hraAttentionEmailSubject,
+    from: grammar.from,
+    subject: grammar.subject,
     text: body.text,
     to: Object.freeze([input.recipient] as const),
   });
@@ -276,17 +320,17 @@ function strictProviderError(
   return { name: snapshot.value.name };
 }
 
-export function isHraAttentionEmailDocumentedRefusal(
+export function isOompaAttentionEmailDocumentedRefusal(
   status: number,
   name: string,
-): name is HraAttentionEmailRefusalType {
-  return documentedNoEffectPairs.get(status)?.has(name as HraAttentionEmailRefusalType) === true;
+): name is OompaAttentionEmailRefusalType {
+  return documentedNoEffectPairs.get(status)?.has(name as OompaAttentionEmailRefusalType) === true;
 }
 
-export function classifyHraAttentionEmailResponse(input: Readonly<{
+export function classifyOompaAttentionEmailResponse(input: Readonly<{
   body: unknown;
   status: number;
-}>): HraAttentionEmailResult {
+}>): OompaAttentionEmailResult {
   if (!Number.isInteger(input.status) || input.status < 100 || input.status > 599) {
     return retryable("unknown_or_incoherent_response");
   }
@@ -328,7 +372,7 @@ export function classifyHraAttentionEmailResponse(input: Readonly<{
   if (input.status === 409 && error?.name === "concurrent_idempotent_requests") {
     return retryable("concurrent_idempotency");
   }
-  if (error !== null && isHraAttentionEmailDocumentedRefusal(input.status, error.name)) {
+  if (error !== null && isOompaAttentionEmailDocumentedRefusal(input.status, error.name)) {
     return Object.freeze({
       kind: "refused",
       providerErrorType: error.name,
@@ -388,42 +432,42 @@ async function readBoundedJson(response: Response): Promise<unknown> {
   }
 }
 
-type HraAttentionEmailInput = Readonly<{
-  body: HraAttentionEmailBody;
+type OompaAttentionEmailInput = Readonly<{
+  body: OompaAttentionEmailBody;
   idempotencyKey: string;
   recipient: CanonicalAuthEmail;
 }>;
 
-type HraAttentionEmailOptions = Readonly<{
+type OompaAttentionEmailOptions = Readonly<{
   environment?: Readonly<Record<string, string | undefined>>;
-  fetch?: HraAttentionEmailFetch;
+  fetch?: OompaAttentionEmailFetch;
 }>;
 
 /** Validate and retain one credential snapshot before a drain claims an effect. */
-export function createHraAttentionEmailSender(
-  options: HraAttentionEmailOptions = {},
-): (input: HraAttentionEmailInput) => Promise<HraAttentionEmailResult> {
+export function createOompaAttentionEmailSender(
+  options: OompaAttentionEmailOptions = {},
+): (input: OompaAttentionEmailInput) => Promise<OompaAttentionEmailResult> {
   const source = options.environment ?? process.env;
   const environment = Object.freeze({
-    [hraAttentionResendApiKeyEnvironmentName]: source[hraAttentionResendApiKeyEnvironmentName],
-    [hraResendApiKeyEnvironmentName]: source[hraResendApiKeyEnvironmentName],
+    [oompaAttentionResendApiKeyEnvironmentName]: source[oompaAttentionResendApiKeyEnvironmentName],
+    [oompaResendApiKeyEnvironmentName]: source[oompaResendApiKeyEnvironmentName],
   });
-  requireHraAttentionResendApiKey(environment);
+  requireOompaAttentionResendApiKey(environment);
   const fetchImplementation = options.fetch ?? globalThis.fetch;
-  return async (input) => await sendHraAttentionEmail(input, {
+  return async (input) => await sendOompaAttentionEmail(input, {
     environment,
     fetch: fetchImplementation,
   });
 }
 
-export async function sendHraAttentionEmail(
-  input: HraAttentionEmailInput,
-  options: HraAttentionEmailOptions = {},
-): Promise<HraAttentionEmailResult> {
-  const payload = buildHraAttentionEmailPayload(input);
+export async function sendOompaAttentionEmail(
+  input: OompaAttentionEmailInput,
+  options: OompaAttentionEmailOptions = {},
+): Promise<OompaAttentionEmailResult> {
+  const payload = buildOompaAttentionEmailPayload(input);
   const idempotencyKey = requireAttentionEmailIdempotencyKey(input.idempotencyKey);
-  const apiKey = requireHraAttentionResendApiKey(options.environment);
-  const fetchImplementation: HraAttentionEmailFetch = options.fetch ?? globalThis.fetch;
+  const apiKey = requireOompaAttentionResendApiKey(options.environment);
+  const fetchImplementation: OompaAttentionEmailFetch = options.fetch ?? globalThis.fetch;
   const controller = new AbortController();
   const timeoutError = new Error("Attention email delivery timed out.");
   let rejectDeadline!: (error: Error) => void;
@@ -433,22 +477,22 @@ export async function sendHraAttentionEmail(
   const timeout = setTimeout(() => {
     rejectDeadline(timeoutError);
     controller.abort(timeoutError);
-  }, hraAttentionEmailDeliveryTimeoutMs);
+  }, oompaAttentionEmailDeliveryTimeoutMs);
 
   try {
-    const request = fetchImplementation(hraAttentionEmailEndpoint, {
+    const request = fetchImplementation(oompaAttentionEmailEndpoint, {
       body: JSON.stringify(payload),
       headers: {
         Accept: "application/json",
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
         "Idempotency-Key": idempotencyKey,
-        "User-Agent": hraAttentionEmailUserAgent,
+        "User-Agent": oompaAttentionEmailUserAgent,
       },
       method: "POST",
       redirect: "error",
       signal: controller.signal,
-    }).then(async (response) => classifyHraAttentionEmailResponse({
+    }).then(async (response) => classifyOompaAttentionEmailResponse({
       body: await readBoundedJson(response),
       status: response.status,
     }));

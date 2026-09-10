@@ -2,24 +2,24 @@
 
 ## Decision
 
-HRA will support scheduled task creation, inspection, editing, pausing, resuming,
+Oompa will support scheduled task creation, inspection, editing, pausing, resuming,
 and deletion as local **session tasks**. A session task is owned by one immutable
-HRA session and may create work only by materializing a message in that
+Oompa session and may create work only by materializing a message in that
 session's existing durable queue. It is not an entry in the private Codex
 desktop Scheduled Tasks registry, a generic scheduler, or a standalone task
 that creates a new conversation.
 
 The pinned Codex app-server protocol has no scheduled-task CRUD request. It
-does expose experimental dynamic tools on `thread/start`, so new HRA-created
+does expose experimental dynamic tools on `thread/start`, so new Oompa-created
 sessions advertise one narrow `hra.automation_update` tool. That tool operates
 only on the session identified by the provider request's authoritative thread
-ID. The public CLI exposes the same storage contract under `hra session task`.
+ID. The public CLI exposes the same storage contract under `oompa session task`.
 Existing provider threads created before this feature remain manageable through
-the CLI. HRA does not retrofit the in-conversation tool onto those threads
-because they have no durable proof that HRA started them with the reviewed tool
+the CLI. Oompa does not retrofit the in-conversation tool onto those threads
+because they have no durable proof that Oompa started them with the reviewed tool
 contract.
 
-HRA never writes `$CODEX_HOME/automations`, edits rollout files, invents a
+Oompa never writes `$CODEX_HOME/automations`, edits rollout files, invents a
 provider automation RPC, or creates a replacement conversation.
 
 ## Product contract
@@ -27,11 +27,11 @@ provider automation RPC, or creates a replacement conversation.
 The CLI grammar is:
 
 ```text
-hra session task list <session>
-hra session task show <session> <task-id>
-hra session task create <session> --name <name> --every-minutes <15..10080> [--paused] [--idempotency-key <uuid>] -- <prompt>
-hra session task edit <session> <task-id> --revision <n> [--name <name>] [--every-minutes <15..10080>] [--pause|--resume] [--idempotency-key <uuid>] [-- <replacement-prompt>]
-hra session task delete <session> <task-id> --revision <n> [--idempotency-key <uuid>]
+oompa session task list <session>
+oompa session task show <session> <task-id>
+oompa session task create <session> --name <name> --every-minutes <15..10080> [--paused] [--idempotency-key <uuid>] -- <prompt>
+oompa session task edit <session> <task-id> --revision <n> [--name <name>] [--every-minutes <15..10080>] [--pause|--resume] [--idempotency-key <uuid>] [-- <replacement-prompt>]
+oompa session task delete <session> <task-id> --revision <n> [--idempotency-key <uuid>]
 ```
 
 Nesting under `session` makes a standalone destination unrepresentable. A
@@ -47,7 +47,7 @@ intervals. The minimum cadence is 15 minutes and the maximum is seven days.
 Calendar, timezone, RRULE, cron, and daylight-saving semantics are not silently
 approximated; a future closed schedule union may add them.
 
-Public records carry `scope: "conversation"`, the HRA session ID, task ID,
+Public records carry `scope: "conversation"`, the Oompa session ID, task ID,
 name, status, interval, revision, timestamps, and next due time. They never
 carry a provider thread ID, project retarget, model, execution environment, or
 standalone kind. List omits prompt content; show and mutation results may return
@@ -57,7 +57,7 @@ the bounded prompt. At most 32 non-deleted tasks may belong to one session.
 
 New threads advertise exactly one namespaced function tool:
 
-- namespace: `hra`
+- namespace: `oompa`
 - name: `automation_update`
 - operations: `create`, `update`, `view`, `list`, and `delete`
 - schedule: `{ "kind": "interval_minutes", "minutes": 15..10080 }`
@@ -83,7 +83,7 @@ version 29. The isolated implementation branch still uses its stale-base next
 version, 27, which already conflicts with migrations 27 and 28 on current main
 and must not be merged unchanged. The feature adds four strict local tables:
 
-- `session_conversation_automation`: durable proof that one exact HRA session
+- `session_conversation_automation`: durable proof that one exact Oompa session
   and provider thread were started with the reviewed conversation tool;
 
 - `session_tasks`: a task ID, non-null session foreign key, name, prompt,
@@ -166,7 +166,7 @@ The implementation is not complete until deterministic tests prove:
 9. the dynamic tool accepts only its exact namespace, name, authority, schema,
    and replay identity; and
 10. a live scheduled run adds a turn to the same provider thread without
-    creating another HRA session; and
+    creating another Oompa session; and
 11. a file-backed WAL close and reopen dispatches one already-committed pending
     occurrence at most once and never duplicates its occurrence row.
 
@@ -176,7 +176,7 @@ This feature can ship in the public source and package without deploying a new
 Convex schema because its authority and prompts are local-only. A protected
 main merge triggers the current Vercel production build. Package publication
 must use a newly accepted current-project-only tag and artifact path; the
-retired HRA v0 publication scripts and provider identities remain prohibited.
+retired Oompa v0 publication scripts and provider identities remain prohibited.
 Canonical domain aliasing, DNS, hosted Convex writes, and native Codex desktop
 task-registry mutation are separate authorities and are not implied by this
 feature.

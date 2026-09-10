@@ -11,7 +11,7 @@ export type TextareaProps = Omit<TextareaHTMLAttributes<HTMLTextAreaElement>, "s
 }>;
 
 function rejectInlineStyle(style: unknown): void {
-  if (style !== undefined) throw new Error("HRA primitives do not accept caller inline styles.");
+  if (style !== undefined) throw new Error("Oompa primitives do not accept caller inline styles.");
 }
 
 export function Textarea({ className, rows = 2, style, xstyle, ...rest }: TextareaProps) {

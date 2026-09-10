@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import type { CompactSessionEvent } from "../hra/cloud";
+import type { CompactSessionEvent } from "../oompa/cloud";
 import { deriveTranscript, mergeCompactEvents } from "./transcript";
 
 const userMessage = (

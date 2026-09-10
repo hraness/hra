@@ -1,6 +1,13 @@
 import { z } from "zod";
 
 import { publicProviderIdentifierSchema } from "../public-provider-identifier";
+import {
+  claudeProviderAccountIdSchema,
+  codexProviderAccountIdSchema,
+  devinProviderAccountIdSchema,
+  providerAccountIdSchema,
+} from "./provider-accounts";
+import { providerSchema } from "./presets";
 import { profileIdSchema, sessionIdSchema, unixMillisecondsSchema } from "./values";
 
 const digestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
@@ -46,7 +53,7 @@ export type InteractionDecision = z.infer<typeof interactionDecisionSchema>;
  * Per-session and daemon-default answering policy for brokered protocol
  * approvals. `auto:all` autoresponds command and permission approvals;
  * `auto:workspace` escalates both until their exact provider authority can be
- * proved workspace-local. File changes remain local because HRA cannot show
+ * proved workspace-local. File changes remain local because Oompa cannot show
  * their exact affected paths. `manual` never autoresponds.
  */
 export const approvalModeSchema = z.enum(["auto:all", "auto:workspace", "manual"]);
@@ -77,10 +84,10 @@ export type InteractionIntendedTerminalState = z.infer<
   typeof interactionIntendedTerminalStateSchema
 >;
 
-/** HRA never leaves an admitted provider callback pending longer than 30 minutes. */
+/** Oompa never leaves an admitted provider callback pending longer than 30 minutes. */
 export const INTERACTION_MAX_PENDING_MS = 30 * 60 * 1_000;
 
-export const providerInteractionAuthoritySchema = z.object({
+const providerInteractionAuthorityFields = {
   profileId: profileIdSchema,
   processGeneration: z.number().int().nonnegative(),
   connectionId: z.string().uuid(),
@@ -91,7 +98,90 @@ export const providerInteractionAuthoritySchema = z.object({
   turnId: nullableProviderIdentifierSchema,
   itemId: nullableProviderIdentifierSchema,
   approvalId: nullableProviderIdentifierSchema,
-}).strict();
+} as const;
+
+/**
+ * Decode-only compatibility schema for immutable pre-provider-account
+ * interaction evidence. Live callers must use
+ * `providerInteractionAuthoritySchema` below.
+ */
+export const legacyProviderInteractionAuthoritySchema = z.object({
+  ...providerInteractionAuthorityFields,
+  provider: providerSchema.optional(),
+  providerAccountId: providerAccountIdSchema.optional(),
+  bindingGeneration: z.number().int().positive().optional(),
+}).strict().superRefine((authority, context) => {
+  const providerFields = [
+    authority.provider,
+    authority.providerAccountId,
+    authority.bindingGeneration,
+  ];
+  const present = providerFields.filter((value) => value !== undefined).length;
+  if (present !== 0 && present !== providerFields.length) {
+    context.addIssue({
+      code: "custom",
+      message: "Provider-account interaction authority must be complete.",
+    });
+    return;
+  }
+  if (
+    authority.provider === "codex"
+    && !codexProviderAccountIdSchema.safeParse(authority.providerAccountId).success
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "Codex interaction authority requires a Codex provider-account id.",
+    });
+  }
+  if (
+    authority.provider === "claude"
+    && !claudeProviderAccountIdSchema.safeParse(authority.providerAccountId).success
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "Claude interaction authority requires a Claude provider-account id.",
+    });
+  }
+  if (authority.provider === "devin"
+    && !devinProviderAccountIdSchema.safeParse(authority.providerAccountId).success) {
+    context.addIssue({ code: "custom", message: "Devin interaction authority requires a Devin provider-account id." });
+  }
+});
+
+export type LegacyProviderInteractionAuthority = z.infer<
+  typeof legacyProviderInteractionAuthoritySchema
+>;
+
+/** Exact provider-account authority required by every live interaction seam. */
+export const providerInteractionAuthoritySchema = z.object({
+  ...providerInteractionAuthorityFields,
+  provider: providerSchema,
+  providerAccountId: providerAccountIdSchema,
+  bindingGeneration: z.number().int().positive(),
+}).strict().superRefine((authority, context) => {
+  if (
+    authority.provider === "codex"
+    && !codexProviderAccountIdSchema.safeParse(authority.providerAccountId).success
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "Codex interaction authority requires a Codex provider-account id.",
+    });
+  }
+  if (
+    authority.provider === "claude"
+    && !claudeProviderAccountIdSchema.safeParse(authority.providerAccountId).success
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "Claude interaction authority requires a Claude provider-account id.",
+    });
+  }
+  if (authority.provider === "devin"
+    && !devinProviderAccountIdSchema.safeParse(authority.providerAccountId).success) {
+    context.addIssue({ code: "custom", message: "Devin interaction authority requires a Devin provider-account id." });
+  }
+});
 
 export type ProviderInteractionAuthority = z.infer<typeof providerInteractionAuthoritySchema>;
 
@@ -514,7 +604,7 @@ export function computeInteractionPresentation(display: InteractionDisplay): Int
       const lines: string[] = [];
       if (display.grantRoot !== null) lines.push(`Grant root: ${display.grantRoot}`);
       if (display.reason !== null) lines.push(`Reason: ${display.reason}`);
-      lines.push("HRA cannot show the exact affected paths for this provider version.");
+      lines.push("Oompa cannot show the exact affected paths for this provider version.");
       return {
         label: "File change approval",
         glyph: "file-edit",

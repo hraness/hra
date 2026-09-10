@@ -2,6 +2,20 @@
 
 Every entry names the release or the plan wave it belongs to. Unreleased work sits under the wave that produced it until a version ships.
 
+## v0.8.0 candidate (unreleased)
+
+Provider account visibility, local automatic usage policy controls, and recovery hardening. This candidate is not yet admitted. The [v0.7.1 immutable installation notes](https://github.com/hraness/hra/blob/v0.7.1/docs/beta-release-notes.md#install) remain the installation path for the admitted artifact. Artifact admission does not clear daemon startup, hosted capacity or intended-target gates.
+
+- HRA is renamed to Oompa. The package is `@hraness/oompa`, the command is `oompa`, the repository is `hraness/oompa`, and the public surfaces are `oompa.dev` and `app.oompa.dev`. The product mark is an orange circle. Oompa installs into its own `~/.bun/install/oompa` authority and publishes only the `oompa` command; an existing `hra` installation keeps running from its old root until removed. The control-plane state root, persisted schema names, hash and encryption domains, the v1 provider preamble and host-tool manifest, opaque token prefixes and public marker paths keep their historical bytes, so existing sessions, profiles and recovery journals continue unchanged.
+- `OOMPA_*` environment names replace `HRA_*`. `HRA_CONVEX_URL`, the Convex secrets and the scheduler lease variables remain accepted as legacy aliases; a contradictory pair refuses before any effect.
+- Attention email adds body version 2 with the Oompa sender, subject and `app.oompa.dev` links. Version 1 rows retry with their original bytes.
+- The local and cloud efficiency plugins are `oompa-local-efficiency` and `oompa-cloud-efficiency`; their bootstrap and repository adoption migrate the previous `hra-*` managed blocks, rule files, profile files and command names in place.
+- `oompa account list --provider codex|claude` returns a separately versioned cached account order, default marker, readiness and observation times without refreshing providers or changing selection. The unqualified listing is unchanged.
+- `oompa usage auto status|on|off|inherit` reads or changes the inherited default and per-provider overrides. Changes require an observed revision and caller-owned idempotency key. Effective Codex disable suppresses new reset-credit dispatches, including retries, while preserving uncertain attempts and already admitted operations.
+- Provider recovery preserves exact historical account, profile, effect and timestamp evidence. Terminal attachment acknowledgement, queued-input settlement and Claude launch-reservation cleanup fail closed when authority or prior-process custody cannot be proved.
+- Additive local storage migrations retain the admitted schema 50 predecessor and append the provider-usage and custody foundation through schema 60. Genuine historical fixtures and explicitly identified synthetic compatibility cases verify migration and refusal boundaries; they do not prove live provider acceptance.
+- Automatic account movement, managed-send forwarding, account order and activation commands, Claude native fallback, and the planned hosted/browser usage view remain unavailable. Existing explicit account selection and provider-specific platform limits are unchanged.
+
 ## Release reliability follow-up (unreleased)
 
 - The npm provenance verifier includes stdin in its existing 60-second deadline and waits for the owned child, input and both output readers before reporting verification success. A failed operation gets a bounded five-second collection window; unproved collection remains a failure. Both release callers preserve the private TUF cache on every verification failure. Cryptographic identity checks, environment and byte bounds are unchanged. This source repair is not part of the immutable v0.7.1 artifact, and no evidence links the cleanup defect to that release's delayed registry visibility.

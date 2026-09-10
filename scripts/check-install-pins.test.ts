@@ -23,13 +23,15 @@ describe("installer pins", () => {
   test("release consistency requires the tagged runtime bytes and matching URLs", async () => {
     const report = await readInstallPins(repositoryRoot);
     const consistent = { ...report, runtime: { publicCommand: report.runtime.actual, actual: report.runtime.actual } };
-    const drift = releasePinDrift(consistent, "v0.7.1", "0.7.1");
+    const drift = releasePinDrift(consistent, "v0.8.0", "0.8.0");
     expect(drift).toEqual([]);
-    expect(releasePinDrift(report, "v0.7.1", "0.7.1").some((line) => line.includes("public command digest") || line.includes("is not the public command digest") || line.length === 0)).toBe(report.runtime.publicCommand !== report.runtime.actual);
-    expect(releasePinDrift(consistent, "v0.1.8", "0.7.1")).toContain("release tag v0.1.8 does not match package.json version 0.7.1");
-    expect(releasePinDrift(consistent, "v0.7.0", "0.7.1"))
-      .toContain("release tag v0.7.0 does not match package.json version 0.7.1");
-    expect(() => releasePinDrift(consistent, "0.7.1", "0.7.1")).toThrow();
+    expect(releasePinDrift(report, "v0.8.0", "0.8.0").some((line) => line.includes("public command digest") || line.includes("is not the public command digest") || line.length === 0)).toBe(report.runtime.publicCommand !== report.runtime.actual);
+    expect(releasePinDrift(consistent, "v0.1.8", "0.8.0")).toContain("release tag v0.1.8 does not match package.json version 0.8.0");
+    for (const priorTag of ["v0.7.0", "v0.7.1"]) {
+      expect(releasePinDrift(consistent, priorTag, "0.8.0"))
+        .toContain(`release tag ${priorTag} does not match package.json version 0.8.0`);
+    }
+    expect(() => releasePinDrift(consistent, "0.8.0", "0.8.0")).toThrow();
   });
 
   test("working-tree drift names the file and both digests", () => {
@@ -52,22 +54,22 @@ describe("installer pins", () => {
     const digest = (source: string) => createHash("sha256").update(source).digest("hex");
     const cli = "export const cli = true;\n";
     const cliDigest = digest(cli);
-    const normalizer = `export const HRA_INSTALL_CLI_SHA256 = "${cliDigest}";\n`;
+    const normalizer = `export const OOMPA_INSTALL_CLI_SHA256 = "${cliDigest}";\n`;
     const normalizerDigest = digest(normalizer);
     const runtime = [
-      `export const HRA_INSTALL_CLI_SHA256 = "${cliDigest}";`,
-      `export const HRA_INSTALL_NORMALIZER_SHA256 = "${normalizerDigest}";`,
-      "export const HRA_INSTALL_ARCHIVE_URL = \"https://github.com/hraness/hra/releases/download/v0.6.1/hraness-hra-0.6.1.tgz\";",
+      `export const OOMPA_INSTALL_CLI_SHA256 = "${cliDigest}";`,
+      `export const OOMPA_INSTALL_NORMALIZER_SHA256 = "${normalizerDigest}";`,
+      "export const OOMPA_INSTALL_ARCHIVE_URL = \"https://github.com/hraness/oompa/releases/download/v0.6.1/hraness-oompa-0.6.1.tgz\";",
       "",
     ].join("\n");
     const runtimeDigest = digest(runtime);
     const sources = {
       cli,
-      manifest: JSON.stringify({ name: "@hraness/hra", version: "0.6.1" }),
+      manifest: JSON.stringify({ name: "@hraness/oompa", version: "0.6.1" }),
       normalizer,
       preflight: [
-        "export const HRA_INSTALL_PREFLIGHT_SOURCE_URL = \"https://raw.githubusercontent.com/hraness/hra/v0.6.1/src/install-preflight-runtime.ts\";",
-        `export const HRA_INSTALL_PREFLIGHT_SOURCE_SHA256 = "${runtimeDigest}";`,
+        "export const OOMPA_INSTALL_PREFLIGHT_SOURCE_URL = \"https://raw.githubusercontent.com/hraness/oompa/v0.6.1/src/install-preflight-runtime.ts\";",
+        `export const OOMPA_INSTALL_PREFLIGHT_SOURCE_SHA256 = "${runtimeDigest}";`,
         "",
       ].join("\n"),
       runtime,
@@ -80,7 +82,7 @@ describe("installer pins", () => {
   });
 
   test("release preparation alone moves the public runtime digest after inner pins converge", async () => {
-    const fixture = await mkdtemp(join(tmpdir(), "hra-release-pins-"));
+    const fixture = await mkdtemp(join(tmpdir(), "oompa-release-pins-"));
     await mkdir(join(fixture, "src"));
     for (const path of [
       "package.json",
@@ -117,10 +119,10 @@ describe("installer pins", () => {
     expect(await readFile(preflightPath, "utf8")).toBe(ordinaryBefore);
 
     expect(report.runtime.actual).not.toBe(report.runtime.publicCommand);
-    expect(await updateInstallPinsForRelease(fixture, "v0.7.1", {
+    expect(await updateInstallPinsForRelease(fixture, "v0.8.0", {
       readPins: async () => report,
     }))
-      .toEqual(["src/install-preflight.ts: replaced 1 public runtime digest site for v0.7.1"]);
+      .toEqual(["src/install-preflight.ts: replaced 1 public runtime digest site for v0.8.0"]);
     const prepared = await readFile(preflightPath, "utf8");
     expect(prepared).toContain(report.runtime.actual);
     expect(prepared).not.toContain(report.runtime.publicCommand);

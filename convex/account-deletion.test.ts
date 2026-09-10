@@ -562,7 +562,7 @@ describe("status-first account deletion", () => {
       const startedPatch = {
         delivery: {
           attemptCount: 1,
-          body: { text: "HRA needs your attention", version: 1 as const },
+          body: { text: "Oompa needs your attention", version: 1 as const },
           bodyDigest: "b".repeat(64),
           claimedAt: startedAt,
           deadline: startedAt + 60_000,

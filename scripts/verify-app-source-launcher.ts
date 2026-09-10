@@ -23,7 +23,7 @@ const sourceHashReadBytes = 64 * 1024;
 const sourceCommitPattern = /^[0-9a-f]{40}$/u;
 const deploymentIdPattern = /^dpl_[A-Za-z0-9]{20,80}$/u;
 const releaseVersionPattern = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u;
-const publicRepositoryUrl = "https://github.com/hraness/hra.git";
+const publicRepositoryUrl = "https://github.com/hraness/oompa.git";
 
 export const appSourceProofRuntimeInjectionEnvironmentNames = [
   "BUN_OPTIONS",
@@ -59,7 +59,7 @@ export type AppSourceProofLauncherErrorCode =
 
 export class AppSourceProofLauncherError extends Error {
   constructor(readonly code: AppSourceProofLauncherErrorCode) {
-    super(`HRA app source proof launcher refused: ${code}`);
+    super(`Oompa app source proof launcher refused: ${code}`);
     this.name = "AppSourceProofLauncherError";
   }
 }

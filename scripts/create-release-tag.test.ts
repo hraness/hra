@@ -95,9 +95,9 @@ function fakeReleaseRunner(options: Readonly<{
     if (key === "gh\u0000api\u0000user") {
       return result(JSON.stringify({ id: options.wrongUser === true ? 7 : 894119, type: "User" }));
     }
-    if (key === "gh\u0000api\u0000repos/hraness/hra") return result(JSON.stringify({
+    if (key === "gh\u0000api\u0000repos/hraness/oompa") return result(JSON.stringify({
       default_branch: "main",
-      full_name: "hraness/hra",
+      full_name: "hraness/oompa",
       id: 1343008607,
       owner: { id: 307125679 },
       private: false,
@@ -125,20 +125,20 @@ function fakeReleaseRunner(options: Readonly<{
     }
     if (key === "git\u0000branch\u0000--show-current") return result("main");
     if (key === "git\u0000remote\u0000get-url\u0000--all\u0000origin") {
-      return result("https://github.com/hraness/hra.git");
+      return result("https://github.com/hraness/oompa.git");
     }
     if (key === "git\u0000remote\u0000get-url\u0000--push\u0000--all\u0000origin") {
-      return result("git@github.com:hraness/hra.git");
+      return result("git@github.com:hraness/oompa.git");
     }
     if (key === "git\u0000rev-parse\u0000--verify\u0000HEAD^{commit}") return result(sha);
     if (key === "git\u0000show\u0000HEAD:package.json") {
-      return result(JSON.stringify({ name: "@hraness/hra", version: "0.6.1" }));
+      return result(JSON.stringify({ name: "@hraness/oompa", version: "0.6.1" }));
     }
     const committedSourcePrefix = `git\u0000show\u0000${sha}:`;
     if (key.startsWith(committedSourcePrefix)) {
       const path = key.slice(committedSourcePrefix.length);
       return result(path === "package.json"
-        ? `${JSON.stringify({ name: "@hraness/hra", version: "0.6.1" })}\n`
+        ? `${JSON.stringify({ name: "@hraness/oompa", version: "0.6.1" })}\n`
         : `// committed ${path}\n`);
     }
     if (key === "git\u0000ls-remote\u0000--heads\u0000origin\u0000refs/heads/main") {
@@ -152,7 +152,7 @@ function fakeReleaseRunner(options: Readonly<{
         ? `${current}${nextObject}\trefs/tags/v0.6.1\n${sha}\trefs/tags/v0.6.1^{}\n`
         : current);
     }
-    if (key.startsWith("gh\u0000api\u0000--method\u0000GET\u0000repos/hraness/hra/rulesets\u0000")) {
+    if (key.startsWith("gh\u0000api\u0000--method\u0000GET\u0000repos/hraness/oompa/rulesets\u0000")) {
       return result(JSON.stringify([
         { id: 1, name: "Release tag creation" },
         { id: 2, name: "Immutable version tags" },
@@ -160,9 +160,9 @@ function fakeReleaseRunner(options: Readonly<{
         { id: 4, name: "Protect main" },
       ]));
     }
-    const detailPrefix = "gh\u0000api\u0000repos/hraness/hra/rulesets/";
+    const detailPrefix = "gh\u0000api\u0000repos/hraness/oompa/rulesets/";
     if (key.startsWith(detailPrefix)) return result(JSON.stringify(details.get(key.slice(detailPrefix.length))));
-    if (key === "gh\u0000api\u0000repos/hraness/hra/actions/workflows/ci.yml") return result(JSON.stringify({
+    if (key === "gh\u0000api\u0000repos/hraness/oompa/actions/workflows/ci.yml") return result(JSON.stringify({
       id: 340428685,
       name: "CI",
       path: ".github/workflows/ci.yml",
@@ -176,11 +176,11 @@ function fakeReleaseRunner(options: Readonly<{
         conclusion: "success",
         event: "push",
         head_branch: "main",
-        head_repository: { full_name: "hraness/hra" },
+        head_repository: { full_name: "hraness/oompa" },
         head_sha: sha,
         id: 10,
         path: ".github/workflows/ci.yml",
-        repository: { full_name: "hraness/hra" },
+        repository: { full_name: "hraness/oompa" },
         run_attempt: 1,
         status: "completed",
       }],
@@ -220,7 +220,7 @@ describe("owner-authorized release tag", () => {
     for (const hiddenIndex of ["assume-unchanged", "skip-worktree"] as const) {
       const fixture = fakeReleaseRunner({ hiddenIndex });
       await expect(createReleaseTag(fixture.runner, async () => ({
-        name: "@hraness/hra",
+        name: "@hraness/oompa",
         version: "0.6.1",
       }))).rejects.toThrow("skip-worktree or assume-unchanged");
       expect(fixture.calls.some((call) => call.includes("\u0000tag\u0000-a\u0000"))).toBe(false);
@@ -231,7 +231,7 @@ describe("owner-authorized release tag", () => {
   test("refuses replacement refs before reading or tagging committed installer blobs", async () => {
     const fixture = fakeReleaseRunner({ replacementRef: true });
     await expect(createReleaseTag(fixture.runner, async () => ({
-      name: "@hraness/hra",
+      name: "@hraness/oompa",
       version: "0.6.1",
     }), acceptReleasePins)).rejects.toThrow("replacement refs");
     expect(fixture.calls.some((call) => call.startsWith(`git\u0000show\u0000${sha}:`))).toBe(false);
@@ -242,7 +242,7 @@ describe("owner-authorized release tag", () => {
   test("uses the committed manifest as release authority", async () => {
     const fixture = fakeReleaseRunner();
     await expect(createReleaseTag(fixture.runner, async () => ({
-      name: "@hraness/hra",
+      name: "@hraness/oompa",
       version: "0.6.2",
     }))).rejects.toThrow("does not match the exact committed package manifest");
     expect(fixture.calls.some((call) => call.includes("\u0000tag\u0000-a\u0000"))).toBe(false);
@@ -356,7 +356,7 @@ describe("owner-authorized release tag", () => {
   test("requires the exact public repository identity", () => {
     const repository = {
       default_branch: "main",
-      full_name: "hraness/hra",
+      full_name: "hraness/oompa",
       id: 1343008607,
       owner: { id: 307125679 },
       private: false,
@@ -369,17 +369,17 @@ describe("owner-authorized release tag", () => {
 
   test("requires one exact fetch and effective push origin", () => {
     expect(() => assertExactOriginUrls(
-      "https://github.com/hraness/hra.git",
-      "git@github.com:hraness/hra.git",
+      "https://github.com/hraness/oompa.git",
+      "git@github.com:hraness/oompa.git",
     )).not.toThrow();
     expect(() => assertExactOriginUrls(
-      "https://github.com/hraness/hra.git",
+      "https://github.com/hraness/oompa.git",
       "https://github.com/attacker/hra.git",
-    )).toThrow("hraness/hra as origin");
+    )).toThrow("hraness/oompa as origin");
     expect(() => assertExactOriginUrls(
-      "https://github.com/hraness/hra.git\nhttps://github.com/attacker/hra.git",
-      "https://github.com/hraness/hra.git",
-    )).toThrow("hraness/hra as origin");
+      "https://github.com/hraness/oompa.git\nhttps://github.com/attacker/hra.git",
+      "https://github.com/hraness/oompa.git",
+    )).toThrow("hraness/oompa as origin");
   });
 
   test("refuses release-pin drift before any local tag effect", async () => {
@@ -387,7 +387,7 @@ describe("owner-authorized release tag", () => {
     let observedTag: string | undefined;
     let observedSources: readonly string[] | undefined;
     await expect(createReleaseTag(fake.runner, async () => ({
-      name: "@hraness/hra",
+      name: "@hraness/oompa",
       version: "0.6.1",
     }), async (sources, tag) => {
       observedTag = tag;
@@ -404,7 +404,7 @@ describe("owner-authorized release tag", () => {
     for (const dirtyOnStatusRead of [2, 3]) {
       const fake = fakeReleaseRunner({ dirtyOnStatusRead });
       await expect(createReleaseTag(fake.runner, async () => ({
-        name: "@hraness/hra",
+        name: "@hraness/oompa",
         version: "0.6.1",
       }), acceptReleasePins)).rejects.toThrow("working-tree drift");
       expect(fake.calls.some((call) => call.includes("\u0000tag\u0000-a\u0000"))).toBe(false);
@@ -415,7 +415,7 @@ describe("owner-authorized release tag", () => {
   test("revalidates current main immediately before one exact tag push", async () => {
     const fake = fakeReleaseRunner();
     await expect(createReleaseTag(fake.runner, async () => ({
-      name: "@hraness/hra",
+      name: "@hraness/oompa",
       version: "0.6.1",
     }), acceptReleasePins)).resolves.toContain("Created immutable v0.6.1");
     const tag = fake.calls.findIndex((call) => call.includes("\u0000tag\u0000-a\u0000v0.6.1"));
@@ -435,7 +435,7 @@ describe("owner-authorized release tag", () => {
   test("compare-deletes its transient local tag when main advances during preflight", async () => {
     const fake = fakeReleaseRunner({ mainAdvancesBeforePush: true });
     await expect(createReleaseTag(fake.runner, async () => ({
-      name: "@hraness/hra",
+      name: "@hraness/oompa",
       version: "0.6.1",
     }), acceptReleasePins)).rejects.toThrow("Remote main advanced during release tag preflight");
     expect(fake.calls.some((call) => call.startsWith("git\u0000push\u0000"))).toBe(false);
@@ -448,7 +448,7 @@ describe("owner-authorized release tag", () => {
   test("performs no repository mutation after an authorization failure", async () => {
     const fake = fakeReleaseRunner({ wrongUser: true });
     await expect(createReleaseTag(fake.runner, async () => ({
-      name: "@hraness/hra",
+      name: "@hraness/oompa",
       version: "0.6.1",
     }))).rejects.toThrow("immutable owner User ID 894119");
     expect(fake.calls).toEqual(["gh\u0000api\u0000user"]);
@@ -457,7 +457,7 @@ describe("owner-authorized release tag", () => {
   test("compare-deletes only its exact transient local tag after a failed push", async () => {
     const fake = fakeReleaseRunner({ pushFails: true });
     await expect(createReleaseTag(fake.runner, async () => ({
-      name: "@hraness/hra",
+      name: "@hraness/oompa",
       version: "0.6.1",
     }), acceptReleasePins)).rejects.toThrow("push failed");
     const push = fake.calls.indexOf("git\u0000push\u0000origin\u0000refs/tags/v0.6.1:refs/tags/v0.6.1");
@@ -470,7 +470,7 @@ describe("owner-authorized release tag", () => {
   test("proves an existing exact remote tag without creating or pushing", async () => {
     const fake = fakeReleaseRunner({ published: true });
     await expect(createReleaseTag(fake.runner, async () => ({
-      name: "@hraness/hra",
+      name: "@hraness/oompa",
       version: "0.6.1",
     }), acceptReleasePins)).resolves.toBe(`Release tag v0.6.1 already immutably names ${sha}.`);
     expect(fake.calls.some((call) => call.includes("\u0000tag\u0000-a\u0000"))).toBe(false);

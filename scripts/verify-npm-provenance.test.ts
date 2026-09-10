@@ -25,7 +25,7 @@ function predicate(
         workflow: {
           path: ".github/workflows/release.yml",
           ref: `refs/tags/${tag}`,
-          repository: "https://github.com/hraness/hra",
+          repository: "https://github.com/hraness/oompa",
         },
       },
       internalParameters: {
@@ -37,14 +37,14 @@ function predicate(
       },
       resolvedDependencies: [{
         digest: { gitCommit: options.commit ?? sha },
-        uri: `git+https://github.com/hraness/hra@refs/tags/${tag}`,
+        uri: `git+https://github.com/hraness/oompa@refs/tags/${tag}`,
       }],
     },
     runDetails: {
       builder: { id: "https://github.com/actions/runner/github-hosted" },
       metadata: {
         invocationId:
-          `https://github.com/hraness/hra/actions/runs/${runId}/attempts/${runAttempt}${options.invocationSuffix ?? ""}`,
+          `https://github.com/hraness/oompa/actions/runs/${runId}/attempts/${runAttempt}${options.invocationSuffix ?? ""}`,
       },
     },
   };
@@ -122,7 +122,7 @@ describe("npm provenance package subject admission", () => {
   const exactStatement = {
     subject: [{
       digest: { sha512: archiveDigest.toString("hex") },
-      name: "pkg:npm/%40hraness/hra@0.6.0",
+      name: "pkg:npm/%40hraness/oompa@0.6.0",
     }],
   };
 
@@ -132,13 +132,13 @@ describe("npm provenance package subject admission", () => {
     expect(() => assertNpmProvenanceSubject({
       subject: [{
         digest: { sha512: archiveDigest.toString("base64") },
-        name: "pkg:npm/%40hraness/hra@0.6.0",
+        name: "pkg:npm/%40hraness/oompa@0.6.0",
       }],
     }, { integrity, tag })).toThrow("exact package bytes");
     expect(() => assertNpmProvenanceSubject({
       subject: [{
         digest: { sha512: archiveDigest.toString("hex") },
-        name: "pkg:npm/%40hraness/hra",
+        name: "pkg:npm/%40hraness/oompa",
       }],
     }, { integrity, tag })).toThrow("exact package bytes");
     expect(() => assertNpmProvenanceSubject(exactStatement, {
@@ -165,14 +165,14 @@ describe("npm provenance attestation-set and signer admission", () => {
   const publishStatement = {
     _type: "https://in-toto.io/Statement/v0.1",
     predicate: {
-      name: "@hraness/hra",
+      name: "@hraness/oompa",
       registry: "https://registry.npmjs.org",
       version: "0.6.0",
     },
     predicateType: "https://github.com/npm/attestation/tree/main/specs/publish/v0.1",
     subject: [{
       digest: { sha512: archiveDigest.toString("hex") },
-      name: "pkg:npm/%40hraness/hra@0.6.0",
+      name: "pkg:npm/%40hraness/oompa@0.6.0",
     }],
   };
   const publish = {
@@ -209,34 +209,34 @@ describe("npm provenance attestation-set and signer admission", () => {
   });
 
   test("binds the Fulcio certificate to the exact npm-release environment and public workflow run", () => {
-    const invocation = "https://github.com/hraness/hra/actions/runs/123/attempts/2";
+    const invocation = "https://github.com/hraness/oompa/actions/runs/123/attempts/2";
     const repositorySubject = [
       "repo:hraness",
-      "307125679/hra",
+      "307125679/oompa",
       "1343008607:environment:npm-release",
     ].join("@");
     const retiredRefSubject = [
       "repo:hraness",
-      "307125679/hra",
+      "307125679/oompa",
       "1343008607:ref:refs/tags/v0.6.0",
     ].join("@");
     const der = canonicalAsciiDerUtf8String;
     const policy = npmProvenanceSignerPolicy(tag, sha, invocation);
     expect(policy.certificateIdentityURI).toBe(
-      "^https://github\\.com/hraness/hra/\\.github/workflows/release\\.yml@refs/tags/v0\\.6\\.0$",
+      "^https://github\\.com/hraness/oompa/\\.github/workflows/release\\.yml@refs/tags/v0\\.6\\.0$",
     );
     expect(policy.certificateOIDs).toEqual({
       "1.3.6.1.4.1.57264.1.2": "push",
       "1.3.6.1.4.1.57264.1.3": sha,
-      "1.3.6.1.4.1.57264.1.5": "hraness/hra",
+      "1.3.6.1.4.1.57264.1.5": "hraness/oompa",
       "1.3.6.1.4.1.57264.1.6": "refs/tags/v0.6.0",
       "1.3.6.1.4.1.57264.1.11": der("github-hosted"),
-      "1.3.6.1.4.1.57264.1.12": der("https://github.com/hraness/hra"),
+      "1.3.6.1.4.1.57264.1.12": der("https://github.com/hraness/oompa"),
       "1.3.6.1.4.1.57264.1.13": der(sha),
       "1.3.6.1.4.1.57264.1.14": der("refs/tags/v0.6.0"),
       "1.3.6.1.4.1.57264.1.15": der("1343008607"),
       "1.3.6.1.4.1.57264.1.18": der(
-        "https://github.com/hraness/hra/.github/workflows/release.yml@refs/tags/v0.6.0",
+        "https://github.com/hraness/oompa/.github/workflows/release.yml@refs/tags/v0.6.0",
       ),
       "1.3.6.1.4.1.57264.1.19": der(sha),
       "1.3.6.1.4.1.57264.1.20": der("push"),
@@ -257,14 +257,14 @@ describe("npm provenance attestation-set and signer admission", () => {
     expect(nextTagPolicy.certificateOIDs["1.3.6.1.4.1.57264.1.24"])
       .toBe(policy.certificateOIDs["1.3.6.1.4.1.57264.1.24"]);
     expect(nextTagPolicy.certificateIdentityURI).toBe(
-      "^https://github\\.com/hraness/hra/\\.github/workflows/release\\.yml@refs/tags/v0\\.6\\.1$",
+      "^https://github\\.com/hraness/oompa/\\.github/workflows/release\\.yml@refs/tags/v0\\.6\\.1$",
     );
     expect(nextTagPolicy.certificateOIDs["1.3.6.1.4.1.57264.1.6"])
       .toBe("refs/tags/v0.6.1");
     expect(nextTagPolicy.certificateOIDs["1.3.6.1.4.1.57264.1.14"])
       .toBe(der("refs/tags/v0.6.1"));
     expect(nextTagPolicy.certificateOIDs["1.3.6.1.4.1.57264.1.18"])
-      .toBe(der("https://github.com/hraness/hra/.github/workflows/release.yml@refs/tags/v0.6.1"));
+      .toBe(der("https://github.com/hraness/oompa/.github/workflows/release.yml@refs/tags/v0.6.1"));
     for (const oid of [
       "1.3.6.1.4.1.57264.1.6",
       "1.3.6.1.4.1.57264.1.14",
@@ -272,10 +272,10 @@ describe("npm provenance attestation-set and signer admission", () => {
     ]) expect(nextTagPolicy.certificateOIDs[oid]).not.toBe(policy.certificateOIDs[oid]);
     expect(nextTagPolicy.certificateIdentityURI).not.toBe(policy.certificateIdentityURI);
     expect(npmProvenanceSignerPolicy(tag, sha,
-      "https://github.com/hraness/hra/actions/runs/123/attempts/1").certificateOIDs["1.3.6.1.4.1.57264.1.21"])
+      "https://github.com/hraness/oompa/actions/runs/123/attempts/1").certificateOIDs["1.3.6.1.4.1.57264.1.21"])
       .not.toBe(der(invocation));
     expect(npmProvenanceSignerPolicy(tag, sha,
-      "https://github.com/hraness/hra/actions/runs/123/attempts/1").certificateIdentityURI)
+      "https://github.com/hraness/oompa/actions/runs/123/attempts/1").certificateIdentityURI)
       .toBe(policy.certificateIdentityURI);
     expect(() => npmProvenanceSignerPolicy(tag, sha,
       "https://github.com/hraness/other/actions/runs/123/attempts/2")).toThrow();

@@ -14,7 +14,7 @@ import {
   generateDeviceSigningKeyPair,
   generateDeviceWrappingKeyPair,
   isOpaqueIdentifier,
-} from "../hra/cloud";
+} from "../oompa/cloud";
 import { randomOpaqueId } from "./registration";
 
 const databaseName = "hra-device-custody";

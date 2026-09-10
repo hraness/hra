@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { getFunctionName } from "convex/server";
 
 import type { CanonicalAuthEmail } from "../src/cloud/authCredentials";
-import type { HraAttentionEmailResult } from "./attentionEmail";
+import type { OompaAttentionEmailResult } from "./attentionEmail";
 import {
   attentionNotificationActionGroupLimit,
   runAttentionNotificationAction,
@@ -10,8 +10,8 @@ import {
 } from "./attentionNotificationDelivery";
 import type { ActionCtx } from "./server";
 import {
-  hraAttentionResendApiKeyEnvironmentName,
-  hraResendApiKeyEnvironmentName,
+  oompaAttentionResendApiKeyEnvironmentName,
+  oompaResendApiKeyEnvironmentName,
 } from "./resendApiKey";
 
 const apiKey = "re_notice_test";
@@ -20,16 +20,16 @@ let previousAttentionKey: string | undefined;
 let previousAuthKey: string | undefined;
 
 beforeEach(() => {
-  previousAttentionKey = process.env[hraAttentionResendApiKeyEnvironmentName];
-  previousAuthKey = process.env[hraResendApiKeyEnvironmentName];
-  process.env[hraAttentionResendApiKeyEnvironmentName] = apiKey;
-  process.env[hraResendApiKeyEnvironmentName] = authApiKey;
+  previousAttentionKey = process.env[oompaAttentionResendApiKeyEnvironmentName];
+  previousAuthKey = process.env[oompaResendApiKeyEnvironmentName];
+  process.env[oompaAttentionResendApiKeyEnvironmentName] = apiKey;
+  process.env[oompaResendApiKeyEnvironmentName] = authApiKey;
 });
 
 afterEach(() => {
   for (const [name, value] of [
-    [hraAttentionResendApiKeyEnvironmentName, previousAttentionKey],
-    [hraResendApiKeyEnvironmentName, previousAuthKey],
+    [oompaAttentionResendApiKeyEnvironmentName, previousAttentionKey],
+    [oompaResendApiKeyEnvironmentName, previousAuthKey],
   ] as const) {
     if (value === undefined) Reflect.deleteProperty(process.env, name);
     else process.env[name] = value;
@@ -38,12 +38,12 @@ afterEach(() => {
 
 const body = {
   text: [
-    "HRA needs your attention",
+    "Oompa needs your attention",
     "",
-    "Open HRA to review:",
-    "- Command approval: https://app.hra.sh/#/session/session_action_test",
+    "Open Oompa to review:",
+    "- Command approval: https://app.oompa.dev/#/session/session_action_test",
   ].join("\n"),
-  version: 1 as const,
+  version: 2 as const,
 };
 
 const untouchedInactive = {
@@ -55,7 +55,7 @@ const untouchedInactive = {
 
 describe("attention notification delivery action", () => {
   test("quietly skips only untouched empty preactivation before requiring a key", async () => {
-    Reflect.deleteProperty(process.env, hraAttentionResendApiKeyEnvironmentName);
+    Reflect.deleteProperty(process.env, oompaAttentionResendApiKeyEnvironmentName);
     let mutations = 0;
     const queries: string[] = [];
     const context = {
@@ -105,12 +105,12 @@ describe("attention notification delivery action", () => {
         },
         runQuery: async () => status,
       } as unknown as Pick<ActionCtx, "runMutation" | "runQuery">;
-      Reflect.deleteProperty(process.env, hraAttentionResendApiKeyEnvironmentName);
+      Reflect.deleteProperty(process.env, oompaAttentionResendApiKeyEnvironmentName);
       const before = mutations;
       await expect(runAttentionNotificationAction(context, 10))
         .rejects.toThrow("Attention email delivery is unavailable.");
       expect(mutations).toBe(before);
-      process.env[hraAttentionResendApiKeyEnvironmentName] = apiKey;
+      process.env[oompaAttentionResendApiKeyEnvironmentName] = apiKey;
       expect(await runAttentionNotificationAction(context, 10)).toEqual({
         claimed: 0,
         closed: 1,
@@ -174,8 +174,8 @@ describe("attention notification delivery action", () => {
     try {
       for (const invalid of [undefined, "re_bad key", "re_short'key", authApiKey]) {
         if (invalid === undefined) {
-          Reflect.deleteProperty(process.env, hraAttentionResendApiKeyEnvironmentName);
-        } else process.env[hraAttentionResendApiKeyEnvironmentName] = invalid;
+          Reflect.deleteProperty(process.env, oompaAttentionResendApiKeyEnvironmentName);
+        } else process.env[oompaAttentionResendApiKeyEnvironmentName] = invalid;
         await expect(runAttentionNotificationDrain(context, 10))
           .rejects.toThrow("Attention email delivery is unavailable.");
       }
@@ -248,7 +248,7 @@ describe("attention notification delivery action", () => {
       },
     } as unknown as Pick<ActionCtx, "runMutation">;
     const sends: string[] = [];
-    const send = async (input: Readonly<{ idempotencyKey: string }>): Promise<HraAttentionEmailResult> => {
+    const send = async (input: Readonly<{ idempotencyKey: string }>): Promise<OompaAttentionEmailResult> => {
       sends.push(input.idempotencyKey);
       return { kind: "accepted", providerMessageId: "message_action" };
     };
@@ -304,7 +304,7 @@ describe("attention notification delivery action", () => {
         };
       },
     } as unknown as Pick<ActionCtx, "runMutation">;
-    const send = async (): Promise<HraAttentionEmailResult> => ({
+    const send = async (): Promise<OompaAttentionEmailResult> => ({
       kind: "ambiguous",
       providerErrorType: "invalid_idempotent_request",
       safetyFault: true,
@@ -345,7 +345,7 @@ describe("attention notification delivery action", () => {
         };
       },
     } as unknown as Pick<ActionCtx, "runMutation">;
-    const send = async (): Promise<HraAttentionEmailResult> => ({
+    const send = async (): Promise<OompaAttentionEmailResult> => ({
       kind: "ambiguous",
       providerErrorType: "invalid_idempotent_request",
       safetyFault: true,

@@ -27,7 +27,7 @@ import {
   parseRemoteCommandPayload,
   sha256Hex,
   type RemoteCommandPayload,
-} from "../hra/cloud";
+} from "../oompa/cloud";
 import { neutraliseText } from "../markdown/sanitise";
 import { downscaleImage, type ImageEncoder, type ImageSize } from "./image-downscale";
 

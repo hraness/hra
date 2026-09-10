@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import type { CompactSessionEvent, DetailSessionEvent } from "../hra/cloud";
+import type { CompactSessionEvent, DetailSessionEvent } from "../oompa/cloud";
 import {
   derivedTitle,
   initialSessionModel,

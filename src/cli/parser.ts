@@ -21,6 +21,7 @@ import {
   type SupportedProvider,
 } from "../domain/presets";
 import { ACCOUNT_USAGE_HISTORY_PAGE_LIMIT } from "../domain/usage-metrics";
+import { usageProviderSchema } from "../domain/provider-usage";
 import { createCloudUuidV7, isUuidV7 } from "../domain/uuid-v7";
 import { parseAuthCredentials } from "../cloud/authCredentials";
 import {
@@ -84,7 +85,7 @@ export type ProtectedAuthLoginCliInvocation = Readonly<{
 }>;
 
 /**
- * `hra session send|queue|steer --attach <path>`. The parser hands back the
+ * `oompa session send|queue|steer --attach <path>`. The parser hands back the
  * exact command plus the paths it was given; the composition entry reads,
  * sniffs, bounds, and stores each file, then reissues the command with the
  * resulting digest references.
@@ -112,7 +113,7 @@ export type SessionEventWatchCliInvocation = Readonly<{
 }>;
 
 /**
- * `hra session export` reads the provider-neutral transcript's latest bounded
+ * `oompa session export` reads the provider-neutral transcript's latest bounded
  * retained tail in one local command and writes one document. Older retained
  * records omitted by that tail remain represented by its exact omission count.
  */
@@ -181,7 +182,7 @@ export type CliInvocation =
   | { kind: "command"; command: LocalCommand; json: boolean };
 
 /*
- * `hra autorespond gateway set` never accepts the key as an argument. The
+ * `oompa autorespond gateway set` never accepts the key as an argument. The
  * parser only names the descriptor to read; the value is read once, sent to
  * the daemon, and never rendered.
  */
@@ -220,43 +221,45 @@ export class CliUsageError extends Error {
   }
 }
 
-export const usage = `HRA
+export const usage = `Oompa
 
 Usage:
-  hra
-  hra help [<group> [<command>]]
-  hra status [--json]
-  hra init [--yes] [--json]
-  hra doctor [--offline] [--json]
-  hra daemon start|status|stop|run
-  hra account add|list|show|login|login-cancel|logout|usage|usage-history|switch|switch-recover
-  hra plugin list <account> [--project <project>] [--refresh]
-  hra plugin show <account> <plugin> [--project <project>] [--refresh]
-  hra project add|list|use
-  hra memory status|list|get|search|explain|remember|share|hosted
-  hra session list|show|status|watch|start|send|queue|steer|stop|peer-policy
-  hra session adoption status [--provider codex|claude]
-  hra session adoption enable <account> --provider codex|claude
-  hra session adoption disable --provider codex|claude
-  hra session discover [--provider codex|claude]
-  hra session task list|show|create|edit|delete
-  hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
-  hra session watch <session> [--cursor <cursor>] [--jsonl]
-  hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
-  hra session rename|recover|abandon|archive|unarchive|note|preset|fast|project
-  hra notification-hours status|set
-  hra notification-email status|enable|disable
-  hra autorespond-after-hours status|enable|disable
-  hra work protocol|apply|snapshot|task|poll|events|watch
-  hra interaction list|show|inspect|decide|grant|answer|submit
-  hra remote list|show|command|send|queue|steer|stop|resolve|preset|fast|allow|deny|policy
-  hra turn inspect
-  hra auth login --input-stdin|--input-fd <fd>
-  hra auth status|logout
-  hra auth delete --acknowledge-erasure
-  hra device list|pair|approve|revoke|key-loss
-  hra sync status|now
-  hra sync projection recover <local-session> --acknowledge-gap
+  oompa
+  oompa help [<group> [<command>]]
+  oompa status [--json]
+  oompa init [--yes] [--json]
+  oompa doctor [--offline] [--json]
+  oompa daemon start|status|stop|run
+  oompa account add|list|show|login|login-cancel|logout|usage|usage-history|switch|switch-recover
+  oompa account list --provider codex|claude
+  oompa usage auto status|on|off|inherit
+  oompa plugin list <account> [--project <project>] [--refresh]
+  oompa plugin show <account> <plugin> [--project <project>] [--refresh]
+  oompa project add|list|use
+  oompa memory status|list|get|search|explain|remember|share|hosted
+  oompa session list|show|status|watch|start|send|queue|steer|stop|peer-policy
+  oompa session adoption status [--provider codex|claude]
+  oompa session adoption enable <account> --provider codex|claude
+  oompa session adoption disable --provider codex|claude
+  oompa session discover [--provider codex|claude]
+  oompa session task list|show|create|edit|delete
+  oompa session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
+  oompa session watch <session> [--cursor <cursor>] [--jsonl]
+  oompa session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
+  oompa session rename|recover|abandon|archive|unarchive|note|preset|fast|project
+  oompa notification-hours status|set
+  oompa notification-email status|enable|disable
+  oompa autorespond-after-hours status|enable|disable
+  oompa work protocol|apply|snapshot|task|poll|events|watch
+  oompa interaction list|show|inspect|decide|grant|answer|submit
+  oompa remote list|show|command|send|queue|steer|stop|resolve|preset|fast|allow|deny|policy
+  oompa turn inspect
+  oompa auth login --input-stdin|--input-fd <fd>
+  oompa auth status|logout
+  oompa auth delete --acknowledge-erasure
+  oompa device list|pair|approve|revoke|key-loss
+  oompa sync status|now
+  oompa sync projection recover <local-session> --acknowledge-gap
 
 Output:
   --json                    Emit one versioned JSON result for supported commands.
@@ -264,7 +267,7 @@ Output:
   --follow                  Follow session or work events as JSON Lines.
 
 Interactive:
-  Run bare \`hra\` in a TTY to start the persistent agent-and-human shell.
+  Run bare \`oompa\` in a TTY to start the persistent agent-and-human shell.
 
 Mutation safety:
   --idempotency-key <uuid>  Reuse after a lost response; changed reuse fails closed.
@@ -280,108 +283,137 @@ Recommended profiles:
   ultra       Sol Ultra       (codex)
   fable-max   Claude Fable    (claude)
 
-Run \`hra <group> --help\` or \`hra help <group> [<command>]\` for command examples.`;
+Run \`oompa <group> --help\` or \`oompa help <group> [<command>]\` for command examples.`;
 
 const groupUsage = {
-  status: `HRA status
+  usage: `Oompa usage
 
 Usage:
-  hra status [--json]
+  oompa usage auto status [codex|claude] [--json]
+  oompa usage auto on|off [codex|claude] --revision <n> --idempotency-key <uuid> [--json]
+  oompa usage auto inherit <codex|claude> --revision <n> --idempotency-key <uuid> [--json]
+
+Notes:
+  Without a provider, on/off changes the inherited default, not a global kill switch.
+  A provider override of on can remain enabled when the inherited default is off.
+  inherit requires a provider and removes that provider's override.
+  Mutations require both --revision from status and a caller-owned --idempotency-key.
+  Reuse the same key and revision after a lost response. A replay returns the saved
+  receipt, not the current policy head; run status to read the current configuration.
+  status accepts no mutation flags. Only Codex and Claude have usage-auto policy.
 
 Examples:
-  hra status
-  hra status --json`,
-  init: `HRA init
+  oompa usage auto status --json
+  oompa usage auto off --revision 1 --idempotency-key 11111111-1111-4111-8111-111111111111
+  oompa usage auto on codex --revision 2 --idempotency-key 22222222-2222-4222-8222-222222222222
+  oompa usage auto inherit claude --revision 3 --idempotency-key 33333333-3333-4333-8333-333333333333`,
+  status: `Oompa status
 
 Usage:
-  hra init [--yes] [--json]
+  oompa status [--json]
 
 Examples:
-  hra init
-  hra init --yes --json`,
-  doctor: `HRA doctor
+  oompa status
+  oompa status --json`,
+  init: `Oompa init
 
 Usage:
-  hra doctor [--offline] [--json]
+  oompa init [--yes] [--json]
 
 Examples:
-  hra doctor --offline
-  hra doctor --json`,
-  daemon: `HRA daemon
+  oompa init
+  oompa init --yes --json`,
+  doctor: `Oompa doctor
 
 Usage:
-  hra daemon start [--json]
-  hra daemon status|stop [--json]
-  hra daemon run
+  oompa doctor [--offline] [--json]
 
 Examples:
-  hra daemon start
-  hra daemon status --json`,
-  account: `HRA account
+  oompa doctor --offline
+  oompa doctor --json`,
+  daemon: `Oompa daemon
 
 Usage:
-  hra account add <label>
-  hra account login <profile> [--provider <codex|claude>] [--device-code] [--handoff-file <absolute-path>] [--idempotency-key <uuid>]
-  hra account login-cancel <profile> [--provider codex]
-  hra account login-cancel <profile> --provider claude --attempt-id <attempt-id> --provider-generation <n> --idempotency-key <uuid> --acknowledge-child-exited
-  hra account login-cancel <profile> --provider devin --attempt-id <attempt-id> --provider-generation <n> --idempotency-key <uuid> --acknowledge-child-exited
+  oompa daemon start [--json]
+  oompa daemon status|stop [--json]
+  oompa daemon run
+
+Examples:
+  oompa daemon start
+  oompa daemon status --json`,
+  account: `Oompa account
+
+Usage:
+  oompa account add <label>
+  oompa account login <profile> [--provider <codex|claude>] [--device-code] [--handoff-file <absolute-path>] [--idempotency-key <uuid>]
+  oompa account login-cancel <profile> [--provider codex]
+  oompa account login-cancel <profile> --provider claude --attempt-id <attempt-id> --provider-generation <n> --idempotency-key <uuid> --acknowledge-child-exited
+  oompa account login-cancel <profile> --provider devin --attempt-id <attempt-id> --provider-generation <n> --idempotency-key <uuid> --acknowledge-child-exited
     Retired-provider cleanup only; does not launch, stop, or authenticate Devin.
-  hra account logout <profile>
-  hra account list
-  hra account show <profile> [--provider <codex|claude>]
-  hra account show <profile> --provider devin  (retired local history and cleanup only)
-  hra account usage [profile] [--refresh]
-  hra account usage-history <profile> [--from <UTC-RFC3339>] [--through <UTC-RFC3339>] [--limit <1..100>] [--cursor <cursor>]
-  hra account switch <profile>
-  hra account switch-recover
+  oompa account logout <profile>
+  oompa account list [--provider <codex|claude>] [--json]
+  oompa account show <profile> [--provider <codex|claude>]
+  oompa account show <profile> --provider devin  (retired local history and cleanup only)
+  oompa account usage [profile] [--refresh]
+  oompa account usage-history <profile> [--from <UTC-RFC3339>] [--through <UTC-RFC3339>] [--limit <1..100>] [--cursor <cursor>]
+  oompa account switch <profile>
+  oompa account switch-recover
+
+Provider listing:
+  --provider lists cached readiness, ordering, and the active pointer for Codex
+  or Claude. Readiness is last observed state, not current usage or quota.
+  This read does not refresh providers, sign in, or change the active account.
+  Without --provider, account list keeps the existing profile listing.
 
 Platform:
   Codex account commands run on macOS and Linux. Claude login and status
   require Linux; macOS refuses before launching Claude.
 
 Examples:
-  hra account add personal
-  hra account login personal --device-code --handoff-file /private/path/login.json
-  hra account login personal --provider claude
-  hra account show personal --provider claude
-  hra account login-cancel personal
-  hra account usage personal --refresh
-  hra account usage-history personal --from 2026-08-23T12:00:00Z --json`,
-  plugin: `HRA plugin
+  oompa account add personal
+  oompa account login personal --device-code --handoff-file /private/path/login.json
+  oompa account login personal --provider claude
+  oompa account list --provider codex
+  oompa account list --provider claude --json
+  oompa account show personal --provider claude
+  oompa account login-cancel personal
+  oompa account usage personal --refresh
+  oompa account usage-history personal --from 2026-08-23T12:00:00Z --json`,
+  plugin: `Oompa plugin
 
 Usage:
-  hra plugin list <account> [--project <project>] [--refresh]
-  hra plugin show <account> <plugin> [--project <project>] [--refresh]
+  oompa plugin list <account> [--project <project>] [--refresh]
+  oompa plugin show <account> <plugin> [--project <project>] [--refresh]
 
 Plugin commands are discovery-only. Installation, enablement, and OAuth stay in Codex.
 
 Examples:
-  hra plugin list personal --refresh
-  hra plugin show personal github --project jungle`,
-  project: `HRA project
+  oompa plugin list personal --refresh
+  oompa plugin show personal github --project jungle`,
+  project: `Oompa project
 
 Usage:
-  hra project add --path <directory> [--name <name>]
-  hra project list
-  hra project use <project>
+  oompa project add --path <directory> [--name <name>]
+  oompa project list
+  oompa project use <project>
 
 Examples:
-  hra project add --path . --name jungle
-  hra project use jungle`,
-  "notification-hours": `HRA notification hours
+  oompa project add --path . --name jungle
+  oompa project use jungle`,
+  "notification-hours": `Oompa notification hours
 
 Usage:
-  hra notification-hours status [--json]
-  hra notification-hours set --start <HH:MM> --end <HH:MM> --timezone <IANA-zone> --revision <n> [--json]
+  oompa notification-hours status [--json]
+  oompa notification-hours set --start <HH:MM> --end <HH:MM> --timezone <IANA-zone> --revision <n> [--json]
 
 Examples:
-  hra notification-hours status
-  hra notification-hours set --start 10:00 --end 22:00 --timezone America/Puerto_Rico --revision 1`,
-  "notification-email": `HRA attention email notifications
+  oompa notification-hours status
+  oompa notification-hours set --start 10:00 --end 22:00 --timezone America/Puerto_Rico --revision 1`,
+  "notification-email": `Oompa attention email notifications
 
 Usage:
-  hra notification-email status [--json]
-  hra notification-email enable|disable --revision <n> [--json]
+  oompa notification-email status [--json]
+  oompa notification-email enable|disable --revision <n> [--json]
 
 The setting is local to this machine. Status and enable report only bounded
 hosted observations. Disable commits locally first, then reports whether hosted
@@ -389,29 +421,29 @@ invalidation was acknowledged, remains pending under a returned receipt, or was
 not observed; it never claims recall of a delivery that already started.
 
 Examples:
-  hra notification-email status
-  hra notification-email enable --revision 1
-  hra notification-email disable --revision 2`,
-  memory: `HRA memory
+  oompa notification-email status
+  oompa notification-email enable --revision 1
+  oompa notification-email disable --revision 2`,
+  memory: `Oompa memory
 
-Memory is selected by an HRA session. Reads combine that session's working
+Memory is selected by an Oompa session. Reads combine that session's working
 lane with its current project's shared canonical lane by default. Add
 --working-only to read the session lane without opening canonical custody.
 Writes never accept a store path, authority, head, rule, or purge capability.
 
 Usage:
-  hra memory status <session> [--json]
-  hra memory list <session> [--working-only] [--continuation <token>] [--json]
-  hra memory get <session> <key> [--working-only] [--continuation <token>] [--json]
-  hra memory search <session> [--working-only] [--continuation <token>] <text> [--json]
-  hra memory explain <session> <query-id> <row> [--json]
-  hra memory remember <session> <key> --title <title> --summary <summary> [--language <tag>] [--idempotency-key <uuid>] [--json] -- <body>
-  hra memory share <session> <key> --reason <reason> [--idempotency-key <uuid>] [--json]
-  hra memory hosted list [--json]
-  hra memory hosted create <project> [--idempotency-key <uuid>] [--json]
-  hra memory hosted attach <project> <hosted-space-id> [--json]
-  hra memory hosted detach <project> --generation <n> [--json]
-  hra memory hosted sync <project> [--json]
+  oompa memory status <session> [--json]
+  oompa memory list <session> [--working-only] [--continuation <token>] [--json]
+  oompa memory get <session> <key> [--working-only] [--continuation <token>] [--json]
+  oompa memory search <session> [--working-only] [--continuation <token>] <text> [--json]
+  oompa memory explain <session> <query-id> <row> [--json]
+  oompa memory remember <session> <key> --title <title> --summary <summary> [--language <tag>] [--idempotency-key <uuid>] [--json] -- <body>
+  oompa memory share <session> <key> --reason <reason> [--idempotency-key <uuid>] [--json]
+  oompa memory hosted list [--json]
+  oompa memory hosted create <project> [--idempotency-key <uuid>] [--json]
+  oompa memory hosted attach <project> <hosted-space-id> [--json]
+  oompa memory hosted detach <project> --generation <n> [--json]
+  oompa memory hosted sync <project> [--json]
 
 The remember command changes only the selected session's expiring working lane.
 The share command explicitly nominates its exact attested working page for
@@ -419,20 +451,20 @@ conflict-checked adoption into the current project's canonical lane. Reuse the
 printed idempotency key after a lost mutation response.
 
 Examples:
-  hra memory status my-session
-  hra memory list my-session --json
-  hra memory get my-session architecture.boundary
-  hra memory search my-session -- "authority boundary"
-  hra memory explain my-session memq_0123456789abcdef0123456789abcdef 0
-  hra memory remember my-session preferences.review --title "Review style" --summary "Prefer adversarial review." -- "Challenge implementation plans before execution."
-  hra memory share my-session preferences.review --reason "Reusable project convention"
-  hra memory hosted create jungle
-  hra memory hosted list`,
-  "autorespond-after-hours": `HRA after-hours automatic approval budgets
+  oompa memory status my-session
+  oompa memory list my-session --json
+  oompa memory get my-session architecture.boundary
+  oompa memory search my-session -- "authority boundary"
+  oompa memory explain my-session memq_0123456789abcdef0123456789abcdef 0
+  oompa memory remember my-session preferences.review --title "Review style" --summary "Prefer adversarial review." -- "Challenge implementation plans before execution."
+  oompa memory share my-session preferences.review --reason "Reusable project convention"
+  oompa memory hosted create jungle
+  oompa memory hosted list`,
+  "autorespond-after-hours": `Oompa after-hours automatic approval budgets
 
 Usage:
-  hra autorespond-after-hours status [--json]
-  hra autorespond-after-hours enable|disable --revision <n> [--json]
+  oompa autorespond-after-hours status [--json]
+  oompa autorespond-after-hours enable|disable --revision <n> [--json]
 
 This machine-local setting is separate consent from notification email and
 notification hours. When enabled, eligible protocol approvals outside notification
@@ -442,91 +474,91 @@ Prose always keeps 3/10/40. Existing approval categories and session approval
 modes still apply. Policy changes never reset counters or refund reservations.
 
 Examples:
-  hra autorespond-after-hours status
+  oompa autorespond-after-hours status
   Only if you choose to consent, use the revision returned by status:
-  hra autorespond-after-hours enable --revision <current-revision>
+  oompa autorespond-after-hours enable --revision <current-revision>
   To withdraw consent, use the revision returned by status:
-  hra autorespond-after-hours disable --revision <current-revision>`,
-  session: `HRA session
+  oompa autorespond-after-hours disable --revision <current-revision>`,
+  session: `Oompa session
 Session tasks always return to the selected conversation. They never create a standalone task or a new conversation.
 
 Usage:
-  hra session list [--account <profile>] [--archived] [--limit <1..100>] [--cursor <cursor>]
-  hra session show <session> [--detail]
-  hra session status <session> [--json]
-  hra session state <session> [--json]
-  hra session peer-policy get <session> [--json]
-  hra session peer-policy set <session> <off|inspect|coordinate> --revision <n> [--json]
-  hra autorespond on|workspace|off|default|status [--session <session>] [--json]
-  hra autorespond gateway set [--from-fd <fd>] [--json]
-  hra autorespond gateway clear [--json]
-  hra session watch <session> [--cursor <cursor>] [--jsonl]
-  hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
-  hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
-  hra session start <account> [--project <project>] [--provider <codex|claude>] [--preset <low|high|ultra|fable-max>] [--fast] [--idempotency-key <uuid> [--preset-contract <1|2>]]
-  hra session send|queue|steer <session> [--attach <path>]... <message>
-  hra session stop|recover|abandon <session>
-  hra session archive|unarchive <session>
-  hra session adoption status [--provider <codex|claude>]
-  hra session adoption enable <account> --provider <codex|claude>
-  hra session adoption disable --provider <codex|claude>
-  hra session discover [--provider <codex|claude>]
-  hra session rename <session> <name>
-  hra session note get|edit|clear <session>
-  hra session note set <session> <note>
-  hra session preset <session> <low|high|ultra|fable-max>
-  hra session switch <session> --provider <codex|claude> [--preset <low|high|ultra|fable-max>] [--account <account>] [--idempotency-key <uuid> [--preset-contract <1|2>]]
-  hra session export <session> [--format <trajectory|json>] [--out <path>]
-  hra session fast <session> <on|off>
-  hra session project <session> <project>
-  hra session task list <session>
-  hra session task show <session> <task-id>
-  hra session task create <session> --name <name> --every-minutes <15..10080> [--paused] [--idempotency-key <uuid>] -- <prompt>
-  hra session task edit <session> <task-id> --revision <n> [--name <name>] [--every-minutes <15..10080>] [--pause|--resume] [--idempotency-key <uuid>] [-- <replacement-prompt>]
-  hra session task delete <session> <task-id> --revision <n> [--idempotency-key <uuid>]
+  oompa session list [--account <profile>] [--archived] [--limit <1..100>] [--cursor <cursor>]
+  oompa session show <session> [--detail]
+  oompa session status <session> [--json]
+  oompa session state <session> [--json]
+  oompa session peer-policy get <session> [--json]
+  oompa session peer-policy set <session> <off|inspect|coordinate> --revision <n> [--json]
+  oompa autorespond on|workspace|off|default|status [--session <session>] [--json]
+  oompa autorespond gateway set [--from-fd <fd>] [--json]
+  oompa autorespond gateway clear [--json]
+  oompa session watch <session> [--cursor <cursor>] [--jsonl]
+  oompa session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
+  oompa session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
+  oompa session start <account> [--project <project>] [--provider <codex|claude>] [--preset <low|high|ultra|fable-max>] [--fast] [--idempotency-key <uuid> [--preset-contract <1|2>]]
+  oompa session send|queue|steer <session> [--attach <path>]... <message>
+  oompa session stop|recover|abandon <session>
+  oompa session archive|unarchive <session>
+  oompa session adoption status [--provider <codex|claude>]
+  oompa session adoption enable <account> --provider <codex|claude>
+  oompa session adoption disable --provider <codex|claude>
+  oompa session discover [--provider <codex|claude>]
+  oompa session rename <session> <name>
+  oompa session note get|edit|clear <session>
+  oompa session note set <session> <note>
+  oompa session preset <session> <low|high|ultra|fable-max>
+  oompa session switch <session> --provider <codex|claude> [--preset <low|high|ultra|fable-max>] [--account <account>] [--idempotency-key <uuid> [--preset-contract <1|2>]]
+  oompa session export <session> [--format <trajectory|json>] [--out <path>]
+  oompa session fast <session> <on|off>
+  oompa session project <session> <project>
+  oompa session task list <session>
+  oompa session task show <session> <task-id>
+  oompa session task create <session> --name <name> --every-minutes <15..10080> [--paused] [--idempotency-key <uuid>] -- <prompt>
+  oompa session task edit <session> <task-id> --revision <n> [--name <name>] [--every-minutes <15..10080>] [--pause|--resume] [--idempotency-key <uuid>] [-- <replacement-prompt>]
+  oompa session task delete <session> <task-id> --revision <n> [--idempotency-key <uuid>]
 
 Examples:
-  hra session start personal --project jungle
-  hra session start personal --provider claude --preset fable-max
-  hra session adoption enable personal --provider codex
-  hra session discover --provider codex
-  hra session switch my-session --provider claude
-  hra session export my-session --format trajectory --out ./trajectory.json
-  hra session watch my-session
-  hra session watch my-session --jsonl
-  hra session events my-session --wait-ms 30000 --jsonl
-  hra session send my-session -- "run --help exactly"
-  hra session send my-session --attach diagram.png --attach notes.md "what changed here?"
-  hra session peer-policy get my-session
-  hra session peer-policy set my-session inspect --revision 1
-  hra session task create my-session --name daily-review --every-minutes 1440 -- "review the release queue"`,
-  work: `HRA work
+  oompa session start personal --project jungle
+  oompa session start personal --provider claude --preset fable-max
+  oompa session adoption enable personal --provider codex
+  oompa session discover --provider codex
+  oompa session switch my-session --provider claude
+  oompa session export my-session --format trajectory --out ./trajectory.json
+  oompa session watch my-session
+  oompa session watch my-session --jsonl
+  oompa session events my-session --wait-ms 30000 --jsonl
+  oompa session send my-session -- "run --help exactly"
+  oompa session send my-session --attach diagram.png --attach notes.md "what changed here?"
+  oompa session peer-policy get my-session
+  oompa session peer-policy set my-session inspect --revision 1
+  oompa session task create my-session --name daily-review --every-minutes 1440 -- "review the release queue"`,
+  work: `Oompa work
 
 Usage:
-  hra work protocol [--operation <kind>|--type <name>|--topic <topic>]
-  hra work apply --input-stdin|--input-fd <fd>
-  hra work snapshot <work> [--actor <session>]
-  hra work task <task> [--history-limit <1..50>] [--history-cursor <cursor>]
-  hra work poll <work> [--actor <session>] [--cursor <event-cursor>] [--action-cursor <action-cursor>] [--limit <1..50>] [--wait-ms <0..30000>]
-  hra work events <work> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
-  hra work watch <work> [--cursor <cursor>]
+  oompa work protocol [--operation <kind>|--type <name>|--topic <topic>]
+  oompa work apply --input-stdin|--input-fd <fd>
+  oompa work snapshot <work> [--actor <session>]
+  oompa work task <task> [--history-limit <1..50>] [--history-cursor <cursor>]
+  oompa work poll <work> [--actor <session>] [--cursor <event-cursor>] [--action-cursor <action-cursor>] [--limit <1..50>] [--wait-ms <0..30000>]
+  oompa work events <work> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
+  oompa work watch <work> [--cursor <cursor>]
 
 Work commands are agent-only and always emit compact JSON. Mutation documents are strict, bounded, and carry their own idempotency key. Watch emits JSON Lines.
 
 Examples:
-  hra work protocol
-  hra work apply --input-stdin < request.json
-  hra work poll work_0123456789abcdef0123456789abcdef --wait-ms 30000
-  hra work watch work_0123456789abcdef0123456789abcdef`,
-  interaction: `HRA interaction
+  oompa work protocol
+  oompa work apply --input-stdin < request.json
+  oompa work poll work_0123456789abcdef0123456789abcdef --wait-ms 30000
+  oompa work watch work_0123456789abcdef0123456789abcdef`,
+  interaction: `Oompa interaction
 
 Usage:
-  hra interaction list [session] [--pending] [--limit <1..100>] [--cursor <cursor>]
-  hra interaction show <interaction-id>
-  hra interaction inspect <interaction-id> --revision <n> [--handoff-file <absolute-path>]
-  hra interaction decide <interaction-id> --revision <n> --decision <once|session|decline|cancel>
-  hra interaction grant|answer <interaction-id> --revision <n> --input-stdin|--input-fd <fd>
-  hra interaction submit <interaction-id> --revision <n> --action <accept|decline|cancel> [--input-stdin|--input-fd <fd>]
+  oompa interaction list [session] [--pending] [--limit <1..100>] [--cursor <cursor>]
+  oompa interaction show <interaction-id>
+  oompa interaction inspect <interaction-id> --revision <n> [--handoff-file <absolute-path>]
+  oompa interaction decide <interaction-id> --revision <n> --decision <once|session|decline|cancel>
+  oompa interaction grant|answer <interaction-id> --revision <n> --input-stdin|--input-fd <fd>
+  oompa interaction submit <interaction-id> --revision <n> --action <accept|decline|cancel> [--input-stdin|--input-fd <fd>]
 
 Protected values are accepted only through stdin or an explicit file descriptor.
 Use \`interaction inspect\` to read complete live command or permission authority through a protected terminal or caller-owned file.
@@ -536,68 +568,68 @@ Permission grant document: {"permissions":["<requested-name>"]}
 Question answer document: {"answers":{"<question-id>":{"answers":["<answer>"]}}}
 
 Examples:
-  hra interaction decide <id> --revision 1 --decision once
-  hra interaction answer <id> --revision 1 --input-stdin`,
-  remote: `HRA remote
+  oompa interaction decide <id> --revision 1 --decision once
+  oompa interaction answer <id> --revision 1 --input-stdin`,
+  remote: `Oompa remote
 
 Usage:
-  hra remote list [--limit <1..100>]
-  hra remote show <cloud-session>
-  hra remote command <uuidv7>
-  hra remote send|queue|steer <cloud-session> <message>
-  hra remote stop <cloud-session>
-  hra remote resolve <cloud-session> --interaction <uuid> --revision <n> --decision <decline>
-  hra remote preset <cloud-session> <low|high|ultra|fable-max>
-  hra remote provider <cloud-session> <codex|claude> [--preset <low|high|ultra|fable-max>]
-  hra remote fast <cloud-session> <on|off>
-  hra remote allow|deny <device-commands|account-linking>
-  hra remote policy
+  oompa remote list [--limit <1..100>]
+  oompa remote show <cloud-session>
+  oompa remote command <uuidv7>
+  oompa remote send|queue|steer <cloud-session> <message>
+  oompa remote stop <cloud-session>
+  oompa remote resolve <cloud-session> --interaction <uuid> --revision <n> --decision <decline>
+  oompa remote preset <cloud-session> <low|high|ultra|fable-max>
+  oompa remote provider <cloud-session> <codex|claude> [--preset <low|high|ultra|fable-max>]
+  oompa remote fast <cloud-session> <on|off>
+  oompa remote allow|deny <device-commands|account-linking>
+  oompa remote policy
 
 Examples:
-  hra remote list
-  hra remote send synced-session -- "continue the migration"
-  hra remote deny device-commands
-  hra remote allow account-linking
-  hra remote command <uuidv7>`,
-  turn: `HRA turn
+  oompa remote list
+  oompa remote send synced-session -- "continue the migration"
+  oompa remote deny device-commands
+  oompa remote allow account-linking
+  oompa remote command <uuidv7>`,
+  turn: `Oompa turn
 
 Usage:
-  hra turn inspect <session> <turn> [--json]
+  oompa turn inspect <session> <turn> [--json]
 
 Example:
-  hra turn inspect my-session turn_123 --json`,
-  auth: `HRA auth
+  oompa turn inspect my-session turn_123 --json`,
+  auth: `Oompa auth
 
 Usage:
-  hra auth login --input-stdin|--input-fd <fd>
-  hra auth status|logout
-  hra auth delete --acknowledge-erasure
+  oompa auth login --input-stdin|--input-fd <fd>
+  oompa auth status|logout
+  oompa auth delete --acknowledge-erasure
 
 Examples:
-  hra auth login --input-stdin
-  hra auth status --json`,
-  device: `HRA device
+  oompa auth login --input-stdin
+  oompa auth status --json`,
+  device: `Oompa device
 
 Usage:
-  hra device list
-  hra device pair
-  hra device key-loss --acknowledge-no-key-holders
-  hra device approve <device-id-or-prefix> --fingerprint <value> [--idempotency-key <uuidv7>] [--json]
-  hra device revoke <device-id-or-prefix> [--idempotency-key <uuidv7>] [--json]
+  oompa device list
+  oompa device pair
+  oompa device key-loss --acknowledge-no-key-holders
+  oompa device approve <device-id-or-prefix> --fingerprint <value> [--idempotency-key <uuidv7>] [--json]
+  oompa device revoke <device-id-or-prefix> [--idempotency-key <uuidv7>] [--json]
 
 Examples:
-  hra device pair
-  hra device key-loss --acknowledge-no-key-holders
-  hra device approve <pending-device-prefix> --fingerprint <value>`,
-  sync: `HRA sync
+  oompa device pair
+  oompa device key-loss --acknowledge-no-key-holders
+  oompa device approve <pending-device-prefix> --fingerprint <value>`,
+  sync: `Oompa sync
 
 Usage:
-  hra sync status|now
-  hra sync projection recover <local-session> --acknowledge-gap [--idempotency-key <uuidv7>] [--json]
+  oompa sync status|now
+  oompa sync projection recover <local-session> --acknowledge-gap [--idempotency-key <uuidv7>] [--json]
 
 Examples:
-  hra sync status
-  hra sync projection recover my-session --acknowledge-gap`,
+  oompa sync status
+  oompa sync projection recover my-session --acknowledge-gap`,
 } as const satisfies Readonly<Record<string, string>>;
 
 export const helpGroupNames: readonly string[] = Object.keys(groupUsage);
@@ -610,7 +642,7 @@ const exampleSectionHeadings: ReadonlySet<string> = new Set(["Examples:", "Examp
 
 const commandLineNamesLeaf = (line: string, group: string, leaf: string): boolean => {
   const tokens = line.trim().split(/\s+/u);
-  return tokens[0] === "hra"
+  return tokens[0] === "oompa"
     && tokens[1] === group
     && (tokens[2]?.split("|").includes(leaf) ?? false);
 };
@@ -624,7 +656,7 @@ const leafUsage = (group: string, groupText: string, leaf: string): string | und
   const usageLines = usageSection.split("\n").slice(1)
     .filter((line) => commandLineNamesLeaf(line, group, leaf));
   if (usageLines.length === 0) return undefined;
-  const parts = [`HRA ${group} ${leaf}`, [usageSectionHeading, ...usageLines].join("\n")];
+  const parts = [`Oompa ${group} ${leaf}`, [usageSectionHeading, ...usageLines].join("\n")];
   for (const section of sections.slice(1)) {
     const [heading = "", ...lines] = section.split("\n");
     if (heading === usageSectionHeading) continue;
@@ -930,7 +962,7 @@ const protectedInput = (cursor: Cursor, required: boolean): ProtectedInputSource
 const remainder = (cursor: Cursor, label: string): string => {
   if (cursor.values.length === 0) throw new CliUsageError(`Missing ${label}.`);
   const unknown = cursor.values.find(isOption);
-  if (unknown !== undefined) throw new CliUsageError("Unknown option. Run `hra --help` for the supported command shape.");
+  if (unknown !== undefined) throw new CliUsageError("Unknown option. Run `oompa --help` for the supported command shape.");
   return cursor.values.splice(0).map(decode).join(" ");
 };
 
@@ -956,7 +988,7 @@ const taskPrompt = (
 
 const finish = (cursor: Cursor): void => {
   const unexpected = cursor.values[0];
-  if (unexpected !== undefined) throw new CliUsageError("Unexpected argument. Run `hra --help` for the supported command shape.");
+  if (unexpected !== undefined) throw new CliUsageError("Unexpected argument. Run `oompa --help` for the supported command shape.");
 };
 
 const finishWithoutTaskPrompt = (cursor: Cursor): void => {
@@ -976,7 +1008,7 @@ export const projectionRecoveryReplayCommand = (
   idempotencyKey: string,
   json: boolean,
 ): string => [
-  "hra sync projection recover",
+  "oompa sync projection recover",
   shellArgument(session),
   "--acknowledge-gap",
   "--idempotency-key",
@@ -991,7 +1023,7 @@ export const accountLoginReplayCommand = (
   handoffFile: string | undefined,
   json: boolean,
 ): string => [
-  "hra account login",
+  "oompa account login",
   shellArgument(command.account),
   ...(command.deviceCode ? ["--device-code"] : []),
   "--idempotency-key",
@@ -1001,13 +1033,13 @@ export const accountLoginReplayCommand = (
 ].join(" ");
 
 export const accountLoginCancelCommand = (account: string): string =>
-  `hra account login-cancel ${shellArgument(account)}`;
+  `oompa account login-cancel ${shellArgument(account)}`;
 
 export const claudeAccountLoginCommand = (
   account: string,
   idempotencyKey?: string,
 ): string => [
-  "hra account login",
+  "oompa account login",
   shellArgument(account),
   "--provider claude",
   ...(idempotencyKey === undefined ? [] : ["--idempotency-key", idempotencyKey]),
@@ -1019,7 +1051,7 @@ export const claudeAccountLoginAbandonCommand = (
   idempotencyKey: string,
   providerGeneration: number,
 ): string => [
-  "hra account login-cancel",
+  "oompa account login-cancel",
   shellArgument(account),
   "--provider claude",
   "--attempt-id",
@@ -1037,7 +1069,7 @@ export const devinAccountLoginAbandonCommand = (
   idempotencyKey: string,
   providerGeneration: number,
 ): string => [
-  "hra account login-cancel",
+  "oompa account login-cancel",
   shellArgument(account),
   "--provider devin",
   "--attempt-id",
@@ -1053,7 +1085,7 @@ export const deviceMutationReplayCommand = (
   command: Extract<LocalCommand, { kind: "device.approve" | "device.revoke" }>,
   json: boolean,
 ): string => [
-  `hra device ${command.kind === "device.approve" ? "approve" : "revoke"}`,
+  `oompa device ${command.kind === "device.approve" ? "approve" : "revoke"}`,
   shellArgument(command.device),
   ...(command.kind === "device.approve" ? ["--fingerprint", command.fingerprint] : []),
   "--idempotency-key",
@@ -1139,7 +1171,13 @@ const parseAccount = (
 ): LocalCommand | AccountLoginCliInvocation | ClaudeAccountAuthCliInvocation => {
   const action = take(cursor, "account action");
   switch (action) {
-    case "list": finish(cursor); return { kind: "account.list" };
+    case "list": {
+      const provider = option(cursor, "--provider");
+      finish(cursor);
+      if (provider === undefined) return { kind: "account.list" };
+      if (cursor.literalDelimiter) throw new CliUsageError("Provider account listing does not accept literal arguments.");
+      return command({ kind: "account.list", provider });
+    }
     case "add": { const label = remainder(cursor, "account label"); return command({ kind: "account.add", label }); }
     case "show": {
       const requestedProvider = option(cursor, "--provider") ?? "codex";
@@ -1276,7 +1314,7 @@ const parseAccount = (
     }
     case "switch": { const account = take(cursor, "account"); finish(cursor); return { kind: "account.switch", account, idempotencyKey: randomUUID() }; }
     case "switch-recover": finish(cursor); return { kind: "account.switch-recover" };
-    default: throw new CliUsageError("Unknown account action. Run `hra account --help` for supported actions.");
+    default: throw new CliUsageError("Unknown account action. Run `oompa account --help` for supported actions.");
   }
 };
 
@@ -1306,7 +1344,7 @@ const parsePlugin = (cursor: Cursor): LocalCommand => {
       `Pinned Codex ${CODEX_PIN} has no safe separated plugin lifecycle effect. Use \`plugin list\` or \`plugin show\` to inspect the exact boundary.`,
     );
   }
-  throw new CliUsageError("Unknown plugin action. Run `hra plugin --help` for supported actions.");
+  throw new CliUsageError("Unknown plugin action. Run `oompa plugin --help` for supported actions.");
 };
 
 const parseProject = (cursor: Cursor, cwd: string): LocalCommand => {
@@ -1315,7 +1353,7 @@ const parseProject = (cursor: Cursor, cwd: string): LocalCommand => {
     case "list": finish(cursor); return { kind: "project.list" };
     case "add": { const requestedPath = option(cursor, "--path") ?? take(cursor, "project directory"); const label = option(cursor, "--name") ?? takeOptional(cursor) ?? requestedPath.split("/").filter(Boolean).at(-1) ?? "Project"; finish(cursor); return command({ kind: "project.add", label, path: resolve(cwd, requestedPath) }); }
     case "use": { const project = take(cursor, "project"); finish(cursor); return { kind: "project.use", project }; }
-    default: throw new CliUsageError("Unknown project action. Run `hra project --help` for supported actions.");
+    default: throw new CliUsageError("Unknown project action. Run `oompa project --help` for supported actions.");
   }
 };
 
@@ -1374,7 +1412,7 @@ const parseMemory = (
       return { kind: "memory.hosted.sync", project };
     }
     throw new CliUsageError(
-      "Unknown hosted memory action. Run `hra memory --help` for supported actions.",
+      "Unknown hosted memory action. Run `oompa memory --help` for supported actions.",
     );
   }
   if (action === "status") {
@@ -1475,7 +1513,7 @@ const parseMemory = (
       value: { key, reason },
     });
   }
-  throw new CliUsageError("Unknown memory action. Run `hra memory --help` for supported actions.");
+  throw new CliUsageError("Unknown memory action. Run `oompa memory --help` for supported actions.");
 };
 
 const parseSessionNote = (cursor: Cursor): LocalCommand => {
@@ -1486,7 +1524,7 @@ const parseSessionNote = (cursor: Cursor): LocalCommand => {
     case "edit": finish(cursor); return { kind: "session.note.edit", session };
     case "set": return command({ kind: "session.note.set", session, note: remainder(cursor, "note") });
     case "clear": finish(cursor); return { kind: "session.note.clear", session };
-    default: throw new CliUsageError("Unknown note action. Run `hra session --help` for supported actions.");
+    default: throw new CliUsageError("Unknown note action. Run `oompa session --help` for supported actions.");
   }
 };
 
@@ -1522,7 +1560,7 @@ const parseSessionPeerPolicy = (cursor: Cursor): LocalCommand => {
     });
   }
   throw new CliUsageError(
-    "Unknown peer policy action. Run `hra session peer-policy --help` for supported actions.",
+    "Unknown peer policy action. Run `oompa session peer-policy --help` for supported actions.",
   );
 };
 
@@ -1614,7 +1652,7 @@ const parseSessionTask = (
       task,
     });
   }
-  throw new CliUsageError("Unknown session task action. Run `hra session --help` for supported actions.");
+  throw new CliUsageError("Unknown session task action. Run `oompa session --help` for supported actions.");
 };
 
 const parseSession = (
@@ -1857,7 +1895,7 @@ const parseSession = (
     case "fast": { const session = take(cursor, "session"); const value = take(cursor, "on or off"); finish(cursor); if (value !== "on" && value !== "off") throw new CliUsageError("Fast must be `on` or `off`."); return { kind: "session.fast", session, enabled: value === "on" }; }
     case "project": { const session = take(cursor, "session"); const project = take(cursor, "project"); finish(cursor); return { kind: "session.project", session, project }; }
     case "task": return parseSessionTask(cursor, idempotencyKey);
-    default: throw new CliUsageError("Unknown session action. Run `hra session --help` for supported actions.");
+    default: throw new CliUsageError("Unknown session action. Run `oompa session --help` for supported actions.");
   }
 };
 
@@ -1988,7 +2026,7 @@ const parseWork = (
         : parsed;
     }
     default:
-      throw new CliUsageError("Unknown work action. Run `hra work --help` for supported actions.");
+      throw new CliUsageError("Unknown work action. Run `oompa work --help` for supported actions.");
   }
 };
 
@@ -2135,11 +2173,11 @@ const parseInteraction = (cursor: Cursor, json: boolean): ParsedInteraction => {
       resolution: { action: "accept", kind: "mcp_submission" },
     };
   }
-  throw new CliUsageError("Unknown interaction action. Run `hra interaction --help` for supported actions.");
+  throw new CliUsageError("Unknown interaction action. Run `oompa interaction --help` for supported actions.");
 };
 
 /**
- * `hra remote allow|deny <switch>` and `hra remote policy`. These are local
+ * `oompa remote allow|deny <switch>` and `oompa remote policy`. These are local
  * daemon commands, so they are peeled off before the cloud remote parser sees
  * the cursor; `null` means this is an ordinary remote action.
  */
@@ -2248,7 +2286,7 @@ const parseRemote = (cursor: Cursor): RemoteCliCommand => {
       if (value !== "on" && value !== "off") throw new CliUsageError("Fast must be `on` or `off`.");
       return { enabled: value === "on", kind: "remote.fast", session };
     }
-    default: throw new CliUsageError("Unknown remote action. Run `hra remote --help` for supported actions.");
+    default: throw new CliUsageError("Unknown remote action. Run `oompa remote --help` for supported actions.");
   }
 };
 
@@ -2289,7 +2327,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
   }
   if (jsonl && group !== "session" && group !== "work") {
     throw new CliUsageError(
-      "--jsonl is supported only by `hra session events` and `hra session watch`, or by `hra work events` and `hra work watch`.",
+      "--jsonl is supported only by `oompa session events` and `oompa session watch`, or by `oompa work events` and `oompa work watch`.",
     );
   }
   if (group === "status") {
@@ -2298,6 +2336,45 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
       throw new CliUsageError("--idempotency-key is not supported by status.");
     }
     return { kind: "status", json };
+  }
+  if (group === "usage") {
+    if (cursor.literalDelimiter) throw new CliUsageError("Literal arguments are not supported by usage auto.");
+    if (take(cursor, "usage command") !== "auto") {
+      throw new CliUsageError("Unknown usage command. Run `oompa usage --help` for supported commands.");
+    }
+    const action = take(cursor, "usage auto action");
+    if (action !== "status" && action !== "on" && action !== "off" && action !== "inherit") {
+      throw new CliUsageError("Unknown usage auto action. Use `status`, `on`, `off`, or `inherit`.");
+    }
+    const revision = action === "status" ? undefined : option(cursor, "--revision");
+    const providerValue = takeOptional(cursor);
+    const provider = providerValue === undefined ? undefined : usageProviderSchema.safeParse(providerValue);
+    if (provider !== undefined && !provider.success) {
+      throw new CliUsageError("Usage-auto provider must be `codex` or `claude`.");
+    }
+    finish(cursor);
+    if (action === "status") {
+      if (idempotencyKey !== undefined) {
+        throw new CliUsageError("--idempotency-key is not supported by usage auto status.");
+      }
+      return { kind: "command", json, command: command({
+        kind: "usage.auto.status", ...(provider === undefined ? {} : { provider: provider.data }),
+      }) };
+    }
+    if (action === "inherit" && provider === undefined) {
+      throw new CliUsageError("usage auto inherit requires a provider.");
+    }
+    if (idempotencyKey === undefined) {
+      throw new CliUsageError("usage auto mutations require --idempotency-key <uuid>.");
+    }
+    return { kind: "command", json, command: command({
+      kind: "usage.auto.set",
+      idempotencyKey,
+      expectedAutomaticPolicyRevision: boundedDecimal(revision, "--revision", 1, Number.MAX_SAFE_INTEGER),
+      change: provider === undefined
+        ? { kind: "set_default", enabled: action === "on" }
+        : { kind: "set_override", provider: provider.data, override: action },
+    }) };
   }
   if (group === "init") { const yes = flag(cursor, "--yes"); finish(cursor); return { kind: "init", yes, json }; }
   if (group === "doctor") { const offline = flag(cursor, "--offline"); finish(cursor); return { kind: "command", command: { kind: "doctor", offline }, json }; }
@@ -2310,7 +2387,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
       return { kind: "daemon.run" };
     }
     if (action === "status" || action === "stop") return { kind: "command", command: { kind: `daemon.${action}` }, json };
-    throw new CliUsageError("Unknown daemon action. Run `hra daemon --help` for supported actions.");
+    throw new CliUsageError("Unknown daemon action. Run `oompa daemon --help` for supported actions.");
   }
   if (group === "remote") {
     // The two policy switches are local daemon state, not a hosted command, so
@@ -2524,7 +2601,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
         throw new CliUsageError("--idempotency-key is not supported by session.export.");
       }
       if (jsonl) {
-        throw new CliUsageError("--jsonl is supported only by `hra session events` and `hra session watch`.");
+        throw new CliUsageError("--jsonl is supported only by `oompa session events` and `oompa session watch`.");
       }
       return sessionCommand;
     }
@@ -2547,7 +2624,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
       return sessionCommand;
     }
     if (jsonl) {
-      throw new CliUsageError("--jsonl is supported only by `hra session events` and `hra session watch`.");
+      throw new CliUsageError("--jsonl is supported only by `oompa session events` and `oompa session watch`.");
     }
     if (sessionCommand.kind === "session.attach") {
       sessionAttach = sessionCommand.attach;
@@ -2570,7 +2647,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
     }
     return { kind: "command", command: workCommand, json: true };
   }
-  else if (group === "turn") { const action = take(cursor, "turn action"); if (action !== "inspect") throw new CliUsageError("Unknown turn action. Run `hra turn --help` for supported actions."); const session = take(cursor, "session"); const turn = take(cursor, "turn"); finish(cursor); parsed = { kind: "turn.inspect", session, turn }; }
+  else if (group === "turn") { const action = take(cursor, "turn action"); if (action !== "inspect") throw new CliUsageError("Unknown turn action. Run `oompa turn --help` for supported actions."); const session = take(cursor, "session"); const turn = take(cursor, "turn"); finish(cursor); parsed = { kind: "turn.inspect", session, turn }; }
   else if (group === "interaction") {
     const interaction = parseInteraction(cursor, json);
     if (interaction.kind === "interaction.inspect-protected") {
@@ -2600,7 +2677,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
     }
     if (action === "delete") {
       if (idempotencyKey !== undefined) {
-        throw new CliUsageError("--idempotency-key is not supported by auth.delete; HRA durably owns deletion recovery.");
+        throw new CliUsageError("--idempotency-key is not supported by auth.delete; Oompa durably owns deletion recovery.");
       }
       const acknowledgeErasure = flag(cursor, "--acknowledge-erasure");
       finish(cursor);
@@ -2612,7 +2689,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
       finish(cursor);
       parsed = { kind: `auth.${action}` };
     } else {
-      throw new CliUsageError("Unknown auth action. Run `hra auth --help` for supported actions.");
+      throw new CliUsageError("Unknown auth action. Run `oompa auth --help` for supported actions.");
     }
   }
   else if (group === "device") {
@@ -2640,7 +2717,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
       const fingerprint = action === "approve" ? option(cursor, "--fingerprint") : undefined;
       finish(cursor);
       if (action === "approve" && fingerprint === undefined) {
-        throw new CliUsageError("Device approval requires --fingerprint <value> from hra device list.");
+        throw new CliUsageError("Device approval requires --fingerprint <value> from oompa device list.");
       }
       if (fingerprint !== undefined && !deviceKeyFingerprintPattern.test(fingerprint)) {
         throw new CliUsageError("Device approval --fingerprint must be eight lower-case hex groups of four separated by hyphens.");
@@ -2653,7 +2730,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
         ? { device, fingerprint, idempotencyKey: deviceMutationKey, kind: "device.approve" }
         : { device, idempotencyKey: deviceMutationKey, kind: "device.revoke" };
     } else {
-      throw new CliUsageError("Unknown device action. Run `hra device --help` for supported actions.");
+      throw new CliUsageError("Unknown device action. Run `oompa device --help` for supported actions.");
     }
   }
   else if (group === "sync") {
@@ -2664,7 +2741,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
     } else if (action === "projection") {
       const projectionAction = take(cursor, "projection action");
       if (projectionAction !== "recover") {
-        throw new CliUsageError("Unknown projection action. Run `hra sync --help` for supported actions.");
+        throw new CliUsageError("Unknown projection action. Run `oompa sync --help` for supported actions.");
       }
       const acknowledgeGap = flag(cursor, "--acknowledge-gap");
       const session = take(cursor, "local session");
@@ -2712,10 +2789,10 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
         replayCommand,
       };
     } else {
-      throw new CliUsageError("Unknown sync action. Run `hra sync --help` for supported actions.");
+      throw new CliUsageError("Unknown sync action. Run `oompa sync --help` for supported actions.");
     }
   }
-  else throw new CliUsageError("Unknown command. Run `hra --help` for supported commands.");
+  else throw new CliUsageError("Unknown command. Run `oompa --help` for supported commands.");
   const supportsIdempotency = idempotentCommandKinds.has(parsed.kind);
   if (idempotencyKey !== undefined && !supportsIdempotency) {
     throw new CliUsageError(`--idempotency-key is not supported by ${parsed.kind}.`);

@@ -88,7 +88,7 @@ function submit(container: HTMLElement): void {
   form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
 }
 
-describe("HRA email sign-in request ownership", () => {
+describe("Oompa email sign-in request ownership", () => {
   test("freezes the requested address while its code is being sent, and permits editing after failure", async () => {
     const container = await renderMounted();
     await act(async () => { submit(container); });

@@ -24,21 +24,21 @@ const trajectoryAttachmentSuffix = (
  *
  * Upstream is an import-oriented normalizer: it converts many harnesses'
  * native logs into the normalized shape and does not convert normalized
- * records back into their native formats. HRA emits that shape for consumers
+ * records back into their native formats. Oompa emits that shape for consumers
  * that accept normalized trajectory v1 arrays.
  * The pinned upstream package and its exported JSON Schema are development
  * fixtures that test this mapping; they are not runtime dependencies.
  *
- * Everything emitted comes from HRA's redacted event stream. HRA never stored
+ * Everything emitted comes from Oompa's redacted event stream. Oompa never stored
  * raw tool arguments or raw tool output, so a tool call's `args` string states
- * what identity HRA does hold, and a tool record's `content` says plainly that
+ * what identity Oompa does hold, and a tool record's `content` says plainly that
  * no output was retained.
  */
 
 export const TRAJECTORY_SCHEMA_ID = "https://letta.ai/schemas/trajectory/v1.json";
-export const TRAJECTORY_NO_OUTPUT_CONTENT = "[hra] tool output was never retained";
-export const TRAJECTORY_EMPTY_ASSISTANT_CONTENT = "[hra] assistant message was empty";
-export const HRA_TRAJECTORY_EXPORT_CONTEXT_VERSION = 1;
+export const TRAJECTORY_NO_OUTPUT_CONTENT = "[oompa] tool output was never retained";
+export const TRAJECTORY_EMPTY_ASSISTANT_CONTENT = "[oompa] assistant message was empty";
+export const OOMPA_TRAJECTORY_EXPORT_CONTEXT_VERSION = 1;
 
 const isoTimestamp = (value: number): string => new Date(value).toISOString();
 
@@ -122,11 +122,11 @@ export const trajectoryDocumentSchema = z.array(trajectoryRecordSchema).min(1);
 export type TrajectoryRecord = z.infer<typeof trajectoryRecordSchema>;
 
 /**
- * HRA-specific export facts carried as JSON text in a standard observation.
+ * Oompa-specific export facts carried as JSON text in a standard observation.
  * These are not extension properties on trajectory v1 records.
  */
-export const hraTrajectoryExportContextSchema = z.object({
-  hra_export_context: z.literal(HRA_TRAJECTORY_EXPORT_CONTEXT_VERSION),
+export const oompaTrajectoryExportContextSchema = z.object({
+  hra_export_context: z.literal(OOMPA_TRAJECTORY_EXPORT_CONTEXT_VERSION),
   session_id: trajectoryIdSchema,
   provider: providerSchema,
   transcript_digest: z.string().regex(/^[a-f0-9]{64}$/u),
@@ -134,7 +134,7 @@ export const hraTrajectoryExportContextSchema = z.object({
   retention_gap_reason: sessionEventGapReasonSchema.optional(),
 }).strict();
 
-export type HraTrajectoryExportContext = z.infer<typeof hraTrajectoryExportContextSchema>;
+export type OompaTrajectoryExportContext = z.infer<typeof oompaTrajectoryExportContextSchema>;
 
 const toolName = (record: Extract<TranscriptRecord, { kind: "tool_call" }>): string => {
   if (record.tool === undefined) return record.itemKind;
@@ -176,17 +176,17 @@ const recordToTrajectory = (
       // erase their durable provenance.
       const prefix = record.actor === "human"
         ? record.text.startsWith(TRANSCRIPT_SEED_HEADER)
-          ? "[hra human] "
+          ? "[oompa human] "
           : ""
         : record.actor === "automation"
-          ? "[hra automation] "
+          ? "[oompa automation] "
           : record.actor === "autorespond"
-            ? "[hra autorespond] "
+            ? "[oompa autorespond] "
             : record.actor === "peer_session"
-              ? "[hra peer session] "
+              ? "[oompa peer session] "
               : record.text.startsWith(TRANSCRIPT_SEED_HEADER)
                 ? ""
-                : "[hra provider handoff] ";
+                : "[oompa provider handoff] ";
       return [{
         role: "user",
         content: `${prefix}${textWithOmission(record)}${trajectoryAttachmentSuffix(record)}`,
@@ -198,7 +198,7 @@ const recordToTrajectory = (
       return [{
         role: "assistant",
         // The upstream schema requires nonempty assistant prose. Preserve an
-        // empty HRA event explicitly instead of emitting an invalid record.
+        // empty Oompa event explicitly instead of emitting an invalid record.
         content: content.length === 0 ? TRAJECTORY_EMPTY_ASSISTANT_CONTENT : content,
         timestamp,
       }];
@@ -214,7 +214,7 @@ const recordToTrajectory = (
       tool_calls: [{
         id: linkedToolCallId ?? record.callId,
         name: toolName(record),
-        // HRA holds no raw arguments. The stringified object states exactly
+        // Oompa holds no raw arguments. The stringified object states exactly
         // what it does hold, so `args` is not fabricated provider input.
         args: JSON.stringify({
           hra_arguments_retained: false,
@@ -237,7 +237,7 @@ const recordToTrajectory = (
     }];
     case "provider_switch": return [{
       role: "observation",
-      content: `[hra] provider switched from ${record.fromProvider} (${record.fromPreset}) to `
+      content: `[oompa] provider switched from ${record.fromProvider} (${record.fromPreset}) to `
         + `${record.toProvider} (${record.toPreset}); account ${
           record.accountChanged ? "changed" : "unchanged"}; seed digest ${record.seedDigest}`,
       timestamp,
@@ -248,7 +248,7 @@ const recordToTrajectory = (
 /**
  * Map one neutral transcript into an ordered @letta-ai/trajectory v1 document.
  * The standard meta record comes first. The next standard observation carries
- * HRA's typed export facts as JSON text because v1 meta forbids extra fields.
+ * Oompa's typed export facts as JSON text because v1 meta forbids extra fields.
  */
 export const transcriptToTrajectory = (input: Readonly<{
   transcript: SessionTranscript;
@@ -256,8 +256,8 @@ export const transcriptToTrajectory = (input: Readonly<{
   createdAt: number;
 }>): readonly TrajectoryRecord[] => {
   const transcript = sessionTranscriptSchema.parse(input.transcript);
-  const exportContext = hraTrajectoryExportContextSchema.parse({
-    hra_export_context: HRA_TRAJECTORY_EXPORT_CONTEXT_VERSION,
+  const exportContext = oompaTrajectoryExportContextSchema.parse({
+    hra_export_context: OOMPA_TRAJECTORY_EXPORT_CONTEXT_VERSION,
     session_id: transcript.sessionId,
     provider: input.provider,
     transcript_digest: transcript.digest,
@@ -268,7 +268,7 @@ export const transcriptToTrajectory = (input: Readonly<{
       : { retention_gap_reason: transcript.retentionGapReason }),
   });
   const records: TrajectoryRecord[] = [
-    { role: "meta", source: "hra" },
+    { role: "meta", source: "oompa" },
     {
       role: "observation",
       content: JSON.stringify(exportContext),

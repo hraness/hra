@@ -69,6 +69,35 @@ async function write(
 }
 
 describe("cloud identity-scoped custody", () => {
+  test("selects the forward deployment alias and refuses contradictory raw aliases", () => {
+    expect(cloudDeploymentSelectionFromEnvironment({ OOMPA_CONVEX_URL: "https://forward.convex.cloud/" }))
+      .toEqual({ deploymentUrl: "https://forward.convex.cloud", explicit: true, kind: "enabled" });
+    expect(() => cloudDeploymentSelectionFromEnvironment({
+      OOMPA_CONVEX_URL: "", HRA_CONVEX_URL: " ",
+    })).toThrow("OOMPA_CONVEX_URL and HRA_CONVEX_URL must be byte-identical when both are set.");
+  });
+
+  test("keeps both alias forms equivalent without changing persistent deployment authority", async () => {
+    const custody = new MemoryCustody();
+    const url = "https://bound.convex.cloud";
+    const legacy = await cloudDeploymentAuthorityFromEnvironment(custody, { HRA_CONVEX_URL: url });
+    const before = [...custody.values];
+    for (const environment of [{ OOMPA_CONVEX_URL: url }, { OOMPA_CONVEX_URL: url, HRA_CONVEX_URL: url }]) {
+      const authority = await cloudDeploymentAuthorityFromEnvironment(custody, environment);
+      expect(authority?.deploymentUrl).toBe(legacy?.deploymentUrl);
+      expect(authority?.generation).toBe(legacy?.generation);
+      expect(authority?.cacheNamespace).toBe(legacy?.cacheNamespace);
+      expect([...custody.values]).toEqual(before);
+    }
+    for (const value of ["", " ", "\t\n"]) {
+      for (const environment of [{ OOMPA_CONVEX_URL: value }, { OOMPA_CONVEX_URL: value, HRA_CONVEX_URL: value }]) {
+        expect(cloudDeploymentSelectionFromEnvironment(environment)).toEqual({ kind: "disabled" });
+        expect(await cloudDeploymentAuthorityFromEnvironment(custody, environment)).toBeNull();
+        expect([...custody.values]).toEqual(before);
+      }
+    }
+  });
+
   test("preserves isolated A to B to A device, key, state, outbox, journal, and attention authority", async () => {
     const raw = new MemoryCustody();
     const unbound = await IdentityScopedCloudSecretCustody.open(raw);
@@ -142,18 +171,18 @@ describe("cloud identity-scoped custody", () => {
     await unbound.assertCurrentIdentity(null);
     await unbound.activateIdentity("user_aaaaaaaa");
     await expect(unbound.assertCurrentIdentity(null))
-      .rejects.toThrow("Cloud identity selection changed; restart HRA.");
+      .rejects.toThrow("Cloud identity selection changed; restart Oompa.");
 
     const identityA = await IdentityScopedCloudSecretCustody.open(raw);
     await identityA.assertCurrentIdentity("user_aaaaaaaa");
     await identityA.activateIdentity("user_bbbbbbbb");
     await expect(identityA.assertCurrentIdentity("user_aaaaaaaa"))
-      .rejects.toThrow("Cloud identity selection changed; restart HRA.");
+      .rejects.toThrow("Cloud identity selection changed; restart Oompa.");
 
     const identityB = await IdentityScopedCloudSecretCustody.open(raw);
     await identityB.activateIdentity("user_aaaaaaaa");
     await expect(identityA.assertCurrentIdentity("user_aaaaaaaa"))
-      .rejects.toThrow("Cloud identity selection changed; restart HRA.");
+      .rejects.toThrow("Cloud identity selection changed; restart Oompa.");
     const returnedA = await IdentityScopedCloudSecretCustody.open(raw);
     await returnedA.assertCurrentIdentity("user_aaaaaaaa");
   });
@@ -172,16 +201,16 @@ describe("cloud identity-scoped custody", () => {
     );
     await identityA.activateIdentity("user_bbbbbbbb");
     await expect(identityA.read("cloud-attention-notification-reconciliation"))
-      .rejects.toThrow("Cloud identity selection changed; restart HRA.");
+      .rejects.toThrow("Cloud identity selection changed; restart Oompa.");
     await expect(identityA.compareAndSwap(
       "cloud-attention-notification-reconciliation",
       0,
       "stale-write",
-    )).rejects.toThrow("Cloud identity selection changed; restart HRA.");
+    )).rejects.toThrow("Cloud identity selection changed; restart Oompa.");
     await expect(identityA.clearIfGeneration(
       "cloud-attention-notification-reconciliation",
       0,
-    )).rejects.toThrow("Cloud identity selection changed; restart HRA.");
+    )).rejects.toThrow("Cloud identity selection changed; restart Oompa.");
 
     const identityB = await IdentityScopedCloudSecretCustody.open(raw);
     expect(await identityB.read("cloud-attention-notification-reconciliation")).toBeNull();
@@ -219,7 +248,7 @@ describe("cloud identity-scoped custody", () => {
       "https://example.convex.cloud?target=other",
     ]) {
       expect(() => cloudDeploymentSelectionFromEnvironment({ HRA_CONVEX_URL: value }))
-        .toThrow("HRA_CONVEX_URL is invalid.");
+        .toThrow("The selected cloud deployment URL is invalid.");
     }
   });
 
@@ -285,7 +314,7 @@ describe("cloud identity-scoped custody", () => {
       const custody = new MemoryCustody();
       await write(custody, slot, "legacy");
       await expect(cloudDeploymentAuthorityFromEnvironment(custody, {}))
-        .rejects.toThrow("requires an explicit HRA_CONVEX_URL");
+        .rejects.toThrow("requires an explicit OOMPA_CONVEX_URL (or legacy HRA_CONVEX_URL)");
       const bound = await cloudDeploymentAuthorityFromEnvironment(custody, {
         HRA_CONVEX_URL: "https://legacy-target.convex.cloud",
       });

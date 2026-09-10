@@ -11,7 +11,7 @@ const roots: string[] = [];
 const store = async (): Promise<AttachmentBlobStore> => {
   // macOS resolves /var through a symlink, and private-directory custody
   // refuses a traversed path, so the fixture root is canonicalized first.
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-attachments-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-attachments-")));
   roots.push(root);
   return new AttachmentBlobStore(join(root, "attachments"));
 };

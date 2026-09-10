@@ -3,7 +3,7 @@
  *
  * The classifier is pure and lexical. It decides who must act next and how
  * the turn ended, using the final assistant message plus a few protocol
- * facts. Ordering matters and is fixed by the HRA Web v1 plan: provider
+ * facts. Ordering matters and is fixed by the Oompa Web v1 plan: provider
  * status, then pending provider interactions, then human-action cues (a strong
  * subset over the whole message, the full list over the tail), then approval
  * cues over the tail demoted by denylist cues anywhere, then a trailing
@@ -391,7 +391,7 @@ export function classifySessionState(input: SessionStateInput): SessionStateClas
 }
 
 /*
- * Wire shape of `hra session state`: the durable latest classification for a
+ * Wire shape of `oompa session state`: the durable latest classification for a
  * session, or `null` when no turn has been classified yet. Exposed through the
  * daemon and validated by the CLI before rendering.
  */

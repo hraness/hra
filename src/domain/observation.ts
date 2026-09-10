@@ -187,6 +187,7 @@ export const providerObservationSchema = z.discriminatedUnion("state", [
     freshness: z.literal("fresh"),
     code: z.enum([
       "account_signed_out",
+      "authority_retired",
       "provider_platform_unavailable",
       "provider_retired",
       "resume_unavailable",

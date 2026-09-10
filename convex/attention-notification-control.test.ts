@@ -15,8 +15,8 @@ import { ATTENTION_NOTIFICATION_TERMINAL_RETENTION_MS } from "./lifecyclePolicy"
 import { logicalDocumentBytes } from "./quota";
 import schema from "./schema";
 import {
-  hraAttentionResendApiKeyEnvironmentName,
-  hraResendApiKeyEnvironmentName,
+  oompaAttentionResendApiKeyEnvironmentName,
+  oompaResendApiKeyEnvironmentName,
 } from "./resendApiKey";
 import { modules } from "./test.setup";
 
@@ -148,8 +148,8 @@ describe("attention-notification safety fault ledger", () => {
     const runtime = convexTest(schema, modules);
     await runtime.mutation(genesis, {});
     const previous = [
-      [hraAttentionResendApiKeyEnvironmentName, process.env[hraAttentionResendApiKeyEnvironmentName]],
-      [hraResendApiKeyEnvironmentName, process.env[hraResendApiKeyEnvironmentName]],
+      [oompaAttentionResendApiKeyEnvironmentName, process.env[oompaAttentionResendApiKeyEnvironmentName]],
+      [oompaResendApiKeyEnvironmentName, process.env[oompaResendApiKeyEnvironmentName]],
     ] as const;
     const attentionKey = "re_notice_test";
     const authKey = "re_auth_test";
@@ -163,8 +163,8 @@ describe("attention-notification safety fault ledger", () => {
         [attentionKey, authKey, true],
       ] as const) {
         for (const [name, value] of [
-          [hraAttentionResendApiKeyEnvironmentName, attention],
-          [hraResendApiKeyEnvironmentName, authentication],
+          [oompaAttentionResendApiKeyEnvironmentName, attention],
+          [oompaResendApiKeyEnvironmentName, authentication],
         ] as const) {
           if (value === undefined) Reflect.deleteProperty(process.env, name);
           else process.env[name] = value;

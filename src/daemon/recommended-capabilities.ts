@@ -30,7 +30,7 @@ const requireExactlyOne = <T>(
 };
 
 /**
- * Compile the exact provider capabilities used by HRA's recommended
+ * Compile the exact provider capabilities used by Oompa's recommended
  * profile. This is an observation only: it never installs, enables, or grants
  * access to an app or plugin.
  */
@@ -53,7 +53,7 @@ export const compileEffectiveRuntimeProfile = (input: {
     if (!feature.enabled || feature.stage !== "stable") {
       throw new CodexError(
         "UNSUPPORTED_CAPABILITY",
-        `The active Codex generation does not advertise the stable enabled ${required.replaceAll("_", " ")} capability required by the recommended HRA profile.`,
+        `The active Codex generation does not advertise the stable enabled ${required.replaceAll("_", " ")} capability required by the recommended Oompa profile.`,
       );
     }
   }

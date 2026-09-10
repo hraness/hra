@@ -61,7 +61,7 @@ describe("browser storage discipline", () => {
 
   test("appearance stores only its bounded shared preference and never reads legacy keys", async () => {
     const text = await readFile(join(appSource, "appearance.ts"), "utf8");
-    expect(text).toContain('hraAppearanceStorageKey = "hraness-design-palette-v1"');
+    expect(text).toContain('oompaAppearanceStorageKey = "hraness-design-palette-v1"');
     expect(text).toContain("maximumPreferenceLength = 256");
     expect(text).toContain("parseDesignPalettePreference");
     expect(text).toContain("legacyStorageKey: null");

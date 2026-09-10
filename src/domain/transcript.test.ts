@@ -13,7 +13,7 @@ import {
   sessionTranscriptSchema,
   TRANSCRIPT_SEED_HEADER,
 } from "./transcript";
-import { hraTrajectoryExportContextSchema, transcriptToTrajectory } from "./trajectory";
+import { oompaTrajectoryExportContextSchema, transcriptToTrajectory } from "./trajectory";
 
 const sessionId = `sess_${"a".repeat(32)}` as const;
 const accountId = `acct_${"b".repeat(32)}` as const;
@@ -92,7 +92,7 @@ describe("session transcript", () => {
         event({ type: "item_started", turnId: turn, itemId: toolItem, itemKind: "unknownFutureKind" }),
       ],
     });
-    // An unknown item kind is still a tool call: HRA would rather record an
+    // An unknown item kind is still a tool call: Oompa would rather record an
     // unfamiliar call than silently drop it.
     expect(transcript.records.map((record) => record.kind)).toEqual(["tool_call"]);
   });
@@ -267,8 +267,8 @@ describe("session transcript", () => {
       toProvider: "codex",
       maxCharacters: 1_024,
     });
-    expect(seed.text.match(/\[HRA provider handoff\]/gu)).toHaveLength(1);
-    expect(seed.text).toContain("User (handoff): [prior HRA handoff seed omitted]");
+    expect(seed.text.match(/\[Oompa provider handoff\]/gu)).toHaveLength(1);
+    expect(seed.text).toContain("User (handoff): [prior Oompa handoff seed omitted]");
     expect(seed.text).toContain("latest real dialogue");
     expect(seed.text).not.toContain("old generated context");
     expect(seed.includedRecords).toBe(2);
@@ -322,7 +322,7 @@ describe("session transcript", () => {
     });
     const seed = renderTranscriptSeed({ transcript, fromProvider: "claude", toProvider: "codex" });
     expect(seed.retentionGapReason).toBe("retention_age");
-    expect(seed.text).toContain("WARNING: HRA pruned earlier ledger history (retention_age)");
+    expect(seed.text).toContain("WARNING: Oompa pruned earlier ledger history (retention_age)");
     expect(seed.text).toContain("number of unavailable records is unknown");
     expect(seed.text).toContain("No additional retained records were omitted");
     expect(seed.text).not.toContain("No records were omitted");
@@ -331,10 +331,10 @@ describe("session transcript", () => {
       provider: "codex",
       createdAt: 1_700_000_000_000,
     });
-    expect(trajectory[0]).toEqual({ role: "meta", source: "hra" });
+    expect(trajectory[0]).toEqual({ role: "meta", source: "oompa" });
     const context = trajectory[1];
-    if (context?.role !== "observation") throw new Error("Expected the HRA export context observation.");
-    expect(hraTrajectoryExportContextSchema.parse(JSON.parse(context.content))).toMatchObject({
+    if (context?.role !== "observation") throw new Error("Expected the Oompa export context observation.");
+    expect(oompaTrajectoryExportContextSchema.parse(JSON.parse(context.content))).toMatchObject({
       omitted_records: 0,
       retention_gap_reason: "retention_age",
     });

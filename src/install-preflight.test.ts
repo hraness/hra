@@ -22,30 +22,30 @@ import { join, relative, resolve } from "node:path";
 import fc from "fast-check";
 
 import {
-  buildHraGlobalInstallCommand,
-  HRA_INSTALL_ARCHIVE_URL,
-  HRA_INSTALL_PREFLIGHT_LOADER,
-  HRA_INSTALL_PREFLIGHT_SOURCE_MAXIMUM_BYTES,
-  HRA_INSTALL_PREFLIGHT_SOURCE_SHA256,
-  HRA_INSTALL_PREFLIGHT_SOURCE_URL,
-  HRA_INSTALL_PREFLIGHT_SUCCESS,
+  buildOompaGlobalInstallCommand,
+  OOMPA_INSTALL_ARCHIVE_URL,
+  OOMPA_INSTALL_PREFLIGHT_LOADER,
+  OOMPA_INSTALL_PREFLIGHT_SOURCE_MAXIMUM_BYTES,
+  OOMPA_INSTALL_PREFLIGHT_SOURCE_SHA256,
+  OOMPA_INSTALL_PREFLIGHT_SOURCE_URL,
+  OOMPA_INSTALL_PREFLIGHT_SUCCESS,
 } from "./install-preflight";
 import {
   assertSafeDarwinInstallAcl as assertSafeDarwinNormalizerAcl,
 } from "./install-normalizer";
 import {
-  HRA_INSTALL_ARCHIVE_NAME,
-  HRA_INSTALL_RELEASE_API_URL,
-  HRA_INSTALL_REPOSITORY_API_URL,
-  HRA_INSTALL_REPOSITORY_ID,
-  HRA_INSTALL_RUNTIME_INJECTION_ENVIRONMENT_NAMES,
+  OOMPA_INSTALL_ARCHIVE_NAME,
+  OOMPA_INSTALL_RELEASE_API_URL,
+  OOMPA_INSTALL_REPOSITORY_API_URL,
+  OOMPA_INSTALL_REPOSITORY_ID,
+  OOMPA_INSTALL_RUNTIME_INJECTION_ENVIRONMENT_NAMES,
   assertSafeDarwinInstallAcl,
-  HRA_INSTALL_NORMALIZER_SHA256,
-  isHraInstallReceiptVersion,
-  parseOfficialHraReleaseRecord,
-  parseOfficialHraRepositoryRecord,
-  resolveOfficialHraArchiveIdentity,
-  sanitizeHraInstallChildEnvironment,
+  OOMPA_INSTALL_NORMALIZER_SHA256,
+  isOompaInstallReceiptVersion,
+  parseOfficialOompaReleaseRecord,
+  parseOfficialOompaRepositoryRecord,
+  resolveOfficialOompaArchiveIdentity,
+  sanitizeOompaInstallChildEnvironment,
 } from "./install-preflight-runtime";
 
 const repositoryRoot = resolve(import.meta.dir, "..");
@@ -53,21 +53,21 @@ const repositoryRoot = resolve(import.meta.dir, "..");
 // dependency resolution metadata removed. The package gate separately checks
 // the unchanged production tarball and its exact dependency policy.
 const TEST_STAGING_DEADLINE_MS = 45_000;
-const PUBLIC_LOADER_INSTALL_CALL = "await m.installHraRelease(a);";
+const PUBLIC_LOADER_INSTALL_CALL = "await m.installOompaRelease(a);";
 const BOUNDED_TEST_LOADER_INSTALL_CALL =
-  `await m.installHraRelease(a,{stageDeadlineMilliseconds:${String(TEST_STAGING_DEADLINE_MS)}});`;
-const BOUNDED_TEST_PREFLIGHT_LOADER = HRA_INSTALL_PREFLIGHT_LOADER.replace(
+  `await m.installOompaRelease(a,{stageDeadlineMilliseconds:${String(TEST_STAGING_DEADLINE_MS)}});`;
+const BOUNDED_TEST_PREFLIGHT_LOADER = OOMPA_INSTALL_PREFLIGHT_LOADER.replace(
   PUBLIC_LOADER_INSTALL_CALL,
   BOUNDED_TEST_LOADER_INSTALL_CALL,
 );
 if (
-  HRA_INSTALL_PREFLIGHT_LOADER.indexOf(PUBLIC_LOADER_INSTALL_CALL)
-    !== HRA_INSTALL_PREFLIGHT_LOADER.lastIndexOf(PUBLIC_LOADER_INSTALL_CALL)
-  || BOUNDED_TEST_PREFLIGHT_LOADER === HRA_INSTALL_PREFLIGHT_LOADER
+  OOMPA_INSTALL_PREFLIGHT_LOADER.indexOf(PUBLIC_LOADER_INSTALL_CALL)
+    !== OOMPA_INSTALL_PREFLIGHT_LOADER.lastIndexOf(PUBLIC_LOADER_INSTALL_CALL)
+  || BOUNDED_TEST_PREFLIGHT_LOADER === OOMPA_INSTALL_PREFLIGHT_LOADER
   || BOUNDED_TEST_PREFLIGHT_LOADER.replace(
     BOUNDED_TEST_LOADER_INSTALL_CALL,
     PUBLIC_LOADER_INSTALL_CALL,
-  ) !== HRA_INSTALL_PREFLIGHT_LOADER
+  ) !== OOMPA_INSTALL_PREFLIGHT_LOADER
 ) throw new Error("The installer test loader did not receive its one bounded staging deadline.");
 // Two serialized staging installs may each consume their complete bounded
 // installer budget. Keep the outer test deadline above both inner budgets so
@@ -107,7 +107,7 @@ type OfficialInstallScenario =
   | "truncated"
   | "wrong-hash";
 
-const makeRoot = async (prefix = "hra-install-preflight-"): Promise<string> => {
+const makeRoot = async (prefix = "oompa-install-preflight-"): Promise<string> => {
   const root = await realpath(await mkdtemp(join(tmpdir(), prefix)));
   await chmod(root, 0o700);
   temporaryRoots.push(root);
@@ -137,7 +137,7 @@ const run = async (
 // fixture hermetic when CI itself uses NODE_OPTIONS; hostile inheritance is
 // covered below by explicit per-scenario overrides.
 const installEnvironment = (root: string): NodeJS.ProcessEnv => ({
-  ...sanitizeHraInstallChildEnvironment(process.env),
+  ...sanitizeOompaInstallChildEnvironment(process.env),
   BUN_INSTALL: join(root, "bun root"),
   HOME: join(root, "home"),
 });
@@ -145,10 +145,10 @@ const installEnvironment = (root: string): NodeJS.ProcessEnv => ({
 const officialArchiveAsset = (
   overrides: Readonly<Record<string, unknown>> = {},
 ): Readonly<Record<string, unknown>> => ({
-  browser_download_url: HRA_INSTALL_ARCHIVE_URL,
+  browser_download_url: OOMPA_INSTALL_ARCHIVE_URL,
   digest: `sha256:${archiveSha256}`,
   id: 8_675_309,
-  name: HRA_INSTALL_ARCHIVE_NAME,
+  name: OOMPA_INSTALL_ARCHIVE_NAME,
   size: 123,
   state: "uploaded",
   ...overrides,
@@ -161,7 +161,7 @@ const officialReleaseRecord = (
   draft: false,
   id: 9_715_113,
   immutable: true,
-  tag_name: "v0.7.1",
+  tag_name: "v0.8.0",
   ...overrides,
 });
 
@@ -170,8 +170,8 @@ const officialRepositoryRecord = (
 ): Readonly<Record<string, unknown>> => ({
   archived: false,
   disabled: false,
-  full_name: "hraness/hra",
-  id: HRA_INSTALL_REPOSITORY_ID,
+  full_name: "hraness/oompa",
+  id: OOMPA_INSTALL_REPOSITORY_ID,
   private: false,
   ...overrides,
 });
@@ -194,7 +194,7 @@ const readJsonRecord = async (path: string): Promise<Record<string, unknown>> =>
   return value as Record<string, unknown>;
 };
 
-type SyntheticInstallPackageName = "@hraness/hra" | "hra";
+type SyntheticInstallPackageName = "@hraness/oompa" | "hra";
 type SyntheticPreviousInstall = Readonly<{
   activePath: string;
   authorityRoot: string;
@@ -208,8 +208,8 @@ type SyntheticPreviousInstall = Readonly<{
 
 const fixturePackageComponents = (
   packageName: SyntheticInstallPackageName,
-): readonly string[] => packageName === "@hraness/hra"
-  ? ["@hraness", "hra"]
+): readonly string[] => packageName === "@hraness/oompa"
+  ? ["@hraness", "oompa"]
   : ["hra"];
 
 const measureSyntheticVersion = async (
@@ -224,7 +224,7 @@ const measureSyntheticVersion = async (
   const visit = async (directory: string): Promise<void> => {
     const directoryMetadata = await lstat(directory);
     if (!directoryMetadata.isDirectory() || (directoryMetadata.mode & 0o777) !== 0o700) {
-      throw new Error(`Synthetic HRA version directory is not private: ${directory}`);
+      throw new Error(`Synthetic Oompa version directory is not private: ${directory}`);
     }
     record(["directory", relative(versionRoot, directory).replaceAll("\\", "/"), 0o700]);
     const entries = (await readdir(directory, { withFileTypes: true }))
@@ -248,7 +248,7 @@ const measureSyntheticVersion = async (
         continue;
       }
       if (!entry.isFile() || !metadata.isFile()) {
-        throw new Error(`Synthetic HRA version contains an unsupported entry: ${path}`);
+        throw new Error(`Synthetic Oompa version contains an unsupported entry: ${path}`);
       }
       const bytes = await readFile(path);
       totalBytes += bytes.byteLength;
@@ -290,14 +290,14 @@ const createSyntheticPreviousInstall = async (
   const layoutPackageName = input.layoutPackageName ?? input.packageName;
   const manifestPackageName = input.manifestPackageName ?? input.packageName;
   const bunRoot = join(root, "bun root");
-  const authorityRoot = join(bunRoot, "install", "hra");
+  const authorityRoot = join(bunRoot, "install", "oompa");
   const versionsRoot = join(authorityRoot, "versions");
   const archiveIdentity = {
     archiveAssetId: archiveSource === "official" ? 8_675_308 : null,
     archiveBytes: 123,
     archiveReleaseId: archiveSource === "official" ? 9_715_112 : null,
     archiveReleaseTag: archiveSource === "official" ? `v${input.packageVersion}` : null,
-    archiveRepositoryId: archiveSource === "official" ? HRA_INSTALL_REPOSITORY_ID : null,
+    archiveRepositoryId: archiveSource === "official" ? OOMPA_INSTALL_REPOSITORY_ID : null,
     archiveSha256: createHash("sha256")
       .update(`synthetic archive:${input.packageName}:${input.packageVersion}:${archiveSource}`)
       .digest("hex"),
@@ -320,7 +320,7 @@ const createSyntheticPreviousInstall = async (
   const sourceRoot = join(packageRoot, "src");
   const cliPath = join(sourceRoot, "cli.ts");
   const packageManifestPath = join(packageRoot, "package.json");
-  const activePath = join(bunRoot, "bin", "hra");
+  const activePath = join(bunRoot, "bin", "oompa");
   for (const directory of [
     bunRoot,
     join(bunRoot, "bin"),
@@ -331,7 +331,7 @@ const createSyntheticPreviousInstall = async (
     join(versionRoot, "install"),
     globalRoot,
     join(globalRoot, "node_modules"),
-    ...(layoutPackageName === "@hraness/hra" ? [join(globalRoot, "node_modules", "@hraness")] : []),
+    ...(layoutPackageName === "@hraness/oompa" ? [join(globalRoot, "node_modules", "@hraness")] : []),
     packageRoot,
     sourceRoot,
   ]) {
@@ -342,7 +342,7 @@ const createSyntheticPreviousInstall = async (
     dependencies: { [layoutPackageName]: input.packageVersion },
   });
   await writePrivateJson(packageManifestPath, {
-    bin: { hra: "./src/cli.ts" },
+    bin: { oompa: "./src/cli.ts" },
     name: manifestPackageName,
     scripts: { check: "bun test" },
     version: input.packageVersion,
@@ -441,7 +441,7 @@ const runInstaller = async (root: string, poisonStageEnvironment = false): Promi
   const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
   const program = [
     `const module = await import(${JSON.stringify(runtimePath)});`,
-    `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+    `await module.installOompaRelease(${JSON.stringify(archivePath)}, {`,
     `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
     ...(poisonStageEnvironment
       ? [
@@ -452,7 +452,7 @@ const runInstaller = async (root: string, poisonStageEnvironment = false): Promi
       ]
       : []),
     "});",
-    `process.stdout.write(${JSON.stringify(`${HRA_INSTALL_PREFLIGHT_SUCCESS}\n`)});`,
+    `process.stdout.write(${JSON.stringify(`${OOMPA_INSTALL_PREFLIGHT_SUCCESS}\n`)});`,
   ].join("\n");
   return await run([
     process.execPath,
@@ -492,7 +492,7 @@ const runTrustedLoader = async (
     "-e",
     sourceSha256 === localRuntimeSha256
       ? BOUNDED_TEST_PREFLIGHT_LOADER
-      : HRA_INSTALL_PREFLIGHT_LOADER,
+      : OOMPA_INSTALL_PREFLIGHT_LOADER,
     "--",
     archivePath,
     sourceSha256,
@@ -525,8 +525,8 @@ const runOfficialInstaller = async (
   await chmod(join(root, "home"), 0o700);
   const observationsPath = join(root, "official-fetch-observations.json");
   const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
-  const authorityRoot = join(root, "bun root", "install", "hra");
-  const allowedAssetUrl = "https://release-assets.githubusercontent.com/hra-test/archive.tgz";
+  const authorityRoot = join(root, "bun root", "install", "oompa");
+  const allowedAssetUrl = "https://release-assets.githubusercontent.com/oompa-test/archive.tgz";
   const program = [
     'const crypto = await import("node:crypto");',
     'const fs = await import("node:fs/promises");',
@@ -536,8 +536,8 @@ const runOfficialInstaller = async (
     'const actualDigest = crypto.createHash("sha256").update(archiveBytes).digest("hex");',
     `const scenario = ${JSON.stringify(scenario)};`,
     "const advertisedDigest = scenario === \"wrong-hash\" ? \"0\".repeat(64) : actualDigest;",
-    "const repository = { archived: false, disabled: false, full_name: \"hraness/hra\", id: module.HRA_INSTALL_REPOSITORY_ID, private: false };",
-    "const release = { assets: [{ browser_download_url: module.HRA_INSTALL_ARCHIVE_URL, digest: `sha256:${advertisedDigest}`, id: 8675309, name: module.HRA_INSTALL_ARCHIVE_NAME, size: archiveBytes.byteLength, state: \"uploaded\" }], draft: false, id: 9715113, immutable: true, tag_name: module.HRA_INSTALL_RELEASE_TAG };",
+    "const repository = { archived: false, disabled: false, full_name: \"hraness/oompa\", id: module.OOMPA_INSTALL_REPOSITORY_ID, private: false };",
+    "const release = { assets: [{ browser_download_url: module.OOMPA_INSTALL_ARCHIVE_URL, digest: `sha256:${advertisedDigest}`, id: 8675309, name: module.OOMPA_INSTALL_ARCHIVE_NAME, size: archiveBytes.byteLength, state: \"uploaded\" }], draft: false, id: 9715113, immutable: true, tag_name: module.OOMPA_INSTALL_RELEASE_TAG };",
     "const jsonResponse = (value) => { const bytes = new TextEncoder().encode(JSON.stringify(value)); return new Response(bytes, { headers: { \"Content-Encoding\": \"identity\", \"Content-Length\": String(bytes.byteLength) }, status: 200 }); };",
     "const chunkedResponse = (payload, includeLength) => {",
     "  const first = Math.max(1, Math.floor(payload.byteLength / 3));",
@@ -554,9 +554,9 @@ const runOfficialInstaller = async (
     "const fetcher = async (input, init) => {",
     "  const headers = new Headers(init.headers);",
     "  observations.push({ accept: headers.get(\"accept\"), acceptEncoding: headers.get(\"accept-encoding\"), cache: init.cache ?? null, credentials: init.credentials ?? null, redirect: init.redirect ?? null, url: input });",
-    "  if (input === module.HRA_INSTALL_REPOSITORY_API_URL) return jsonResponse(repository);",
-    "  if (input === module.HRA_INSTALL_RELEASE_API_URL) return jsonResponse(release);",
-    "  if (input === module.HRA_INSTALL_ARCHIVE_URL) {",
+    "  if (input === module.OOMPA_INSTALL_REPOSITORY_API_URL) return jsonResponse(repository);",
+    "  if (input === module.OOMPA_INSTALL_RELEASE_API_URL) return jsonResponse(release);",
+    "  if (input === module.OOMPA_INSTALL_ARCHIVE_URL) {",
     "    const location = scenario === \"disallowed-redirect\" ? \"https://evil.example/hra.tgz\" : " + JSON.stringify(allowedAssetUrl) + ";",
     "    return new Response(null, { headers: { Location: location }, status: 302 });",
     "  }",
@@ -571,11 +571,11 @@ const runOfficialInstaller = async (
     "  throw new Error(`Unexpected installer fetch: ${input}`);",
     "};",
     "const beforePrivateArchiveReadback = " + (mutatePrivateArchiveBeforeReadback
-      ? "async () => { const stage = (await fs.readdir(" + JSON.stringify(authorityRoot) + ")).find((entry) => entry.startsWith(\".staging-\")); if (!stage) throw new Error(\"The private archive stage is missing.\"); const privatePath = path.join(" + JSON.stringify(authorityRoot) + ", stage, \".hra-release-archive.tgz\"); const bytes = Buffer.from(await fs.readFile(privatePath)); bytes[0] = (bytes[0] ?? 0) ^ 1; await fs.writeFile(privatePath, bytes, { mode: 0o600 }); }"
+      ? "async () => { const stage = (await fs.readdir(" + JSON.stringify(authorityRoot) + ")).find((entry) => entry.startsWith(\".staging-\")); if (!stage) throw new Error(\"The private archive stage is missing.\"); const privatePath = path.join(" + JSON.stringify(authorityRoot) + ", stage, \".oompa-release-archive.tgz\"); const bytes = Buffer.from(await fs.readFile(privatePath)); bytes[0] = (bytes[0] ?? 0) ^ 1; await fs.writeFile(privatePath, bytes, { mode: 0o600 }); }"
       : "undefined") + ";",
     "try {",
-    `  await module.installHraRelease(module.HRA_INSTALL_ARCHIVE_URL, { beforePrivateArchiveReadback, fetcher, stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)} });`,
-    "  process.stdout.write(`${module.HRA_INSTALL_SUCCESS}\\n`);",
+    `  await module.installOompaRelease(module.OOMPA_INSTALL_ARCHIVE_URL, { beforePrivateArchiveReadback, fetcher, stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)} });`,
+    "  process.stdout.write(`${module.OOMPA_INSTALL_SUCCESS}\\n`);",
     "} finally {",
     `  await fs.writeFile(${JSON.stringify(observationsPath)}, JSON.stringify(observations), { mode: 0o600 });`,
     "}",
@@ -603,14 +603,15 @@ const runStalledStage = async (
   const sentinel = join(root, `${mode}-pids`);
   const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
   const program = [
-    `const module = await import(${JSON.stringify(runtimePath)});`,
-    `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+    "const [runtimePath, archivePath, mode, sentinel] = process.argv.slice(1);",
+    "const module = await import(runtimePath);",
+    "await module.installOompaRelease(archivePath, {",
     "  stageDeadlineMilliseconds: 400,",
-    `  stageWorkerTestMode: ${JSON.stringify(mode)},`,
-    `  afterStageWorkerStarted: async (bunPid, workerPid) => { await Bun.write(${JSON.stringify(sentinel)}, String(bunPid) + " " + String(workerPid) + "\\n"); },`,
+    "  stageWorkerTestMode: mode,",
+    '  afterStageWorkerStarted: async (bunPid, workerPid) => { await Bun.write(sentinel, String(bunPid) + " " + String(workerPid) + "\\n"); },',
     "});",
   ].join("\n");
-  const result = await run([process.execPath, "-e", program], {
+  const result = await run([process.execPath, "-e", program, "--", runtimePath, archivePath, mode, sentinel], {
     cwd: root,
     environment: installEnvironment(root),
   });
@@ -626,7 +627,7 @@ const runStalledStage = async (
 const assertStalledStageRecovers = async (
   mode: "stall-after-ready" | "stall-before-ready",
 ): Promise<void> => {
-  const root = await makeRoot(`hra-install-${mode}-`);
+  const root = await makeRoot(`oompa-install-${mode}-`);
   const { bunPid, result, workerPid } = await runStalledStage(root, mode);
   expect(result.exitCode).not.toBe(0);
   expect(result.stdout).toBe("");
@@ -638,21 +639,21 @@ const assertStalledStageRecovers = async (
   await waitForProcessIdentityToDisappear(workerPid);
   await waitForProcessIdentityToDisappear(bunPid, true);
   const bunRoot = join(root, "bun root");
-  const authorityRoot = join(bunRoot, "install", "hra");
-  expect(await Bun.file(join(bunRoot, "bin", "hra")).exists()).toBeFalse();
+  const authorityRoot = join(bunRoot, "install", "oompa");
+  expect(await Bun.file(join(bunRoot, "bin", "oompa")).exists()).toBeFalse();
   expect((await readdir(authorityRoot)).some((entry) => entry.startsWith(".staging-"))).toBeTrue();
 
   const recovered = await runInstaller(root);
   expect(recovered.exitCode).toBe(0);
   expect(recovered.stderr).toBe("");
-  expect(recovered.stdout).toBe(`${HRA_INSTALL_PREFLIGHT_SUCCESS}\n`);
-  expect((await lstat(join(bunRoot, "bin", "hra"))).isSymbolicLink()).toBeTrue();
+  expect(recovered.stdout).toBe(`${OOMPA_INSTALL_PREFLIGHT_SUCCESS}\n`);
+  expect((await lstat(join(bunRoot, "bin", "oompa"))).isSymbolicLink()).toBeTrue();
   expect((await readdir(authorityRoot)).some((entry) => entry.startsWith(".staging-"))).toBeFalse();
   expect(await Bun.file(join(authorityRoot, "install-intent.json")).exists()).toBeFalse();
 };
 
 beforeAll(async () => {
-  const root = await makeRoot("hra-install-archive-");
+  const root = await makeRoot("oompa-install-archive-");
   sourcePackageManifest = await readJsonRecord(join(repositoryRoot, "package.json"));
   const packed = await run([
     process.execPath,
@@ -662,7 +663,7 @@ beforeAll(async () => {
     root,
   ], { cwd: repositoryRoot });
   if (packed.exitCode !== 0) throw new Error(`Could not build installer fixture: ${packed.stderr}${packed.stdout}`);
-  const productionArchivePath = join(root, "hraness-hra-0.7.1.tgz");
+  const productionArchivePath = join(root, "hraness-oompa-0.8.0.tgz");
   const extractedRoot = join(root, "extracted");
   await mkdir(extractedRoot, { mode: 0o700 });
   const extracted = await run(["tar", "-xzf", productionArchivePath, "-C", extractedRoot], { cwd: root });
@@ -708,7 +709,27 @@ afterAll(async () => {
   }));
 }, 60_000);
 
-describe("transactional HRA installer", () => {
+describe("transactional Oompa installer", () => {
+  test("passes installer child arguments as data without changing static eval source", async () => {
+    const root = await makeRoot("oompa-install-child-arguments-");
+    const values = [
+      "a path with spaces",
+      "\"'; process.exit(73); //",
+      "backslash\\value",
+      "line\nreturn\rseparator\u2028paragraph\u2029",
+      "</script>",
+      "--preload=unreviewed-fixture.ts",
+    ];
+    const program = "process.stdout.write(JSON.stringify(process.argv.slice(1)));";
+    const result = await run([process.execPath, "-e", program, "--", ...values], {
+      cwd: root,
+      environment: installEnvironment(root),
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout) as unknown).toEqual(values);
+  });
+
   test("rejects an ambiguous maximum-length receipt semver within a joined watchdog", () => {
     expect(adversarialReceiptVersion).toHaveLength(128);
     // The child only imports the predicate and evaluates one value. SIGKILL
@@ -719,15 +740,15 @@ describe("transactional HRA installer", () => {
       "--config=/dev/null",
       "--eval",
       [
-        'const { isHraInstallReceiptVersion } = await import(process.argv[1]);',
-        'process.stdout.write(String(isHraInstallReceiptVersion(process.argv[2])) + "\\n");',
+        'const { isOompaInstallReceiptVersion } = await import(process.argv[1]);',
+        'process.stdout.write(String(isOompaInstallReceiptVersion(process.argv[2])) + "\\n");',
       ].join("\n"),
       resolve(import.meta.dir, "install-preflight-runtime.ts"),
       adversarialReceiptVersion,
     ], {
       cwd: repositoryRoot,
       encoding: "utf8",
-      env: sanitizeHraInstallChildEnvironment(process.env),
+      env: sanitizeOompaInstallChildEnvironment(process.env),
       killSignal: "SIGKILL",
       maxBuffer: 1_024,
       stdio: ["ignore", "pipe", "pipe"],
@@ -756,8 +777,8 @@ describe("transactional HRA installer", () => {
       "1.2.3\n", "1.2.3\r", "1.2.3\r\n", "1.2.3\u2028", "1.2.3\u2029", "1.2.3\0",
       "1.2.3-a\n", "1.2.3+a\n", `1.2.3-${"a".repeat(123)}`,
     ];
-    for (const value of accepted) expect(isHraInstallReceiptVersion(value), value).toBeTrue();
-    for (const value of rejected) expect(isHraInstallReceiptVersion(value), value).toBeFalse();
+    for (const value of accepted) expect(isOompaInstallReceiptVersion(value), value).toBeTrue();
+    for (const value of rejected) expect(isOompaInstallReceiptVersion(value), value).toBeFalse();
   });
 
   test("preserves bounded generated receipt semver grammar and rejects invalid mutations", () => {
@@ -775,19 +796,19 @@ describe("transactional HRA installer", () => {
         const suffix = (prerelease.length === 0 ? "" : `-${prerelease.join(".")}`)
           + (build.length === 0 ? "" : `+${build.join(".")}`);
         const version = `${core.join(".")}${suffix}`;
-        expect(isHraInstallReceiptVersion(version), version).toBeTrue();
-        expect(isHraInstallReceiptVersion(`0${version}`)).toBeFalse();
-        expect(isHraInstallReceiptVersion(`${version}\n`)).toBeFalse();
-        expect(isHraInstallReceiptVersion(`${core.join(".")}-01`)).toBeFalse();
-        expect(isHraInstallReceiptVersion(`${core.join(".")}+01`)).toBeTrue();
+        expect(isOompaInstallReceiptVersion(version), version).toBeTrue();
+        expect(isOompaInstallReceiptVersion(`0${version}`)).toBeFalse();
+        expect(isOompaInstallReceiptVersion(`${version}\n`)).toBeFalse();
+        expect(isOompaInstallReceiptVersion(`${core.join(".")}-01`)).toBeFalse();
+        expect(isOompaInstallReceiptVersion(`${core.join(".")}+01`)).toBeTrue();
       },
     ), { numRuns: 300, seed: 20_260_908 });
   });
 
   test("refuses an ambiguous receipt semver before staging without mutating installed authority", async () => {
-    const root = await makeRoot("hra-install-semver-bound-");
+    const root = await makeRoot("oompa-install-semver-bound-");
     const previous = await createSyntheticPreviousInstall(root, {
-      packageName: "@hraness/hra",
+      packageName: "@hraness/oompa",
       packageVersion: "0.1.4",
     });
     // Preserve a valid protected namespace so the malformed receipt reaches
@@ -797,7 +818,7 @@ describe("transactional HRA installer", () => {
     await writePrivateJson(previous.receiptPath, receipt);
     await expectPreviousInstallRejectedBeforeStaging(
       previous,
-      "complete HRA version receipt is invalid",
+      "complete Oompa version receipt is invalid",
       async (installRoot) => {
         await mkdir(join(installRoot, "home"), { recursive: true, mode: 0o700 });
         // No stage worker is permitted in this fixture, even if receipt
@@ -808,9 +829,9 @@ describe("transactional HRA installer", () => {
           "--config=/dev/null",
           "--eval",
           [
-            'const { installHraRelease } = await import(process.argv[1]);',
+            'const { installOompaRelease } = await import(process.argv[1]);',
             "try {",
-            '  await installHraRelease(process.argv[2], { beforeStageWorkerSpawn: () => { throw new Error("Unexpected install staging"); } });',
+            '  await installOompaRelease(process.argv[2], { beforeStageWorkerSpawn: () => { throw new Error("Unexpected install staging"); } });',
             "} catch (error) {",
             '  process.stderr.write(error instanceof Error ? error.message : "Unexpected non-Error refusal");',
             "  process.exitCode = 1;",
@@ -850,40 +871,40 @@ describe("transactional HRA installer", () => {
   });
 
   test("binds the public command to one tagged preflight and one exact tagged archive", async () => {
-    expect(HRA_INSTALL_PREFLIGHT_SOURCE_URL).toBe(
-      "https://raw.githubusercontent.com/hraness/hra/v0.7.1/src/install-preflight-runtime.ts",
+    expect(OOMPA_INSTALL_PREFLIGHT_SOURCE_URL).toBe(
+      "https://raw.githubusercontent.com/hraness/oompa/v0.8.0/src/install-preflight-runtime.ts",
     );
-    expect(HRA_INSTALL_ARCHIVE_URL).toBe(
-      "https://github.com/hraness/hra/releases/download/v0.7.1/hraness-hra-0.7.1.tgz",
+    expect(OOMPA_INSTALL_ARCHIVE_URL).toBe(
+      "https://github.com/hraness/oompa/releases/download/v0.8.0/hraness-oompa-0.8.0.tgz",
     );
     const runtimeBytes = await readFile(resolve(import.meta.dir, "install-preflight-runtime.ts"));
     // The public digest names the runtime at the released tag; the working
     // tree may differ between releases. check-install-pins.ts proves equality
     // under a tag ref.
-    expect(HRA_INSTALL_PREFLIGHT_SOURCE_SHA256).toMatch(/^[0-9a-f]{64}$/u);
+    expect(OOMPA_INSTALL_PREFLIGHT_SOURCE_SHA256).toMatch(/^[0-9a-f]{64}$/u);
     const runtimeSource = runtimeBytes.toString("utf8");
     expect(runtimeSource).not.toContain('"libc.so.6"');
     expect(runtimeSource).not.toContain('"libc.musl-x86_64.so.1"');
     expect(runtimeSource).not.toContain('"libc.musl-aarch64.so.1"');
     const normalizerBytes = await readFile(resolve(import.meta.dir, "install-normalizer.ts"));
     expect(createHash("sha256").update(normalizerBytes).digest("hex")).toBe(
-      HRA_INSTALL_NORMALIZER_SHA256,
+      OOMPA_INSTALL_NORMALIZER_SHA256,
     );
   });
 
   test("neutralizes ambient runtime injection before the public installer and its children", async () => {
-    const command = buildHraGlobalInstallCommand(HRA_INSTALL_ARCHIVE_URL);
-    const unsetRuntimeInjection = HRA_INSTALL_RUNTIME_INJECTION_ENVIRONMENT_NAMES.join(" ");
+    const command = buildOompaGlobalInstallCommand(OOMPA_INSTALL_ARCHIVE_URL);
+    const unsetRuntimeInjection = OOMPA_INSTALL_RUNTIME_INJECTION_ENVIRONMENT_NAMES.join(" ");
     expect(command).toBe(
-      `test "$(unset ${unsetRuntimeInjection} && curl -fsSL --connect-timeout 10 --max-time 60 --max-filesize ${String(HRA_INSTALL_PREFLIGHT_SOURCE_MAXIMUM_BYTES)} --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 ${HRA_INSTALL_PREFLIGHT_SOURCE_URL} | command bun --no-env-file --config=/dev/null -e '${HRA_INSTALL_PREFLIGHT_LOADER}' -- ${HRA_INSTALL_ARCHIVE_URL} ${HRA_INSTALL_PREFLIGHT_SOURCE_SHA256})" = ${HRA_INSTALL_PREFLIGHT_SUCCESS}`,
+      `test "$(unset ${unsetRuntimeInjection} && curl -fsSL --connect-timeout 10 --max-time 60 --max-filesize ${String(OOMPA_INSTALL_PREFLIGHT_SOURCE_MAXIMUM_BYTES)} --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 ${OOMPA_INSTALL_PREFLIGHT_SOURCE_URL} | command bun --no-env-file --config=/dev/null -e '${OOMPA_INSTALL_PREFLIGHT_LOADER}' -- ${OOMPA_INSTALL_ARCHIVE_URL} ${OOMPA_INSTALL_PREFLIGHT_SOURCE_SHA256})" = ${OOMPA_INSTALL_PREFLIGHT_SUCCESS}`,
     );
     expect(command).toContain("--connect-timeout 10");
     expect(command).toContain("--max-time 60");
-    expect(command).toContain(`--max-filesize ${String(HRA_INSTALL_PREFLIGHT_SOURCE_MAXIMUM_BYTES)}`);
+    expect(command).toContain(`--max-filesize ${String(OOMPA_INSTALL_PREFLIGHT_SOURCE_MAXIMUM_BYTES)}`);
     expect(command).toContain("--retry 3");
     expect(command).toContain("--retry-max-time 60");
-    expect(command).toContain(HRA_INSTALL_PREFLIGHT_SOURCE_SHA256);
-    expect(() => buildHraGlobalInstallCommand("https://example.com/hra.tgz")).toThrow(
+    expect(command).toContain(OOMPA_INSTALL_PREFLIGHT_SOURCE_SHA256);
+    expect(() => buildOompaGlobalInstallCommand("https://example.com/hra.tgz")).toThrow(
       "exact immutable release archive URL",
     );
     expect(command).not.toContain("| bun - ");
@@ -899,13 +920,13 @@ describe("transactional HRA installer", () => {
       NODE_OPTIONS: "--require=/untrusted/node.js",
       SSL_CERT_FILE: "/reviewed/ca.pem",
     };
-    expect(sanitizeHraInstallChildEnvironment(preservedEnvironment)).toEqual({
+    expect(sanitizeOompaInstallChildEnvironment(preservedEnvironment)).toEqual({
       BUN_CONFIG_REGISTRY: preservedEnvironment.BUN_CONFIG_REGISTRY,
       HTTPS_PROXY: preservedEnvironment.HTTPS_PROXY,
       SSL_CERT_FILE: preservedEnvironment.SSL_CERT_FILE,
     });
 
-    const stageZeroRoot = await makeRoot("hra-install-public-stage-zero-");
+    const stageZeroRoot = await makeRoot("oompa-install-public-stage-zero-");
     const fixtureBin = join(stageZeroRoot, "bin");
     const preloadPath = join(stageZeroRoot, "ambient-preload.ts");
     const preloadSentinel = join(stageZeroRoot, "ambient-preload-ran");
@@ -913,7 +934,7 @@ describe("transactional HRA installer", () => {
     await symlink(process.execPath, join(fixtureBin, "bun"));
     await writeFile(
       join(fixtureBin, "curl"),
-      "#!/bin/sh\nprintf '%s\\n' 'not the tagged HRA runtime'\n",
+      "#!/bin/sh\nprintf '%s\\n' 'not the tagged Oompa runtime'\n",
       { mode: 0o700 },
     );
     await writeFile(
@@ -936,22 +957,22 @@ describe("transactional HRA installer", () => {
       environment: {
         ...installEnvironment(stageZeroRoot),
         BUN_OPTIONS: `--preload=${preloadPath}`,
-        HRA_TEST_PRELOAD_SENTINEL: preloadSentinel,
+        OOMPA_TEST_PRELOAD_SENTINEL: preloadSentinel,
         PATH: `${fixtureBin}:/usr/bin:/bin`,
       },
     });
     expect(stageZero.exitCode).not.toBe(0);
-    expect(stageZero.stderr).toContain("tagged HRA preflight digest is invalid");
+    expect(stageZero.stderr).toContain("tagged Oompa preflight digest is invalid");
     expect(stageZero.stdout).toBe("");
     expect(await Bun.file(preloadSentinel).exists()).toBeFalse();
 
-    const oversizedRoot = await makeRoot("hra-install-source-overrun-");
+    const oversizedRoot = await makeRoot("oompa-install-source-overrun-");
     const oversized = trackDirectTestChild(Bun.spawn([
       process.execPath,
       "--no-env-file",
       "--config=/dev/null",
       "-e",
-      HRA_INSTALL_PREFLIGHT_LOADER,
+      OOMPA_INSTALL_PREFLIGHT_LOADER,
       "--",
       archivePath,
       "0".repeat(64),
@@ -959,7 +980,7 @@ describe("transactional HRA installer", () => {
       cwd: oversizedRoot,
       env: installEnvironment(oversizedRoot),
       stderr: "pipe",
-      stdin: new Blob([new Uint8Array(HRA_INSTALL_PREFLIGHT_SOURCE_MAXIMUM_BYTES + 1)]),
+      stdin: new Blob([new Uint8Array(OOMPA_INSTALL_PREFLIGHT_SOURCE_MAXIMUM_BYTES + 1)]),
       stdout: "pipe",
     }));
     const [oversizedExitCode, oversizedStderr, oversizedStdout] = await Promise.all([
@@ -968,18 +989,18 @@ describe("transactional HRA installer", () => {
       new Response(oversized.stdout).text(),
     ]);
     expect(oversizedExitCode).not.toBe(0);
-    expect(oversizedStderr).toContain("tagged HRA preflight exceeds its byte limit");
+    expect(oversizedStderr).toContain("tagged Oompa preflight exceeds its byte limit");
     expect(oversizedStdout).toBe("");
     expect(await Bun.file(join(oversizedRoot, "bun root")).exists()).toBeFalse();
 
-    const refusedRoot = await makeRoot("hra-install-source-refusal-");
+    const refusedRoot = await makeRoot("oompa-install-source-refusal-");
     const refused = await runTrustedLoader(refusedRoot, "0".repeat(64));
     expect(refused.exitCode).not.toBe(0);
-    expect(refused.stderr).toContain("tagged HRA preflight digest is invalid");
+    expect(refused.stderr).toContain("tagged Oompa preflight digest is invalid");
     expect(refused.stdout).toBe("");
     expect(await Bun.file(join(refusedRoot, "bun root")).exists()).toBeFalse();
 
-    const unsafeRoot = await makeRoot("hra-install-stage-zero-refusal-");
+    const unsafeRoot = await makeRoot("oompa-install-stage-zero-refusal-");
     const unsafe = await runTrustedLoader(unsafeRoot, localRuntimeSha256, {
       BUN_OPTIONS: "",
     });
@@ -994,16 +1015,16 @@ describe("transactional HRA installer", () => {
       future_release_field: { ignored: true },
       assets: [officialArchiveAsset({ future_asset_field: ["ignored"] })],
     });
-    expect(parseOfficialHraReleaseRecord(acceptedRelease)).toEqual({
+    expect(parseOfficialOompaReleaseRecord(acceptedRelease)).toEqual({
       archiveAssetId: 8_675_309,
       archiveBytes: 123,
       archiveReleaseId: 9_715_113,
-      archiveReleaseTag: "v0.7.1",
-      archiveRepositoryId: HRA_INSTALL_REPOSITORY_ID,
+      archiveReleaseTag: "v0.8.0",
+      archiveRepositoryId: OOMPA_INSTALL_REPOSITORY_ID,
       archiveSha256,
       archiveSource: "official",
     });
-    expect(() => parseOfficialHraRepositoryRecord(officialRepositoryRecord({
+    expect(() => parseOfficialOompaRepositoryRecord(officialRepositoryRecord({
       future_repository_field: "ignored",
     }))).not.toThrow();
 
@@ -1039,7 +1060,7 @@ describe("transactional HRA installer", () => {
         message: "one exact archive asset",
         record: officialReleaseRecord({
           assets: [officialArchiveAsset({
-            browser_download_url: "https://example.com/hra-v0.7.1.tgz",
+            browser_download_url: "https://example.com/oompa-v0.8.0.tgz",
             name: "other.tgz",
           })],
         }),
@@ -1058,17 +1079,17 @@ describe("transactional HRA installer", () => {
       },
     ];
     for (const failure of releaseFailures) {
-      expect(() => parseOfficialHraReleaseRecord(failure.record)).toThrow(failure.message);
+      expect(() => parseOfficialOompaReleaseRecord(failure.record)).toThrow(failure.message);
     }
 
     for (const record of [
-      officialRepositoryRecord({ id: HRA_INSTALL_REPOSITORY_ID + 1 }),
-      officialRepositoryRecord({ full_name: "attacker/hra" }),
+      officialRepositoryRecord({ id: OOMPA_INSTALL_REPOSITORY_ID + 1 }),
+      officialRepositoryRecord({ full_name: "attacker/oompa" }),
       officialRepositoryRecord({ private: true }),
       officialRepositoryRecord({ archived: true }),
       officialRepositoryRecord({ disabled: true }),
     ] as const) {
-      expect(() => parseOfficialHraRepositoryRecord(record)).toThrow(
+      expect(() => parseOfficialOompaRepositoryRecord(record)).toThrow(
         "GitHub repository identity is invalid",
       );
     }
@@ -1076,17 +1097,17 @@ describe("transactional HRA installer", () => {
 
   test("fetches bounded release authority records without redirects, credentials, or encodings", async () => {
     const calls: Array<Readonly<{ init: RequestInit; url: string }>> = [];
-    const identity = await resolveOfficialHraArchiveIdentity(async (url, init) => {
+    const identity = await resolveOfficialOompaArchiveIdentity(async (url, init) => {
       calls.push({ init, url });
-      if (url === HRA_INSTALL_REPOSITORY_API_URL) return jsonResponse(officialRepositoryRecord());
-      if (url === HRA_INSTALL_RELEASE_API_URL) return jsonResponse(officialReleaseRecord());
+      if (url === OOMPA_INSTALL_REPOSITORY_API_URL) return jsonResponse(officialRepositoryRecord());
+      if (url === OOMPA_INSTALL_RELEASE_API_URL) return jsonResponse(officialReleaseRecord());
       throw new Error(`Unexpected release-authority URL: ${url}`);
     });
-    expect(identity.archiveRepositoryId).toBe(HRA_INSTALL_REPOSITORY_ID);
+    expect(identity.archiveRepositoryId).toBe(OOMPA_INSTALL_REPOSITORY_ID);
     expect(identity.archiveSha256).toBe(archiveSha256);
     expect(new Set(calls.map((call) => call.url))).toEqual(new Set([
-      HRA_INSTALL_REPOSITORY_API_URL,
-      HRA_INSTALL_RELEASE_API_URL,
+      OOMPA_INSTALL_REPOSITORY_API_URL,
+      OOMPA_INSTALL_RELEASE_API_URL,
     ]));
     for (const call of calls) {
       const headers = new Headers(call.init.headers);
@@ -1096,7 +1117,7 @@ describe("transactional HRA installer", () => {
       expect(call.init.signal).toBeInstanceOf(AbortSignal);
       expect(headers.get("accept")).toBe("application/vnd.github+json");
       expect(headers.get("accept-encoding")).toBe("identity");
-      expect(headers.get("user-agent")).toBe("hra-installer/0.7.1");
+      expect(headers.get("user-agent")).toBe("oompa-installer/0.8.0");
       expect(headers.get("x-github-api-version")).toBe("2022-11-28");
       expect(headers.get("authorization")).toBeNull();
     }
@@ -1153,8 +1174,8 @@ describe("transactional HRA installer", () => {
       },
     ];
     for (const failure of failures) {
-      const operation = resolveOfficialHraArchiveIdentity(async (url) =>
-        url === HRA_INSTALL_REPOSITORY_API_URL
+      const operation = resolveOfficialOompaArchiveIdentity(async (url) =>
+        url === OOMPA_INSTALL_REPOSITORY_API_URL
           ? jsonResponse(officialRepositoryRecord())
           : failure.response());
       await expect(operation).rejects.toThrow(failure.message);
@@ -1162,29 +1183,29 @@ describe("transactional HRA installer", () => {
   });
 
   test("keeps Bun's post-link tree private, verifies the complete version, and atomically activates only its CLI", async () => {
-    const root = await makeRoot("hra install transactional ");
+    const root = await makeRoot("oompa install transactional ");
     const first = await runTrustedLoader(root);
     expect(first).toEqual({
       exitCode: 0,
       stderr: "",
-      stdout: `${HRA_INSTALL_PREFLIGHT_SUCCESS}\n`,
+      stdout: `${OOMPA_INSTALL_PREFLIGHT_SUCCESS}\n`,
     });
     const bunRoot = join(root, "bun root");
-    const activePath = join(bunRoot, "bin", "hra");
+    const activePath = join(bunRoot, "bin", "oompa");
     const activeMetadata = await lstat(activePath);
     expect(activeMetadata.isSymbolicLink()).toBeTrue();
     const activeTarget = await realpath(activePath);
-    expect(activeTarget).toContain(`${join(bunRoot, "install", "hra", "versions")}/`);
-    expect(activeTarget).toEndWith("/install/global/node_modules/@hraness/hra/src/cli.ts");
+    expect(activeTarget).toContain(`${join(bunRoot, "install", "oompa", "versions")}/`);
+    expect(activeTarget).toEndWith("/install/global/node_modules/@hraness/oompa/src/cli.ts");
     expect((await lstat(activeTarget)).mode & 0o777).toBe(0o755);
-    expect(await Bun.file(join(bunRoot, "install", "global", "node_modules", "@hraness", "hra")).exists()).toBeFalse();
-    expect(await Bun.file(join(bunRoot, "install", "hra", "install-intent.json")).exists()).toBeFalse();
-    const versions = await readdir(join(bunRoot, "install", "hra", "versions"));
+    expect(await Bun.file(join(bunRoot, "install", "global", "node_modules", "@hraness", "oompa")).exists()).toBeFalse();
+    expect(await Bun.file(join(bunRoot, "install", "oompa", "install-intent.json")).exists()).toBeFalse();
+    const versions = await readdir(join(bunRoot, "install", "oompa", "versions"));
     expect(versions).toHaveLength(1);
     expect(await Bun.file(join(
       bunRoot,
       "install",
-      "hra",
+      "oompa",
       "versions",
       versions[0] as string,
       ".hra-install-complete.json",
@@ -1192,33 +1213,33 @@ describe("transactional HRA installer", () => {
     expect(await readJsonRecord(join(
       bunRoot,
       "install",
-      "hra",
+      "oompa",
       "versions",
       versions[0] as string,
       "install",
       "global",
       "package.json",
-    ))).toEqual({ dependencies: { "@hraness/hra": "0.7.1" } });
+    ))).toEqual({ dependencies: { "@hraness/oompa": "0.8.0" } });
 
     const second = await runInstaller(root);
     expect(second).toEqual({
       exitCode: 0,
       stderr: "",
-      stdout: `${HRA_INSTALL_PREFLIGHT_SUCCESS}\n`,
+      stdout: `${OOMPA_INSTALL_PREFLIGHT_SUCCESS}\n`,
     });
     expect(await realpath(activePath)).toBe(activeTarget);
-    expect(await readdir(join(bunRoot, "install", "hra", "versions"))).toEqual(versions);
+    expect(await readdir(join(bunRoot, "install", "oompa", "versions"))).toEqual(versions);
   }, SERIAL_STAGING_INSTALL_TEST_TIMEOUT_MS);
 
   test("rejects a staged loopback archive URL with a malformed route UUID or archive filename", async () => {
     for (const mutation of ["route-uuid", "archive-name"] as const) {
-      const root = await makeRoot(`hra-install-loopback-${mutation}-`);
+      const root = await makeRoot(`oompa-install-loopback-${mutation}-`);
       await mkdir(join(root, "home"), { mode: 0o700 });
-      const authorityRoot = join(root, "bun root", "install", "hra");
+      const authorityRoot = join(root, "bun root", "install", "oompa");
       const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
       const program = [
         `const module = await import(${JSON.stringify(runtimePath)});`,
-        `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+        `await module.installOompaRelease(${JSON.stringify(archivePath)}, {`,
         `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
         "  afterStageWorkerExit: async () => {",
         '    const fs = await import("node:fs/promises");',
@@ -1228,11 +1249,11 @@ describe("transactional HRA installer", () => {
         '    if (!stageName) throw new Error("staging root is missing");',
         '    const manifestPath = path.join(authorityRoot, stageName, "install", "global", "package.json");',
         "    const manifest = JSON.parse(await fs.readFile(manifestPath, \"utf8\"));",
-        "    const archiveUrl = new URL(manifest.dependencies[module.HRA_INSTALL_PACKAGE_NAME]);",
+        "    const archiveUrl = new URL(manifest.dependencies[module.OOMPA_INSTALL_PACKAGE_NAME]);",
         mutation === "route-uuid"
-          ? '    archiveUrl.pathname = "/not-a-v4-uuid/" + module.HRA_INSTALL_ARCHIVE_NAME;'
+          ? '    archiveUrl.pathname = "/not-a-v4-uuid/" + module.OOMPA_INSTALL_ARCHIVE_NAME;'
           : '    archiveUrl.pathname = archiveUrl.pathname.replace(/[^/]+$/u, "unexpected.tgz");',
-        "    manifest.dependencies[module.HRA_INSTALL_PACKAGE_NAME] = archiveUrl.toString();",
+        "    manifest.dependencies[module.OOMPA_INSTALL_PACKAGE_NAME] = archiveUrl.toString();",
         '    await fs.writeFile(manifestPath, JSON.stringify(manifest) + "\\n", { mode: 0o600 });',
         "  },",
         "});",
@@ -1244,23 +1265,23 @@ describe("transactional HRA installer", () => {
       expect(result.exitCode).not.toBe(0);
       expect(result.stderr).toContain("descriptor-bound loopback archive authority");
       expect(result.stdout).toBe("");
-      expect(await Bun.file(join(root, "bun root", "bin", "hra")).exists()).toBeFalse();
+      expect(await Bun.file(join(root, "bun root", "bin", "oompa")).exists()).toBeFalse();
     }
   }, 60_000);
 
   test("scrubs ambient runtime preloads from the detached worker and Bun add", async () => {
-    const root = await makeRoot("hra-install-runtime-preload-");
+    const root = await makeRoot("oompa-install-runtime-preload-");
     const installed = await runInstaller(root, true);
     expect(installed).toEqual({
       exitCode: 0,
       stderr: "",
-      stdout: `${HRA_INSTALL_PREFLIGHT_SUCCESS}\n`,
+      stdout: `${OOMPA_INSTALL_PREFLIGHT_SUCCESS}\n`,
     });
-    expect(await Bun.file(join(root, "bun root", "bin", "hra")).exists()).toBeTrue();
+    expect(await Bun.file(join(root, "bun root", "bin", "oompa")).exists()).toBeTrue();
   }, SERIAL_STAGING_INSTALL_TEST_TIMEOUT_MS);
 
   test("upgrades and recovers a verified legacy unscoped 0.1.0 installation", async () => {
-    const root = await makeRoot("hra-install-legacy-upgrade-");
+    const root = await makeRoot("oompa-install-legacy-upgrade-");
     const legacy = await createSyntheticPreviousInstall(root, {
       packageName: "hra",
       packageVersion: "0.1.0",
@@ -1275,7 +1296,7 @@ describe("transactional HRA installer", () => {
       "-e",
       [
         `const module = await import(${JSON.stringify(runtimePath)});`,
-        `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+        `await module.installOompaRelease(${JSON.stringify(archivePath)}, {`,
         `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
         '  afterNormalized: () => { throw new Error("test legacy normalized interruption"); },',
         "});",
@@ -1298,11 +1319,11 @@ describe("transactional HRA installer", () => {
     expect(recovered).toEqual({
       exitCode: 0,
       stderr: "",
-      stdout: `${HRA_INSTALL_PREFLIGHT_SUCCESS}\n`,
+      stdout: `${OOMPA_INSTALL_PREFLIGHT_SUCCESS}\n`,
     });
     const activeTarget = await readlink(legacy.activePath);
     expect(activeTarget).not.toBe(legacy.cliPath);
-    expect(activeTarget).toEndWith("/install/global/node_modules/@hraness/hra/src/cli.ts");
+    expect(activeTarget).toEndWith("/install/global/node_modules/@hraness/oompa/src/cli.ts");
     expect(await realpath(legacy.activePath)).toBe(activeTarget);
     expect(await readFile(legacy.cliPath)).toEqual(legacyCliBefore);
     expect(await readFile(legacy.receiptPath)).toEqual(legacyReceiptBefore);
@@ -1344,10 +1365,10 @@ describe("transactional HRA installer", () => {
     },
   ]) {
     test(`refuses and preserves an interrupted intent owned by immutable ${priorRelease.tag}`, async () => {
-      const root = await makeRoot("hra-install-prior-release-intent-");
+      const root = await makeRoot("oompa-install-prior-release-intent-");
       const previous = await createSyntheticPreviousInstall(root, {
         archiveSource: "official",
-        packageName: "@hraness/hra",
+        packageName: "@hraness/oompa",
         packageVersion: "0.5.0",
       });
       const priorArchiveSha256 = priorRelease.archiveSha256;
@@ -1375,7 +1396,7 @@ describe("transactional HRA installer", () => {
         archiveBytes: priorRelease.archiveBytes,
         archiveReleaseId: priorRelease.archiveReleaseId,
         archiveReleaseTag: priorRelease.tag,
-        archiveRepositoryId: HRA_INSTALL_REPOSITORY_ID,
+        archiveRepositoryId: OOMPA_INSTALL_REPOSITORY_ID,
         archiveSha256: priorArchiveSha256,
         archiveSource: "official",
         createdAt: 1_757_192_400_000,
@@ -1414,7 +1435,7 @@ describe("transactional HRA installer", () => {
       // as far as the foreign release tag instead of relying on a digest change.
       await writePrivateJson(intentPath, {
         ...priorIntent,
-        normalizerSha256: HRA_INSTALL_NORMALIZER_SHA256,
+        normalizerSha256: OOMPA_INSTALL_NORMALIZER_SHA256,
       });
       const sameNormalizerIntent = await readFile(intentPath);
       const sameNormalizerResult = await runInstaller(root);
@@ -1432,10 +1453,10 @@ describe("transactional HRA installer", () => {
   }
 
   test("accepts an older scoped official release as verified previous authority", async () => {
-    const root = await makeRoot("hra-install-older-scoped-");
+    const root = await makeRoot("oompa-install-older-scoped-");
     const previous = await createSyntheticPreviousInstall(root, {
       archiveSource: "official",
-      packageName: "@hraness/hra",
+      packageName: "@hraness/oompa",
       packageVersion: "0.1.4",
     });
     const receiptBefore = await readFile(previous.receiptPath);
@@ -1444,11 +1465,11 @@ describe("transactional HRA installer", () => {
     expect(result).toEqual({
       exitCode: 0,
       stderr: "",
-      stdout: `${HRA_INSTALL_PREFLIGHT_SUCCESS}\n`,
+      stdout: `${OOMPA_INSTALL_PREFLIGHT_SUCCESS}\n`,
     });
     const activeTarget = await readlink(previous.activePath);
     expect(activeTarget).not.toBe(previous.cliPath);
-    expect(activeTarget).toEndWith("/install/global/node_modules/@hraness/hra/src/cli.ts");
+    expect(activeTarget).toEndWith("/install/global/node_modules/@hraness/oompa/src/cli.ts");
     expect(await readFile(previous.receiptPath)).toEqual(receiptBefore);
     expect(await measureSyntheticVersion(previous.versionRoot)).toEqual(treeBefore);
     expect(await readdir(previous.versionsRoot)).toHaveLength(2);
@@ -1456,24 +1477,24 @@ describe("transactional HRA installer", () => {
   }, SERIAL_STAGING_INSTALL_TEST_TIMEOUT_MS);
 
   test("rejects invalid previous package identities before staging", async () => {
-    const unsupportedRoot = await makeRoot("hra-install-legacy-version-refusal-");
+    const unsupportedRoot = await makeRoot("oompa-install-legacy-version-refusal-");
     const unsupported = await createSyntheticPreviousInstall(unsupportedRoot, {
       packageName: "hra",
       packageVersion: "0.1.1",
     });
-    await expectPreviousInstallRejectedBeforeStaging(unsupported, "legacy HRA version receipt is invalid");
+    await expectPreviousInstallRejectedBeforeStaging(unsupported, "legacy Oompa version receipt is invalid");
 
-    const invalidSemverRoot = await makeRoot("hra-install-semver-refusal-");
+    const invalidSemverRoot = await makeRoot("oompa-install-semver-refusal-");
     const invalidSemver = await createSyntheticPreviousInstall(invalidSemverRoot, {
-      packageName: "@hraness/hra",
+      packageName: "@hraness/oompa",
       packageVersion: "01.2.3",
     });
-    await expectPreviousInstallRejectedBeforeStaging(invalidSemver, "complete HRA version receipt is invalid");
+    await expectPreviousInstallRejectedBeforeStaging(invalidSemver, "complete Oompa version receipt is invalid");
 
-    const officialTagRoot = await makeRoot("hra-install-old-tag-refusal-");
+    const officialTagRoot = await makeRoot("oompa-install-old-tag-refusal-");
     const officialTag = await createSyntheticPreviousInstall(officialTagRoot, {
       archiveSource: "official",
-      packageName: "@hraness/hra",
+      packageName: "@hraness/oompa",
       packageVersion: "0.1.4",
     });
     const officialReceipt = await readJsonRecord(officialTag.receiptPath);
@@ -1481,27 +1502,27 @@ describe("transactional HRA installer", () => {
     await writePrivateJson(officialTag.receiptPath, officialReceipt);
     await expectPreviousInstallRejectedBeforeStaging(officialTag, "official archive authority is invalid");
 
-    const manifestRoot = await makeRoot("hra-install-old-manifest-refusal-");
+    const manifestRoot = await makeRoot("oompa-install-old-manifest-refusal-");
     const manifest = await createSyntheticPreviousInstall(manifestRoot, {
       packageName: "hra",
       packageVersion: "0.1.0",
     });
     const manifestValue = await readJsonRecord(manifest.packageManifestPath);
-    manifestValue.name = "@hraness/hra";
+    manifestValue.name = "@hraness/oompa";
     await writePrivateJson(manifest.packageManifestPath, manifestValue);
     await resealSyntheticVersion(manifest);
-    await expectPreviousInstallRejectedBeforeStaging(manifest, "installed HRA package identity is not exact");
+    await expectPreviousInstallRejectedBeforeStaging(manifest, "installed Oompa package identity is not exact");
 
-    const layoutRoot = await makeRoot("hra-install-receipt-layout-refusal-");
+    const layoutRoot = await makeRoot("oompa-install-receipt-layout-refusal-");
     const layout = await createSyntheticPreviousInstall(layoutRoot, {
       layoutPackageName: "hra",
       manifestPackageName: "hra",
-      packageName: "@hraness/hra",
+      packageName: "@hraness/oompa",
       packageVersion: "0.1.4",
     });
     await expectPreviousInstallRejectedBeforeStaging(layout, "package layout that conflicts with its receipt");
 
-    const mixedRoot = await makeRoot("hra-install-mixed-layout-refusal-");
+    const mixedRoot = await makeRoot("oompa-install-mixed-layout-refusal-");
     const mixed = await createSyntheticPreviousInstall(mixedRoot, {
       packageName: "hra",
       packageVersion: "0.1.0",
@@ -1512,14 +1533,14 @@ describe("transactional HRA installer", () => {
       "global",
       "node_modules",
       "@hraness",
-      "hra",
+      "oompa",
     );
     await mkdir(alternatePackageRoot, { recursive: true, mode: 0o700 });
     await chmod(join(mixed.versionRoot, "install", "global", "node_modules", "@hraness"), 0o700);
     await chmod(alternatePackageRoot, 0o700);
     await expectPreviousInstallRejectedBeforeStaging(mixed, "package layout that conflicts with its receipt");
 
-    const integrityRoot = await makeRoot("hra-install-legacy-integrity-refusal-");
+    const integrityRoot = await makeRoot("oompa-install-legacy-integrity-refusal-");
     const integrity = await createSyntheticPreviousInstall(integrityRoot, {
       packageName: "hra",
       packageVersion: "0.1.0",
@@ -1530,7 +1551,7 @@ describe("transactional HRA installer", () => {
     await chmod(integrity.cliPath, 0o755);
     await expectPreviousInstallRejectedBeforeStaging(integrity, "durable tree receipt");
 
-    const symlinkRoot = await makeRoot("hra-install-legacy-root-symlink-refusal-");
+    const symlinkRoot = await makeRoot("oompa-install-legacy-root-symlink-refusal-");
     const symlinked = await createSyntheticPreviousInstall(symlinkRoot, {
       packageName: "hra",
       packageVersion: "0.1.0",
@@ -1550,7 +1571,7 @@ describe("transactional HRA installer", () => {
       {
         label: "relative target",
         message: "target is not canonical and absolute",
-        target: () => "../install/hra/versions/relative/install/global/node_modules/hra/src/cli.ts",
+        target: () => "../install/oompa/versions/relative/install/global/node_modules/oompa/src/cli.ts",
       },
       {
         label: "outside authority",
@@ -1579,7 +1600,7 @@ describe("transactional HRA installer", () => {
           "install",
           "global",
           "node_modules",
-          "hra",
+          "oompa",
           "src",
           "cli.ts",
         ),
@@ -1591,7 +1612,7 @@ describe("transactional HRA installer", () => {
           fixture.versionRoot,
           "install",
           "global",
-          "hra",
+          "oompa",
           "src",
           "cli.ts",
         ),
@@ -1612,7 +1633,7 @@ describe("transactional HRA installer", () => {
       },
     ];
     for (const testCase of cases) {
-      const root = await makeRoot(`hra-install-active-layout-${testCase.label.replaceAll(" ", "-")}-`);
+      const root = await makeRoot(`oompa-install-active-layout-${testCase.label.replaceAll(" ", "-")}-`);
       const fixture = await createSyntheticPreviousInstall(root, {
         packageName: "hra",
         packageVersion: "0.1.0",
@@ -1623,15 +1644,15 @@ describe("transactional HRA installer", () => {
   }, 60_000);
 
   test("keeps identical local and official archives in distinct namespaces and fetches the official asset", async () => {
-    const root = await makeRoot("hra-install-source-classes-");
+    const root = await makeRoot("oompa-install-source-classes-");
     const local = await runInstaller(root);
     expect(local).toEqual({
       exitCode: 0,
       stderr: "",
-      stdout: `${HRA_INSTALL_PREFLIGHT_SUCCESS}\n`,
+      stdout: `${OOMPA_INSTALL_PREFLIGHT_SUCCESS}\n`,
     });
     const bunRoot = join(root, "bun root");
-    const versionsRoot = join(bunRoot, "install", "hra", "versions");
+    const versionsRoot = join(bunRoot, "install", "oompa", "versions");
     const localVersions = await readdir(versionsRoot);
     expect(localVersions).toHaveLength(1);
     expect(localVersions[0]).toContain("-local-");
@@ -1644,7 +1665,7 @@ describe("transactional HRA installer", () => {
     }).toEqual({
       exitCode: 0,
       stderr: "",
-      stdout: `${HRA_INSTALL_PREFLIGHT_SUCCESS}\n`,
+      stdout: `${OOMPA_INSTALL_PREFLIGHT_SUCCESS}\n`,
     });
     const versions = (await readdir(versionsRoot)).sort();
     expect(versions).toHaveLength(2);
@@ -1671,21 +1692,21 @@ describe("transactional HRA installer", () => {
     expect(localReceipt.archiveAssetId).toBeNull();
     expect(officialReceipt.archiveSource).toBe("official");
     expect(officialReceipt.archiveSha256).toBe(archiveSha256);
-    expect(officialReceipt.archiveRepositoryId).toBe(HRA_INSTALL_REPOSITORY_ID);
+    expect(officialReceipt.archiveRepositoryId).toBe(OOMPA_INSTALL_REPOSITORY_ID);
     expect(officialReceipt.archiveReleaseId).toBe(9_715_113);
     expect(officialReceipt.archiveAssetId).toBe(8_675_309);
-    expect(await realpath(join(bunRoot, "bin", "hra"))).toContain(`/${officialVersion as string}/`);
+    expect(await realpath(join(bunRoot, "bin", "oompa"))).toContain(`/${officialVersion as string}/`);
 
     const observedUrls = new Set(official.observations.map((observation) => observation.url));
     for (const expectedUrl of [
-      HRA_INSTALL_REPOSITORY_API_URL,
-      HRA_INSTALL_RELEASE_API_URL,
-      HRA_INSTALL_ARCHIVE_URL,
-      "https://release-assets.githubusercontent.com/hra-test/archive.tgz",
+      OOMPA_INSTALL_REPOSITORY_API_URL,
+      OOMPA_INSTALL_RELEASE_API_URL,
+      OOMPA_INSTALL_ARCHIVE_URL,
+      "https://release-assets.githubusercontent.com/oompa-test/archive.tgz",
     ]) expect(observedUrls.has(expectedUrl)).toBeTrue();
     const archiveRequests = official.observations.filter((observation) =>
-      observation.url === HRA_INSTALL_ARCHIVE_URL
-      || observation.url === "https://release-assets.githubusercontent.com/hra-test/archive.tgz");
+      observation.url === OOMPA_INSTALL_ARCHIVE_URL
+      || observation.url === "https://release-assets.githubusercontent.com/oompa-test/archive.tgz");
     expect(archiveRequests).toHaveLength(2);
     for (const request of archiveRequests) {
       expect(request.accept).toBe("application/octet-stream");
@@ -1719,18 +1740,18 @@ describe("transactional HRA installer", () => {
       },
     ];
     for (const failure of failures) {
-      const root = await makeRoot(`hra-install-official-${failure.scenario}-`);
+      const root = await makeRoot(`oompa-install-official-${failure.scenario}-`);
       const result = await runOfficialInstaller(root, failure.scenario);
       expect(result.exitCode).not.toBe(0);
       expect(result.stderr).toContain(failure.message);
       expect(result.stdout).toBe("");
-      expect(result.observations.some((observation) => observation.url === HRA_INSTALL_ARCHIVE_URL)).toBeTrue();
-      expect(await Bun.file(join(root, "bun root", "bin", "hra")).exists()).toBeFalse();
+      expect(result.observations.some((observation) => observation.url === OOMPA_INSTALL_ARCHIVE_URL)).toBeTrue();
+      expect(await Bun.file(join(root, "bun root", "bin", "oompa")).exists()).toBeFalse();
     }
   }, 60_000);
 
   test("rejects a same-size local archive mutation after recording its identity", async () => {
-    const root = await makeRoot("hra-install-local-mutation-");
+    const root = await makeRoot("oompa-install-local-mutation-");
     await mkdir(join(root, "home"), { mode: 0o700 });
     const localArchive = join(root, "mutable-hra.tgz");
     const original = await readFile(archivePath);
@@ -1740,7 +1761,7 @@ describe("transactional HRA installer", () => {
       'const fs = await import("node:fs/promises");',
       `const module = await import(${JSON.stringify(runtimePath)});`,
       `const archive = ${JSON.stringify(localArchive)};`,
-      "await module.installHraRelease(archive, {",
+      "await module.installOompaRelease(archive, {",
       `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
       "  afterArchiveIdentityResolved: async () => {",
       "    const bytes = Buffer.from(await fs.readFile(archive));",
@@ -1757,28 +1778,28 @@ describe("transactional HRA installer", () => {
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toContain("changed after its identity was recorded");
     expect(result.stdout).toBe("");
-    expect(await Bun.file(join(root, "bun root", "bin", "hra")).exists()).toBeFalse();
+    expect(await Bun.file(join(root, "bun root", "bin", "oompa")).exists()).toBeFalse();
   });
 
   test("reopens and rejects a same-size mutation of the private official archive copy", async () => {
-    const root = await makeRoot("hra-install-private-archive-mutation-");
+    const root = await makeRoot("oompa-install-private-archive-mutation-");
     const result = await runOfficialInstaller(root, "success", true);
     expect(result.exitCode).not.toBe(0);
-    expect(result.stderr).toContain("private HRA archive copy changed");
+    expect(result.stderr).toContain("private Oompa archive copy changed");
     expect(result.stdout).toBe("");
     expect(result.observations.some((observation) =>
-      observation.url === "https://release-assets.githubusercontent.com/hra-test/archive.tgz")).toBeTrue();
-    expect(await Bun.file(join(root, "bun root", "bin", "hra")).exists()).toBeFalse();
+      observation.url === "https://release-assets.githubusercontent.com/oompa-test/archive.tgz")).toBeTrue();
+    expect(await Bun.file(join(root, "bun root", "bin", "oompa")).exists()).toBeFalse();
   });
 
   test("refuses a private archive changed after parent verification but before worker custody", async () => {
-    const root = await makeRoot("hra-install-worker-archive-mutation-");
+    const root = await makeRoot("oompa-install-worker-archive-mutation-");
     await mkdir(join(root, "home"), { mode: 0o700 });
     const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
     const program = [
       'const fs = await import("node:fs/promises");',
       `const module = await import(${JSON.stringify(runtimePath)});`,
-      `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      `await module.installOompaRelease(${JSON.stringify(archivePath)}, {`,
       `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
       "  beforeStageWorkerSpawn: async (privateArchivePath) => {",
       "    const bytes = Buffer.from(await fs.readFile(privateArchivePath));",
@@ -1794,24 +1815,24 @@ describe("transactional HRA installer", () => {
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toContain("ended before publishing complete lock readiness");
     expect(result.stdout).toBe("");
-    expect(await Bun.file(join(root, "bun root", "bin", "hra")).exists()).toBeFalse();
+    expect(await Bun.file(join(root, "bun root", "bin", "oompa")).exists()).toBeFalse();
   });
 
   test("refuses a private archive changed after the worker snapshots it without re-signaling the settled Bun group", async () => {
-    const root = await makeRoot("hra-install-worker-post-snapshot-mutation-");
+    const root = await makeRoot("oompa-install-worker-post-snapshot-mutation-");
     await mkdir(join(root, "home"), { mode: 0o700 });
     const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
-    const authorityRoot = join(root, "bun root", "install", "hra");
+    const authorityRoot = join(root, "bun root", "install", "oompa");
     const program = [
       'const fs = await import("node:fs/promises");',
       'const path = await import("node:path");',
       `const module = await import(${JSON.stringify(runtimePath)});`,
-      `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      `await module.installOompaRelease(${JSON.stringify(archivePath)}, {`,
       `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
       "  afterStageWorkerStarted: async () => {",
       `    const stage = (await fs.readdir(${JSON.stringify(authorityRoot)})).find((entry) => entry.startsWith(".staging-"));`,
       "    if (!stage) throw new Error(\"The private archive stage is missing.\");",
-      `    const privateArchivePath = path.join(${JSON.stringify(authorityRoot)}, stage, ".hra-release-archive.tgz");`,
+      `    const privateArchivePath = path.join(${JSON.stringify(authorityRoot)}, stage, ".oompa-release-archive.tgz");`,
       "    const bytes = Buffer.from(await fs.readFile(privateArchivePath));",
       "    bytes[0] = (bytes[0] ?? 0) ^ 1;",
       "    await fs.writeFile(privateArchivePath, bytes, { mode: 0o600 });",
@@ -1823,26 +1844,26 @@ describe("transactional HRA installer", () => {
       environment: installEnvironment(root),
     });
     expect(result.exitCode).not.toBe(0);
-    expect(result.stderr).toContain("Bun could not stage the exact HRA archive (exit 1)");
+    expect(result.stderr).toContain("Bun could not stage the exact Oompa archive (exit 1)");
     expect(result.stdout).toBe("");
-    expect(await Bun.file(join(root, "bun root", "bin", "hra")).exists()).toBeFalse();
+    expect(await Bun.file(join(root, "bun root", "bin", "oompa")).exists()).toBeFalse();
   }, 60_000);
 
   test("refuses an extracted package mutation before an official receipt is issued", async () => {
-    const root = await makeRoot("hra-install-extracted-package-mutation-");
+    const root = await makeRoot("oompa-install-extracted-package-mutation-");
     await mkdir(join(root, "home"), { mode: 0o700 });
     const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
-    const authorityRoot = join(root, "bun root", "install", "hra");
+    const authorityRoot = join(root, "bun root", "install", "oompa");
     const program = [
       'const fs = await import("node:fs/promises");',
       'const path = await import("node:path");',
       `const module = await import(${JSON.stringify(runtimePath)});`,
-      `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      `await module.installOompaRelease(${JSON.stringify(archivePath)}, {`,
       `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
       "  afterStageCleanupCustody: async () => {",
       `    const stage = (await fs.readdir(${JSON.stringify(authorityRoot)})).find((entry) => entry.startsWith(".staging-"));`,
       "    if (!stage) throw new Error(\"The extracted package stage is missing.\");",
-      `    const packageFile = path.join(${JSON.stringify(authorityRoot)}, stage, "install/global/node_modules/@hraness/hra/src/domain/values.ts");`,
+      `    const packageFile = path.join(${JSON.stringify(authorityRoot)}, stage, "install/global/node_modules/@hraness/oompa/src/domain/values.ts");`,
       "    const bytes = Buffer.from(await fs.readFile(packageFile));",
       "    bytes[0] = (bytes[0] ?? 0) ^ 1;",
       "    await fs.writeFile(packageFile, bytes);",
@@ -1856,23 +1877,23 @@ describe("transactional HRA installer", () => {
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toContain("does not match its authenticated release archive");
     expect(result.stdout).toBe("");
-    expect(await Bun.file(join(root, "bun root", "bin", "hra")).exists()).toBeFalse();
+    expect(await Bun.file(join(root, "bun root", "bin", "oompa")).exists()).toBeFalse();
   }, 60_000);
 
   test("does not traverse a replaced Bun global directory during post-stage cleanup", async () => {
-    const root = await makeRoot("hra-install-global-cleanup-symlink-");
+    const root = await makeRoot("oompa-install-global-cleanup-symlink-");
     await mkdir(join(root, "home"), { mode: 0o700 });
     const outside = join(root, "outside-global");
     await mkdir(join(outside, "node_modules"), { recursive: true, mode: 0o700 });
     await writeFile(join(outside, "bun.lock"), "outside lock\n", { mode: 0o600 });
     await writeFile(join(outside, "package.json"), "outside manifest\n", { mode: 0o600 });
     const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
-    const authorityRoot = join(root, "bun root", "install", "hra");
+    const authorityRoot = join(root, "bun root", "install", "oompa");
     const program = [
       'const fs = await import("node:fs/promises");',
       'const path = await import("node:path");',
       `const module = await import(${JSON.stringify(runtimePath)});`,
-      `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      `await module.installOompaRelease(${JSON.stringify(archivePath)}, {`,
       `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
       "  afterStageCleanupCustody: async () => {",
       `    const stage = (await fs.readdir(${JSON.stringify(authorityRoot)})).find((entry) => entry.startsWith(".staging-"));`,
@@ -1892,22 +1913,22 @@ describe("transactional HRA installer", () => {
     expect(result.stderr).toContain("unsafe directory component");
     expect(await readFile(join(outside, "bun.lock"), "utf8")).toBe("outside lock\n");
     expect(await readFile(join(outside, "package.json"), "utf8")).toBe("outside manifest\n");
-    expect(await Bun.file(join(root, "bun root", "bin", "hra")).exists()).toBeFalse();
+    expect(await Bun.file(join(root, "bun root", "bin", "oompa")).exists()).toBeFalse();
   }, 60_000);
 
   test("quarantines Bun cache cleanup without following nested outside symlinks", async () => {
-    const root = await makeRoot("hra-install-cache-quarantine-");
+    const root = await makeRoot("oompa-install-cache-quarantine-");
     await mkdir(join(root, "home"), { mode: 0o700 });
     const outside = join(root, "outside-cache");
     await mkdir(outside, { mode: 0o700 });
     await writeFile(join(outside, "sentinel"), "outside cache sentinel\n", { mode: 0o600 });
     const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
-    const authorityRoot = join(root, "bun root", "install", "hra");
+    const authorityRoot = join(root, "bun root", "install", "oompa");
     const program = [
       'const fs = await import("node:fs/promises");',
       'const path = await import("node:path");',
       `const module = await import(${JSON.stringify(runtimePath)});`,
-      `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      `await module.installOompaRelease(${JSON.stringify(archivePath)}, {`,
       `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
       "  afterStageWorkerExit: async () => {",
       `    const stage = (await fs.readdir(${JSON.stringify(authorityRoot)})).find((entry) => entry.startsWith(".staging-"));`,
@@ -1925,22 +1946,22 @@ describe("transactional HRA installer", () => {
     expect(result.stderr).toBe("");
     expect(result.stdout).toBe("");
     expect(await readFile(join(outside, "sentinel"), "utf8")).toBe("outside cache sentinel\n");
-    expect((await lstat(join(root, "bun root", "bin", "hra"))).isSymbolicLink()).toBeTrue();
+    expect((await lstat(join(root, "bun root", "bin", "oompa"))).isSymbolicLink()).toBeTrue();
   }, 60_000);
 
   test("quarantines only the exact Bun cache inode already held by staging custody", async () => {
-    const root = await makeRoot("hra-install-cache-held-identity-");
+    const root = await makeRoot("oompa-install-cache-held-identity-");
     await mkdir(join(root, "home"), { mode: 0o700 });
     const replacement = join(root, "replacement-cache");
     await mkdir(replacement, { mode: 0o700 });
     await writeFile(join(replacement, "sentinel"), "replacement cache sentinel\n", { mode: 0o600 });
     const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
-    const authorityRoot = join(root, "bun root", "install", "hra");
+    const authorityRoot = join(root, "bun root", "install", "oompa");
     const program = [
       'const fs = await import("node:fs/promises");',
       'const path = await import("node:path");',
       `const module = await import(${JSON.stringify(runtimePath)});`,
-      `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      `await module.installOompaRelease(${JSON.stringify(archivePath)}, {`,
       `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
       "  beforeCacheQuarantine: async () => {",
       `    const stage = (await fs.readdir(${JSON.stringify(authorityRoot)})).find((entry) => entry.startsWith(".staging-"));`,
@@ -1962,19 +1983,19 @@ describe("transactional HRA installer", () => {
     expect(stage).toBeDefined();
     expect(await readFile(join(authorityRoot, stage as string, "install", "cache", "sentinel"), "utf8"))
       .toBe("replacement cache sentinel\n");
-    expect(await Bun.file(join(root, "bun root", "bin", "hra")).exists()).toBeFalse();
+    expect(await Bun.file(join(root, "bun root", "bin", "oompa")).exists()).toBeFalse();
   }, 60_000);
 
   test("retains staging-root descriptor custody through the version rename", async () => {
-    const root = await makeRoot("hra-install-version-root-swap-");
+    const root = await makeRoot("oompa-install-version-root-swap-");
     await mkdir(join(root, "home"), { mode: 0o700 });
     const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
-    const versionsRoot = join(root, "bun root", "install", "hra", "versions");
+    const versionsRoot = join(root, "bun root", "install", "oompa", "versions");
     const program = [
       'const fs = await import("node:fs/promises");',
       'const path = await import("node:path");',
       `const module = await import(${JSON.stringify(runtimePath)});`,
-      `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      `await module.installOompaRelease(${JSON.stringify(archivePath)}, {`,
       `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
       "  afterVersionRename: async () => {",
       `    const versionsRoot = ${JSON.stringify(versionsRoot)};`,
@@ -1993,19 +2014,19 @@ describe("transactional HRA installer", () => {
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toContain("does not name its held staging directory after rename");
     expect(result.stdout).toBe("");
-    expect(await Bun.file(join(root, "bun root", "bin", "hra")).exists()).toBeFalse();
+    expect(await Bun.file(join(root, "bun root", "bin", "oompa")).exists()).toBeFalse();
   }, 60_000);
 
   test("retains version-root descriptor custody through the normalized intent write", async () => {
-    const root = await makeRoot("hra-install-version-root-rebind-swap-");
+    const root = await makeRoot("oompa-install-version-root-rebind-swap-");
     await mkdir(join(root, "home"), { mode: 0o700 });
     const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
-    const versionsRoot = join(root, "bun root", "install", "hra", "versions");
+    const versionsRoot = join(root, "bun root", "install", "oompa", "versions");
     const program = [
       'const fs = await import("node:fs/promises");',
       'const path = await import("node:path");',
       `const module = await import(${JSON.stringify(runtimePath)});`,
-      `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      `await module.installOompaRelease(${JSON.stringify(archivePath)}, {`,
       `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
       "  afterVersionRebind: async () => {",
       `    const versionsRoot = ${JSON.stringify(versionsRoot)};`,
@@ -2024,28 +2045,28 @@ describe("transactional HRA installer", () => {
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toContain("no longer names its held custody descriptor");
     expect(result.stdout).toBe("");
-    expect(await Bun.file(join(root, "bun root", "bin", "hra")).exists()).toBeFalse();
+    expect(await Bun.file(join(root, "bun root", "bin", "oompa")).exists()).toBeFalse();
   }, 60_000);
 
   test("rejects a complete receipt whose archive identity no longer matches its namespace", async () => {
-    const root = await makeRoot("hra-install-receipt-identity-");
+    const root = await makeRoot("oompa-install-receipt-identity-");
     const installed = await runInstaller(root);
     expect(installed.exitCode).toBe(0);
     const bunRoot = join(root, "bun root");
-    const versionsRoot = join(bunRoot, "install", "hra", "versions");
+    const versionsRoot = join(bunRoot, "install", "oompa", "versions");
     const [versionName] = await readdir(versionsRoot);
     expect(versionName).toBeDefined();
     const receiptPath = join(versionsRoot, versionName as string, ".hra-install-complete.json");
     const receipt = await readJsonRecord(receiptPath);
     receipt.archiveSha256 = "0".repeat(64);
     await writeFile(receiptPath, `${JSON.stringify(receipt)}\n`, { mode: 0o600 });
-    const activeBefore = await realpath(join(bunRoot, "bin", "hra"));
+    const activeBefore = await realpath(join(bunRoot, "bin", "oompa"));
 
     const rejected = await runInstaller(root);
     expect(rejected.exitCode).not.toBe(0);
     expect(rejected.stderr).toContain("namespace does not match its archive identity");
     expect(rejected.stdout).toBe("");
-    expect(await realpath(join(bunRoot, "bin", "hra"))).toBe(activeBefore);
+    expect(await realpath(join(bunRoot, "bin", "oompa"))).toBe(activeBefore);
   }, 60_000);
 
   test("refuses an unverified pre-existing PATH entry without replacing it or starting a staged install", async () => {
@@ -2053,7 +2074,7 @@ describe("transactional HRA installer", () => {
     await mkdir(join(root, "home"), { mode: 0o700 });
     const bunRoot = join(root, "bun root");
     await mkdir(join(bunRoot, "bin"), { recursive: true, mode: 0o700 });
-    const activePath = join(bunRoot, "bin", "hra");
+    const activePath = join(bunRoot, "bin", "oompa");
     await writeFile(activePath, "unverified\n", { mode: 0o700 });
     const result = await run([
       process.execPath,
@@ -2063,8 +2084,8 @@ describe("transactional HRA installer", () => {
     expect(result.exitCode).not.toBe(0);
     expect(result.stdout).toBe("");
     expect(await readFile(activePath, "utf8")).toBe("unverified\n");
-    expect(await Bun.file(join(bunRoot, "install", "hra", "install-intent.json")).exists()).toBeFalse();
-    const authorityEntries = await readdir(join(bunRoot, "install", "hra"));
+    expect(await Bun.file(join(bunRoot, "install", "oompa", "install-intent.json")).exists()).toBeFalse();
+    const authorityEntries = await readdir(join(bunRoot, "install", "oompa"));
     expect(authorityEntries.some((entry) => entry.startsWith(".staging-"))).toBeFalse();
   });
 
@@ -2077,19 +2098,20 @@ describe("transactional HRA installer", () => {
   }, 60_000);
 
   test("a stalled Bun stage whose caller dies after READY retains custody until its detached deadline and recovers", async () => {
-    const root = await makeRoot("hra-install-kill-");
+    const root = await makeRoot("oompa-install-kill-");
     await mkdir(join(root, "home"), { mode: 0o700 });
     const sentinel = join(root, "bun-link-observed");
     const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
     const program = [
-      `const module = await import(${JSON.stringify(runtimePath)});`,
-      `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      "const [runtimePath, archivePath, sentinel] = process.argv.slice(1);",
+      "const module = await import(runtimePath);",
+      "await module.installOompaRelease(archivePath, {",
       "  stageDeadlineMilliseconds: 6000,",
       '  stageWorkerTestMode: "stall-after-ready",',
-      `  afterStageWorkerReady: async (bunPid, lockPid) => { await Bun.write(${JSON.stringify(sentinel)}, String(bunPid) + " " + String(lockPid) + "\\n"); await new Promise(() => {}); },`,
+      '  afterStageWorkerReady: async (bunPid, lockPid) => { await Bun.write(sentinel, String(bunPid) + " " + String(lockPid) + "\\n"); await new Promise(() => {}); },',
       "});",
     ].join("\n");
-    const child = trackDirectTestChild(Bun.spawn([process.execPath, "-e", program], {
+    const child = trackDirectTestChild(Bun.spawn([process.execPath, "-e", program, "--", runtimePath, archivePath, sentinel], {
       cwd: root,
       detached: true,
       env: installEnvironment(root),
@@ -2116,19 +2138,19 @@ describe("transactional HRA installer", () => {
     expect(bunPid).not.toBe(child.pid);
     expect(lockPid).not.toBe(child.pid);
     const bunRoot = join(root, "bun root");
-    const authorityRoot = join(bunRoot, "install", "hra");
+    const authorityRoot = join(bunRoot, "install", "oompa");
     const stageName = (await readdir(authorityRoot)).find((entry) => entry.startsWith(".staging-"));
     expect(stageName).toBeDefined();
-    expect(await Bun.file(join(bunRoot, "bin", "hra")).exists()).toBeFalse();
+    expect(await Bun.file(join(bunRoot, "bin", "oompa")).exists()).toBeFalse();
     process.kill(child.pid, "SIGKILL");
     await child.exited;
     expect(() => process.kill(lockPid, 0)).not.toThrow();
-    expect(await Bun.file(join(bunRoot, "bin", "hra")).exists()).toBeFalse();
+    expect(await Bun.file(join(bunRoot, "bin", "oompa")).exists()).toBeFalse();
 
     const busy = await runInstaller(root);
     expect(busy.exitCode).not.toBe(0);
-    expect(busy.stderr).toContain("prior HRA Bun staging process is still running");
-    expect(await Bun.file(join(bunRoot, "bin", "hra")).exists()).toBeFalse();
+    expect(busy.stderr).toContain("prior Oompa Bun staging process is still running");
+    expect(await Bun.file(join(bunRoot, "bin", "oompa")).exists()).toBeFalse();
 
     await waitForProcessIdentityToDisappear(lockPid, false, 10_000);
     await waitForProcessIdentityToDisappear(bunPid, true, 5_000);
@@ -2137,34 +2159,45 @@ describe("transactional HRA installer", () => {
     let recovered = await runInstaller(root);
     while (
       recovered.exitCode !== 0
-      && recovered.stderr.includes("prior HRA Bun staging process is still running")
+      && recovered.stderr.includes("prior Oompa Bun staging process is still running")
       && Date.now() < recoveryDeadline
     ) {
       await Bun.sleep(10);
       recovered = await runInstaller(root);
     }
     expect(recovered.exitCode, recovered.stderr).toBe(0);
-    expect(recovered.stdout).toBe(`${HRA_INSTALL_PREFLIGHT_SUCCESS}\n`);
-    expect((await lstat(join(bunRoot, "bin", "hra"))).isSymbolicLink()).toBeTrue();
+    expect(recovered.stdout).toBe(`${OOMPA_INSTALL_PREFLIGHT_SUCCESS}\n`);
+    expect((await lstat(join(bunRoot, "bin", "oompa"))).isSymbolicLink()).toBeTrue();
     expect((await readdir(authorityRoot)).some((entry) => entry.startsWith(".staging-"))).toBeFalse();
     expect(await Bun.file(join(authorityRoot, "install-intent.json")).exists()).toBeFalse();
   }, 60_000);
 
   test("every post-link publication boundary leaves either no command or the complete verified command", async () => {
-    const root = await makeRoot("hra-install-boundaries-");
+    const root = await makeRoot("oompa-install-boundaries-");
     await mkdir(join(root, "home"), { mode: 0o700 });
     const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
-    const activePath = join(root, "bun root", "bin", "hra");
+    const activePath = join(root, "bun root", "bin", "oompa");
     const runWithHook = async (hook: "afterNormalized" | "afterPublishRename" | "beforePublish") => await run([
       process.execPath,
       "-e",
       [
-        `const module = await import(${JSON.stringify(runtimePath)});`,
-        `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
-        `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
-        `  ${hook}: () => { throw new Error(${JSON.stringify(`test interruption at ${hook}`)}); },`,
+        "const [runtimePath, archivePath, deadline, hook] = process.argv.slice(1);",
+        "const module = await import(runtimePath);",
+        'const interrupt = () => { throw new Error("test interruption at " + hook); };',
+        'const hooks = hook === "afterNormalized" ? { afterNormalized: interrupt }',
+        '  : hook === "afterPublishRename" ? { afterPublishRename: interrupt }',
+        '  : hook === "beforePublish" ? { beforePublish: interrupt } : undefined;',
+        'if (hooks === undefined) throw new Error("Unexpected installer interruption hook.");',
+        "await module.installOompaRelease(archivePath, {",
+        "  stageDeadlineMilliseconds: Number(deadline),",
+        "  ...hooks,",
         "});",
       ].join("\n"),
+      "--",
+      runtimePath,
+      archivePath,
+      String(TEST_STAGING_DEADLINE_MS),
+      hook,
     ], { cwd: root, environment: installEnvironment(root) });
 
     const normalizedInterruption = await runWithHook("afterNormalized");
@@ -2184,21 +2217,21 @@ describe("transactional HRA installer", () => {
     const recovered = await runInstaller(root);
     expect(recovered.exitCode, recovered.stderr).toBe(0);
     expect(await realpath(activePath)).toBe(publishedTarget);
-    expect(await Bun.file(join(root, "bun root", "install", "hra", "install-intent.json")).exists()).toBeFalse();
+    expect(await Bun.file(join(root, "bun root", "install", "oompa", "install-intent.json")).exists()).toBeFalse();
   }, 60_000);
 
   test("detects same-size installed-tree mutation after normalization before PATH publication", async () => {
-    const root = await makeRoot("hra-install-tree-digest-");
+    const root = await makeRoot("oompa-install-tree-digest-");
     await mkdir(join(root, "home"), { mode: 0o700 });
     const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
-    const versionsRoot = join(root, "bun root", "install", "hra", "versions");
+    const versionsRoot = join(root, "bun root", "install", "oompa", "versions");
     const program = [
       `const module = await import(${JSON.stringify(runtimePath)});`,
-      `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      `await module.installOompaRelease(${JSON.stringify(archivePath)}, {`,
       `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
       "  afterNormalized: async () => {",
       `    const versions = await (await import("node:fs/promises")).readdir(${JSON.stringify(versionsRoot)});`,
-      `    const path = ${JSON.stringify(versionsRoot)} + "/" + versions[0] + "/install/global/node_modules/@hraness/hra/src/domain/values.ts";`,
+      `    const path = ${JSON.stringify(versionsRoot)} + "/" + versions[0] + "/install/global/node_modules/@hraness/oompa/src/domain/values.ts";`,
       "    const bytes = Buffer.from(await Bun.file(path).arrayBuffer());",
       "    bytes[0] = (bytes[0] ?? 0) ^ 1;",
       "    await Bun.write(path, bytes);",
@@ -2211,19 +2244,19 @@ describe("transactional HRA installer", () => {
     });
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toContain("durable tree receipt");
-    expect(await Bun.file(join(root, "bun root", "bin", "hra")).exists()).toBeFalse();
+    expect(await Bun.file(join(root, "bun root", "bin", "oompa")).exists()).toBeFalse();
   }, 60_000);
 
   test("rejects an outside bounce symlink even while its final target points back into the staged tree", async () => {
-    const root = await makeRoot("hra-install-symlink-bounce-");
+    const root = await makeRoot("oompa-install-symlink-bounce-");
     await mkdir(join(root, "home"), { mode: 0o700 });
     const outside = join(root, "outside");
     await mkdir(outside, { mode: 0o700 });
-    const authorityRoot = join(root, "bun root", "install", "hra");
+    const authorityRoot = join(root, "bun root", "install", "oompa");
     const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
     const program = [
       `const module = await import(${JSON.stringify(runtimePath)});`,
-      `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      `await module.installOompaRelease(${JSON.stringify(archivePath)}, {`,
       `  stageDeadlineMilliseconds: ${String(TEST_STAGING_DEADLINE_MS)},`,
       "  afterStageWorkerExit: async () => {",
       '    const fs = await import("node:fs/promises");',
@@ -2232,8 +2265,8 @@ describe("transactional HRA installer", () => {
       "    const stageName = (await fs.readdir(authorityRoot)).find((entry) => entry.startsWith(\".staging-\"));",
       '    if (!stageName) throw new Error("staging root is missing");',
       "    const stageRoot = path.join(authorityRoot, stageName);",
-      "    const stagedLink = path.join(stageRoot, \"bin\", \"hra\");",
-      '    if (!(await fs.lstat(stagedLink)).isSymbolicLink()) throw new Error("staged hra link is missing");',
+      "    const stagedLink = path.join(stageRoot, \"bin\", \"oompa\");",
+      '    if (!(await fs.lstat(stagedLink)).isSymbolicLink()) throw new Error("staged oompa link is missing");',
       "    const inside = path.join(stageRoot, \"inside-target\");",
       `    const bounce = ${JSON.stringify(join(outside, "bounce"))};`,
       "    const candidate = path.join(stageRoot, \"outside-bounce\");",
@@ -2249,14 +2282,14 @@ describe("transactional HRA installer", () => {
     });
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toContain("lexically escaping symbolic link");
-    expect(await Bun.file(join(root, "bun root", "bin", "hra")).exists()).toBeFalse();
+    expect(await Bun.file(join(root, "bun root", "bin", "oompa")).exists()).toBeFalse();
   }, 60_000);
 
   test("accepts non-mutating Darwin ACLs and rejects a later inherited non-owner delete ALLOW", async () => {
     if (process.platform !== "darwin") return;
     const uid = process.getuid?.();
     if (uid === undefined) throw new Error("Darwin ACL proof requires a current-user identity.");
-    const root = await makeRoot("hra-install-acl-");
+    const root = await makeRoot("oompa-install-acl-");
     const aclFree = join(root, "acl-free");
     const denyOnly = join(root, "deny-only");
     const readOnly = join(root, "read-only");

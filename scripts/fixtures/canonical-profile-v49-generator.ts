@@ -13,6 +13,32 @@ import type * as WorkStoreModule from "../../src/storage/work-store";
 import type * as WorkCapabilityModule from "../../src/storage/work-capability";
 import type * as StatePathsModule from "../../src/storage/paths";
 
+// Minimal consumed surface of the hash-pinned 7ab3478 runtime. Its native
+// session import accepts providerAccountKey, not today's providerAuthority.
+// Keep that closed historical call shape separate from current admission.
+type ArchivedV49Store = Pick<StateStoreModule.StateStore,
+  "close" | "createWorkStore" | "nextDaemonGeneration" | "createProfile"
+  | "nextProfileGeneration" | "setProfileState" | "createProject"
+> & {
+  upsertProviderSession(input: Readonly<{
+    profileId: StateStoreModule.ProfileRecord["id"];
+    projectId: StateStoreModule.ProjectRecord["id"];
+    provider: "codex";
+    providerThreadId: string;
+    title: string;
+    providerAccountKey: string;
+    preset: "ultra";
+    fastEnabled: false;
+    state: "idle";
+  }>): Pick<StateStoreModule.SessionRecord, "id">;
+};
+type ArchivedV49StateStoreModule = Readonly<{
+  StateStore: new (
+    paths: ReturnType<typeof StatePathsModule.resolveStatePaths>,
+    options: Readonly<{ now: () => number; resolveMachineTimeZone: () => string; readonly?: boolean }>,
+  ) => ArchivedV49Store;
+}>;
+
 // Manual offline source-bound generator, never part of ordinary tests. Supply
 // an immutable checkout/export with its own frozen dependencies. No provider,
 // credentials, Git/network request, or current migration implementation is used.
@@ -71,7 +97,7 @@ await mkdir(syntheticParent, { mode: 0o700 });
 await mkdir(syntheticProject, { mode: 0o700 });
 
 // Full immutable runtime bytes above bind these dynamically loaded modules.
-const { StateStore } = await import(pathToFileURL(join(sourceRoot, "src/storage/state-store.ts")).href) as typeof StateStoreModule;
+const { StateStore } = await import(pathToFileURL(join(sourceRoot, "src/storage/state-store.ts")).href) as ArchivedV49StateStoreModule;
 const { canonicalWorkJson } = await import(pathToFileURL(join(sourceRoot, "src/storage/work-store.ts")).href) as typeof WorkStoreModule;
 const { WorkCapabilityCodec } = await import(pathToFileURL(join(sourceRoot, "src/storage/work-capability.ts")).href) as typeof WorkCapabilityModule;
 const { resolveStatePaths, initializeStatePaths } = await import(pathToFileURL(join(sourceRoot, "src/storage/paths.ts")).href) as typeof StatePathsModule;

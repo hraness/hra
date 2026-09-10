@@ -19,7 +19,7 @@ const repositorySchema = z.object({
 export function assertLiveReleaseRepository(value: unknown): void {
   const parsed = repositorySchema.safeParse(value);
   if (!parsed.success) {
-    throw new Error("Publication requires the exact live public HRA repository identity.");
+    throw new Error("Publication requires the exact live public Oompa repository identity.");
   }
 }
 

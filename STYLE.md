@@ -1,6 +1,6 @@
 # Public writing
 
-Public prose must be precise, useful, and free of hype. State what HRA does, how to use it, and where its authority stops.
+Public prose must be precise, useful, and free of hype. State what Oompa does, how to use it, and where its authority stops.
 
 ## Leave the reader with a clearer model
 
@@ -26,4 +26,4 @@ Public prose must be precise, useful, and free of hype. State what HRA does, how
 - Keep exact commands and literal values in code formatting.
 - Do not use exclamation marks, all-capital emphasis, rhetorical questions, or em dashes.
 - Avoid “simply,” “just,” “seamless,” “powerful,” and other words that hide work or ask for trust.
-- Keep README and website feature claims identical through generated content, not manual copying.
+- Write the package README and description for installation, CLI use, public imports and operational limits. Keep website copy under its separate content owner; do not generate package documentation from it or copy marketing sections into the archive. Verify each surface's claims against the same runtime and release facts without requiring identical prose.

@@ -98,7 +98,7 @@ export function randomKeyBytes(): Uint8Array {
 }
 
 // AES-GCM with random 96-bit nonces stays below the NIST SP 800-38D collision
-// bound only while one key encrypts fewer than 2^32 messages. HRA stops at
+// bound only while one key encrypts fewer than 2^32 messages. Oompa stops at
 // half that and requires a key-version rotation before encrypting more.
 export const gcmMessageBudgetPerKey = 2 ** 31;
 // Callers persist a high-water mark that leads the count by up to two

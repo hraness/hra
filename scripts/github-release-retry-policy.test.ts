@@ -57,7 +57,7 @@ describe("bounded GitHub Release retry policy", () => {
       name: "Publish canonical GitHub artifacts",
       run_attempt: 1,
       run_id: Number(runId),
-      run_url: `https://api.github.com/repos/hraness/hra/actions/runs/${runId}`,
+      run_url: `https://api.github.com/repos/hraness/oompa/actions/runs/${runId}`,
       status: "completed",
       steps: publicationConclusion === undefined ? [] : [{
         conclusion: publicationConclusion,

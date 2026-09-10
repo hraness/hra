@@ -6,7 +6,7 @@ import {
   type PreparedAttachment,
 } from "../domain/attachments.ts";
 import type { PresetRequirement } from "../domain/presets.ts";
-import { HRA_VERSION } from "../version.ts";
+import { OOMPA_VERSION } from "../version.ts";
 import type {
   InteractionKind,
   InteractionResolution,
@@ -23,8 +23,8 @@ import { CodexConnectionEffects } from "./session-effects.ts";
 import { record, safeInteger, string } from "./parse.ts";
 import type { CodexProcess } from "./process.ts";
 import {
-  HRA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS,
-  HRA_HOST_DYNAMIC_TOOLS,
+  OOMPA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS,
+  OOMPA_HOST_DYNAMIC_TOOLS,
   OPERATIONS,
   PINNED_CODEX_VERSION,
   assertPinnedCodexNotificationMatrix,
@@ -39,7 +39,7 @@ import {
   parseAccountUsage,
   parseAppPage,
   parseBrokeredCodexServerRequest,
-  parseHraHostToolCall,
+  parseOompaHostToolCall,
   parseCredentialStores,
   parseFact,
   parseFeaturePage,
@@ -74,7 +74,7 @@ import {
   type CodexAuthority,
   type CodexCapabilitySnapshot,
   type ConversationAutomationToolCall,
-  type HraHostToolCall,
+  type OompaHostToolCall,
   type CodexFact,
   type CodexFeature,
   type CodexMethod,
@@ -111,7 +111,7 @@ type ClientState =
 const STANDARD_MCP_FORM_INPUT_EXTENSION = "openai/standard-form-input";
 const INTERACTION_DEADLINE_ERROR = Object.freeze({
   code: -32_008,
-  message: "HRA interaction deadline expired",
+  message: "Oompa interaction deadline expired",
 });
 const PRE_READY_FACT_LIMIT = 128;
 const PRE_READY_FACT_BYTES = 1 * 1024 * 1024;
@@ -122,8 +122,8 @@ const CAPABILITY_DISCOVERY_MAX_DEADLINE_MS = 40_000;
 const DEVELOPER_INSTRUCTIONS_MAX_BYTES = 64 * 1_024;
 const developerInstructionsEncoder = new TextEncoder();
 
-const activeHraHostToolCallKey = (
-  call: Pick<HraHostToolCall, "threadId" | "turnId" | "callId">,
+const activeOompaHostToolCallKey = (
+  call: Pick<OompaHostToolCall, "threadId" | "turnId" | "callId">,
 ): string => JSON.stringify([call.threadId, call.turnId, call.callId]);
 
 const exactDeveloperInstructions = (value: string): string => {
@@ -206,13 +206,13 @@ export interface CodexAppServerClientOptions {
     authority: CodexAuthority,
   ) => void | Promise<void>;
   readonly onFact?: (fact: FencedCodexValue<CodexFact>) => void | Promise<void>;
-  /** Local-only host service for the complete versioned HRA tool manifest. */
-  readonly onHraHostToolCall?: (
-    call: HraHostToolCall,
+  /** Local-only host service for the complete versioned Oompa tool manifest. */
+  readonly onOompaHostToolCall?: (
+    call: OompaHostToolCall,
   ) => DynamicToolPublicResult | Promise<DynamicToolPublicResult>;
   /** Invoked only after the corresponding generic host-tool success response is fully written. */
-  readonly onHraHostToolResponseWritten?: (
-    call: HraHostToolCall,
+  readonly onOompaHostToolResponseWritten?: (
+    call: OompaHostToolCall,
   ) => void | Promise<void>;
   /** Local-only host service for the one conversation-bound dynamic tool. */
   readonly onConversationAutomationToolCall?: (
@@ -270,14 +270,19 @@ export interface ThreadPolicy {
   readonly writableRoots: readonly string[];
 }
 
-export interface StartThreadInput {
+interface ThreadStartRuntimeInput {
   readonly cwd: string;
-  readonly developerInstructions: string;
   readonly preset: ResolvedPreset;
   readonly policy: ThreadPolicy;
 }
 
-export interface ResumeThreadInput extends StartThreadInput {
+export type StartThreadInput = ThreadStartRuntimeInput & (
+  | Readonly<{ hostCapabilities?: "current"; developerInstructions: string }>
+  | Readonly<{ hostCapabilities: "historical_v1"; developerInstructions?: never }>
+);
+
+export interface ResumeThreadInput extends ThreadStartRuntimeInput {
+  readonly developerInstructions: string;
   readonly threadId: string;
 }
 
@@ -295,13 +300,13 @@ export interface StartTurnInput {
  * The `turn/start` and `turn/steer` input array.
  *
  * The pinned app-server accepts `UserInput` variants `text`, `image`,
- * `localImage`, `audio`, `localAudio`, `skill`, and `mention`. HRA emits
+ * `localImage`, `audio`, `localAudio`, `skill`, and `mention`. Oompa emits
  * exactly two of them: one `text` item, and one `localImage` item per image
  * attachment naming its mode-0600 blob in the local content-addressed store.
  * There is no file content item, so a text-ish attachment is folded into the
  * text item as a fenced block with a header naming the file.
  *
- * With no attachment this returns the exact single-element array HRA sent
+ * With no attachment this returns the exact single-element array Oompa sent
  * before attachments existed, so every existing turn is byte-identical.
  */
 export const codexTurnInput = (
@@ -325,11 +330,11 @@ export class CodexAppServerClient {
     | CodexAppServerClientOptions["onAccountAuthoritySignal"]
     | undefined;
   readonly #onFact: NonNullable<CodexAppServerClientOptions["onFact"]>;
-  readonly #onHraHostToolCall:
-    | CodexAppServerClientOptions["onHraHostToolCall"]
+  readonly #onOompaHostToolCall:
+    | CodexAppServerClientOptions["onOompaHostToolCall"]
     | undefined;
-  readonly #onHraHostToolResponseWritten:
-    | CodexAppServerClientOptions["onHraHostToolResponseWritten"]
+  readonly #onOompaHostToolResponseWritten:
+    | CodexAppServerClientOptions["onOompaHostToolResponseWritten"]
     | undefined;
   readonly #onConversationAutomationToolCall:
     | CodexAppServerClientOptions["onConversationAutomationToolCall"]
@@ -348,7 +353,7 @@ export class CodexAppServerClient {
   readonly #pending = new Map<number, PendingRequest>();
   readonly #serverRequests = new Map<string, PendingServerRequest>();
   readonly #dynamicRequestDigests = new Map<string, string>();
-  readonly #activeHraHostToolCalls = new Map<string, HraHostToolCall>();
+  readonly #activeOompaHostToolCalls = new Map<string, OompaHostToolCall>();
   readonly #hostToolTurnFenceByThread = new Map<string, string | null>();
   readonly #effects = new CodexConnectionEffects();
   readonly #writeQueue: PendingFrameWrite[] = [];
@@ -387,12 +392,12 @@ export class CodexAppServerClient {
     this.#onAccountAuthoritySignal = options.onAccountAuthoritySignal;
     this.#onFact = options.onFact ?? (() => undefined);
     if (
-      (options.onHraHostToolCall === undefined)
-      !== (options.onHraHostToolResponseWritten === undefined)
+      (options.onOompaHostToolCall === undefined)
+      !== (options.onOompaHostToolResponseWritten === undefined)
     ) {
       throw new CodexError(
         "INVALID_INPUT",
-        "HRA host tools require paired call and response-written callbacks",
+        "Oompa host tools require paired call and response-written callbacks",
       );
     }
     if (
@@ -405,16 +410,16 @@ export class CodexAppServerClient {
       );
     }
     if (
-      options.onHraHostToolCall !== undefined
+      options.onOompaHostToolCall !== undefined
       && options.onConversationAutomationToolCall !== undefined
     ) {
       throw new CodexError(
         "INVALID_INPUT",
-        "generic HRA host tools and legacy conversation automation cannot both be configured",
+        "generic Oompa host tools and legacy conversation automation cannot both be configured",
       );
     }
-    this.#onHraHostToolCall = options.onHraHostToolCall;
-    this.#onHraHostToolResponseWritten = options.onHraHostToolResponseWritten;
+    this.#onOompaHostToolCall = options.onOompaHostToolCall;
+    this.#onOompaHostToolResponseWritten = options.onOompaHostToolResponseWritten;
     this.#onConversationAutomationToolCall = options.onConversationAutomationToolCall;
     this.#onConversationAutomationToolResponseWritten =
       options.onConversationAutomationToolResponseWritten;
@@ -455,26 +460,24 @@ export class CodexAppServerClient {
   }
 
   /** Pure synchronous proof that this exact provider callback is still active. */
-  hasLiveHraHostToolCall(input: {
-    readonly authority: CodexAuthority;
+  hasLiveOompaHostToolCall(input: {
+    readonly authority: OompaHostToolCall["authority"];
     readonly connectionId: string;
     readonly threadId: string;
     readonly turnId: string;
     readonly callId: string;
     readonly requestDigest: string;
   }): boolean {
-    const retained = this.#activeHraHostToolCalls.get(activeHraHostToolCallKey(input));
+    const retained = this.#activeOompaHostToolCalls.get(activeOompaHostToolCallKey(input));
     return this.#state === "ready"
-      && input.authority.profileId === this.#authority.profileId
-      && input.authority.processGeneration === this.#authority.processGeneration
+      && sameAuthority(input.authority, this.#authority)
       && input.connectionId === this.#connectionId
       && (
         !this.#hostToolTurnFenceByThread.has(input.threadId)
         || this.#hostToolTurnFenceByThread.get(input.threadId) === input.turnId
       )
       && retained !== undefined
-      && retained.authority.profileId === input.authority.profileId
-      && retained.authority.processGeneration === input.authority.processGeneration
+      && sameAuthority(retained.authority, input.authority)
       && retained.connectionId === input.connectionId
       && retained.threadId === input.threadId
       && retained.turnId === input.turnId
@@ -500,9 +503,9 @@ export class CodexAppServerClient {
         OPERATIONS.initialize,
         {
           clientInfo: {
-            name: "hra",
-            title: "HRA",
-            version: HRA_VERSION,
+            name: "oompa",
+            title: "Oompa",
+            version: OOMPA_VERSION,
           },
           capabilities: {
             experimentalApi: this.#experimentalApi,
@@ -833,8 +836,13 @@ export class CodexAppServerClient {
   }
 
   async startThread(input: StartThreadInput): Promise<FencedCodexValue<ThreadStartResult>> {
-    const hasGenericHostTools = this.#onHraHostToolCall !== undefined
-      && this.#onHraHostToolResponseWritten !== undefined;
+    const hostCapabilities: unknown = input.hostCapabilities;
+    if ((hostCapabilities !== undefined && hostCapabilities !== "current" && hostCapabilities !== "historical_v1")
+      || (hostCapabilities === "historical_v1" && "developerInstructions" in input)) {
+      throw new CodexError("INVALID_INPUT", "The thread host-capability mode is invalid");
+    }
+    const hasGenericHostTools = this.#onOompaHostToolCall !== undefined
+      && this.#onOompaHostToolResponseWritten !== undefined;
     const hasLegacyAutomation = this.#onConversationAutomationToolCall !== undefined
       && this.#onConversationAutomationToolResponseWritten !== undefined;
     if (
@@ -843,12 +851,13 @@ export class CodexAppServerClient {
     ) {
       throw new CodexError(
         "UNSUPPORTED_CAPABILITY",
-        "HRA host tools require the reviewed dynamic-tool host service",
+        "Oompa host tools require the reviewed dynamic-tool host service",
       );
     }
     const cwd = canonicalAbsolute(input.cwd, "cwd");
     const policy = compileThreadPolicy(input.policy);
-    const developerInstructions = exactDeveloperInstructions(input.developerInstructions);
+    const developerInstructions = input.hostCapabilities === "historical_v1"
+      ? undefined : exactDeveloperInstructions(input.developerInstructions);
     return this.#closedRequest(
       "thread/start",
       {
@@ -860,12 +869,12 @@ export class CodexAppServerClient {
         approvalPolicy: "on-request",
         approvalsReviewer: input.policy.review,
         config: { model_reasoning_effort: input.preset.effort },
-        developerInstructions,
+        ...(developerInstructions === undefined ? {} : { developerInstructions }),
         ephemeral: false,
         historyMode: "paginated",
-        dynamicTools: hasGenericHostTools
-          ? HRA_HOST_DYNAMIC_TOOLS
-          : HRA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS,
+        dynamicTools: hasGenericHostTools && input.hostCapabilities !== "historical_v1"
+          ? OOMPA_HOST_DYNAMIC_TOOLS
+          : OOMPA_CONVERSATION_AUTOMATION_DYNAMIC_TOOLS,
       },
       (value) => validateThreadStartResult(parseThreadStart(value), input, policy.runtimeWorkspaceRoots, cwd),
     );
@@ -889,7 +898,7 @@ export class CodexAppServerClient {
 
   /**
    * Resume an existing thread while replacing its next-turn policy with the
-   * same reviewed authority HRA applies at native thread creation. The pinned
+   * same reviewed authority Oompa applies at native thread creation. The pinned
    * resume contract cannot add dynamic tools retroactively, so this method
    * deliberately sends only fields the provider documents for resume.
    */
@@ -1273,7 +1282,7 @@ export class CodexAppServerClient {
   async #close(): Promise<void> {
     if (this.#state === "closed") return;
     this.#state = "closing";
-    this.#activeHraHostToolCalls.clear();
+    this.#activeOompaHostToolCalls.clear();
     this.#hostToolTurnFenceByThread.clear();
     this.#wakeWriteBarrier();
     this.#failPending(new CodexError("PROCESS_EXITED", "Codex is shutting down"));
@@ -1294,10 +1303,10 @@ export class CodexAppServerClient {
     });
     if (!exitSettled) this.#onSafeDiagnostic("Codex process exit did not settle after termination");
     if (!readSettled) this.#onSafeDiagnostic("Codex stdout did not settle after termination");
-    if (!factsSettled) this.#onSafeDiagnostic("HRA fact delivery did not settle after Codex termination");
+    if (!factsSettled) this.#onSafeDiagnostic("Oompa fact delivery did not settle after Codex termination");
     if (!writesSettled) this.#onSafeDiagnostic("Codex writes did not settle after termination");
     if (!inboundSettled) {
-      this.#onSafeDiagnostic("HRA dynamic-tool handling did not settle after Codex termination");
+      this.#onSafeDiagnostic("Oompa dynamic-tool handling did not settle after Codex termination");
     }
     if (!serverRequestsSettled) {
       this.#onSafeDiagnostic("Codex server-request handling did not settle after termination");
@@ -1485,7 +1494,7 @@ export class CodexAppServerClient {
   }
 
   #enqueueBufferedFact(fact: CodexFact): void {
-    this.#applyHraHostToolFactFence(fact);
+    this.#applyOompaHostToolFactFence(fact);
     if (fact.type === "serverRequestResolved") {
       void this.#enqueueFact({
         type: "protocolNotice",
@@ -1507,7 +1516,7 @@ export class CodexAppServerClient {
         id: rawProviderRequestId(requestId),
         error: {
           code: -32_001,
-          message: "HRA has not activated this provider connection",
+          message: "Oompa has not activated this provider connection",
         },
       });
       return;
@@ -1525,7 +1534,7 @@ export class CodexAppServerClient {
   }
 
   async #handleParsedFact(fact: CodexFact): Promise<void> {
-    this.#applyHraHostToolFactFence(fact);
+    this.#applyOompaHostToolFactFence(fact);
     if (this.#state !== "ready") return;
     const accountAuthoritySignaled = this.#signalAccountAuthority(fact);
     if (!(await this.#authorityIsCurrent())) return;
@@ -1539,9 +1548,9 @@ export class CodexAppServerClient {
     );
   }
 
-  #applyHraHostToolFactFence(fact: CodexFact): void {
+  #applyOompaHostToolFactFence(fact: CodexFact): void {
     if (fact.type === "providerDisconnected") {
-      this.#activeHraHostToolCalls.clear();
+      this.#activeOompaHostToolCalls.clear();
       this.#hostToolTurnFenceByThread.clear();
       return;
     }
@@ -1570,7 +1579,7 @@ export class CodexAppServerClient {
     ) {
       this.#rememberHostToolTurnFence(fact.threadId, null);
     }
-    for (const [key, call] of this.#activeHraHostToolCalls) {
+    for (const [key, call] of this.#activeOompaHostToolCalls) {
       const invalid = fact.type === "threadDeleted"
         ? call.threadId === fact.threadId
         : fact.type === "threadStatusChanged"
@@ -1585,7 +1594,7 @@ export class CodexAppServerClient {
                   ? call.threadId === fact.threadId
                     && providerRequestIdKey(call.requestId) === providerRequestIdKey(fact.requestId)
                   : false;
-      if (invalid) this.#activeHraHostToolCalls.delete(key);
+      if (invalid) this.#activeOompaHostToolCalls.delete(key);
     }
   }
 
@@ -1594,7 +1603,7 @@ export class CodexAppServerClient {
       !this.#hostToolTurnFenceByThread.has(threadId)
       && this.#hostToolTurnFenceByThread.size >= HOST_TOOL_TURN_FENCE_LIMIT
     ) {
-      this.#quarantineConnection("Codex exceeded the HRA host-tool turn-fence limit");
+      this.#quarantineConnection("Codex exceeded the Oompa host-tool turn-fence limit");
       return;
     }
     this.#hostToolTurnFenceByThread.set(threadId, turnId);
@@ -1671,7 +1680,7 @@ export class CodexAppServerClient {
           return;
         }
         this.#trackInboundDynamicRequest(
-          () => this.#handleHraHostToolCall(
+          () => this.#handleOompaHostToolCall(
             message.id,
             message.params ?? {},
           ),
@@ -1717,7 +1726,7 @@ export class CodexAppServerClient {
       return;
     }
     if (!pending.dispatched) {
-      this.#quarantineConnection("Codex emitted a response before HRA dispatched its request");
+      this.#quarantineConnection("Codex emitted a response before Oompa dispatched its request");
       return;
     }
     if (pending.responseReceived) return;
@@ -1832,7 +1841,7 @@ export class CodexAppServerClient {
     });
   }
 
-  async #handleHraHostToolCall(
+  async #handleOompaHostToolCall(
     idValue: unknown,
     params: unknown,
   ): Promise<void> {
@@ -1842,8 +1851,8 @@ export class CodexAppServerClient {
       this.#quarantineConnection("Codex reused a brokered request id for a dynamic tool");
       return;
     }
-    const genericHandler = this.#onHraHostToolCall;
-    const genericAfterWrite = this.#onHraHostToolResponseWritten;
+    const genericHandler = this.#onOompaHostToolCall;
+    const genericAfterWrite = this.#onOompaHostToolResponseWritten;
     const automationHandler = this.#onConversationAutomationToolCall;
     const automationAfterWrite = this.#onConversationAutomationToolResponseWritten;
     if (
@@ -1853,10 +1862,10 @@ export class CodexAppServerClient {
         && (automationHandler === undefined || automationAfterWrite === undefined)
       )
     ) {
-      if (!(await this.#hraHostToolAuthorityIsCurrent())) return;
-      await this.#writeHraHostToolFrame({
+      if (!(await this.#oompaHostToolAuthorityIsCurrent())) return;
+      await this.#writeOompaHostToolFrame({
         id: rawProviderRequestId(requestId),
-        error: { code: -32_601, message: "HRA did not advertise this host service" },
+        error: { code: -32_601, message: "Oompa did not advertise this host service" },
       });
       void this.#enqueueFact({
         type: "protocolNotice",
@@ -1866,9 +1875,9 @@ export class CodexAppServerClient {
       return;
     }
 
-    let call: HraHostToolCall;
+    let call: OompaHostToolCall;
     try {
-      call = parseHraHostToolCall({
+      call = parseOompaHostToolCall({
         authority: this.#authority,
         connectionId: this.#connectionId,
         requestId,
@@ -1877,11 +1886,11 @@ export class CodexAppServerClient {
     } catch (error: unknown) {
       const unsupported = error instanceof CodexError
         && error.code === "UNSUPPORTED_CAPABILITY";
-      if (!(await this.#hraHostToolAuthorityIsCurrent())) return;
-      await this.#writeHraHostToolFrame({
+      if (!(await this.#oompaHostToolAuthorityIsCurrent())) return;
+      await this.#writeOompaHostToolFrame({
         id: rawProviderRequestId(requestId),
         error: unsupported
-          ? { code: -32_601, message: "HRA did not advertise this dynamic tool" }
+          ? { code: -32_601, message: "Oompa did not advertise this dynamic tool" }
           : { code: -32_602, message: "Invalid dynamic tool call params" },
       });
       this.#onSafeDiagnostic(unsupported
@@ -1906,10 +1915,10 @@ export class CodexAppServerClient {
       ? async () => await automationAfterWrite(call)
       : undefined;
     if (invokeHostTool === undefined || notifyResponseWritten === undefined) {
-      if (!(await this.#hraHostToolAuthorityIsCurrent())) return;
-      await this.#writeHraHostToolFrame({
+      if (!(await this.#oompaHostToolAuthorityIsCurrent())) return;
+      await this.#writeOompaHostToolFrame({
         id: rawProviderRequestId(requestId),
-        error: { code: -32_601, message: "HRA did not advertise this dynamic tool" },
+        error: { code: -32_601, message: "Oompa did not advertise this dynamic tool" },
       });
       this.#onSafeDiagnostic("Codex requested a host tool without an admitted handler");
       void this.#enqueueFact({
@@ -1933,21 +1942,21 @@ export class CodexAppServerClient {
       this.#dynamicRequestDigests.set(requestKey, call.requestDigest);
     }
 
-    const activeKey = activeHraHostToolCallKey(call);
-    if (this.#activeHraHostToolCalls.has(activeKey)) {
-      this.#quarantineConnection("Codex reused an active HRA host-tool call id");
+    const activeKey = activeOompaHostToolCallKey(call);
+    if (this.#activeOompaHostToolCalls.has(activeKey)) {
+      this.#quarantineConnection("Codex reused an active Oompa host-tool call id");
       return;
     }
-    if (this.#activeHraHostToolCalls.size >= INBOUND_DYNAMIC_REQUEST_LIMIT) {
-      this.#quarantineConnection("Codex exceeded the active HRA host-tool call limit");
+    if (this.#activeOompaHostToolCalls.size >= INBOUND_DYNAMIC_REQUEST_LIMIT) {
+      this.#quarantineConnection("Codex exceeded the active Oompa host-tool call limit");
       return;
     }
-    this.#activeHraHostToolCalls.set(activeKey, call);
+    this.#activeOompaHostToolCalls.set(activeKey, call);
     try {
-      if (!(await this.#hraHostToolAuthorityIsCurrent())) return;
+      if (!(await this.#oompaHostToolAuthorityIsCurrent())) return;
       if (
-        this.#activeHraHostToolCalls.get(activeKey) !== call
-        || !this.hasLiveHraHostToolCall(call)
+        this.#activeOompaHostToolCalls.get(activeKey) !== call
+        || !this.hasLiveOompaHostToolCall(call)
       ) return;
       let invocation:
         | { readonly ok: true; readonly value: DynamicToolPublicResult }
@@ -1958,26 +1967,26 @@ export class CodexAppServerClient {
         invocation = { ok: false };
       }
       if (
-        this.#activeHraHostToolCalls.get(activeKey) !== call
-        || !this.hasLiveHraHostToolCall(call)
+        this.#activeOompaHostToolCalls.get(activeKey) !== call
+        || !this.hasLiveOompaHostToolCall(call)
       ) return;
 
       let text: string;
       try {
-        if (!invocation.ok) throw new CodexError("PROTOCOL_ERROR", "HRA host-tool handler failed");
-        if (!(await this.#hraHostToolAuthorityIsCurrent())) return;
+        if (!invocation.ok) throw new CodexError("PROTOCOL_ERROR", "Oompa host-tool handler failed");
+        if (!(await this.#oompaHostToolAuthorityIsCurrent())) return;
         text = serializeDynamicToolPublicResult(invocation.value);
       } catch {
-        if (!(await this.#hraHostToolAuthorityIsCurrent())) return;
-        this.#onSafeDiagnostic("HRA host-tool handler failed");
-        await this.#writeHraHostToolFrame({
+        if (!(await this.#oompaHostToolAuthorityIsCurrent())) return;
+        this.#onSafeDiagnostic("Oompa host-tool handler failed");
+        await this.#writeOompaHostToolFrame({
           id: rawProviderRequestId(requestId),
           result: {
             contentItems: [{
               type: "inputText",
               text: call.tool === "automation_update"
-                ? "HRA could not complete this conversation-bound scheduled task request."
-                : "HRA could not complete this host-tool request.",
+                ? "Oompa could not complete this conversation-bound scheduled task request."
+                : "Oompa could not complete this host-tool request.",
             }],
             success: false,
           },
@@ -1985,26 +1994,26 @@ export class CodexAppServerClient {
         return;
       }
 
-      if (!(await this.#writeHraHostToolFrame({
+      if (!(await this.#writeOompaHostToolFrame({
         id: rawProviderRequestId(requestId),
         result: {
           contentItems: [{ type: "inputText", text }],
           success: true,
         },
       }, call))) return;
-      if (!(await this.#hraHostToolAuthorityIsCurrent())) return;
+      if (!(await this.#oompaHostToolAuthorityIsCurrent())) return;
       if (
-        this.#activeHraHostToolCalls.get(activeKey) !== call
-        || !this.hasLiveHraHostToolCall(call)
+        this.#activeOompaHostToolCalls.get(activeKey) !== call
+        || !this.hasLiveOompaHostToolCall(call)
       ) return;
       try {
         await notifyResponseWritten();
       } catch {
-        this.#onSafeDiagnostic("HRA host-tool post-response hook failed");
+        this.#onSafeDiagnostic("Oompa host-tool post-response hook failed");
       }
     } finally {
-      if (this.#activeHraHostToolCalls.get(activeKey) === call) {
-        this.#activeHraHostToolCalls.delete(activeKey);
+      if (this.#activeOompaHostToolCalls.get(activeKey) === call) {
+        this.#activeOompaHostToolCalls.delete(activeKey);
       }
     }
   }
@@ -2013,9 +2022,9 @@ export class CodexAppServerClient {
     this.#effects.track("dynamic", task, () => {
       if (this.#state !== "ready") return;
       try {
-        this.#quarantineConnection("HRA dynamic-tool request handling failed");
+        this.#quarantineConnection("Oompa dynamic-tool request handling failed");
       } catch {
-        this.#onSafeDiagnostic("HRA could not terminate a failed dynamic-tool connection");
+        this.#onSafeDiagnostic("Oompa could not terminate a failed dynamic-tool connection");
       }
     });
   }
@@ -2026,12 +2035,12 @@ export class CodexAppServerClient {
       try {
         this.#quarantineConnection("Codex server-request handling failed");
       } catch {
-        this.#onSafeDiagnostic("HRA could not terminate a failed server-request connection");
+        this.#onSafeDiagnostic("Oompa could not terminate a failed server-request connection");
       }
     });
   }
 
-  async #hraHostToolAuthorityIsCurrent(): Promise<boolean> {
+  async #oompaHostToolAuthorityIsCurrent(): Promise<boolean> {
     let current = false;
     try {
       current = await this.#authorityIsCurrent();
@@ -2040,16 +2049,16 @@ export class CodexAppServerClient {
     }
     if (this.#state === "ready" && current) return true;
     if (this.#state === "ready") {
-      this.#quarantineConnection("HRA dynamic-tool request belongs to stale authority");
+      this.#quarantineConnection("Oompa dynamic-tool request belongs to stale authority");
     }
     return false;
   }
 
-  async #writeHraHostToolFrame(value: unknown, call?: HraHostToolCall): Promise<boolean> {
+  async #writeOompaHostToolFrame(value: unknown, call?: OompaHostToolCall): Promise<boolean> {
     try {
       await this.#writeFrame(value, {
         beforeWriteAsync: async () => {
-          if (!(await this.#hraHostToolAuthorityIsCurrent())) {
+          if (!(await this.#oompaHostToolAuthorityIsCurrent())) {
             throw new CodexError("AUTHORITY_STALE", "Codex process generation is stale");
           }
         },
@@ -2060,11 +2069,11 @@ export class CodexAppServerClient {
           if (
             call !== undefined
             && (
-              this.#activeHraHostToolCalls.get(activeHraHostToolCallKey(call)) !== call
-              || !this.hasLiveHraHostToolCall(call)
+              this.#activeOompaHostToolCalls.get(activeOompaHostToolCallKey(call)) !== call
+              || !this.hasLiveOompaHostToolCall(call)
             )
           ) {
-            throw new CodexError("AUTHORITY_STALE", "The HRA host-tool call is no longer live");
+            throw new CodexError("AUTHORITY_STALE", "The Oompa host-tool call is no longer live");
           }
         },
       });
@@ -2098,8 +2107,8 @@ export class CodexAppServerClient {
         error: {
           code: disposition === null ? -32_601 : -32_601,
           message: disposition === "internal_host_service"
-            ? "HRA did not advertise this host service"
-            : "HRA does not support this server request",
+            ? "Oompa did not advertise this host service"
+            : "Oompa does not support this server request",
         },
       });
       void this.#enqueueFact({ type: "protocolNotice", method, connectionId: this.#connectionId });
@@ -2123,7 +2132,7 @@ export class CodexAppServerClient {
         error: unsupportedCapability
           ? {
               code: -32_601,
-              message: "HRA cannot broker this server request capability",
+              message: "Oompa cannot broker this server request capability",
               data: { code: "UNSUPPORTED_CAPABILITY" },
             }
           : { code: -32_602, message: "Invalid server request params" },
@@ -2216,7 +2225,7 @@ export class CodexAppServerClient {
         if (pending.state !== "pending") return;
         await this.#writeFrame({
           id: rawProviderRequestId(requestId),
-          error: { code: -32_000, message: "HRA could not durably admit this interaction" },
+          error: { code: -32_000, message: "Oompa could not durably admit this interaction" },
         }).catch(() => undefined);
       },
     );
@@ -2257,8 +2266,8 @@ export class CodexAppServerClient {
       await this.#onFact({ authority: this.#authority, value: fact });
     }, (error) => {
       this.#onSafeDiagnostic(error instanceof Error
-        ? `HRA fact observer failed: ${error.name}`
-        : "HRA fact observer failed");
+        ? `Oompa fact observer failed: ${error.name}`
+        : "Oompa fact observer failed");
     });
   }
 
@@ -2286,7 +2295,7 @@ export class CodexAppServerClient {
   }
 
   #emitDisconnected(reason: "eof" | "process_exit" | "closed" | "protocol_fault"): void {
-    this.#activeHraHostToolCalls.clear();
+    this.#activeOompaHostToolCalls.clear();
     this.#hostToolTurnFenceByThread.clear();
     if (!this.#connectionAnnounced || this.#disconnectEmitted) return;
     this.#disconnectEmitted = true;
@@ -2300,7 +2309,7 @@ export class CodexAppServerClient {
   #quarantineConnection(message: string): void {
     if (this.#state === "closing" || this.#state === "closed" || this.#state === "failed") return;
     this.#state = "failed";
-    this.#activeHraHostToolCalls.clear();
+    this.#activeOompaHostToolCalls.clear();
     this.#hostToolTurnFenceByThread.clear();
     this.#wakeWriteBarrier();
     this.#onSafeDiagnostic(message);
@@ -2607,7 +2616,7 @@ function compileThreadPolicy(policy: ThreadPolicy): {
 
 function validateThreadStartResult(
   value: ThreadStartResult,
-  input: StartThreadInput,
+  input: ThreadStartRuntimeInput,
   runtimeWorkspaceRoots: readonly string[],
   cwd: string,
 ): ThreadStartResult {
@@ -2643,10 +2652,13 @@ function validateThreadStartResult(
   return value;
 }
 
-function sameAuthority(left: CodexAuthority, right: CodexAuthority): boolean {
+function sameAuthority(left: OompaHostToolCall["authority"], right: OompaHostToolCall["authority"]): boolean {
   return (
     left.profileId === right.profileId &&
-    left.processGeneration === right.processGeneration
+    left.processGeneration === right.processGeneration &&
+    left.provider === right.provider &&
+    left.providerAccountId === right.providerAccountId &&
+    left.bindingGeneration === right.bindingGeneration
   );
 }
 
@@ -2656,6 +2668,9 @@ function sameProviderInteractionAuthority(
 ): boolean {
   return left.profileId === right.profileId
     && left.processGeneration === right.processGeneration
+    && left.provider === right.provider
+    && left.providerAccountId === right.providerAccountId
+    && left.bindingGeneration === right.bindingGeneration
     && left.connectionId === right.connectionId
     && providerRequestIdKey(left.requestId) === providerRequestIdKey(right.requestId)
     && left.method === right.method

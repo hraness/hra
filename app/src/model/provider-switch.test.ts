@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { parseRemoteCommandPayload } from "../hra/cloud";
+import { parseRemoteCommandPayload } from "../oompa/cloud";
 import {
   buildDefaultSetProviderPayload,
   buildSetProviderPayload,

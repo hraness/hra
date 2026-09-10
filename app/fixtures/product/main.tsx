@@ -13,7 +13,7 @@ import "@hraness/design-kit/compiler-palettes.css";
 import "../../src/index.css";
 
 export type ProductPreviewStatusMessage = Readonly<{
-  type: "hra-preview-ready" | "hra-preview-failed";
+  type: "oompa-preview-ready" | "oompa-preview-failed";
   view: ProductPreviewView | null;
 }>;
 
@@ -52,10 +52,10 @@ function Screen({ session }: Readonly<{ session: ProductPreviewSession }>) {
         && stylesheets.every((link) => link.sheet !== null && !link.disabled);
       if (rendered && stylesReady && fontsReady && snapshot !== null && snapshot === previous) {
         document.documentElement.dataset.previewReady = "true";
-        notify({ type: "hra-preview-ready", view });
+        notify({ type: "oompa-preview-ready", view });
       } else if (performance.now() >= deadline) {
         document.documentElement.dataset.previewFailed = "true";
-        notify({ type: "hra-preview-failed", view });
+        notify({ type: "oompa-preview-failed", view });
       } else {
         previous = snapshot;
         frame = requestAnimationFrame(settle);
@@ -86,7 +86,7 @@ const failed = () => {
   session?.harness.recordBrowserActivityError();
   document.documentElement.dataset.previewFailed = "true";
   delete document.documentElement.dataset.previewReady;
-  notify({ type: "hra-preview-failed", view: selected });
+  notify({ type: "oompa-preview-failed", view: selected });
 };
 
 try {

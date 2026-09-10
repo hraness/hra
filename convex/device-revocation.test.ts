@@ -4,7 +4,7 @@ import type { Value } from "convex/values";
 import { convexTest } from "convex-test";
 
 import { sha256Hex } from "../src/cloud/crypto";
-import { buildHraAttentionEmailBody } from "./attentionEmail";
+import { buildOompaAttentionEmailBody } from "./attentionEmail";
 import { reserveAttentionNotificationFaultCapacity } from "./attentionNotificationControl";
 import { attentionNotificationQuotaReservations } from "./attentionNotifications";
 import {
@@ -513,7 +513,7 @@ async function insertNotificationFixtures(world: Awaited<ReturnType<typeof revoc
     await reserveNonterminalCommandQuotaForInsert(ctx, world.userId, started);
     const startedId = await ctx.db.insert("attentionNotificationOutbox", started);
     const deliveryId = uuidV7(now, "401");
-    const body = buildHraAttentionEmailBody([{
+    const body = buildOompaAttentionEmailBody([{
       interactionKind: started.interactionKind,
       sessionPublicId: started.sessionPublicId,
     }]);

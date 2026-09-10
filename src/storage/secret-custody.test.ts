@@ -67,7 +67,7 @@ const digest = (value: string): string => createHash("sha256").update(value).dig
 
 describe("FileSecretBackend atomic immutable publication", () => {
   test("publishes through one bounded pending file and never overwrites a final value", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-value-atomic-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-value-atomic-")));
     try {
       const root = join(home, "values");
       const backend = new FileSecretBackend(root);
@@ -83,7 +83,7 @@ describe("FileSecretBackend atomic immutable publication", () => {
   });
 
   test("enforces the public backend's 1..65,536 UTF-8 byte contract", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-value-bounds-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-value-bounds-")));
     try {
       const backend = new FileSecretBackend(join(home, "values"));
       await expect(backend.set("empty.value", ""))
@@ -100,7 +100,7 @@ describe("FileSecretBackend atomic immutable publication", () => {
   });
 
   test("rewrites a crash-partial deterministic pending file under its kernel lock", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-value-partial-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-value-partial-")));
     try {
       const root = join(home, "values");
       await mkdir(root, { mode: 0o700 });
@@ -117,7 +117,7 @@ describe("FileSecretBackend atomic immutable publication", () => {
 
   for (const failedSync of [1, 2] as const) {
     test(`restart reconciles publication when directory sync ${failedSync} fails`, async () => {
-      const home = await realpath(await mkdtemp(join(tmpdir(), `hra-value-sync-${failedSync}-`)));
+      const home = await realpath(await mkdtemp(join(tmpdir(), `oompa-value-sync-${failedSync}-`)));
       try {
         const root = join(home, "values");
         const failure = new Error(`sync ${failedSync}`);
@@ -141,7 +141,7 @@ describe("FileSecretBackend atomic immutable publication", () => {
   }
 
   test("an exact-value set replays a crash after link and before pending cleanup", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-value-exact-replay-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-value-exact-replay-")));
     try {
       const root = join(home, "values");
       const failure = new Error("post-link sync failure");
@@ -170,7 +170,7 @@ describe("FileSecretBackend atomic immutable publication", () => {
   });
 
   test("a no-op link cannot publish partial bytes at the final name", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-value-link-proof-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-value-link-proof-")));
     try {
       const root = join(home, "values");
       const interrupted = new FileSecretBackend(root, { linkAt: () => null });
@@ -189,7 +189,7 @@ describe("FileSecretBackend atomic immutable publication", () => {
   });
 
   test("link success must prove the exact final account name and inode", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-value-exact-link-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-value-exact-link-")));
     try {
       const root = join(home, "values");
       const backend = new FileSecretBackend(root, {
@@ -210,7 +210,7 @@ describe("FileSecretBackend atomic immutable publication", () => {
   });
 
   test("two live writers serialize on the per-account kernel lock", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-value-writers-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-value-writers-")));
     try {
       let release!: () => void;
       const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -240,7 +240,7 @@ describe("FileSecretBackend atomic immutable publication", () => {
   });
 
   test("a reader waiting on a linked pending inode observes the immutable final value", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-value-reader-race-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-value-reader-race-")));
     try {
       let release!: () => void;
       const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -271,7 +271,7 @@ describe("FileSecretBackend atomic immutable publication", () => {
   });
 
   test("delete attempts final and pending cleanup and remains idempotent", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-value-delete-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-value-delete-")));
     try {
       const root = join(home, "values");
       const backend = new FileSecretBackend(root);
@@ -305,7 +305,7 @@ describe("descriptor-relative authority and ACLs", () => {
 
   for (const operation of ["get", "set", "delete"] as const) {
     test(`${operation} cannot traverse a parent swapped at its exact child boundary`, async () => {
-      const home = await realpath(await mkdtemp(join(tmpdir(), `hra-value-${operation}-swap-`)));
+      const home = await realpath(await mkdtemp(join(tmpdir(), `oompa-value-${operation}-swap-`)));
       try {
         const parent = join(home, "authority");
         const root = join(parent, "values");
@@ -356,7 +356,7 @@ describe("descriptor-relative authority and ACLs", () => {
 
   test("Darwin ACL present/indeterminate states fail closed for root and value descriptors", async () => {
     for (const inspection of ["present", "indeterminate"] as const) {
-      const home = await realpath(await mkdtemp(join(tmpdir(), `hra-acl-root-${inspection}-`)));
+      const home = await realpath(await mkdtemp(join(tmpdir(), `oompa-acl-root-${inspection}-`)));
       try {
         const rootRejected = new FileSecretBackend(join(home, "root-values"), {
           inspectDarwinAcl: () => inspection,
@@ -379,7 +379,7 @@ describe("descriptor-relative authority and ACLs", () => {
   });
 
   test("descriptor cleanup cannot replace the original ACL failure", async () => {
-    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-acl-cleanup-order-")));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "oompa-acl-cleanup-order-")));
     try {
       let closed = false;
       const backend = new FileSecretBackend(join(home, "values"), {
@@ -410,7 +410,7 @@ describe("descriptor-relative authority and ACLs", () => {
 
 describe("GenerationalSecretCustody bounded state machine", () => {
   test("keeps one current value and a compact v3 pointer across high churn", async () => {
-    const { home, paths } = await fixture("hra-cas-churn-");
+    const { home, paths } = await fixture("oompa-cas-churn-");
     try {
       const custody = new GenerationalSecretCustody(paths);
       let expected: number | null = null;
@@ -434,7 +434,7 @@ describe("GenerationalSecretCustody bounded state machine", () => {
   }, 30_000);
 
   test("aggregate files and bytes are linear in slot count after repeated generations", async () => {
-    const { home, paths } = await fixture("hra-cas-aggregate-");
+    const { home, paths } = await fixture("oompa-cas-aggregate-");
     try {
       const custody = new GenerationalSecretCustody(paths);
       const slots = 8;
@@ -467,7 +467,7 @@ describe("GenerationalSecretCustody bounded state machine", () => {
   }, 30_000);
 
   test("restart rolls back a staged CAS whose value publication never linked", async () => {
-    const { home, paths } = await fixture("hra-cas-staged-rollback-");
+    const { home, paths } = await fixture("oompa-cas-staged-rollback-");
     try {
       const failure = new Error("injected link failure");
       const backend = new FileSecretBackend(join(paths.root, "secret-values"), {
@@ -490,7 +490,7 @@ describe("GenerationalSecretCustody bounded state machine", () => {
   });
 
   test("restart commits a staged pointer after the exact new value was published", async () => {
-    const { home, paths } = await fixture("hra-cas-staged-commit-");
+    const { home, paths } = await fixture("oompa-cas-staged-commit-");
     try {
       let failRename = true;
       const interrupted = new GenerationalSecretCustody(paths, undefined, {
@@ -515,7 +515,7 @@ describe("GenerationalSecretCustody bounded state machine", () => {
   });
 
   test("a no-op rename cannot be reported as an authoritative pointer commit", async () => {
-    const { home, paths } = await fixture("hra-pointer-noop-rename-");
+    const { home, paths } = await fixture("oompa-pointer-noop-rename-");
     try {
       const interrupted = new GenerationalSecretCustody(paths, undefined, {
         renameAt: () => null,
@@ -536,7 +536,7 @@ describe("GenerationalSecretCustody bounded state machine", () => {
 
   test("retired deletion failure and deletion-before-compaction crash replay idempotently", async () => {
     for (const boundary of ["delete", "compact"] as const) {
-      const { home, paths } = await fixture(`hra-retired-${boundary}-`);
+      const { home, paths } = await fixture(`oompa-retired-${boundary}-`);
       try {
         const backend = new MemoryBackend();
         let armed = false;
@@ -569,7 +569,7 @@ describe("GenerationalSecretCustody bounded state machine", () => {
   });
 
   test("v1 pointers and v2 clearing/cleared replay remain compatible", async () => {
-    const { home, paths } = await fixture("hra-pointer-compat-");
+    const { home, paths } = await fixture("oompa-pointer-compat-");
     try {
       const backend = new MemoryBackend();
       const nonce = crypto.randomUUID();
@@ -611,7 +611,7 @@ describe("GenerationalSecretCustody bounded state machine", () => {
   });
 
   test("generation increment rejects safe-integer exhaustion", async () => {
-    const { home, paths } = await fixture("hra-generation-exhaustion-");
+    const { home, paths } = await fixture("oompa-generation-exhaustion-");
     try {
       const backend = new MemoryBackend();
       const nonce = crypto.randomUUID();
@@ -637,7 +637,7 @@ describe("GenerationalSecretCustody bounded state machine", () => {
 
 describe("persistent slot locks, metadata authority, and closed ACL output", () => {
   test("converts an old PID lock and crash-after-quarantine hardlink without PID authority", async () => {
-    const { home, paths } = await fixture("hra-lock-conversion-");
+    const { home, paths } = await fixture("oompa-lock-conversion-");
     try {
       const metadataRoot = join(paths.root, "secret-metadata");
       await mkdir(metadataRoot, { mode: 0o700 });
@@ -660,7 +660,7 @@ describe("persistent slot locks, metadata authority, and closed ACL output", () 
   });
 
   test("recovers an orphan quarantine link left after canonical lock unlink", async () => {
-    const { home, paths } = await fixture("hra-lock-orphan-quarantine-");
+    const { home, paths } = await fixture("oompa-lock-orphan-quarantine-");
     try {
       const metadataRoot = join(paths.root, "secret-metadata");
       await mkdir(metadataRoot, { mode: 0o700 });
@@ -684,7 +684,7 @@ describe("persistent slot locks, metadata authority, and closed ACL output", () 
   });
 
   test("retries when the canonical lock name is replaced while flock admission waits", async () => {
-    const { home, paths } = await fixture("hra-lock-canonical-retry-");
+    const { home, paths } = await fixture("oompa-lock-canonical-retry-");
     try {
       const metadataRoot = join(paths.root, "secret-metadata");
       await mkdir(metadataRoot, { mode: 0o700 });
@@ -712,7 +712,7 @@ describe("persistent slot locks, metadata authority, and closed ACL output", () 
   });
 
   test("concurrent CAS attempts serialize through the persistent descriptor lock", async () => {
-    const { home, paths } = await fixture("hra-slot-flock-");
+    const { home, paths } = await fixture("oompa-slot-flock-");
     try {
       const backend = new MemoryBackend();
       const custody = new GenerationalSecretCustody(paths, backend);
@@ -730,7 +730,7 @@ describe("persistent slot locks, metadata authority, and closed ACL output", () 
   });
 
   test("pointer rename remains in the held root across exact-boundary substitution", async () => {
-    const { home, paths } = await fixture("hra-pointer-root-swap-");
+    const { home, paths } = await fixture("oompa-pointer-root-swap-");
     try {
       const metadataRoot = join(paths.root, "secret-metadata");
       const displaced = join(home, "metadata-displaced");
@@ -768,7 +768,7 @@ describe("persistent slot locks, metadata authority, and closed ACL output", () 
   });
 
   test("an expected-generation mismatch still proves the metadata root before returning", async () => {
-    const { home, paths } = await fixture("hra-pointer-read-root-swap-");
+    const { home, paths } = await fixture("oompa-pointer-read-root-swap-");
     try {
       const backend = new MemoryBackend();
       const initial = new GenerationalSecretCustody(paths, backend);
@@ -802,7 +802,7 @@ describe("persistent slot locks, metadata authority, and closed ACL output", () 
   });
 
   test("Darwin ACL checks cover metadata root, lock, and authoritative pointer descriptors", async () => {
-    const { home, paths } = await fixture("hra-metadata-acl-");
+    const { home, paths } = await fixture("oompa-metadata-acl-");
     try {
       const rootRejected = new GenerationalSecretCustody(paths, new MemoryBackend(), {
         inspectDarwinAcl: () => "present",
@@ -840,7 +840,7 @@ describe("persistent slot locks, metadata authority, and closed ACL output", () 
   });
 
   test("operation and unlock failures preserve original-first aggregation and attempt close", async () => {
-    const { home, paths } = await fixture("hra-cleanup-aggregate-");
+    const { home, paths } = await fixture("oompa-cleanup-aggregate-");
     try {
       const primary = new Error("primary pointer failure");
       const custody = new GenerationalSecretCustody(paths, new MemoryBackend(), {

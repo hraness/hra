@@ -10,12 +10,22 @@ import {
   type DesktopRecoveryStorePort,
 } from "./recovery.ts";
 
-const stateRoot = join(tmpdir(), "hra-recovery-test");
+const stateRoot = join(tmpdir(), "oompa-recovery-test");
 const targetProfileId = "acct_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const idempotencyKey = "11111111-1111-4111-8111-111111111111";
 const executablePath = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT";
 const cdHash = "a".repeat(40);
 const identityToken = "b".repeat(64);
+
+function providerAuthority(profileId: string, processGeneration: number) {
+  return {
+    providerAccountId: profileId,
+    profileId,
+    provider: "codex" as const,
+    bindingGeneration: 1,
+    processGeneration,
+  };
+}
 
 const capability: ChatGptBundleCapability = {
   status: "supported-experimental",
@@ -45,8 +55,10 @@ function recoveryPlan(originalPhase = "launch_started") {
     switchGeneration: 7,
     sourceProfileId: null,
     sourceProcessGeneration: null,
+    sourceProviderAuthority: null,
     targetProfileId,
     targetProcessGeneration: 3,
+    targetProviderAuthority: providerAuthority(targetProfileId, 3),
     originalPhase,
     diagnostic: "EFFECT_ADJACENT_RESTART",
     recoveryDeadlineAt: 2_000,
@@ -101,8 +113,10 @@ function fixture(options: {
         switchGeneration: input.switchGeneration,
         sourceProfileId: input.sourceProfileId,
         sourceProcessGeneration: input.sourceProcessGeneration,
+        sourceProviderAuthority: input.sourceProviderAuthority,
         targetProfileId: input.targetProfileId,
         targetProcessGeneration: input.targetProcessGeneration,
+        targetProviderAuthority: input.targetProviderAuthority,
         diagnostic: input.diagnostic,
         observationDigest: input.observationDigest,
         resolvedAt: 5_000,
@@ -194,6 +208,7 @@ describe("DesktopSwitchRecoveryController", () => {
         ...recoveryPlan("quit_started"),
         sourceProfileId,
         sourceProcessGeneration: 2,
+        sourceProviderAuthority: providerAuthority(sourceProfileId, 2),
       },
       instances: [
         instance(source.codexHome, source.desktopUserData),
@@ -216,7 +231,7 @@ describe("DesktopSwitchRecoveryController", () => {
     expect(await multiple.controller.recover(new AbortController().signal)).toMatchObject({
       status: "recovery_required",
       diagnostic: "MULTIPLE_EXACT_PROCESSES",
-      action: "hra account switch-recover",
+      action: "oompa account switch-recover",
     });
 
     const changing = fixture({

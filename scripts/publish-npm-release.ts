@@ -35,9 +35,9 @@ const verifiedTag = process.env.VERIFIED_TAG;
 const verifiedSha = process.env.VERIFIED_SHA;
 const runId = process.env.GITHUB_RUN_ID;
 const runAttempt = process.env.GITHUB_RUN_ATTEMPT;
-const preflightArtifactState = process.env.HRA_NPM_PREFLIGHT_STATE;
-const preflightRunAttempt = process.env.HRA_NPM_PREFLIGHT_RUN_ATTEMPT;
-const preflightRunId = process.env.HRA_NPM_PREFLIGHT_RUN_ID;
+const preflightArtifactState = process.env.OOMPA_NPM_PREFLIGHT_STATE;
+const preflightRunAttempt = process.env.OOMPA_NPM_PREFLIGHT_RUN_ATTEMPT;
+const preflightRunId = process.env.OOMPA_NPM_PREFLIGHT_RUN_ID;
 if (
   verifiedTag !== `v${inspection.version}`
   || verifiedSha === undefined

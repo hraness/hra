@@ -6,7 +6,7 @@ import {
   isRecord,
   isUuidV7,
   type CommandState,
-} from "../hra/cloud";
+} from "../oompa/cloud";
 import type {
   WireCommandReceiptProofArgs,
   WireDeviceEnqueueArgs,

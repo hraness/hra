@@ -31,7 +31,7 @@ import {
 } from "../public-provider-identifier";
 
 const CURSOR_PREFIX = "hra1";
-export const HRA_CURSOR_MAX_BYTES = SESSION_EVENT_CURSOR_MAX_BYTES;
+export const OOMPA_CURSOR_MAX_BYTES = SESSION_EVENT_CURSOR_MAX_BYTES;
 
 export type SessionEventCursorErrorReason =
   | "filter_mismatch"
@@ -494,7 +494,7 @@ export class SessionEventCursorCodec {
       && typeof envelope.value.type === "string"
     ) {
       throw new SessionEventCursorError(
-        "A typed HRA cursor cannot be used as a session event cursor.",
+        "A typed Oompa cursor cannot be used as a session event cursor.",
         "type_mismatch",
       );
     }
@@ -523,7 +523,7 @@ export class SessionEventCursorCodec {
       || envelope.value.type !== "work"
     ) {
       throw new SessionEventCursorError(
-        "Another HRA cursor type cannot be used as a work event cursor.",
+        "Another Oompa cursor type cannot be used as a work event cursor.",
         "type_mismatch",
       );
     }
@@ -565,7 +565,7 @@ export class SessionEventCursorCodec {
       || envelope.value.type !== "work_actions"
     ) {
       throw new SessionEventCursorError(
-        "Another HRA cursor type cannot be used as a work action cursor.",
+        "Another Oompa cursor type cannot be used as a work action cursor.",
         "type_mismatch",
       );
     }
@@ -609,7 +609,7 @@ export class SessionEventCursorCodec {
       || envelope.value.type !== "work_task_history"
     ) {
       throw new SessionEventCursorError(
-        "Another HRA cursor type cannot be used as a work task history cursor.",
+        "Another Oompa cursor type cannot be used as a work task history cursor.",
         "type_mismatch",
       );
     }
@@ -705,7 +705,7 @@ export class SessionEventCursorCodec {
       || envelope.value.type !== "session_list_local"
     ) {
       throw new SessionEventCursorError(
-        "Another HRA cursor type cannot be used as a local session-list cursor.",
+        "Another Oompa cursor type cannot be used as a local session-list cursor.",
         "type_mismatch",
       );
     }
@@ -761,7 +761,7 @@ export class SessionEventCursorCodec {
       || envelope.value.type !== "session_list_composite"
     ) {
       throw new SessionEventCursorError(
-        "Another HRA cursor type cannot be used as a composite session-list cursor.",
+        "Another Oompa cursor type cannot be used as a composite session-list cursor.",
         "type_mismatch",
       );
     }
@@ -819,7 +819,7 @@ export class SessionEventCursorCodec {
       || envelope.value.type !== "peer_session_list"
     ) {
       throw new SessionEventCursorError(
-        "Another HRA cursor type cannot be used as a peer session-list cursor.",
+        "Another Oompa cursor type cannot be used as a peer session-list cursor.",
         "type_mismatch",
       );
     }
@@ -968,7 +968,7 @@ export class SessionEventCursorCodec {
       || envelope.value.type !== "session_list"
     ) {
       throw new SessionEventCursorError(
-        "Another HRA cursor type cannot be used as a session-list cursor.",
+        "Another Oompa cursor type cannot be used as a session-list cursor.",
         "type_mismatch",
       );
     }
@@ -1031,7 +1031,7 @@ export class SessionEventCursorCodec {
       || envelope.value.type !== "session_list_account_local"
     ) {
       throw new SessionEventCursorError(
-        "Another HRA cursor type cannot be used as an account local-session cursor.",
+        "Another Oompa cursor type cannot be used as an account local-session cursor.",
         "type_mismatch",
       );
     }
@@ -1058,14 +1058,14 @@ export class SessionEventCursorCodec {
     const encodedPayload = Buffer.from(payloadJson, "utf8").toString("base64url");
     const signature = this.#signature(encodedPayload).toString("base64url");
     const cursor = `${CURSOR_PREFIX}.${encodedPayload}.${signature}`;
-    if (Buffer.byteLength(cursor, "utf8") > HRA_CURSOR_MAX_BYTES) {
+    if (Buffer.byteLength(cursor, "utf8") > OOMPA_CURSOR_MAX_BYTES) {
       throw new Error(`${label} exceeds its byte bound.`);
     }
     return cursor;
   }
 
   #decodeEnvelope(cursor: string, label: string): DecodedCursorEnvelope {
-    if (Buffer.byteLength(cursor, "utf8") > HRA_CURSOR_MAX_BYTES) {
+    if (Buffer.byteLength(cursor, "utf8") > OOMPA_CURSOR_MAX_BYTES) {
       throw new SessionEventCursorError(`${label} exceeds its byte bound.`, "too_large");
     }
     const parts = cursor.split(".");

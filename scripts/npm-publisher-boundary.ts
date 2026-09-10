@@ -95,7 +95,7 @@ export function assertNpmPublisherIdentity(
     || source.GITHUB_REF !== `refs/tags/${expectedTag}`
     || source.GITHUB_REF_NAME !== expectedTag
     || source.GITHUB_REF_TYPE !== "tag"
-    || source.GITHUB_REPOSITORY !== "hraness/hra"
+    || source.GITHUB_REPOSITORY !== "hraness/oompa"
     || source.GITHUB_REPOSITORY_ID !== "1343008607"
     || source.GITHUB_REPOSITORY_OWNER !== "hraness"
     || source.GITHUB_REPOSITORY_OWNER_ID !== "307125679"
@@ -103,7 +103,7 @@ export function assertNpmPublisherIdentity(
     || source.GITHUB_SERVER_URL !== "https://github.com"
     || source.GITHUB_JOB !== "npm_mirror"
     || source.GITHUB_WORKFLOW !== "Release"
-    || source.GITHUB_WORKFLOW_REF !== `hraness/hra/.github/workflows/release.yml@refs/tags/${expectedTag}`
+    || source.GITHUB_WORKFLOW_REF !== `hraness/oompa/.github/workflows/release.yml@refs/tags/${expectedTag}`
     || source.GITHUB_WORKFLOW_SHA !== expectedSha
     || source.RUNNER_ENVIRONMENT !== "github-hosted"
     || source.ACTIONS_ID_TOKEN_REQUEST_TOKEN === undefined
@@ -216,7 +216,7 @@ async function createNpmPublisherConfiguration(): Promise<NpmPublisherConfigurat
   let directory: string | undefined;
   try {
     const parent = await realpath(tmpdir());
-    directory = await mkdtemp(join(parent, "hra-npm-publisher-"));
+    directory = await mkdtemp(join(parent, "oompa-npm-publisher-"));
     directory = await realpath(directory);
     configuration = Object.freeze({
       directory,

@@ -9,7 +9,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { useCustody } from "../custody/custody-context";
-import { decryptSessionMetadata, type SessionMetadataPayload } from "../hra/cloud";
+import { decryptSessionMetadata, type SessionMetadataPayload } from "../oompa/cloud";
 import { createCancellation } from "../lib/cancellation";
 import { archivedSessionRows, type ArchivedSessionView } from "../model/settings-view";
 import type { SessionHead } from "./wire";

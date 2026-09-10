@@ -11,7 +11,7 @@ async function withFixture(
   files: Readonly<Record<string, string>>,
   run: (root: string) => Promise<void> | void,
 ): Promise<void> {
-  const root = await mkdtemp(join(tmpdir(), "hra-import-cycles-"));
+  const root = await mkdtemp(join(tmpdir(), "oompa-import-cycles-"));
   try {
     for (const [path, content] of Object.entries(files)) {
       await mkdir(join(root, path, ".."), { recursive: true });

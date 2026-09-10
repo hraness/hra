@@ -16,7 +16,7 @@ import { useComposerAttachments } from "../data/composer-attachments";
 import { holdSentAttachment } from "../data/sent-attachments";
 import { useSessionHead } from "../data/session-heads";
 import { useSessionModel } from "../data/session-model-hook";
-import type { RemoteCommandPayload } from "../hra/cloud";
+import type { RemoteCommandPayload } from "../oompa/cloud";
 import {
   attachmentAcceptAttribute,
   attachmentSendSupported,

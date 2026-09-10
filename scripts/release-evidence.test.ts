@@ -16,14 +16,14 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { HRA_VERSION } from "../src/version";
+import { OOMPA_VERSION } from "../src/version";
 
 import {
   canonicalDigest,
   canonicalJson,
   deployEvidenceSchema,
-  HRA_CONVEX_PROJECT_ID,
-  HRA_CONVEX_TEAM_ID,
+  OOMPA_CONVEX_PROJECT_ID,
+  OOMPA_CONVEX_TEAM_ID,
   liveAcceptanceEvidenceDocumentSchema,
   readProtectedJson,
   withSelfDigest,
@@ -34,7 +34,7 @@ import {
 const roots: string[] = [];
 
 const makeRoot = async (): Promise<string> => {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-release-evidence-test-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-release-evidence-test-")));
   await chmod(root, 0o700);
   roots.push(root);
   return root;
@@ -74,11 +74,11 @@ describe("release evidence canonicalization", () => {
   test("parses both historical and current package versions for durable live evidence", () => {
     const historical = liveEvidence();
     const { selfDigest: _historicalDigest, ...unsigned } = historical;
-    const current = withSelfDigest({ ...unsigned, packageVersion: HRA_VERSION });
+    const current = withSelfDigest({ ...unsigned, packageVersion: OOMPA_VERSION });
 
     expect(_historicalDigest).toHaveLength(64);
     expect(liveAcceptanceEvidenceDocumentSchema.parse(historical).packageVersion).toBe("0.1.0");
-    expect(liveAcceptanceEvidenceDocumentSchema.parse(current).packageVersion).toBe(HRA_VERSION);
+    expect(liveAcceptanceEvidenceDocumentSchema.parse(current).packageVersion).toBe(OOMPA_VERSION);
     for (const packageVersion of [
       "01.2.3",
       "1.02.3",
@@ -101,8 +101,8 @@ describe("release evidence canonicalization", () => {
       deploymentId: 5_089_017,
       deploymentName: "qualified-hummingbird-537",
       deploymentUrl: "https://qualified-hummingbird-537.convex.cloud",
-      projectId: HRA_CONVEX_PROJECT_ID,
-      teamId: HRA_CONVEX_TEAM_ID,
+      projectId: OOMPA_CONVEX_PROJECT_ID,
+      teamId: OOMPA_CONVEX_TEAM_ID,
     } as const;
     const invalid = withSelfDigest({
       after: {

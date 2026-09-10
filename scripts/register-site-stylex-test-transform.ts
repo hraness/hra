@@ -16,7 +16,7 @@ const collector = createStylexTransformCollector(repositoryRoot);
 // The site and its two pure native-menu files share this compiler. Other app,
 // CLI, provider and cloud modules retain their ordinary loading boundary.
 Bun.plugin({
-  name: "hra-site-stylex-test-transform",
+  name: "oompa-site-stylex-test-transform",
   setup(build) {
     build.onLoad({ filter: siteStylexTestFilter }, async ({ path }) => {
       const contents = (await collector.transform(await Bun.file(path).text(), path)).code;

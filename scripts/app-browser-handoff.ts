@@ -21,7 +21,7 @@ export type BrowserPrepared = Readonly<{
 }>;
 export type BrowserHandoff = Readonly<{ request: BrowserRequest; prepared: BrowserPrepared }>;
 export type BrowserExecutionEvidence = Readonly<{
-  schemaVersion: 1; kind: "hra-browser-execution-admission"; root: string; run: string;
+  schemaVersion: 1; kind: "oompa-browser-execution-admission"; root: string; run: string;
   requestSha256: string; preparedSha256: string; producerDriver: BrowserFile; executionDriver: BrowserFile;
 }>;
 /** This in-memory capability belongs to the Node bootstrap. A serialized copy
@@ -218,7 +218,7 @@ async function readBrowserPreparedInputs(root: string, run: string): Promise<Bro
   const prepared = parseBrowserPrepared(JSON.parse((await readBrowserFile(join(run, "prepared.json"), 16 * 1024 * 1024)).toString("utf8")) as unknown);
   assert.equal(prepared.requestSha256, browserDigest(bytes)); assert.deepEqual(prepared.buildRuntime.executable, request.bun);
   await verifyBrowserRequest(request);
-  await verifyBrowserInventory(join(run, "fixture/hra-app"), prepared.fixture);
+  await verifyBrowserInventory(join(run, "fixture/oompa-app"), prepared.fixture);
   return { request, prepared };
 }
 /** Producer-bound reads retain their original strict seven-field contract. */
@@ -296,7 +296,7 @@ export function createBrowserAdmissionController(root: string, run: string, sign
         assert.deepEqual(await operations.readDriver(), executionDriver, "Browser driver changed during execution admission");
         assertReady();
         const evidence: BrowserExecutionEvidence = freezeBrowserSnapshot({
-          schemaVersion: 1, kind: "hra-browser-execution-admission", root, run,
+          schemaVersion: 1, kind: "oompa-browser-execution-admission", root, run,
           requestSha256: snapshot.prepared.requestSha256, preparedSha256: browserDigest(JSON.stringify(snapshot.prepared)),
           producerDriver: snapshot.prepared.driver, executionDriver,
         });

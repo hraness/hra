@@ -8,8 +8,9 @@ import {
   IndeterminateCodexEffectError,
   launchPinnedCodexAppServer,
   type CodexAppServerClient,
+  type CodexAuthority,
   type CodexFact,
-  type HraHostToolCall,
+  type OompaHostToolCall,
   type CodexThread,
   type CodexThreadItem,
   type CodexTurn,
@@ -25,7 +26,8 @@ import {
   replaceCodexDesktopHeartbeatTitle,
 } from "../domain/codex-heartbeat-envelope";
 import type { PreparedAttachment } from "../domain/attachments";
-import { HRA_SESSION_PREAMBLE_TEXT } from "../domain/hra-preamble";
+import { codexProviderAccountIdSchema } from "../domain/provider-accounts";
+import { OOMPA_SESSION_PREAMBLE_TEXT } from "../domain/oompa-preamble";
 import {
   assertPresetSupportedByProvider,
   type Preset,
@@ -110,6 +112,66 @@ type AccountAuthorityBarrier = {
   readonly settled: boolean;
 };
 
+const sameProfileAuthority = (
+  left: ProfileAuthority,
+  right: ProfileAuthority,
+): boolean => left.id === right.id
+  && left.generation === right.generation
+  && left.provider === right.provider
+  && left.providerAccountId === right.providerAccountId
+  && left.bindingGeneration === right.bindingGeneration;
+
+const codexAuthorityOf = (authority: ProfileAuthority): CodexAuthority => {
+  if (
+    authority.provider !== "codex"
+    || !codexProviderAccountIdSchema.safeParse(authority.providerAccountId).success
+    || !Number.isSafeInteger(authority.bindingGeneration)
+    || authority.bindingGeneration < 1
+    || !Number.isSafeInteger(authority.generation)
+    || authority.generation < 1
+  ) {
+    throw new CodexError(
+      "AUTHORITY_STALE",
+      "The live Codex provider-account authority is invalid.",
+    );
+  }
+  return {
+    profileId: authority.id,
+    processGeneration: authority.generation,
+    provider: "codex",
+    providerAccountId: authority.providerAccountId,
+    bindingGeneration: authority.bindingGeneration,
+  };
+};
+
+const sameCodexAuthority = (
+  left: Omit<CodexAuthority, "provider"> & { readonly provider: unknown },
+  right: CodexAuthority,
+): boolean =>
+  left.profileId === right.profileId
+  && left.processGeneration === right.processGeneration
+  && left.provider === right.provider
+  && left.providerAccountId === right.providerAccountId
+  && left.bindingGeneration === right.bindingGeneration;
+
+const profileAuthorityTombstoneKey = (authority: ProfileAuthority): string =>
+  JSON.stringify([
+    authority.id,
+    authority.generation,
+    authority.provider,
+    authority.providerAccountId,
+    authority.bindingGeneration,
+  ]);
+
+const interactionMatchesProfileAuthority = (
+  provider: ProviderInteractionAuthority,
+  authority: ProfileAuthority,
+): boolean => provider.profileId === authority.id
+  && provider.processGeneration === authority.generation
+  && provider.provider === authority.provider
+  && provider.providerAccountId === authority.providerAccountId
+  && provider.bindingGeneration === authority.bindingGeneration;
+
 const assertReviewedThreadRuntime = (
   value: ThreadStartResult,
   profile: EffectiveRuntimeProfile,
@@ -147,13 +209,13 @@ const assertReviewedThreadRuntime = (
 
 export type CodexRuntimeObserver = {
   account(authority: ProfileAuthority, account: CodexAccountProjection): void | Promise<void>;
-  hraHostTool?(
+  oompaHostTool?(
     authority: ProfileAuthority,
-    call: HraHostToolCall,
+    call: OompaHostToolCall,
   ): DynamicToolPublicResult | Promise<DynamicToolPublicResult>;
-  hraHostToolResponseWritten?(
+  oompaHostToolResponseWritten?(
     authority: ProfileAuthority,
-    call: HraHostToolCall,
+    call: OompaHostToolCall,
   ): void | Promise<void>;
   fact(authority: ProfileAuthority, fact: CodexFact): void | Promise<void>;
 };
@@ -772,9 +834,12 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
   readonly #background = new Set<Promise<unknown>>();
   readonly #accountRefreshes = new Map<string, AccountAuthorityBarrier>();
   readonly #accountRefreshDirty = new Set<string>();
-  readonly #authorityCloseClients = new Map<string, CodexAppServerClient>();
+  readonly #endedAuthorityTombstones = new Set<string>();
+  readonly #authorityCloseClients = new Map<string, Readonly<{
+    profileId: string;
+    client: CodexAppServerClient;
+  }>>();
   readonly #authorityCloseTasks = new Map<string, Promise<void>>();
-  readonly #endedGenerationByProfile = new Map<string, number>();
   readonly #deterministicallyDisconnectedByProfile = new Map<
     string,
     DeterministicallyDisconnectedClient
@@ -998,8 +1063,12 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     if (pending?.review === review) this.#runtimeReviews.delete(review.reviewId);
   }
 
-  async startSession(input: { authority: ProfileAuthority; projectRoot?: string; review: RuntimeStartReview; signal: AbortSignal }): Promise<CodexSessionProjection & { effectiveRuntimeProfile: EffectiveRuntimeProfile }> {
+  async startSession(input: { authority: ProfileAuthority; hostCapabilities?: "current" | "historical_v1"; projectRoot?: string; review: RuntimeStartReview; signal: AbortSignal }): Promise<CodexSessionProjection & { effectiveRuntimeProfile: EffectiveRuntimeProfile }> {
     return await this.#admit(async () => {
+      const hostCapabilityInput: { readonly hostCapabilities?: unknown } = input;
+      if (hostCapabilityInput.hostCapabilities !== undefined && hostCapabilityInput.hostCapabilities !== "current" && hostCapabilityInput.hostCapabilities !== "historical_v1") {
+        throw new CodexError("INVALID_INPUT", "The session host-capability mode is invalid");
+      }
       if (input.projectRoot === undefined) throw new Error("A project directory is required before starting a session.");
       if (input.signal.aborted) throw input.signal.reason;
       const reviewed = this.#consumeReview(input.review, {
@@ -1012,7 +1081,9 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
       const observationFactSequence = running.sessionObservationFactSequence;
       const started = (await running.client.startThread({
         cwd: input.projectRoot,
-        developerInstructions: HRA_SESSION_PREAMBLE_TEXT,
+        ...(input.hostCapabilities === "historical_v1"
+          ? { hostCapabilities: "historical_v1" as const }
+          : { developerInstructions: OOMPA_SESSION_PREAMBLE_TEXT }),
         preset,
         policy: this.#policy(input.projectRoot),
       })).value;
@@ -1047,10 +1118,11 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
         this.#assertObservedClientCurrent(running);
         if (
           (running.sessionObservationFactByThread.get(projection.providerThreadId) ?? 0)
-          <= observationFactSequence
+          > observationFactSequence
         ) {
-          this.#rememberSessionObservation(running, projection, false);
+          throw new Error("THREAD_START_PROJECTION_INVALIDATED_BY_CONCURRENT_FACT");
         }
+        this.#rememberSessionObservation(running, projection, false);
         return { ...projection, effectiveRuntimeProfile: reviewed.review.effectiveRuntimeProfile };
       } catch (error: unknown) {
         throw new IndeterminateCodexEffectError("thread/start", 0, error);
@@ -1087,15 +1159,12 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     const running = this.#clients.get(input.authority.id);
     return this.#state === "open"
       && running !== undefined
-      && running.authority.generation === input.authority.generation
+      && sameProfileAuthority(running.authority, input.authority)
       && running.client.state === "ready"
       && running.client.connectionId === input.connectionId
       && this.#isCurrent(input.authority)
-      && running.client.hasLiveHraHostToolCall({
-        authority: {
-          processGeneration: input.authority.generation,
-          profileId: input.authority.id,
-        },
+      && running.client.hasLiveOompaHostToolCall({
+        authority: codexAuthorityOf(input.authority),
         callId: input.callId,
         connectionId: input.connectionId,
         requestDigest: input.requestDigest,
@@ -1126,10 +1195,10 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
         input.providerThreadId,
         input.signal,
       );
-      // Claiming is deliberately non-mutating. HRA applies its reviewed
+      // Claiming is deliberately non-mutating. Oompa applies its reviewed
       // approval and permission policy on every turn after the durable
       // adoption commit, so a failed commit cannot leave provider policy
-      // changed on a thread HRA does not own.
+      // changed on a thread Oompa does not own.
       let resumedThreadId: string | undefined;
       try {
         await this.#invalidateRetainedResumeUnavailable(running, input.providerThreadId);
@@ -1430,11 +1499,8 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
           "The interaction deadline elapsed before runtime dispatch.",
         );
       }
-      if (
-        input.provider.profileId !== input.authority.id
-        || input.provider.processGeneration !== input.authority.generation
-        || !this.#isCurrent(input.authority)
-      ) {
+      if (!interactionMatchesProfileAuthority(input.provider, input.authority)
+        || !this.#isCurrent(input.authority)) {
         throw new CodexError(
           "AUTHORITY_STALE",
           "The interaction belongs to another account process generation.",
@@ -1443,7 +1509,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
       const running = this.#clients.get(input.authority.id);
       if (
         running === undefined
-        || running.authority.generation !== input.authority.generation
+        || !sameProfileAuthority(running.authority, input.authority)
         || running.client.state !== "ready"
         || running.client.connectionId !== input.provider.connectionId
       ) {
@@ -1470,11 +1536,8 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
   }): Promise<{ responseDigest: string }> {
     return await this.#admit(async () => {
       if (input.signal.aborted) throw input.signal.reason;
-      if (
-        input.provider.profileId !== input.authority.id
-        || input.provider.processGeneration !== input.authority.generation
-        || !this.#isCurrent(input.authority)
-      ) {
+      if (!interactionMatchesProfileAuthority(input.provider, input.authority)
+        || !this.#isCurrent(input.authority)) {
         throw new CodexError(
           "AUTHORITY_STALE",
           "The interaction belongs to another account process generation.",
@@ -1483,7 +1546,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
       const running = this.#clients.get(input.authority.id);
       if (
         running === undefined
-        || running.authority.generation !== input.authority.generation
+        || !sameProfileAuthority(running.authority, input.authority)
         || running.client.state !== "ready"
         || running.client.connectionId !== input.provider.connectionId
       ) {
@@ -1508,11 +1571,8 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
   }): Promise<LiveInteractionApprovalAuthority> {
     return await this.#admit(async () => {
       if (input.signal.aborted) throw input.signal.reason;
-      if (
-        input.provider.profileId !== input.authority.id
-        || input.provider.processGeneration !== input.authority.generation
-        || !this.#isCurrent(input.authority)
-      ) {
+      if (!interactionMatchesProfileAuthority(input.provider, input.authority)
+        || !this.#isCurrent(input.authority)) {
         throw new CodexError(
           "AUTHORITY_STALE",
           "The interaction belongs to another account process generation.",
@@ -1561,7 +1621,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     return !signal.aborted
       && this.#isCurrent(authority)
       && this.#clients.get(authority.id) === running
-      && running.authority.generation === authority.generation
+      && sameProfileAuthority(running.authority, authority)
       && running.client.state === "ready"
       && running.client.connectionId === provider.connectionId;
   }
@@ -1573,15 +1633,12 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
   }): Promise<{ responseDigest: string }> {
     return await this.#admit(async () => {
       if (input.signal.aborted) throw input.signal.reason;
-      if (
-        input.provider.profileId !== input.authority.id
-        || input.provider.processGeneration !== input.authority.generation
-        || !this.#isCurrent(input.authority)
-      ) throw new CodexError("AUTHORITY_STALE", "The interaction belongs to another account process generation.");
+      if (!interactionMatchesProfileAuthority(input.provider, input.authority)
+        || !this.#isCurrent(input.authority)) throw new CodexError("AUTHORITY_STALE", "The interaction belongs to another account process generation.");
       const running = this.#clients.get(input.authority.id);
       if (
         running === undefined
-        || running.authority.generation !== input.authority.generation
+        || !sameProfileAuthority(running.authority, input.authority)
         || running.client.state !== "ready"
         || running.client.connectionId !== input.provider.connectionId
       ) throw new CodexError("AUTHORITY_STALE", "The interaction's exact provider connection is no longer live.");
@@ -1596,15 +1653,12 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
   }): Promise<{ responseWritten: true }> {
     return await this.#admit(async () => {
       if (input.signal.aborted) throw input.signal.reason;
-      if (
-        input.provider.profileId !== input.authority.id
-        || input.provider.processGeneration !== input.authority.generation
-        || !this.#isCurrent(input.authority)
-      ) throw new CodexError("AUTHORITY_STALE", "The interaction belongs to another account process generation.");
+      if (!interactionMatchesProfileAuthority(input.provider, input.authority)
+        || !this.#isCurrent(input.authority)) throw new CodexError("AUTHORITY_STALE", "The interaction belongs to another account process generation.");
       const running = this.#clients.get(input.authority.id);
       if (
         running === undefined
-        || running.authority.generation !== input.authority.generation
+        || !sameProfileAuthority(running.authority, input.authority)
         || running.client.state !== "ready"
         || running.client.connectionId !== input.provider.connectionId
       ) throw new CodexError("AUTHORITY_STALE", "The interaction's exact provider connection is no longer live.");
@@ -1636,9 +1690,9 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     for (const key of this.#authorityCloseClients.keys()) {
       const existing = this.#authorityCloseTasks.get(key);
       if (existing !== undefined && closes.includes(existing)) continue;
-      const client = this.#authorityCloseClients.get(key);
-      if (client === undefined) continue;
-      closes.push(this.#closeRetiredClient(key, client));
+      const retained = this.#authorityCloseClients.get(key);
+      if (retained === undefined) continue;
+      closes.push(this.#closeRetiredClient(key, retained.client));
     }
     const outcomes = await Promise.allSettled(closes.filter(
       (close): close is Promise<void> => close !== undefined,
@@ -1710,15 +1764,28 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
   }
 
   #accountAuthorityKey(authority: ProfileAuthority): string {
-    return JSON.stringify([authority.id, authority.generation]);
+    return profileAuthorityTombstoneKey(authority);
   }
 
   #retryExactClientClose(authority: ProfileAuthority): Promise<void> | undefined {
     const key = this.#accountAuthorityKey(authority);
     const active = this.#authorityCloseTasks.get(key);
     if (active !== undefined) return active;
-    const client = this.#authorityCloseClients.get(key);
-    return client === undefined ? undefined : this.#closeRetiredClient(key, client);
+    const retained = this.#authorityCloseClients.get(key);
+    return retained === undefined ? undefined : this.#closeRetiredClient(key, retained.client);
+  }
+
+  #retainClientClose(authority: ProfileAuthority, client: CodexAppServerClient): Promise<void> {
+    const key = this.#accountAuthorityKey(authority);
+    const retained = this.#authorityCloseClients.get(key);
+    if (retained !== undefined && retained.client !== client) {
+      throw new CodexError(
+        "AUTHORITY_STALE",
+        "Another Codex process still retains this exact account authority.",
+      );
+    }
+    this.#authorityCloseClients.set(key, { profileId: authority.id, client });
+    return this.#closeRetiredClient(key, client);
   }
 
   #closeRetiredClient(key: string, client: CodexAppServerClient): Promise<void> {
@@ -1733,7 +1800,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     }
     this.#authorityCloseTasks.set(key, close);
     const tracked = close.then(
-      () => { if (this.#authorityCloseClients.get(key) === client) this.#authorityCloseClients.delete(key); },
+      () => { if (this.#authorityCloseClients.get(key)?.client === client) this.#authorityCloseClients.delete(key); },
       () => undefined,
     );
     this.#background.add(tracked);
@@ -1751,7 +1818,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     const running = this.#clients.get(authority.id);
     if (
       running === undefined
-      || running.authority.generation !== authority.generation
+      || !sameProfileAuthority(running.authority, authority)
       || (expected !== undefined && running !== expected)
     ) return undefined;
 
@@ -1760,13 +1827,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     // while close drains the client's fact and request tails.
     this.#clients.delete(authority.id);
     this.#clearSessionObservations(running);
-    this.#endedGenerationByProfile.set(
-      authority.id,
-      Math.max(
-        this.#endedGenerationByProfile.get(authority.id) ?? 0,
-        authority.generation,
-      ),
-    );
+    this.#endedAuthorityTombstones.add(profileAuthorityTombstoneKey(authority));
     const disconnected = this.#deterministicallyDisconnectedByProfile.get(authority.id);
     if (disconnected?.running === running) {
       this.#deterministicallyDisconnectedByProfile.delete(authority.id);
@@ -1775,18 +1836,9 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
       if (review.running === running) this.#runtimeReviews.delete(reviewId);
     }
 
-    const key = this.#accountAuthorityKey(authority);
-    const retained = this.#authorityCloseClients.get(key);
-    if (retained !== undefined && retained !== running.client) {
-      throw new CodexError(
-        "AUTHORITY_STALE",
-        "Another Codex process still retains this exact account authority.",
-      );
-    }
-    this.#authorityCloseClients.set(key, running.client);
     // Do not await on the account barrier: client close drains the fact tail,
     // whose triggering account fact is itself waiting for that barrier.
-    return this.#closeRetiredClient(key, running.client);
+    return this.#retainClientClose(authority, running.client);
   }
 
   async #client(authority: ProfileAuthority): Promise<CodexAppServerClient> { return (await this.#running(authority)).client; }
@@ -1795,6 +1847,9 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     return JSON.stringify([
       running.authority.id,
       running.authority.generation,
+      running.authority.provider,
+      running.authority.providerAccountId,
+      running.authority.bindingGeneration,
       running.client.connectionId,
       providerThreadId,
     ]);
@@ -2094,7 +2149,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     const current = this.#clients.get(running.authority.id);
     if (
       current !== running
-      || current.authority.generation !== running.authority.generation
+      || !sameProfileAuthority(current.authority, running.authority)
       || current.client.connectionId !== running.client.connectionId
       || current.client.state !== "ready"
       || !this.#isCurrent(running.authority)
@@ -2578,33 +2633,28 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
   }
 
   async #runningLocked(authority: ProfileAuthority): Promise<RunningClient> {
+    codexAuthorityOf(authority);
     if (!this.#isCurrent(authority)) throw new Error("Codex account generation is stale.");
     const existing = this.#clients.get(authority.id);
-    const endedGeneration = this.#endedGenerationByProfile.get(authority.id);
+    const ended = this.#endedAuthorityTombstones.has(profileAuthorityTombstoneKey(authority));
     const disconnected = this.#deterministicallyDisconnectedByProfile.get(authority.id);
     const mayRelaunchDisconnectedClient =
       this.#allowSameGenerationRelaunchAfterProviderDisconnect
-      && endedGeneration === authority.generation
+      && ended
       && existing !== undefined
-      && existing.authority.generation === authority.generation
+      && sameProfileAuthority(existing.authority, authority)
       && existing.client.state !== "ready"
       && disconnected?.running === existing
       && disconnected.generation === authority.generation
       && disconnected.connectionId === existing.client.connectionId;
-    if (
-      endedGeneration !== undefined
-      && endedGeneration >= authority.generation
-      && !mayRelaunchDisconnectedClient
-    ) {
+    if (ended && !mayRelaunchDisconnectedClient) {
       throw new CodexError(
         "AUTHORITY_STALE",
-        "The Codex process generation ended and cannot be relaunched under the same authority.",
+        "The exact Codex authority ended and cannot be relaunched.",
       );
     }
-    if (existing?.authority.generation === authority.generation && existing.client.state === "ready") {
-      return existing;
-    }
-    if (existing?.authority.generation === authority.generation) {
+    if (existing !== undefined && sameProfileAuthority(existing.authority, authority) && existing.client.state === "ready") return existing;
+    if (existing !== undefined && sameProfileAuthority(existing.authority, authority)) {
       if (mayRelaunchDisconnectedClient) return await this.#launch(authority, existing);
       throw new CodexError(
         "AUTHORITY_STALE",
@@ -2633,10 +2683,15 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     authority: ProfileAuthority,
     disconnectedClient?: RunningClient,
   ): Promise<RunningClient> {
+    const clientAuthority = codexAuthorityOf(authority);
+    if ([...this.#authorityCloseClients.values()].some((retained) =>
+      retained.profileId === authority.id)) {
+      throw new CodexError("AUTHORITY_STALE", "A prior Codex process for this account is still unjoined.");
+    }
     const existing = this.#clients.get(authority.id);
     const replacingDeterministicDisconnect = disconnectedClient !== undefined
       && existing === disconnectedClient
-      && existing.authority.generation === authority.generation;
+      && sameProfileAuthority(existing.authority, authority);
     const previousConnectionId = replacingDeterministicDisconnect
       ? disconnectedClient.client.connectionId
       : undefined;
@@ -2647,15 +2702,9 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
       this.#clients.delete(authority.id);
       this.#clearSessionObservations(existing);
       if (!replacingDeterministicDisconnect) {
-        this.#endedGenerationByProfile.set(
-          existing.authority.id,
-          Math.max(
-            this.#endedGenerationByProfile.get(existing.authority.id) ?? 0,
-            existing.authority.generation,
-          ),
-        );
+        this.#endedAuthorityTombstones.add(profileAuthorityTombstoneKey(existing.authority));
       }
-      await existing.client.close();
+      await this.#retainClientClose(existing.authority, existing.client);
     }
     if (this.#prepareCodexHome !== undefined) {
       await this.#prepareCodexHome(authority.codexHome);
@@ -2673,17 +2722,17 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     let client: CodexAppServerClient;
     try {
       client = await this.#launchClient({
-        authority: { profileId: authority.id, processGeneration: authority.generation },
+        authority: clientAuthority,
         expectedCodexHome: authority.codexHome,
         ...(environment === undefined ? {} : { environment }),
         credentialStorePreflight: this.#credentialStorePreflight,
         experimentalApi: true,
-        isAuthorityCurrent: () => this.#isCurrent(authority),
+        isAuthorityCurrent: (candidate) =>
+          sameCodexAuthority(candidate, clientAuthority) && this.#isCurrent(authority),
         now: this.#now,
         onAccountAuthoritySignal: (signaled) => {
           if (
-            signaled.profileId !== authority.id
-            || signaled.processGeneration !== authority.generation
+            !sameCodexAuthority(signaled, clientAuthority)
           ) return;
           const published = this.#clients.get(authority.id);
           if (
@@ -2701,11 +2750,10 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
           }
           return this.#scheduleAccountRefresh(authority, runningReady);
         },
-        onHraHostToolCall: async (call) => await this.#admit(async () => {
+        onOompaHostToolCall: async (call) => await this.#admit(async () => {
           const current = this.#clients.get(authority.id);
           if (
-            call.authority.profileId !== authority.id
-            || call.authority.processGeneration !== authority.generation
+            !sameCodexAuthority(call.authority, clientAuthority)
             || !this.#isCurrent(authority)
             || launchedClient.current === undefined
             || current?.client !== launchedClient.current
@@ -2714,31 +2762,31 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
           ) {
             throw new CodexError(
               "AUTHORITY_STALE",
-              "The HRA host-tool call belongs to a stale Codex account generation",
+              "The Oompa host-tool call belongs to a stale Codex account generation",
             );
           }
-          if (this.#observer.hraHostTool === undefined) {
+          if (this.#observer.oompaHostTool === undefined) {
             throw new CodexError(
               "UNSUPPORTED_CAPABILITY",
-              "The HRA host-tool service is unavailable",
+              "The Oompa host-tool service is unavailable",
             );
           }
-          return await this.#observer.hraHostTool(authority, call);
+          return await this.#observer.oompaHostTool(authority, call);
         }),
-        onHraHostToolResponseWritten: (call) => {
+        onOompaHostToolResponseWritten: (call) => {
           const current = this.#clients.get(authority.id);
           if (
-            call.authority.profileId !== authority.id
-            || call.authority.processGeneration !== authority.generation
+            !sameCodexAuthority(call.authority, clientAuthority)
             || !this.#isCurrent(authority)
             || launchedClient.current === undefined
             || current?.client !== launchedClient.current
             || launchedClient.current.state !== "ready"
             || launchedClient.current.connectionId !== call.connectionId
           ) return;
-          return this.#observer.hraHostToolResponseWritten?.(authority, call);
+          return this.#observer.oompaHostToolResponseWritten?.(authority, call);
         },
         onFact: async (value: FencedCodexValue<CodexFact>) => {
+          if (!sameCodexAuthority(value.authority, clientAuthority)) return;
           if (!this.#acceptingOperations()) return;
           try {
             await this.#admit(async () => {
@@ -2749,7 +2797,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
                 || launchedClient.current === undefined
                 || owned.client !== launchedClient.current
                 || exactClient !== owned
-                || exactClient.authority.generation !== authority.generation
+                || !sameProfileAuthority(exactClient.authority, authority)
               ) return;
               const factUnloadsThread = value.value.type === "threadDeleted"
                 || (
@@ -2767,7 +2815,8 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
               if ((factUnloadsThread || factInvalidatesStartProjection) && "threadId" in value.value) {
                 const observed = this.#clients.get(authority.id);
                 if (
-                  observed?.authority.generation === authority.generation
+                  observed !== undefined
+                  && sameProfileAuthority(observed.authority, authority)
                   && observed.client.connectionId === value.value.connectionId
                 ) {
                   observed.sessionObservationFactSequence += 1;
@@ -2788,20 +2837,15 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
               if (value.value.type === "providerDisconnected") {
                 const disconnected = this.#clients.get(authority.id);
                 const exactDisconnectedClient =
-                  disconnected?.authority.generation === authority.generation
+                  disconnected !== undefined
+                  && sameProfileAuthority(disconnected.authority, authority)
                   && disconnected.client.connectionId === value.value.connectionId
                   && disconnected.client.state !== "ready"
                     ? disconnected
                     : undefined;
                 if (exactDisconnectedClient !== undefined) {
                   this.#clearSessionObservations(exactDisconnectedClient);
-                  this.#endedGenerationByProfile.set(
-                    authority.id,
-                    Math.max(
-                      this.#endedGenerationByProfile.get(authority.id) ?? 0,
-                      authority.generation,
-                    ),
-                  );
+                  this.#endedAuthorityTombstones.add(profileAuthorityTombstoneKey(authority));
                   if (this.#allowSameGenerationRelaunchAfterProviderDisconnect) {
                     this.#deterministicallyDisconnectedByProfile.set(authority.id, {
                       connectionId: value.value.connectionId,
@@ -2836,7 +2880,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     }
     if (previousConnectionId !== undefined && client.connectionId === previousConnectionId) {
       publishRunning(null);
-      await client.close();
+      await this.#retainClientClose(authority, client);
       throw new CodexError(
         "PROTOCOL_ERROR",
         "The replacement Codex process reused the disconnected connection identity.",
@@ -2845,15 +2889,10 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     launchedClient.current = client;
     if (!this.#isCurrent(authority)) {
       publishRunning(null);
-      await client.close();
+      await this.#retainClientClose(authority, client);
       throw new Error("Codex account generation changed during launch.");
     }
-    if (
-      replacingDeterministicDisconnect
-      && this.#endedGenerationByProfile.get(authority.id) === authority.generation
-    ) {
-      this.#endedGenerationByProfile.delete(authority.id);
-    }
+    if (replacingDeterministicDisconnect) this.#endedAuthorityTombstones.delete(profileAuthorityTombstoneKey(authority));
     const running: RunningClient = {
       authority,
       client,
@@ -2938,7 +2977,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
       !this.#acceptingOperations()
       || !this.#isCurrent(authority)
       || this.#clients.get(authority.id) !== running
-      || running.authority.generation !== authority.generation
+      || !sameProfileAuthority(running.authority, authority)
       || running.client.state !== "ready"
     ) {
       throw new CodexError(
@@ -3032,8 +3071,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
       pending === undefined
       || pending.review !== review
       || pending.review.kind !== expected.kind
-      || pending.running.authority.id !== expected.authority.id
-      || pending.running.authority.generation !== expected.authority.generation
+      || !sameProfileAuthority(pending.running.authority, expected.authority)
       || pending.projectRoot !== expected.projectRoot
       || pending.providerThreadId !== expected.providerThreadId
       || this.#clients.get(expected.authority.id) !== pending.running

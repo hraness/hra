@@ -6,7 +6,7 @@ import {
   type SessionModel,
 } from "../model/session-model";
 import { mergeCompactEvents } from "../model/transcript";
-import type { CompactSessionEvent } from "../hra/cloud";
+import type { CompactSessionEvent } from "../oompa/cloud";
 import { useCompactHistory } from "./compact-history";
 import { useCompactTail } from "./compact-tail";
 import { useLiveTail } from "./live-tail";

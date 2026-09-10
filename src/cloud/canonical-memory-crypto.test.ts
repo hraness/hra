@@ -13,7 +13,7 @@ import {
   CANONICAL_MEMORY_OPERATION_BUNDLE_PURPOSE,
   canonicalMemoryCiphertextLimits,
   canonicalMemoryPlaintextLimits,
-  HRA_CANONICAL_MEMORY_OPERATION_MAX_BYTES,
+  OOMPA_CANONICAL_MEMORY_OPERATION_MAX_BYTES,
 } from "../domain/canonical-memory-sync";
 import {
   canonicalMemoryBindingDigest,
@@ -1238,13 +1238,13 @@ describe("canonical memory client cryptography", () => {
     }
   });
 
-  test("refuses a valid Oh operation above HRA's one-row encrypted ceiling", async () => {
+  test("refuses a valid Oh operation above Oompa's one-row encrypted ceiling", async () => {
     const oversized = operationFixture(
       canonicalSpaceId,
-      HRA_CANONICAL_MEMORY_OPERATION_MAX_BYTES + 1_024,
+      OOMPA_CANONICAL_MEMORY_OPERATION_MAX_BYTES + 1_024,
     ).operation;
     expect(new TextEncoder().encode(canonicalJson(oversized)).byteLength)
-      .toBeGreaterThan(HRA_CANONICAL_MEMORY_OPERATION_MAX_BYTES);
+      .toBeGreaterThan(OOMPA_CANONICAL_MEMORY_OPERATION_MAX_BYTES);
     await expect(encryptCanonicalMemoryOperation({
       authority,
       encryptionKey: encryptionKey(spaceKey, keyVersion),

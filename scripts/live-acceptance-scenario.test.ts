@@ -21,7 +21,7 @@ import { pathToFileURL } from "node:url";
 
 import type { PublicInteraction } from "../src/domain/interactions";
 import type { SessionEvent } from "../src/domain/session-events";
-import { HRA_VERSION } from "../src/version";
+import { OOMPA_VERSION } from "../src/version";
 import {
   projectPublicProviderIdentifier,
   projectPublicSessionEventBody,
@@ -87,7 +87,7 @@ const cursorWire = (label: string): string =>
   `hra1.${Buffer.from(`fixture:${label}`).toString("base64url")}.${cursorWireSignature}`;
 const attestation = {
   cloudTargetDigest: "a".repeat(64),
-  packageVersion: HRA_VERSION,
+  packageVersion: OOMPA_VERSION,
   sourceRevision: "b".repeat(40),
 } as const;
 
@@ -528,7 +528,7 @@ class FakeDevice implements LiveAcceptanceDevice {
 
   constructor(device: LiveAcceptanceDeviceName, world: FakeWorld) {
     this.device = device;
-    this.projectDirectory = `/private/tmp/hra-acceptance-${device}`;
+    this.projectDirectory = `/private/tmp/oompa-acceptance-${device}`;
     this.#world = world;
   }
 
@@ -643,7 +643,7 @@ class FakeDevice implements LiveAcceptanceDevice {
       liveAcceptanceScenarioTesting.writeOwnedProtectedJsonDocument(handoffPath, {
         accountId: argv[2],
         accountLabel,
-        cancelCommand: `hra account login-cancel ${argv[2] ?? "unknown"}`,
+        cancelCommand: `oompa account login-cancel ${argv[2] ?? "unknown"}`,
         method: "device_code",
         type: "codex_device_login",
         userCode: this.#world.unsafeDeviceCode ? "ABCD\u001b[2J" : "ABCD-EFGH",
@@ -810,10 +810,10 @@ class FakeDevice implements LiveAcceptanceDevice {
       const cursorIndex = argv.indexOf("--cursor");
       const requestedCursor = cursorIndex < 0 ? null : argv[cursorIndex + 1]!;
       const marker = this.#world.messages.get(sessionId)?.match(
-        /hra-live-(?:user-input|permission)-[0-9a-f-]+/u,
+        /oompa-live-(?:user-input|permission)-[0-9a-f-]+/u,
       )?.[0] ?? "";
       const expectedCommand = this.#world.messages.get(sessionId)?.match(
-        /\/bin\/echo hra-live-tool-progress \| \/usr\/bin\/tee \.\/\.hra-live-command-proof-[0-9a-f-]+\.txt/u,
+        /\/bin\/echo oompa-live-tool-progress \| \/usr\/bin\/tee \.\/\.oompa-live-command-proof-[0-9a-f-]+\.txt/u,
       )?.[0] ?? "";
       const commandDigest = safeLiveAcceptanceCommandDigest(expectedCommand);
       if (commandDigest === undefined) throw new Error("Fake prompt omitted the exact live command.");
@@ -844,7 +844,7 @@ class FakeDevice implements LiveAcceptanceDevice {
     }
     if (command === "session.show") {
       const prompt = this.#world.messages.get(argv[2]!) ?? "";
-      const marker = prompt.match(/hra-live-(?:user-input|permission)-[0-9a-f-]+/u)?.[0] ?? "";
+      const marker = prompt.match(/oompa-live-(?:user-input|permission)-[0-9a-f-]+/u)?.[0] ?? "";
       return success(command, {
         projection: {
           messages: [
@@ -1203,7 +1203,7 @@ class FakeDevice implements LiveAcceptanceDevice {
         return failure();
       }
       const prompt = this.#world.messages.get(sessionA) ?? "";
-      const localMarker = prompt.match(/hra-live-user-input-[0-9a-f-]+/u)?.[0] ?? "";
+      const localMarker = prompt.match(/oompa-live-user-input-[0-9a-f-]+/u)?.[0] ?? "";
       if (this.#world.remoteApplied) this.#world.remoteProjectionPolls += 1;
       const remoteTurnSettled = this.#world.remoteApplied
         && !this.#world.remoteTurnNeverCompletes
@@ -1261,7 +1261,7 @@ class FakeDevice implements LiveAcceptanceDevice {
       if (this.device === "b" && (!this.#world.approved || this.#world.deviceBRevoked)) {
         return failure();
       }
-      this.#world.remoteMarker = argv[3]!.match(/hra-live-remote-[0-9a-f-]+/u)?.[0] ?? "";
+      this.#world.remoteMarker = argv[3]!.match(/oompa-live-remote-[0-9a-f-]+/u)?.[0] ?? "";
       this.#world.remotePrompt = argv[3]!;
       return success(command, {
         commandPublicId: commandId,
@@ -1499,7 +1499,7 @@ class FakeOperator implements LiveAcceptanceScenarioOperator {
     if (
       document.accountId !== input.accountId
       || document.accountLabel !== input.accountLabel
-      || document.cancelCommand !== `hra account login-cancel ${input.accountId}`
+      || document.cancelCommand !== `oompa account login-cancel ${input.accountId}`
       || typeof document.userCode !== "string"
       || !/^[A-Z0-9]{4,12}(?:-[A-Z0-9]{4,12}){0,2}$/u.test(document.userCode)
       || typeof document.verificationUrl !== "string"
@@ -1514,7 +1514,7 @@ class FakeOperator implements LiveAcceptanceScenarioOperator {
     projectDirectory: string;
   }>): Promise<string> {
     void input;
-    const root = await mkdtemp(join(await realpath(tmpdir()), "hra-fake-login-"));
+    const root = await mkdtemp(join(await realpath(tmpdir()), "oompa-fake-login-"));
     await chmod(root, 0o700);
     const path = join(root, "handoff.json");
     await writeFile(path, "", { flag: "wx", mode: 0o600 });
@@ -1589,7 +1589,7 @@ const startFakeScenario = (
     prepareCommandProof: () => {
       commandProofSequence += 1;
       const proofId = `00000000-0000-4000-8000-${String(commandProofSequence).padStart(12, "0")}`;
-      const command = `/bin/echo hra-live-tool-progress | /usr/bin/tee ./.hra-live-command-proof-${proofId}.txt`;
+      const command = `/bin/echo oompa-live-tool-progress | /usr/bin/tee ./.oompa-live-command-proof-${proofId}.txt`;
       const commandDigest = safeLiveAcceptanceCommandDigest(command);
       if (commandDigest === undefined) throw new Error("Invalid fake command proof grammar.");
       return {
@@ -1747,7 +1747,7 @@ describe("live acceptance release scenario", () => {
       accountIds: [accountA, accountB],
       cloudTargetDigest: "a".repeat(64),
       devicePublicIds: [deviceAId, deviceBId],
-      packageVersion: HRA_VERSION,
+      packageVersion: OOMPA_VERSION,
       memory: {
         divergence: {
           commonHead: laterHead,
@@ -2207,7 +2207,7 @@ describe("live acceptance release scenario", () => {
       ),
     ]);
 
-    const createdRoot = await mkdtemp(join(tmpdir(), "hra-protected-loader-"));
+    const createdRoot = await mkdtemp(join(tmpdir(), "oompa-protected-loader-"));
     await chmod(createdRoot, 0o700);
     const root = await realpath(createdRoot);
     const documentPath = join(root, "document.json");
@@ -2231,7 +2231,7 @@ describe("live acceptance release scenario", () => {
   });
 
   test("accepts only stable owned single-link protected JSON documents and preserves them", async () => {
-    const createdRoot = await mkdtemp(join(tmpdir(), "hra-protected-hostile-"));
+    const createdRoot = await mkdtemp(join(tmpdir(), "oompa-protected-hostile-"));
     await chmod(createdRoot, 0o700);
     const root = await realpath(createdRoot);
     const makeCase = async (name: string, content = "{\"answer\":42}") => {
@@ -2355,7 +2355,7 @@ describe("live acceptance release scenario", () => {
   });
 
   test("rejects FIFO child substitutions promptly across every protected open", async () => {
-    const createdRoot = await mkdtemp(join(tmpdir(), "hra-protected-fifo-"));
+    const createdRoot = await mkdtemp(join(tmpdir(), "oompa-protected-fifo-"));
     await chmod(createdRoot, 0o700);
     const root = await realpath(createdRoot);
     const moduleUrl = pathToFileURL(join(import.meta.dir, "live-acceptance-scenario.ts")).href;
@@ -2432,7 +2432,7 @@ describe("live acceptance release scenario", () => {
           "      },",
           "    },",
           "  );",
-          '  const fileName = proof.command.match(/\\.\\/(\\.hra-live-command-proof-[0-9a-f-]+\\.txt)$/u)?.[1];',
+          '  const fileName = proof.command.match(/\\.\\/(\\.oompa-live-command-proof-[0-9a-f-]+\\.txt)$/u)?.[1];',
           '  if (fileName === undefined) throw new Error("Missing command proof file name.");',
           `  proofPath = join(${JSON.stringify(proofDirectory)}, fileName);`,
           "  proof.verify();",
@@ -2452,13 +2452,13 @@ describe("live acceptance release scenario", () => {
   }, 10_000);
 
   test("creates an isolated exact echo command proof and rejects a wrong side effect", async () => {
-    const createdDirectory = await mkdtemp(join(tmpdir(), "hra-command-proof-"));
+    const createdDirectory = await mkdtemp(join(tmpdir(), "oompa-command-proof-"));
     await chmod(createdDirectory, 0o700);
     const directory = await realpath(createdDirectory);
     try {
       const proof = liveAcceptanceScenarioTesting.createCommandProof(directory);
       expect(proof.command).toMatch(
-        /^\/bin\/echo hra-live-tool-progress \| \/usr\/bin\/tee \.\/\.hra-live-command-proof-[0-9a-f-]+\.txt$/u,
+        /^\/bin\/echo oompa-live-tool-progress \| \/usr\/bin\/tee \.\/\.oompa-live-command-proof-[0-9a-f-]+\.txt$/u,
       );
       expect(safeLiveAcceptanceCommandDigest(proof.command)).toBe(proof.commandDigest);
       const child = spawn("/bin/sh", ["-c", proof.command], {
@@ -2471,7 +2471,7 @@ describe("live acceptance release scenario", () => {
       expect(close).toBe(0);
       proof.verify();
 
-      const fileName = proof.command.match(/\.\/(\.hra-live-command-proof-[0-9a-f-]+\.txt)$/u)?.[1];
+      const fileName = proof.command.match(/\.\/(\.oompa-live-command-proof-[0-9a-f-]+\.txt)$/u)?.[1];
       if (fileName === undefined) throw new Error("Missing command proof file name.");
       await writeFile(join(directory, fileName), "wrong\n");
       expect(() => proof.verify()).toThrow("command_proof_content_invalid");
@@ -2490,7 +2490,7 @@ describe("live acceptance release scenario", () => {
   });
 
   test("binds command proof children through held directory descriptors across parent swaps", async () => {
-    const createdRoot = await mkdtemp(join(tmpdir(), "hra-command-proof-swap-"));
+    const createdRoot = await mkdtemp(join(tmpdir(), "oompa-command-proof-swap-"));
     await chmod(createdRoot, 0o700);
     const root = await realpath(createdRoot);
     const createDirectory = join(root, "create");
@@ -2623,7 +2623,7 @@ describe("live acceptance release scenario", () => {
 
   test("JSONL routes Codex login secrets through a caller-owned protected handoff file", async () => {
     const moduleUrl = pathToFileURL(join(import.meta.dir, "live-acceptance-scenario.ts")).href;
-    const createdDirectory = await mkdtemp(join(tmpdir(), "hra-login-handoff-"));
+    const createdDirectory = await mkdtemp(join(tmpdir(), "oompa-login-handoff-"));
     await chmod(createdDirectory, 0o700);
     const directory = await realpath(createdDirectory);
     const handoffPath = join(directory, "codex-login.json");
@@ -2638,7 +2638,7 @@ describe("live acceptance release scenario", () => {
         "const signal = new AbortController().signal;",
         `const accountId = 'acct_${"1".repeat(32)}';`,
         "const documentPath = await operator.prepareDeviceLoginHandoff({ accountId, accountLabel: 'primary', projectDirectory: '/unused' }, signal);",
-        `liveAcceptanceScenarioTesting.writeOwnedProtectedJsonDocument(documentPath, { accountId: 'acct_${"1".repeat(32)}', accountLabel: 'primary', cancelCommand: 'hra account login-cancel acct_${"1".repeat(32)}', method: 'device_code', type: 'codex_device_login', userCode: ${JSON.stringify(userCode)}, verificationUrl: ${JSON.stringify(verificationUrl)}, version: 1 });`,
+        `liveAcceptanceScenarioTesting.writeOwnedProtectedJsonDocument(documentPath, { accountId: 'acct_${"1".repeat(32)}', accountLabel: 'primary', cancelCommand: 'oompa account login-cancel acct_${"1".repeat(32)}', method: 'device_code', type: 'codex_device_login', userCode: ${JSON.stringify(userCode)}, verificationUrl: ${JSON.stringify(verificationUrl)}, version: 1 });`,
         "await operator.acknowledgeDeviceLogin({ accountId, accountLabel: 'primary', documentPath }, signal);",
         "await operator.flush();",
         "operator.close();",
@@ -2689,7 +2689,7 @@ describe("live acceptance release scenario", () => {
       expect(JSON.parse(await readFile(handoffPath, "utf8"))).toEqual({
         accountId: `acct_${"1".repeat(32)}`,
         accountLabel: "primary",
-        cancelCommand: `hra account login-cancel acct_${"1".repeat(32)}`,
+        cancelCommand: `oompa account login-cancel acct_${"1".repeat(32)}`,
         method: "device_code",
         type: "codex_device_login",
         userCode,
@@ -2716,7 +2716,7 @@ describe("live acceptance release scenario", () => {
   }, 10_000);
 
   test("JSONL rejects a protected device-login document bound to a different account ID", async () => {
-    const createdDirectory = await mkdtemp(join(tmpdir(), "hra-login-account-binding-"));
+    const createdDirectory = await mkdtemp(join(tmpdir(), "oompa-login-account-binding-"));
     await chmod(createdDirectory, 0o700);
     const directory = await realpath(createdDirectory);
     const handoffPath = join(directory, "codex-login.json");
@@ -2727,7 +2727,7 @@ describe("live acceptance release scenario", () => {
       await writeFile(handoffPath, JSON.stringify({
         accountId: `acct_${"9".repeat(32)}`,
         accountLabel: "primary",
-        cancelCommand: `hra account login-cancel ${expectedAccountId}`,
+        cancelCommand: `oompa account login-cancel ${expectedAccountId}`,
         method: "device_code",
         type: "codex_device_login",
         userCode,
@@ -2746,7 +2746,7 @@ describe("live acceptance release scenario", () => {
   }, 10_000);
 
   test("JSONL rejects a protected device-login document with a noncanonical cancel command", async () => {
-    const createdDirectory = await mkdtemp(join(tmpdir(), "hra-login-cancel-binding-"));
+    const createdDirectory = await mkdtemp(join(tmpdir(), "oompa-login-cancel-binding-"));
     await chmod(createdDirectory, 0o700);
     const directory = await realpath(createdDirectory);
     const handoffPath = join(directory, "codex-login.json");
@@ -2757,7 +2757,7 @@ describe("live acceptance release scenario", () => {
       await writeFile(handoffPath, JSON.stringify({
         accountId: expectedAccountId,
         accountLabel: "primary",
-        cancelCommand: `hra account login-cancel acct_${"9".repeat(32)}`,
+        cancelCommand: `oompa account login-cancel acct_${"9".repeat(32)}`,
         method: "device_code",
         type: "codex_device_login",
         userCode,
@@ -2831,7 +2831,7 @@ describe("live acceptance release scenario", () => {
 
   test("JSONL operator reads configuration and matching responses from one stdin stream", async () => {
     const moduleUrl = pathToFileURL(join(import.meta.dir, "live-acceptance-scenario.ts")).href;
-    const createdProtectedDirectory = await mkdtemp(join(tmpdir(), "hra-protected-input-"));
+    const createdProtectedDirectory = await mkdtemp(join(tmpdir(), "oompa-protected-input-"));
     await chmod(createdProtectedDirectory, 0o700);
     const protectedDirectory = await realpath(createdProtectedDirectory);
     const protectedPath = join(protectedDirectory, "document.json");
@@ -3188,7 +3188,7 @@ describe("live acceptance release scenario", () => {
     })),
     { label: "closed maximum resume descriptor", arguments: ["--resume-fd", "255"], configuration: null, calls: 0, exitCode: 1 },
   ])("validates $label before the recovery boundary and preserves valid-run refusal", async (input) => {
-    const directory = await mkdtemp(join(tmpdir(), "hra-recovery-input-"));
+    const directory = await mkdtemp(join(tmpdir(), "oompa-recovery-input-"));
     try {
       const receiptKind = input.receipt;
       const receiptPath = receiptKind === undefined ? null : join(directory, "receipt.json");
@@ -3280,7 +3280,7 @@ describe("live acceptance release scenario", () => {
   });
 
   test("the executable rejects JSONL configuration from terminal descriptor mode", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "hra-scenario-mode-"));
+    const directory = await mkdtemp(join(tmpdir(), "oompa-scenario-mode-"));
     try {
       const configurationPath = join(directory, "configuration.json");
       await writeFile(configurationPath, JSON.stringify({
@@ -3292,7 +3292,7 @@ describe("live acceptance release scenario", () => {
         "/bin/sh",
         "-c",
         'exec 3< "$1"; exec "$2" "$3" --scenario-fd 3 --deploy-evidence "$4"',
-        "hra-live-acceptance",
+        "oompa-live-acceptance",
         configurationPath,
         process.execPath,
         join(import.meta.dir, "live-acceptance.ts"),

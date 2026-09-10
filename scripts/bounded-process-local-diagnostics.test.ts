@@ -9,7 +9,7 @@ type OwnedFixture = { cleanupAllowed: boolean; tasks: Promise<BoundedProcessResu
 const fixtures = new Map<string, OwnedFixture>();
 
 async function fixture() {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "hra-local-diagnostics-")));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-local-diagnostics-")));
   fixtures.set(root, { cleanupAllowed: true, tasks: [] });
   return { root, recoveryDirectory: join(root, "recovery") };
 }

@@ -9,16 +9,16 @@ import {
   snapshotForeignJson,
 } from "../src/cloud/contracts";
 import {
-  createHraAttentionEmailSender,
-  type HraAttentionEmailBody,
-  type HraAttentionEmailResult,
+  createOompaAttentionEmailSender,
+  type OompaAttentionEmailBody,
+  type OompaAttentionEmailResult,
 } from "./attentionEmail";
 import { internalAction, type ActionCtx } from "./server";
 
 export const attentionNotificationActionGroupLimit = 10;
 
 type ClaimedEffect = Readonly<{
-  body: HraAttentionEmailBody;
+  body: OompaAttentionEmailBody;
   deliveryId: string;
   generation: number;
   globalNotificationGeneration: number;
@@ -59,7 +59,7 @@ const settleAttempt = makeFunctionReference<
     deliveryId: string;
     generation: number;
     globalNotificationGeneration: number;
-    result: HraAttentionEmailResult;
+    result: OompaAttentionEmailResult;
   }>,
   SettlementMutationResult
 >("attentionNotifications:settleAttempt");
@@ -71,11 +71,11 @@ const quarantineFaultedDelivery = makeFunctionReference<
 
 export type AttentionNotificationSender = (
   input: Readonly<{
-    body: HraAttentionEmailBody;
+    body: OompaAttentionEmailBody;
     idempotencyKey: string;
     recipient: CanonicalAuthEmail;
   }>,
-) => Promise<HraAttentionEmailResult>;
+) => Promise<OompaAttentionEmailResult>;
 
 function requireDrainLimit(value: number): number {
   if (
@@ -93,7 +93,7 @@ export async function runAttentionNotificationDrain(
 ) {
   const maximum = requireDrainLimit(limit);
   // Configuration failure must not claim an effect or spend a delivery attempt.
-  const sender = send ?? createHraAttentionEmailSender();
+  const sender = send ?? createOompaAttentionEmailSender();
   let claimed = 0;
   let closed = 0;
   for (let slot = 0; slot < maximum; slot += 1) {
@@ -115,7 +115,7 @@ export async function runAttentionNotificationDrain(
       continue;
     }
     claimed += 1;
-    let result: HraAttentionEmailResult;
+    let result: OompaAttentionEmailResult;
     try {
       result = await sender({
         body: claim.body,

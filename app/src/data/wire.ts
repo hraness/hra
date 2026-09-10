@@ -22,7 +22,7 @@ import {
   type EncryptedEnvelope,
   type SyncStream,
   type WrappedKeyEnvelope,
-} from "../hra/cloud";
+} from "../oompa/cloud";
 
 export type WireEncryptedEnvelope = EncryptedEnvelope;
 
