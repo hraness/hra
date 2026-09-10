@@ -3,7 +3,7 @@
 - `index.html` is the only shell. It carries the mobile viewport with `viewport-fit=cover` and one authored module entry. The sealed build adds a same-origin appearance bootstrap before paint.
 - `src/appearance-entry.ts` and `src/appearance.ts` apply shared themes and restrict preference storage to a bounded palette/mode record. The bootstrap binds static controls; each mounted app menu owns and releases its controller reference.
 - `vite.config.ts` and the repository's app build script compile the shell with no runtime asset or style inlining. The sole authored exception is one canonical data-URI favicon pinned to the reviewed Oompa SVG bytes; it adds no image origin or public asset type. Every compiler foundation precedes one finalized same-origin StyleX recipe stylesheet.
-- `vercel.json` configures the second Vercel project (`app.oompa.dev`) with the F1 Content Security Policy and the no-store shell headers.
+- `vercel.json` configures the second Vercel project (`app.oompa.app`) with the F1 Content Security Policy and the no-store shell headers.
 - `src/oompa/` re-exports the browser-safe repository modules the app is allowed to reach.
 - `src/auth/` holds the Convex client, the in-memory token storage adapter, and the one-time-code sign-in screen.
 - `src/custody/` holds device key generation, IndexedDB key storage, the enrollment flow, the account-key context that opens an enrolled browser automatically, and presence.

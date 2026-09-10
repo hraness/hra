@@ -218,7 +218,7 @@ export const docsPages: readonly DocsPage[] = [
         blocks: [
           setupNotice,
           paragraph(text("First-time machine setup belongs in "), link("Set up Oompa", "/docs/start/"), text(". On a configured, eligible machine, complete Oompa's "), link("protected email-code sign-in", "/docs/web/#cloud-sign-in-and-device-pairing"), text(" with "), code("oompa auth login --input-stdin"), text(". Each invocation reads one protected JSON document; the linked instructions show how to request and verify a code. Complete machine sign-in before enrolling the browser. Your provider sign-in is separate.")),
-          paragraph(text("Open "), link("app.oompa.dev", "https://app.oompa.dev/"), text(" and sign in with your Oompa email and one-time code. Use the same identity as your execution machine. A browser cannot be the first device on an account or approve another device.")),
+          paragraph(text("Open "), link("app.oompa.app", "https://app.oompa.app/"), text(" and sign in with your Oompa email and one-time code. Use the same identity as your execution machine. A browser cannot be the first device on an account or approve another device.")),
           list(
             [text("Choose Enroll this browser. Oompa generates this browser's device keys and shows a fingerprint.")],
             [text("On an already approved machine, list devices and compare the browser fingerprint before approving its exact device ID.")],

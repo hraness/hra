@@ -40,8 +40,8 @@ describe("independently authored package content", () => {
     expect(readme.indexOf(packageInstallCommand)).toBeLessThan(readme.indexOf("\noompa doctor --offline\n"));
     expect(readme).toContain(packageDaemonNotice);
     expect(readme.indexOf(packageDaemonNotice)).toBeLessThan(readme.indexOf("oompa session start personal --provider codex --json"));
-    expect(readme).toContain("[Availability](https://oompa.dev/docs/status/)");
-    expect(readme).toContain("[ordered update runbook](https://oompa.dev/docs/status/#install-and-update)");
+    expect(readme).toContain("[Availability](https://oompa.app/docs/status/)");
+    expect(readme).toContain("[ordered update runbook](https://oompa.app/docs/status/#install-and-update)");
     expect(readme).toContain("https://github.com/hraness/oompa/blob/main/PRIVACY.md");
     expect(readme).toContain("Oompa is maintained by [Hraness](https://hraness.com/) and published under the MIT license.");
     expect(readme.match(/Oompa is maintained by/gu)).toHaveLength(1);

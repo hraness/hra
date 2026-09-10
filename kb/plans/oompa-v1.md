@@ -14,6 +14,8 @@ tags:
 
 # Oompa v1
 
+Domain update, 2026-09-10: [the current domain plan](./oompa-app-domain.md) supersedes earlier host choices in this record. Current website and app destinations are `oompa.app` and `app.oompa.app`; prior hosts grant no current routing or authentication authority. Dated delivery evidence remains historical.
+
 ## Canonical site response headers (2026-09-10)
 
 Status: source repair in progress. Production readback after the protected-input operator merge proved the canonical source identity and matching public page and asset content, but found missing declared headers on the well-known data files and canonical example document. Browser interaction success does not satisfy those response-header contracts.

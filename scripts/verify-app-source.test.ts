@@ -120,7 +120,7 @@ const alias = {
 };
 
 const projectDomain = {
-  apexName: "oompa.dev",
+  apexName: "oompa.app",
   customEnvironmentId: null,
   gitBranch: null,
   name: oompaAppAlias,
@@ -872,6 +872,9 @@ describe("Oompa browser app source proof", () => {
   test("requires the direct verified project domain and non-proxy DNS", async () => {
     for (const hostileSample of [
       providerSample({
+        projectDomainDocument: { ...projectDomain, name: "app.oompa.dev", apexName: "oompa.dev" },
+      }),
+      providerSample({
         projectDomainDocument: { ...projectDomain, verified: false },
       }),
       providerSample({
@@ -903,6 +906,7 @@ describe("Oompa browser app source proof", () => {
 
   test("requires a READY production Git deployment and the exact alias tuple", async () => {
     for (const firstSample of [
+      providerSample({ aliasDocument: { ...alias, alias: "app.oompa.dev" } }),
       providerSample({ deploymentDocument: { ...deployment, readyState: "BUILDING" } }),
       providerSample({ deploymentDocument: { ...deployment, target: null } }),
       providerSample({ deploymentDocument: { ...deployment, source: "cli" } }),

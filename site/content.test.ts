@@ -202,7 +202,7 @@ describe("public content contract", () => {
         github: "https://github.com/hraness/oompa",
       },
       productName: "Oompa",
-      siteUrl: "https://oompa.dev",
+      siteUrl: "https://oompa.app",
     });
   });
 
@@ -288,19 +288,19 @@ describe("public content contract", () => {
     expect(previewEyebrow.textContent).toBe(publicContent.tagline);
     expectCompiledClasses(previewEyebrow);
     expect(publicContent.socialCard).toEqual({
-      alt: "Oompa command-line card showing offline diagnostics and read-only status · v0.8.0 candidate · daemon rollout blocked on capacity · oompa.dev",
+      alt: "Oompa command-line card showing offline diagnostics and read-only status · v0.8.0 candidate · daemon rollout blocked on capacity · oompa.app",
       height: 630,
       path: "/social-card.png",
       width: 1200,
     });
     for (const document of [html, renderPrivacyHtml(), renderPreviewHtml()]) {
-      expect(document).toContain('<meta property="og:image" content="https://oompa.dev/social-card.png">');
+      expect(document).toContain('<meta property="og:image" content="https://oompa.app/social-card.png">');
       expect(document).toContain('<meta property="og:image:type" content="image/png">');
       expect(document).toContain('<meta property="og:image:width" content="1200">');
       expect(document).toContain('<meta property="og:image:height" content="630">');
       expect(document).toContain(`<meta property="og:image:alt" content="${publicContent.socialCard.alt}">`);
       expect(document).toContain('<meta name="twitter:card" content="summary_large_image">');
-      expect(document).toContain('<meta name="twitter:image" content="https://oompa.dev/social-card.png">');
+      expect(document).toContain('<meta name="twitter:image" content="https://oompa.app/social-card.png">');
       expect(document).not.toContain("social-card.svg");
     }
     const llms = renderLlmsText();
@@ -885,7 +885,7 @@ describe("public content contract", () => {
       "honors Do Not Track",
       "disables person profiles, autocapture, heatmaps, feature flags, surveys, conversations, and session recording",
       "Oompa sends no form values, account identity, provider or session data, URL query, or fragment.",
-      "Vercel serves oompa.dev",
+      "Vercel serves oompa.app",
       "GitHub hosts the source repository, releases, and release downloads",
     ];
     const surfaces = [
@@ -1360,7 +1360,7 @@ describe("public content contract", () => {
   test("contains JSON-LD, owned appearance bootstrap, and one owned analytics module on public pages", () => {
     const html = renderSiteHtml();
     const privacy = renderPrivacyHtml();
-    expect(html).toContain('<link rel="canonical" href="https://oompa.dev/">');
+    expect(html).toContain('<link rel="canonical" href="https://oompa.app/">');
     expect(html).toContain('<meta property="og:type" content="website">');
     expect(html).toContain('<link rel="stylesheet" href="/styles.css">');
     expect(html).toContain('<script type="application/ld+json">');
@@ -1374,7 +1374,7 @@ describe("public content contract", () => {
     expect(html).not.toContain("onclick=");
     for (const page of docsPages) {
       const document = parseHTML(renderDocsHtml(page)).document;
-      expect(document.querySelector('link[rel="canonical"]')?.getAttribute("href")).toBe(`https://oompa.dev${page.path}`);
+      expect(document.querySelector('link[rel="canonical"]')?.getAttribute("href")).toBe(`https://oompa.app${page.path}`);
       expect([...document.querySelectorAll("script[src]")].map((script) => script.getAttribute("src"))).toEqual(["/appearance.js", "/analytics.js", "/site.js"]);
       expect(document.documentElement.getAttribute("data-palette")).toBe("catppuccin");
       expect(document.documentElement.getAttribute("data-theme")).toBe("dark");
@@ -1471,7 +1471,7 @@ describe("public content contract", () => {
     const preview = renderPreviewHtml();
     expectCompiledClasses(oneElement(preview, "body.preview-page"));
     expect(preview).toContain('<meta name="robots" content="noindex, nofollow">');
-    expect(preview).toContain('<link rel="canonical" href="https://oompa.dev/">');
+    expect(preview).toContain('<link rel="canonical" href="https://oompa.app/">');
     const title = oneElement(preview, "h1#preview-title");
     expect(title.textContent).toBe(publicContent.productName);
     expectCompiledClasses(title);

@@ -367,7 +367,7 @@ describe("Git history generated hunk metadata", () => {
     const git = async (...arguments_: readonly string[]) => requireHistoryFixtureGitOutput(
       await runHistoryFixtureGit(root, arguments_, remaining()),
     );
-    const title = "The isolated product demos on oompa.dev incorporate MIT-licensed `@hraness/direct` v0.7.0.";
+    const title = "The isolated product demos on oompa.app incorporate MIT-licensed `@hraness/direct` v0.7.0.";
     const before = `${title}\n\n\n\n\n before\n before\n before\n old\n`;
     try {
       await initializeHistoryFixture(root, before, git);
@@ -481,7 +481,7 @@ describe("Git hunk section scope projection", () => {
 
   test("scans complete real Git history when a public package is truncated in a generated heading", async () => {
     const root = resolve(await mkdtemp(join(tmpdir(), "oompa-history-section-")));
-    const heading = "The isolated product demos on oompa.dev incorporate MIT-licensed `@hraness/direct`.";
+    const heading = "The isolated product demos on oompa.app incorporate MIT-licensed `@hraness/direct`.";
     const before = `${heading}\n${"\n".repeat(8)}before\n`;
     try {
       await initializeHistoryFixture(root, before);

@@ -308,7 +308,7 @@ describe("static-site build", () => {
   });
 
   test("renders one crawlable Ask AI row on each public page with exact provider prompts", () => {
-    const subjectUrl = "https://oompa.dev/privacy/";
+    const subjectUrl = "https://oompa.app/privacy/";
     const prompt = `Tell me about ${subjectUrl}`;
     const row = renderAskAiAboutThis(subjectUrl);
     const providers = [
@@ -331,7 +331,7 @@ describe("static-site build", () => {
     }
 
     const publicPages = [
-      [renderSiteHtml(), "https://oompa.dev/"],
+      [renderSiteHtml(), "https://oompa.app/"],
       [renderPrivacyHtml(), subjectUrl],
     ] as const;
     for (const [html, canonicalUrl] of publicPages) {
@@ -437,8 +437,8 @@ describe("static-site build", () => {
     expect(fontUrls).toHaveLength(13);
     const resolvedFonts = fontUrls.map((url) => {
       expect(url).not.toMatch(/^(?:data:|https?:|\/)/iu);
-      const resolved = new URL(url, `https://oompa.dev/${foundationPath}`);
-      expect(resolved.origin).toBe("https://oompa.dev");
+      const resolved = new URL(url, `https://oompa.app/${foundationPath}`);
+      expect(resolved.origin).toBe("https://oompa.app");
       expect(resolved.search).toBe("");
       expect(resolved.hash).toBe("");
       return decodeURIComponent(resolved.pathname.slice(1));
@@ -658,7 +658,7 @@ describe("static-site build", () => {
 
     expect(compiledStylesheetJoin(preview).authoredHtml).toBe(renderPreviewHtml());
     expect(preview).toContain('<meta name="robots" content="noindex, nofollow">');
-    expect(preview).toContain('<link rel="canonical" href="https://oompa.dev/">');
+    expect(preview).toContain('<link rel="canonical" href="https://oompa.app/">');
     expect(preview).not.toContain("/analytics.js");
     expect(sitemap).not.toContain("/preview");
   });
