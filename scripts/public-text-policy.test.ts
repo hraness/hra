@@ -90,8 +90,12 @@ describe("public text policy", () => {
   });
 
   test("allows only the reviewed public Hraness packages", () => {
-    expect(() => assertPublicText("@hraness/atet", "public dependency"))
+    expect(() => assertPublicText("@hraness/slopcamera", "public dependency"))
       .not.toThrow();
+    expect(() => assertPublicText("@hraness/atet@2.0.0", "historical public dependency"))
+      .not.toThrow();
+    expect(() => assertPublicText("@hraness/slopcamera-unreviewed", "unreviewed package suffix"))
+      .toThrow(PublicTextPolicyError);
     expect(() => assertPublicText("@hraness/hra", "public dependency"))
       .not.toThrow();
     expect(() => assertPublicText("@hraness/design-kit", "public dependency"))

@@ -24,7 +24,8 @@ import {
   symlinkMatches,
   writeAtomic,
 } from "./shared";
-import { resolveAtetHostResourceModule, resolveAtetRuntimeRoot } from "./host-run";
+import { resolveSlopcameraHostResourceModule, resolveSlopcameraRuntimeRoot } from "./host-run";
+import { slopcameraArtifacts, slopcameraCommit, slopcameraRuntimeDescription } from "./runtime-pin";
 
 type Mode = "apply" | "check";
 
@@ -53,8 +54,6 @@ const claudeSettings = Object.freeze({
   defaultMode: "auto",
 });
 const minimumClaudeAutoModeVersion = Object.freeze([2, 1, 83] as const);
-const atetRelease = "Atet v2.0.0 host-resource runtime";
-const atetCommit = "58132fa6e8ac09a87d1fdffc17be40c8b1fd9d6d";
 const pluginName = "hra-local-efficiency";
 const commandScripts = Object.freeze([
   "host-run.ts",
@@ -65,32 +64,6 @@ const commandScripts = Object.freeze([
   "ci-ref-audit.ts",
   "repo-adoption.ts",
   "doctor.ts",
-]);
-const atetArtifacts = Object.freeze([
-  Object.freeze({
-    bytes: 978,
-    name: "host-resources.js",
-    sha256: "c86948a8530410bb24e341ce047879196bd423ce8762ad9522a23f29ab517912",
-    source: "dist/host-resources.js",
-  }),
-  Object.freeze({
-    bytes: 46_672,
-    name: "index-64bhbap5.js",
-    sha256: "df629241e110836ed5c0ce9e0489e2c678237ba142ebed35a6a1a030c478245d",
-    source: "dist/index-64bhbap5.js",
-  }),
-  Object.freeze({
-    bytes: 68,
-    name: "index-z1w83f81.js",
-    sha256: "ff933e06cdca2b4821af7b65fc871a38add69a6360000717a76c35736169fd4a",
-    source: "dist/index-z1w83f81.js",
-  }),
-  Object.freeze({
-    bytes: 1_077,
-    name: "LICENSE",
-    sha256: "fa7d249dcd800e7faa648a60289865073d8819d477ab3f5edcd626345160d452",
-    source: "LICENSE",
-  }),
 ]);
 
 function regularFileModeOrDefault(
@@ -136,7 +109,7 @@ export function parseBootstrapArguments(arguments_: readonly string[]): Bootstra
   let codexHome = resolvedCodexHome();
   let installDependency = true;
   let mode: Mode | undefined;
-  const runtimeRoot = resolveAtetRuntimeRoot();
+  const runtimeRoot = resolveSlopcameraRuntimeRoot();
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
     if (argument === "--apply" || argument === "--check") {
@@ -431,12 +404,12 @@ function dependencyAvailable(
   environment: Readonly<NodeJS.ProcessEnv> = process.env,
 ): boolean {
   try {
-    const configured = environment.HRA_ATET_HOST_RESOURCES_MODULE;
+    const configured = environment.HRA_SLOPCAMERA_HOST_RESOURCES_MODULE;
     const modulePath = configured === undefined || configured === ""
       ? join(runtimeRoot, "host-resources.js")
-      : resolveAtetHostResourceModule(environment);
+      : resolveSlopcameraHostResourceModule(environment);
     if (configured === undefined || configured === "") {
-      for (const artifact of atetArtifacts) {
+      for (const artifact of slopcameraArtifacts) {
         const path = join(runtimeRoot, artifact.name);
         const metadata = lstatSync(path);
         if (
@@ -464,11 +437,11 @@ function dependencyAvailable(
   }
 }
 
-async function downloadAtetArtifact(
-  artifact: (typeof atetArtifacts)[number],
+async function downloadSlopcameraArtifact(
+  artifact: (typeof slopcameraArtifacts)[number],
   fetcher: typeof fetch = fetch,
 ): Promise<Uint8Array> {
-  const url = `https://raw.githubusercontent.com/hraness/atet/${atetCommit}/${artifact.source}`;
+  const url = `https://raw.githubusercontent.com/hraness/slopcamera/${slopcameraCommit}/${artifact.source}`;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 30_000);
   try {
@@ -499,12 +472,12 @@ async function downloadAtetArtifact(
   }
 }
 
-export async function installAtetRuntime(
+export async function installSlopcameraRuntime(
   runtimeRoot: string,
   fetcher: typeof fetch = fetch,
 ): Promise<void> {
   const downloaded = await Promise.all(
-    atetArtifacts.map(async (artifact) => [artifact, await downloadAtetArtifact(artifact, fetcher)] as const),
+    slopcameraArtifacts.map(async (artifact) => [artifact, await downloadSlopcameraArtifact(artifact, fetcher)] as const),
   );
   mkdirSync(runtimeRoot, { recursive: true, mode: 0o700 });
   const rootMetadata = lstatSync(runtimeRoot);
@@ -1030,7 +1003,7 @@ export function checkInstallation(
     if (!symlinkMatches(target, link)) failures.push(`command link differs: ${link}`);
   }
   if (!dependencyAvailable(options.runtimeRoot, environment)) {
-    failures.push(`missing private dependency: ${atetRelease}`);
+    failures.push(`missing private dependency: ${slopcameraRuntimeDescription}`);
   }
   return failures;
 }
@@ -1081,7 +1054,7 @@ async function applyInstallation(options: BootstrapOptions): Promise<void> {
     preflightManagedCommandSymlink(target, link, options.codexHome);
   }
   if (!dependencyAvailable(options.runtimeRoot) && !options.installDependency) {
-    throw new Error(`missing ${atetRelease}; dependency installation was disabled`);
+    throw new Error(`missing ${slopcameraRuntimeDescription}; dependency installation was disabled`);
   }
 
   mkdirSync(options.codexHome, { recursive: true, mode: 0o700 });
@@ -1103,7 +1076,7 @@ async function applyInstallation(options: BootstrapOptions): Promise<void> {
     console.log(`${result.toUpperCase()}\t${link}\t${target}`);
   }
   if (!dependencyAvailable(options.runtimeRoot)) {
-    await installAtetRuntime(options.runtimeRoot);
+    await installSlopcameraRuntime(options.runtimeRoot);
   }
   const failures = checkInstallation(options);
   if (failures.length > 0) throw new Error(failures.join("\n"));

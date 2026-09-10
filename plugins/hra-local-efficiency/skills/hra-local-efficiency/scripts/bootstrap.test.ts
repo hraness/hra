@@ -139,7 +139,7 @@ describe("machine bootstrap", () => {
     writeFileSync(modulePath, "export const createHostResourceCoordinator = () => ({})\n");
     const environment = {
       ...fakeClaude(root),
-      HRA_ATET_HOST_RESOURCES_MODULE: modulePath,
+      HRA_SLOPCAMERA_HOST_RESOURCES_MODULE: modulePath,
     };
     const first = Bun.spawnSync({
       cmd: [
@@ -314,7 +314,7 @@ describe("machine bootstrap", () => {
     writeFileSync(modulePath, "export const createHostResourceCoordinator = () => ({})\n");
     const environment = {
       ...fakeClaude(root, "2.1.82"),
-      HRA_ATET_HOST_RESOURCES_MODULE: modulePath,
+      HRA_SLOPCAMERA_HOST_RESOURCES_MODULE: modulePath,
     };
 
     expect(claudeAutoModeCapability(environment)).toEqual({
@@ -405,7 +405,7 @@ describe("machine bootstrap", () => {
     });
     const environment = {
       ...fakeClaude(root, "2.1.261", 0, emptyLists, validAutoModeProbeOutput),
-      HRA_ATET_HOST_RESOURCES_MODULE: modulePath,
+      HRA_SLOPCAMERA_HOST_RESOURCES_MODULE: modulePath,
     };
     const arguments_ = [
       process.execPath,
@@ -469,7 +469,7 @@ describe("machine bootstrap", () => {
           "--bun-bin",
           bunBin,
         ],
-        env: { ...fakeClaude(root), HRA_ATET_HOST_RESOURCES_MODULE: modulePath },
+        env: { ...fakeClaude(root), HRA_SLOPCAMERA_HOST_RESOURCES_MODULE: modulePath },
         stderr: "pipe",
       });
 
@@ -507,7 +507,7 @@ describe("machine bootstrap", () => {
         "--bun-bin",
         bunBin,
       ],
-      env: { ...fakeClaude(root), HRA_ATET_HOST_RESOURCES_MODULE: modulePath },
+      env: { ...fakeClaude(root), HRA_SLOPCAMERA_HOST_RESOURCES_MODULE: modulePath },
       stderr: "pipe",
     });
 
@@ -583,7 +583,7 @@ describe("machine bootstrap", () => {
         "--bun-bin",
         bunBin,
       ],
-      env: { ...fakeClaude(root), HRA_ATET_HOST_RESOURCES_MODULE: modulePath },
+      env: { ...fakeClaude(root), HRA_SLOPCAMERA_HOST_RESOURCES_MODULE: modulePath },
       stderr: "pipe",
     });
     expect(result.exitCode).toBe(1);
@@ -617,7 +617,7 @@ describe("machine bootstrap", () => {
         "--bun-bin",
         bunBin,
       ],
-      env: { ...fakeClaude(root), HRA_ATET_HOST_RESOURCES_MODULE: modulePath },
+      env: { ...fakeClaude(root), HRA_SLOPCAMERA_HOST_RESOURCES_MODULE: modulePath },
       stderr: "pipe",
     });
     expect(result.exitCode).toBe(1);
@@ -625,7 +625,7 @@ describe("machine bootstrap", () => {
     expect(readFileSync(managedTarget, "utf8")).toBe("# Managed elsewhere\n");
   });
 
-  test("preserves exact profile symlinks and existing global Atet commands", () => {
+  test("preserves exact profile symlinks and existing global Slopcamera commands", () => {
     const root = mkdtempSync(join(tmpdir(), "hra-local-efficiency-bootstrap-dotfiles-"));
     temporary.push(root);
     const codexHome = join(root, "codex");
@@ -636,8 +636,8 @@ describe("machine bootstrap", () => {
     mkdirSync(bunBin);
     mkdirSync(dotfiles);
     mkdirSync(join(globalRoot, "bin"), { recursive: true });
-    const globalAtet = join(globalRoot, "bin", "atet");
-    writeFileSync(globalAtet, "existing-global-command\n");
+    const globalSlopcamera = join(globalRoot, "bin", "slopcamera");
+    writeFileSync(globalSlopcamera, "existing-global-command\n");
     for (const profile of ["hra-worker.config.toml", "hra-routine.config.toml"]) {
       const target = join(dotfiles, profile);
       writeFileSync(target, readFileSync(join(import.meta.dir, "..", "assets", profile), "utf8"));
@@ -648,7 +648,7 @@ describe("machine bootstrap", () => {
     const environment = {
       ...fakeClaude(root),
       BUN_INSTALL: globalRoot,
-      HRA_ATET_HOST_RESOURCES_MODULE: modulePath,
+      HRA_SLOPCAMERA_HOST_RESOURCES_MODULE: modulePath,
     };
     const arguments_ = [
       process.execPath,
@@ -664,7 +664,7 @@ describe("machine bootstrap", () => {
     ];
     const applied = Bun.spawnSync({ cmd: arguments_, env: environment, stderr: "pipe" });
     expect(applied.exitCode, applied.stderr.toString()).toBe(0);
-    expect(readFileSync(globalAtet, "utf8")).toBe("existing-global-command\n");
+    expect(readFileSync(globalSlopcamera, "utf8")).toBe("existing-global-command\n");
     for (const profile of ["hra-worker.config.toml", "hra-routine.config.toml"]) {
       expect(lstatSync(join(codexHome, profile)).isSymbolicLink()).toBe(true);
       expect(readlinkSync(join(codexHome, profile))).toBe(join(dotfiles, profile));
@@ -680,7 +680,7 @@ describe("machine bootstrap", () => {
     const refused = Bun.spawnSync({ cmd: arguments_, env: environment, stderr: "pipe" });
     expect(refused.exitCode).toBe(1);
     expect(lstatSync(join(codexHome, "hra-worker.config.toml")).isSymbolicLink()).toBe(true);
-    expect(readFileSync(globalAtet, "utf8")).toBe("existing-global-command\n");
+    expect(readFileSync(globalSlopcamera, "utf8")).toBe("existing-global-command\n");
   }, 10_000);
 
   test("updates a command link owned by a prior plugin-cache install", () => {
@@ -723,7 +723,7 @@ describe("machine bootstrap", () => {
         "--bun-bin",
         bunBin,
       ],
-      env: { ...fakeClaude(root), HRA_ATET_HOST_RESOURCES_MODULE: modulePath },
+      env: { ...fakeClaude(root), HRA_SLOPCAMERA_HOST_RESOURCES_MODULE: modulePath },
       stderr: "pipe",
     });
 
@@ -851,7 +851,7 @@ describe("machine bootstrap", () => {
         "--bun-bin",
         bunBin,
       ],
-      env: { ...fakeClaude(root), HRA_ATET_HOST_RESOURCES_MODULE: modulePath },
+      env: { ...fakeClaude(root), HRA_SLOPCAMERA_HOST_RESOURCES_MODULE: modulePath },
       stderr: "pipe",
     });
 
