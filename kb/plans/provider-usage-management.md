@@ -16,7 +16,7 @@ tags:
 
 ## Current delivery checkpoint
 
-The [Oompa rename and package separation plan](oompa-rename.md) now governs
+2026-09-10: the foundation candidate is integrated into [PR 174](https://github.com/hraness/oompa/pull/174) on branch `claude/oompa-v0.8.0` together with the site header repair and the Oompa rename; the earlier PR 140 and PR 172 are closed as superseded. The [Oompa rename and package separation plan](oompa-rename.md) governs
 forward naming and delivery. Preserve this foundation's reviewed source and
 evidence, but hold old-name release and domain promotion until the rename's
 compatibility and admission gates pass. The requested orange-circle identity
