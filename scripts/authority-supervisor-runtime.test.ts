@@ -85,7 +85,7 @@ const isSupportedLinux = (): boolean =>
   process.platform === "linux" && (process.arch === "x64" || process.arch === "arm64");
 
 const makeRoot = async (): Promise<string> => {
-  const root = await mkdtemp(join(tmpdir(), "oompa-authority-runtime-"));
+  const root = await mkdtemp(join(tmpdir(), "oompa-authority-rt-"));
   await chmod(root, 0o700);
   roots.push(root);
   return root;
@@ -1425,7 +1425,7 @@ test("authority supervisor holds a target behind GO", async () => {
     } catch { /* Diagnostic inability cannot replace the original failure. */ }
   };
   const fixture = createOwnedRuntimeFixture(async (scope) => {
-    const root = await mkdtemp(join(tmpdir(), "oompa-authority-runtime-"));
+    const root = await mkdtemp(join(tmpdir(), "oompa-authority-rt-"));
     // Register even a late root before any further await or cancellation check.
     roots.push(root);
     ownedFixtureCleanups.set(root, fixture.collect);
