@@ -112,6 +112,7 @@ import {
 } from "../storage/state-store";
 import { SessionSendOwnershipError } from "../storage/session-send-owner";
 import { canonicalAdoption40DatabaseBytes, canonicalAdoption40Fixture } from "../../scripts/fixtures/canonical-adoption40";
+import { provisionMigratedStateTemplate } from "../../scripts/fixtures/migrated-state-template";
 import {
   DeterministicProseResponder,
   PROSE_APPROVAL_REPLY,
@@ -1498,6 +1499,13 @@ type FixtureAdoptionOptions = Readonly<{
   canonical39Attachments?: Canonical39AttachmentScenario;
   managedClaude?: ClaudeRuntimePort;
   memory?: OompaMemoryPort;
+  /**
+   * `template`, this file's default for an empty store, copies the
+   * process-wide migrated template before the open. `migrate` runs the real
+   * migration chain from an empty file. Archived sources above always take
+   * the real path.
+   */
+  provision?: "template" | "migrate";
   personalCodex?: CodexRuntimePort;
   personalClaude?: ClaudeRuntimePort;
   personalDiscovery?: PersonalSessionDiscoveryPort;
@@ -1612,6 +1620,13 @@ async function fixture(
       throw new Error("Choose exactly one archived source.");
     }
     await writeFile(paths.database, canonical39AttachmentDatabaseBytes(adoption.canonical39Attachments), { mode: 0o600 });
+  }
+  const archivedSource = adoption.canonical40Queues === true || adoption.canonical39Devin === true
+    || adoption.canonical39Retired !== undefined || adoption.canonical39RetiredRecovery !== undefined
+    || adoption.canonical39RetiredTarget !== undefined || adoption.canonicalSessionStart !== undefined
+    || adoption.canonical39Attachments !== undefined;
+  if (!archivedSource && adoption.provision !== "migrate") {
+    await provisionMigratedStateTemplate(paths, { now });
   }
   const store = new StateStore(paths, {
     now,
