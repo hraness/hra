@@ -47,7 +47,7 @@ export function browserFailureDetails(value: unknown, depth = 0): BrowserFailure
   };
 }
 type Profile = Readonly<{ name: string; width: number; height: number; coarse: boolean; reduced: boolean; forced: boolean; rtl: boolean; colorScheme?: "dark" | "light" }>;
-const fixtureViews = ["signin", "locked", "enrollment", "grid", "session", "session-long", "retired", "settings", "primitives"] as const;
+const fixtureViews = ["signin", "enrollment", "grid", "session", "session-long", "retired", "settings", "primitives"] as const;
 const productViews = ["overview", "conversation", "question", "settings"] as const;
 type ProductView = typeof productViews[number];
 const siteRouteLabels = ["home", "privacy", "preview", "docs", "docs-start", "docs-web", "docs-sessions", "docs-reference", "docs-status"] as const;
@@ -1620,7 +1620,10 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
           }
           if (view === "session" || view === "session-long" || view === "retired") {
             assert.ok(await page.getByRole("heading", { name: "Browser fixture session", exact: true }).isVisible());
-            assert.ok(await page.getByText("compiled presentation", { exact: true }).isVisible());
+            // Older responses fold to one summary line; only the newest stays open.
+            assert.ok(await page.getByText(view === "session-long"
+              ? "Fixture transcript: compiled presentation and native controls."
+              : "compiled presentation", { exact: true }).isVisible());
             const bubble = await page.getByText("Review the browser fixture", { exact: true }).evaluate((element) => {
               const css = getComputedStyle(element);
               return { left: css.borderTopLeftRadius, right: css.borderTopRightRadius };
@@ -1634,10 +1637,19 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
             for (const name of ["Attach a file", "Message this session", "Stop the turn"]) {
               assert.equal(await page.getByLabel(name, { exact: true }).isDisabled(), view === "retired");
             }
-            await page.getByRole("button", { name: "Session menu", exact: true }).click();
-            await page.getByRole("dialog").waitFor({ state: "visible" });
-            await page.keyboard.press("Escape");
-            await page.getByRole("dialog").waitFor({ state: "hidden" });
+            assert.equal(await page.getByLabel("Message this session", { exact: true }).evaluate((element) => element.tagName), "TEXTAREA");
+            await page.getByRole("button", { name: /^Session actions for /u }).click();
+            const settingsItem = page.getByRole("menuitem", { name: "Approvals and provider", exact: true });
+            await settingsItem.waitFor({ state: "visible" });
+            if (view === "retired") {
+              assert.ok(await settingsItem.isDisabled(), "Retired session still offers its settings sheet");
+              await page.keyboard.press("Escape");
+            } else {
+              await settingsItem.click();
+              await page.getByRole("dialog").waitFor({ state: "visible" });
+              await page.keyboard.press("Escape");
+              await page.getByRole("dialog").waitFor({ state: "hidden" });
+            }
             if (view === "session-long") {
               const quote = await page.locator("blockquote").first().evaluate((element) => {
                 const css = getComputedStyle(element);
@@ -1646,18 +1658,18 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
               assert.deepEqual(quote, profile.rtl
                 ? { left: "0px", right: "2px", paddingLeft: "0px", paddingRight: "12px" }
                 : { left: "2px", right: "0px", paddingLeft: "12px", paddingRight: "0px" }, "Markdown quote gutter did not follow inline start");
-              const scroller = page.locator("#root div").filter({ has: page.getByText("compiled presentation", { exact: true }) });
-              const scroll = await scroller.evaluateAll((elements) => {
-                const target = elements.find((element) => getComputedStyle(element).overflowY === "auto");
+              const collapsed = await page.getByRole("button", { expanded: false }).filter({ hasText: "Transcript row" }).count();
+              assert.ok(collapsed > 0, "Older responses did not start collapsed");
+              const scroll = await page.getByRole("log", { name: /^Conversation of /u }).evaluate((target) => {
                 if (!(target instanceof HTMLElement)) return null;
                 target.scrollTop = 0;
                 const start = target.scrollTop;
                 target.scrollTop = target.scrollHeight;
                 return { start, end: target.scrollTop, viewport: target.clientHeight, content: target.scrollHeight,
-                  pageHeight: document.documentElement.scrollHeight, screen: innerHeight };
+                  overflow: getComputedStyle(target).overflowY, screen: innerHeight };
               });
-              assert.ok(scroll !== null && scroll.start === 0 && scroll.end > 0 && scroll.content > scroll.viewport);
-              assert.ok(scroll.pageHeight <= scroll.screen + 1, "Long history escaped its bounded transcript scroller");
+              assert.ok(scroll !== null && scroll.start === 0 && scroll.end > 0 && scroll.content > scroll.viewport && scroll.overflow === "auto");
+              assert.ok(scroll.viewport <= scroll.screen * 0.6 + 1, "Long history escaped its bounded conversation scroller");
               assert.ok(await page.getByLabel("Message this session", { exact: true }).isVisible());
             }
           }

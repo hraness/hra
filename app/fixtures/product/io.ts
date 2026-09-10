@@ -75,8 +75,8 @@ export const useAuthActions: typeof Auth.useAuthActions = () => ({ signIn: refus
 export function useCustody(): Custody {
   return {
     busy: false, devicePublicId: null, enroll: refuseAsync, enrollment: "needs_registration",
-    error: null, fingerprint: null, lock: refuse, refresh: refuseAsync, reportAuthorityFailure: refuse,
-    state: "locked", unlock: refuseAsync,
+    error: null, fingerprint: null, refresh: refuseAsync, reportAuthorityFailure: refuse,
+    state: "unenrolled", unlock: refuseAsync,
   };
 }
 

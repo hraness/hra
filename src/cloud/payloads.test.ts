@@ -585,6 +585,23 @@ describe("device registry payloads", () => {
     expect(await decryptDeviceRegistry(envelope, key, authority)).toEqual(withAdoption);
   });
 
+  test("accepts an additive default project only when it names a listed project", async () => {
+    const withDefault = {
+      ...registry,
+      defaultProjectPublicId: "proj_00000000000000000000000000000001",
+    } as const;
+    expect(parseDeviceRegistryPayload(withDefault)).toEqual(withDefault);
+    const key = randomKeyBytes();
+    const envelope = await encryptDeviceRegistry(withDefault, key, authority);
+    expect(await decryptDeviceRegistry(envelope, key, authority)).toEqual(withDefault);
+    expect(parseDeviceRegistryPayload({
+      ...registry,
+      defaultProjectPublicId: "proj_00000000000000000000000000000009",
+    })).toBeNull();
+    expect(parseDeviceRegistryPayload({ ...registry, defaultProjectPublicId: null })).toBeNull();
+    expect(parseDeviceRegistryPayload({ ...registry, defaultProjectPublicId: "/Users/me" })).toBeNull();
+  });
+
   test("parses and encrypts a registry carrying a Devin account and Astra default", async () => {
     const providerRegistry = {
       ...registry,

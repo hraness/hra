@@ -3,7 +3,8 @@ import { StrictMode, useEffect } from "react";
 import { createRoot } from "react-dom/client";
 import { ErrorBoundary } from "../../src/components/error-boundary";
 import { GridScreen } from "../../src/screens/grid-screen";
-import { SessionScreen } from "../../src/screens/session-screen";
+import { SessionCard } from "../../src/components/session-card";
+import { useSessionHead } from "../../src/data/session-heads";
 import { SettingsScreen } from "../../src/screens/settings-screen";
 import { createProductPreviewSession, parseProductPreviewSelection, type ProductPreviewSession, type ProductPreviewView } from "./definition";
 import { PRODUCT_SESSION_IDS } from "./fixtures";
@@ -44,7 +45,8 @@ function Screen({ session }: Readonly<{ session: ProductPreviewSession }>) {
       const snapshot = clean && screen !== null ? `${JSON.stringify(probe.value)}\n${screen.innerHTML}` : null;
       const rendered = view === "overview" ? document.querySelectorAll("[data-session-id]").length === 3
         : view === "question" ? document.querySelector('[aria-label="Pending interaction"]') !== null
-          : document.querySelector("h1") !== null;
+          : view === "conversation" ? document.querySelectorAll("[data-session-id]").length === 1
+            : document.querySelector("h1") !== null;
       // A resource failure can precede the bundle's error listeners. Both
       // sealed stylesheets must actually load, not merely appear in the DOM.
       const stylesheets = [...document.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"]')];
@@ -65,10 +67,28 @@ function Screen({ session }: Readonly<{ session: ProductPreviewSession }>) {
     return () => { disposed = true; cancelAnimationFrame(frame); };
   }, [session, view]);
   return <div data-product-preview={view} inert>
-    {view === "overview" ? <GridScreen onSelect={() => undefined} selectedSessionId={null} />
+    {view === "overview" ? <GridScreen />
       : view === "settings" ? <SettingsScreen onBack={() => undefined} />
-        : <SessionScreen sessionPublicId={PRODUCT_SESSION_IDS[view]} />}
+        : <SingleCard sessionPublicId={PRODUCT_SESSION_IDS[view]} />}
   </div>;
+}
+
+const noOrdering = {
+  arranged: false,
+  canMoveLeft: false,
+  canMoveRight: false,
+  dragging: false,
+  dropTarget: false,
+  onDragStart: () => undefined,
+  onMove: () => undefined,
+  onReset: () => undefined,
+} as const;
+
+/** One conversation card on its own, as the site's conversation scenes show it. */
+function SingleCard({ sessionPublicId }: Readonly<{ sessionPublicId: string }>) {
+  const head = useSessionHead(sessionPublicId);
+  if (head === null) throw new Error("Unknown product example session.");
+  return <SessionCard head={head} onSummary={() => undefined} ordering={noOrdering} />;
 }
 
 const container = document.getElementById("root");

@@ -17,7 +17,6 @@ import {
   SettingsRow,
   SettingsSection,
 } from "../components/settings-list";
-import { useCustody } from "../custody/custody-context";
 import { useArchivedSessions } from "../data/archived-sessions";
 import { useCommandState, useSubmitCommand } from "../data/commands";
 import {
@@ -1134,7 +1133,6 @@ function DeviceRow({ device, now }: Readonly<{ device: DeviceView; now: number }
  * `#/settings` decides where back goes without this screen knowing about it.
  */
 export function SettingsScreen({ onBack }: Readonly<{ onBack: () => void }>) {
-  const custody = useCustody();
   const { signOut } = useAuthActions();
   const registries = useDeviceRegistries();
   const { devices, loading: devicesLoading } = useDevices();
@@ -1293,17 +1291,10 @@ export function SettingsScreen({ onBack }: Readonly<{ onBack: () => void }>) {
         </SettingsSection>
 
         <SettingsSection
-          description="Locking drops the account key from this tab. Nothing decrypts until you unlock again."
+          description="The account key lives only in this tab's memory and is dropped when the page closes."
           title="This session"
         >
           <SettingsCard>
-            <SettingsRow
-              control={(
-                <Button onClick={custody.lock} size="small" variant="secondary">Lock</Button>
-              )}
-              description="Also happens on idle and on Ctrl+L."
-              title="Lock this tab"
-            />
             <SettingsRow
               control={(
                 <Button onClick={() => { void signOut(); }} size="small" variant="danger">

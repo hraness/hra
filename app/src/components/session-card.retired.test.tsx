@@ -21,9 +21,6 @@ const head: SessionHead = {
   updatedAt: 0,
 };
 
-await mock.module("../data/session-heads", () => ({
-  useSessionHead: () => head,
-}));
 await mock.module("../data/session-model-hook", () => ({
   useSessionModel: () => ({
     compactEvents: [],
@@ -49,18 +46,47 @@ await mock.module("../data/commands", () => ({
     throw new Error("Unexpected provider command");
   },
 }));
-await mock.module("../components/scheduled-tasks-badge", () => ({
+await mock.module("../data/composer-attachments", () => ({
+  useComposerAttachments: () => ({
+    attachments: [],
+    busy: false,
+    clear: () => {},
+    dragging: false,
+    notice: null,
+    onDragLeave: () => {},
+    onDragOver: () => {},
+    onDrop: () => {},
+    onPaste: () => {},
+    onPick: () => {},
+    remove: () => {},
+    sendRefusal: null,
+  }),
+}));
+await mock.module("./scheduled-tasks-badge", () => ({
   ScheduledTasksBadge: () => null,
 }));
 
-const { SessionScreen } = await import("./session-screen");
+const { SessionCard } = await import("./session-card");
 
-describe("retired session screen", () => {
-  test("retains the conversation view but disables every visible execution input", () => {
+const ordering = {
+  arranged: false,
+  canMoveLeft: false,
+  canMoveRight: false,
+  dragging: false,
+  dropTarget: false,
+  onDragStart: () => {},
+  onMove: () => {},
+  onReset: () => {},
+};
+
+describe("retired session card", () => {
+  test("retains the conversation but disables every visible execution input", () => {
     retired = true;
-    const markup = renderToStaticMarkup(<SessionScreen sessionPublicId={head.publicId} />);
+    const markup = renderToStaticMarkup(
+      <SessionCard head={head} onSummary={() => {}} ordering={ordering} />,
+    );
     expect(markup).toContain("Historical conversation");
-    expect(markup).toContain("Devin support is retired. This session is read-only.");
+    expect(markup).toContain("Devin retired · read-only");
     for (const label of ["Attach a file", "Message this session", "Stop the turn"]) {
       const element = markup.match(new RegExp('<[^>]+aria-label="' + label + '"[^>]*>'))?.[0];
       expect(element).toBeDefined();
@@ -71,13 +97,16 @@ describe("retired session screen", () => {
 
   test("does not disable the same controls on a supported session", () => {
     retired = false;
-    const markup = renderToStaticMarkup(<SessionScreen sessionPublicId={head.publicId} />);
-    expect(markup).not.toContain("Devin support is retired");
+    const markup = renderToStaticMarkup(
+      <SessionCard head={head} onSummary={() => {}} ordering={ordering} />,
+    );
+    expect(markup).not.toContain("Devin retired");
     for (const label of ["Attach a file", "Message this session", "Stop the turn"]) {
       const element = markup.match(new RegExp('<[^>]+aria-label="' + label + '"[^>]*>'))?.[0];
       expect(element).toBeDefined();
       expect(element).not.toContain('disabled=""');
     }
+    expect(markup).toContain('aria-label="Conversation of Historical conversation"');
     expect(submitted).toBe(0);
   });
 });

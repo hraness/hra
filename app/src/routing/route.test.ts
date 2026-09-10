@@ -1,15 +1,13 @@
 import { describe, expect, test } from "bun:test";
 
-import { parseRoute, routeHash, sameRoute, sessionRoute } from "./route";
+import { parseRoute, routeHash, sameRoute } from "./route";
 
 const sessionId = "0199aaaabbbbccccddddeeeeffff0000";
 
 describe("parseRoute", () => {
-  test("reads the three routes", () => {
+  test("reads the two routes", () => {
     expect(parseRoute("#/")).toEqual({ kind: "grid" });
     expect(parseRoute("#/settings")).toEqual({ kind: "settings" });
-    expect(parseRoute(`#/session/${sessionId}`))
-      .toEqual({ kind: "session", sessionPublicId: sessionId });
   });
 
   test("accepts a fragment with or without its hash and with stray slashes", () => {
@@ -31,7 +29,8 @@ describe("parseRoute", () => {
     }
   });
 
-  test("refuses a session id that is not an opaque identifier", () => {
+  test("an old conversation link lands on the grid, where the card now lives", () => {
+    expect(parseRoute(`#/session/${sessionId}`)).toEqual({ kind: "grid" });
     for (const id of ["../../etc", "not a session", "a".repeat(300), "<script>"]) {
       expect(parseRoute(`#/session/${id}`)).toEqual({ kind: "grid" });
     }
@@ -43,14 +42,13 @@ describe("routeHash", () => {
     for (const route of [
       { kind: "grid" } as const,
       { kind: "settings" } as const,
-      sessionRoute(sessionId),
     ]) {
       expect(parseRoute(routeHash(route))).toEqual(route);
     }
   });
 
   test("compares routes by their fragment", () => {
-    expect(sameRoute(sessionRoute(sessionId), sessionRoute(sessionId))).toBe(true);
-    expect(sameRoute(sessionRoute(sessionId), { kind: "grid" })).toBe(false);
+    expect(sameRoute({ kind: "settings" }, { kind: "settings" })).toBe(true);
+    expect(sameRoute({ kind: "settings" }, { kind: "grid" })).toBe(false);
   });
 });

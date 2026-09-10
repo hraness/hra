@@ -73,6 +73,7 @@ await mock.module("../data/registry", () => ({
       daemonVersion: "0.4.1",
       defaultApprovalMode: "auto:all",
       defaultPreset: "astra",
+      defaultProjectPublicId: null,
       deviceCommandsAllowed: true,
       devicePublicId: "device_studio01",
       deviceStatus: "active",
