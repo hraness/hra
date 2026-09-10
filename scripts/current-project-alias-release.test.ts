@@ -33,6 +33,7 @@ import {
   parseArguments,
   parseCurrentDeploymentReadback,
   parseCurrentProjectAliasReleasePlan,
+  readProtectedProviderActivityEvidenceFile,
   requiredAliasConfirmation,
   type CurrentAliasReadback,
   type CurrentDeploymentReadback,
@@ -831,6 +832,7 @@ const runDirectApiCli = async (
   operation: "execute" | "preflight" | "recover-source",
   confirmation = requiredAliasConfirmation(inputPlan),
   providerActivityEvidence?: ProviderActivityTargetEvidence,
+  inputMode: "descriptor" | "file" = "descriptor",
 ): Promise<Readonly<{
   convexCalls: number;
   exitCode: number;
@@ -840,6 +842,9 @@ const runDirectApiCli = async (
   const stdout: string[] = [];
   const stderr: string[] = [];
   let convexCalls = 0;
+  const inputArguments = inputMode === "descriptor"
+    ? ["--vercel-auth-fd", "3"]
+    : ["--vercel-auth-file", "/fixture/auth.json", "--plan-file", "/fixture/plan.json"];
   const exitCode = await executeCurrentProjectAliasReleaseWithExplicitApiCapability(
     {
       accessToken: "fixture-vercel-token",
@@ -853,11 +858,10 @@ const runDirectApiCli = async (
     },
     {
       arguments: operation === "preflight"
-        ? ["preflight", "--vercel-auth-fd", "3"]
+        ? ["preflight", ...inputArguments]
         : [
             operation === "execute" ? "--execute" : "recover-source",
-            "--vercel-auth-fd",
-            "3",
+            ...inputArguments,
             "--confirm-exact",
             confirmation,
           ],
@@ -1121,6 +1125,18 @@ describe("current-project alias plan", () => {
     expect(credentialConsumption).toBeGreaterThan(runtimeGuard);
     expect(journalRecovery).toBeGreaterThan(credentialConsumption);
     expect(journalRecovery).toBeGreaterThan(runtimeGuard);
+    for (const read of [
+      "readProtectedVercelAccessTokenFile(arguments_.vercelAuthFile)",
+      "readProtectedProviderActivityEvidenceFile(arguments_.recoveryEvidenceFile)",
+      "readProtectedAliasPlanFile(arguments_.planFile)",
+    ]) {
+      const consumption = implementation.indexOf(read, main);
+      expect(consumption).toBeGreaterThan(runtimeGuard);
+      expect(consumption).toBeLessThan(journalRecovery);
+    }
+    const execution = implementation.indexOf("executeCurrentProjectAliasRelease({", main);
+    expect(execution).toBeGreaterThan(journalRecovery);
+    expect(implementation).toContain("readAliasInputBuffer(size, (document, offset) => readSync(");
   });
 });
 
@@ -1661,6 +1677,30 @@ describe("current-project alias authority", () => {
 });
 
 describe("current-project Vercel provider", () => {
+  test("keeps file-argument API dispatch behind the same authority and ledger gates", async () => {
+    await withStateDirectory(async (stateDirectory) => {
+      const transport = new FakeDirectVercelTransport();
+      const preflight = await runDirectApiCli(cliSourcePlan, transport, stateDirectory, "preflight",
+        requiredAliasConfirmation(cliSourcePlan), undefined, "file");
+      expect(preflight.exitCode).toBe(0);
+      expect(preflight.stderr).toEqual([]);
+      expect(JSON.parse(preflight.stdout.join(""))).toMatchObject({ status: "ready", observedState: "source" });
+      expect(transport.requests.filter((request) => request.init.method === "POST")).toHaveLength(0);
+      const refused = await runDirectApiCli(cliSourcePlan, transport, stateDirectory, "execute", "wrong", undefined, "file");
+      expect(refused.exitCode).toBe(1);
+      expect(transport.requests.filter((request) => request.init.method === "POST")).toHaveLength(0);
+      const executed = await runDirectApiCli(cliSourcePlan, transport, stateDirectory, "execute",
+        requiredAliasConfirmation(cliSourcePlan), undefined, "file");
+      expect(executed.exitCode).toBe(0);
+      expect(executed.stderr).toEqual([]);
+      expect(JSON.parse(executed.stdout.join(""))).toMatchObject({ status: "committed" });
+      expect(transport.requests.filter((request) => request.init.method === "POST")).toHaveLength(1);
+      const replay = await runDirectApiCli(cliSourcePlan, transport, stateDirectory, "execute",
+        requiredAliasConfirmation(cliSourcePlan), undefined, "file");
+      expect(replay.exitCode).toBe(0);
+      expect(transport.requests.filter((request) => request.init.method === "POST")).toHaveLength(1);
+    });
+  });
   test("constructs only the direct alias endpoint request with the plan-bound key", async () => {
     const key = currentAliasReleaseMutationKey(plan, "assign-target");
     expect(currentAliasReleaseApiArguments(target, key)).toEqual([
@@ -1782,6 +1822,7 @@ describe("current-project Vercel provider", () => {
       const validPath = join(stateDirectory, "recovery-evidence.json");
       await writeFile(validPath, JSON.stringify(providerActivityEvidence), { mode: 0o600 });
       await chmod(validPath, 0o600);
+      expect(readProtectedProviderActivityEvidenceFile(validPath)).toEqual(providerActivityEvidence);
       const validDescriptor = openSync(
         validPath,
         constants.O_RDONLY | constants.O_NOFOLLOW,
@@ -1797,6 +1838,8 @@ describe("current-project Vercel provider", () => {
         observedTargetMarkerVersion: HRA_RELEASE_VERSION,
       }), { mode: 0o600 });
       await chmod(invalidPath, 0o600);
+      expect(() => readProtectedProviderActivityEvidenceFile(invalidPath))
+        .toThrow("recovery_evidence_invalid");
       const invalidDescriptor = openSync(
         invalidPath,
         constants.O_RDONLY | constants.O_NOFOLLOW,

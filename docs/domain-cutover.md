@@ -46,9 +46,13 @@ The alias operator never changes Convex; exact live default-production readback 
 
 ## Provider readback contract
 
-Use Bun 1.3.14. Both the executable entry point and the explicit-capability test boundary reject any other Bun version before argument recovery, provider reads, or durable alias state mutation. The canonical `--vercel-auth-fd` path supports Darwin and Linux by making bounded HTTPS requests directly to fixed paths at `https://api.vercel.com`, with the stable Vercel team ID in every request. It rejects redirects, non-JSON responses, oversized bodies, and responses outside the strict endpoint schemas. This path starts no Vercel subprocess and performs no Vercel CLI discovery. A separate explicit `--vercel-cli` compatibility path remains available only on Linux under the repository's PID-namespace authority supervisor. Do not use that legacy path for this Darwin-capable procedure. Any credential-bearing provider subprocess remains authority work with no process-group fallback.
+Use Bun 1.3.14. Both the executable entry point and the explicit-capability test boundary reject any other Bun version before argument recovery, provider reads, or durable alias state mutation. The canonical `--vercel-auth-file` and retained `--vercel-auth-fd` paths support Darwin and Linux by making bounded HTTPS requests directly to fixed paths at `https://api.vercel.com`, with the stable Vercel team ID in every request. They reject redirects, non-JSON responses, oversized bodies, and responses outside the strict endpoint schemas. Neither path starts a Vercel subprocess or performs Vercel CLI discovery. A separate explicit `--vercel-cli` compatibility path remains available only on Linux under the repository's PID-namespace authority supervisor. Do not use that legacy path for this Darwin-capable procedure. Any credential-bearing provider subprocess remains authority work with no process-group fallback.
 
-Select one reviewed file-backed Vercel session for the designated operating-system account and open it on the descriptor supplied through `--vercel-auth-fd`. The held descriptor must not be a TTY and must identify a current-user-owned, single-link, mode-`0600` regular file within the bounded size limit. Darwin also rejects any extended access-control list. The operator recognizes only the bounded session token and optional expiry, closes the credential descriptor before bounded-process journal recovery or any provider call, sends the token in the Vercel authorization header, and never writes the token to output, logs, argv, the plan, intent, or receipt. An expiring token must have at least 15 minutes remaining at the start of each preflight or execution invocation; a shorter, malformed, or expired session is refused before recovery or provider work, and the margin provides headroom for the bounded forward-and-restoration path. The operator does not refresh the token and does not discover one from an environment variable, inherited `HOME`, default CLI configuration path, Keychain, or another ambient account source. Review the exact file before opening the descriptor, keep the same file and operating-system account through preflight and execution, and never pass the token itself as a command-line value.
+Select one reviewed file-backed Vercel session for the designated operating-system account and name its exact absolute path with `--vercel-auth-file`. The operator opens that file itself after scheduler admission. It requires a current-user-owned, single-link, mode-`0600` regular file, refuses symlinks and special files, and uses a nonblocking no-follow open. It compares the path and held descriptor identities around two bounded matching reads and rejects any Darwin extended ACL. Credential files are limited to 8 KiB; plan and recovery-evidence files are limited to 32 KiB. File paths must be absolute, normalized, control-free and at most 4,096 characters. Each input accepts either its file flag or its descriptor flag, never both; file paths must be distinct.
+
+The operator recognizes only the bounded session token and optional expiry, clears read buffers and closes its credential descriptor before bounded-process journal recovery or any provider call. It sends the token in the Vercel authorization header and never writes it to output, logs, argv, the plan, intent, or receipt. An expiring token must have at least 15 minutes remaining at the start of each preflight or execution invocation; a shorter, malformed, or expired session is refused before recovery or provider work. The operator does not refresh the token or discover one from an environment variable, inherited `HOME`, default CLI configuration path, Keychain, or another ambient account source. Review the exact file, keep the same file and operating-system account through preflight and execution, and never pass the token itself as a command-line value.
+
+Existing `--vercel-auth-fd`, `--plan-fd` and `--recovery-evidence-fd` inputs remain available to callers that already preserve and review those descriptors. File inputs do not reuse their descriptor numbers. In particular, the host scheduler uses descriptor 3 and, on capability lanes, descriptor 4 for its leases; it does not forward arbitrary caller input descriptors. Use file inputs with a direct Bun child; do not overwrite lease descriptors or add a shell or package-script wrapper to carry private inputs.
 
 Preflight and execution read the following state from the providers instead of trusting names or a prior observation:
 
@@ -64,14 +68,12 @@ Provider output is parsed from `unknown`, bounded, and reduced to closed result 
 
 ## Read-only preflight
 
-Run preflight as the designated Darwin or Linux writer custodian from a clean checkout containing the reviewed operator. Invoke the Bun entry point directly and open the reviewed Vercel session and fresh private plan on separate descriptors. Do not put this descriptor-bearing command behind `bun run` or another package-script runner: Bun's package runner does not preserve arbitrary inherited descriptors reliably on Darwin.
+Run preflight as the designated Darwin or Linux writer custodian from a clean checkout containing the reviewed operator. Name the reviewed Vercel session and fresh private plan explicitly. When the host scheduler is installed, resolve its absolute command path and invoke it directly with the complete Bun child arguments, using shared mode and the applicable capability lane. Do not invoke the scheduler through a shell wrapper.
 
 ```sh
 bun ./scripts/current-project-alias-release.ts preflight \
-  --vercel-auth-fd 3 \
-  --plan-fd 4 \
-  3</absolute/path/to/reviewed-vercel-auth.json \
-  4</absolute/path/to/fresh-hra-sh-plan.json
+  --vercel-auth-file /absolute/path/to/reviewed-vercel-auth.json \
+  --plan-file /absolute/path/to/fresh-hra-sh-plan.json
 ```
 
 Preflight performs no provider write. Its result uses `schemaVersion: 3`; version 3 replaces the retired conversational-approval action while retaining `requiredConfirmation` as the exact machine token. It first takes the designated custodian's same machine-local lock and inspects the protected ledger. A receipt-less current intent returns `unresolved_current_intent`, and a different receipt-less intent returns `unresolved_prior_intent`, before provider readback; neither can be reclassified as already committed. Exact source authority with no terminal record returns `status: "ready"`, `nextAction: "execute_with_machine_token_under_standing_task_authority"`, and `requiredConfirmation`. Exact target authority returns `status: "already_committed"` only when no intent exists or a valid target receipt agrees. An unplanned alias, marker mismatch, provider mismatch, unreadable response, unsafe project setting, wrong Convex default, terminal receipt mismatch, or retired identity blocks or refuses.
@@ -84,11 +86,9 @@ After a ready preflight under applicable standing task authority, the designated
 
 ```sh
 bun ./scripts/current-project-alias-release.ts --execute \
-  --vercel-auth-fd 3 \
-  --plan-fd 4 \
-  --confirm-exact '<exact requiredConfirmation from the immediately preceding preflight>' \
-  3</absolute/path/to/reviewed-vercel-auth.json \
-  4</absolute/path/to/fresh-hra-sh-plan.json
+  --vercel-auth-file /absolute/path/to/reviewed-vercel-auth.json \
+  --plan-file /absolute/path/to/fresh-hra-sh-plan.json \
+  --confirm-exact '<exact requiredConfirmation from the immediately preceding preflight>'
 ```
 
 The only provider mutation form constructed by the operator is the documented direct `POST /v2/deployments/<exact-deployment-id>/aliases` request with the JSON field `alias: "hra.sh"`, scoped to stable Vercel team ID `team_UAd1iD2XogJlbFg4h14mRaPM`. The deployment ID is either the exact plan target or, only after a protected target phase and durable source-recovery intent, the exact plan source. The bounded in-process transport never invokes the friendly `vercel alias set` command because that command can perform implicit domain and certificate setup beyond the one alias record. Each request carries its distinct plan- and effect-derived mutation key in an `Idempotency-Key` correlation header. The alias endpoint does not document deduplication for that header, so recovery safety does not assume provider-side idempotency. An uncertain target request is never redispatched and is never followed by an opposing source write; it becomes a durable hard stop. The request does not detach the alias first and cannot select another alias or project. After an acknowledged target response with exact prior-source provenance, one 60-second retry-admission deadline governs every attempt to obtain the complete target proof. The operator starts no new fast or complete sample after that deadline. A provider read already in progress completes or fails under its own stricter bounded transport or process timeout. Every exact sample requires the authenticated alias tuple and public marker to match before the operator rechecks the Vercel project, both deployments, current Convex default production, alias, and marker. Two consecutive complete samples must agree before the operator returns `status: "committed"`. A transient unplanned alias, marker mismatch, or closed provider-read failure resets the consecutive count and is retried within the same admission deadline. The operator never turns a mismatch into authority and never restarts the deadline between the fast tuple-marker check and full readback.
@@ -111,26 +111,21 @@ After an acknowledged target response whose `oldDeploymentId` proves the exact p
 
 ```sh
 bun ./scripts/current-project-alias-release.ts recover-source \
-  --plan-fd 3 \
-  --vercel-auth-fd 4 \
-  --confirm-exact '<exact requiredConfirmation from the original ready preflight>' \
-  3</absolute/path/to/unchanged-hra-sh-plan.json \
-  4</absolute/path/to/reviewed-vercel-auth.json
+  --plan-file /absolute/path/to/unchanged-hra-sh-plan.json \
+  --vercel-auth-file /absolute/path/to/reviewed-vercel-auth.json \
+  --confirm-exact '<exact requiredConfirmation from the original ready preflight>'
 ```
 
 The recovery operation never dispatches the target assignment. Before writing, it revalidates the current project, both deployments, current Convex production target, and exact authenticated target alias tuple. The only admitted target-authority defect is `marker_mismatch`, and that mismatch is narrower than an arbitrary invalid marker: every marker field and the target commit must be exact except `version`, which must be noncurrent and stable across two complete observations. If the complete target authority including its current marker version is already exact, recovery refuses rather than undoing a proved release. It accepts only a protected target phase tied to the original intent and exact confirmation. For a normal current record, that phase comes from the previously accepted target response. A legacy receipt-less intent may instead use a separately reviewed compound phase attestation. The operator accepts only the single historical operator commit, source-blob OID, entrypoint SHA-256, and Bun version tuple explicitly allowlisted in the reviewed implementation; arbitrary syntactically valid provenance is refused before provider access. It then dynamically revalidates the exact protected intent, the provider `aliases-assigned` Activity event set, the authenticated alias record, and the exact target and source deployment alias lists. The Activity query uses the live-proven team-scoped `since` surface because provider-side `projectIds` and `until` filters excluded this manual event; it accepts uniqueness only while the complete returned page contains fewer than the 100-record limit and otherwise fails closed without mutation. Uninterrupted sole-writer custody is an explicit externally reviewed assumption carried in the protected, self-digested evidence; no machine-local lock can dynamically prove the absence of a writer on another host or account. That compound evidence establishes the exact target effect under the recorded intent; it is not represented as an `oldDeploymentId` response and does not weaken the response requirement for new executions. Missing, stale, ambiguous, or conflicting evidence is a nonmutating hard stop.
 
-Only legacy compound attestation takes an additional evidence descriptor. Use direct REST authentication, add `--recovery-evidence-fd 5`, and open the separately reviewed evidence as descriptor 5. The evidence file must satisfy the same current-user-owned, single-link, mode-`0600` regular-file and stable-read protections as the other inputs. Keep its exact provider, operator, and custody identifiers outside the repository and out of terminal output. The legacy Vercel CLI compatibility transport cannot attest provider Activity.
+Only legacy compound attestation takes an additional evidence input. Use direct REST authentication and name the separately reviewed file with `--recovery-evidence-file`. It must satisfy the same current-user-owned, single-link, mode-`0600` regular-file and stable-read protections as the other inputs. Keep its exact provider, operator, and custody identifiers outside the repository and out of terminal output. The legacy Vercel CLI compatibility transport cannot attest provider Activity.
 
 ```sh
 bun ./scripts/current-project-alias-release.ts recover-source \
-  --plan-fd 3 \
-  --vercel-auth-fd 4 \
-  --recovery-evidence-fd 5 \
-  --confirm-exact '<exact requiredConfirmation from the original ready preflight>' \
-  3</absolute/path/to/unchanged-hra-sh-plan.json \
-  4</absolute/path/to/reviewed-vercel-auth.json \
-  5</absolute/path/to/reviewed-compound-phase-evidence.json
+  --plan-file /absolute/path/to/unchanged-hra-sh-plan.json \
+  --vercel-auth-file /absolute/path/to/reviewed-vercel-auth.json \
+  --recovery-evidence-file /absolute/path/to/reviewed-compound-phase-evidence.json \
+  --confirm-exact '<exact requiredConfirmation from the original ready preflight>'
 ```
 
 After the protected phase is proved, recovery publishes and rereads the source-recovery intent before making one exact source assignment. Its accepted response must prove `oldDeploymentId` equals the plan target. Two consecutive full source-authority samples must then pass before the bound terminal source receipt is published. The first proven completion returns `status: "recovered_source"`; a later invocation may replay that exact terminal source receipt without mutation. A legacy source receipt without both phase-digest bindings remains `alias_reverted` and is never relabeled as an explicit recovery. Any ambiguous source result or incomplete proof remains recovery-required. Recovery cannot create a target receipt, turn target readback into a successful release, select another source, edit the original records, or authorize a new forward transition.
