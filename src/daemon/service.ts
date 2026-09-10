@@ -9,7 +9,7 @@ import {
   KeyRotationRequiredError,
 } from "../domain/cloud-outcomes";
 // eslint-disable-next-line @typescript-eslint/no-restricted-imports -- the daemon maps this provider's closed failure codes onto command outcomes; only the error class and the pinned version cross the boundary.
-import { ClaudeError } from "../claude/errors";
+import { ClaudeError, IndeterminateClaudeEffectError } from "../claude/errors";
 // eslint-disable-next-line @typescript-eslint/no-restricted-imports -- `claude/pin.ts` is the zero-import pin module; the daemon names the exact release an operator must install.
 import { CLAUDE_PIN } from "../claude/pin";
 // eslint-disable-next-line @typescript-eslint/no-restricted-imports -- D4 extracts the provider port; until then the daemon composes the pinned Codex runtime directly.
@@ -483,6 +483,9 @@ const providerFailure = (error: unknown): CodexError | ClaudeError | null =>
 
 const providerFailureCode = (error: unknown): string | null => providerFailure(error)?.code ?? null;
 
+const isIndeterminateProviderEffect = (error: unknown): boolean =>
+  error instanceof IndeterminateCodexEffectError || error instanceof IndeterminateClaudeEffectError;
+
 const retiredProviderFailure = (): CommandFailure => new CommandFailure(
   "UNAVAILABLE",
   "Devin support has been removed. Existing sessions are read-only; no Devin process will be launched.",
@@ -501,6 +504,12 @@ type HraHostToolProvenance = Readonly<{
 
 const claudeCommandFailure = (error: ClaudeError): CommandFailure => {
   switch (error.code) {
+    case "INDETERMINATE_EFFECT":
+      return new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "Claude may have applied the operation, but HRA could not prove its outcome. Reconcile the recorded attempt before retrying.",
+        { reason: "claude_effect_indeterminate" },
+      );
     case "AUTHORITY_STALE":
       return new CommandFailure(
         "UNAVAILABLE",
@@ -1282,7 +1291,7 @@ export type BackgroundDiagnostic = Readonly<{
 const classifyBackgroundDiagnosticCause = (error: unknown): BackgroundDiagnosticCause => {
   if (error instanceof StateSecurityScrubRequiredError) return "scrub_required";
   if (error instanceof DaemonAuthoritySafetyError) return "authority_unsafe";
-  if (error instanceof IndeterminateCodexEffectError || error instanceof IndeterminateLocalCommitError) return "indeterminate";
+  if (isIndeterminateProviderEffect(error) || error instanceof IndeterminateLocalCommitError) return "indeterminate";
   if (error instanceof CommandFailure) return "command_failure";
   if (error instanceof Error && error.name === "AbortError") return "aborted";
   return "error";
@@ -1343,6 +1352,51 @@ const PENDING_CLAUDE_DISCONNECT_LIMIT = 1_024;
 const PROVIDER_USAGE_PERSISTENCE_QUEUE_LIMIT = 1_024;
 /** Facts emitted synchronously by a target's first turn wait behind its durable seed receipt. */
 const SESSION_SWITCH_DEFERRED_FACT_LIMIT = 256;
+/** Lifetime admission bounds, never replenished by an inline failure drain. */
+const CLAUDE_INPUT_FACT_LIMIT = 256;
+const CLAUDE_INPUT_FACT_BYTES = 1024 * 1024;
+
+type ClaudeInputFactEffect =
+  | Readonly<{
+      kind: "mutation";
+      attemptId: MutationAttemptRecord["id"];
+      idempotencyKey: string;
+      operation: "session.send" | "session.steer" | "session.stop";
+    }>
+  | Readonly<{
+      kind: "queue";
+      queueId: Parameters<StateStore["requireQueue"]>[0];
+      evidenceDigest: string;
+    }>;
+
+type ClaudeInputFactOwner = {
+  readonly sessionId: SessionRecord["id"];
+  readonly authority: ProfileAuthority;
+  readonly providerAuthority: ProviderAccountAuthority;
+  readonly providerThreadId: string;
+  readonly connectionId: string;
+  readonly source: ProviderFactSource;
+  readonly effect: ClaudeInputFactEffect;
+  readonly jobs: Array<() => Promise<void>>;
+  accepting: boolean;
+  admittedCount: number;
+  admittedBytes: number;
+  firstBarrierIndex: number | null;
+  failure: Readonly<{ error: unknown }> | null;
+};
+
+type ClaudeInputTimelineFact = Exclude<CodexFact, Readonly<{
+  type: "providerConnected" | "providerDisconnected" | "notificationIgnored"
+    | "rateLimitsUpdated" | "loginCompleted" | "interactionRequested"
+    | "interactionResolved" | "protocolNotice" | "threadDeleted";
+}>> & Readonly<{ threadId: string }>;
+
+type ClaudeInputTimelineCapture = Readonly<{
+  owner: ClaudeInputFactOwner;
+  authority: ProfileAuthority;
+  fact: ClaudeInputTimelineFact;
+  source: ProviderFactSource;
+}>;
 
 type PendingClaudeDisconnect = Readonly<{
   authority: ProfileAuthority;
@@ -1558,6 +1612,9 @@ export class HraService {
   readonly #sessionProviderConnections = new Map<string, string>();
   readonly #pendingClaudeDisconnects = new Map<string, PendingClaudeDisconnect>();
   readonly #sessionFactAuthorities = new Map<string, SessionFactAuthority>();
+  readonly #claudeInputFactOwners = new Map<SessionRecord["id"], ClaudeInputFactOwner>();
+  /** Pending FIFO reservations only; counts never confer effect authority. */
+  readonly #pendingOrderedFacts = new Map<ProfileRecord["id"], number>();
   readonly #sessionObservationFailures = new Map<string, string>();
   readonly #sessionResubscriptionConnections = new Map<string, string>();
   readonly #sessionsAwaitingResubscription = new Set<string>();
@@ -5205,6 +5262,9 @@ export class HraService {
     // only a bounded immutable accounting job here, never wait in the reader.
     // The ranked FIFO places publication after all earlier timeline facts;
     // the informational SQLite write still runs outside locks on its timer.
+    // This immutable publication is not a timeline-retention barrier: it
+    // changes no authority or session state and grants no turn binding. Keep
+    // its original FIFO and captured-settlement checks; never inline it.
     const task = drain === undefined
       ? this.#serializeProfileAuthorities([observation.authority.profileId], async () =>
           await this.#serialize(`session:${observation.turn.sessionId}`, publish))
@@ -8306,10 +8366,17 @@ export class HraService {
       );
       return;
     }
+    const capturedInputFact = drain === undefined
+      ? this.#captureClaudeInputTimeline(observedSession.id, authority, fact, provider, source)
+      : undefined;
+    if (capturedInputFact === false) return;
+    const timelineAuthority = capturedInputFact?.authority ?? authority;
+    const timelineFact = capturedInputFact?.fact ?? fact;
+    const timelineSource = capturedInputFact?.source ?? source;
     await this.#applyOrderedSessionFact(observedSession, async () => {
-      const currentProfile = this.#store.requireProfileById(authority.id);
+      const currentProfile = this.#store.requireProfileById(timelineAuthority.id);
       if (
-        !this.#profileAuthorityIsCurrent(authority)
+        !this.#profileAuthorityIsCurrent(timelineAuthority)
         || (provider === "codex" && currentProfile.state !== "signed_in")
         || (provider === "codex" && this.#profileAuthorityRevocationIsPending(
           currentProfile.id,
@@ -8317,10 +8384,10 @@ export class HraService {
         ))
       ) return;
       const session = this.#findSessionForProviderFact(
-        authority.id,
-        fact.threadId,
+        timelineAuthority.id,
+        timelineFact.threadId,
         provider,
-        source,
+        timelineSource,
       );
       if (
         session === null
@@ -8329,32 +8396,32 @@ export class HraService {
       ) return;
       if (!await this.#ensureSessionFactAuthority(
         session,
-        authority,
+        timelineAuthority,
         provider,
-        source,
-        fact.threadId,
-        fact.connectionId,
+        timelineSource,
+        timelineFact.threadId,
+        timelineFact.connectionId,
       )) return;
-      const event = this.#eventBodyForCodexFact(fact, session);
+      const event = this.#eventBodyForCodexFact(timelineFact, session);
       if (event !== null) {
         if (!this.#sessionFactAuthorityIsCurrent(
           session.id,
-          authority,
+          timelineAuthority,
           provider,
-          source,
-          fact.threadId,
-          fact.connectionId,
+          timelineSource,
+          timelineFact.threadId,
+          timelineFact.connectionId,
         )) return;
-        this.#appendSessionEvent(authority, session.id, fact.connectionId ?? null, event);
+        this.#appendSessionEvent(timelineAuthority, session.id, timelineFact.connectionId ?? null, event);
       }
       const recoveryUnsettled = await this.#cloud
         .isCompactProjectionRecoveryUnsettled(session.id);
       await this.#daemonAuthority.assertCurrent();
       const exact = this.#findSessionForProviderFact(
-        authority.id,
-        fact.threadId,
+        timelineAuthority.id,
+        timelineFact.threadId,
         provider,
-        source,
+        timelineSource,
       );
       if (
         exact === null
@@ -8363,20 +8430,20 @@ export class HraService {
       ) return;
       if (!this.#sessionFactAuthorityIsCurrent(
         exact.id,
-        authority,
+        timelineAuthority,
         provider,
-        source,
-        fact.threadId,
-        fact.connectionId,
+        timelineSource,
+        timelineFact.threadId,
+        timelineFact.connectionId,
       )) return;
       const priorRevision = exact.revision;
-      const dispatchQueue = this.#applyCodexFact(authority, fact, exact);
+      const dispatchQueue = this.#applyCodexFact(timelineAuthority, timelineFact, exact);
       const committed = this.#store.requireSession(exact.id);
       if (committed.revision !== priorRevision) {
         await this.#reconcileCommittedSessionFactsMemory(committed);
       }
       if (dispatchQueue) this.#scheduleIdleQueue(committed);
-    }, drain);
+    }, drain, capturedInputFact);
   }
 
   async #applyOrDeferProviderThreadDeletion(
@@ -17185,7 +17252,7 @@ export class HraService {
         } catch (error: unknown) {
           await this.#daemonAuthority.assertCurrent();
           if (
-            error instanceof IndeterminateCodexEffectError
+            isIndeterminateProviderEffect(error)
             || error instanceof IndeterminateLocalCommitError
           ) {
             this.#quarantineSession(local.id);
@@ -17724,7 +17791,7 @@ export class HraService {
   ): boolean {
     if (
       error instanceof DaemonAuthoritySafetyError
-      || error instanceof IndeterminateCodexEffectError
+      || isIndeterminateProviderEffect(error)
       || error instanceof IndeterminateLocalCommitError
     ) return true;
     if (error instanceof CodexError) return false;
@@ -19878,6 +19945,10 @@ export class HraService {
         : await this.#requireUsableProjectRoot(project.rootPath);
       await this.#assertPersonalSessionAccountAuthority(session, profile, signal, true);
       turnBindingOwner = this.#beginProviderUsageTurnBinding(session.id, providerAuthority);
+      return await this.#withClaudeInputFacts({
+        session, authority: runtimeAuthority, connectionId: observedProviderConnectionId,
+        effect: { kind: "mutation", attemptId, idempotencyKey: key, operation: "session.send" },
+      }, async () => {
       startedResult = await this.#fencedEffect(async () => {
         this.#assertObservedProviderConnection(session.id, observedProviderConnectionId);
         autorespondAdmission?.();
@@ -19899,6 +19970,7 @@ export class HraService {
         signal,
       );
       return { ...startedResult, sourceId: attemptId };
+      });
     }, beginEffect: async (attemptId, custody) => {
       baseline = await this.#readExactSessionProjection(session, profile, false, signal);
       if (baseline.status === "active" || baseline.activeTurnId !== undefined) throw new CommandFailure("CONFLICT", "The session already has an active turn. Use `session steer` or `session queue`.");
@@ -20108,12 +20180,17 @@ export class HraService {
       if (activeTurnId === undefined) throw new CommandFailure("CONFLICT", "The session has no active turn to steer.");
       const turnId = activeTurnId;
       await this.#assertPersonalSessionAccountAuthority(session, profile, signal, true);
+      return await this.#withClaudeInputFacts({
+        session, authority: runtimeAuthority, connectionId: observedProviderConnectionId,
+        effect: { kind: "mutation", attemptId, idempotencyKey: key, operation: "session.steer" },
+      }, async () => {
       await this.#fencedEffect(async () => {
         this.#assertObservedProviderConnection(session.id, observedProviderConnectionId);
         await this.#runtimeForSession(session).steer({ authority: runtimeAuthority, providerThreadId: session.providerThreadId, activeTurnId: turnId, message, ...(attachments.values.length === 0 ? {} : { attachments: attachments.values }), clientMessageId: attemptId, signal });
       });
       await this.#assertSessionAccountAuthorityAfterProviderEffect(session, profile, signal);
       return { steered: true as const, activeTurnId: turnId };
+      });
     }, beginEffect: async (attemptId, custody) => {
       baseline = await this.#readExactSessionProjection(session, profile, false, signal);
       activeTurnId = baseline.activeTurnId;
@@ -20361,7 +20438,7 @@ export class HraService {
     return error instanceof ProviderConnectionChangedBeforeEffectError
       || !(error instanceof CommandFailure
       || error instanceof DaemonAuthoritySafetyError
-      || error instanceof IndeterminateCodexEffectError
+      || isIndeterminateProviderEffect(error)
       || error instanceof IndeterminateLocalCommitError);
   }
 
@@ -20377,16 +20454,21 @@ export class HraService {
     const key = idempotencyKey ?? randomUUID();
     let baseline: CodexSessionProjection | undefined;
     let activeTurnId: string | null = null;
-    const result = await this.#effect({ kind: "session.stop", authorityId: session.id, authorityGeneration: providerAuthority.processGeneration, request: {}, idempotencyKey: key, providerAuthorities: [{ role: "primary", authority: providerAuthority, provenance: "session_stop" }], effect: async () => {
+    const result = await this.#effect({ kind: "session.stop", authorityId: session.id, authorityGeneration: providerAuthority.processGeneration, request: {}, idempotencyKey: key, providerAuthorities: [{ role: "primary", authority: providerAuthority, provenance: "session_stop" }], effect: async (attemptId) => {
       if (activeTurnId === null) return { stopped: false as const, activeTurnId: null };
       const turnId = activeTurnId;
       await this.#assertPersonalSessionAccountAuthority(session, profile, signal, true);
+      return await this.#withClaudeInputFacts({
+        session, authority: runtimeAuthority, connectionId: observedProviderConnectionId,
+        effect: { kind: "mutation", attemptId, idempotencyKey: key, operation: "session.stop" },
+      }, async () => {
       await this.#fencedEffect(async () => {
         this.#assertObservedProviderConnection(session.id, observedProviderConnectionId);
         await this.#runtimeForSession(session).interrupt({ authority: runtimeAuthority, providerThreadId: session.providerThreadId, activeTurnId: turnId, signal });
       });
       await this.#assertSessionAccountAuthorityAfterProviderEffect(session, profile, signal);
       return { stopped: true as const, activeTurnId: turnId };
+      });
     }, beginEffect: async (attemptId) => {
       baseline = await this.#readExactSessionProjection(session, profile, false, signal);
       activeTurnId = baseline.activeTurnId ?? null;
@@ -22491,7 +22573,7 @@ export class HraService {
     const project = session.projectId === undefined ? undefined : this.#store.requireProject(session.projectId);
     if (project === undefined) return;
     let evidence: ReturnType<StateStore["beginQueueEffect"]> | undefined;
-    let providerApplied = false;
+    const providerOutcome = { applied: false };
     let review: RuntimeStartReviewOf<ReviewedRuntimeProfile> | undefined;
     try {
       if (this.#store.cancelRevokedPendingPeerQueue(queued.id) !== null) {
@@ -22573,7 +22655,11 @@ export class HraService {
       let turnBindingTurnId: string | null = null;
       let turnBindingBound = false;
       try {
-        const result = await this.#fencedEffect(async () => {
+        const result = await this.#withClaudeInputFacts({
+          session: boundSession, authority, connectionId: observedProviderConnectionId,
+          effect: { kind: "queue", queueId: queued.id, evidenceDigest: evidence.digest },
+        }, async () => {
+        const started = await this.#fencedEffect(async () => {
           const projectRoot = await this.#requireUsableProjectRoot(project.rootPath);
           this.#assertObservedProviderConnection(session.id, observedProviderConnectionId);
           return await this.#runtimeForSession(session).startTurn({
@@ -22589,9 +22675,11 @@ export class HraService {
             signal,
           });
         });
-        turnBindingTurnId = result.turnId;
-        providerApplied = true;
+        turnBindingTurnId = started.turnId;
+        providerOutcome.applied = true;
         await this.#assertSessionAccountAuthorityAfterProviderEffect(boundSession, profile, signal);
+        return started;
+        });
         const committingSession = this.#store.requireSession(session.id);
         const committingProfile = this.#store.requireProfileById(committingSession.profileId);
         const providerConnectionId = this.#sessionProviderConnections.get(session.id) ?? null;
@@ -22652,7 +22740,7 @@ export class HraService {
         return;
       }
       this.#queuePreEffectRetryCounts.delete(queued.id);
-      if (providerApplied || error instanceof IndeterminateCodexEffectError || error instanceof IndeterminateLocalCommitError) {
+      if (providerOutcome.applied || isIndeterminateProviderEffect(error) || error instanceof IndeterminateLocalCommitError) {
         this.#store.markQueueEffectAmbiguous(queued.id, evidence.digest);
         return;
       }
@@ -22795,11 +22883,15 @@ export class HraService {
     }
   }
 
-  async #serialize<T>(key: string, operation: () => Promise<T> | T): Promise<T> {
+  async #serialize<T>(key: string, operation: () => Promise<T> | T, onSettled?: () => void): Promise<T> {
     const previous = this.#mutationTails.get(key) ?? Promise.resolve();
     const current = previous.catch(() => undefined).then(async () => {
-      await this.#daemonAuthority.assertCurrent();
-      return await operation();
+      try {
+        await this.#daemonAuthority.assertCurrent();
+        return await operation();
+      } finally {
+        onSettled?.();
+      }
     });
     this.#mutationTails.set(key, current);
     try {
@@ -22825,6 +22917,7 @@ export class HraService {
   async #serializeProfileAuthorities<T>(
     profileIds: readonly ProfileRecord["id"][],
     operation: () => Promise<T> | T,
+    onSettled?: () => void,
   ): Promise<T> {
     const ordered = [...new Set(profileIds)].sort();
     const acquire = async (index: number): Promise<T> => {
@@ -22833,6 +22926,7 @@ export class HraService {
       return await this.#serialize(
         `account:${profileId}`,
         async () => acquire(index + 1),
+        index === 0 ? onSettled : undefined,
       );
     };
     return await acquire(0);
@@ -22867,6 +22961,192 @@ export class HraService {
     return await acquire(0);
   }
 
+  async #withClaudeInputFacts<T>(
+    input: Readonly<{
+      session: SessionRecord;
+      authority: ProfileAuthority;
+      connectionId: string;
+      effect: ClaudeInputFactEffect;
+    }>,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    if (input.session.provider !== "claude") return await operation();
+    if (input.session.providerThreadId === undefined || this.#claudeInputFactOwners.has(input.session.id)) {
+      throw new Error("CLAUDE_INPUT_FACT_OWNER_UNAVAILABLE");
+    }
+    const owner: ClaudeInputFactOwner = {
+      sessionId: input.session.id,
+      authority: Object.freeze({ ...input.authority }),
+      providerAuthority: Object.freeze(this.#providerAccountAuthority(input.authority)),
+      providerThreadId: input.session.providerThreadId,
+      connectionId: input.connectionId,
+      source: this.#sessionUsesFactSource(input.session, "claude", "personal") ? "personal" : "managed",
+      effect: Object.freeze({ ...input.effect }),
+      jobs: [], accepting: true, admittedCount: 0, admittedBytes: 0, failure: null,
+      firstBarrierIndex: (this.#pendingOrderedFacts.get(input.session.profileId) ?? 0) > 0 ? 0 : null,
+    };
+    this.#claudeInputFactOwners.set(owner.sessionId, owner);
+    try {
+      await this.#assertClaudeInputFactOwner(owner);
+      let result: T;
+      try {
+        result = await operation();
+      } catch (error: unknown) {
+        if (error instanceof DaemonAuthoritySafetyError) throw error;
+        try {
+          await this.#drainClaudeInputFacts(owner);
+        } catch (drainError: unknown) {
+          const cause = new AggregateError([error, drainError], "Claude input fact retention failed after provider rejection.");
+          if (drainError instanceof DaemonAuthoritySafetyError) {
+            const unsafe = new DaemonAuthoritySafetyError("Claude input fact retention lost daemon authority.");
+            unsafe.cause = cause;
+            throw unsafe;
+          }
+          if (drainError instanceof StateSecurityScrubRequiredError) this.#requestStop();
+          throw new IndeterminateLocalCommitError("Claude input facts could not be retained before recovery.", cause);
+        }
+        throw error;
+      }
+      if (owner.failure !== null) {
+        try {
+          await this.#drainClaudeInputFacts(owner);
+        } catch (error: unknown) {
+          if (error instanceof DaemonAuthoritySafetyError) throw error;
+          if (error instanceof StateSecurityScrubRequiredError) this.#requestStop();
+          throw new IndeterminateLocalCommitError("Claude input facts could not be retained after provider dispatch.", error);
+        }
+      }
+      return result;
+    } finally {
+      owner.accepting = false;
+      if (this.#claudeInputFactOwners.get(owner.sessionId) === owner) this.#claudeInputFactOwners.delete(owner.sessionId);
+    }
+  }
+
+  async #assertClaudeInputFactOwner(owner: ClaudeInputFactOwner): Promise<void> {
+    await this.#daemonAuthority.assertCurrent();
+    const session = this.#store.requireSession(owner.sessionId);
+    if (this.#claudeInputFactOwners.get(owner.sessionId) !== owner
+      || !this.#mutationTails.has(`account:${owner.authority.id}`)
+      || !this.#mutationTails.has(`session:${owner.sessionId}`)
+      || session.provider !== "claude" || session.profileId !== owner.authority.id
+      || session.providerThreadId !== owner.providerThreadId
+      || !sameProviderUsageAuthority(owner.providerAuthority, this.#capturedSessionProviderAuthority(session))
+      || !this.#sessionUsesFactSource(session, "claude", owner.source)
+      || !this.#sessionFactAuthorityIsCurrent(owner.sessionId, owner.authority, "claude", owner.source,
+        owner.providerThreadId, owner.connectionId)) {
+      throw new Error("CLAUDE_INPUT_FACT_AUTHORITY_CHANGED");
+    }
+    const effect = owner.effect;
+    if (effect.kind === "mutation") {
+      const attempt = this.#store.readMutation(effect.idempotencyKey);
+      const authorities = this.#store.readMutationProviderAuthorities(effect.attemptId);
+      const primary = authorities[0];
+      if (attempt === null || attempt.id !== effect.attemptId || attempt.kind !== effect.operation
+        || attempt.state !== "effect_started" || attempt.authorityId !== owner.sessionId
+        || attempt.authorityGeneration !== owner.providerAuthority.processGeneration
+        || attempt.evidence?.evidence.kind !== effect.operation
+        || attempt.evidence.evidence.providerThreadId !== owner.providerThreadId
+        || authorities.length !== 1 || primary?.role !== "primary"
+        || !sameProviderUsageAuthority(primary.authority, owner.providerAuthority)) {
+        throw new Error("CLAUDE_INPUT_FACT_MUTATION_CHANGED");
+      }
+    } else {
+      const queued = this.#store.requireQueue(effect.queueId);
+      const evidence = this.#store.readQueueEffect(effect.queueId);
+      const providerAuthority = this.#store.readQueueProviderAuthority(effect.queueId);
+      if (queued.sessionId !== owner.sessionId || queued.state !== "dispatching"
+        || evidence === null || evidence.digest !== effect.evidenceDigest
+        || evidence.evidence.queueId !== effect.queueId || evidence.evidence.sessionId !== owner.sessionId
+        || evidence.evidence.providerThreadId !== owner.providerThreadId
+        || evidence.evidence.profileGeneration !== owner.providerAuthority.processGeneration
+        || providerAuthority === null || !sameProviderUsageAuthority(providerAuthority, owner.providerAuthority)) {
+        throw new Error("CLAUDE_INPUT_FACT_QUEUE_CHANGED");
+      }
+    }
+    this.#assertSessionAccountAuthorityIfSignedIn(session);
+  }
+
+  #captureClaudeInputTimeline(
+    sessionId: SessionRecord["id"], authority: ProfileAuthority,
+    fact: ClaudeInputTimelineFact, provider: Provider, source: ProviderFactSource,
+  ): ClaudeInputTimelineCapture | false | undefined {
+    const owner = this.#claudeInputFactOwners.get(sessionId);
+    if (provider !== "claude" || owner === undefined || !owner.accepting || owner.source !== source
+      || fact.threadId !== owner.providerThreadId || fact.connectionId !== owner.connectionId
+      || !sameProviderUsageAuthority(owner.providerAuthority, this.#providerAccountAuthority(authority))) return undefined;
+    if (owner.failure !== null) return false;
+    try {
+      if (owner.admittedCount >= CLAUDE_INPUT_FACT_LIMIT) throw new Error("CLAUDE_INPUT_FACT_LIMIT");
+      // Own the full routing/fact snapshot before any enqueue await. No caller
+      // retains an alias to the data the original guarded closure will read.
+      const captured = structuredClone({ authority, fact, source });
+      const bytes = Buffer.byteLength(JSON.stringify(captured), "utf8");
+      if (bytes > CLAUDE_INPUT_FACT_BYTES - owner.admittedBytes) throw new Error("CLAUDE_INPUT_FACT_BYTES");
+      owner.admittedCount += 1;
+      owner.admittedBytes += bytes;
+      return Object.freeze({ ...captured, owner });
+    } catch (error: unknown) {
+      owner.failure = { error };
+      return false;
+    }
+  }
+
+  async #drainClaudeInputFacts(owner: ClaudeInputFactOwner): Promise<void> {
+    try {
+    await this.#assertClaudeInputFactOwner(owner);
+    // Never shift: a reentrant arrival cannot replenish either admission cap
+    // or move the first unowned FIFO boundary past an already captured job.
+    for (let index = 0; index < owner.jobs.length; index += 1) {
+      if (owner.firstBarrierIndex !== null && index >= owner.firstBarrierIndex) {
+        throw new IndeterminateLocalCommitError("Claude timeline facts remain behind an earlier ordered fact.",
+          new Error("CLAUDE_INPUT_FACT_ORDERING_BOUNDARY"));
+      }
+      const job = owner.jobs[index];
+      if (job === undefined) throw new Error("CLAUDE_INPUT_FACT_JOB_MISSING");
+      await this.#assertClaudeInputFactOwner(owner);
+      await job();
+      await this.#assertClaudeInputFactOwner(owner);
+    }
+    if (owner.failure !== null) {
+      throw new IndeterminateLocalCommitError("Claude input facts exceeded their bounded retention.", owner.failure.error);
+    }
+    } finally {
+      // Seal in this turn, before returning the drain promise: no arrival in
+      // the caller's next microtask can become a captured but undrained job.
+      owner.accepting = false;
+    }
+  }
+
+  #reserveOrderedFact(
+    profileId: ProfileRecord["id"], reserve: (release: () => void) => Promise<void>, capturedOwner?: ClaudeInputFactOwner,
+  ): Promise<void> {
+    for (const owner of this.#claudeInputFactOwners.values()) {
+      if (owner.authority.id === profileId && owner !== capturedOwner) owner.firstBarrierIndex ??= owner.jobs.length;
+    }
+    const pending = (this.#pendingOrderedFacts.get(profileId) ?? 0) + 1;
+    if (!Number.isSafeInteger(pending)) throw new Error("ORDERED_FACT_RESERVATION_LIMIT");
+    this.#pendingOrderedFacts.set(profileId, pending);
+    let released = false;
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      const current = this.#pendingOrderedFacts.get(profileId);
+      if (current === undefined || current < 1) throw new Error("ORDERED_FACT_RESERVATION_UNDERFLOW");
+      const remaining = current - 1;
+      if (remaining === 0) this.#pendingOrderedFacts.delete(profileId);
+      else this.#pendingOrderedFacts.set(profileId, remaining);
+    };
+    try {
+      // The original authority job releases before its FIFO tail settles;
+      // this fallback owns a refusal before that job could be entered.
+      return reserve(release).finally(release);
+    } catch (error: unknown) {
+      release();
+      throw error;
+    }
+  }
+
   async #applyOrderedAccountFact(
     profileId: ProfileRecord["id"],
     operation: () => Promise<void> | void,
@@ -22881,13 +23161,13 @@ export class HraService {
     }
     const accountKey = `account:${profileId}`;
     if (!this.#mutationTails.has(accountKey)) {
-      await this.#serialize(accountKey, operation);
+      await this.#reserveOrderedFact(profileId, async (release) => await this.#serialize(accountKey, operation, release));
       return;
     }
     // Return the old client's fact callback before a queued fresh-generation
     // login closes that client. Later account facts join the same FIFO tail, so a
     // disconnect cannot overtake an already observed terminal login result.
-    const task = this.#serialize(accountKey, operation);
+    const task = this.#reserveOrderedFact(profileId, async (release) => await this.#serialize(accountKey, operation, release));
     const tracked = task.then(
       () => undefined,
       (error: unknown) => {
@@ -22903,6 +23183,7 @@ export class HraService {
     session: Pick<SessionRecord, "id" | "profileId">,
     operation: () => Promise<void> | void,
     drain?: SessionSwitchFactDrain,
+    capture?: ClaudeInputTimelineCapture,
   ): Promise<void> {
     if (drain !== undefined) {
       await this.#daemonAuthority.assertCurrent();
@@ -22913,21 +23194,35 @@ export class HraService {
     }
     const accountKey = `account:${session.profileId}`;
     const sessionKey = `session:${session.id}`;
-    const ordered = async (): Promise<void> => {
+    let orderedOperation = operation;
+    if (capture !== undefined) {
+      if (this.#claudeInputFactOwners.get(session.id) !== capture.owner) {
+        throw new Error("CLAUDE_INPUT_FACT_OWNER_CHANGED");
+      }
+      let ran = false;
+      const runOnce = async (): Promise<void> => {
+        if (ran) return;
+        ran = true;
+        await operation();
+      };
+      capture.owner.jobs.push(runOnce);
+      orderedOperation = runOnce;
+    }
+    const ordered = async (release: () => void): Promise<void> => {
       await this.#serializeSessionAuthority(
         session,
-        operation,
-        { allowDuringProjectionRecovery: true },
+        orderedOperation,
+        { allowDuringProjectionRecovery: true, orderedFactSettled: release },
       );
     };
     if (!this.#mutationTails.has(accountKey) && !this.#mutationTails.has(sessionKey)) {
-      await ordered();
+      await this.#reserveOrderedFact(session.profileId, ordered, capture?.owner);
       return;
     }
     // Provider callbacks can be awaited from inside the provider effect that
     // owns these tails. Queue the entire source revalidation and fact commit,
     // then return the callback so the effect can release its authority.
-    const task = ordered();
+    const task = this.#reserveOrderedFact(session.profileId, ordered, capture?.owner);
     const tracked = task.then(
       () => undefined,
       (error: unknown) => {
@@ -22990,6 +23285,7 @@ export class HraService {
     operation: () => Promise<T> | T,
     options: Readonly<{
       allowDuringProjectionRecovery?: boolean;
+      orderedFactSettled?: () => void;
       replay?: (input: Readonly<{ finalizePending: boolean }>) =>
         | Readonly<{ matched: false }>
         | Readonly<{ matched: true; value: T }>;
@@ -23009,6 +23305,7 @@ export class HraService {
     operation: () => Promise<T> | T,
     options: Readonly<{
       allowDuringProjectionRecovery?: boolean;
+      orderedFactSettled?: () => void;
       replay?: (input: Readonly<{ finalizePending: boolean }>) =>
         | Readonly<{ matched: false }>
         | Readonly<{ matched: true; value: T }>;
@@ -23049,7 +23346,7 @@ export class HraService {
         }
         this.#assertSessionAccountAuthorityIfSignedIn(this.#store.requireSession(session.id));
         return await operation();
-      }));
+      }), options.orderedFactSettled);
   }
 
   async #serializeInteractionAuthority<T>(
@@ -23202,7 +23499,7 @@ export class HraService {
       // determinate provider rejection is never stranded as `effect_started`
       // when the fence closed during the call.
       if (error instanceof DaemonAuthoritySafetyError) throw error;
-      const terminal = error instanceof IndeterminateCodexEffectError
+      const terminal = isIndeterminateProviderEffect(error)
         || error instanceof IndeterminateLocalCommitError
         ? "ambiguous"
         : "failed";

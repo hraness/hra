@@ -3,7 +3,7 @@ import fc from "fast-check";
 
 import type { ClaudeFact } from "./assembler";
 import { ClaudeStreamClient } from "./client";
-import { ClaudeError } from "./errors";
+import { ClaudeError, IndeterminateClaudeEffectError } from "./errors";
 import type { ClaudeProcess, ClaudeProcessIdentity } from "./process";
 
 const CONFIG_DIR = "/var/hra/profiles/acct/claude";
@@ -128,6 +128,100 @@ const writtenLines = (process: FakeClaudeProcess): readonly unknown[] =>
     chunk.split("\n").filter((line) => line.length > 0).map((line) => JSON.parse(line) as unknown));
 
 describe("Claude stream client", () => {
+  test("reports actual write entry from a snapshotted callback, not a pre-write refusal", async () => {
+    const { client, process } = open();
+    let started = 0;
+    let substituted = 0;
+    const onWriteStarted = (): void => { started += 1; };
+    try {
+      await expect(client.steer("No active turn", [], onWriteStarted))
+        .rejects.toMatchObject({ code: "INVALID_INPUT" });
+      expect(started).toBe(0);
+      expect(process.written).toEqual([]);
+      const input = { turnId: "turn-witness", message: "One exact write", onWriteStarted };
+      const starting = client.startTurn(input);
+      input.onWriteStarted = () => { substituted += 1; };
+      await starting;
+      expect(started).toBe(1);
+      expect(substituted).toBe(0);
+      expect(process.written).toHaveLength(1);
+    } finally {
+      await client.close();
+    }
+  });
+
+  test("fences queued frames before recovering a rejected write chain", async () => {
+    const { client, process } = open();
+    await client.startTurn({ turnId: "turn-fence", message: "Start a turn" });
+    let rejectWrite!: (error: Error) => void;
+    process.writeSettlementGate = new Promise<void>((_resolve, reject) => { rejectWrite = reject; });
+    let signalWrite!: () => void;
+    const wrote = new Promise<void>((resolve) => { signalWrite = resolve; });
+    process.onWrite = signalWrite;
+    const cause = new Error("test-only partial write rejection");
+    let firstEntries = 0;
+    let secondEntries = 0;
+    const first = client.steer("First steering frame", [], () => { firstEntries += 1; })
+      .then(() => null, (error: unknown) => error);
+    await wrote;
+    const second = client.steer("Queued steering frame", [], () => { secondEntries += 1; })
+      .then(() => null, (error: unknown) => error);
+    try {
+      rejectWrite(cause);
+      expect(await first).toBe(cause);
+      expect(await second).toBeInstanceOf(IndeterminateClaudeEffectError);
+      expect(firstEntries).toBe(1);
+      expect(secondEntries).toBe(0);
+      expect(process.written).toHaveLength(2);
+      expect(process.written.join("")).not.toContain("Queued steering frame");
+      expect(process.terminated).toBe(false);
+    } finally {
+      rejectWrite(cause);
+      await Promise.all([first, second]);
+      await client.close();
+    }
+  });
+
+  test.each(["silent", "throwing"] as const)(
+    "fences an accepted fact observer rejection with a %s diagnostic callback", async (diagnostic) => {
+    const process = new FakeClaudeProcess();
+    const cause = new Error("test-only accepted fact observer failure");
+    const facts: ClaudeFact[] = [];
+    let diagnostics = 0;
+    const client = new ClaudeStreamClient({
+      configDir: CONFIG_DIR,
+      process,
+      onFact: (fact) => {
+        facts.push(fact);
+        if (fact.type === "turnStarted") throw cause;
+      },
+      onSafeDiagnostic: () => {
+        diagnostics += 1;
+        if (diagnostic === "throwing") throw new Error("test-only diagnostic callback failure");
+      },
+    });
+    let started = 0;
+    try {
+      const outcome = await client.startTurn({
+        turnId: "turn-observer", message: "Written before observer failure",
+        onWriteStarted: () => { started += 1; },
+      }).then(() => null, (error: unknown) => error);
+      expect(outcome).toBe(cause);
+      expect(diagnostics).toBe(1);
+      expect(client.activeTurnId).toBeNull();
+      expect(started).toBe(1);
+      expect(facts.filter((fact) => fact.type === "turnStarted")).toHaveLength(1);
+      expect(facts.some((fact) => fact.type === "turnCompleted")).toBe(false);
+      await expect(client.startTurn({ turnId: "turn-after-failure", message: "Do not replay" }))
+        .rejects.toBeInstanceOf(IndeterminateClaudeEffectError);
+      expect(process.written).toHaveLength(1);
+      expect(process.terminated).toBe(false);
+    } finally {
+      await client.close();
+    }
+    },
+  );
+
   test.each(["count", "bytes"] as const)("fences pending first-write facts at the %s bound", async (bound) => {
     const process = new FakeClaudeProcess();
     const facts: ClaudeFact[] = [];

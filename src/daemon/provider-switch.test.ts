@@ -22,7 +22,7 @@ import {
   type Preset,
   type PresetContract,
 } from "../domain/presets";
-import { ClaudeError } from "../claude/errors";
+import { ClaudeError, IndeterminateClaudeEffectError } from "../claude/errors";
 import { presetRequirementForContract, type PresetRequirement } from "../domain/presets";
 import type {
   EffectiveClaudeRuntimeProfile,
@@ -534,7 +534,8 @@ class SwitchFakeClaude implements ClaudeRuntimePort {
   }> {
     this.calls.push("start-turn");
     this.pendingReviewIds.delete(input.review.reviewId);
-    if (this.startTurnError instanceof ClaudeError) throw this.startTurnError;
+    if (this.startTurnError instanceof ClaudeError
+      && !(this.startTurnError instanceof IndeterminateClaudeEffectError)) throw this.startTurnError;
     this.seededMessages.push(input.message);
     if (this.startTurnError !== undefined) throw this.startTurnError;
     this.#turns += 1;
@@ -3445,7 +3446,7 @@ describe("provider portability", () => {
       });
     }, 5_000);
 
-    test("settles a proved seed rejection but never replays an ambiguous seed", () => {
+    test.each(["raw", "typed"] as const)("settles a proved seed rejection but never replays an ambiguous seed (%s)", (failure) => {
       const current = prepared;
       if (current?.value === undefined) throw new Error("The coupled seed case was not prepared.");
       const { rejected, rejectedSession, ambiguous, ambiguousSession, ambiguousTarget, ambiguousSourceAuthority } = current.value;
@@ -3464,7 +3465,10 @@ describe("provider portability", () => {
         }));
         expect(rejected.claude.seededMessages).toEqual([]);
 
-        ambiguous.claude.startTurnError = new Error("transport ended after write");
+        const cause = new Error("transport ended after write");
+        ambiguous.claude.startTurnError = failure === "raw"
+          ? cause
+          : new IndeterminateClaudeEffectError("turn/start", cause);
         const ambiguousKey = "00000000-0000-4000-8000-0000000007a4";
         const ambiguousCommand = {
           idempotencyKey: ambiguousKey,

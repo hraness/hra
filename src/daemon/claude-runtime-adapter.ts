@@ -6,6 +6,7 @@ import {
   CLAUDE_HOST_TOOL_SESSION_HISTORY_LIMIT,
   ClaudeError,
   ClaudeStreamClient,
+  IndeterminateClaudeEffectError,
   boundClaudeText,
   claudeSessionArgv,
   readClaudeAuthStatus,
@@ -745,6 +746,23 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     }
   }
 
+  async #withWriteWitness<T>(
+    client: ClaudeStreamClient,
+    operation: IndeterminateClaudeEffectError["operation"],
+    effect: (onWriteStarted: () => void) => Promise<T>,
+  ): Promise<T> {
+    const witness = { started: false };
+    try {
+      return await effect(() => { witness.started = true; });
+    } catch (cause: unknown) {
+      if (!witness.started) throw cause;
+      // The witness names this call's actual stdin boundary, not adapter
+      // entry. It remains live through fact delivery and post-write checks.
+      client.fenceWrites();
+      throw new IndeterminateClaudeEffectError(operation, cause);
+    }
+  }
+
   async startTurn(input: {
     authority: ProfileAuthority;
     providerThreadId: string;
@@ -778,29 +796,32 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     // boundary it publishes, and it carries no id of its own.
     const turnId = randomUUID();
     const startAttachments = input.attachments ?? [];
-    await session.client.startTurn({
-      ...(startAttachments.length === 0 ? {} : { attachments: startAttachments }),
-      message: input.message,
-      turnId,
+    return await this.#withWriteWitness(session.client, "turn/start", async (onWriteStarted) => {
+      await session.client.startTurn({
+        ...(startAttachments.length === 0 ? {} : { attachments: startAttachments }),
+        message: input.message,
+        onWriteStarted,
+        turnId,
+      });
+      this.#appendUserMessage(session, turnId, input.message, input.clientMessageId);
+      const activeTurnId = session.client.activeTurnId;
+      const summary = session.turnSummaries.find((value) => value.id === turnId);
+      if (activeTurnId !== null && activeTurnId !== turnId) {
+        throw new ClaudeError("PROTOCOL_ERROR", "Claude turn admission observed another active turn.");
+      }
+      if (activeTurnId === null && summary === undefined) {
+        throw new ClaudeError("PROTOCOL_ERROR", "Claude turn admission lost its exact terminal result.");
+      }
+      session.activeTurnId = activeTurnId ?? undefined;
+      if (session.status !== "terminal") session.status = activeTurnId === null ? "idle" : "active";
+      session.updatedAt = this.#now();
+      input.signal.throwIfAborted();
+      return {
+        effectiveRuntimeProfile: pending.review.effectiveRuntimeProfile,
+        status: summary?.status ?? "inProgress",
+        turnId,
+      };
     });
-    this.#appendUserMessage(session, turnId, input.message, input.clientMessageId);
-    const activeTurnId = session.client.activeTurnId;
-    const summary = session.turnSummaries.find((value) => value.id === turnId);
-    if (activeTurnId !== null && activeTurnId !== turnId) {
-      throw new ClaudeError("PROTOCOL_ERROR", "Claude turn admission observed another active turn.");
-    }
-    if (activeTurnId === null && summary === undefined) {
-      throw new ClaudeError("PROTOCOL_ERROR", "Claude turn admission lost its exact terminal result.");
-    }
-    session.activeTurnId = activeTurnId ?? undefined;
-    if (session.status !== "terminal") session.status = activeTurnId === null ? "idle" : "active";
-    session.updatedAt = this.#now();
-    input.signal.throwIfAborted();
-    return {
-      effectiveRuntimeProfile: pending.review.effectiveRuntimeProfile,
-      status: summary?.status ?? "inProgress",
-      turnId,
-    };
   }
 
   async steer(input: {
@@ -818,9 +839,11 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
       throw new ClaudeError("INVALID_INPUT", "That Claude turn is no longer active.");
     }
     await this.#assertSessionConfig(session, input.signal);
-    await session.client.steer(input.message, input.attachments ?? []);
-    this.#appendUserMessage(session, input.activeTurnId, input.message, input.clientMessageId);
-    input.signal.throwIfAborted();
+    await this.#withWriteWitness(session.client, "turn/steer", async (onWriteStarted) => {
+      await session.client.steer(input.message, input.attachments ?? [], onWriteStarted);
+      this.#appendUserMessage(session, input.activeTurnId, input.message, input.clientMessageId);
+      input.signal.throwIfAborted();
+    });
   }
 
   async interrupt(input: {
@@ -833,8 +856,10 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     const session = this.#requireSession(input.authority, input.providerThreadId);
     if (session.activeTurnId !== input.activeTurnId) return;
     await this.#assertSessionConfig(session, input.signal);
-    await session.client.interrupt();
-    input.signal.throwIfAborted();
+    await this.#withWriteWitness(session.client, "turn/interrupt", async (onWriteStarted) => {
+      await session.client.interrupt(onWriteStarted);
+      input.signal.throwIfAborted();
+    });
   }
 
   async observeSession(input: {
@@ -1188,10 +1213,14 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
       throw new ClaudeError("DEADLINE_EXPIRED", "The Claude interaction deadline passed.");
     }
     await this.#assertSessionConfig(session, input.signal);
-    await session.client.resolveInteraction(requestId, decisionFor(input.kind, input.resolution, request));
-    this.#reportInteractionSettled(session, requestId);
-    input.signal.throwIfAborted();
-    return { responseWritten: true };
+    return await this.#withWriteWitness(session.client, "interaction/resolve", async (onWriteStarted) => {
+      await session.client.resolveInteraction(
+        requestId, decisionFor(input.kind, input.resolution, request), onWriteStarted,
+      );
+      this.#reportInteractionSettled(session, requestId);
+      input.signal.throwIfAborted();
+      return { responseWritten: true };
+    });
   }
 
   async validateInteractionTimeout(input: {
@@ -1219,13 +1248,15 @@ export class PinnedClaudeRuntimeManager implements ClaudeRuntimePort {
     input.signal.throwIfAborted();
     const { session, requestId } = this.#requirePending(input.authority, input.provider);
     await this.#assertSessionConfig(session, input.signal);
-    await session.client.resolveInteraction(requestId, {
-      kind: "deny",
-      message: "HRA did not receive a decision in time",
+    return await this.#withWriteWitness(session.client, "interaction/resolve", async (onWriteStarted) => {
+      await session.client.resolveInteraction(requestId, {
+        kind: "deny",
+        message: "HRA did not receive a decision in time",
+      }, onWriteStarted);
+      this.#reportInteractionSettled(session, requestId);
+      input.signal.throwIfAborted();
+      return { responseWritten: true };
     });
-    this.#reportInteractionSettled(session, requestId);
-    input.signal.throwIfAborted();
-    return { responseWritten: true };
   }
 
   /**

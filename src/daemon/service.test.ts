@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import fc from "fast-check";
 import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readFile, realpath, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -45,6 +46,7 @@ import {
 import { parseFact, parseThreadMetadataRead } from "../codex/protocol";
 import { projectBoundedThread } from "./codex-runtime-adapter";
 import { CLAUDE_PIN, CLAUDE_PIN_MODEL } from "../claude/pin";
+import { IndeterminateClaudeEffectError } from "../claude/errors";
 import { CloudProjectionRecoveryAdmissionError } from "../cloud/contracts";
 import { AccountKeyLossPreconditionError } from "../cloud/local-control";
 import {
@@ -689,6 +691,7 @@ class FakeClaude implements ClaudeRuntimePort {
     Parameters<ClaudeRuntimePort["validateInteractionResolution"]>[0]
   > = [];
   beforeEndSessionReturn?: () => Promise<void>;
+  beforeStartTurnReturn?: () => Promise<void>;
   beforeClaimSessionAdmission?: (
     input: Parameters<ClaudeRuntimePort["claimSession"]>[0],
   ) => Promise<void> | void;
@@ -956,6 +959,7 @@ class FakeClaude implements ClaudeRuntimePort {
       ],
     };
     if (this.startTurnError !== undefined) throw this.startTurnError;
+    if (this.beforeStartTurnReturn !== undefined) await this.beforeStartTurnReturn();
     return {
       turnId,
       status: "completed",
@@ -20091,6 +20095,398 @@ describe("HraService", () => {
     expect(recovered).toMatchObject({
       usage: [{ poll: { sourceRevision: 2, state: "observed" } }],
     });
+  });
+
+  test.each([
+    { prefix: 1, suffix: 1, barrier: true, sample: "regression" },
+    { prefix: 0, suffix: 2, barrier: true, sample: "leading-barrier" },
+    ...fc.sample(fc.record({
+      prefix: fc.integer({ min: 0, max: 3 }),
+      suffix: fc.integer({ min: 1, max: 3 }),
+      barrier: fc.boolean(),
+    }), { seed: 893041, numRuns: 8 }).map((value, index) => ({ ...value, sample: String(index) })),
+  ])("preserves the Claude input fact prefix ordering law for %j", async ({ prefix, suffix, barrier }) => {
+    const value = await nativeClaudeFixture("Claude input fact barrier", "claude-input-barrier", {
+      pid: 63_091, pidDomain: "darwin", procStart: "claude-input-barrier-process",
+    });
+    const authority = liveAuthorityFor(value.store, value.accountId, "claude");
+    const connectionId = value.managedClaude.observationConnectionId;
+    value.managedClaude.beforeStartTurnReturn = async () => {
+      delete value.managedClaude.beforeStartTurnReturn;
+      for (let index = 0; index < prefix; index += 1) {
+        await value.service.observeClaudeFact(authority, {
+          connectionId, providerThreadId: value.providerThreadId,
+          type: "turnCompleted", turnId: `captured-prefix-${String(index)}`, status: "completed",
+        });
+      }
+      // This session-wide notification reserves its normal ordered slot, but
+      // the input operation does not own authority to apply it inline.
+      if (barrier) {
+        await value.service.observeClaudeFact(authority, {
+          connectionId, providerThreadId: value.providerThreadId,
+          type: "protocolNotice", event: "test/ordered_barrier",
+        });
+      }
+      for (let index = 0; index < suffix; index += 1) {
+        await value.service.observeClaudeFact(authority, {
+          connectionId, providerThreadId: value.providerThreadId,
+          type: "turnCompleted", turnId: `captured-suffix-${String(index)}`, status: "completed",
+        });
+      }
+      throw new IndeterminateClaudeEffectError("turn/start",
+        new Error("test-only failure after captured facts"));
+    };
+    const idempotencyKey = crypto.randomUUID();
+    const command = {
+      kind: "session.send" as const, session: value.session.id,
+      message: "Retain only the safe ordered prefix", idempotencyKey,
+    };
+    await expect(value.service.execute(command, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await value.service.settled();
+    const page = value.store.listSessionEvents({ sessionId: value.session.id, afterSequence: null });
+    const expectedTurns = [
+      ...Array.from({ length: prefix }, (_, index) => `captured-prefix-${String(index)}`),
+      ...Array.from({ length: barrier ? 0 : suffix }, (_, index) => `captured-suffix-${String(index)}`),
+    ];
+    expect(page.events.map((event) => event.body).filter((body) => body.type === "turn_completed"))
+      .toEqual(expectedTurns.map((turnId) => ({
+        type: "turn_completed", status: "completed",
+        turnId: value.store.projectPublicProviderIdentifier(turnId),
+      })));
+    expect(page.events.some((event) => event.body.type === "user_message")).toBe(false);
+    expect(value.store.readMutation(idempotencyKey)).toMatchObject({ state: "ambiguous" });
+    expect(value.store.requireSession(value.session.id).state).toBe("recovery_required");
+    const eventsBeforeReplay = page.events;
+    await expect(value.service.execute(command, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await expect(value.service.execute({ ...command, idempotencyKey: crypto.randomUUID() }, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await value.service.settled();
+    expect(value.managedClaude.turnRequests).toHaveLength(1);
+    expect(value.store.listSessionEvents({ sessionId: value.session.id, afterSequence: null }).events)
+      .toEqual(eventsBeforeReplay);
+  }, 5_000);
+
+  test.each(["binding", "process"] as const)(
+    "refuses a captured Claude input fact after its provider %s authority changes", async (retirement) => {
+      const value = await nativeClaudeFixture("Claude stale input fact", "claude-input-stale", {
+        pid: 63_092, pidDomain: "darwin", procStart: "claude-input-stale-process",
+      });
+      const authority = liveAuthorityFor(value.store, value.accountId, "claude");
+      const captured = value.store.requireProviderAccountAuthority(value.accountId, "claude");
+      value.managedClaude.beforeStartTurnReturn = async () => {
+        delete value.managedClaude.beforeStartTurnReturn;
+        await value.service.observeClaudeFact(authority, {
+          connectionId: value.managedClaude.observationConnectionId,
+          providerThreadId: value.providerThreadId,
+          type: "turnCompleted", turnId: "retired-captured-turn", status: "completed",
+        });
+        if (retirement === "binding") {
+          value.store.observeProviderAccountReadiness({
+            profileId: value.accountId, provider: "claude",
+            expectedBindingGeneration: captured.bindingGeneration, readiness: "signed_out",
+          });
+        } else {
+          value.store.advanceProviderAccountProcessGeneration({
+            profileId: value.accountId, provider: "claude",
+            expectedProcessGeneration: captured.processGeneration,
+          });
+        }
+        throw new IndeterminateClaudeEffectError("turn/start",
+          new Error("test-only failure after authority retirement"));
+      };
+      const idempotencyKey = crypto.randomUUID();
+      await expect(value.service.execute({
+        kind: "session.send", session: value.session.id,
+        message: "Do not retain stale authority", idempotencyKey,
+      }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      await value.service.settled();
+      expect(value.store.requireProviderAccountAuthority(value.accountId, "claude")).not.toEqual(captured);
+      expect(value.store.listSessionEvents({ sessionId: value.session.id, afterSequence: null }).events
+        .some((event) => event.body.type === "turn_completed" || event.body.type === "user_message"))
+        .toBe(false);
+      expect(value.store.readMutation(idempotencyKey)).toMatchObject({ state: "ambiguous" });
+      expect(value.store.requireSession(value.session.id).state).toBe("recovery_required");
+      expect(value.managedClaude.turnRequests).toHaveLength(1);
+    },
+  );
+
+  test("seals retained Claude input fact routing before its producer mutates callback arguments", async () => {
+    const value = await nativeClaudeFixture("Claude captured input snapshot", "claude-input-snapshot", {
+      pid: 63_093, pidDomain: "darwin", procStart: "claude-input-snapshot-process",
+    });
+    value.managedClaude.beforeStartTurnReturn = async () => {
+      delete value.managedClaude.beforeStartTurnReturn;
+      const authority = { ...liveAuthorityFor(value.store, value.accountId, "claude") };
+      const fact = {
+        connectionId: value.managedClaude.observationConnectionId,
+        providerThreadId: value.providerThreadId,
+        type: "turnCompleted" as const, turnId: "sealed-captured-turn", status: "completed" as const,
+      };
+      await value.service.observeClaudeFact(authority, fact);
+      // The callback has reserved its original FIFO slot. Its caller may no
+      // longer mutate the routing or payload retained for the later drain.
+      authority.generation += 1;
+      fact.connectionId = "30000000-0000-4000-8000-0000000000ff";
+      fact.providerThreadId = "mutated-unrelated-thread";
+      fact.turnId = "mutated-unrelated-turn";
+      throw new IndeterminateClaudeEffectError("turn/start",
+        new Error("test-only failure after caller mutation"));
+    };
+    const idempotencyKey = crypto.randomUUID();
+    await expect(value.service.execute({
+      kind: "session.send", session: value.session.id,
+      message: "Retain the observed immutable routing", idempotencyKey,
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await value.service.settled();
+    const bodies = value.store.listSessionEvents({ sessionId: value.session.id, afterSequence: null })
+      .events.map((event) => event.body);
+    expect(bodies.filter((body) => body.type === "turn_completed"))
+      .toEqual([{
+        type: "turn_completed", status: "completed",
+        turnId: value.store.projectPublicProviderIdentifier("sealed-captured-turn"),
+      }]);
+    expect(bodies.some((body) => body.type === "user_message")).toBe(false);
+    expect(value.store.readMutation(idempotencyKey)).toMatchObject({ state: "ambiguous" });
+    expect(value.store.requireSession(value.session.id).state).toBe("recovery_required");
+    expect(value.managedClaude.turnRequests).toHaveLength(1);
+  });
+
+  test.each(["queued", "reentrant"] as const)(
+    "bounds the lifetime of retained Claude input facts across %s arrivals", async (arrival) => {
+      const value = await nativeClaudeFixture("Claude input fact bound", "claude-input-bound", {
+        pid: 63_094, pidDomain: "darwin", procStart: "claude-input-bound-process",
+      });
+      const authority = liveAuthorityFor(value.store, value.accountId, "claude");
+      const capturedLimit = 256;
+      let observed = 0;
+      const observeNext = async (): Promise<void> => {
+        const index = observed++;
+        await value.service.observeClaudeFact(authority, {
+          connectionId: value.managedClaude.observationConnectionId,
+          providerThreadId: value.providerThreadId,
+          type: "turnCompleted", turnId: `bounded-turn-${String(index)}`, status: "completed",
+        });
+      };
+      value.managedClaude.beforeStartTurnReturn = async () => {
+        delete value.managedClaude.beforeStartTurnReturn;
+        if (arrival === "queued") {
+          for (let index = 0; index <= capturedLimit; index += 1) await observeNext();
+        } else {
+          await observeNext();
+          value.cloud.beforeProjectionUnsettledSessionReturn = async (sessionId) => {
+            if (sessionId !== value.session.id || observed > capturedLimit) return;
+            // Admit another real callback while the previous closure drains.
+            // Removing jobs must not replenish lifetime count capacity.
+            await observeNext();
+          };
+        }
+        throw new IndeterminateClaudeEffectError("turn/start",
+          new Error("test-only failure before a bounded fact drain"));
+      };
+      const idempotencyKey = crypto.randomUUID();
+      try {
+        await expect(value.service.execute({
+          kind: "session.send", session: value.session.id,
+          message: "Keep callback retention finite", idempotencyKey,
+        }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+        await value.service.settled();
+      } finally {
+        delete value.cloud.beforeProjectionUnsettledSessionReturn;
+      }
+      expect(observed).toBe(capturedLimit + 1);
+      const first = value.store.listSessionEvents({ sessionId: value.session.id, afterSequence: null });
+      const lastSequence = first.events.at(-1)?.sequence;
+      if (lastSequence === undefined) throw new Error("Expected retained events before the bound.");
+      const second = value.store.listSessionEvents({ sessionId: value.session.id, afterSequence: lastSequence });
+      const bodies = [...first.events, ...second.events].map((event) => event.body);
+      const completed = bodies.filter((body) => body.type === "turn_completed");
+      expect(completed.map((body) => body.turnId)).toEqual(Array.from({ length: capturedLimit },
+        (_, index) => value.store.projectPublicProviderIdentifier(`bounded-turn-${String(index)}`)));
+      expect(bodies.some((body) => body.type === "user_message")).toBe(false);
+      expect(value.store.readMutation(idempotencyKey)).toMatchObject({ state: "ambiguous" });
+      expect(value.store.requireSession(value.session.id).state).toBe("recovery_required");
+      expect(value.managedClaude.turnRequests).toHaveLength(1);
+    },
+  );
+
+  test("does not invent a Claude input barrier after the preceding ordered fact releases its locks", async () => {
+    const value = await nativeClaudeFixture("Claude prior fact release", "claude-input-prior-fact", {
+      pid: 63_095, pidDomain: "darwin", procStart: "claude-input-prior-fact-process",
+    });
+    const authority = liveAuthorityFor(value.store, value.accountId, "claude");
+    const connectionId = value.managedClaude.observationConnectionId;
+    value.managedClaude.beforeStartTurnReturn = async () => {
+      delete value.managedClaude.beforeStartTurnReturn;
+      await value.service.observeClaudeFact(authority, {
+        connectionId, providerThreadId: value.providerThreadId,
+        type: "turnCompleted", turnId: "following-input-fact", status: "completed",
+      });
+      throw new IndeterminateClaudeEffectError("turn/start",
+        new Error("test-only failure after preceding locks released"));
+    };
+    const idempotencyKey = crypto.randomUUID();
+    const following: { outcome?: Promise<Readonly<{ status: string; error?: unknown }>> } = {};
+    value.cloud.beforeProjectionUnsettledSessionReturn = async (sessionId) => {
+      if (sessionId !== value.session.id) return;
+      delete value.cloud.beforeProjectionUnsettledSessionReturn;
+      // Queue the next input while the preceding fact still owns its locks.
+      // Do not await that input from its predecessor's held authority.
+      following.outcome = value.service.execute({
+        kind: "session.send", session: value.session.id,
+        message: "Wait behind the preceding fact", idempotencyKey,
+      }, { signal }).then(
+        () => ({ status: "fulfilled" }),
+        (error: unknown) => ({ status: "rejected", error }),
+      );
+    };
+    await value.service.observeClaudeFact(authority, {
+      connectionId, providerThreadId: value.providerThreadId,
+      type: "turnCompleted", turnId: "preceding-fact", status: "completed",
+    });
+    if (following.outcome === undefined) throw new Error("Expected preceding fact to queue the next input.");
+    expect(await following.outcome).toMatchObject({ status: "rejected", error: { code: "RECOVERY_REQUIRED" } });
+    await value.service.settled();
+    const completed = value.store.listSessionEvents({ sessionId: value.session.id, afterSequence: null })
+      .events.map((event) => event.body).filter((body) => body.type === "turn_completed");
+    expect(completed.map((body) => body.turnId)).toEqual([
+      value.store.projectPublicProviderIdentifier("preceding-fact"),
+      value.store.projectPublicProviderIdentifier("following-input-fact"),
+    ]);
+    expect(value.store.readMutation(idempotencyKey)).toMatchObject({ state: "ambiguous" });
+    expect(value.store.requireSession(value.session.id).state).toBe("recovery_required");
+    expect(value.managedClaude.turnRequests).toHaveLength(1);
+  });
+
+  test.each([
+    { payload: "single", outcome: "rejected" },
+    { payload: "cumulative", outcome: "rejected" },
+    { payload: "single", outcome: "accepted" },
+  ] as const)(
+    "bounds retained Claude input fact bytes before a later completion: %j", async ({ payload, outcome }) => {
+      const value = await nativeClaudeFixture("Claude input fact byte bound", "claude-input-byte-bound", {
+        pid: 63_096, pidDomain: "darwin", procStart: "claude-input-byte-bound-process",
+      });
+      const authority = liveAuthorityFor(value.store, value.accountId, "claude");
+      const connectionId = value.managedClaude.observationConnectionId;
+      let providerReturns = 0;
+      const startTurn = value.managedClaude.startTurn.bind(value.managedClaude);
+      value.managedClaude.startTurn = async (input) => {
+        const result = await startTurn(input);
+        providerReturns += 1;
+        return result;
+      };
+      value.managedClaude.beforeStartTurnReturn = async () => {
+        delete value.managedClaude.beforeStartTurnReturn;
+        await value.service.observeClaudeFact(authority, {
+          connectionId, providerThreadId: value.providerThreadId,
+          type: "turnCompleted", turnId: "byte-prefix", status: "completed",
+        });
+        const text = "a".repeat(payload === "single" ? 1024 * 1024 : 64 * 1024);
+        // Both variants stay far below the independent 256-fact count cap.
+        // The second crosses the byte budget only through cumulative input.
+        for (let index = 0; index < (payload === "single" ? 1 : 17); index += 1) {
+          await value.service.observeClaudeFact(authority, {
+            connectionId, providerThreadId: value.providerThreadId,
+            type: "assistantDelta", turnId: "byte-payload", itemId: "byte-item", text,
+          });
+        }
+        await value.service.observeClaudeFact(authority, {
+          connectionId, providerThreadId: value.providerThreadId,
+          type: "turnCompleted", turnId: "byte-suffix", status: "completed",
+        });
+        if (outcome === "rejected") {
+          throw new IndeterminateClaudeEffectError("turn/start",
+            new Error("test-only failure after the byte budget is exceeded"));
+        }
+      };
+      const idempotencyKey = crypto.randomUUID();
+      await expect(value.service.execute({
+        kind: "session.send", session: value.session.id,
+        message: "Bound retained callback bytes", idempotencyKey,
+      }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      await value.service.settled();
+      expect(providerReturns).toBe(outcome === "accepted" ? 1 : 0);
+      const completed: string[] = [];
+      let afterSequence: number | null = null;
+      let reachedEnd = false;
+      for (let pageIndex = 0; pageIndex < 8; pageIndex += 1) {
+        const page = value.store.listSessionEvents({ sessionId: value.session.id, afterSequence });
+        for (const event of page.events) {
+          if (event.body.type === "turn_completed") completed.push(event.body.turnId);
+          expect(event.body.type).not.toBe("user_message");
+        }
+        const lastSequence = page.events.at(-1)?.sequence;
+        if (lastSequence === undefined || lastSequence >= page.observedThroughSequence) {
+          reachedEnd = true;
+          break;
+        }
+        afterSequence = lastSequence;
+      }
+      expect(reachedEnd).toBe(true);
+      expect(completed).toEqual([value.store.projectPublicProviderIdentifier("byte-prefix")]);
+      expect(value.store.readMutation(idempotencyKey)).toMatchObject({ state: "ambiguous" });
+      expect(value.store.requireSession(value.session.id).state).toBe("recovery_required");
+      expect(value.managedClaude.turnRequests).toHaveLength(1);
+      await expect(value.service.execute({
+        kind: "session.send", session: value.session.id, message: "Do not replay overflowing input",
+      }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      expect(value.managedClaude.turnRequests).toHaveLength(1);
+    },
+  );
+
+  test("never retries a retained Claude input fact closure after its local drain fails", async () => {
+    const value = await nativeClaudeFixture("Claude input fact drain failure", "claude-input-drain-failure", {
+      pid: 63_097, pidDomain: "darwin", procStart: "claude-input-drain-failure-process",
+    });
+    const authority = liveAuthorityFor(value.store, value.accountId, "claude");
+    let attemptedDrains = 0;
+    value.managedClaude.beforeStartTurnReturn = async () => {
+      delete value.managedClaude.beforeStartTurnReturn;
+      await value.service.observeClaudeFact(authority, {
+        connectionId: value.managedClaude.observationConnectionId,
+        providerThreadId: value.providerThreadId,
+        type: "turnCompleted", turnId: "partially-drained-turn", status: "completed",
+      });
+      value.cloud.beforeProjectionUnsettledSessionReturn = async (sessionId) => {
+        if (sessionId !== value.session.id) return;
+        attemptedDrains += 1;
+        throw new Error("test-only local retention failure after the event was appended");
+      };
+      throw new IndeterminateClaudeEffectError("turn/start",
+        new Error("test-only provider input uncertainty before the drain"));
+    };
+    const idempotencyKey = crypto.randomUUID();
+    const command = {
+      kind: "session.send" as const, session: value.session.id,
+      message: "Do not retry a partially applied local fact", idempotencyKey,
+    };
+    try {
+      await expect(value.service.execute(command, { signal }))
+        .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      await value.service.settled();
+    } finally {
+      delete value.cloud.beforeProjectionUnsettledSessionReturn;
+    }
+    expect(attemptedDrains).toBe(1);
+    const page = value.store.listSessionEvents({ sessionId: value.session.id, afterSequence: null });
+    expect(page.events.map((event) => event.body).filter((body) => body.type === "turn_completed"))
+      .toEqual([{
+        type: "turn_completed", status: "completed",
+        turnId: value.store.projectPublicProviderIdentifier("partially-drained-turn"),
+      }]);
+    expect(value.store.readMutation(idempotencyKey)).toMatchObject({ state: "ambiguous" });
+    expect(value.store.requireSession(value.session.id).state).toBe("recovery_required");
+    await expect(value.service.execute(command, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await expect(value.service.execute({ ...command, idempotencyKey: crypto.randomUUID() }, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await value.service.settled();
+    expect(value.managedClaude.turnRequests).toHaveLength(1);
+    expect(attemptedDrains).toBe(1);
+    expect(value.store.listSessionEvents({ sessionId: value.session.id, afterSequence: null }).events)
+      .toEqual(page.events);
   });
 
   test("accepts provider notifications that arrive before mutation responses", async () => {

@@ -1459,10 +1459,15 @@ describe("Claude sessions on the local authority", () => {
     expect(value.store.requireSession(started.session.id)).toMatchObject({ state: "idle" });
     expect(value.store.requireSession(started.session.id).activeTurnId).toBeUndefined();
     const facts = await eventBodies(value, started.session.id);
+    const userIndex = facts.findIndex((fact) => fact.type === "user_message");
     const startedIndex = facts.findIndex((fact) => fact.type === "turn_started");
     const completedIndex = facts.findIndex((fact) => fact.type === "turn_completed");
+    expect(userIndex).toBeGreaterThanOrEqual(0);
+    expect(startedIndex).toBeGreaterThan(userIndex);
     expect(startedIndex).toBeGreaterThanOrEqual(0);
     expect(completedIndex).toBeGreaterThan(startedIndex);
+    expect(facts.filter((fact) => fact.type === "turn_started")).toHaveLength(1);
+    expect(facts.filter((fact) => fact.type === "turn_completed")).toHaveLength(1);
     expect(value.store.readMutation(key)).toMatchObject({ state: "applied", result: { turnId: sent.turnId } });
     const shown = await value.service.execute({
       kind: "session.show", session: started.session.id, detail: false,
@@ -1500,11 +1505,14 @@ describe("Claude sessions on the local authority", () => {
     };
     await expect(value.service.execute(command, { signal })).rejects.toThrow();
     await value.service.settled();
-    const failed = value.store.readMutation(key);
-    expect(failed).toMatchObject({ state: "failed" });
+    const uncertain = value.store.readMutation(key);
+    expect(uncertain).toMatchObject({ state: "ambiguous" });
     const facts = await eventBodies(value, started.session.id);
     expect(facts.some((fact) => fact.type === "turn_started")).toBe(false);
+    expect(facts.some((fact) => fact.type === "user_message")).toBe(false);
     expect(facts.find((fact) => fact.type === "turn_completed")).toMatchObject({ status: "completed" });
+    expect(facts.filter((fact) => fact.type === "turn_completed")).toHaveLength(1);
+    expect(value.store.requireSession(started.session.id).state).toBe("recovery_required");
     expect(value.store.requireSession(started.session.id).activeTurnId).toBeUndefined();
     const captured = value.store.requireSessionProviderAuthority(started.session.id);
     expect(value.store.providerUsageObservations({
@@ -1514,11 +1522,264 @@ describe("Claude sessions on the local authority", () => {
       diagnostic.code === "provider_usage_persistence_failed"))
       .toMatchObject({ count: 1 });
     const writes = [...process.written];
-    await expect(value.service.execute(command, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
-    expect(value.store.readMutation(key)).toEqual(failed);
+    await expect(value.service.execute(command, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(value.store.readMutation(key)).toEqual(uncertain);
+    expect(process.written).toEqual(writes);
+    await expect(value.service.execute({
+      ...command, idempotencyKey: crypto.randomUUID(), message: "Never replay under a new key",
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
     expect(process.written).toEqual(writes);
     expect(value.processes).toHaveLength(1);
   });
+
+  test("fences a different-key Claude send after a post-write rejection without a result", async () => {
+    const value = await claudeFixture();
+    const account = await authenticatedClaudeAccount(value, "Claude post-write uncertainty");
+    const started = await value.service.execute({
+      account, fast: false, kind: "session.start", preset: "fable-max", provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const process = value.processes[0];
+    if (process === undefined) throw new Error("Expected one pinned Claude process.");
+    await value.service.settled();
+    const authority = value.store.requireSessionProviderAuthority(started.session.id);
+    const initialWrites = [...process.written];
+    const writeError = new Error("test-only rejection after recording the Claude user frame");
+    process.beforeWriteReturn = () => {
+      process.beforeWriteReturn = undefined;
+      // FakeClaudeProcess.write has already recorded the actual user frame.
+      // Emit no result, assistant response, EOF or process exit before rejecting.
+      throw writeError;
+    };
+    const firstKey = crypto.randomUUID();
+    const firstMessage = "First input with an unsettled write outcome";
+    let firstError: unknown;
+    try {
+      await value.service.execute({
+        idempotencyKey: firstKey, kind: "session.send", message: firstMessage,
+        session: started.session.id,
+      }, { signal });
+    } catch (error: unknown) {
+      firstError = error;
+    }
+    await value.service.settled();
+    expect(firstError).toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(value.store.readMutation(firstKey)).toMatchObject({ state: "ambiguous" });
+    expect(value.store.requireSession(started.session.id)).toMatchObject({ state: "recovery_required" });
+    expect(value.store.requireSession(started.session.id).activeTurnId).toBeUndefined();
+    const firstWrites = [...process.written];
+    expect(firstWrites.slice(initialWrites.length)).toEqual([`${JSON.stringify({
+      message: { content: [{ text: firstMessage, type: "text" }], role: "user" },
+      type: "user",
+    })}\n`]);
+    expect(process.terminated).toBe(false);
+    expect(value.processes).toEqual([process]);
+    expect(value.store.requireSessionProviderAuthority(started.session.id)).toEqual(authority);
+    const firstFacts = await eventBodies(value, started.session.id);
+    expect(firstFacts.some((fact) => fact.type === "turn_started" || fact.type === "turn_completed"))
+      .toBe(false);
+    expect(value.store.providerUsageObservations({
+      providerAccountId: authority.providerAccountId, component: "accounting",
+    })).toEqual([]);
+
+    const secondKey = crypto.randomUUID();
+    expect(secondKey).not.toBe(firstKey);
+    const secondOutcome = await value.service.execute({
+      idempotencyKey: secondKey, kind: "session.send",
+      message: "Different-key input before any result or recovery", session: started.session.id,
+    }, { signal }).then(
+      () => ({ status: "fulfilled" as const }),
+      (error: unknown) => ({ status: "rejected" as const, error }),
+    );
+    await value.service.settled();
+    expect(process.terminated).toBe(false);
+    expect(value.processes).toEqual([process]);
+    expect(value.store.requireSessionProviderAuthority(started.session.id)).toEqual(authority);
+    expect((await eventBodies(value, started.session.id))
+      .some((fact) => fact.type === "turn_completed")).toBe(false);
+    // Decisive cross-layer safety oracle: no second frame may reach this same
+    // still-open process merely because the second caller chose another key.
+    expect({ outcome: secondOutcome.status, writes: process.written }).toEqual({
+      outcome: "rejected", writes: firstWrites,
+    });
+  }, 5_000);
+
+  test.each(["no_result", "result_before_rejection"] as const)(
+    "keeps later Claude queue entries pending after an uncertain dispatch (%s)", async (disposition) => {
+    const value = await claudeFixture();
+    const account = await authenticatedClaudeAccount(value, "Claude uncertain queue");
+    const started = await value.service.execute({
+      account, fast: false, kind: "session.start", preset: "fable-max", provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const session = started.session.id;
+    const process = value.processes[0];
+    if (process === undefined) throw new Error("Expected one pinned Claude process.");
+    const initial = await value.service.execute({
+      kind: "session.send", session, message: "Initial active turn",
+    }, { signal }) as { turnId: string };
+    const accountingAttempts: string[] = [];
+    const record = value.store.recordProviderUsageObservation.bind(value.store);
+    value.store.recordProviderUsageObservation = (observation) => {
+      if (observation.source === "claude_result") {
+        accountingAttempts.push(observation.turn.turnId);
+      }
+      return record(observation);
+    };
+    const first = await value.service.execute({
+      kind: "session.queue", session, message: "Uncertain queued input",
+    }, { signal }) as { queued: { id: `queue_${string}` } };
+    const second = await value.service.execute({
+      kind: "session.queue", session, message: "Must remain pending",
+    }, { signal }) as { queued: { id: `queue_${string}` } };
+    expect(value.store.requireQueue(first.queued.id).state).toBe("pending");
+    expect(value.store.requireQueue(second.queued.id).state).toBe("pending");
+    process.beforeWriteReturn = async () => {
+      process.beforeWriteReturn = undefined;
+      if (disposition === "result_before_rejection") {
+        const queuedResultRead = new Promise<void>((resolve) => {
+          process.afterStdoutChunkRead = () => {
+            process.afterStdoutChunkRead = undefined;
+            resolve();
+          };
+        });
+        process.emit({
+          ...resultLine("Queued turn actually completed before its write rejected"),
+          uuid: "48000000-0000-4000-8000-000000000052",
+        });
+        await queuedResultRead;
+      }
+      throw new Error("test-only queued frame rejection after write");
+    };
+    const resultRead = new Promise<void>((resolve) => {
+      process.afterStdoutChunkRead = () => {
+        process.afterStdoutChunkRead = undefined;
+        resolve();
+      };
+    });
+    process.emit(resultLine("Initial turn actually completed"));
+    await resultRead;
+    await value.service.settled();
+    expect(value.store.requireQueue(first.queued.id).state).toBe("ambiguous");
+    expect(value.store.requireQueue(second.queued.id).state).toBe("pending");
+    expect(value.store.requireSession(session).state).toBe("recovery_required");
+    expect(process.written).toHaveLength(2);
+    expect(process.written[1]).toContain("Uncertain queued input");
+    expect(process.written.join("")).not.toContain("Must remain pending");
+    expect((await eventBodies(value, session)).filter((fact) => fact.type === "turn_completed"))
+      .toHaveLength(disposition === "result_before_rejection" ? 2 : 1);
+    // Immutable accounting publication keeps its original FIFO. The initial
+    // turn remains bound; the uncertain queued turn must never gain a binding
+    // merely because its real completion was retained before quarantine.
+    expect(accountingAttempts[0]).toBe(initial.turnId);
+    expect(accountingAttempts).toHaveLength(disposition === "result_before_rejection" ? 2 : 1);
+    if (disposition === "result_before_rejection") {
+      expect(accountingAttempts[1]).not.toBe(initial.turnId);
+      expect(value.service.backgroundDiagnostics().byCode.find((diagnostic) =>
+        diagnostic.code === "provider_usage_persistence_failed")).toMatchObject({ count: 1 });
+    }
+    const authority = value.store.requireSessionProviderAuthority(session);
+    const accounting = value.store.providerUsageObservations({
+      component: "accounting", providerAccountId: authority.providerAccountId,
+    });
+    expect(accounting).toHaveLength(1);
+    expect(accounting[0]).toMatchObject({ turn: { sessionId: session, turnId: initial.turnId } });
+    expect(process.terminated).toBe(false);
+    const writes = [...process.written];
+    await expect(value.service.execute({
+      kind: "session.send", session, message: "Different-key input after uncertain queue",
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await value.service.settled();
+    expect(process.written).toEqual(writes);
+    expect(value.processes).toEqual([process]);
+    }, 5_000,
+  );
+
+  test.each(["session.steer", "session.stop"] as const)(
+    "requires recovery after a post-write Claude %s rejection", async (kind) => {
+      const value = await claudeFixture();
+      const account = await authenticatedClaudeAccount(value, "Claude uncertain active operation");
+      const started = await value.service.execute({
+        account, fast: false, kind: "session.start", preset: "fable-max", provider: "claude",
+      }, { signal }) as { session: { id: `sess_${string}` } };
+      const session = started.session.id;
+      const process = value.processes[0];
+      if (process === undefined) throw new Error("Expected one pinned Claude process.");
+      await value.service.execute({ kind: "session.send", session, message: "Active turn" }, { signal });
+      process.beforeWriteReturn = () => {
+        process.beforeWriteReturn = undefined;
+        throw new Error("test-only active operation write rejection");
+      };
+      const idempotencyKey = crypto.randomUUID();
+      const command = kind === "session.steer"
+        ? { kind, session, idempotencyKey, message: "Uncertain steering" }
+        : { kind, session, idempotencyKey };
+      await expect(value.service.execute(command, { signal }))
+        .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      await value.service.settled();
+      expect(value.store.readMutation(idempotencyKey)).toMatchObject({ state: "ambiguous" });
+      expect(value.store.requireSession(session).state).toBe("recovery_required");
+      expect(process.written).toHaveLength(2);
+      const writes = [...process.written];
+      await expect(value.service.execute({
+        kind: "session.steer", session, message: "Do not repeat an uncertain operation",
+      }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+      expect(process.written).toEqual(writes);
+      expect(process.terminated).toBe(false);
+    }, 5_000,
+  );
+
+  test("does not replay a Claude approval after its written response rejects", async () => {
+    const value = await claudeFixture();
+    const account = await authenticatedClaudeAccount(value, "Claude uncertain approval");
+    const started = await value.service.execute({
+      account, fast: false, kind: "session.start", preset: "fable-max", provider: "claude",
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    const session = started.session.id;
+    const process = value.processes[0];
+    if (process === undefined) throw new Error("Expected one pinned Claude process.");
+    await value.service.execute({ kind: "session.send", session, message: "Ask for approval" }, { signal });
+    const requestRead = new Promise<void>((resolve) => {
+      process.afterStdoutChunkRead = () => {
+        process.afterStdoutChunkRead = undefined;
+        resolve();
+      };
+    });
+    const requestId = "48000000-0000-4000-8000-000000000061";
+    process.emit(approvalRequestLine(requestId));
+    await requestRead;
+    await value.service.settled();
+    const pending = await value.service.execute({
+      kind: "interaction.list", limit: 10, pending: true, session,
+    }, { signal }) as { interactions: readonly { id: string; revision: number }[] };
+    expect(pending.interactions).toHaveLength(1);
+    const interaction = pending.interactions[0];
+    if (interaction === undefined) throw new Error("Expected the pending approval.");
+    process.beforeWriteReturn = () => {
+      process.beforeWriteReturn = undefined;
+      throw new Error("test-only approval response rejection after write");
+    };
+    const command = {
+      expectedRevision: interaction.revision, interaction: interaction.id,
+      kind: "interaction.resolve" as const,
+      resolution: { decision: "once" as const, kind: "approval_decision" as const },
+    };
+    await expect(value.service.execute(command, { signal }))
+      .rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    await value.service.settled();
+    expect(value.store.requireInteraction(interaction.id).state).toBe("resolution_unknown");
+    const writes = [...process.written];
+    expect(writes.filter((line) => line.includes("control_response"))).toHaveLength(1);
+    expect(writes.at(-1)).toContain(requestId);
+    await expect(value.service.execute(command, { signal })).rejects.toThrow();
+    await value.service.settled();
+    expect(value.store.requireInteraction(interaction.id).state).toBe("resolution_unknown");
+    expect(process.written).toEqual(writes);
+    await expect(value.service.execute({
+      kind: "session.steer", session, message: "Do not bypass an uncertain approval with fresh input",
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(process.written).toEqual(writes);
+    expect(process.terminated).toBe(false);
+    expect(value.processes).toEqual([process]);
+  }, 5_000);
 
   test("drops Claude usage callbacks stamped with a retired provider authority", async () => {
     const value = await claudeFixture();

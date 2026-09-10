@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 
 import type { PreparedAttachment } from "../domain/attachments.ts";
 import { ClaudeDeltaAssembler, type ClaudeFact } from "./assembler.ts";
-import { ClaudeError } from "./errors.ts";
+import { ClaudeError, IndeterminateClaudeEffectError } from "./errors.ts";
 import { ClaudeJsonLineDecoder } from "./jsonl.ts";
 import type { ClaudeProcess } from "./process.ts";
 import {
@@ -142,6 +142,7 @@ export class ClaudeStreamClient {
   #state: "open" | "closing" | "closed" | "failed" = "open";
   #disconnectEmitted = false;
   #writeChain: Promise<void> = Promise.resolve();
+  #writesFenced = false;
   #pendingTurnStart: PendingTurnStart | null = null;
 
   constructor(options: ClaudeStreamClientOptions) {
@@ -242,7 +243,9 @@ export class ClaudeStreamClient {
     turnId: string;
     message: string;
     attachments?: readonly PreparedAttachment[];
+    onWriteStarted?: () => void;
   }>): Promise<void> {
+    const onWriteStarted = input.onWriteStarted;
     this.#assertOpen();
     if (this.#pendingTurnStart !== null) {
       throw new ClaudeError("INVALID_INPUT", "A Claude turn start is still settling");
@@ -251,21 +254,31 @@ export class ClaudeStreamClient {
     this.#assembler.beginTurn(input.turnId);
     const pending: PendingTurnStart = { turnId: input.turnId, facts: [], bytes: 0, draining: null };
     this.#pendingTurnStart = pending;
+    const write = { started: false };
     try {
-      await this.#write(line);
+      await this.#write(line, () => {
+        write.started = true;
+        onWriteStarted?.();
+      });
       this.#assertOpen();
+      await this.#drainPendingTurnStart(pending, true);
     } catch (error: unknown) {
+      if (write.started) this.fenceWrites();
       // A rejected write may have escaped. Retain actual observed history,
       // but never manufacture a successful start or replace the write error.
       try {
         await this.#drainPendingTurnStart(pending, false);
       } catch {
-        this.#onSafeDiagnostic?.("HRA fact delivery failed after Claude turn admission failed");
+        try {
+          this.#onSafeDiagnostic?.("HRA fact delivery failed after Claude turn admission failed");
+        } catch {
+          // An informational observer cannot replace the admission failure
+          // or prevent the local turn from being abandoned below.
+        }
       }
       this.#assembler.abandonTurn("the Claude turn write failed");
       throw error;
     }
-    await this.#drainPendingTurnStart(pending, true);
   }
 
   async #emitFact(fact: ClaudeFact): Promise<void> {
@@ -330,20 +343,21 @@ export class ClaudeStreamClient {
   async steer(
     message: string,
     attachments: readonly PreparedAttachment[] = [],
+    onWriteStarted?: () => void,
   ): Promise<void> {
     this.#assertOpen();
     if (this.#assembler.activeTurnId === null) {
       throw new ClaudeError("INVALID_INPUT", "No Claude turn is in flight to steer");
     }
-    await this.#write(claudeUserLine(message, attachments));
+    await this.#write(claudeUserLine(message, attachments), onWriteStarted);
   }
 
   /** Asks the runtime to stop the in-flight turn. Its `result` reads interrupted. */
-  async interrupt(): Promise<void> {
+  async interrupt(onWriteStarted?: () => void): Promise<void> {
     this.#assertOpen();
     if (this.#assembler.activeTurnId === null) return;
     this.#assembler.markInterrupted();
-    await this.#write(claudeInterruptLine(randomUUID()));
+    await this.#write(claudeInterruptLine(randomUUID()), onWriteStarted);
   }
 
   pendingInteraction(requestId: string): PendingInteraction | undefined {
@@ -366,10 +380,11 @@ export class ClaudeStreamClient {
   async resolveInteraction(
     requestId: string,
     decision: ClaudeInteractionDecision,
+    onWriteStarted?: () => void,
   ): Promise<Readonly<{ responseDigest: string }>> {
     this.#assertOpen();
     const validated = this.validateInteractionResolution(requestId, decision);
-    await this.#write(claudeControlResponseLine(requestId, validated.response));
+    await this.#write(claudeControlResponseLine(requestId, validated.response), onWriteStarted);
     this.#pending.delete(requestId);
     return { responseDigest: validated.responseDigest };
   }
@@ -475,20 +490,34 @@ export class ClaudeStreamClient {
     }
   }
 
+  /** Close frame admission without inventing process exit or joining an observer. */
+  fenceWrites(): void {
+    this.#writesFenced = true;
+  }
+
   #assertOpen(): void {
     if (this.#state !== "open") {
       throw new ClaudeError("PROCESS_EXITED", "The Claude runtime connection is closed");
     }
+    if (this.#writesFenced) throw new IndeterminateClaudeEffectError("write");
   }
 
-  #write(line: string): Promise<void> {
+  #write(line: string, onWriteStarted?: () => void): Promise<void> {
     const bytes = this.#encoder.encode(line);
     const chained = this.#writeChain.then(async () => {
       // Admission can change while this frame waits behind an earlier write.
       // Recheck at the actual provider boundary so close, disconnect, and
       // account revocation fence every frame that has not begun writing yet.
       this.#assertOpen();
-      await this.#process.write(bytes);
+      try {
+        onWriteStarted?.();
+        await this.#process.write(bytes);
+      } catch (error: unknown) {
+        // Fence synchronously before the recovered chain can release another
+        // queued frame. Cleanup and actual stream facts retain their owners.
+        this.fenceWrites();
+        throw error;
+      }
     });
     this.#writeChain = chained.catch(() => undefined);
     return chained;
