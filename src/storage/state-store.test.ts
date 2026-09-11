@@ -490,7 +490,12 @@ async function syntheticAdoption36ContractFixture(scenario: "launch" | "quaranti
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const database = new Database(paths.database, { create: true, strict: true });
-  try { installSyntheticAdoption36Fixture(database, scenario); }
+  try {
+    // Batch only fixture construction; the tested v36 migration remains a
+    // separate real first open. Foreign keys must be enabled before BEGIN.
+    database.exec("PRAGMA foreign_keys=ON");
+    database.transaction(() => installSyntheticAdoption36Fixture(database, scenario)).immediate();
+  }
   finally { database.close(false); }
   await chmod(paths.database, 0o600);
   return paths;
@@ -36236,13 +36241,17 @@ describe("StateStore", () => {
           const triggers = damaged.query(
             "SELECT name,sql FROM sqlite_master WHERE type='trigger' ORDER BY name",
           ).all().map((row) => z.object({ name: z.string(), sql: z.string() }).strict().parse(row));
-          for (const trigger of triggers) {
-            damaged.exec(`DROP TRIGGER "${trigger.name.replaceAll('"', '""')}"`);
-          }
-          damaged.exec("ALTER TABLE queue_entries DROP COLUMN message_actor");
-          damaged.exec(`ALTER TABLE queue_entries ADD COLUMN message_actor TEXT NOT NULL
-            DEFAULT 'human' CHECK(message_actor IN ('human','peer_session','automation'))`);
-          for (const trigger of triggers) damaged.exec(trigger.sql);
+          // Commit the adversarial fixture once, then prove both real opens
+          // refuse the same completed schema under the original test deadline.
+          damaged.transaction(() => {
+            for (const trigger of triggers) {
+              damaged.exec(`DROP TRIGGER "${trigger.name.replaceAll('"', '""')}"`);
+            }
+            damaged.exec("ALTER TABLE queue_entries DROP COLUMN message_actor");
+            damaged.exec(`ALTER TABLE queue_entries ADD COLUMN message_actor TEXT NOT NULL
+              DEFAULT 'human' CHECK(message_actor IN ('human','peer_session','automation'))`);
+            for (const trigger of triggers) damaged.exec(trigger.sql);
+          }).immediate();
         } else {
           const guard = z.object({ sql: z.string() }).strict().parse(damaged.query(
             "SELECT sql FROM sqlite_master WHERE name='queue_peer_provenance_immutable'",
