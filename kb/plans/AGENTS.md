@@ -1,5 +1,6 @@
 # Contents
 
+- `wonka-marketing.md` tracks the homepage's restrained top-hat artwork, engraved story seals, rendering budget, and acceptance evidence.
 - `oompa-rename.md` governs the Oompa identity transition, package-only content, orange-circle branding, compatibility and organization-wide consumer delivery.
 - `oompa-app-domain.md` records the owner's replacement domain choice, source and account authority changes, and removal of the earlier domain without redirects.
 - `ui-marketing-docs.md` tracks UI-first product marketing, task-oriented public guides, isolated Direct examples, and their delivery evidence.
