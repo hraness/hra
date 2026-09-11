@@ -19,8 +19,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     # Source shards and the ordered remainder cover the complete gate while
     # retaining every test's own deadline. The measured serial source suites
-    # need a larger finite job budget than the ordered remainder.
-    timeout-minutes: ${{ matrix.gate == 'remainder' && 20 || 75 }}
+    # need a larger finite job budget than the ordered remainder. macOS also
+    # needs headroom for setup and post-job cleanup after its measured gate.
+    timeout-minutes: ${{ matrix.gate == 'remainder' && (matrix.os == 'macos-15' && 25 || 20) || 75 }}
     strategy:
       fail-fast: false
       matrix:

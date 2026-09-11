@@ -31,9 +31,12 @@ serial tests and isolated file globals. The seventh job,
 `bun run check:ci-remainder`, runs every other command from `bun run check`,
 in its original order. All jobs retain the same pinned dependencies, complete
 governed Git history and Linux native verification. Source jobs have a finite
-75-minute job limit; the remainder and browser jobs retain their 20-minute
-limits. Every test retains its own deadline. The larger source allowance
-accommodates measured serial suite duration, not retries or skipped failures.
+75-minute job limit. The macOS remainder has 25 minutes; the Ubuntu remainder
+and browser jobs retain 20 minutes. The macOS allowance includes setup and
+post-job cleanup after an observed successful 19-minute, 36-second gate that
+reached the former job limit during cleanup. Every test retains its own
+deadline. These finite job allowances cover measured work, without retries
+or skipped failures.
 The `Required` check succeeds only when all fourteen jobs and the separate
 compiled app/site browser job succeed.
 

@@ -1,6 +1,7 @@
 //! Scripts-only direct-child ownership fixture. This is not a sandbox or a
 //! descendant-container, and is not connected to the production daemon.
 //! stdin is OOC1 control; stdout is OOC1 status. The target inherits neither.
+//! Explicit stdio-v1 transport receives target stdin/out/err on separate FDs 3/4/5.
 const std = @import("std");
 const builtin = @import("builtin");
 const c = @cImport({
@@ -12,6 +13,7 @@ const c = @cImport({
     @cInclude("errno.h");
     @cInclude("dirent.h");
     @cInclude("sys/wait.h");
+    @cInclude("sys/stat.h");
 });
 
 comptime {
@@ -66,6 +68,7 @@ const Config = struct {
     shutdown_ms: u32,
     target: [*:0]const u8,
     target_argv: [*:null]const ?[*:0]const u8,
+    transport: bool,
 };
 
 fn closeInherited() bool {
@@ -116,30 +119,57 @@ fn closeInherited() bool {
 }
 
 fn parseConfig(args: []const [*:0]const u8) ?Config {
-    if (args.len < 13 or args.len > 77) return null;
+    const transport = args.len > 1 and std.mem.eql(u8, std.mem.span(args[1]), "--transport=stdio-v1");
+    const offset: usize = if (transport) 1 else 0;
+    if (args.len < 13 + offset or args.len > 77 + offset) return null;
     const names = [_][]const u8{ "--nonce", "--generation", "--startup-ms", "--run-ms", "--shutdown-ms" };
     for (names, 0..) |name, index| {
-        if (!std.mem.eql(u8, std.mem.span(args[index * 2 + 1]), name)) return null;
+        if (!std.mem.eql(u8, std.mem.span(args[index * 2 + 1 + offset]), name)) return null;
     }
-    if (!std.mem.eql(u8, std.mem.span(args[11]), "--")) return null;
-    const nonce = std.mem.span(args[2]);
+    if (!std.mem.eql(u8, std.mem.span(args[11 + offset]), "--")) return null;
+    const nonce = std.mem.span(args[2 + offset]);
     if (!nonceValid(nonce)) return null;
-    const target = std.mem.span(args[12]);
+    const target = std.mem.span(args[12 + offset]);
     if (target.len == 0 or target.len > 4096 or target[0] != '/') return null;
-    for (args[12..]) |argument| if (std.mem.span(argument).len > 16384) return null;
+    for (args[12 + offset ..]) |argument| if (std.mem.span(argument).len > 16384) return null;
     return .{
         .nonce = nonce,
-        .generation = number(std.mem.span(args[4]), 2147483647) orelse return null,
-        .startup_ms = number(std.mem.span(args[6]), 30000) orelse return null,
-        .run_ms = number(std.mem.span(args[8]), 86400000) orelse return null,
-        .shutdown_ms = number(std.mem.span(args[10]), 30000) orelse return null,
-        .target = args[12],
-        .target_argv = @ptrCast(args.ptr + 12),
+        .generation = number(std.mem.span(args[4 + offset]), 2147483647) orelse return null,
+        .startup_ms = number(std.mem.span(args[6 + offset]), 30000) orelse return null,
+        .run_ms = number(std.mem.span(args[8 + offset]), 86400000) orelse return null,
+        .shutdown_ms = number(std.mem.span(args[10 + offset]), 30000) orelse return null,
+        .target = args[12 + offset],
+        .target_argv = @ptrCast(args.ptr + 12 + offset),
+        .transport = transport,
     };
+}
+
+fn validateTransport() bool {
+    var identities: [6]c.struct_stat = undefined;
+    for (0..6) |index| {
+        const fd: c_int = @intCast(index);
+        if (c.fstat(fd, &identities[index]) != 0) return false;
+        if (index < 3) continue;
+        const kind = identities[index].st_mode & c.S_IFMT;
+        if (kind != c.S_IFIFO and kind != c.S_IFSOCK) return false;
+        // Reused controller or target endpoints would merge channel authority.
+        for (identities[0..index]) |previous| {
+            if (previous.st_dev == identities[index].st_dev and previous.st_ino == identities[index].st_ino) return false;
+        }
+        const flags = c.fcntl(fd, c.F_GETFL);
+        if (flags < 0 or (index == 3 and (flags & c.O_ACCMODE) == c.O_WRONLY) or
+            (index != 3 and (flags & c.O_ACCMODE) == c.O_RDONLY)) return false;
+        if (c.fcntl(fd, c.F_SETFL, @as(c_int, flags & ~@as(c_int, c.O_NONBLOCK))) < 0) return false;
+    }
+    return true;
 }
 
 fn childMain(config: Config, gate_read: c_int, gate_write: c_int) noreturn {
     _ = c.close(gate_write);
+    // Copy transport endpoints before fd 3 becomes the private execution gate.
+    if (config.transport) {
+        for (0..3) |index| if (c.dup2(@intCast(index + 3), @intCast(index)) < 0) c._exit(125);
+    }
     // Preserve only one gate descriptor. No inherited controller channel or
     // incidental parent descriptor can survive into the target.
     if (gate_read != 3) {
@@ -147,10 +177,12 @@ fn childMain(config: Config, gate_read: c_int, gate_write: c_int) noreturn {
         _ = c.close(gate_read);
     }
     if (!closeInherited()) c._exit(125);
-    const null_fd = c.open("/dev/null", c.O_RDWR);
-    if (null_fd < 0) c._exit(125);
-    for (0..3) |index| if (c.dup2(null_fd, @intCast(index)) < 0) c._exit(125);
-    if (null_fd > 3) _ = c.close(null_fd);
+    if (!config.transport) {
+        const null_fd = c.open("/dev/null", c.O_RDWR);
+        if (null_fd < 0) c._exit(125);
+        for (0..3) |index| if (c.dup2(null_fd, @intCast(index)) < 0) c._exit(125);
+        if (null_fd > 3) _ = c.close(null_fd);
+    }
     if (!setSignal(c.SIGTERM, null) or !setSignal(c.SIGINT, null) or !setSignal(c.SIGPIPE, null)) c._exit(125);
     var byte: u8 = 0;
     const count = c.read(3, &byte, 1);
@@ -174,6 +206,11 @@ fn supervise(config: Config) u8 {
     }
     const child_pid = c.fork();
     if (child_pid == 0) childMain(config, gate[0], gate[1]);
+    // Only the direct child owns target endpoints; the helper must not hold
+    // provider EOF open after that child closes them or exits.
+    if (config.transport) {
+        for (3..6) |index| { _ = c.close(@intCast(index)); }
+    }
     _ = c.close(gate[0]);
     if (child_pid < 1) {
         _ = c.close(gate[1]);
@@ -305,6 +342,7 @@ fn supervise(config: Config) u8 {
 
 pub fn main(init: std.process.Init.Minimal) void {
     const config = parseConfig(init.args.vector) orelse c._exit(64);
+    if (config.transport and !validateTransport()) c._exit(70);
     if (!setSignal(c.SIGPIPE, ignoreSignal) or !setSignal(c.SIGTERM, onSignal) or !setSignal(c.SIGINT, onSignal)) c._exit(70);
     for (0..2) |index| {
         const fd: c_int = @intCast(index);

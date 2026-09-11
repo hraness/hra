@@ -1,12 +1,14 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import * as fs from "node:fs";
 import {
   chmodSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -19,6 +21,7 @@ import {
   appSourceProofRuntimeInjectionEnvironmentNames,
   assertHardenedAppSourceProofStageZero,
   assertHostedOperatorSource,
+  captureHostedOperatorSource,
   commandCapacityChildEnvironment,
   createAppSourceProofScratchDirectory,
   executeAppSourceProofLauncher,
@@ -96,6 +99,10 @@ const launcherFixture = (overrides: Readonly<{
   cleanupLeavesRegistered?: boolean;
   hiddenIndex?: boolean;
   installFails?: boolean;
+  buildFails?: boolean;
+  buildSignal?: NodeJS.Signals;
+  buildThrows?: boolean;
+  sourceChangesDuringBuild?: boolean;
   mainAdvancesAfterFirstRead?: boolean;
   maskedOrigin?: boolean;
   remoteMain?: string;
@@ -182,11 +189,17 @@ const launcherFixture = (overrides: Readonly<{
       }
       return result("", overrides.installFails === true ? 1 : 0);
     }
+    if (key.endsWith("/scripts/build-app.ts")) {
+      events.push(`build-environment:${JSON.stringify(options.environment ?? {})}`);
+      if (overrides.sourceChangesDuringBuild === true) writeFileSync(join(root, "package.json"), `${trackedDocument} `);
+      if (overrides.buildThrows === true) throw new Error("fixture_build_exception");
+      return { ...result("", overrides.buildFails === true ? 1 : 0), signal: overrides.buildSignal ?? null };
+    }
     if (key.includes("/scripts/verify-app-source.ts\0")) {
       return result(
         overrides.childExitCode === 1
           ? ""
-          : '{"kind":"hra-app-source-proof","schemaVersion":3}\n',
+          : '{"kind":"hra-app-source-proof","schemaVersion":4}\n',
         overrides.childExitCode ?? 0,
       );
     }
@@ -294,9 +307,9 @@ const realRepositoryLauncherFixture = (
       return result(`${commit}\trefs/heads/main\n`);
     }
     if (command[0] === "/trusted/bun") {
-      if (command[3] === "install") return result();
+      if (command[3] === "install" || command[3]?.endsWith("/scripts/build-app.ts") === true) return result();
       if (command[3]?.endsWith("/scripts/verify-app-source.ts") === true) {
-        return result('{"kind":"hra-app-source-proof","schemaVersion":3}\n');
+        return result('{"kind":"hra-app-source-proof","schemaVersion":4}\n');
       }
     }
     const executable = command[0];
@@ -700,7 +713,7 @@ describe("Oompa browser app source proof launcher", () => {
         stdout: stdout.writer,
       })).toBe(0);
       expect(stderr.lines).toEqual([]);
-      expect(stdout.lines.join("")).toContain('"schemaVersion":3');
+      expect(stdout.lines.join("")).toContain('"schemaVersion":4');
       expect(fixture.events.some((event) => event.startsWith("credential:opened:"))).toBe(true);
       expect(fixture.events.some((event) => event.includes("\0ls-tree\0-r\0-z\0--full-tree")))
         .toBe(true);
@@ -747,6 +760,75 @@ describe("Oompa browser app source proof launcher", () => {
       fixture.git(["remote", "set-url", "origin", "https://untrusted.invalid/oompa.git"]);
       expect(() => assertHostedOperatorSource(expected)).toThrow("verifier_source_invalid");
       expect(fixture.events).toEqual([]);
+    } finally { fixture.cleanup(); }
+  });
+
+  test("captured source retains exact private content without claiming later Git state", () => {
+    const fixture = realRepositoryLauncherFixture({ "payload.txt": "canonical\n" });
+    try {
+      const commit = fixture.git(["rev-parse", "--verify", "HEAD^{commit}"]).trim();
+      const source = captureHostedOperatorSource({ repositoryRoot: fixture.root, sourceCommit: commit });
+      expect(Object.keys(source).sort()).toEqual(["assertCapturedContentCurrent", "sourceCommit", "sourceTree"]);
+      expect(Object.isFrozen(source)).toBe(true);
+      expect(source.sourceCommit).toBe(commit);
+      expect(source.sourceTree).toBe(fixture.git(["rev-parse", "--verify", "HEAD^{tree}"]).trim());
+      fixture.git(["remote", "set-url", "origin", "https://untrusted.invalid/oompa.git"]);
+      fixture.git(["update-index", "--assume-unchanged", "payload.txt"]);
+      writeFileSync(join(fixture.root, "untracked.txt"), "later unrelated file\n");
+      expect(() => source.assertCapturedContentCurrent()).not.toThrow();
+      expect(() => captureHostedOperatorSource({ repositoryRoot: fixture.root, sourceCommit: commit })).toThrow("verifier_source_invalid");
+      writeFileSync(join(fixture.root, "payload.txt"), "changed!!\n");
+      expect(() => source.assertCapturedContentCurrent()).toThrow("verifier_source_invalid");
+    } finally { fixture.cleanup(); }
+  });
+
+  test("captured source refuses root replacement and executable-mode drift", () => {
+    const fixture = realRepositoryLauncherFixture({ "payload.txt": "canonical\n" });
+    const moved = `${fixture.root}-retained`;
+    try {
+      const source = captureHostedOperatorSource({ repositoryRoot: fixture.root,
+        sourceCommit: fixture.git(["rev-parse", "--verify", "HEAD^{commit}"]).trim() });
+      chmodSync(join(fixture.root, "payload.txt"), 0o755);
+      expect(() => source.assertCapturedContentCurrent()).toThrow("verifier_source_invalid");
+      chmodSync(join(fixture.root, "payload.txt"), 0o644);
+      renameSync(fixture.root, moved);
+      mkdirSync(fixture.root, { mode: 0o700 });
+      writeFileSync(join(fixture.root, "payload.txt"), "canonical\n");
+      expect(() => source.assertCapturedContentCurrent()).toThrow("verifier_source_invalid");
+    } finally { fixture.cleanup(); rmSync(moved, { recursive: true, force: true }); }
+  });
+
+  test("captured source checks the named file after descriptor hashing", () => {
+    const fixture = realRepositoryLauncherFixture({ "payload.txt": "canonical\n" });
+    try {
+      const source = captureHostedOperatorSource({ repositoryRoot: fixture.root,
+        sourceCommit: fixture.git(["rev-parse", "--verify", "HEAD^{commit}"]).trim() });
+      const original = fs.fstatSync;
+      let reads = 0;
+      function observedStat(descriptor: number, options?: fs.StatOptions & { bigint?: false | undefined }): fs.Stats;
+      function observedStat(descriptor: number, options: fs.StatOptions & { bigint: true }): fs.BigIntStats;
+      function observedStat(descriptor: number, options?: fs.StatOptions): fs.Stats | fs.BigIntStats;
+      function observedStat(descriptor: number, options?: fs.StatOptions): fs.Stats | fs.BigIntStats {
+        const value = original(descriptor, options);
+        if (++reads === 2) {
+          renameSync(join(fixture.root, "payload.txt"), join(fixture.root, "retained.txt"));
+          writeFileSync(join(fixture.root, "payload.txt"), "canonical\n", { mode: 0o644 });
+        }
+        return value;
+      }
+      const observe = spyOn(fs, "fstatSync").mockImplementation(observedStat);
+      try { expect(() => source.assertCapturedContentCurrent()).toThrow("verifier_source_invalid"); }
+      finally { observe.mockRestore(); }
+      expect(reads).toBe(2);
+    } finally { fixture.cleanup(); }
+  });
+
+  test("capture rejects oversized tracked content before reading its bytes", () => {
+    const fixture = realRepositoryLauncherFixture({ "oversized.txt": "x".repeat(8 * 1024 * 1024 + 1) });
+    try {
+      const expected = { repositoryRoot: fixture.root,
+        sourceCommit: fixture.git(["rev-parse", "--verify", "HEAD^{commit}"]).trim() };
+      expect(() => captureHostedOperatorSource(expected)).toThrow("verifier_source_invalid");
     } finally { fixture.cleanup(); }
   });
 
@@ -819,7 +901,7 @@ describe("Oompa browser app source proof launcher", () => {
       });
       expect(code).toBe(0);
       expect(stderr.lines).toEqual([]);
-      expect(stdout.lines.join("")).toContain('"schemaVersion":3');
+      expect(stdout.lines.join("")).toContain('"schemaVersion":4');
       const opened = fixture.events.findIndex((event) => event.startsWith("credential:opened:"));
       const installed = fixture.events.findIndex((event) => event.includes("\0install\0--frozen-lockfile"));
       const mainReads = fixture.events
@@ -827,7 +909,7 @@ describe("Oompa browser app source proof launcher", () => {
         .filter((index) => index >= 0);
       const child = fixture.events.findIndex((event) => event.includes("/scripts/verify-app-source.ts\0"));
       expect(installed).toBeGreaterThan(-1);
-      expect(mainReads).toHaveLength(4);
+      expect(mainReads).toHaveLength(6);
       expect(mainReads.every((index) => fixture.events[index]?.startsWith("command:/:")))
         .toBe(true);
       expect(fixture.events
@@ -837,7 +919,7 @@ describe("Oompa browser app source proof launcher", () => {
       const runtimeCommands = fixture.events.filter((event) =>
         event.includes(":/trusted/bun\0")
       );
-      expect(runtimeCommands).toHaveLength(2);
+      expect(runtimeCommands).toHaveLength(3);
       expect(runtimeCommands.every((event) => event.includes(
         ":/trusted/bun\0--no-env-file\0--config=/dev/null\0",
       ))).toBe(true);
@@ -896,6 +978,33 @@ describe("Oompa browser app source proof launcher", () => {
       expect(fixture.events.some((event) => event.includes("\0worktree\0remove\0--force"))).toBe(true);
     } finally {
       fixture.cleanup();
+    }
+  });
+
+  test("joins the fixed credential-free production build before opening auth and refuses build/source failure", () => {
+    for (const options of [{}, { buildFails: true }, { sourceChangesDuringBuild: true }, { buildSignal: "SIGTERM" as const }, { buildThrows: true }]) {
+      const fixture = launcherFixture(options);
+      const stdout = output();
+      const stderr = output();
+      try {
+        const code = executeAppSourceProofLauncher(proveArguments, { ...fixture.dependencies, stdout: stdout.writer, stderr: stderr.writer });
+        const built = fixture.events.findIndex((event) => event.endsWith("/scripts/build-app.ts:none"));
+        expect(built).toBeGreaterThan(-1);
+        const environment = fixture.events.find((event) => event.startsWith("build-environment:"));
+        expect(environment).toBe(`build-environment:${JSON.stringify({ ...appSourceProofChildEnvironment(), OOMPA_RELEASE_COMMIT: sourceCommit })}`);
+        if (Object.keys(options).length === 0) {
+          expect(code).toBe(0);
+          expect(fixture.events.findIndex((event) => event.startsWith("credential:opened:"))).toBeGreaterThan(built);
+        } else {
+          expect(code).toBe(1);
+          expect(fixture.events.some((event) => event.startsWith("credential:opened:"))).toBe(false);
+          expect(fixture.events.some((event) => event.includes("\0worktree\0remove\0"))).toBe(false);
+          expect(fixture.events.some((event) => event.startsWith("scratch:removed:"))).toBe(false);
+          const failure: unknown = JSON.parse(stderr.lines.join(""));
+          expect(failure).toMatchObject({ retainedBuild: { directory: expect.stringContaining("hra-app-source-verifier-"), locatorOnly: true } });
+          expect(Buffer.byteLength(stderr.lines.join(""))).toBeLessThan(1024);
+        }
+      } finally { fixture.cleanup(); }
     }
   });
 
@@ -999,6 +1108,7 @@ describe("Oompa browser app source proof launcher", () => {
       expect(code).toBe(0);
       expect(fixture.events.some((event) => event.startsWith("credential:"))).toBe(false);
       expect(fixture.events.some((event) => event.includes("\0--verify-retained\0"))).toBe(true);
+      expect(fixture.events.some((event) => event.includes("/scripts/build-app.ts"))).toBe(false);
     } finally {
       fixture.cleanup();
     }

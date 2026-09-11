@@ -5,16 +5,17 @@ import { chmod, link, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, sym
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { acquireClaudeLiveAcceptanceOwner, type ClaudeLiveAcceptanceOwner } from "./claude-live-acceptance-owner";
+import { acquireClaudeLiveAcceptanceOwner, acquireClaudeMacosAuthQualificationOwner, type ClaudeLiveAcceptanceOwner } from "./claude-live-acceptance-owner";
 
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const operation of cleanup.splice(0).reverse()) await operation(); });
 
-const fixture = async () => {
+const fixture = async (macosAuth = false) => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-claude-owner-")));
   const runId = randomUUID();
-  const receiptPath = join(root, `.oompa-live-claude-acceptance-${runId}.recovery.json`);
-  const lockPath = join(root, `.oompa-live-claude-acceptance-${runId}.lock`);
+  const prefix = macosAuth ? ".oompa-macos-auth-qualification" : ".oompa-live-claude-acceptance";
+  const receiptPath = join(root, `${prefix}-${runId}.recovery.json`);
+  const lockPath = join(root, `${prefix}-${runId}.lock`);
   const owners: ClaudeLiveAcceptanceOwner[] = [];
   cleanup.push(async () => {
     for (const owner of owners) await owner.releasePreserving().catch(() => undefined);
@@ -22,14 +23,16 @@ const fixture = async () => {
   });
   const input = { runId, receiptPath };
   return { root, input, lockPath, acquire: async () => {
-    const owner = await acquireClaudeLiveAcceptanceOwner(input); owners.push(owner); return owner;
+    const owner = await (macosAuth ? acquireClaudeMacosAuthQualificationOwner : acquireClaudeLiveAcceptanceOwner)(input);
+    owners.push(owner); return owner;
   } };
 };
 
-const childAttempt = (input: Readonly<{ runId: string; receiptPath: string }>): string => {
+const childAttempt = (input: Readonly<{ runId: string; receiptPath: string }>, macosAuth = false): string => {
   const modulePath = new URL("./claude-live-acceptance-owner.ts", import.meta.url).href;
-  const program = `import {acquireClaudeLiveAcceptanceOwner} from ${JSON.stringify(modulePath)};
-try { const owner=await acquireClaudeLiveAcceptanceOwner(${JSON.stringify(input)});
+  const factory = macosAuth ? "acquireClaudeMacosAuthQualificationOwner" : "acquireClaudeLiveAcceptanceOwner";
+  const program = `import {${factory} as acquire} from ${JSON.stringify(modulePath)};
+try { const owner=await acquire(${JSON.stringify(input)});
 await owner.releasePreserving(); process.stdout.write("acquired"); }
 catch(error) { if(error?.code!=="concurrent_owner") process.exit(2); process.stdout.write("refused"); }`;
   const child = spawnSync(process.execPath, ["--eval", program], { encoding: "utf8", maxBuffer: 1024, timeout: 5000 });
@@ -41,6 +44,29 @@ catch(error) { if(error?.code!=="concurrent_owner") process.exit(2); process.std
 };
 
 describe("exact Claude acceptance invocation owner", () => {
+  test("the Mac auth family preserves native exclusion and cannot acquire a session receipt", async () => {
+    const f = await fixture(true);
+    if (process.platform !== "darwin") {
+      await expect(f.acquire()).rejects.toMatchObject({ code: "primitive_unavailable" });
+      await expect(lstat(f.lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+      return;
+    }
+    await expect(acquireClaudeLiveAcceptanceOwner(f.input)).rejects.toMatchObject({ code: "scope_refused" });
+    await expect(acquireClaudeMacosAuthQualificationOwner({
+      ...f.input, receiptPath: join(f.root, `.oompa-live-claude-acceptance-${f.input.runId}.recovery.json`),
+    })).rejects.toMatchObject({ code: "scope_refused" });
+    const owner = await f.acquire();
+    owner.assertCurrent();
+    const before = await lstat(f.lockPath);
+    expect(childAttempt(f.input, true)).toBe("refused");
+    await owner.releasePreserving();
+    expect(childAttempt(f.input, true)).toBe("acquired");
+    expect((await lstat(f.lockPath)).ino).toBe(before.ino);
+    const recovered = await f.acquire();
+    await recovered.removeAndRelease();
+    await expect(lstat(f.lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   test("holds native ownership across processes, preserves the name, and permits recovery reacquisition", async () => {
     const f = await fixture();
     const owner = await f.acquire();
