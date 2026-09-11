@@ -705,7 +705,12 @@ type CapturedBrowserBody = Promise<{ bytes: Buffer } | { error: unknown }>;
 
 /** Keep resource ownership inside one document's inspection and body settlement. */
 export async function withBrowserResourceCapture(
-  page: Pick<Page, "on" | "off">,
+  page: {
+    on(event: "response", listener: (response: BrowserResponse) => void): unknown;
+    on(event: "request", listener: (request: BrowserRequest) => void): unknown;
+    off(event: "response", listener: (response: BrowserResponse) => void): unknown;
+    off(event: "request", listener: (request: BrowserRequest) => void): unknown;
+  },
   captureResponse: (response: BrowserResponse) => void,
   captureRequest: (request: BrowserRequest) => void,
   inspectDocument: () => Promise<void>,
