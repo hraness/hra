@@ -1,5 +1,6 @@
 # Contents
 
+- `owned-controller/` contains an experimental direct-child protocol, a macOS native helper and credential-free process fixtures. It is separate from the Linux authority supervisor and is not connected to the production daemon or package.
 - `check-effect-architecture.ts` and its paired fixtures constrain the reviewed Effect programs; `check-codex-effect-architecture.ts` owns the Codex module-role policy.
 - `build-appearance.ts` produces the external, browser-only palette bootstrap reused by app and static-site builds; shared palette rules enter their completed StyleX unions.
 - Build scripts compile the CLI, generate the static website, and finalize the browser app's complete StyleX graph.
