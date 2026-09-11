@@ -1,13 +1,44 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runInNewContext } from "node:vm";
-import { assertAppColorScheme, assertDefaultButtonPresentation, assertDefaultPalette, assertKeyboardFocusStrip, assertNativeModalFocus, assertProductPreviewObservation, assetContentType, assetPath, boundedBrowserOperation, browserExecutableSha256, browserFailureDetails, captureBrowserResponseBody, installBrowserServiceWorkerRefusal, inventory, loadedStylesheetControl, productionCsp, settleBrowserResponseBodies, siteFoundationFontPaths, siteProductionCsp, siteStylesheetPaths, snapshotProductPreview, snapshotStaticSite, waitForClosedProductPreview } from "./app-browser";
+import { assertAppColorScheme, assertDefaultButtonPresentation, assertDefaultPalette, assertKeyboardFocusStrip, assertNativeModalFocus, assertProductPreviewObservation, assetContentType, assetPath, boundedBrowserOperation, browserExecutableSha256, browserFailureDetails, captureBrowserResponseBody, installBrowserServiceWorkerRefusal, inventory, loadedStylesheetControl, productionCsp, settleBrowserResponseBodies, siteFoundationFontPaths, siteProductionCsp, siteStylesheetPaths, snapshotProductPreview, snapshotStaticSite, waitForClosedProductPreview, withBrowserResourceCapture } from "./app-browser";
 import { browserIoModules } from "../app/fixtures/browser/config";
 
 describe("browser response lifetime", () => {
+  test("keeps duplicate responses inside one census and detaches before a subsequent document", async () => {
+    const page = new EventEmitter();
+    let requests = 0, responses = 0, unrelatedResponses = 0;
+    page.on("response", () => { unrelatedResponses += 1; });
+    const collected = Promise.withResolvers<undefined>();
+    const census = withBrowserResourceCapture(page, () => { responses += 1; }, () => { requests += 1; }, async () => {
+      page.emit("request"); page.emit("response"); page.emit("response");
+      await collected.promise;
+      expect(responses).toBe(2);
+    });
+    await Promise.resolve();
+    expect(page.listenerCount("request")).toBe(1);
+    collected.resolve(undefined);
+    await census;
+    page.emit("request"); page.emit("response");
+    expect({ requests, responses, unrelatedResponses }).toEqual({ requests: 1, responses: 2, unrelatedResponses: 3 });
+    expect(page.listenerCount("request")).toBe(0);
+    expect(page.listenerCount("response")).toBe(1);
+  });
+
+  test("detaches a failed document census before propagating its exact error", async () => {
+    const page = new EventEmitter();
+    const failure = new Error("Document resource mismatch");
+    await expect(withBrowserResourceCapture(page, () => undefined, () => undefined, async () => {
+      throw failure;
+    })).rejects.toBe(failure);
+    expect(page.listenerCount("request")).toBe(0);
+    expect(page.listenerCount("response")).toBe(0);
+  });
+
   test("captures immediately and settles bytes before the caller can discard a document", async () => {
     const received = Promise.withResolvers<Buffer>();
     const events: string[] = [];

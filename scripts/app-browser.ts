@@ -703,6 +703,19 @@ export async function waitForClosedProductPreview(dialog: Pick<Locator, "waitFor
 
 type CapturedBrowserBody = Promise<{ bytes: Buffer } | { error: unknown }>;
 
+/** Keep resource ownership inside one document's inspection and body settlement. */
+export async function withBrowserResourceCapture(
+  page: Pick<Page, "on" | "off">,
+  captureResponse: (response: BrowserResponse) => void,
+  captureRequest: (request: BrowserRequest) => void,
+  inspectDocument: () => Promise<void>,
+): Promise<void> {
+  page.on("response", captureResponse);
+  page.on("request", captureRequest);
+  try { await inspectDocument(); }
+  finally { page.off("response", captureResponse); page.off("request", captureRequest); }
+}
+
 /** Start native reads at response delivery and observe rejections immediately.
  * A renderer's ready signal does not mean its protocol body read has settled. */
 export function captureBrowserResponseBody(response: Pick<BrowserResponse, "body">): CapturedBrowserBody {
@@ -1774,10 +1787,8 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
             if (productRequests.length < 256) productRequests.push(request);
             else responseOverflow = true;
           };
-          page.on("response", capture);
-          page.on("request", captureProduct);
           const settleResources = () => settleBrowserResponseBodies([...responses, ...productResponses].map(({ body }) => body));
-          try {
+          await withBrowserResourceCapture(page, capture, captureProduct, async () => {
             mark(`static-site:${routeLabel}:navigation`);
             const response = await page.goto(`${site.origin}${route.pathname}`);
             assert.ok(response !== null);
@@ -1850,11 +1861,6 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
                 await page.waitForFunction(() => document.querySelector("figure[data-product-preview] [data-preview-status]")?.textContent === "");
               }
             }
-            if (profile.name === "desktop" && route.pathname === "/docs/reference/") {
-              mark("static-site:docs-reference:appearance-menu");
-              await verifyGuideAppearance(page, profile.colorScheme ?? "dark");
-              evidence.push({ name: "desktop:docs-reference:appearance-menu", values: "light, dark restoration, Escape, and focus passed" });
-            }
             assert.equal(responseOverflow, false, "Static resource census exceeded its bound");
             mark(`static-site:${routeLabel}:resource-bytes`);
             await settleResources();
@@ -1899,7 +1905,14 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
             }));
             evidence.push({ name: `${profile.name}:static-site:${route.path}:product-resources`, values: { requests: productRequests.length, delivered: productDelivered } });
             evidence.push({ name: `${profile.name}:static-site:${route.path}`, values: { documentSha256: digest(documentBytes), fonts, delivered: delivered.sort((a, b) => a.path.localeCompare(b.path)) } });
-          } finally { page.off("response", capture); page.off("request", captureProduct); }
+          });
+          if (profile.name === "desktop" && route.pathname === "/docs/reference/") {
+            // Persistence reloads the guide. Finish the exact per-document resource
+            // census first so the second document cannot masquerade as duplicates.
+            mark("static-site:docs-reference:appearance-menu");
+            await verifyGuideAppearance(page, profile.colorScheme ?? "dark");
+            evidence.push({ name: "desktop:docs-reference:appearance-menu", values: "light, dark, saved palette reload, System restoration, Escape, and focus passed" });
+          }
         }
         if (profile.name === "desktop") {
           mark("static-site:docs:search");
