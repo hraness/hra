@@ -2,6 +2,10 @@ import * as stylex from "@stylexjs/stylex";
 
 const marketingStyles = stylex.create({
   productHero: {
+    position: "relative",
+    isolation: "isolate",
+    overflowX: "clip",
+    overflowY: "clip",
     paddingTop: { default: null, ":is(header)": "clamp(2rem, 4vw, 3.5rem)" },
     paddingBottom: { default: null, ":is(header)": "2rem" },
     gap: { default: null, ":is(header)": "clamp(1.5rem, 3vw, 2.5rem)" },

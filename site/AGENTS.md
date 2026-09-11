@@ -6,6 +6,7 @@
 - `marketing.tsx` composes public design-kit server components; `render.ts` is the captured build-time entry for all nine HTML routes.
 - `product-preview.tsx` renders inert real-UI frames and their accessible parent controls. `product-scenes.ts` is their closed public scene catalog; Direct itself stays in the separately built fixture app.
 - `site-entry.ts` progressively enhances scene selection, enlargement, local guide search, and moved reference fragments without authentication or persistence.
+- `wonka-artifact.tsx` and the `wonka-*` recipes add the homepage's decorative hat and story seals. The bounded WebGL renderer progressively replaces the static print and stops rendering at rest.
 - `appearance-menu.tsx` reexports the pure native header menu owned alongside its static recipe in `app/src/components/appearance-menu*`. The shared app appearance bootstrap drives it; the preview remains a fixed, inert Catppuccin dark surface.
 - `presentation.stylex.ts` and `marketing.stylex.ts` own local component recipes. `foundation.ts` is the build-only CSS entry; `foundation.css` joins approved document foundations and public fonts, without importing legacy component styles. The empty entry chunk stays private.
 - `analytics-site.ts` defines the exact production host, route taxonomy, and event vocabulary.
