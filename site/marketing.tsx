@@ -62,10 +62,9 @@ export function renderMarketingPage(content: PublicContent): string {
           { ...content.hero.primaryAction, emphasis: "primary" },
           { ...content.hero.secondaryAction, emphasis: "secondary" },
         ]}
-        align="center"
+        align="start"
         boundary={content.hero.boundary}
         className={productHeroClassName()}
-        eyebrow={content.hero.eyebrow}
         frame={<ProductPreview />}
         heading={content.hero.heading}
         headingId="oompa-title"

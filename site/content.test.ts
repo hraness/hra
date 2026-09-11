@@ -1376,8 +1376,8 @@ describe("public content contract", () => {
       const document = parseHTML(renderDocsHtml(page)).document;
       expect(document.querySelector('link[rel="canonical"]')?.getAttribute("href")).toBe(`https://oompa.dev${page.path}`);
       expect([...document.querySelectorAll("script[src]")].map((script) => script.getAttribute("src"))).toEqual(["/appearance.js", "/analytics.js", "/site.js"]);
-      expect(document.documentElement.getAttribute("data-palette")).toBe("catppuccin");
-      expect(document.documentElement.getAttribute("data-theme")).toBe("dark");
+      expect(document.documentElement.getAttribute("data-palette")).toBe("paper");
+      expect(document.documentElement.getAttribute("data-theme")).toBe("light");
       expect(document.querySelectorAll("details[data-oompa-appearance]")).toHaveLength(1);
       expect(document.querySelectorAll('script[type="application/ld+json"]')).toHaveLength(1);
     }

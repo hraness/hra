@@ -22,6 +22,14 @@ The pinned `@vercel/routing-utils` 6.4.0 compiler reproduces the two configurati
 
 Acceptance requires causal routing regressions, exact header-value and browser-policy contracts, independent full-diff review, fresh current-base Required CI and actual-main admission, then a new guarded source-to-target alias plan and independent live headers, content and browser verification. The already committed alias plan remains terminal; this follow-up does not authorize replay, ledger edits, release republication, or daemon, hosted or new-model activation.
 
+## Shared Paper appearance (2026-09-10)
+
+The marketing site adopts the AICharts-derived Paper theme from the shared design kit: warm neutral surfaces, blue actions, compact Nebula Sans headings, and a wider reading frame. The app uses the same semantic palette and retains its sealed, font-free artifact contract. New visits start with Paper and System appearance. Existing bounded palette/mode preferences retain their storage key and win over the new default; the other named palettes remain available. Inert examples retain their fixed Catppuccin dark appearance and cannot read preferences.
+
+The theme arrives through the existing compiled design-kit and UI boundaries. Oompa imports the opt-in, dependency-free Paper foundation alongside compiler palettes, without standalone component recipes, runtime styles, network assets, or a new package boundary. The public homepage retains its product content, fictional examples, command-line social card, and runtime admission limits.
+
+Status: implementation and focused preference, static-shell, and browser-oracle contracts are present. The final dependency pin, independent review, required compiled browser acceptance, current-base Required CI, and canonical website/app verification remain delivery gates. This theme change does not authorize a daemon upgrade or hosted command-writer activation.
+
 ## Web appearance (2026-09-08)
 
 Status: the native app/site menu integration is implemented. Focused validation passed 44 tests with 728 assertions, changed-file lint, and diff checks. The final aggregate, mandatory browser checks, current-head CI, and production verification remain pending.
