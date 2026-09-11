@@ -88,9 +88,16 @@ type CommandCapacityArguments = Readonly<{
   sourceCommit: string;
 }>;
 
+type QuotaUpgradeArguments = Readonly<{
+  mode: "quota-upgrade";
+  operatorArguments: readonly string[];
+  sourceCommit: string;
+}>;
+
 export type HostedProtectedLauncherArguments =
   | AppSourceProofLauncherArguments
-  | CommandCapacityArguments;
+  | CommandCapacityArguments
+  | QuotaUpgradeArguments;
 
 type CommandResult = Readonly<{
   exitCode: number;
@@ -190,7 +197,7 @@ export const parseAppSourceProofLauncherArguments = (
   arguments_: readonly string[],
 ): HostedProtectedLauncherArguments => {
   const [mode, ...rest] = arguments_;
-  if (mode === "command-capacity") {
+  if (mode === "command-capacity" || mode === "quota-upgrade") {
     const sourceIndexes = rest
       .map((argument, index) => argument === "--source-commit" ? index : -1)
       .filter((index) => index >= 0);
@@ -581,6 +588,23 @@ const assertExactSource = (
   }
 };
 
+/** Recheck the operator's exact local source without network, installation or credentials. */
+export const assertHostedOperatorSource = (
+  { repositoryRoot, sourceCommit }: Readonly<{ repositoryRoot: string; sourceCommit: string }>,
+): void => {
+  try {
+    if (
+      !isNormalizedAbsolutePath(repositoryRoot)
+      || realpathSync(repositoryRoot) !== repositoryRoot
+      || !sourceCommitPattern.test(sourceCommit)
+    ) fail("verifier_source_invalid");
+    assertExactSource(repositoryRoot, sourceCommit, defaultRunCommand, false);
+  } catch (error: unknown) {
+    if (error instanceof AppSourceProofLauncherError) throw error;
+    fail("verifier_source_invalid");
+  }
+};
+
 const assertScratchDirectory = (directory: string): ScratchDirectoryIdentity => {
   const temporaryRoot = trustedScratchRoot();
   const metadata = lstatSync(directory);
@@ -690,7 +714,8 @@ export const executeAppSourceProofLauncher = (
     if (!isNormalizedAbsolutePath(rootInput) || realpathSync(rootInput) !== rootInput) {
       fail("verifier_source_invalid");
     }
-    const requireRemoteMain = expected.mode !== "command-capacity";
+    const hostedOperator = expected.mode === "command-capacity" || expected.mode === "quota-upgrade";
+    const requireRemoteMain = !hostedOperator;
     assertExactSource(rootInput, expected.sourceCommit, runCommand, requireRemoteMain);
 
     const createdScratch = (
@@ -735,12 +760,14 @@ export const executeAppSourceProofLauncher = (
     assertExactSource(rootInput, expected.sourceCommit, runCommand, requireRemoteMain);
     assertExactSource(worktree, expected.sourceCommit, runCommand, requireRemoteMain);
     const verifier = join(worktree, "scripts", "verify-app-source.ts");
-    const command = expected.mode === "command-capacity"
+    const command = hostedOperator
       ? [
           dependencies.runtimePath ?? process.execPath,
           "--no-env-file",
           "--config=/dev/null",
-          join(worktree, "scripts", "manage-command-lifecycle-capacity.ts"),
+          join(worktree, "scripts", expected.mode === "command-capacity"
+            ? "manage-command-lifecycle-capacity.ts"
+            : "manage-quota-upgrade.ts"),
           ...expected.operatorArguments,
         ]
       : expected.mode === "prove"
@@ -787,7 +814,7 @@ export const executeAppSourceProofLauncher = (
     result = runCommand(command, credentialDescriptor < 0
       ? {
           cwd: worktree,
-          ...(expected.mode === "command-capacity"
+          ...(hostedOperator
             ? {
                 environment: commandCapacityChildEnvironment(
                   dependencies.runtimeEnvironment ?? process.env,
@@ -796,7 +823,7 @@ export const executeAppSourceProofLauncher = (
             : {}),
         }
       : { credentialDescriptor, cwd: worktree });
-    const admittedExitCodes = expected.mode === "command-capacity" ? [0, 1, 75] : [0, 1];
+    const admittedExitCodes = hostedOperator ? [0, 1, 75] : [0, 1];
     if (
       result.signal !== null
       || !admittedExitCodes.includes(result.exitCode)

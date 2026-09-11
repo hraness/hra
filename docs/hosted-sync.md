@@ -156,6 +156,64 @@ There is one exceptional fresh-source supersession path for a bootstrap or candi
 
 Deployment intents and final documents use canonical SHA-256 JSON, bounded no-follow reads, exclusive mode-`0600` files, descriptor and path identity checks, file and directory sync, and atomic no-replace publication. Retain the `.intent` beside its final evidence until the release is complete.
 
+### Upgrade predecessor quota ledgers before capacity repair
+
+The memory schema adds a quota category and a per-user resource counter.
+Existing accounts need an explicit additive upgrade before ordinary writes or
+command-capacity repair can use the new schema. Deploy the checked forward
+candidate first, retain both its protected deployment evidence and its exact
+predecessor evidence, then run the quota operator from that clean source:
+
+```sh
+run_quota_upgrade() (
+  unset BUN_OPTIONS NODE_OPTIONS LD_AUDIT LD_LIBRARY_PATH LD_ORIGIN_PATH LD_PRELOAD \
+    DYLD_FALLBACK_FRAMEWORK_PATH DYLD_FALLBACK_LIBRARY_PATH DYLD_FRAMEWORK_PATH \
+    DYLD_IMAGE_SUFFIX DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_ROOT_PATH \
+    DYLD_VERSIONED_FRAMEWORK_PATH DYLD_VERSIONED_LIBRARY_PATH &&
+  command bun --no-env-file --config=/dev/null \
+    ./scripts/verify-app-source-launcher.ts quota-upgrade "$@"
+)
+
+run_quota_upgrade status \
+  --source-commit <CANDIDATE_COMMIT> \
+  --deploy-evidence /protected/release/candidate-deploy.json \
+  --previous-deploy-evidence /protected/release/previous-deploy.json \
+  --deployment steady-otter-321 \
+  --team-id 513923 --project-id 2854545 --deployment-id 7654321 \
+  --deployment-url https://steady-otter-321.convex.cloud
+```
+
+`status` makes bounded reads and reports closed aggregate counts. It does not
+publish an intent, upgrade an identity or clear the command-capacity hold. If
+the audit reports corruption, stop and diagnose a forward repair; never
+reinitialize existing quota authority or infer a missing counter's value.
+
+For an admissible legacy or unmarked current ledger, repeat the same command
+with `repair` instead of `status` and add
+`--evidence-path /protected/release/quota-upgrade.json --execute --acknowledge-forward-only`.
+The operator re-audits before writing, binds a protected intent to the exact
+candidate, predecessor, target and runtime, and upgrades at most eight
+identities in each atomic page. An exact legacy ledger receives the two zero
+memory counters and an identity-row version marker. A complete unmarked
+current ledger receives only the marker. Existing fields, counters, IDs,
+timestamps and limits remain unchanged; no user content is deleted. A marked
+identity with later missing rows is corruption and cannot be mistaken for a
+legacy account. Fresh identities carry the marker from initialization.
+
+After two complete clean audits, the operator publishes a protected completion
+receipt. An interrupted invocation retains its intent; the same bound repair
+first audits current state and never guesses whether an earlier page committed.
+Exact completed replay performs the audits without repeating mutations.
+Provider errors, binding drift or unproven process cleanup remain failures.
+Retain recovery paths and resolve the existing recovery journal before resuming.
+
+This receipt proves only the quota schema upgrade. It authorizes no daemon,
+provider writer or capacity activation. Continue with the command-capacity
+operator below; its two-pass evidence, activation and target-marker gates are
+unchanged. Do not downgrade to code that does not understand the new ledger
+shape. Do not invoke the internal migration manually or bypass the source
+launcher with a package-script alias.
+
 ### Converge command lifecycle capacity before writer rollout
 
 The additive command-lifecycle and durable-job-capacity deployment is a
@@ -171,7 +229,8 @@ during settlement, account for the new physical job shape, exchange the
 authority-reduction rows, or erase every obligation during account deletion.
 Repair forward from the exact currently live candidate instead.
 
-Run the capacity operator immediately after the candidate deployment and
+Run the capacity operator after the candidate deployment and any required
+quota-ledger upgrade, and
 before upgrading current daemons/executors or declaring current command
 writers available. The Vercel app can auto-build from `main` before this gate;
 an early UI deployment is not capacity readiness. Fresh marker-2 enqueue is

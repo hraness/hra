@@ -1,5 +1,5 @@
 import { paginationOptsValidator } from "convex/server";
-import { getDocumentSize, v, type GenericId as Id, type Value } from "convex/values";
+import { getDocumentSize, v, type GenericId as Id, type Infer, type Value } from "convex/values";
 
 import {
   identityInviteLifetimeMs,
@@ -12,7 +12,9 @@ import {
   internalMutation,
   internalQuery,
   type MutationCtx,
+  type QueryCtx,
 } from "./server";
+import { RELEASE_ATTESTATION } from "./releaseAttestation";
 import {
   authorityReductionCapacityReservation,
   authorityReductionCapacityVersion,
@@ -21,6 +23,10 @@ import {
   quotaEnforcement,
   quotaUserResource,
   maximumCommandLifecycleBatch,
+  maximumUserQuotaUpgradeBatch,
+  currentUserQuotaSchemaVersion,
+  userQuotaUpgradePaginationOpts,
+  runtimeReleaseAttestation,
 } from "./validators";
 
 export const QUOTA_CATEGORIES = [
@@ -176,7 +182,7 @@ function requireHardServiceAuthority<T extends HardServiceAuthority>(
   return authority;
 }
 
-export async function requireHardQuotaAuthority(ctx: MutationCtx): Promise<void> {
+export async function requireHardQuotaAuthority(ctx: Pick<QueryCtx, "db">): Promise<void> {
   const rows = await ctx.db.query("storageUsageService")
     .withIndex("by_key", (builder) => builder.eq("key", "global"))
     .take(2);
@@ -277,6 +283,12 @@ type StoredUserUsage = Readonly<{
   records: number;
 }>;
 
+const validQuotaSchemaMarker = (row: Readonly<{
+  category: QuotaCategory;
+  quotaSchemaVersion?: number;
+}>): boolean => row.quotaSchemaVersion === undefined
+  || (row.category === "identity" && row.quotaSchemaVersion === currentUserQuotaSchemaVersion);
+
 async function applyQuotaDelta(
   ctx: MutationCtx,
   userId: Id<"users">,
@@ -305,6 +317,7 @@ async function applyQuotaDelta(
   for (const row of userRows) {
     if (
       !QUOTA_CATEGORIES.includes(row.category)
+      || !validQuotaSchemaMarker(row)
       || !safeCounter(row.logicalBytes)
       || !safeCounter(row.records)
       || row.logicalBytes > CATEGORY_QUOTAS[row.category].logicalBytes
@@ -1735,6 +1748,222 @@ export const hostedBootstrapStatus = internalQuery({
   },
 });
 
+type QuotaUpgradeRuntime = Infer<typeof runtimeReleaseAttestation>;
+type QuotaUpgradeDisposition = "legacy" | "unmarked_current" | "current";
+type QuotaUpgradeClassification = Readonly<{
+  disposition: QuotaUpgradeDisposition;
+  identityRowId: Id<"storageUsageByUser">;
+}>;
+
+// This list names one reviewed predecessor schema. Deriving it by subtracting
+// today's additions would silently authorize future unknown upgrade shapes.
+const predecessorQuotaCategories = [
+  "identity", "device", "account", "session", "chunk", "usage",
+  "command", "custody", "receipt", "security", "job",
+] as const;
+const predecessorQuotaResources = [
+  "device", "codex_account", "session_head", "session_chunk",
+  "nonterminal_command", "live_chunk",
+] as const;
+
+function quotaUpgradeRuntimeTuple(runtime: QuotaUpgradeRuntime): readonly unknown[] {
+  return runtime.bound
+    ? [runtime.bound, runtime.schemaIdentity, runtime.schemaVersion,
+      runtime.deployedAtMs, runtime.previousDeployDigest, runtime.runtimeRevision, runtime.runtimeSourceCommit]
+    : [runtime.bound, runtime.schemaIdentity, runtime.schemaVersion];
+}
+
+function requireQuotaUpgradeRuntime(expected: QuotaUpgradeRuntime, runtime: QuotaUpgradeRuntime): void {
+  if (!expected.bound || !runtime.bound
+    || JSON.stringify(quotaUpgradeRuntimeTuple(expected))
+      !== JSON.stringify(quotaUpgradeRuntimeTuple(runtime))) {
+    throw new Error("QUOTA_UPGRADE_RUNTIME_CHANGED");
+  }
+}
+
+async function classifyUserQuotaUpgrade(
+  ctx: QueryCtx,
+  userId: Id<"users">,
+): Promise<QuotaUpgradeClassification> {
+  const [user, serviceRows, categories, resources] = await Promise.all([
+    ctx.db.get(userId),
+    ctx.db.query("storageUsageService")
+      .withIndex("by_key", (query) => query.eq("key", "global")).take(2),
+    ctx.db.query("storageUsageByUser")
+      .withIndex("by_user_and_category", (query) => query.eq("userId", userId))
+      .take(QUOTA_CATEGORIES.length + 1),
+    ctx.db.query("storageResourceUsageByUser")
+      .withIndex("by_user_and_resource", (query) => query.eq("userId", userId))
+      .take(USER_QUOTA_RESOURCES.length + 1),
+  ]);
+  if (user === null || serviceRows.length !== 1) return corrupt();
+  const service = requireHardServiceAuthority(serviceRows[0]);
+  const byCategory = new Map(categories.map((row) => [row.category, row]));
+  const byResource = new Map(resources.map((row) => [row.resource, row]));
+  if (byCategory.size !== categories.length || byResource.size !== resources.length) return corrupt();
+  let logicalBytes = 0;
+  let records = 0;
+  for (const row of categories) {
+    if (
+      !QUOTA_CATEGORIES.includes(row.category)
+      || !validQuotaSchemaMarker(row)
+      || !safeCounter(row.logicalBytes)
+      || !safeCounter(row.records)
+      || !isFiniteTimestamp(row.updatedAt)
+      || !canonicalUsagePair(row.logicalBytes, row.records)
+      || row.logicalBytes > CATEGORY_QUOTAS[row.category].logicalBytes
+      || row.records > CATEGORY_QUOTAS[row.category].records
+    ) return corrupt();
+    logicalBytes += row.logicalBytes;
+    records += row.records;
+    if (!safeCounter(logicalBytes) || !safeCounter(records)) return corrupt();
+  }
+  if (
+    logicalBytes > USER_TOTAL_QUOTA.logicalBytes
+    || records > USER_TOTAL_QUOTA.records
+    || logicalBytes > service.userLogicalBytes
+    || records > service.userRecords
+    || !canonicalUsagePair(logicalBytes, records)
+  ) return corrupt();
+  for (const row of resources) {
+    if (
+      !USER_QUOTA_RESOURCES.includes(row.resource)
+      || !safeCounter(row.records)
+      || !isFiniteTimestamp(row.updatedAt)
+      || row.records > USER_RESOURCE_QUOTAS[row.resource]
+    ) return corrupt();
+  }
+  const identity = byCategory.get("identity");
+  if (identity === undefined) return corrupt();
+  const current = categories.length === QUOTA_CATEGORIES.length
+    && resources.length === USER_QUOTA_RESOURCES.length
+    && QUOTA_CATEGORIES.every((category) => byCategory.has(category))
+    && USER_QUOTA_RESOURCES.every((resource) => byResource.has(resource));
+  if (current) {
+    const memory = byCategory.get("memory");
+    const memorySpace = byResource.get("memory_space");
+    // Every charged memory space is also one record in its category. A
+    // complete ledger with contradictory counters must not acquire a marker.
+    if (memory === undefined || memorySpace === undefined || memorySpace.records > memory.records) return corrupt();
+    return {
+      disposition: identity.quotaSchemaVersion === undefined ? "unmarked_current" : "current",
+      identityRowId: identity._id,
+    };
+  }
+  if (
+    identity.quotaSchemaVersion !== undefined
+    || categories.length !== predecessorQuotaCategories.length
+    || resources.length !== predecessorQuotaResources.length
+    || !predecessorQuotaCategories.every((category) => byCategory.has(category))
+    || !predecessorQuotaResources.every((resource) => byResource.has(resource))
+  ) return corrupt();
+  const [space, operation] = await Promise.all([
+    ctx.db.query("memorySpaces")
+      .withIndex("by_user_and_public_id", (query) => query.eq("userId", userId)).take(1),
+    ctx.db.query("memoryOperations")
+      .withIndex("by_user", (query) => query.eq("userId", userId)).take(1),
+  ]);
+  // Even an orphan operation disproves zero usage. Never infer absence from
+  // missing space rows or inspect another owner's content.
+  if (space.length !== 0 || operation.length !== 0) return corrupt();
+  return { disposition: "legacy", identityRowId: identity._id };
+}
+
+function requireQuotaUpgradePageSize(numItems: number): void {
+  if (!Number.isSafeInteger(numItems) || numItems < 1 || numItems > maximumUserQuotaUpgradeBatch) corrupt();
+}
+
+type QuotaUpgradePageArgs = Readonly<{
+  expectedRuntimeAttestation: QuotaUpgradeRuntime;
+  paginationOpts: Infer<typeof userQuotaUpgradePaginationOpts>;
+}>;
+
+// The explicit runtime parameter is the credential-free server-test seam.
+// Registered production functions below always supply their compiled constant.
+export async function auditUserQuotaUpgradePageForRuntime(
+  ctx: QueryCtx,
+  args: QuotaUpgradePageArgs,
+  runtime: QuotaUpgradeRuntime,
+) {
+  requireQuotaUpgradeRuntime(args.expectedRuntimeAttestation, runtime);
+  requireQuotaUpgradePageSize(args.paginationOpts.numItems);
+  await requireHardQuotaAuthority(ctx);
+  const page = await ctx.db.query("users").paginate({
+    cursor: args.paginationOpts.cursor,
+    numItems: args.paginationOpts.numItems,
+    maximumRowsRead: maximumUserQuotaUpgradeBatch,
+  });
+  if (page.page.length > maximumUserQuotaUpgradeBatch) return corrupt();
+  const counts = { legacy: 0, unmarkedCurrent: 0, current: 0, corrupt: 0 };
+  for (const user of page.page) {
+    try {
+      const result = await classifyUserQuotaUpgrade(ctx, user._id);
+      switch (result.disposition) {
+        case "legacy": counts.legacy += 1; break;
+        case "unmarked_current": counts.unmarkedCurrent += 1; break;
+        case "current": counts.current += 1; break;
+      }
+    } catch (error: unknown) {
+      if (!(error instanceof Error) || error.message !== "QUOTA_AUTHORITY_CORRUPT") throw error;
+      counts.corrupt += 1;
+    }
+  }
+  return { ...counts, continueCursor: page.continueCursor, isDone: page.isDone, scanned: page.page.length, schemaVersion: 1 as const };
+}
+
+export async function upgradeUserQuotaPageForRuntime(
+  ctx: MutationCtx,
+  args: QuotaUpgradePageArgs,
+  runtime: QuotaUpgradeRuntime,
+) {
+  requireQuotaUpgradeRuntime(args.expectedRuntimeAttestation, runtime);
+  requireQuotaUpgradePageSize(args.paginationOpts.numItems);
+  await requireHardQuotaAuthority(ctx);
+  const page = await ctx.db.query("users").paginate({
+    cursor: args.paginationOpts.cursor,
+    numItems: args.paginationOpts.numItems,
+    maximumRowsRead: maximumUserQuotaUpgradeBatch,
+  });
+  if (page.page.length > maximumUserQuotaUpgradeBatch) return corrupt();
+  let upgraded = 0;
+  let marked = 0;
+  for (const user of page.page) {
+    const result = await classifyUserQuotaUpgrade(ctx, user._id);
+    if (result.disposition === "current") continue;
+    if (result.disposition === "legacy") {
+      const updatedAt = Date.now();
+      await ctx.db.insert("storageUsageByUser", {
+        category: "memory", logicalBytes: 0, records: 0, updatedAt, userId: user._id,
+      });
+      await ctx.db.insert("storageResourceUsageByUser", {
+        resource: "memory_space", records: 0, updatedAt, userId: user._id,
+      });
+      upgraded += 1;
+    }
+    await ctx.db.patch(result.identityRowId, { quotaSchemaVersion: currentUserQuotaSchemaVersion });
+    marked += 1;
+  }
+  return { continueCursor: page.continueCursor, current: page.page.length - marked, isDone: page.isDone, marked, scanned: page.page.length, schemaVersion: 1 as const, upgraded };
+}
+
+/** Read-only aggregate classification; raw identity and quota rows stay internal. */
+export const auditUserQuotaUpgradePage = internalQuery({
+  args: {
+    expectedRuntimeAttestation: runtimeReleaseAttestation,
+    paginationOpts: userQuotaUpgradePaginationOpts,
+  },
+  handler: async (ctx, args) => await auditUserQuotaUpgradePageForRuntime(ctx, args, RELEASE_ATTESTATION),
+});
+
+/** One atomic page. Any refusal rolls back additions for every selected user. */
+export const upgradeUserQuotaPage = internalMutation({
+  args: {
+    expectedRuntimeAttestation: runtimeReleaseAttestation,
+    paginationOpts: userQuotaUpgradePaginationOpts,
+  },
+  handler: async (ctx, args) => await upgradeUserQuotaPageForRuntime(ctx, args, RELEASE_ATTESTATION),
+});
+
 export async function initializeUserQuotaAuthority(
   ctx: MutationCtx,
   userId: Id<"users">,
@@ -1760,6 +1989,7 @@ export async function initializeUserQuotaAuthority(
   for (const category of QUOTA_CATEGORIES) {
     await ctx.db.insert("storageUsageByUser", {
       category,
+      ...(category === "identity" ? { quotaSchemaVersion: currentUserQuotaSchemaVersion } : {}),
       logicalBytes: 0,
       records: 0,
       updatedAt: now,
@@ -1807,6 +2037,7 @@ export async function finalizeUserQuotaAuthorityForDelete(
   for (const row of categoryRows) {
     if (
       categories.has(row.category)
+      || !validQuotaSchemaMarker(row)
       || row.logicalBytes !== 0
       || row.records !== 0
     ) corrupt();

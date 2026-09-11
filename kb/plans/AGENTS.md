@@ -1,5 +1,7 @@
 # Contents
 
+- `cross-platform-daily-driver.md` tracks the owner's macOS-first daily-driver target and native macOS, Linux and Windows implementation and acceptance.
+- `memory-quota-upgrade.md` tracks the explicit additive migration from predecessor quota ledgers to the memory category and resource, preserving all prior accounting and independent capacity guards.
 - `wonka-marketing.md` tracks the homepage's restrained top-hat artwork, engraved story seals, rendering budget, and acceptance evidence.
 - `oompa-rename.md` governs the Oompa identity transition, package-only content, orange-circle branding, compatibility and organization-wide consumer delivery.
 - `oompa-app-domain.md` records the owner's replacement domain choice, source and account authority changes, and removal of the earlier domain without redirects.
