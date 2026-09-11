@@ -81,9 +81,73 @@ test("unverified projection has fixed token and row bounds for arbitrary help te
     const stdout = `Usage: claude auth login [options]\nOptions:\n${suffix.replace(/\p{Cc}/gu, " ")}`;
     const value = inspectClaudeAuthLoginHelp(output(stdout));
     expect(value.admitted).toBeFalse(); expect(value.optionRows.length).toBeLessThanOrEqual(32);
+    expect(value.diagnostics.rejections.length).toBeLessThanOrEqual(32);
+    expect(value.diagnostics.lineCount).toBeLessThanOrEqual(16_385);
+    expect(value.diagnostics.acceptedCount).toBe(value.optionRows.length);
+    for (const rejected of value.diagnostics.rejections) {
+      expect(rejected.line).toBeGreaterThan(0); expect(rejected.line).toBeLessThanOrEqual(256);
+      expect(rejected.indentCodeUnits).toBeLessThanOrEqual(256);
+      expect(rejected.lineBytes).toBeLessThanOrEqual(65_536); expect(rejected.declarationBytes).toBeLessThanOrEqual(rejected.lineBytes);
+      expect(["candidate_limit", "declaration_limit", "duplicate_flag", "malformed_flag_declaration", "non_option_line"]).toContain(rejected.reason);
+    }
     for (const row of value.optionRows) {
       expect(row.flags.length).toBeLessThanOrEqual(2); expect(["none", "required", "optional"]).toContain(row.argument);
       for (const flag of row.flags) expect(flag).toMatch(/^(?:-[A-Za-z0-9]|--[a-z][a-z0-9-]{0,63})$/u);
     }
   }));
+});
+
+test("closed diagnostics distinguish five synthetic rejection causes without retaining rejected content", () => {
+  const prefix = "Usage: claude auth login [options]\nOptions:\n  --claudeai  PRIVATE_PROSE\n";
+  const suffixes = [
+    { suffix: "  --claudeai  PRIVATE_DUPLICATE\n", reason: "duplicate_flag", beginsWithFlag: true },
+    { suffix: "  --bad=PRIVATE_ARGUMENT\n", reason: "malformed_flag_declaration", beginsWithFlag: true },
+    { suffix: `  --flag <${"P".repeat(257)}>\n`, reason: "declaration_limit", beginsWithFlag: true },
+    { suffix: "  PRIVATE_CONTINUATION\n", reason: "non_option_line", beginsWithFlag: false },
+  ] as const;
+  for (const { suffix, reason, beginsWithFlag } of suffixes) {
+    const value = inspectClaudeAuthLoginHelp(output(prefix + suffix));
+    expect(value).toMatchObject({ admitted: false, projectionComplete: false, diagnostics: { version: 1, usage: "exact", scan: "scanned",
+      lineCount: 5, optionsHeadingCount: 1, candidateCount: 2, acceptedCount: 1, candidateLimitExceeded: false, rejectionsTruncated: false } });
+    expect(value.diagnostics.rejections).toEqual([{ line: 4, reason, beginsWithFlag, indentCodeUnits: 2, indentClamped: false,
+      lineBytes: new TextEncoder().encode(suffix.slice(0, -1)).byteLength,
+      declarationBytes: new TextEncoder().encode(suffix.trim().split(/ {2,}/u)[0]).byteLength,
+      precedingOptionOrdinal: 1, precedingDescriptionRelation: "before" }]);
+    expect(JSON.stringify(value)).not.toContain("PRIVATE_"); expect(JSON.stringify(value)).not.toContain("P".repeat(257));
+    expect(Object.isFrozen(value.diagnostics)).toBeTrue(); expect(Object.isFrozen(value.diagnostics.rejections)).toBeTrue();
+    expect(Object.isFrozen(value.diagnostics.rejections[0])).toBeTrue();
+  }
+  const many = Array.from({ length: 80 }, (_, index) => `  --flag-${index}\n`).join("");
+  const value = inspectClaudeAuthLoginHelp(output("Usage: claude auth login [options]\nOptions:\n" + many));
+  expect(value).toMatchObject({ admitted: false, projectionComplete: false, diagnostics: { candidateCount: 80, acceptedCount: 32,
+    candidateLimitExceeded: true, rejectionsTruncated: true } });
+  expect(value.diagnostics.rejections).toHaveLength(32);
+  expect(value.diagnostics.rejections.every((entry) => entry.reason === "candidate_limit")).toBeTrue();
+});
+
+test("synthetic continuation layout reports code-unit relations without accepting prose or copying placeholders", () => {
+  const declaration = "  --email <PRIVATE_PLACEHOLDER>  ";
+  for (const offset of [-1, 0, 1]) {
+    const spaces = declaration.length + offset;
+    const value = inspectClaudeAuthLoginHelp(output("Usage: claude auth login [options]\nOptions:\n"
+      + declaration + "PRIVATE_DESCRIPTION\n" + " ".repeat(spaces) + "PRIVATE_CONTINUATION\n"));
+    expect(value).toMatchObject({ admitted: false, projectionComplete: false, diagnostics: { candidateCount: 2, acceptedCount: 1 } });
+    expect(value.diagnostics.rejections[0]).toMatchObject({ line: 4, reason: "non_option_line", indentCodeUnits: spaces,
+      precedingOptionOrdinal: 1, precedingDescriptionRelation: offset < 0 ? "before" : offset === 0 ? "at" : "after" });
+    expect(JSON.stringify(value)).not.toContain("PRIVATE_");
+  }
+  const clamped = inspectClaudeAuthLoginHelp(output("Options:\n" + " ".repeat(300) + "PRIVATE_CONTINUATION\n"));
+  expect(clamped.diagnostics.rejections[0]).toMatchObject({ indentCodeUnits: 256, indentClamped: true,
+    precedingOptionOrdinal: null, precedingDescriptionRelation: "unavailable" });
+});
+
+test("usage and heading or line limits are explicit while extraction never grants capability", () => {
+  const complete = "Usage: other command [options]\nOptions:\n  --claudeai\n";
+  expect(inspectClaudeAuthLoginHelp(output(complete))).toMatchObject({ admitted: false, projectionComplete: true, diagnostics: { usage: "different" } });
+  expect(inspectClaudeAuthLoginHelp(output("PRIVATE_PROSE\n"))).toMatchObject({ admitted: false, projectionComplete: false,
+    diagnostics: { usage: "missing", optionsHeadingCount: 0, candidateCount: null, scan: "missing_options_heading" } });
+  expect(inspectClaudeAuthLoginHelp(output("Options:\nOptions:\n  --claudeai\n"))).toMatchObject({ admitted: false, projectionComplete: false,
+    diagnostics: { optionsHeadingCount: 2, candidateCount: null, scan: "multiple_options_headings" } });
+  expect(inspectClaudeAuthLoginHelp(output("Usage: claude auth login [options]\nOptions:\n  --claudeai\n" + "\n".repeat(253)))).toMatchObject({
+    admitted: false, projectionComplete: false, optionRows: [], diagnostics: { lineCount: 257, candidateCount: 1, acceptedCount: 0, scan: "line_limit" } });
 });

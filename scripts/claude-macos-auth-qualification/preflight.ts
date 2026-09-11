@@ -53,7 +53,7 @@ type Probe = Readonly<{
   runId: string; attemptId: string; probeId: string; profile: "A" | "B"; operation: Operation;
   stdoutSha256: string; stdoutBytes: number; stderrBytes: 0; deadlineMs: number; elapsedMs: number;
   detachment: Readonly<z.infer<typeof detachmentSchema>>;
-  loginHelp: Readonly<Pick<ReturnType<typeof inspectClaudeAuthLoginHelp>, "optionRows" | "projectionComplete">> | null;
+  loginHelp: Readonly<Pick<ReturnType<typeof inspectClaudeAuthLoginHelp>, "optionRows" | "projectionComplete" | "diagnostics">> | null;
 }>;
 type Diagnostic = Readonly<{
   admitted: false; reason: "login_help_unverified"; runId: string; attemptId: string;
@@ -146,7 +146,7 @@ async function collectPreflight(input: CommonInput, stateInput: unknown, source:
           : createHash("sha256").update(stdout).digest("hex");
       probes.push(Object.freeze({ runId: scope.runId, attemptId, probeId: scope.probeId, profile: scope.profile, operation: scope.operation,
         stdoutSha256, stdoutBytes: stdout.byteLength, stderrBytes: 0, deadlineMs, elapsedMs: observed.elapsedMs,
-        loginHelp: loginHelp === null ? null : Object.freeze({ optionRows: loginHelp.optionRows, projectionComplete: loginHelp.projectionComplete }),
+        loginHelp: loginHelp === null ? null : Object.freeze({ optionRows: loginHelp.optionRows, projectionComplete: loginHelp.projectionComplete, diagnostics: loginHelp.diagnostics }),
         detachment: Object.freeze({ ...observed.detachment, identity: Object.freeze({ ...identity }) }) }));
       return scope.operation === "version" ? text : null;
     } finally { active = null; for (const bytes of raw) bytes.fill(0); }

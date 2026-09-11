@@ -119,7 +119,9 @@ test("six fixed probes preserve fresh authority ordering and exact version facto
     ...(operation === "version" ? ["resolve"] : []), `authority:${profile}:${operation}`, "ticket", "bind", "source-current", "custody-current", `start:${profile}:${operation}`])));
   for (const probe of result.probes) {
     expect(probe.loginHelp).toEqual(probe.operation === "login_help" ? { projectionComplete: true,
-      optionRows: [{ flags: ["--claudeai"], argument: "none" }, { flags: ["-h", "--help"], argument: "none" }] } : null);
+      optionRows: [{ flags: ["--claudeai"], argument: "none" }, { flags: ["-h", "--help"], argument: "none" }],
+      diagnostics: { version: 1, usage: "exact", scan: "scanned", lineCount: 6, optionsHeadingCount: 1, candidateCount: 2,
+        acceptedCount: 2, candidateLimitExceeded: false, rejectionsTruncated: false, rejections: [] } } : null);
   }
   expect(result).not.toHaveProperty("freshEmptyRoots"); expect(result).not.toHaveProperty("signatureRevalidated");
   expect(JSON.stringify(result)).not.toContain("Usage:"); expect(JSON.stringify(result)).not.toContain(root); expect(value.owned).toHaveLength(6); cleared(value);
@@ -133,9 +135,35 @@ test("both unverified login-help projections remain diagnostic even when extract
   expect(result).toMatchObject({ admitted: false, reason: "login_help_unverified", loginHelpBoth: false });
   for (const probe of result.probes.filter((entry) => entry.operation === "login_help")) expect(probe.loginHelp).toEqual({
     projectionComplete: false, optionRows: [{ flags: ["--claudeai"], argument: "none" }],
+    diagnostics: { version: 1, usage: "exact", scan: "scanned", lineCount: 5, optionsHeadingCount: 1, candidateCount: 2,
+      acceptedCount: 1, candidateLimitExceeded: false, rejectionsTruncated: false,
+      rejections: [{ line: 4, reason: "non_option_line", indentCodeUnits: 2, indentClamped: false,
+        lineBytes: 25, declarationBytes: 23, beginsWithFlag: false, precedingOptionOrdinal: 1, precedingDescriptionRelation: "before" }] },
   });
   expect(JSON.stringify(result)).not.toContain("private description"); expect(JSON.stringify(result)).not.toContain("unexpected continuation");
   cleared(value);
+});
+
+test("maximum row and rejection counts fit the unchanged private caller outcome bound", async () => {
+  const declarations = Array.from({ length: 32 }, (_, index) => `  --a${"x".repeat(60)}${index.toString().padStart(2, "0")} <${"P".repeat(64)}>  PRIVATE_DESCRIPTION\n`).join("");
+  const rejected = Array.from({ length: 32 }, () => " ".repeat(257) + "PRIVATE_CONTINUATION\n").join("");
+  const help = "Usage: claude auth login [options]\nOptions:\n" + declarations + rejected;
+  expect(new TextEncoder().encode(help).byteLength).toBeLessThanOrEqual(16_384);
+  const value = fixture({ output: (operation) => new TextEncoder().encode(operation === "login_help" ? help : text(operation)) });
+  const result = await collectCredentialFreeClaudeMacosPreflight(value.request, value.ports);
+  for (const probe of result.probes.filter((entry) => entry.operation === "login_help")) {
+    expect(probe.loginHelp?.optionRows).toHaveLength(32); expect(probe.loginHelp?.diagnostics.rejections).toHaveLength(32);
+    expect(probe.loginHelp?.diagnostics.candidateLimitExceeded).toBeTrue();
+  }
+  // The reviewed native caller restricts its capsule to ASCII. Reserve the full
+  // 4096-character path bound for each retained recovery path, plus its envelope.
+  const envelope = { kind: "native_login_help_diagnostic_outcome", version: 1, sourceCommit: "a".repeat(40), completedAt: "2026-09-11T23:59:59.999Z",
+    outcome: { admitted: false, step: 0, status: "blocked", reason: "login_help_unverified", cleanup: "joined", ownerRelease: "released",
+      recovery: { runId: id(1), runRoot: "/" + "x".repeat(4095), receiptPath: "/" + "x".repeat(4095) },
+      diagnostic: result, freshRootsObserved: true, checkpoint: "dispatched" } };
+  expect(new TextEncoder().encode(JSON.stringify(envelope) + "\n").byteLength).toBeLessThanOrEqual(65_536);
+  expect(JSON.stringify(result)).not.toContain("PRIVATE_"); expect(JSON.stringify(result)).not.toContain("P".repeat(64));
+  expect(result.admitted).toBeFalse(); expect(result.loginHelpBoth).toBeFalse(); expect(value.owned).toHaveLength(6); cleared(value);
 });
 
 test("missing dispatch, fixture/native mixing and open input overrides refuse before launch", async () => {
