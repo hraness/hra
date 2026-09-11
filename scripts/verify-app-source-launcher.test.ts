@@ -186,7 +186,7 @@ const launcherFixture = (overrides: Readonly<{
       return result(
         overrides.childExitCode === 1
           ? ""
-          : '{"kind":"hra-app-source-proof","schemaVersion":2}\n',
+          : '{"kind":"hra-app-source-proof","schemaVersion":3}\n',
         overrides.childExitCode ?? 0,
       );
     }
@@ -296,7 +296,7 @@ const realRepositoryLauncherFixture = (
     if (command[0] === "/trusted/bun") {
       if (command[3] === "install") return result();
       if (command[3]?.endsWith("/scripts/verify-app-source.ts") === true) {
-        return result('{"kind":"hra-app-source-proof","schemaVersion":2}\n');
+        return result('{"kind":"hra-app-source-proof","schemaVersion":3}\n');
       }
     }
     const executable = command[0];
@@ -700,7 +700,7 @@ describe("Oompa browser app source proof launcher", () => {
         stdout: stdout.writer,
       })).toBe(0);
       expect(stderr.lines).toEqual([]);
-      expect(stdout.lines.join("")).toContain('"schemaVersion":2');
+      expect(stdout.lines.join("")).toContain('"schemaVersion":3');
       expect(fixture.events.some((event) => event.startsWith("credential:opened:"))).toBe(true);
       expect(fixture.events.some((event) => event.includes("\0ls-tree\0-r\0-z\0--full-tree")))
         .toBe(true);
@@ -819,7 +819,7 @@ describe("Oompa browser app source proof launcher", () => {
       });
       expect(code).toBe(0);
       expect(stderr.lines).toEqual([]);
-      expect(stdout.lines.join("")).toContain('"schemaVersion":2');
+      expect(stdout.lines.join("")).toContain('"schemaVersion":3');
       const opened = fixture.events.findIndex((event) => event.startsWith("credential:opened:"));
       const installed = fixture.events.findIndex((event) => event.includes("\0install\0--frozen-lockfile"));
       const mainReads = fixture.events

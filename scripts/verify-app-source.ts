@@ -217,10 +217,17 @@ const bulkRedirectReadbackSchema = z.object({
   pagination: z.object({
     numPages: z.number().int().nonnegative(),
     page: z.literal(1),
-    per_page: z.literal(1),
+    per_page: z.literal(10),
   }),
-  redirects: z.array(z.unknown()).max(1),
+  redirects: z.array(z.unknown()).max(10),
   version: bulkRedirectVersionSchema.optional(),
+});
+const unconfiguredBulkRedirectsSchema = z.strictObject({
+  redirects: z.array(z.unknown()).length(0),
+  version: z.null(),
+});
+const noBulkRedirectVersionsSchema = z.strictObject({
+  versions: z.array(z.unknown()).length(0),
 });
 
 const firewallActionSchema = z.enum([
@@ -264,6 +271,11 @@ const firewallReadbackSchema = z.object({
   updatedAt: z.string().min(1).max(128),
   version: z.number().int().nonnegative(),
 });
+const firewallConfigurationsReadbackSchema = z.strictObject({
+  active: firewallReadbackSchema.nullable(),
+  draft: z.record(z.string(), z.unknown()).nullable(),
+  versions: z.array(z.record(z.string(), z.unknown())).max(1_000),
+});
 
 const aliasReadbackSchema = z.object({
   alias: z.literal(oompaAppAlias),
@@ -304,9 +316,9 @@ const appSourceProofUnsignedSchema = z.object({
   deploymentId: deploymentIdSchema,
   deploymentUrl: deploymentUrlSchema,
   domainConfiguredBy: z.enum(["A", "CNAME"]),
-  firewallConfigId: z.string().min(1).max(256),
-  firewallConfigVersion: z.number().int().nonnegative(),
-  firewallEnabled: z.boolean(),
+  firewallConfigId: z.string().min(1).max(256).nullable(),
+  firewallConfigVersion: z.number().int().nonnegative().nullable(),
+  firewallEnabled: z.boolean().nullable(),
   kind: z.literal("hra-app-source-proof"),
   marker: markerSchema,
   observationBoundary: z.literal("sequential-readback-without-provider-lock"),
@@ -317,7 +329,7 @@ const appSourceProofUnsignedSchema = z.object({
   releaseVersion: releaseVersionSchema,
   repositoryId: z.literal(oompaAppRepositoryId),
   rollingReleaseState: z.enum(["ABORTED", "COMPLETE"]).nullable(),
-  schemaVersion: z.literal(2),
+  schemaVersion: z.literal(3),
   skewProtectionBoundaryAt: z.null(),
   skewProtectionMaxAge: z.union([z.null(), z.literal(0)]),
   sourceCommit: commitSchema,
@@ -343,6 +355,8 @@ export const appSourceProofEvidenceSchema = appSourceProofUnsignedSchema.extend(
     || value.marker.version !== value.releaseVersion
     || value.sourceRemoteMainCommit !== value.sourceCommit
     || value.verifierSourceCommit !== value.sourceCommit
+    || (value.firewallConfigId === null) !== (value.firewallConfigVersion === null)
+    || (value.firewallConfigId === null) !== (value.firewallEnabled === null)
     || !Number.isFinite(started)
     || !Number.isFinite(completed)
     || completed < started
@@ -408,9 +422,9 @@ type ProviderSample = Readonly<{
   deploymentId: string;
   deploymentUrl: string;
   domainConfiguredBy: "A" | "CNAME";
-  firewallConfigId: string;
-  firewallConfigVersion: number;
-  firewallEnabled: boolean;
+  firewallConfigId: string | null;
+  firewallConfigVersion: number | null;
+  firewallEnabled: boolean | null;
   projectRouteVersionId: string | null;
   projectBuildSettingsDigest: string;
   projectId: string;
@@ -794,35 +808,47 @@ const readProviderSample = async (
   const bulkRedirectDocument = await readProviderJson(
     fetcher,
     accessToken,
-    `/v1/bulk-redirects?projectId=${oompaAppProjectId}&page=1&per_page=1`,
+    `/v1/bulk-redirects?projectId=${oompaAppProjectId}&page=1&per_page=10`,
   );
   const bulkRedirects = bulkRedirectReadbackSchema.safeParse(bulkRedirectDocument);
-  if (
-    !bulkRedirects.success
-    || bulkRedirects.data.redirects.length !== 0
-    || bulkRedirects.data.pagination.numPages !== 0
-  ) fail("provider_readback_invalid");
+  let bulkRedirectVersionId: string | null;
+  if (bulkRedirects.success) {
+    if (bulkRedirects.data.redirects.length !== 0 || bulkRedirects.data.pagination.numPages !== 0) fail("provider_readback_invalid");
+    bulkRedirectVersionId = bulkRedirects.data.version?.id ?? null;
+  } else {
+    // Fresh unconfigured projects omit pagination. Require both exact absence
+    // documents under this authenticated sample; errors never imply emptiness.
+    if (!unconfiguredBulkRedirectsSchema.safeParse(bulkRedirectDocument).success) fail("provider_readback_invalid");
+    const versions = await readProviderJson(fetcher, accessToken,
+      `/v1/bulk-redirects/versions?projectId=${oompaAppProjectId}`);
+    if (!noBulkRedirectVersionsSchema.safeParse(versions).success) fail("provider_readback_invalid");
+    bulkRedirectVersionId = null;
+  }
 
   const firewallDocument = await readProviderJson(
     fetcher,
     accessToken,
-    `/v1/security/firewall/config/active?projectId=${oompaAppProjectId}`,
+    `/v1/security/firewall/config?projectId=${oompaAppProjectId}`,
   );
-  const firewall = firewallReadbackSchema.safeParse(firewallDocument);
-  if (!firewall.success) fail("provider_readback_invalid");
-  const customRedirect = firewall.data.firewallEnabled
-    && firewall.data.rules.some((rule) =>
+  const configurations = firewallConfigurationsReadbackSchema.safeParse(firewallDocument);
+  if (!configurations.success) fail("provider_readback_invalid");
+  const firewall = configurations.data.active;
+  if (firewall === null && (configurations.data.draft !== null || configurations.data.versions.length !== 0)) fail("provider_readback_invalid");
+  // The documented list includes the full active configuration, so the same
+  // owner/project/rule guards need no second, potentially different active read.
+  const customRedirect = firewall?.firewallEnabled === true
+    && firewall.rules.some((rule) =>
       rule.active
       && rule.valid
       && rule.action.mitigate?.action === "redirect"
     );
-  const rulesetRedirect = firewall.data.firewallEnabled
-    && firewall.data.rulesets !== undefined
-    && (Array.isArray(firewall.data.rulesets)
-      ? firewall.data.rulesets.some((ruleset) =>
+  const rulesetRedirect = firewall?.firewallEnabled === true
+    && firewall.rulesets !== undefined
+    && (Array.isArray(firewall.rulesets)
+      ? firewall.rulesets.some((ruleset) =>
         ruleset.active && ruleset.action?.mitigate?.action === "redirect"
       )
-      : Object.values(firewall.data.rulesets).some(
+      : Object.values(firewall.rulesets).some(
         (ruleset) => ruleset.action === "redirect",
       ));
   if (customRedirect || rulesetRedirect) fail("provider_readback_invalid");
@@ -896,16 +922,16 @@ const readProviderSample = async (
   return Object.freeze({
     aliasUid: alias.data.uid,
     aliasUpdatedAt: alias.data.updatedAt,
-    bulkRedirectVersionId: bulkRedirects.data.version?.id ?? null,
+    bulkRedirectVersionId,
     deploymentBuildSettingsDigest: digestBuildSettings(
       deploymentSnapshot.projectSettings,
     ),
     deploymentId: deployment.data.id,
     deploymentUrl: deployment.data.url,
     domainConfiguredBy: domainConfig.data.configuredBy,
-    firewallConfigId: firewall.data.id,
-    firewallConfigVersion: firewall.data.version,
-    firewallEnabled: firewall.data.firewallEnabled,
+    firewallConfigId: firewall?.id ?? null,
+    firewallConfigVersion: firewall?.version ?? null,
+    firewallEnabled: firewall?.firewallEnabled ?? null,
     projectRouteVersionId: liveRouteVersion?.id ?? null,
     projectBuildSettingsDigest: digestBuildSettings({
       buildCommand: project.data.buildCommand,
@@ -1123,7 +1149,7 @@ export const executeAppSourceProof = async (
       releaseVersion: expected.releaseVersion,
       repositoryId: oompaAppRepositoryId,
       rollingReleaseState: after.rollingReleaseState,
-      schemaVersion: 2,
+      schemaVersion: 3,
       skewProtectionBoundaryAt: after.skewProtectionBoundaryAt,
       skewProtectionMaxAge: after.skewProtectionMaxAge,
       sourceCommit: expected.sourceCommit,
