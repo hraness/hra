@@ -986,6 +986,10 @@ export default defineSchema({
   storageUsageByUser: defineTable({
     category: quotaCategory,
     logicalBytes: v.number(),
+    // Only the identity category may carry this uncharged authority marker.
+    // Keep stored numbers readable so runtime validation refuses future or
+    // damaged authority instead of treating it as an unmarked predecessor.
+    quotaSchemaVersion: v.optional(v.number()),
     records: v.number(),
     updatedAt: v.number(),
     userId: v.id("users"),
