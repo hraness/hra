@@ -138,7 +138,7 @@ const domainConfig = {
 };
 const rollingRelease = { rollingRelease: null };
 const bulkRedirects = {
-  pagination: { numPages: 0, page: 1, per_page: 1 },
+  pagination: { numPages: 0, page: 1, per_page: 10 },
   redirects: [],
 };
 const firewall = {
@@ -231,11 +231,13 @@ const jsonResponse = (planned: PlannedResponse): Response => {
 type ProviderSampleOverrides = Partial<Readonly<{
   aliasDocument: unknown;
   bulkRedirectDocument: unknown;
+  bulkRedirectVersionsDocument: unknown;
   deploymentDocument: unknown;
   deploymentListPages: readonly Readonly<{ document: unknown; until?: number }>[];
   domainConfigDocument: unknown;
   exactRoutes: Readonly<{ document: unknown; versionId: string }>;
   firewallDocument: unknown;
+  firewallConfigurationsDocument: unknown;
   projectDocument: unknown;
   projectDomainDocument: unknown;
   rollingReleaseDocument: unknown;
@@ -281,13 +283,19 @@ const providerSample = (
     {
       document: documents.bulkRedirectDocument,
       url: providerUrl(
-        `/v1/bulk-redirects?projectId=${oompaAppProjectId}&page=1&per_page=1`,
+        `/v1/bulk-redirects?projectId=${oompaAppProjectId}&page=1&per_page=10`,
       ),
     },
+    ...(Object.hasOwn(overrides, "bulkRedirectVersionsDocument") ? [{
+      document: overrides.bulkRedirectVersionsDocument,
+      url: providerUrl(`/v1/bulk-redirects/versions?projectId=${oompaAppProjectId}`),
+    }] : []),
     {
-      document: documents.firewallDocument,
+      document: Object.hasOwn(overrides, "firewallConfigurationsDocument")
+        ? overrides.firewallConfigurationsDocument
+        : { active: documents.firewallDocument, draft: null, versions: [] },
       url: providerUrl(
-        `/v1/security/firewall/config/active?projectId=${oompaAppProjectId}`,
+        `/v1/security/firewall/config?projectId=${oompaAppProjectId}`,
       ),
     },
     {
@@ -323,6 +331,13 @@ const completePlan = (
   markerResponse,
   ...after,
 ];
+
+const unconfiguredSample = (overrides: ProviderSampleOverrides = {}): readonly PlannedResponse[] => providerSample({
+  bulkRedirectDocument: { redirects: [], version: null },
+  bulkRedirectVersionsDocument: { versions: [] },
+  firewallConfigurationsDocument: { active: null, draft: null, versions: [] },
+  ...overrides,
+});
 
 const plannedFetcher = (
   plan: readonly PlannedResponse[],
@@ -398,8 +413,8 @@ describe("Oompa browser app source proof", () => {
       providerUrl(`/v9/projects/${oompaAppProjectId}/domains/${oompaAppAlias}`),
       providerUrl(`/v6/domains/${oompaAppAlias}/config?projectIdOrName=${oompaAppProjectId}`),
       providerUrl(`/v1/projects/${oompaAppProjectId}/rolling-release`),
-      providerUrl(`/v1/bulk-redirects?projectId=${oompaAppProjectId}&page=1&per_page=1`),
-      providerUrl(`/v1/security/firewall/config/active?projectId=${oompaAppProjectId}`),
+      providerUrl(`/v1/bulk-redirects?projectId=${oompaAppProjectId}&page=1&per_page=10`),
+      providerUrl(`/v1/security/firewall/config?projectId=${oompaAppProjectId}`),
       providerUrl(`/v1/projects/${oompaAppProjectId}/routes/versions`),
       deploymentListUrl(),
       providerUrl(`/v13/deployments/${deploymentId}?withGitRepoInfo=true`),
@@ -409,8 +424,8 @@ describe("Oompa browser app source proof", () => {
       providerUrl(`/v9/projects/${oompaAppProjectId}/domains/${oompaAppAlias}`),
       providerUrl(`/v6/domains/${oompaAppAlias}/config?projectIdOrName=${oompaAppProjectId}`),
       providerUrl(`/v1/projects/${oompaAppProjectId}/rolling-release`),
-      providerUrl(`/v1/bulk-redirects?projectId=${oompaAppProjectId}&page=1&per_page=1`),
-      providerUrl(`/v1/security/firewall/config/active?projectId=${oompaAppProjectId}`),
+      providerUrl(`/v1/bulk-redirects?projectId=${oompaAppProjectId}&page=1&per_page=10`),
+      providerUrl(`/v1/security/firewall/config?projectId=${oompaAppProjectId}`),
       providerUrl(`/v1/projects/${oompaAppProjectId}/routes/versions`),
       deploymentListUrl(),
       providerUrl(`/v13/deployments/${deploymentId}?withGitRepoInfo=true`),
@@ -453,7 +468,7 @@ describe("Oompa browser app source proof", () => {
       releaseVersion,
       repositoryId: oompaAppRepositoryId,
       rollingReleaseState: null,
-      schemaVersion: 2,
+      schemaVersion: 3,
       selfDigest: expect.stringMatching(/^[a-f0-9]{64}$/u),
       skewProtectionBoundaryAt: null,
       skewProtectionMaxAge: 0,
@@ -975,7 +990,7 @@ describe("Oompa browser app source proof", () => {
   test("refuses live bulk redirects and active WAF redirect rules", async () => {
     const bulkRedirect = await execute(providerSample({
       bulkRedirectDocument: {
-        pagination: { numPages: 1, page: 1, per_page: 1 },
+        pagination: { numPages: 1, page: 1, per_page: 10 },
         redirects: [{ destination: "https://attacker.invalid", source: "/" }],
         version: {
           id: "bulk-redirect-production",
@@ -990,7 +1005,7 @@ describe("Oompa browser app source proof", () => {
 
     const inconsistentEmptyRedirectPage = await execute(providerSample({
       bulkRedirectDocument: {
-        pagination: { numPages: 1, page: 1, per_page: 1 },
+        pagination: { numPages: 1, page: 1, per_page: 10 },
         redirects: [],
       },
     }));
@@ -1040,6 +1055,143 @@ describe("Oompa browser app source proof", () => {
       expect(result.code).toBe(1);
       expect(result.stdout).toBe("");
       expect(result.stderr).toContain('"code":"provider_readback_invalid"');
+    }
+  });
+
+  test("accepts explicit unconfigured responses only with authenticated empty redirect history", async () => {
+    const result = await execute([
+      ...unconfiguredSample(), { document: marker, url: markerUrl }, ...unconfiguredSample(),
+    ]);
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    const proof = appSourceProofEvidenceSchema.parse(result.evidence[0]);
+    expect(proof).toMatchObject({ schemaVersion: 3, bulkRedirectVersionId: null,
+      firewallConfigId: null, firewallConfigVersion: null, firewallEnabled: null });
+    const versionsUrl = providerUrl(`/v1/bulk-redirects/versions?projectId=${oompaAppProjectId}`);
+    const firewallUrl = providerUrl(`/v1/security/firewall/config?projectId=${oompaAppProjectId}`);
+    expect(result.requests.filter((request) => request.url === versionsUrl)).toHaveLength(2);
+    expect(result.requests.filter((request) => request.url === firewallUrl)).toHaveLength(2);
+    expect(result.requests.some((request) => request.url.includes("/config/active"))).toBe(false);
+    for (const request of result.requests.filter((entry) => entry.url !== markerUrl)) {
+      expect(request.init?.method).toBe("GET");
+      expect(request.init?.redirect).toBe("error");
+      expect(request.init?.cache).toBe("no-store");
+      expect(new Headers(request.init?.headers).get("authorization")).toBe(`Bearer ${accessToken}`);
+    }
+  });
+
+  test("refuses malformed empty redirect bodies and any unconfigured history ambiguity", async () => {
+    for (const bulkRedirectDocument of [
+      {}, { redirects: [] }, { version: null }, { redirects: null, version: null },
+      { redirects: [], version: {} }, { redirects: [null], version: null },
+      { redirects: [], version: null, pagination: null },
+      { redirects: [], version: null, pagination: { numPages: 0, page: 1, per_page: 10 } },
+      { redirects: [], version: null, error: { code: "forbidden" } },
+    ]) {
+      const result = await execute(unconfiguredSample({ bulkRedirectDocument }));
+      expect(result.code).toBe(1); expect(result.stdout).toBe("");
+      expect(result.requests.some((request) => request.url.includes("/bulk-redirects/versions"))).toBe(false);
+      expect(result.stderr).toContain('"code":"provider_readback_invalid"');
+    }
+    for (const bulkRedirectVersionsDocument of [
+      {}, null, { versions: null }, { versions: [], pagination: {} }, { versions: [], error: "forbidden" },
+      { versions: [{ id: "historic", isLive: false }] }, { versions: [{ id: "live", isLive: true, redirectCount: 0 }] },
+    ]) {
+      const result = await execute(unconfiguredSample({ bulkRedirectVersionsDocument }));
+      expect(result.code).toBe(1); expect(result.stdout).toBe("");
+      expect(result.requests.some((request) => request.url.includes("/security/firewall"))).toBe(false);
+      expect(result.stderr).toContain('"code":"provider_readback_invalid"');
+    }
+  });
+
+  test("requires exact requested redirect pagination even for an empty configured page", async () => {
+    for (const pagination of [
+      { numPages: 0, page: 1, per_page: 1 }, { numPages: 0, page: 1, per_page: 250 },
+      { numPages: 0, page: 2, per_page: 10 }, { numPages: 1, page: 1, per_page: 10 },
+      { numPages: 0, page: 1 }, { numPages: 0, page: "1", per_page: 10 },
+    ]) {
+      const result = await execute(providerSample({ bulkRedirectDocument: { redirects: [], pagination } }));
+      expect(result.code).toBe(1); expect(result.stdout).toBe("");
+      expect(result.stderr).toContain('"code":"provider_readback_invalid"');
+    }
+    const version = { id: "empty-live-bulk-version", isLive: true, redirectCount: 0 };
+    const sample = providerSample({ bulkRedirectDocument: { ...bulkRedirects, version } });
+    const valid = await execute([...sample, { document: marker, url: markerUrl }, ...sample]);
+    expect(valid.code).toBe(0);
+    expect(appSourceProofEvidenceSchema.parse(valid.evidence[0]).bulkRedirectVersionId).toBe(version.id);
+    expect(valid.requests.some((request) => request.url.includes("/bulk-redirects/versions"))).toBe(false);
+  });
+
+  test("firewall absence requires all three explicit empty fields and never infers disabled configuration", async () => {
+    for (const firewallConfigurationsDocument of [
+      {}, null, { active: null, draft: null }, { active: null, versions: [] },
+      { draft: null, versions: [] }, { active: null, draft: {}, versions: [] },
+      { active: null, draft: null, versions: [{}] }, { active: null, draft: null, versions: null },
+      { active: null, draft: null, versions: [], error: "not_found" },
+      { active: {}, draft: null, versions: [] },
+    ]) {
+      const result = await execute(unconfiguredSample({ firewallConfigurationsDocument }));
+      expect(result.code).toBe(1); expect(result.stdout).toBe("");
+      expect(result.stderr).toContain('"code":"provider_readback_invalid"');
+    }
+    const sample = providerSample({ firewallDocument: { ...firewall, firewallEnabled: false } });
+    const disabled = await execute([...sample, { document: marker, url: markerUrl }, ...sample]);
+    expect(disabled.code).toBe(0);
+    expect(appSourceProofEvidenceSchema.parse(disabled.evidence[0])).toMatchObject({
+      firewallConfigId: firewall.id, firewallConfigVersion: firewall.version, firewallEnabled: false,
+    });
+  });
+
+  test("new empty-state endpoints retain exact HTTP authorization, URL and redirect refusal", async () => {
+    const endpoints = [
+      providerUrl(`/v1/bulk-redirects?projectId=${oompaAppProjectId}&page=1&per_page=10`),
+      providerUrl(`/v1/bulk-redirects/versions?projectId=${oompaAppProjectId}`),
+      providerUrl(`/v1/security/firewall/config?projectId=${oompaAppProjectId}`),
+    ];
+    for (const endpoint of endpoints) {
+      for (const changes of [
+        ...[400, 401, 403, 404, 429, 500].map((status) => ({ status })),
+        { redirected: true }, { responseUrl: `${endpoint}&extra=1` },
+        { responseUrl: endpoint.replace(oompaAppProjectId, "prj_other") },
+        { responseUrl: endpoint.replace(oompaAppTeamId, "team_other") },
+        { responseUrl: "https://attacker.invalid/empty" }, { contentType: "text/html" },
+      ]) {
+        const sample = unconfiguredSample().map((response) => response.url === endpoint ? { ...response, ...changes } : response);
+        const result = await execute(sample);
+        expect(result.code).toBe(1); expect(result.stdout).toBe("");
+        expect(result.evidence).toHaveLength(0);
+        expect(result.stderr).toContain('"code":"provider_readback_invalid"');
+        expect(result.stderr).not.toContain(accessToken);
+      }
+    }
+  });
+
+  test("firewall absence and exact active identity must remain unchanged around the marker", async () => {
+    for (const [before, after] of [
+      [unconfiguredSample(), providerSample()], [providerSample(), unconfiguredSample()],
+      [providerSample(), providerSample({ firewallDocument: { ...firewall, id: "next-active" } })],
+      [providerSample(), providerSample({ firewallDocument: { ...firewall, version: firewall.version + 1 } })],
+      [providerSample(), providerSample({ firewallDocument: { ...firewall, firewallEnabled: false } })],
+    ] as const) {
+      const result = await execute([...before, { document: marker, url: markerUrl }, ...after]);
+      expect(result.code).toBe(1); expect(result.stdout).toBe("");
+      expect(result.stderr).toContain('"code":"authority_changed_during_observation"');
+    }
+  });
+
+  test("schema3 accepts only coherent firewall nulls and rejects earlier proof semantics", async () => {
+    const generated = await execute(completePlan());
+    const proof = appSourceProofEvidenceSchema.parse(generated.evidence[0]);
+    for (let mask = 0; mask < 8; mask += 1) {
+      const document = redigestProof(proof, {
+        firewallConfigId: (mask & 1) === 0 ? firewall.id : null,
+        firewallConfigVersion: (mask & 2) === 0 ? firewall.version : null,
+        firewallEnabled: (mask & 4) === 0 ? false : null,
+      });
+      expect(appSourceProofEvidenceSchema.safeParse(document).success).toBe(mask === 0 || mask === 7);
+    }
+    for (const schemaVersion of [1, 2]) {
+      expect(appSourceProofEvidenceSchema.safeParse(redigestProof(proof, { schemaVersion })).success).toBe(false);
     }
   });
 

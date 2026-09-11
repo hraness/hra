@@ -646,10 +646,20 @@ an active rolling release, active Skew Protection, any live project route, an
 active WAF redirect, an observed provider or protected-main change during the
 at-most-five-minute sample, or a non-READY deployment stops the observation.
 
+The bulk-redirect read requests page 1 with ten records per page. A response
+without pagination is accepted only as the exact empty form
+`{redirects:[],version:null}`, corroborated by an authenticated empty versions
+list. The firewall configuration list supplies its full active configuration
+for the existing identity and redirect checks. Only explicit
+`{active:null,draft:null,versions:[]}` proves an unconfigured firewall; its
+receipt records null configuration ID, version and enabled state together.
+HTTP errors and missing fields never establish absence.
+
 `--evidence-path` must be an absolute normalized path naming an absent direct
 child of a protected mode-`0700` evidence directory. The command publishes one
-schema-version-2 canonical, self-digested, mode-`0600`, single-link document
+schema-version-3 canonical, self-digested, mode-`0600`, single-link document
 through no-follow and atomic no-replace checks, then syncs and revalidates it.
+Earlier proof versions require a fresh observation with the current verifier.
 It never overwrites or treats an exact replay as success. Standard output is
 only a bounded non-secret echo for observation; shell redirection of stdout is
 not evidence. Standard error is one closed refusal code. Neither stream
