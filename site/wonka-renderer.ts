@@ -59,6 +59,10 @@ void main() {
   // Closely spaced contours describe the curved object; cipher marks stay rare.
   float contours = hairline(v_position.y * 47. + sin(v_uv.x * 6.283) * 0.16, 0.075);
   float meridians = hairline(v_uv.x * 144., 0.048);
+  // Keep the crown's closed fabric top smooth; latitude bands there read as holes.
+  float crownTop = smoothstep(1.04, 1.05, v_position.y);
+  contours *= 1. - crownTop;
+  meridians *= 1. - crownTop;
   float engraving = contours * 0.25 + meridians * 0.09;
   color = mix(color, silver, engraving * (0.35 + light * 0.6));
   vec2 grid = vec2(v_uv.x * 62., v_position.y * 29.);
@@ -82,7 +86,7 @@ void main() {
   color = mix(color, diffraction, rim * 0.34 * (0.5 + light * 0.5));
   // Let light describe the object instead of painting an opaque prop behind copy.
   float ink = 0.11 + contours * 0.24 + meridians * 0.08 + rim * 0.31 + glyph * 0.18;
-  ink += band * 0.055 + bandEdge * 0.12;
+  ink += band * 0.16 + bandEdge * 0.12;
   outColor = vec4(color, clamp(ink, 0., 0.68));
 }`;
 

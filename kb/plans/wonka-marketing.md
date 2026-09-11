@@ -19,7 +19,7 @@ The scene remains almost still until pointer movement changes its angle and ligh
 # Acceptance
 
 - Implementation: complete. Homepage-only decoration stays outside the accessibility tree and never intercepts controls. Geometry has 5,698 vertices and 10,560 triangles; it requires no external model or texture.
-- Focused validation: eight geometry/lifecycle tests, seven existing homepage semantic tests, two marketing layout tests, and 33 CI equivalence tests pass. Focused lint and the first production build pass. Final typecheck and refined build are queued at submission.
+- Focused validation: eight geometry/lifecycle tests, seven existing homepage semantic tests, two marketing layout tests, and 33 CI equivalence tests pass. Focused lint, typecheck, and the refined production build pass. The final silhouette correction is limited to shader strings and compiled dimensions; final rendered confirmation remains pending at submission.
 - Visual acceptance: actual GPU output checked at desktop width in light and dark themes and at 390px mobile width. No horizontal overflow or console errors; preview enlargement, Escape/focus return, and scene switching work. The initial solid material was refined into translucent engraving with lower mobile opacity; final confirmation and static-print inspection remain pending at submission.
 - Independent review: complete. A reviewer who authored no changed files reviewed the entire diff and the final shader changes. The sole test assertion finding was repaired and the focused tests passed again.
 - Delivery: pending. Preserve the required exact-head and current-base CI gate before merge, then verify the matching production deployment.
