@@ -30,7 +30,7 @@ The marketing site adopts the AICharts-derived Paper theme from the shared desig
 
 The theme arrives through the existing compiled design-kit and UI boundaries. Oompa imports the opt-in, dependency-free Paper foundation alongside compiler palettes, without standalone component recipes, runtime styles, network assets, or a new package boundary. The public homepage retains its product content, fictional examples, command-line social card, and runtime admission limits.
 
-Status: implementation and focused preference, static-shell, and browser-oracle contracts are present. The final dependency pin, independent review, required compiled browser acceptance, current-base Required CI, and canonical website/app verification remain delivery gates. This theme change does not authorize a daemon upgrade or hosted command-writer activation.
+Status: implementation and stable dependency pins are independently reviewed. Design-kit v0.6.4, UI v0.5.13, and site-footer v0.6.3 share the same compiler contract. Focused preferences, static-shell and browser-oracle checks, full typecheck, six-profile compiled browser acceptance with native custody, and desktop/mobile marketing presentation checks passed. The saved-palette reload runs after the exact per-document resource census and restores Paper/System. Two stale hero-eyebrow assertions now match the approved compact layout while retaining metadata and content checks. The final current-base Required CI and canonical website/app verification remain delivery gates. The domain rollout retains sole alias ownership; this theme change does not authorize a daemon upgrade or hosted command-writer activation.
 
 ## Web appearance (2026-09-08)
 

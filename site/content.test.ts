@@ -281,9 +281,7 @@ describe("public content contract", () => {
     expect(publicContent.description).toContain("daemon and hosted command-writer rollout remains blocked on capacity");
     expect(html).toContain('href="/docs/status/"');
     expect(html).toContain(`<title>${publicContent.productName} | ${publicContent.tagline}</title>`);
-    const eyebrow = oneElement(html, "p.hraness-marketing-hero__eyebrow");
-    expect(eyebrow.textContent).toBe(publicContent.tagline);
-    expectCompiledClasses(eyebrow);
+    expect(parseHTML(html).document.querySelectorAll("p.hraness-marketing-hero__eyebrow")).toHaveLength(0);
     const previewEyebrow = oneElement(renderPreviewHtml(), "p.preview-eyebrow");
     expect(previewEyebrow.textContent).toBe(publicContent.tagline);
     expectCompiledClasses(previewEyebrow);

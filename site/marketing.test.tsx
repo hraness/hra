@@ -114,8 +114,9 @@ describe("public server marketing composition", () => {
     const { document } = parseHTML(renderMarketingPage(publicContent));
     const textAt = (selector: string) => document.querySelector(selector)?.textContent;
     const textsAt = (selector: string) => [...document.querySelectorAll(selector)].map((node) => node.textContent);
+    expect(document.querySelectorAll(".hraness-marketing-hero__eyebrow")).toHaveLength(0);
     for (const [role, text] of [
-      ["eyebrow", publicContent.hero.eyebrow], ["name", publicContent.productName],
+      ["name", publicContent.productName], ["heading", publicContent.hero.heading],
       ["summary", publicContent.hero.summary], ["boundary", publicContent.hero.boundary],
     ]) expect(textAt(`.hraness-marketing-hero__${role}`)).toBe(text);
     expect(textsAt(".hraness-marketing-pillars__label")).toEqual(publicContent.hero.pillars.map((pillar) => pillar.label));
