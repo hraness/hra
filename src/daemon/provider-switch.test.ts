@@ -3425,11 +3425,16 @@ describe("provider portability", () => {
       ambiguousTarget: { account: { id: `acct_${string}` } };
       ambiguousSourceAuthority: ProfileAuthority;
     };
-    let prepared: { owner: ReturnType<typeof createOwnedSwitchCase>; value?: PreparedSeedCase } | undefined;
+    let prepared: {
+      owner: ReturnType<typeof createOwnedSwitchCase>;
+      rejected?: Pick<PreparedSeedCase, "rejected" | "rejectedSession">;
+      value?: PreparedSeedCase;
+    } | undefined;
 
-    // These current-schema cases do not inspect migrations. Reuse the checked
-    // template so two migration chains do not consume the 5s setup allowance.
-    // Keep every seed/replay/abandon assertion under the separate 5s proof deadline.
+    // Prepare the independent fixtures in separate bounded hooks: the first
+    // template use also builds its migrated image. Both phases share one owner
+    // so cancellation joins setup before closing either fixture. Every coupled
+    // seed/replay/abandon assertion retains the separate 5s proof deadline.
     beforeEach(() => {
       const holder: NonNullable<typeof prepared> = { owner: createOwnedSwitchCase() };
       prepared = holder;
@@ -3437,6 +3442,16 @@ describe("provider portability", () => {
       return owner.run(async () => {
         const rejected = await owner.request(() => fixture(undefined, undefined, true, undefined, owner.resources, "template"));
         const rejectedSession = await owner.request(() => codexSession(rejected, owner.signal));
+        owner.signal.throwIfAborted();
+        holder.rejected = { rejected, rejectedSession };
+      });
+    }, 5_000);
+
+    beforeEach(() => {
+      const holder = prepared;
+      if (holder?.rejected === undefined) throw new Error("The rejected seed fixture was not prepared.");
+      const { owner, rejected: { rejected, rejectedSession } } = holder;
+      return owner.run(async () => {
         const ambiguous = await owner.request(() => fixture(undefined, undefined, true, undefined, owner.resources, "template"));
         const ambiguousSession = await owner.request(() => codexSession(ambiguous, owner.signal));
         const ambiguousTarget = await owner.request(() => ambiguous.service.execute(

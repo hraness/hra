@@ -30,8 +30,10 @@ const escapeHtml = (value: string): string =>
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
 
-const defaultPalette = getDesignPaletteTheme("catppuccin", "dark");
-const paletteAttributes = `class="${escapeHtml(defaultPalette.className)}" data-palette="catppuccin" data-theme="dark"`;
+const defaultPalette = getDesignPaletteTheme("paper", "light");
+const previewPalette = getDesignPaletteTheme("catppuccin", "dark");
+const previewPaletteAttributes = `class="${escapeHtml(previewPalette.className)}" data-palette="catppuccin" data-theme="dark"`;
+const paletteAttributes = `class="${escapeHtml(defaultPalette.className)}" data-hraness-theme="paper" data-palette="paper" data-theme="light"`;
 const classes = (hook: string, ...slots: readonly SitePresentationSlot[]): string =>
   [hook, sitePresentationClasses(...slots)].filter(Boolean).join(" ");
 
@@ -175,6 +177,7 @@ const renderHead = (
     readonly openGraphType?: "article" | "website";
     readonly robots?: string;
     readonly title: string;
+    readonly themeColor?: string;
   },
 ): string => {
   const canonicalUrl = `${content.siteUrl}${options.canonicalPath}`;
@@ -229,7 +232,7 @@ ${image.type === undefined ? "" : `<meta property="og:image:type" content="${esc
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:image" content="${escapeHtml(image.src)}">
 <meta name="twitter:image:alt" content="${escapeHtml(image.alt)}">
-<meta name="theme-color" content="${escapeHtml(defaultPalette.background)}">
+<meta name="theme-color" content="${escapeHtml(options.themeColor ?? defaultPalette.background)}">
 ${options.interactiveAppearance === false ? "" : '<script src="/appearance.js"></script>'}
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/styles.css">${structuredData}`;
@@ -277,13 +280,14 @@ ${renderOompaAnalyticsScript()}
 
 export const renderPreviewHtml = (content: PublicContent = publicContent): string =>
   `<!doctype html>
-<html ${paletteAttributes} lang="en">
+<html ${previewPaletteAttributes} lang="en">
 <head>
 ${renderHead(content, {
   canonicalPath: "/",
   description: content.description,
   includeStructuredData: false,
   interactiveAppearance: false,
+  themeColor: previewPalette.background,
   robots: "noindex, nofollow",
   title: `${content.productName} | ${content.tagline}`,
 })}

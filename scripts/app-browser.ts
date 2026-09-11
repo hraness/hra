@@ -406,8 +406,8 @@ export function siteStylesheetPaths(documents: ReadonlyMap<string, Buffer>): rea
     assert.ok(bytes !== undefined && bytes.length > 0 && bytes.length <= 8 * 1024 * 1024, `Missing bounded site document: ${path}`);
     const { document } = parseHTML(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
     assert.equal(document.querySelectorAll("style,[style],base").length, 0, "Static document changed its no-inline/base contract");
-    assert.equal(document.documentElement.getAttribute("data-palette"), "catppuccin", "Static default palette changed");
-    assert.equal(document.documentElement.getAttribute("data-theme"), "dark", "Static default theme changed");
+    assert.equal(document.documentElement.getAttribute("data-palette"), path === "preview/index.html" ? "catppuccin" : "paper", "Static default palette changed");
+    assert.equal(document.documentElement.getAttribute("data-theme"), path === "preview/index.html" ? "dark" : "light", "Static default theme changed");
     const appearance = [...document.querySelectorAll('script[src="/appearance.js"]')];
     const menus = [...document.querySelectorAll("details[data-oompa-appearance]")];
     if (path === "preview/index.html") {
@@ -703,6 +703,24 @@ export async function waitForClosedProductPreview(dialog: Pick<Locator, "waitFor
 
 type CapturedBrowserBody = Promise<{ bytes: Buffer } | { error: unknown }>;
 
+/** Keep resource ownership inside one document's inspection and body settlement. */
+export async function withBrowserResourceCapture(
+  page: {
+    on(event: "response", listener: (response: BrowserResponse) => void): unknown;
+    on(event: "request", listener: (request: BrowserRequest) => void): unknown;
+    off(event: "response", listener: (response: BrowserResponse) => void): unknown;
+    off(event: "request", listener: (request: BrowserRequest) => void): unknown;
+  },
+  captureResponse: (response: BrowserResponse) => void,
+  captureRequest: (request: BrowserRequest) => void,
+  inspectDocument: () => Promise<void>,
+): Promise<void> {
+  page.on("response", captureResponse);
+  page.on("request", captureRequest);
+  try { await inspectDocument(); }
+  finally { page.off("response", captureResponse); page.off("request", captureRequest); }
+}
+
 /** Start native reads at response delivery and observe rejections immediately.
  * A renderer's ready signal does not mean its protocol body read has settled. */
 export function captureBrowserResponseBody(response: Pick<BrowserResponse, "body">): CapturedBrowserBody {
@@ -790,18 +808,24 @@ async function settle(page: Page): Promise<void> {
 
 type ButtonPlacement = "card-content" | "sign-in-form";
 
-/** Independent default-palette contract for the pinned shared package. OS light
- * preference alone must not override a fresh user's Catppuccin dark choice. */
-export function assertDefaultPalette(value: unknown, forced: boolean): void {
+/** Independent product default contract. Paper follows the operating system;
+ * deliberately inert product previews keep their fixed Catppuccin dark world. */
+export function assertDefaultPalette(value: unknown, forced: boolean,
+  appearance: { readonly palette: "paper"; readonly mode: "light" | "dark" } | { readonly palette: "catppuccin"; readonly mode: "dark" } = { palette: "paper", mode: "dark" }): void {
   const sample = record(value);
-  assert.equal(sample.palette, "catppuccin");
-  assert.equal(sample.theme, "dark");
-  assert.equal(sample.primary, forced ? "Highlight" : "#92bafa", "Shared primary semantic color is missing");
-  assert.equal(sample.foreground, forced ? "CanvasText" : "#dbe1f7", "Shared foreground semantic color is missing");
-  if (!forced) assert.equal(sample.background, "rgb(30, 30, 46)", "Default palette background differs from its semantic role");
+  const expected = appearance.palette === "catppuccin"
+    ? { primary: "#92bafa", foreground: "#dbe1f7", background: "rgb(30, 30, 46)" }
+    : appearance.mode === "light"
+      ? { primary: "#1e5ae1", foreground: "#1c1917", background: "rgb(248, 247, 244)" }
+      : { primary: "#8fb0ff", foreground: "#f5f2ed", background: "rgb(18, 16, 15)" };
+  assert.equal(sample.palette, appearance.palette);
+  assert.equal(sample.theme, appearance.mode);
+  assert.equal(sample.primary, forced ? "Highlight" : expected.primary, "Shared primary semantic color is missing");
+  assert.equal(sample.foreground, forced ? "CanvasText" : expected.foreground, "Shared foreground semantic color is missing");
+  if (!forced) assert.equal(sample.background, expected.background, "Default palette background differs from its semantic role");
 }
 
-async function defaultPalette(page: Page, forced: boolean): Promise<void> {
+async function defaultPalette(page: Page, forced: boolean, mode: "light" | "dark" = "dark", preview = false): Promise<void> {
   assertDefaultPalette(await page.evaluate(() => {
     const root = document.documentElement;
     const css = getComputedStyle(root);
@@ -811,11 +835,11 @@ async function defaultPalette(page: Page, forced: boolean): Promise<void> {
       foreground: css.getPropertyValue("--foreground").trim(),
       background: css.backgroundColor,
     };
-  }), forced);
+  }), forced, preview ? { palette: "catppuccin", mode: "dark" } : { palette: "paper", mode });
 }
 
 /** One real guide exercises the shared control; restore before any later route. */
-async function verifyGuideAppearance(page: Page): Promise<void> {
+async function verifyGuideAppearance(page: Page, systemMode: "light" | "dark"): Promise<void> {
   const menu = page.locator("details[data-oompa-appearance]");
   assert.equal(await menu.count(), 1);
   const summary = menu.locator("summary");
@@ -823,13 +847,24 @@ async function verifyGuideAppearance(page: Page): Promise<void> {
   await page.keyboard.press("Enter");
   const mode = menu.locator("select[data-oompa-mode]");
   await mode.selectOption("light");
-  await page.waitForFunction(() => document.documentElement.dataset.palette === "catppuccin" && document.documentElement.dataset.theme === "light"
+  await page.waitForFunction(() => document.documentElement.dataset.palette === "paper" && document.documentElement.dataset.theme === "light"
     && getComputedStyle(document.documentElement).colorScheme === "light");
-  assert.equal(await summary.getAttribute("aria-label"), "Appearance: Catppuccin, Light");
+  assert.equal(await summary.getAttribute("aria-label"), "Appearance: Paper, Light");
   await mode.selectOption("dark");
   await page.waitForFunction(() => document.documentElement.dataset.theme === "dark"
     && getComputedStyle(document.documentElement).colorScheme === "dark");
   await defaultPalette(page, false);
+  const palette = menu.locator("select[data-oompa-palette]");
+  await palette.selectOption("gruvbox");
+  await page.waitForFunction(() => document.documentElement.dataset.palette === "gruvbox");
+  await page.reload();
+  await page.waitForFunction(() => document.documentElement.dataset.palette === "gruvbox" && document.documentElement.dataset.theme === "dark");
+  assert.equal(await summary.getAttribute("aria-label"), "Appearance: Gruvbox, Dark");
+  await summary.focus(); await page.keyboard.press("Enter");
+  await palette.selectOption("paper");
+  await mode.selectOption("system");
+  await page.waitForFunction((expected) => document.documentElement.dataset.palette === "paper" && document.documentElement.dataset.theme === expected, systemMode);
+  await defaultPalette(page, false, systemMode);
   await mode.focus();
   await page.keyboard.press("Escape");
   assert.equal(await menu.evaluate((element) => (element as HTMLDetailsElement).open), false);
@@ -842,8 +877,8 @@ export function assertAppColorScheme(value: unknown, profile: Pick<Profile, "for
   assert.equal(sample.forced, profile.forced, "Forced-colors media did not match the requested profile");
   assert.equal(sample.forcedColorAdjust, "auto", "App opted out of the user's forced-color palette");
   // CSS Color Adjustment §3.1 forces the computed value to "light dark".
-  // Ordinary profiles, including a light OS preference, retain authored dark.
-  assert.equal(sample.colorScheme, profile.forced ? "light dark" : "dark", "App color scheme did not match the verified color-adjustment mode");
+  // Ordinary profiles resolve the product's System default to the requested OS mode.
+  assert.equal(sample.colorScheme, profile.forced ? "light dark" : profile.colorScheme ?? "dark", "App color scheme did not match the verified color-adjustment mode");
 }
 
 export function assertDefaultButtonPresentation(value: unknown, placement: ButtonPlacement): void {
@@ -1597,7 +1632,7 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
             colorScheme: css.colorScheme, forcedColorAdjust: css.forcedColorAdjust,
           };
         }), profile);
-        await defaultPalette(page, profile.forced);
+        await defaultPalette(page, profile.forced, profile.colorScheme ?? "dark");
         await cleanDocument(page);
         mark("production-anonymous:negative-css");
         await negativeStylesheet(page, "button", "/stylex.css", negativeReporter("production-anonymous:negative-css"), restorationBoundary);
@@ -1611,7 +1646,7 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
           await page.locator("#root button").first().waitFor();
           await settle(page);
           await cleanDocument(page);
-          await defaultPalette(page, profile.forced);
+          await defaultPalette(page, profile.forced, profile.colorScheme ?? "dark");
           if (view === "grid") {
             const usage = page.getByRole("button", { name: "Codex usage unknown. Open usage history.", exact: true });
             assert.ok(await usage.isVisible(), "Partial historical usage must remain unknown on the grid");
@@ -1757,10 +1792,8 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
             if (productRequests.length < 256) productRequests.push(request);
             else responseOverflow = true;
           };
-          page.on("response", capture);
-          page.on("request", captureProduct);
           const settleResources = () => settleBrowserResponseBodies([...responses, ...productResponses].map(({ body }) => body));
-          try {
+          await withBrowserResourceCapture(page, capture, captureProduct, async () => {
             mark(`static-site:${routeLabel}:navigation`);
             const response = await page.goto(`${site.origin}${route.pathname}`);
             assert.ok(response !== null);
@@ -1801,7 +1834,7 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
             mark(`static-site:${routeLabel}:color-scheme`);
             assert.equal(await page.evaluate(() => matchMedia("(prefers-color-scheme: light)").matches), profile.colorScheme === "light");
             mark(`static-site:${routeLabel}:background`);
-            await defaultPalette(page, profile.forced);
+            await defaultPalette(page, profile.forced, profile.colorScheme ?? "dark", route.pathname === "/preview/");
             mark(`static-site:${routeLabel}:heading-style`);
             assert.ok(await page.locator(route.heading).evaluate((element) => Number.parseFloat(getComputedStyle(element).fontSize) > 24));
             mark(`static-site:${routeLabel}:inertness`);
@@ -1832,11 +1865,6 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
                   values: await verifyProductScene(iframe, view as ProductView) });
                 await page.waitForFunction(() => document.querySelector("figure[data-product-preview] [data-preview-status]")?.textContent === "");
               }
-            }
-            if (profile.name === "desktop" && route.pathname === "/docs/reference/") {
-              mark("static-site:docs-reference:appearance-menu");
-              await verifyGuideAppearance(page);
-              evidence.push({ name: "desktop:docs-reference:appearance-menu", values: "light, dark restoration, Escape, and focus passed" });
             }
             assert.equal(responseOverflow, false, "Static resource census exceeded its bound");
             mark(`static-site:${routeLabel}:resource-bytes`);
@@ -1882,7 +1910,14 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
             }));
             evidence.push({ name: `${profile.name}:static-site:${route.path}:product-resources`, values: { requests: productRequests.length, delivered: productDelivered } });
             evidence.push({ name: `${profile.name}:static-site:${route.path}`, values: { documentSha256: digest(documentBytes), fonts, delivered: delivered.sort((a, b) => a.path.localeCompare(b.path)) } });
-          } finally { page.off("response", capture); page.off("request", captureProduct); }
+          });
+          if (profile.name === "desktop" && route.pathname === "/docs/reference/") {
+            // Persistence reloads the guide. Finish the exact per-document resource
+            // census first so the second document cannot masquerade as duplicates.
+            mark("static-site:docs-reference:appearance-menu");
+            await verifyGuideAppearance(page, profile.colorScheme ?? "dark");
+            evidence.push({ name: "desktop:docs-reference:appearance-menu", values: "light, dark, saved palette reload, System restoration, Escape, and focus passed" });
+          }
         }
         if (profile.name === "desktop") {
           mark("static-site:docs:search");

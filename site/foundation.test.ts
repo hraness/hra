@@ -47,6 +47,7 @@ test("the static entry joins compiler foundations and local fonts without legacy
     '@import "@hraness/design-kit/compiler-foundation.css";',
     '@import "@hraness/design-kit/fonts.css";',
     '@import "@hraness/site-footer/compiler-foundation.css";',
+    '@import "@hraness/design-kit/paper-theme.css";',
     '@import "./styles.css";',
   ]);
   expect(imports).not.toMatch(/tailwind|components\.css|palettes\.css|@hraness\/[^"\n]+\/styles\.css|https?:/u);

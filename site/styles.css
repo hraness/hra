@@ -21,7 +21,7 @@
   --ui-font-mono: var(--font-mono);
   --hraness-site-accent: var(--primary);
   --hraness-site-accent-ink: var(--primary-foreground);
-  --hraness-site-footer-measure: 72rem;
+  --hraness-site-footer-measure: 80rem;
   font-family: var(--font-sans);
   font-synthesis: none;
   line-height: 1.55;
@@ -52,7 +52,7 @@ body {
   --hraness-marketing-text-font: var(--font-sans);
   --hraness-marketing-heading-font: var(--font-sans);
   --hraness-marketing-mono-font: var(--font-mono);
-  --hraness-marketing-measure: 72rem;
+  --hraness-marketing-measure: 80rem;
 }
 
 

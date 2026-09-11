@@ -281,9 +281,7 @@ describe("public content contract", () => {
     expect(publicContent.description).toContain("daemon and hosted command-writer rollout remains blocked on capacity");
     expect(html).toContain('href="/docs/status/"');
     expect(html).toContain(`<title>${publicContent.productName} | ${publicContent.tagline}</title>`);
-    const eyebrow = oneElement(html, "p.hraness-marketing-hero__eyebrow");
-    expect(eyebrow.textContent).toBe(publicContent.tagline);
-    expectCompiledClasses(eyebrow);
+    expect(parseHTML(html).document.querySelectorAll("p.hraness-marketing-hero__eyebrow")).toHaveLength(0);
     const previewEyebrow = oneElement(renderPreviewHtml(), "p.preview-eyebrow");
     expect(previewEyebrow.textContent).toBe(publicContent.tagline);
     expectCompiledClasses(previewEyebrow);
@@ -1376,8 +1374,8 @@ describe("public content contract", () => {
       const document = parseHTML(renderDocsHtml(page)).document;
       expect(document.querySelector('link[rel="canonical"]')?.getAttribute("href")).toBe(`https://oompa.app${page.path}`);
       expect([...document.querySelectorAll("script[src]")].map((script) => script.getAttribute("src"))).toEqual(["/appearance.js", "/analytics.js", "/site.js"]);
-      expect(document.documentElement.getAttribute("data-palette")).toBe("catppuccin");
-      expect(document.documentElement.getAttribute("data-theme")).toBe("dark");
+      expect(document.documentElement.getAttribute("data-palette")).toBe("paper");
+      expect(document.documentElement.getAttribute("data-theme")).toBe("light");
       expect(document.querySelectorAll("details[data-oompa-appearance]")).toHaveLength(1);
       expect(document.querySelectorAll('script[type="application/ld+json"]')).toHaveLength(1);
     }

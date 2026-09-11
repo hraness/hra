@@ -1,13 +1,44 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runInNewContext } from "node:vm";
-import { assertAppColorScheme, assertDefaultButtonPresentation, assertDefaultPalette, assertKeyboardFocusStrip, assertNativeModalFocus, assertProductPreviewObservation, assetContentType, assetPath, boundedBrowserOperation, browserExecutableSha256, browserFailureDetails, captureBrowserResponseBody, installBrowserServiceWorkerRefusal, inventory, loadedStylesheetControl, productionCsp, settleBrowserResponseBodies, siteFoundationFontPaths, siteProductionCsp, siteStylesheetPaths, snapshotProductPreview, snapshotStaticSite, waitForClosedProductPreview } from "./app-browser";
+import { assertAppColorScheme, assertDefaultButtonPresentation, assertDefaultPalette, assertKeyboardFocusStrip, assertNativeModalFocus, assertProductPreviewObservation, assetContentType, assetPath, boundedBrowserOperation, browserExecutableSha256, browserFailureDetails, captureBrowserResponseBody, installBrowserServiceWorkerRefusal, inventory, loadedStylesheetControl, productionCsp, settleBrowserResponseBodies, siteFoundationFontPaths, siteProductionCsp, siteStylesheetPaths, snapshotProductPreview, snapshotStaticSite, waitForClosedProductPreview, withBrowserResourceCapture } from "./app-browser";
 import { browserIoModules } from "../app/fixtures/browser/config";
 
 describe("browser response lifetime", () => {
+  test("keeps duplicate responses inside one census and detaches before a subsequent document", async () => {
+    const page = new EventEmitter();
+    let requests = 0, responses = 0, unrelatedResponses = 0;
+    page.on("response", () => { unrelatedResponses += 1; });
+    const collected = Promise.withResolvers<undefined>();
+    const census = withBrowserResourceCapture(page, () => { responses += 1; }, () => { requests += 1; }, async () => {
+      page.emit("request"); page.emit("response"); page.emit("response");
+      await collected.promise;
+      expect(responses).toBe(2);
+    });
+    await Promise.resolve();
+    expect(page.listenerCount("request")).toBe(1);
+    collected.resolve(undefined);
+    await census;
+    page.emit("request"); page.emit("response");
+    expect({ requests, responses, unrelatedResponses }).toEqual({ requests: 1, responses: 2, unrelatedResponses: 3 });
+    expect(page.listenerCount("request")).toBe(0);
+    expect(page.listenerCount("response")).toBe(1);
+  });
+
+  test("detaches a failed document census before propagating its exact error", async () => {
+    const page = new EventEmitter();
+    const failure = new Error("Document resource mismatch");
+    await expect(withBrowserResourceCapture(page, () => undefined, () => undefined, async () => {
+      throw failure;
+    })).rejects.toBe(failure);
+    expect(page.listenerCount("request")).toBe(0);
+    expect(page.listenerCount("response")).toBe(0);
+  });
+
   test("captures immediately and settles bytes before the caller can discard a document", async () => {
     const received = Promise.withResolvers<Buffer>();
     const events: string[] = [];
@@ -155,8 +186,8 @@ function staticSiteFixture(sanitized = false) {
   const css = fontPaths.map((path, index) => `@font-face{font-family:"Fixture ${index}";src:url("./${path.split("/").at(-1)}") format("woff2")}`).join("");
   const appearance = '<script src="/appearance.js"></script>';
   const menu = '<header><details data-oompa-appearance><summary>Appearance</summary></details></header>';
-  const html = Buffer.from(`<!doctype html><html data-palette="catppuccin" data-theme="dark"><head><link rel="stylesheet" href="/${foundation}"><link rel="stylesheet" href="/stylex.css">${appearance}</head><body>${menu}<h1 class="x123">Fixture</h1></body></html>`);
-  const inertHtml = Buffer.from(html.toString().replace(appearance, "").replace(menu, ""));
+  const html = Buffer.from(`<!doctype html><html data-hraness-theme="paper" data-palette="paper" data-theme="light"><head><link rel="stylesheet" href="/${foundation}"><link rel="stylesheet" href="/stylex.css">${appearance}</head><body>${menu}<h1 class="x123">Fixture</h1></body></html>`);
+  const inertHtml = Buffer.from(html.toString().replace(appearance, "").replace(menu, "").replace('data-palette="paper"', 'data-palette="catppuccin"').replace('data-theme="light"', 'data-theme="dark"').replace(' data-hraness-theme="paper"', ""));
   const files = new Map<string, Buffer>([
     ["index.html", html], ["privacy/index.html", html], ["preview/index.html", inertHtml],
     ...docsRoutes.map((path) => [`${path}/index.html`, html] as const),
@@ -176,8 +207,8 @@ describe("static site graph acceptance", () => {
       for (const mutate of [
         (html: string) => html.replace('<script src="/appearance.js"></script>', ""),
         (html: string) => html.replace('src="/appearance.js"', 'defer src="/appearance.js"'),
-        (html: string) => html.replace('data-palette="catppuccin"', 'data-palette="other"'),
-        (html: string) => html.replace('data-theme="dark"', 'data-theme="light"'),
+        (html: string) => html.replace(/data-palette="(?:paper|catppuccin)"/u, 'data-palette="other"'),
+        (html: string) => html.replace(/data-theme="(?:light|dark)"/u, 'data-theme="other"'),
         (html: string) => html.replace("data-oompa-appearance", "data-unbound-appearance"),
       ]) {
         const fixture = staticSiteFixture();
@@ -461,7 +492,7 @@ describe("separate closed product example generation", () => {
 });
 
 test("default palette assertions retain semantic roles and respect native forced colors", () => {
-  const sample = { palette: "catppuccin", theme: "dark", primary: "#92bafa", foreground: "#dbe1f7", background: "rgb(30, 30, 46)" };
+  const sample = { palette: "paper", theme: "dark", primary: "#8fb0ff", foreground: "#f5f2ed", background: "rgb(18, 16, 15)" };
   const forced = { ...sample, primary: "Highlight", foreground: "CanvasText", background: "Canvas" };
   expect(() => assertDefaultPalette(sample, false)).not.toThrow();
   expect(() => assertDefaultPalette(forced, true)).not.toThrow();
@@ -471,6 +502,15 @@ test("default palette assertions retain semantic roles and respect native forced
     expect(() => assertDefaultPalette({ ...sample, [field]: "wrong" }, false)).toThrow();
     if (field !== "background") expect(() => assertDefaultPalette({ ...forced, [field]: "wrong" }, true)).toThrow();
   }
+});
+
+test("palette acceptance distinguishes the light OS default from the fixed dark preview", () => {
+  const light = { palette: "paper", theme: "light", primary: "#1e5ae1", foreground: "#1c1917", background: "rgb(248, 247, 244)" };
+  const preview = { palette: "catppuccin", theme: "dark", primary: "#92bafa", foreground: "#dbe1f7", background: "rgb(30, 30, 46)" };
+  expect(() => assertDefaultPalette(light, false, { palette: "paper", mode: "light" })).not.toThrow();
+  expect(() => assertDefaultPalette(preview, false, { palette: "catppuccin", mode: "dark" })).not.toThrow();
+  expect(() => assertDefaultPalette(preview, false, { palette: "paper", mode: "light" })).toThrow();
+  expect(() => assertDefaultPalette(light, false, { palette: "catppuccin", mode: "dark" })).toThrow();
 });
 
 test("offset focus contrast uses the exposed surface and composites native alpha colors", () => {
@@ -633,12 +673,12 @@ describe("loaded stylesheet negative control", () => {
 });
 
 describe("browser acceptance boundaries", () => {
-  test("requires exact authored dark for ordinary profiles, including a light OS preference", () => {
+  test("requires the product System default to follow each ordinary OS profile", () => {
     for (const colorScheme of ["dark", "light"] as const) {
       const profile = { forced: false, colorScheme };
-      const sample = { forced: false, colorScheme: "dark", forcedColorAdjust: "auto" };
+      const sample = { forced: false, colorScheme, forcedColorAdjust: "auto" };
       expect(() => assertAppColorScheme(sample, profile)).not.toThrow();
-      for (const invalid of ["light", "light dark", "dark light", "only dark", "normal", undefined]) {
+      for (const invalid of [colorScheme === "light" ? "dark" : "light", "light dark", "dark light", "only dark", "normal", undefined]) {
         expect(() => assertAppColorScheme({ ...sample, colorScheme: invalid }, profile)).toThrow();
       }
     }
