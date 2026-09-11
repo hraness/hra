@@ -1,5 +1,7 @@
 # Oompa product website and documentation
 
+Domain update, 2026-09-10: [the current domain plan](./oompa-app-domain.md) supersedes earlier host choices in this record. Current website and app destinations are `oompa.app` and `app.oompa.app`; prior hosts grant no current routing or authentication authority. Dated delivery evidence remains historical.
+
 Status: implemented; final integration and delivery pending. Owner: Hraness. Source checked: 2026-09-08. Reassess: 2026-10-20.
 
 ## Scope and decision

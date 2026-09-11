@@ -169,7 +169,7 @@ describe("task-oriented documentation content", () => {
     const signInIndex = pairing.blocks.findIndex((block) =>
       blockLinks(block).includes("/docs/web/#cloud-sign-in-and-device-pairing"),
     );
-    const browserIndex = pairing.blocks.findIndex((block) => blockLinks(block).some((href) => href === "https://app.oompa.dev/"));
+    const browserIndex = pairing.blocks.findIndex((block) => blockLinks(block).some((href) => href === "https://app.oompa.app/"));
     expect(signInIndex).toBeGreaterThan(-1);
     expect(browserIndex).toBeGreaterThan(signInIndex);
     const instructions = blockText(pairing.blocks[signInIndex]!);
@@ -179,7 +179,7 @@ describe("task-oriented documentation content", () => {
 
   test("teaches actual browser actions without granting browser device or provider authority", () => {
     const text = pageText(pageAt("/docs/web/"));
-    expect(text).toContain("app.oompa.dev");
+    expect(text).toContain("app.oompa.app");
     const hold = text.indexOf("Initialization, daemon startup, and hosted command writers remain blocked on capacity");
     expect(hold).toBeGreaterThan(-1);
     expect(hold).toBeLessThan(text.indexOf("oompa auth login --input-stdin"));
