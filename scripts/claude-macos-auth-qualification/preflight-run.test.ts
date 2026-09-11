@@ -44,7 +44,10 @@ function fixture() {
       stdoutBytes: 20, stderrBytes: 0 as const, deadlineMs: 5000, elapsedMs: 10,
       detachment: { identity: { pid: 123, pidDomain: "darwin" as const, procStart: "Fri Sep 11 16:34:59 2026" },
         setsidChecked: true as const, newSession: true as const, controllingTty: false as const, stdinClosed: true as const },
-      loginHelp: operation === "login_help" ? { optionRows: [{ flags: ["--claudeai"], argument: "none" as const }], projectionComplete: true } : null,
+      loginHelp: operation === "login_help" ? { optionRows: [{ flags: ["--claudeai"], argument: "none" as const }], projectionComplete: true,
+        diagnostics: { version: 1 as const, usage: "exact" as const, scan: "scanned" as const,
+          lineCount: 3, optionsHeadingCount: 1, candidateCount: 1, acceptedCount: 1,
+          candidateLimitExceeded: false, rejectionsTruncated: false, rejections: [] } } : null,
     })));
     return { source: "credential_free_fixture", admitted: false, reason: "login_help_unverified", runId: binding.runId, attemptId,
       exactVersionBoth: true, logoutHelpBoth: true, loginHelpBoth: false, probes };
@@ -70,7 +73,10 @@ test("fixed runner durably dispatches one fresh attempt, keeps step zero, retain
   expect(value.calls).toEqual(["capture", "create", "fresh", "persist:intent", "persist:persisted", "environment", "custody-current", "source-current", "persist:dispatched", "collect-six", "release"]);
   expect(value.state().events.map((event) => event.type)).toEqual(["intent", "persisted", "dispatch"]);
   expect(value.state().step).toBe(0); expect(value.state().pending?.stage).toBe("dispatched");
-  expect(outcome.diagnostic?.probes).toHaveLength(6); cleared(value);
+  expect(outcome.diagnostic?.probes).toHaveLength(6);
+  expect(outcome.diagnostic?.probes.filter((probe) => probe.operation === "login_help").map((probe) => probe.loginHelp?.diagnostics))
+    .toEqual(value.diagnostic().probes.filter((probe) => probe.operation === "login_help").map((probe) => probe.loginHelp?.diagnostics));
+  cleared(value);
 });
 
 test("each uncertain checkpoint stops the sequence without a second write or any preflight effect", async () => {
