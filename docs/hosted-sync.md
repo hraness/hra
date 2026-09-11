@@ -514,10 +514,19 @@ committed lockfile with `--frozen-lockfile --ignore-scripts --backend=copyfile`,
 but first applies the complete source proof to the materialized worktree so Bun
 cannot parse checkout-converted package or lockfile bytes. After installation it
 repeats the configuration, raw-blob, index, origin, and protected-main checks in
-both worktrees. Only after those checks may the fresh dependency tree receive
-the credential descriptor. The launcher ignores ambient `TMPDIR` and creates
+both worktrees. In `prove` mode it next runs only `scripts/build-app.ts`, with
+`OOMPA_RELEASE_COMMIT` fixed to that source and both Vercel marker variables
+absent, and requires successful completion of the sealed production build.
+It repeats both complete source checks after that build. Only then may the
+fresh dependency tree receive the credential descriptor. Retained verification
+performs no build. The launcher ignores ambient `TMPDIR` and creates
 its directory as a direct child of the canonical root-owned sticky `/tmp`
-directory, so another operating-system user cannot rename that entry. It
+directory, so another operating-system user cannot rename that entry. An attempted build that fails, signals, throws, or fails either post-build
+source check retains that worktree and all builder recovery records. Its closed
+refusal adds a bounded `retainedBuild` directory locator with `locatorOnly:true`;
+this identifies the originally admitted scratch path, not current custody,
+cleanup permission or permission to retry. Preserve and reconcile it before
+any cleanup. After a successful build and source join, the launcher
 removes its exact registered temporary worktree after the verifier returns,
 verifies that Git no longer lists it, removes the same private directory
 identity, and refuses if cleanup cannot be proven. Every child receives a fixed
@@ -596,11 +605,15 @@ framework, build, install, output, and outside-root-source contract above; its
 dashboard ignore command may be unset because the tracked configuration owns
 that setting, but any other value is refused. The effective deployment must
 carry the exact tracked build, install, output, framework, and ignore command.
-Because the single-deployment response omits root and outside-root fields, a
-second bounded, cursor-paginated `/v7/deployments` readback locates the exact
-deployment under project, commit, branch, target, and state filters and binds
-its complete immutable settings snapshot too. A Git deployment with a
-per-deployment build override is therefore refused. The exact project-domain
+The v13 detail must report all six of those historical settings, including the
+nullable dev command. A second bounded, cursor-paginated `/v7/deployments`
+readback locates the exact deployment under project, commit, branch, target,
+and state filters. Its optional settings may be absent, but every reported
+setting must match, including root and outside-root values if present. Missing
+historical root and outside-root settings are explicitly `not-attested`;
+current project settings never fill them in. Mandatory public artifact equality
+below establishes the served publication, without claiming the historical
+build used a root setting that the provider does not expose. The exact project-domain
 record must be verified,
 unredirected, production-scoped, and directly configured through a Vercel
 `A` or `CNAME` record rather than an HTTP proxy. The project must have no live
@@ -646,6 +659,30 @@ an active rolling release, active Skew Protection, any live project route, an
 active WAF redirect, an observed provider or protected-main change during the
 at-most-five-minute sample, or a non-READY deployment stops the observation.
 
+The same sample also compares every artifact in the fresh local app publication
+with its exact public URL, plus `/` with the local `index.html`. All public
+requests exclude credentials, refuse redirects and unexpected origins, use a
+fresh nonce and enforce the seven source-defined security headers; both HTML
+entry responses and the marker require `no-store`. Actual response lengths and
+SHA-256 digests must equal the complete local inventory. The marker is compared
+as exact canonical bytes as well as parsed identity. The local reader joins the
+publication record to its actual package, lockfile, marker environment and full
+`app/dist` inventory before and after network observation. The launcher's
+successful sealed build supplies compiler-completion provenance; parsing a
+publication record alone does not reconstruct that provenance.
+
+The accepted inventory allows at most 64 files, 8 MiB per artifact, and 32 MiB
+across all public artifact response bytes, including the additional `/` read.
+All provider, marker and artifact requests share the 128-request, five-minute
+observation budget and per-request deadline. Existing local builder readers
+retain their own 4,096-file, 64-MiB-file and 256-MiB census limits; the smaller
+public limits do not claim stronger local preallocation bounds. The receipt
+contains the complete manifest and its digest, explicit byte counters and
+source/package/lock/publication bindings. It proves equality for the named
+publication and canonical entry only; it does not enumerate unlisted remote
+files or prove their absence. Source and provider samples still cannot rule out
+an unobserved move away and restoration between reads.
+
 The bulk-redirect read requests page 1 with ten records per page. A response
 without pagination is accepted only as the exact empty form
 `{redirects:[],version:null}`, corroborated by an authenticated empty versions
@@ -657,7 +694,7 @@ HTTP errors and missing fields never establish absence.
 
 `--evidence-path` must be an absolute normalized path naming an absent direct
 child of a protected mode-`0700` evidence directory. The command publishes one
-schema-version-3 canonical, self-digested, mode-`0600`, single-link document
+schema-version-4 canonical, self-digested, mode-`0600`, single-link document
 through no-follow and atomic no-replace checks, then syncs and revalidates it.
 Earlier proof versions require a fresh observation with the current verifier.
 It never overwrites or treats an exact replay as success. Standard output is
