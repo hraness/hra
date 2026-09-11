@@ -635,8 +635,8 @@ describe("release workflow", () => {
       expect(guide).not.toContain("You can install and check v0.8.0 now");
     }
     expect(readme).not.toContain("The v0.7.1 candidate is not yet admitted");
-    expect(readme).toContain("[Availability](https://oompa.dev/docs/status/)");
-    expect(readme).toContain("[ordered update runbook](https://oompa.dev/docs/status/#install-and-update)");
+    expect(readme).toContain("[Availability](https://oompa.app/docs/status/)");
+    expect(readme).toContain("[ordered update runbook](https://oompa.app/docs/status/#install-and-update)");
     expect(readme).not.toContain("Local CLI v0.7.0 is a release candidate");
     const homepageAvailability = publicContent.questions.find(({ question }) => question === "Can I start using it now?");
     expect(homepageAvailability).toBeDefined();
@@ -900,7 +900,7 @@ describe("release workflow", () => {
     expect(routing).toContain("The v0.7.1 artifact is fully admitted");
     expect(routing).toContain("Operational rollout remains pending");
     expect(releaseNotes).toContain("../README.md#get-started");
-    expect(releaseNotes).toContain("https://oompa.dev/docs/status/#install-and-update");
+    expect(releaseNotes).toContain("https://oompa.app/docs/status/#install-and-update");
     expect(releaseNotes).not.toContain("../README.md#update-runbook");
     const recovery = releaseRecord.split("## Recover delayed public visibility\n")[1]?.split("\n## ")[0];
     for (const boundary of [
