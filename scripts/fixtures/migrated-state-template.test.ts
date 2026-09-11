@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, test } from "bun:test";
 import { lstat, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -41,6 +41,17 @@ function snapshot(path: string): unknown {
 }
 
 describe("migrated state template", () => {
+  // Build the reusable template in its own bounded setup. The comparison still
+  // migrates a separate empty database and retains its five-second body limit.
+  beforeAll(async () => {
+    const { home, paths } = await freshRoot();
+    try {
+      await provisionMigratedStateTemplate(paths, { resolveMachineTimeZone: () => timeZone });
+    } finally {
+      await rm(home, { force: true, recursive: true });
+    }
+  }, 5_000);
+
   test("provisions a store identical to a real migration under the same clock and time zone", async () => {
     const real = await freshRoot();
     const templated = await freshRoot();
