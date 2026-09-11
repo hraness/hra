@@ -2,6 +2,7 @@
 
 - Pin holds the one exact Claude Code version, Fable model id, reasoning effort, and reviewed stream-json matrix digests.
 - Runtime discovery locates and version-admits the pinned `claude` executable and builds its exact argv.
+- Account metadata reads expose only normalized cached identity scalars through the existing bounded no-follow reader. Authentication and credential-principal evidence remain separate from those cached fields.
 - Process spawns that executable with the same environment allowlist Codex uses. Managed profiles set a reviewed absolute `CLAUDE_CONFIG_DIR`; the explicitly bound personal profile omits that variable so Claude resolves its canonical default home itself. The runtime profile records which mode was used.
 - Protocol parses every stream-json line from `unknown` into a closed union and maps `can_use_tool` onto Oompa interaction kinds.
 - Assembler is the delta assembler: it owns turn, item, and subagent identity and emits the closed fact vocabulary the runtime consumes.

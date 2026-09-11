@@ -1,12 +1,14 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import * as fs from "node:fs";
 import {
   chmodSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -19,6 +21,7 @@ import {
   appSourceProofRuntimeInjectionEnvironmentNames,
   assertHardenedAppSourceProofStageZero,
   assertHostedOperatorSource,
+  captureHostedOperatorSource,
   commandCapacityChildEnvironment,
   createAppSourceProofScratchDirectory,
   executeAppSourceProofLauncher,
@@ -747,6 +750,75 @@ describe("Oompa browser app source proof launcher", () => {
       fixture.git(["remote", "set-url", "origin", "https://untrusted.invalid/oompa.git"]);
       expect(() => assertHostedOperatorSource(expected)).toThrow("verifier_source_invalid");
       expect(fixture.events).toEqual([]);
+    } finally { fixture.cleanup(); }
+  });
+
+  test("captured source retains exact private content without claiming later Git state", () => {
+    const fixture = realRepositoryLauncherFixture({ "payload.txt": "canonical\n" });
+    try {
+      const commit = fixture.git(["rev-parse", "--verify", "HEAD^{commit}"]).trim();
+      const source = captureHostedOperatorSource({ repositoryRoot: fixture.root, sourceCommit: commit });
+      expect(Object.keys(source).sort()).toEqual(["assertCapturedContentCurrent", "sourceCommit", "sourceTree"]);
+      expect(Object.isFrozen(source)).toBe(true);
+      expect(source.sourceCommit).toBe(commit);
+      expect(source.sourceTree).toBe(fixture.git(["rev-parse", "--verify", "HEAD^{tree}"]).trim());
+      fixture.git(["remote", "set-url", "origin", "https://untrusted.invalid/oompa.git"]);
+      fixture.git(["update-index", "--assume-unchanged", "payload.txt"]);
+      writeFileSync(join(fixture.root, "untracked.txt"), "later unrelated file\n");
+      expect(() => source.assertCapturedContentCurrent()).not.toThrow();
+      expect(() => captureHostedOperatorSource({ repositoryRoot: fixture.root, sourceCommit: commit })).toThrow("verifier_source_invalid");
+      writeFileSync(join(fixture.root, "payload.txt"), "changed!!\n");
+      expect(() => source.assertCapturedContentCurrent()).toThrow("verifier_source_invalid");
+    } finally { fixture.cleanup(); }
+  });
+
+  test("captured source refuses root replacement and executable-mode drift", () => {
+    const fixture = realRepositoryLauncherFixture({ "payload.txt": "canonical\n" });
+    const moved = `${fixture.root}-retained`;
+    try {
+      const source = captureHostedOperatorSource({ repositoryRoot: fixture.root,
+        sourceCommit: fixture.git(["rev-parse", "--verify", "HEAD^{commit}"]).trim() });
+      chmodSync(join(fixture.root, "payload.txt"), 0o755);
+      expect(() => source.assertCapturedContentCurrent()).toThrow("verifier_source_invalid");
+      chmodSync(join(fixture.root, "payload.txt"), 0o644);
+      renameSync(fixture.root, moved);
+      mkdirSync(fixture.root, { mode: 0o700 });
+      writeFileSync(join(fixture.root, "payload.txt"), "canonical\n");
+      expect(() => source.assertCapturedContentCurrent()).toThrow("verifier_source_invalid");
+    } finally { fixture.cleanup(); rmSync(moved, { recursive: true, force: true }); }
+  });
+
+  test("captured source checks the named file after descriptor hashing", () => {
+    const fixture = realRepositoryLauncherFixture({ "payload.txt": "canonical\n" });
+    try {
+      const source = captureHostedOperatorSource({ repositoryRoot: fixture.root,
+        sourceCommit: fixture.git(["rev-parse", "--verify", "HEAD^{commit}"]).trim() });
+      const original = fs.fstatSync;
+      let reads = 0;
+      function observedStat(descriptor: number, options?: fs.StatOptions & { bigint?: false | undefined }): fs.Stats;
+      function observedStat(descriptor: number, options: fs.StatOptions & { bigint: true }): fs.BigIntStats;
+      function observedStat(descriptor: number, options?: fs.StatOptions): fs.Stats | fs.BigIntStats;
+      function observedStat(descriptor: number, options?: fs.StatOptions): fs.Stats | fs.BigIntStats {
+        const value = original(descriptor, options);
+        if (++reads === 2) {
+          renameSync(join(fixture.root, "payload.txt"), join(fixture.root, "retained.txt"));
+          writeFileSync(join(fixture.root, "payload.txt"), "canonical\n", { mode: 0o644 });
+        }
+        return value;
+      }
+      const observe = spyOn(fs, "fstatSync").mockImplementation(observedStat);
+      try { expect(() => source.assertCapturedContentCurrent()).toThrow("verifier_source_invalid"); }
+      finally { observe.mockRestore(); }
+      expect(reads).toBe(2);
+    } finally { fixture.cleanup(); }
+  });
+
+  test("capture rejects oversized tracked content before reading its bytes", () => {
+    const fixture = realRepositoryLauncherFixture({ "oversized.txt": "x".repeat(8 * 1024 * 1024 + 1) });
+    try {
+      const expected = { repositoryRoot: fixture.root,
+        sourceCommit: fixture.git(["rev-parse", "--verify", "HEAD^{commit}"]).trim() };
+      expect(() => captureHostedOperatorSource(expected)).toThrow("verifier_source_invalid");
     } finally { fixture.cleanup(); }
   });
 
