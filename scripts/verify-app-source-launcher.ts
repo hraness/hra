@@ -733,11 +733,19 @@ const registeredWorktrees = (document: string): ReadonlySet<string> => new Set(
 const renderFailure = (
   error: unknown,
   stderr: Readonly<{ write(value: string): unknown }>,
+  retainedBuildIdentity?: ScratchDirectoryIdentity,
 ): number => {
   const code = error instanceof AppSourceProofLauncherError
     ? error.code
     : "verifier_execution_failed";
-  stderr.write(`${JSON.stringify({ code, schemaVersion: 1, status: "refused" })}\n`);
+  // This identity came only from fixed-namespace scratch admission. Report its
+  // original path without turning a fresh lookup into recovery authority.
+  const retainedBuild = retainedBuildIdentity !== undefined
+    && retainedBuildIdentity.path.length <= 512
+    && isNormalizedAbsolutePath(retainedBuildIdentity.path)
+    ? { directory: retainedBuildIdentity.path, locatorOnly: true } : undefined;
+  stderr.write(`${JSON.stringify({ code, schemaVersion: 1, status: "refused",
+    ...(retainedBuild === undefined ? {} : { retainedBuild }) })}\n`);
   return 1;
 };
 
@@ -751,6 +759,7 @@ export const executeAppSourceProofLauncher = (
   let scratchDirectory: string | undefined;
   let scratchIdentity: ScratchDirectoryIdentity | undefined;
   let worktreeAddAttempted = false;
+  let buildNeedsRecovery = false;
   let credentialDescriptor = -1;
   let result: CommandResult | undefined;
   let failure: unknown;
@@ -816,6 +825,20 @@ export const executeAppSourceProofLauncher = (
 
     assertExactSource(rootInput, expected.sourceCommit, runCommand, requireRemoteMain);
     assertExactSource(worktree, expected.sourceCommit, runCommand, requireRemoteMain);
+    if (expected.mode === "prove") {
+      // The fresh, source-verified scratch checkout owns this fixed sealed build.
+      // A failed attempt retains its exact source worktree and builder records.
+      // No credential is opened before successful completion and source rechecks.
+      buildNeedsRecovery = true;
+      requireSuccessfulCommand(runCommand([
+        dependencies.runtimePath ?? process.execPath,
+        "--no-env-file", "--config=/dev/null", join(worktree, "scripts", "build-app.ts"),
+      ], { cwd: worktree, environment: { ...appSourceProofChildEnvironment(), OOMPA_RELEASE_COMMIT: expected.sourceCommit } }),
+      "verifier_install_failed");
+      assertExactSource(rootInput, expected.sourceCommit, runCommand, requireRemoteMain);
+      assertExactSource(worktree, expected.sourceCommit, runCommand, requireRemoteMain);
+      buildNeedsRecovery = false;
+    }
     const verifier = join(worktree, "scripts", "verify-app-source.ts");
     const command = hostedOperator
       ? [
@@ -897,7 +920,7 @@ export const executeAppSourceProofLauncher = (
         failure = new AppSourceProofLauncherError("provider_credentials_refused");
       }
     }
-    if (scratchDirectory !== undefined && scratchIdentity !== undefined) {
+    if (scratchDirectory !== undefined && scratchIdentity !== undefined && !buildNeedsRecovery) {
       let cleanupFailed = false;
       try {
         assertSameScratchDirectory(scratchIdentity);
@@ -948,7 +971,7 @@ export const executeAppSourceProofLauncher = (
       }
     }
   }
-  if (failure !== undefined) return renderFailure(failure, dependencies.stderr);
+  if (failure !== undefined) return renderFailure(failure, dependencies.stderr, buildNeedsRecovery ? scratchIdentity : undefined);
   if (result === undefined) return renderFailure(
     new AppSourceProofLauncherError("verifier_execution_failed"),
     dependencies.stderr,
