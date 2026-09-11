@@ -27,6 +27,7 @@ async function main(): Promise<void> {
   const binding = bindDarwinForegroundLogin({ executablePath, executableSha256: input.sha256, configDir,
     temporaryDirectory: join(process.cwd(), "temporary"), environment: { PATH: "/usr/bin:/bin", HOME: homedir(), LANG: "C", LC_ALL: "C", TZ: "UTC", ANTHROPIC_API_KEY: "synthetic-must-not-cross", NODE_OPTIONS: "synthetic-must-not-cross" },
   });
+  binding.assertOwnerTerminalCurrent();
   const runtime: PinnedClaudeRuntime = { executablePath, version: CLAUDE_PIN, model: CLAUDE_PIN_MODEL, effort: CLAUDE_PIN_EFFORT,
     nativeFallback: CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY, argv: buildPinnedClaudeRuntimeArgv({ executablePath, nativeFallback: CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY }) };
   let secondRefused = false;
@@ -61,6 +62,7 @@ async function main(): Promise<void> {
   }); } finally { restoreTerminal?.(); }
   phase = "collection";
   const settlement = await binding.settled();
+  binding.assertOwnerTerminalCurrent();
   writeFileSync(join(process.cwd(), "result.json"), JSON.stringify({ result, settlement, secondRefused, ownerPid: process.pid }), { mode: 0o600, flag: "wx" });
   if (process.connected) process.disconnect?.();
 }

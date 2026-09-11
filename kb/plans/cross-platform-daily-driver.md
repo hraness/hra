@@ -24,6 +24,10 @@ The reviewed source and runtime admission adapter binds the current executable b
 
 The help inspector now adds bounded rejection reasons, counts and layout metadata without retaining descriptions or placeholder names. All 43 focused help, preflight, runner and logout tests passed, with strict types, lint and independent review. A conservative complete private outcome remains below the unchanged 64 KiB limit. These additions preserve the option grammar and `admitted:false`; a separately recorded diagnostic must use a new source binding and fresh roots. The original attempt cannot be replayed or reclassified as complete. The full owner ceremony and managed-profile qualification remain pending.
 
+A second fresh diagnostic completed six joined probes and identified the incomplete projection as one non-option line aligned with the preceding option description. Both historical attempts remain recovery-only and performed no authentication. The strict login-help parser now matches the observed bounded declarations and continuation layout, with 48 focused tests, strict types, lint and independent review. A future fresh capture must pass it; historical diagnostics are not upgraded into capability authority.
+
+The bounded first-account composition is implemented for source review and validation. It retains genuine runtimes, verifies both fresh profiles signed out, persists each effect boundary and binds a single foreground A login to a subsequent owner-terminal observation. It stops at step 2 without claiming account isolation or activation. Focused checks, independent implementation review, affected native terminal fixtures and actual owner interaction remain pending. The complete continuation through both accounts, bidirectional logout, interruption and recovery must still be implemented and qualified before daily-driver activation.
+
 ## Qualification boundaries
 
 | Work | Required evidence and authority |

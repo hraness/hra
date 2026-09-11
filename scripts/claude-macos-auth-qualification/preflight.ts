@@ -3,8 +3,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 
 import { CLAUDE_PIN } from "../../src/claude/pin";
-import { resolvePinnedClaudeRuntime, type ClaudeVersionProbeProcess } from "../../src/claude/runtime";
-import { inspectClaudeAuthLoginHelp, parseClaudeAuthLogoutHelp } from "../claude-auth-help";
+import { resolvePinnedClaudeRuntime, type ClaudeVersionProbeProcess, type PinnedClaudeRuntime } from "../../src/claude/runtime";
+import { inspectClaudeAuthLoginHelp, parseClaudeAuthLoginHelp, parseClaudeAuthLogoutHelp } from "../claude-auth-help";
 import { parseDarwinTerminalDevice } from "../claude-macos-auth-process/detachment";
 import { bindDarwinDetachedAuthProcess, type DetachedAuthSettlement } from "../claude-macos-auth-process/process";
 import { QualificationCustody, type QualificationDispatchAuthority, type QualificationDispatchScope } from "./custody";
@@ -59,6 +59,11 @@ type Diagnostic = Readonly<{
   admitted: false; reason: "login_help_unverified"; runId: string; attemptId: string;
   exactVersionBoth: true; logoutHelpBoth: true; loginHelpBoth: false; probes: readonly Probe[];
 }>;
+export type ClaudeMacosCapabilities = Readonly<{
+  kind: "capabilities_only"; runId: string; attemptId: string;
+  exactVersionBoth: true; logoutHelpBoth: true; loginHelpBoth: true; probes: readonly Probe[];
+  runtimes: Readonly<{ A: PinnedClaudeRuntime; B: PinnedClaudeRuntime }>;
+}>;
 const authoritySchema = z.strictObject({ revalidate: z.custom<ClaudeMacosPreflightAuthority["revalidate"]>((value) => typeof value === "function") });
 const commonSchema = z.strictObject({ environment: environmentSchema, signal: z.instanceof(AbortSignal), authority: authoritySchema });
 const nativeInputSchema = commonSchema.extend({ custody: z.custom<QualificationCustody>((value) => value instanceof QualificationCustody) });
@@ -83,7 +88,9 @@ const sameEnvironment = (a: Readonly<Record<string, string | undefined>>, b: Rea
   Object.keys(a).length === Object.keys(b).length && Object.keys(a).every((key) => Object.hasOwn(b, key) && a[key] === b[key]);
 
 /** Private composition only; metadata/source authority must settle independently of native deadlines. */
-async function collectPreflight(input: CommonInput, stateInput: unknown, source: "native_process" | "credential_free_fixture", ports: FixturePorts): Promise<Diagnostic> {
+async function collectPreflight(input: CommonInput, stateInput: unknown, source: "native_process" | "credential_free_fixture", ports: FixturePorts, mode: "diagnostic"): Promise<Diagnostic>;
+async function collectPreflight(input: CommonInput, stateInput: unknown, source: "native_process" | "credential_free_fixture", ports: FixturePorts, mode: "strict"): Promise<ClaudeMacosCapabilities>;
+async function collectPreflight(input: CommonInput, stateInput: unknown, source: "native_process" | "credential_free_fixture", ports: FixturePorts, mode: "diagnostic" | "strict"): Promise<Diagnostic | ClaudeMacosCapabilities> {
   const state = snapshotSchema.safeParse(stateInput);
   if (!state.success || (source === "native_process" ? !nativeQualificationBindingSchema.safeParse(state.data.binding).success
     : !qualificationBindingSchema.safeParse(state.data.binding).success)) throw new ClaudeMacosPreflightError("scope_refused", "not_started");
@@ -91,6 +98,7 @@ async function collectPreflight(input: CommonInput, stateInput: unknown, source:
   const environment = Object.freeze({ ...input.environment });
   const revalidate = input.authority.revalidate.bind(input.authority);
   const probes: Probe[] = []; const issued = new Set<string>();
+  const runtimes = new Map<"A" | "B", PinnedClaudeRuntime>();
   let started = 0; let joined = 0; let active: ClaudeVersionProbeProcess | null = null;
   let failure: Failure = "authority_refused";
   const cleanup = (): Cleanup => started === 0 ? "not_started" : started === joined ? "joined" : "uncertain";
@@ -140,9 +148,10 @@ async function collectPreflight(input: CommonInput, stateInput: unknown, source:
       // Preserve a leading BOM so help digests cover the original valid UTF-8 bytes
       // and the existing exact version parser sees, and can refuse, that scalar.
       const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(stdout);
-      const loginHelp = scope.operation === "login_help" ? inspectClaudeAuthLoginHelp({ exitCode: observed.exitCode, stdout: text, stderr: "" }) : null;
+      const loginHelp = scope.operation === "login_help" && mode === "diagnostic" ? inspectClaudeAuthLoginHelp({ exitCode: observed.exitCode, stdout: text, stderr: "" }) : null;
       const stdoutSha256 = scope.operation === "logout_help" ? parseClaudeAuthLogoutHelp({ exitCode: observed.exitCode, stdout: text, stderr: "" })
         : loginHelp !== null ? loginHelp.helpSha256
+          : scope.operation === "login_help" ? parseClaudeAuthLoginHelp({ exitCode: observed.exitCode, stdout: text, stderr: "" })
           : createHash("sha256").update(stdout).digest("hex");
       probes.push(Object.freeze({ runId: scope.runId, attemptId, probeId: scope.probeId, profile: scope.profile, operation: scope.operation,
         stdoutSha256, stdoutBytes: stdout.byteLength, stderrBytes: 0, deadlineMs, elapsedMs: observed.elapsedMs,
@@ -184,7 +193,14 @@ async function collectPreflight(input: CommonInput, stateInput: unknown, source:
         checkAbort();
         const resolved = resolvedRuntimeSchema.safeParse(runtime);
         if (!wasCalled() || !resolved.success || resolved.data.executablePath !== binding.executable.path) throw new ClaudeMacosPreflightError("runtime_refused", cleanup());
+        runtimes.set(profile, runtime);
       }
+    }
+    if (mode === "strict") {
+      const A = runtimes.get("A"); const B = runtimes.get("B");
+      if (A === undefined || B === undefined) throw new ClaudeMacosPreflightError("runtime_refused", cleanup());
+      return Object.freeze({ kind: "capabilities_only", runId: binding.runId, attemptId,
+        exactVersionBoth: true, logoutHelpBoth: true, loginHelpBoth: true, probes: Object.freeze(probes), runtimes: Object.freeze({ A, B }) });
     }
     return Object.freeze({ admitted: false, reason: "login_help_unverified", runId: binding.runId, attemptId,
       exactVersionBoth: true, logoutHelpBoth: true, loginHelpBoth: false, probes: Object.freeze(probes) });
@@ -206,7 +222,7 @@ export async function collectNativeClaudeMacosPreflight(input: NativeClaudeMacos
   const prepare = QualificationCustody.prototype.prepareDispatchAuthority.bind(parsed.data.custody);
   const result = await collectPreflight(parsed.data, state, "native_process", {
     prepareDispatchAuthority: prepare, bindProcess: bindDarwinDetachedAuthProcess, resolveRuntime: resolvePinnedClaudeRuntime,
-  });
+  }, "diagnostic");
   return Object.freeze({ ...result, source: "native_process" });
 }
 
@@ -216,5 +232,28 @@ export async function collectCredentialFreeClaudeMacosPreflight(input: CommonInp
   if (!parsed.success || typeof ports.prepareDispatchAuthority !== "function" || typeof ports.bindProcess !== "function" || typeof ports.resolveRuntime !== "function") {
     throw new ClaudeMacosPreflightError("invalid_input", "not_started");
   }
-  return Object.freeze({ ...await collectPreflight(parsed.data, parsed.data.state, "credential_free_fixture", ports), source: "credential_free_fixture" });
+  return Object.freeze({ ...await collectPreflight(parsed.data, parsed.data.state, "credential_free_fixture", ports, "diagnostic"), source: "credential_free_fixture" });
+}
+
+/** Fresh strict grammar and genuine runtime objects only; no authentication or step settlement. */
+export async function collectNativeClaudeMacosCapabilities(input: NativeClaudeMacosPreflightInput): Promise<ClaudeMacosCapabilities & Readonly<{ source: "native_process" }>> {
+  const parsed = nativeInputSchema.safeParse(input);
+  if (!parsed.success) throw new ClaudeMacosPreflightError("invalid_input", "not_started");
+  let state: unknown;
+  try { state = Reflect.get(QualificationCustody.prototype, "state", parsed.data.custody); }
+  catch { throw new ClaudeMacosPreflightError("scope_refused", "not_started"); }
+  const result = await collectPreflight(parsed.data, state, "native_process", {
+    prepareDispatchAuthority: QualificationCustody.prototype.prepareDispatchAuthority.bind(parsed.data.custody),
+    bindProcess: bindDarwinDetachedAuthProcess, resolveRuntime: resolvePinnedClaudeRuntime,
+  }, "strict");
+  return Object.freeze({ ...result, source: "native_process" });
+}
+
+/** Strict synthetic collection cannot return native provenance or authorize login. */
+export async function collectCredentialFreeClaudeMacosCapabilities(input: CommonInput & Readonly<{ state: unknown }>, ports: FixturePorts): Promise<ClaudeMacosCapabilities & Readonly<{ source: "credential_free_fixture" }>> {
+  const parsed = fixtureInputSchema.safeParse(input);
+  if (!parsed.success || typeof ports.prepareDispatchAuthority !== "function" || typeof ports.bindProcess !== "function" || typeof ports.resolveRuntime !== "function") {
+    throw new ClaudeMacosPreflightError("invalid_input", "not_started");
+  }
+  return Object.freeze({ ...await collectPreflight(parsed.data, parsed.data.state, "credential_free_fixture", ports, "strict"), source: "credential_free_fixture" });
 }

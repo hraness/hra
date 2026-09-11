@@ -31,6 +31,46 @@ export function parseClaudeAuthLogoutHelp(input: unknown): string {
   return digest(stdout);
 }
 
+/** Capability grammar only; neither account identity nor authority to dispatch login. */
+export function parseClaudeAuthLoginHelp(input: unknown): string {
+  const stdout = parseOutput(input);
+  // The native collector bounds bytes; keep that bound for unknown direct callers too.
+  if (Buffer.byteLength(stdout, "utf8") > 16 * 1024) throw new ClaudeAuthHelpError();
+  const lines = stdout.split("\n");
+  const prose = (value: string | undefined): value is string => value !== undefined && value.length > 0
+    && value.trim() === value && !/(?:^|\s)-|:/u.test(value)
+    && !/[\p{Zl}\p{Zp}]/u.test(value);
+  if (lines.length !== 12) throw new ClaudeAuthHelpError();
+  const nonempty = lines.map((line, index) => ({ line, index, trimmed: line.trim() })).filter((row) => row.trimmed !== "");
+  const headings = nonempty.filter((row) => row.trimmed === "Options:"); const heading = headings[0];
+  if (nonempty[0]?.trimmed !== "Usage: claude auth login [options]" || headings.length !== 1 || heading === undefined
+    || nonempty.slice(1).filter((row) => row.index < heading.index).some((row) => !prose(row.trimmed))) throw new ClaudeAuthHelpError();
+  const candidates = nonempty.filter((row) => row.index > heading.index);
+  if (candidates.length !== 6) throw new ClaudeAuthHelpError();
+  const expected = [/^--claudeai$/u, /^--console$/u, /^--email +<[A-Za-z][A-Za-z0-9_-]{0,63}>$/u, /^-h, +--help$/u, /^--sso$/u];
+  let consoleDescriptionColumn: number | null = null;
+  for (const [ordinal, declarationPattern] of expected.entries()) {
+    const row = candidates[ordinal < 2 ? ordinal : ordinal + 1];
+    if (row === undefined) throw new ClaudeAuthHelpError();
+    const indent = row.line.length - row.line.trimStart().length;
+    if (indent > 256 || row.line.slice(0, indent) !== " ".repeat(indent)) throw new ClaudeAuthHelpError();
+    const separator = / {2,}/u.exec(row.trimmed);
+    const declaration = separator === null ? row.trimmed : row.trimmed.slice(0, separator.index);
+    const description = separator === null ? null : row.trimmed.slice(separator.index + separator[0].length);
+    const descriptionColumn = separator === null ? null : indent + separator.index + separator[0].length;
+    if (declaration.length > 256 || (descriptionColumn !== null && descriptionColumn > 256)
+      || !declarationPattern.test(declaration) || (description !== null && !prose(description))) throw new ClaudeAuthHelpError();
+    if (ordinal === 1) consoleDescriptionColumn = descriptionColumn;
+  }
+  // The reviewed observation has exactly one nonflag continuation on line 8,
+  // at column 19, following the console option in the nonempty row order. No general wrapping
+  // or unknown section grammar is admitted, and no prose is retained.
+  const continuation = candidates[2];
+  if (consoleDescriptionColumn !== 19 || continuation?.index !== 7
+    || !continuation.line.startsWith(" ".repeat(19)) || !prose(continuation.line.slice(19))) throw new ClaudeAuthHelpError();
+  return digest(stdout);
+}
+
 type UnverifiedOptionRow = Readonly<{ flags: readonly string[]; argument: "none" | "required" | "optional" }>;
 type RejectionReason = "candidate_limit" | "declaration_limit" | "duplicate_flag" | "malformed_flag_declaration" | "non_option_line";
 type RejectedOptionLine = Readonly<{

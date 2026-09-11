@@ -3,10 +3,88 @@ import { createHash } from "node:crypto";
 import { expect, spyOn, test } from "bun:test";
 import fc from "fast-check";
 
-import { ClaudeAuthHelpError, inspectClaudeAuthLoginHelp, parseClaudeAuthLogoutHelp } from "./claude-auth-help";
+import { ClaudeAuthHelpError, inspectClaudeAuthLoginHelp, parseClaudeAuthLoginHelp, parseClaudeAuthLogoutHelp } from "./claude-auth-help";
 
 const help = "Usage: claude auth logout [options]\n\nLog out from your Anthropic account\n\nOptions:\n  -h, --help  Display help for command\n";
 const output = (stdout = help) => ({ exitCode: 0, stderr: "", stdout });
+// Synthetic prose/placeholder bytes; only the closed observed layout is reproduced.
+const loginLines = ["Usage: claude auth login [options]", "", "Synthetic login description", "", "Options:",
+  "  --claudeai".padEnd(19) + "Synthetic browser login", "  --console".padEnd(19) + "Synthetic console login",
+  " ".repeat(19) + "Continuation", "  --email <value>".padEnd(19) + "Synthetic email",
+  "  -h, --help".padEnd(19) + "Synthetic command help", "  --sso".padEnd(19) + "Synthetic SSO", ""];
+const loginHelp = loginLines.join("\n");
+
+test("strict login capability admits the five declarations and only the observed wrapped layout", () => {
+  const variants = [loginHelp,
+    ["", loginLines[0], loginLines[2], "", ...loginLines.slice(4)].join("\n"),
+    [loginLines[0], "", loginLines[2], "Options:", loginLines[5], "", ...loginLines.slice(6)].join("\n"),
+    [loginLines[0], "", loginLines[2], "Options:", loginLines[5], loginLines[6], "", ...loginLines.slice(7)].join("\n")];
+  for (const stdout of variants) {
+    expect(parseClaudeAuthLoginHelp(output(stdout))).toBe(createHash("sha256").update(stdout, "utf8").digest("hex"));
+    // The existing diagnostic continues to refuse capability and retain its sole rejection.
+    expect(inspectClaudeAuthLoginHelp(output(stdout))).toMatchObject({ admitted: false, reason: "login_help_unverified",
+      projectionComplete: false, diagnostics: { lineCount: 12, candidateCount: 6, acceptedCount: 5,
+        rejections: [{ line: 8, reason: "non_option_line", indentCodeUnits: 19, precedingOptionOrdinal: 2, precedingDescriptionRelation: "at" }] } });
+  }
+});
+
+test("strict login refuses unknown, missing, duplicate or altered declarations without relaxing the diagnostic", () => {
+  const variants = [loginHelp.replace("--sso", "--unknown"), loginHelp.replace("--sso", "--claudeai"),
+    loginHelp.replace("--claudeai", "--claudeai <value>"), loginHelp.replace("--console", "--console=value"),
+    loginHelp.replace("--email <value>", "--email [value]"), loginHelp.replace("--email <value>", "--email"),
+    loginHelp.replace("--email <value>", "--email <bad.value>"), loginHelp.replace("-h, --help", "-H, --help"),
+    loginHelp.replace("-h, --help", "--help"), loginHelp.replace("--sso", "--sso --extra"),
+    loginHelp.replace("Synthetic login description", "--extra  Additional flag"),
+    loginHelp.replace("Synthetic email", "Synthetic email --extra"),
+    loginHelp.replace("Usage: claude auth login [options]", "Usage: claude auth login [arguments]"),
+    loginHelp.replace("Options:", "Commands:"), loginHelp.replace("Synthetic login description", "Options:"),
+    loginHelp.replace("Synthetic login description", "Additional options:"),
+    loginHelp.replace("Synthetic login description", "Additional section: unexpected prose"),
+    loginHelp.replace("Continuation", "Commands:"), loginHelp.replace("Continuation", "--unknown"),
+    loginLines.filter((_, index) => index !== 10).join("\n"),
+    [...loginLines.slice(0, -1), "  --extra  Additional flag", ""].join("\n")];
+  for (const stdout of variants) expect(() => parseClaudeAuthLoginHelp(output(stdout))).toThrow(ClaudeAuthHelpError);
+});
+
+test("strict login refuses other continuation positions, alignment and line or byte limits", () => {
+  for (const indent of [0, 2, 18, 20, 256, 257]) {
+    expect(() => parseClaudeAuthLoginHelp(output(loginHelp.replace(" ".repeat(19) + "Continuation", " ".repeat(indent) + "Continuation"))))
+      .toThrow(ClaudeAuthHelpError);
+  }
+  const variants = [loginHelp.replace("  --console".padEnd(19), "  --console".padEnd(20)),
+    loginHelp.replace("  --console".padEnd(19), "--console  "),
+    [...loginLines.slice(0, 6), loginLines[7], loginLines[6], ...loginLines.slice(8)].join("\n"),
+    [...loginLines.slice(0, 7), loginLines[8], loginLines[7], ...loginLines.slice(9)].join("\n"),
+    [loginLines[0], "", "Options:", loginLines[5], loginLines[6], loginLines[7],
+      " ".repeat(19) + "Another continuation", ...loginLines.slice(8), ""].join("\n"),
+    loginHelp.replace("Synthetic email", "Synthetic email\n" + " ".repeat(19) + "Another continuation"),
+    loginHelp.replace(" ".repeat(19) + "Continuation", ""), loginHelp + "\n", loginHelp.slice(0, -1),
+    loginHelp.replace("  --email <value>", `  --email <${"x".repeat(257)}>`),
+    loginHelp.replace("Synthetic email", "界".repeat(6000)),
+    loginHelp.replace("Continuation", "\u2028Continuation"), loginHelp.replace("Continuation", "Continuation\u2029")];
+  for (const stdout of variants) expect(() => parseClaudeAuthLoginHelp(output(stdout))).toThrow(ClaudeAuthHelpError);
+});
+
+test("strict login bounds unknown inputs and never accepts a caller-supplied inspection result", () => {
+  for (const input of [null, {}, { ...output(loginHelp), exitCode: 1 }, { ...output(loginHelp), stderr: "unexpected" },
+    { ...output(loginHelp), admitted: true }, inspectClaudeAuthLoginHelp(output(loginHelp)), output("")]) {
+    expect(() => parseClaudeAuthLoginHelp(input)).toThrow(ClaudeAuthHelpError);
+  }
+  fc.assert(fc.property(fc.integer({ min: 0, max: 127 }).filter((value) => (value < 32 || value === 127) && value !== 10), (control) => {
+    expect(() => parseClaudeAuthLoginHelp(output(loginHelp.replace("Continuation", `Continuation${String.fromCharCode(control)}`))))
+      .toThrow(ClaudeAuthHelpError);
+  }));
+});
+
+test("strict login digests bounded prose and placeholder variation but rejects every unknown flag", () => {
+  const word = fc.array(fc.constantFrom("a", "b", "C", "d"), { minLength: 1, maxLength: 64 }).map((letters) => letters.join(""));
+  fc.assert(fc.property(word, word, (placeholder, description) => {
+    const stdout = loginHelp.replace("<value>", `<${placeholder}>`).replace("Synthetic email", description);
+    expect(parseClaudeAuthLoginHelp(output(stdout))).toBe(createHash("sha256").update(stdout, "utf8").digest("hex"));
+    expect(() => parseClaudeAuthLoginHelp(output(stdout.replace("--sso", `--unknown-${placeholder.toLowerCase()}`))))
+      .toThrow(ClaudeAuthHelpError);
+  }));
+});
 
 test("shared logout grammar retains exact-byte digests, descriptive prose and supported help spacing", () => {
   for (const stdout of [help, help.slice(0, -1), help.replace("Log out from your Anthropic account", "Updated descriptive prose"),
@@ -37,6 +115,7 @@ test("oversized unknown help refuses before allocating or scanning normalized te
   try {
     const input = output("x".repeat(16_385));
     expect(() => parseClaudeAuthLogoutHelp(input)).toThrow(ClaudeAuthHelpError);
+    expect(() => parseClaudeAuthLoginHelp(input)).toThrow(ClaudeAuthHelpError);
     expect(() => inspectClaudeAuthLoginHelp(input)).toThrow(ClaudeAuthHelpError);
     expect(replace).not.toHaveBeenCalled();
   } finally { replace.mockRestore(); }

@@ -77,6 +77,7 @@ export function bindDarwinForegroundLogin(input: ClaudeQualificationBindingInput
   environment: Readonly<Record<string, string>>;
   stdio: typeof descriptors;
   processFactory: ClaudeForegroundLoginProcessFactory;
+  assertOwnerTerminalCurrent(): void;
   settled(): Promise<ForegroundQualificationSettlement | null>;
 }> {
   const binding = bindDarwinQualificationEnvironment(input);
@@ -113,7 +114,7 @@ export function bindDarwinForegroundLogin(input: ClaudeQualificationBindingInput
       },
     });
   };
-  return Object.freeze({ environment: binding.environment, stdio: descriptors, processFactory,
+  return Object.freeze({ environment: binding.environment, stdio: descriptors, processFactory, assertOwnerTerminalCurrent: terminal.assertCurrent,
     async settled() { return settlement === null ? null : await settlement; },
   });
 }
