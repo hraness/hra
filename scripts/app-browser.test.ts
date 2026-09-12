@@ -3,9 +3,9 @@ import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { runInNewContext } from "node:vm";
-import { assertAppColorScheme, assertDefaultButtonPresentation, assertDefaultPalette, assertKeyboardFocusStrip, assertNativeModalFocus, assertProductPreviewObservation, assetContentType, assetPath, boundedBrowserOperation, browserExecutableSha256, browserFailureDetails, captureBrowserResponseBody, installBrowserServiceWorkerRefusal, inventory, loadedStylesheetControl, productionCsp, settleBrowserResponseBodies, siteFoundationFontPaths, siteProductionCsp, siteStylesheetPaths, snapshotProductPreview, snapshotStaticSite, waitForClosedProductPreview, withBrowserResourceCapture } from "./app-browser";
+import { assertAppColorScheme, assertSitePublicFontsUnchanged, assertDefaultButtonPresentation, assertDefaultPalette, assertKeyboardFocusStrip, assertNativeModalFocus, assertProductPreviewObservation, assetContentType, assetPath, boundedBrowserOperation, browserExecutableSha256, browserFailureDetails, captureBrowserResponseBody, installBrowserServiceWorkerRefusal, inventory, loadedStylesheetControl, productionCsp, settleBrowserResponseBodies, siteFoundationFontPaths, siteProductionCsp, siteStylesheetPaths, snapshotProductPreview, snapshotStaticSite, waitForClosedProductPreview, withBrowserResourceCapture } from "./app-browser";
 import { browserIoModules } from "../app/fixtures/browser/config";
 
 describe("browser response lifetime", () => {
@@ -365,6 +365,29 @@ describe("static site graph acceptance", () => {
       expect(() => snapshotStaticSite(fixture.files, fixture.publicFonts, fixture.preset)).toThrow();
       expect(assetContentType(path)).toBe("application/octet-stream");
     }
+  });
+
+  test("postflight revalidates thirteen installed fonts and the vendor-only editorial face at their original roots", async () => {
+    const directory = await realpath(await mkdtemp(join(tmpdir(), "site-font-origins-")));
+    const installed = join(directory, "installed"), vendor = join(directory, "vendor");
+    const fixture = staticSiteFixture();
+    const source = (path: string) => join(path.startsWith("instrument-serif/") ? vendor : installed, "fonts", path);
+    try {
+      for (const [path, bytes] of fixture.publicFonts) {
+        await mkdir(dirname(source(path)), { recursive: true });
+        await writeFile(source(path), bytes);
+      }
+      // The old kit intentionally has no editorial font; both source families
+      // must still be revalidated and neither may substitute the other's bytes.
+      await expect(assertSitePublicFontsUnchanged(installed, vendor, fixture.publicFonts)).resolves.toBeUndefined();
+      for (const path of ["nebula-sans/NebulaSans-Light.woff2", "instrument-serif/instrument-serif-latin-400.woff2"]) {
+        await writeFile(source(path), "changed after browser run");
+        await expect(assertSitePublicFontsUnchanged(installed, vendor, fixture.publicFonts)).rejects.toThrow("Public font input changed");
+        await writeFile(source(path), fixture.publicFonts.get(path)!);
+      }
+      fixture.publicFonts.set("../unowned.woff2", Buffer.from("escape"));
+      await expect(assertSitePublicFontsUnchanged(installed, vendor, fixture.publicFonts)).rejects.toThrow();
+    } finally { await rm(directory, { recursive: true }); }
   });
 
   test("keeps texture URL spelling and substitution closed in token-valued CSS", () => {

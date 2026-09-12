@@ -566,6 +566,16 @@ export function snapshotProductPreview(files: ReadonlyMap<string, Buffer>) {
   return { paths, stylesheets, scripts: paths.filter((path) => path.endsWith(".js")) };
 }
 
+/** Revalidate each font against its original physical source. Older installed
+ * kits supply thirteen faces; the editorial face belongs to the admitted vendor. */
+export async function assertSitePublicFontsUnchanged(publicFontRoot: string, presetRoot: string, fonts: ReadonlyMap<string, Buffer>): Promise<void> {
+  assert.deepEqual([...fonts.keys()].sort(), [...sitePublicFonts].sort());
+  for (const [path, bytes] of fonts) {
+    const root = path === sitePresetFont ? presetRoot : publicFontRoot;
+    assert.deepEqual(await ordinary(join(root, "fonts", path)), bytes, "Public font input changed during browser acceptance");
+  }
+}
+
 export function snapshotStaticSite(allFiles: ReadonlyMap<string, Buffer>, publicFonts: ReadonlyMap<string, Buffer>, preset: ReadonlyMap<string, Buffer>) {
   const product = snapshotProductPreview(new Map([...allFiles].filter(([path]) => path.startsWith("examples/app/"))));
   const files = new Map([...allFiles].filter(([path]) => !path.startsWith("examples/app/")));
@@ -2001,7 +2011,7 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
     }
     assert.deepEqual(artifacts(await inventory(join(root, "app/dist"))), artifacts(appFiles));
     assert.deepEqual(artifacts(await inventory(siteRoot, siteFontPaths)), artifacts(siteFiles));
-    for (const [path, bytes] of publicFonts) assert.deepEqual(await ordinary(join(publicFontRoot, "fonts", path)), bytes, "Public font input changed during browser acceptance");
+    await assertSitePublicFontsUnchanged(publicFontRoot, join(root, "site/vendor/marketing-preset"), publicFonts);
     assert.deepEqual(await ordinary(join(root, "package.json")), packageBytes);
     assert.deepEqual(await ordinary(join(root, "bun.lock")), lockBytes);
     assert.deepEqual(await admission.verify(admission, root, run), handoff, "Browser preparation changed during acceptance");

@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test"
+import * as fc from "fast-check"
 import { inspectSiteCssResources } from "./site-css-resources.ts"
 
 test("ordinary CSS inspection includes local custom-property textures and typed font/image URLs", () => {
@@ -38,4 +39,19 @@ test.each([
   '.x{--field:image-set("./one.png" type(var(--mime)) 1x);background:var(--field)}',
 ])("ordinary CSS inspection rejects resource-producing substitutions: %s", source => {
   expect(() => inspectSiteCssResources(source, "fixture.css")).toThrow()
+})
+
+
+test("original URL inventory preserves generated spelling/order/multiplicity while ignoring quoted lookalikes", () => {
+  const name = fc.array(fc.constantFrom(...Array.from("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")),
+    { minLength: 1, maxLength: 24 }).map(parts => parts.join(""))
+  const url = fc.tuple(fc.constantFrom("./", "https://example.test/"), name, fc.constantFrom("svg", "woff2", "png"))
+    .map(([prefix, leaf, extension]) => `${prefix}${leaf}.${extension}`)
+  fc.assert(fc.property(fc.array(url, { minLength: 1, maxLength: 16 }), urls => {
+    const references = urls.map(value => `url("${value}")`).join(",")
+    const source = `.x{--field:${references};background-image:var(--field);content:'${references}'}`
+    expect(inspectSiteCssResources(source, "property.css")).toEqual(urls)
+    const duplicate = `.x{--field:${references},url("${urls[0]}");content:'${references}'}`
+    expect(inspectSiteCssResources(duplicate, "property.css")).toEqual([...urls, urls[0]!])
+  }), { seed: 20260912, numRuns: 100 })
 })
