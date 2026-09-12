@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import fc from "fast-check";
 import {
   existsSync,
   mkdtempSync,
@@ -13,6 +14,7 @@ import { join } from "node:path";
 import {
   capabilityPlatformSupported,
   hostAccessRequiredCode,
+  hostCommandDigest,
   hostAccessRequiredExitCode,
   inheritedLeaseCovers,
   parseHostRunArguments,
@@ -24,8 +26,10 @@ import {
   resolveSlopcameraRuntimeRoot,
   resolveCapabilityStateRoot,
   resolveHostResourceStateRoot,
+  runHostCommand,
 } from "./host-run";
 import { slopcameraRuntimeDirectory } from "./runtime-pin";
+import { commandDigest } from "./telemetry";
 
 describe("host-wide resource wrapper", () => {
   test("uses the established 1/2/all weighted model", () => {
@@ -103,6 +107,47 @@ describe("host-wide resource wrapper", () => {
       { CODEX_HOME: "/profiles/two" },
       "/opt/tester",
     )).toBe(resolveSlopcameraRuntimeRoot({}, "/opt/tester"));
+  });
+
+  test("TTY child signal ownership is an explicit closed non-inherited command option", () => {
+    expect(parseHostRunArguments(["--tty-signal-owner=child", "--", "bun", "fixture.ts"]).ttySignalOwner).toBe("child");
+    expect(parseHostRunArguments(["--tty-signal-owner=parent", "--", "bun"]).ttySignalOwner).toBe("parent");
+    expect(parseHostRunArguments(["--", "bun"]).ttySignalOwner).toBeUndefined();
+    for (const value of ["", "auto", "none", "CHILD", "child\0", "child,parent"]) {
+      expect(() => parseHostRunArguments([`--tty-signal-owner=${value}`, "--", "bun"])).toThrow("invalid TTY signal owner");
+    }
+    expect(() => parseHostRunArguments(["--tty-signal-owner=child", "--tty-signal-owner=parent", "--", "bun"])).toThrow("only once");
+    expect(parseHostRunArguments(["--", "bun", "--tty-signal-owner=child"]).command).toEqual(["bun", "--tty-signal-owner=child"]);
+  });
+
+  test("child ownership refuses before module, lease or subprocess when any standard descriptor is not a TTY", async () => {
+    // The ordinary compute test has no controlling terminal; actual three-TTY
+    // success and each missing descriptor are separate explicit native fixtures.
+    if (process.stdin.isTTY && process.stdout.isTTY && process.stderr.isTTY) return;
+    await expect(runHostCommand({ command: ["/synthetic/must-not-start"], cwd: import.meta.dir, label: "tty-refusal", lane: "compute", mode: "shared",
+      ttySignalOwner: "child", environment: { OOMPA_SLOPCAMERA_HOST_RESOURCES_MODULE: "/synthetic/must-not-load" } })).rejects.toThrow("requires POSIX terminal descriptors");
+    const foreign = { command: ["/synthetic/must-not-start"], cwd: import.meta.dir, label: "tty-refusal", lane: "compute" as const, mode: "shared" as const };
+    Reflect.set(foreign, "ttySignalOwner", "unknown");
+    await expect(runHostCommand(foreign)).rejects.toThrow("invalid TTY signal owner");
+  });
+
+  test("generated TTY options preserve opaque child argv and refuse every other prefix value", () => {
+    fc.assert(fc.property(fc.constantFrom("parent", "child"), fc.array(fc.string({ maxLength: 40 }), { maxLength: 8 }), (owner, arguments_) => {
+      const parsed = parseHostRunArguments([`--tty-signal-owner=${owner}`, "--", "bun", ...arguments_]);
+      expect(parsed.ttySignalOwner).toBe(owner);
+      expect(parsed.command).toEqual(["bun", ...arguments_]);
+    }), { numRuns: 128 });
+    fc.assert(fc.property(fc.string({ maxLength: 64 }).filter((value) => value !== "parent" && value !== "child"), (value) => {
+      expect(() => parseHostRunArguments([`--tty-signal-owner=${value}`, "--", "bun"])).toThrow("invalid TTY signal owner");
+    }), { numRuns: 128 });
+  });
+
+  test("child signal ownership cannot reuse the default command digest", () => {
+    const argv = ["bun", "owner.ts"]; const scope = "synthetic-scope";
+    expect(hostCommandDigest(argv, scope)).toBe(commandDigest(argv, scope));
+    expect(hostCommandDigest(argv, scope, "parent")).toBe(commandDigest(argv, scope));
+    expect(hostCommandDigest(argv, scope, "child")).not.toBe(commandDigest(argv, scope));
+    expect(hostCommandDigest(argv, scope, "child")).not.toBe(hostCommandDigest(["bun", "other.ts"], scope, "child"));
   });
 
   test("requires macOS for the mac-native lane", () => {
