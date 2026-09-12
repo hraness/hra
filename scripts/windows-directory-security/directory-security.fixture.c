@@ -31,6 +31,13 @@ static int close_binding(wd_binding **b) {
   if (wd_close(b) != WD_OK) return 0;
   closed_handles++; return 1;
 }
+/* Windows may report either sharing violation or access denied when an open
+ * directory handle fences rename/removal. Both are refusal outcomes; any
+ * success, or another error, remains a fixture failure. */
+static int delete_refused(void) {
+  DWORD error = GetLastError();
+  return error == ERROR_SHARING_VIOLATION || error == ERROR_ACCESS_DENIED;
+}
 static int make_path(WCHAR *out, const WCHAR *root, const WCHAR *name) {
   return swprintf_s(out, MAX_PATH, L"%s\\%s", root, name) > 0;
 }
@@ -153,8 +160,8 @@ int wmain(int argc, wchar_t **argv) {
   REQUIRE(wd_adopt(&h, &second) == WD_OK);
   REQUIRE(wd_same_directory(binding, second) == WD_REFUSED); CASE();
   REQUIRE(close_binding(&second));
-  REQUIRE(!MoveFileW(a, moved) && GetLastError() == ERROR_SHARING_VIOLATION); CASE();
-  REQUIRE(!RemoveDirectoryW(a) && GetLastError() == ERROR_SHARING_VIOLATION); CASE();
+  REQUIRE(!MoveFileW(a, moved) && delete_refused()); CASE();
+  REQUIRE(!RemoveDirectoryW(a) && delete_refused()); CASE();
   REQUIRE(close_binding(&binding));
   REQUIRE(MoveFileW(a, moved)); made_a = 0;
   REQUIRE(MoveFileW(moved, a)); made_a = 1; CASE();
