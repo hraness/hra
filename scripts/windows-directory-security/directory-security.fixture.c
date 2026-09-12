@@ -26,6 +26,13 @@ static HANDLE open_directory(const WCHAR *path) {
   if (h != INVALID_HANDLE_VALUE) opened_handles++;
   return h;
 }
+static HANDLE open_peer_directory(const WCHAR *path) {
+  HANDLE h = CreateFileW(path, READ_CONTROL | FILE_READ_ATTRIBUTES | WRITE_DAC,
+    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+  if (h != INVALID_HANDLE_VALUE) opened_handles++;
+  return h;
+}
 static int close_binding(wd_binding **b) {
   if (*b == NULL) return 1;
   if (wd_close(b) != WD_OK) return 0;
@@ -169,7 +176,7 @@ int wmain(int argc, wchar_t **argv) {
   REQUIRE(create_private(a, user)); made_a = 1;
   h = open_directory(a); REQUIRE(h != INVALID_HANDLE_VALUE);
   REQUIRE(wd_adopt(&h, &binding) == WD_OK);
-  peer = open_directory(a); REQUIRE(peer != INVALID_HANDLE_VALUE);
+  peer = open_peer_directory(a); REQUIRE(peer != INVALID_HANDLE_VALUE);
   REQUIRE(set_acl(peer, everyone, 0, 1, 0));
   REQUIRE(wd_revalidate(binding) == WD_REFUSED); CASE();
   REQUIRE(set_acl(peer, user, 0, 1, 0));
