@@ -10,9 +10,13 @@
 - `custody.ts` binds fresh private roots, a retained noncredential proof key and atomic checkpoints to the separate native Mac owner. Its fixed removal operation reconciles only the four owned profile/temporary roots.
 - `custody.test.ts` explicitly enables native custody tests using fresh synthetic roots and keys; ordinary invocations skip them.
 - `admission.ts` binds captured source contents and the exact reviewed executable bytes to a closed native preflight authority. It joins prior signature evidence without running Claude.
-- `preflight.ts` collects the fixed two-profile version and help probes with actual child and stream joins. Login-help option rows are private unverified diagnostics.
+- `preflight.ts` collects the fixed two-profile version and help probes with actual child and stream joins. Its diagnostic entry remains unverified; the separate strict capability entry retains the genuine resolved runtimes after both help grammars pass.
 - `preflight-run.ts` creates one fresh native custody run, persists its first dispatch, collects only those six probes and retains the unchanged checkpoint and roots. It stops before authentication and releases the owner once.
-- `orchestration.ts` drives credential-free fixtures; the live adapter remains unavailable.
+- `first-login-run.ts` composes fresh capability and signed-out checks with one foreground A login and a subsequent attempt-bound terminal observation. It stops at step 2, retains evidence and exposes no restore, account-isolation or activation entry. Its paired tests use explicit credential-free ports.
+- `owner-terminal.ts` owns fresh attempt-bound input challenges and the fixed four-login signal sequence. Its prearmed interruption and no-prompt windows supply owner observations only after the caller's native joins.
+- `native-effects.ts` collects only the three fixed logout steps, retaining actual children and all stream/inspector joins. A logout receipt still requires the following signed-out identity check.
+- `native-run.ts` holds one fresh owner and the genuine preflight runtimes through all 22 account-isolation steps and journaled four-root cleanup. Its separate fixture entry supplies no native authority, and both outcomes retain `activationAuthorized:false`.
+- `orchestration.ts` drives the original credential-free state fixtures independently of the guarded native composition.
 - Pure tests exercise synthetic identities, ordering, failure and recovery without provider or filesystem operations.
 - `contract.md` records the foundation's capabilities and the separate live acceptance requirements.
 

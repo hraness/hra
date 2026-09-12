@@ -6,7 +6,7 @@ import fc from "fast-check";
 import { CLAUDE_PIN, CLAUDE_PIN_EFFORT, CLAUDE_PIN_MODEL, CLAUDE_PIN_NATIVE_FALLBACK_CAPABILITY, PINNED_CLAUDE_ARTIFACT_DIGESTS } from "../../src/claude/pin";
 import type { DetachedAuthOperation, DetachedAuthProcess, DetachedAuthSettlement } from "../claude-macos-auth-process/process";
 import { QualificationCustody } from "./custody";
-import { collectCredentialFreeClaudeMacosPreflight, collectNativeClaudeMacosPreflight, type ClaudeMacosPreflightScope, type NativeClaudeMacosPreflightInput } from "./preflight";
+import { collectCredentialFreeClaudeMacosCapabilities, collectCredentialFreeClaudeMacosPreflight, collectNativeClaudeMacosCapabilities, collectNativeClaudeMacosPreflight, type ClaudeMacosPreflightScope, type NativeClaudeMacosPreflightInput } from "./preflight";
 import { createQualification, observeQualification, type QualificationState } from "./state";
 
 type FixtureInput = Parameters<typeof collectCredentialFreeClaudeMacosPreflight>[0];
@@ -106,6 +106,38 @@ const cleared = (value: ReturnType<typeof fixture>): void => {
   for (const owned of value.owned) { expect(owned.stdout.every((byte) => byte === 0)).toBeTrue(); expect(owned.stderr.every((byte) => byte === 0)).toBeTrue();
     expect(owned.stdoutReads).toBe(1); expect(owned.stderrReads).toBe(1); }
 };
+
+const strictHelp = ["Usage: claude auth login [options]", "", "Synthetic login", "", "Options:",
+  "  --claudeai".padEnd(19) + "Synthetic browser", "  --console".padEnd(19) + "Synthetic console", " ".repeat(19) + "Continuation",
+  "  --email <value>  Synthetic email", "  -h, --help  Synthetic help", "  --sso  Synthetic SSO", ""].join("\n");
+
+test("strict capabilities retain the actual A/B resolver objects and clear every captured byte", async () => {
+  const value = fixture({ output: (operation) => new TextEncoder().encode(operation === "login_help" ? strictHelp : text(operation)) });
+  const runtimes: Awaited<ReturnType<FixturePorts["resolveRuntime"]>>[] = [];
+  const result = await collectCredentialFreeClaudeMacosCapabilities(value.request, { ...value.ports, async resolveRuntime(input) {
+    const runtime = await value.ports.resolveRuntime(input); runtimes.push(runtime); return runtime;
+  } });
+  expect(result).toMatchObject({ source: "credential_free_fixture", kind: "capabilities_only", exactVersionBoth: true, loginHelpBoth: true, logoutHelpBoth: true });
+  expect(runtimes[0]).toBe(result.runtimes.A); expect(runtimes[1]).toBe(result.runtimes.B);
+  expect(result.probes).toHaveLength(6); expect(result.probes.every((probe) => probe.loginHelp === null)).toBeTrue();
+  expect(result.probes.filter((probe) => probe.operation === "login_help").map((probe) => probe.stdoutSha256))
+    .toEqual(Array.from({ length: 2 }, () => createHash("sha256").update(strictHelp).digest("hex")));
+  expect(JSON.stringify(result)).not.toContain("Synthetic console"); cleared(value);
+});
+
+test("strict help refusal on either profile cannot return runtimes or admit later probes", async () => {
+  for (const failAt of [1, 2]) {
+    let helps = 0;
+    const value = fixture({ output: (operation) => new TextEncoder().encode(operation === "login_help"
+      ? ++helps === failAt ? strictHelp.replace("--sso", "--unknown") : strictHelp : text(operation)) });
+    await expect(collectCredentialFreeClaudeMacosCapabilities(value.request, value.ports)).rejects.toMatchObject({ code: "capability_refused", cleanup: "joined" });
+    expect(value.owned).toHaveLength(failAt === 1 ? 2 : 5); cleared(value);
+  }
+  const invalid = fixture();
+  await expect(collectNativeClaudeMacosCapabilities({ ...invalid.request, custody: {} } as unknown as NativeClaudeMacosPreflightInput))
+    .rejects.toMatchObject({ code: "invalid_input", cleanup: "not_started" });
+  expect(invalid.owned).toHaveLength(0);
+});
 
 test("six fixed probes preserve fresh authority ordering and exact version factories, with unadmitted private diagnostics", async () => {
   const value = fixture(); const result = await collectCredentialFreeClaudeMacosPreflight(value.request, value.ports);
