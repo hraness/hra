@@ -43,16 +43,64 @@ body {
 
 /* Marketing grammar reads the same shared palette as the rest of Oompa. */
 :where(.hraness-marketing-page, .hraness-marketing-header) {
-  --hraness-marketing-ink: var(--foreground);
-  --hraness-marketing-muted: var(--muted);
+  --hraness-marketing-ink: var(--hraness-marketing-field-ink, var(--foreground));
+  --hraness-marketing-muted: var(--hraness-marketing-field-muted, var(--muted));
   --hraness-marketing-background: var(--background);
   --hraness-marketing-surface: var(--surface);
   --hraness-marketing-inverse: var(--inverse-background);
   --hraness-marketing-inverse-ink: var(--inverse-foreground);
   --hraness-marketing-text-font: var(--font-sans);
-  --hraness-marketing-heading-font: var(--font-sans);
+  --hraness-marketing-heading-font: var(--hraness-marketing-display-font, var(--font-sans));
   --hraness-marketing-mono-font: var(--font-mono);
-  --hraness-marketing-measure: 80rem;
+  --hraness-marketing-measure: var(--hraness-marketing-content-measure, 80rem);
+}
+
+:root[data-hraness-marketing-preset] .hraness-marketing-header {
+  --hraness-marketing-measure: var(--hraness-marketing-header-measure);
+}
+
+/* Keep the continuous shared field behind the compiled page's reset. */
+:root[data-hraness-marketing-preset] .hraness-marketing-page {
+  --hraness-marketing-background: transparent;
+}
+
+/* Compatibility with the installed 0.6.4 sealed descendants: these few fixed
+ * declarations cannot receive className overrides through its public API.
+ * The compiler graph remains authoritative for layout and native states. */
+:root[data-hraness-marketing-preset] .hraness-marketing-hero__heading {
+  font-weight: var(--hraness-marketing-display-weight, 400);
+  line-height: var(--hraness-marketing-h1-leading, 1.05);
+  letter-spacing: var(--hraness-marketing-h1-tracking, -.025em);
+}
+
+:root[data-hraness-marketing-preset] :where(.hraness-marketing-section__heading, .hraness-marketing-trust__heading, .hraness-marketing-questions__heading, .hraness-marketing-maker__heading, .hraness-marketing-cta__heading) {
+  font-weight: var(--hraness-marketing-display-weight, 400);
+  line-height: var(--hraness-marketing-h2-leading, 1.15);
+  letter-spacing: var(--hraness-marketing-h2-tracking, -.012em);
+}
+
+:root[data-hraness-marketing-preset] .hraness-marketing-hero__summary {
+  line-height: var(--hraness-marketing-summary-leading, 1.55);
+}
+
+:root[data-hraness-marketing-preset] .hraness-marketing-header__inner {
+  min-block-size: var(--hraness-marketing-header-height, 3.5rem);
+}
+
+:root[data-hraness-marketing-preset] .hraness-marketing-header .hraness-marketing-action {
+  min-block-size: var(--hraness-marketing-header-action-height, var(--hraness-marketing-action-height, 2.625rem));
+}
+
+:root[data-hraness-marketing-preset] .hraness-marketing-header-surface {
+  background-color: var(--hraness-marketing-header-background, var(--background));
+  -webkit-backdrop-filter: var(--hraness-marketing-header-backdrop, none);
+  backdrop-filter: var(--hraness-marketing-header-backdrop, none);
+}
+
+@media (pointer: coarse) {
+  :root[data-hraness-marketing-preset] .hraness-marketing-header .hraness-marketing-action {
+    min-block-size: 3rem;
+  }
 }
 
 

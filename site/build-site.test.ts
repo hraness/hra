@@ -55,6 +55,10 @@ const expectedFontPaths = [
   "geist-mono/PROVENANCE.md",
 ].sort();
 const expectedAttributionPaths = expectedFontPaths.filter((path) => !path.endsWith(".woff2"));
+const presetRoot = join(sourceRoot, "site/vendor/marketing-preset");
+const presetFontPath = "instrument-serif/instrument-serif-latin-400.woff2";
+const presetAttributionPaths = ["instrument-serif/OFL.txt", "instrument-serif/UPSTREAM.md"];
+const allAttributionPaths = [...expectedAttributionPaths, ...presetAttributionPaths].sort();
 
 function assertMobileHeaderRule(css: string, className: string): void {
   expect(className).toMatch(/^x[a-z0-9]+$/u);
@@ -371,7 +375,9 @@ describe("static-site build", () => {
       "dist/site/social-card.png",
       "dist/site/stylex.css",
       ...docsPaths.flatMap((path) => [`dist/site${path}index.html`, `dist/site${path}index.md`]),
-      ...expectedAttributionPaths.map((path) => `dist/site/fonts/${path}`),
+      ...allAttributionPaths.map((path) => `dist/site/fonts/${path}`),
+      "dist/site/marketing-preset/LICENSE",
+      "dist/site/marketing-preset/marketing-assets/UPSTREAM.md",
     ];
 
     for (const path of expectedPaths) {
@@ -423,10 +429,16 @@ describe("static-site build", () => {
     }
     const inventory = await inventoryFiles(join(root, "dist/site"));
     const fontPaths = inventory.filter((path) => path.endsWith(".woff2"));
-    expect(fontPaths).toHaveLength(13);
+    expect(fontPaths).toHaveLength(14);
     for (const path of fontPaths) expect(path).toMatch(/^graphs\/foundation\/assets\/[A-Za-z0-9_.[\]-]+\.woff2$/u);
     const expectedFontBytes = await Promise.all(expectedFontPaths.filter((path) => path.endsWith(".woff2"))
       .map((path) => readFile(join(installedFontRoot, "fonts", path))));
+    expectedFontBytes.push(await readFile(join(presetRoot, "fonts", presetFontPath)));
+    const fieldPaths = inventory.filter((path) => path.startsWith("graphs/foundation/assets/") && path.endsWith(".svg"));
+    expect(fieldPaths).toHaveLength(2);
+    const fieldBytes = await Promise.all(fieldPaths.map((path) => readFile(join(root, "dist/site", path))));
+    const expectedFieldBytes = await Promise.all(["grain.svg", "cells.svg"].map((path) => readFile(join(presetRoot, "marketing-assets", path))));
+    expect(fieldBytes.map(hash).sort()).toEqual(expectedFieldBytes.map(hash).sort());
     const emittedFontBytes = await Promise.all(fontPaths.map((path) => readFile(join(root, "dist/site", path))));
     expect(emittedFontBytes.map(hash).sort()).toEqual(expectedFontBytes.map(hash).sort());
     const bold = await readFile(join(installedFontRoot, "fonts/nebula-sans/NebulaSans-Bold.woff2"));
@@ -434,7 +446,7 @@ describe("static-site build", () => {
     expect(emittedFontBytes.some((bytes) => bytes.equals(bold))).toBe(true);
     const fontUrls: string[] = [];
     transform({ filename: foundationPath, code: Buffer.from(foundation), visitor: { Url(value) { fontUrls.push(value.url); } } });
-    expect(fontUrls).toHaveLength(13);
+    expect(fontUrls).toHaveLength(16);
     const resolvedFonts = fontUrls.map((url) => {
       expect(url).not.toMatch(/^(?:data:|https?:|\/)/iu);
       const resolved = new URL(url, `https://oompa.app/${foundationPath}`);
@@ -443,7 +455,7 @@ describe("static-site build", () => {
       expect(resolved.hash).toBe("");
       return decodeURIComponent(resolved.pathname.slice(1));
     });
-    expect(resolvedFonts.sort()).toEqual(fontPaths);
+    expect(resolvedFonts.sort()).toEqual([...fontPaths, ...fieldPaths].sort());
     const previewPaths = inventory.filter((path) => path.startsWith("examples/app/"));
     expect(previewPaths).toContain("examples/app/index.html");
     expect(previewPaths).toContain("examples/app/stylex.css");
@@ -466,13 +478,18 @@ describe("static-site build", () => {
     }
     expect(inventory).toEqual([
       ...expectedPaths.filter((path) => path.startsWith("dist/site/")).map((path) => path.slice("dist/site/".length)),
-      foundationPath, ...fontPaths, ...previewPaths,
+      foundationPath, ...fontPaths, ...fieldPaths, ...previewPaths,
     ].sort());
     expect(inventory.filter((path) => path.endsWith(".js") && !path.startsWith("examples/app/"))).toEqual(["analytics.js", "appearance.js", "site.js"]);
     for (const path of ["analytics.js", "appearance.js", "site.js"]) assertSiteBrowserBundle(await readFile(join(root, "dist/site", path), "utf8"));
     expect(inventory.some((path) => path.endsWith("stylex-complete.json") || path.includes("/complete/") || path.endsWith(".map"))).toBe(false);
     expect(inventory.some((path) => /\.(?:map|ts|tsx|otf)$/u.test(path) || path.startsWith("graphs/renderer/"))).toBe(false);
-    expect(await inventoryFiles(join(root, "dist/site/fonts"))).toEqual(expectedAttributionPaths);
+    expect(await inventoryFiles(join(root, "dist/site/fonts"))).toEqual(allAttributionPaths);
+    for (const path of presetAttributionPaths) {
+      expect(await readFile(join(root, "dist/site/fonts", path))).toEqual(await readFile(join(presetRoot, "fonts", path)));
+    }
+    expect(document.documentElement.getAttribute("data-hraness-marketing-preset")).toBe("editorial");
+    expect(document.querySelector("main.hraness-marketing-field")).not.toBeNull();
     for (const path of expectedAttributionPaths) {
       expect(await readFile(join(root, "dist/site/fonts", path)))
         .toEqual(await readFile(join(installedFontRoot, "fonts", path)));

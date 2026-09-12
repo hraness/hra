@@ -39,7 +39,7 @@ function inlineContent(content: readonly InlineContent[], styleLinks: boolean): 
 export function renderMarketingHeader(content: PublicContent, currentPath: string): string {
   return renderToStaticMarkup(
     <MarketingSiteHeader
-      className={mobileHeaderFlowClassName()}
+      className={`${mobileHeaderFlowClassName()}${currentPath === "/" ? " hraness-marketing-header-surface" : ""}`}
       trailing={<SiteAppearanceMenu />}
       action={{ emphasis: "primary", href: content.links.app, label: "Open Oompa" }}
       brand={content.productName}
