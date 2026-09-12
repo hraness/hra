@@ -5,7 +5,7 @@ import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { runInNewContext } from "node:vm";
-import { assertAppColorScheme, assertSitePublicFontsUnchanged, assertDefaultButtonPresentation, assertDefaultPalette, assertKeyboardFocusStrip, assertNativeModalFocus, assertProductPreviewObservation, assetContentType, assetPath, boundedBrowserOperation, browserExecutableSha256, browserFailureDetails, captureBrowserResponseBody, installBrowserServiceWorkerRefusal, inventory, loadedStylesheetControl, productionCsp, settleBrowserResponseBodies, siteFoundationFontPaths, siteProductionCsp, siteStylesheetPaths, snapshotProductPreview, snapshotStaticSite, waitForClosedProductPreview, withBrowserResourceCapture } from "./app-browser";
+import { assertSiteMaterialPaint, assertAppColorScheme, assertSitePublicFontsUnchanged, assertDefaultButtonPresentation, assertDefaultPalette, assertKeyboardFocusStrip, assertNativeModalFocus, assertProductPreviewObservation, assetContentType, assetPath, boundedBrowserOperation, browserExecutableSha256, browserFailureDetails, captureBrowserResponseBody, installBrowserServiceWorkerRefusal, inventory, loadedStylesheetControl, productionCsp, settleBrowserResponseBodies, siteFoundationFontPaths, siteProductionCsp, siteStylesheetPaths, snapshotProductPreview, snapshotStaticSite, waitForClosedProductPreview, withBrowserResourceCapture } from "./app-browser";
 import { browserIoModules } from "../app/fixtures/browser/config";
 
 describe("browser response lifetime", () => {
@@ -954,5 +954,44 @@ describe("browser acceptance boundaries", () => {
     expect(browserIoModules).toHaveLength(9);
     expect(browserIoModules.every((path) => /^app\/src\/(data|custody)\//u.test(path))).toBe(true);
     expect(browserIoModules.some((path) => /\/(components|screens|model)\/|\.stylex/u.test(path))).toBe(false);
+  });
+});
+
+
+describe("native website Lantern material acceptance", () => {
+  const paint = (background: string, ink = "rgb(28, 25, 23)", image = "none", backdrop = "none") => ({ background, ink, image, backdrop });
+  const fixture = (home: boolean, opaque: boolean) => {
+    const chrome = paint("rgb(255, 254, 250)", undefined, "none", opaque ? "none" : "blur(20px) saturate(1.1)");
+    const pane = paint("rgb(255, 254, 250)");
+    const choice = paint("rgb(250, 244, 228)");
+    const wall = paint("rgb(248, 247, 244)", undefined, opaque ? "none" : "repeating-linear-gradient(90deg, transparent, white), repeating-linear-gradient(0deg, transparent, white), radial-gradient(white, transparent)");
+    return { material: "lantern", preset: home ? "editorial" : null, walls: home ? 1 : 0, fields: 0, header: chrome,
+      panes: [pane], wall: home ? wall : null, selected: home ? [choice] : [], disclosures: home ? [choice] : [],
+      references: { chrome, pane, choice, wall } };
+  };
+  test("retains exact canonical surfaces in normal and opaque modes without applying editorial type to guides", () => {
+    for (const home of [true, false]) for (const opaque of [true, false]) {
+      expect(() => assertSiteMaterialPaint(fixture(home, opaque), home, opaque)).not.toThrow();
+    }
+  });
+  test("rejects lost scopes, compiled paint overrides and missing native selected/disclosure observations", () => {
+    const sample = fixture(true, false);
+    const baseWall = sample.references.wall;
+    for (const patch of [
+      { material: null }, { preset: null }, { walls: 0 }, { fields: 1 },
+      { header: { ...sample.header, backdrop: "blur(14px) saturate(1.4)" } },
+      { header: { ...sample.header, background: "transparent" } },
+      { panes: [{ ...sample.references.pane, background: "transparent" }] },
+      { panes: [{ ...sample.references.pane, ink: "transparent" }] },
+      { selected: [] }, { selected: [sample.references.choice, sample.references.choice] }, { disclosures: [] },
+      { selected: [{ ...sample.references.choice, ink: "transparent" }] },
+      { disclosures: [{ ...sample.references.choice, background: "transparent" }] },
+      { wall: { ...baseWall, image: "none" } },
+    ]) expect(() => assertSiteMaterialPaint({ ...sample, ...patch }, true, false)).toThrow();
+    expect(() => assertSiteMaterialPaint({ ...fixture(false, false), preset: "editorial" }, false, false)).toThrow();
+    expect(() => assertSiteMaterialPaint({ ...fixture(false, false), wall: sample.wall }, false, false)).toThrow();
+    const opaque = fixture(true, true);
+    expect(() => assertSiteMaterialPaint({ ...opaque, header: sample.header }, true, true)).toThrow();
+    expect(() => assertSiteMaterialPaint({ ...opaque, wall: sample.wall }, true, true)).toThrow();
   });
 });
