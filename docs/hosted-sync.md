@@ -272,6 +272,54 @@ run_command_capacity status \
   --deployment-url https://steady-otter-321.convex.cloud
 ```
 
+To distinguish authority-reduction quota ceilings without attempting a repair,
+use the same wrapper and exact candidate/target arguments with
+`diagnose-headroom` in place of `status`:
+
+```sh
+run_command_capacity diagnose-headroom \
+  --source-commit <CANDIDATE_COMMIT> \
+  --deploy-evidence /protected/release/candidate-<CANDIDATE_COMMIT>-deploy.json \
+  --deployment steady-otter-321 \
+  --team-id 513923 \
+  --project-id 2854545 \
+  --deployment-id 7654321 \
+  --deployment-url https://steady-otter-321.convex.cloud
+```
+
+The diagnostic emits a separate version-1 result with
+`state: "diagnostic_complete"`, `repairAuthorized: false` and
+`activationAuthorized: false`. Completion means its bounded observations and
+source/target checks finished. It does not mean quota fits, clear a prior
+hard-quota hold or produce readiness evidence. Status and repair retain their
+version-2 results and existing acceptance requirements.
+
+Only aggregate counts leave the query. The seven fixed ceiling dimensions are
+identity, job, device, security and receipt categories, user total and service
+total. A missing account pair needs two records; each missing non-revoked-device
+quartet needs four. `recordsBlocked` is exact for completing that identity's
+missing sets from the observed ledger. `bytesBlockedByLowerBound` proves a
+refusal only when the required 2048-byte padding per row already exceeds a
+ceiling. All other byte cases remain `bytesUnknown`, including equality at that
+padding floor. Future document metadata is not invented. Counts across ceilings
+can overlap, and service observations do not simulate successively repairing
+every identity.
+
+`ready` remains the existing capacity-classifier count, not quota admission.
+Only `capacityMissing` identities have their quota ledgers evaluated;
+`quotaAuthorityUnknown` preserves corrupt or missing ledger authority without
+mislabeling it as a ceiling. The query creates no reservation, changes no quota,
+and returns no identity, raw usage, timestamp or secret. Cursors remain private
+transport state and are absent from emitted output.
+
+Each page reads at most eight identities under one query snapshot. The operator
+caps the scan at 626 pages and 5000 identities and refuses incomplete coverage.
+Its `per_page_only` consistency does not promise a global snapshot or a stable
+population across pages. Exact source, candidate evidence, runtime attestation,
+numeric target and process-custody checks remain the same as the status path.
+The command rejects execute, acknowledgement, retirement and readiness-evidence
+flags. A completed diagnostic never falls through to repair or activation.
+
 The status command enumerates every identity to prove its account pair and
 every non-revoked device quartet, then enumerates both command tables in all three nonterminal
 states and all five terminal states with provider pages capped at eight maximal

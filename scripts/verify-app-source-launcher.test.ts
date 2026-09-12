@@ -497,6 +497,29 @@ describe("Oompa browser app source proof launcher", () => {
     }
   });
 
+  test("headroom diagnosis retains the fixed command-capacity source launcher", () => {
+    const fixture = launcherFixture();
+    const stdout = output();
+    const stderr = output();
+    const args = commandCapacityArguments.map((argument) => argument === "status" ? "diagnose-headroom" : argument);
+    try {
+      expect(executeAppSourceProofLauncher(args, {
+        ...fixture.dependencies,
+        runtimeEnvironment: { HOME: fixture.root },
+        stderr: stderr.writer, stdout: stdout.writer,
+      })).toBe(0);
+      const child = fixture.events.find((event) => event.includes("/scripts/manage-command-lifecycle-capacity.ts"));
+      expect(child).toContain("diagnose-headroom");
+      expect(child).toContain("/hra-app-source-verifier-");
+      expect(child).not.toContain(`${fixture.root}/scripts/manage-command-lifecycle-capacity.ts`);
+      expect(fixture.events.some((event) => event.includes("--frozen-lockfile"))).toBe(true);
+      expect(fixture.events.some((event) => event.startsWith("credential:"))).toBe(false);
+      expect(stderr.lines).toEqual([]);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
   test("launches only the fixed quota operator after frozen installation and every source recheck", () => {
     const fixture = launcherFixture({ remoteMain: "7".repeat(40) });
     const stdout = output();
