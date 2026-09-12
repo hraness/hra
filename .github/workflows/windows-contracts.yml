@@ -45,3 +45,15 @@ jobs:
       # credential, daemon, installation or platform authority is exercised.
       - name: Check portable framing and help grammars
         run: bun test ./scripts/owned-controller/protocol.test.ts ./scripts/claude-auth-help.test.ts --isolate --max-concurrency=1
+
+      - name: Build fixed Win32 directory security fixture
+        # These invalid ambient options must be removed by the fixed builder.
+        env:
+          CL: '/DOOMPA_AMBIENT_CL_MUST_NOT_REACH_COMPILER=1'
+          _CL_: '/DOOMPA_AMBIENT_CL_TAIL_MUST_NOT_REACH_COMPILER=1'
+        run: ./scripts/windows-directory-security/build-fixture.ps1
+
+      - name: Check actual Win32 directory handle security
+        env:
+          OOMPA_WINDOWS_DIRECTORY_NATIVE: '1'
+        run: bun --no-env-file --config=./scripts/windows-directory-security/bunfig.toml test ./scripts/windows-directory-security/native.test.ts --isolate --max-concurrency=1

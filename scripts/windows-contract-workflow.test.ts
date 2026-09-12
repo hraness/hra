@@ -10,7 +10,7 @@ function record(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-test("Windows qualification stays credential-free, bounded and limited to portable contracts", async () => {
+test("Windows qualification preserves portable contracts and requires the bounded native directory fixture", async () => {
   const workflow = record(Bun.YAML.parse(await readFile(
     join(import.meta.dir, "..", ".github", "workflows", "windows-contracts.yml"), "utf8",
   )));
@@ -28,10 +28,15 @@ test("Windows qualification stays credential-free, bounded and limited to portab
   }
   if (!Array.isArray(job.steps)) throw new TypeError("Expected steps");
   const steps = job.steps.map(record);
-  expect(steps).toHaveLength(5);
-  for (const step of steps) {
-    for (const key of Object.keys(step)) expect(["name", "uses", "with", "run"]).toContain(key);
+  expect(steps).toHaveLength(7);
+  for (const [index, step] of steps.entries()) {
+    for (const key of Object.keys(step)) expect(["name", "uses", "with", "run", ...(index >= 5 ? ["env"] : [])]).toContain(key);
   }
+  expect(steps[5]?.env).toEqual({
+    CL: "/DOOMPA_AMBIENT_CL_MUST_NOT_REACH_COMPILER=1",
+    _CL_: "/DOOMPA_AMBIENT_CL_TAIL_MUST_NOT_REACH_COMPILER=1",
+  });
+  expect(steps[6]?.env).toEqual({ OOMPA_WINDOWS_DIRECTORY_NATIVE: "1" });
   expect(steps.filter((step) => step.uses !== undefined).map(({ uses, with: inputs }) => ({ uses, inputs })))
     .toEqual([
       { uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1", inputs: {
@@ -43,6 +48,9 @@ test("Windows qualification stays credential-free, bounded and limited to portab
     "bun --no-env-file -e \"if (process.platform !== 'win32' || process.arch !== 'x64' || Bun.version !== '1.3.14') process.exit(1); console.log('Windows x64 / Bun ' + Bun.version);\"",
     "bun install --frozen-lockfile --ignore-scripts",
     "bun test ./scripts/owned-controller/protocol.test.ts ./scripts/claude-auth-help.test.ts --isolate --max-concurrency=1",
+    "./scripts/windows-directory-security/build-fixture.ps1",
+    "bun --no-env-file --config=./scripts/windows-directory-security/bunfig.toml test ./scripts/windows-directory-security/native.test.ts --isolate --max-concurrency=1",
   ]);
+  expect(Bun.TOML.parse(await readFile(join(import.meta.dir, "windows-directory-security", "bunfig.toml"), "utf8"))).toEqual({});
   expect((await readFile(join(import.meta.dir, "..", ".bun-version"), "utf8")).trim()).toBe("1.3.14");
 });
