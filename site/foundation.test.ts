@@ -80,7 +80,7 @@ details.hraness-marketing-question[open] > summary {
 }
 `;
 
-test("the stylesheet keeps six foundations and thirteen exact preset/material compatibility rules", async () => {
+test("the stylesheet keeps six foundations and fourteen exact preset/material compatibility rules", async () => {
   const css = await readFile(new URL("styles.css", import.meta.url));
   const compatibilitySelectors: StyleRule["selectors"][] = [];
   const compatibilityDeclarations: StyleRule["declarations"][] = [];
@@ -90,7 +90,7 @@ test("the stylesheet keeps six foundations and thirteen exact preset/material co
       compatibilityDeclarations.push(rule.value.declarations);
     },
   } } });
-  expect(compatibilitySelectors).toHaveLength(17);
+  expect(compatibilitySelectors).toHaveLength(18);
   const selectors: unknown[] = [];
   const declarations: unknown[] = [];
   const media: unknown[] = [];
