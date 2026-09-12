@@ -137,6 +137,10 @@ details.hraness-marketing-question[open] > summary.hraness-marketing-question__s
   background-color: var(--hraness-material-warm-plane);
   color: var(--hraness-material-ink);
 }
+details.hraness-marketing-question[open] > summary {
+  background-color: var(--hraness-material-warm-plane);
+  color: var(--hraness-material-ink);
+}
 :root[data-hraness-material="lantern"] .hraness-marketing-question[open] > summary {
   background-color: var(--hraness-material-warm-plane);
   color: var(--hraness-material-ink);
