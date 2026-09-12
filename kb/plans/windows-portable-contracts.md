@@ -21,9 +21,12 @@ separate Windows check must pass on the final integration candidate before this
 unit merges. Later Windows backend changes need their own focused native tests
 and reviewed integration with the required gate.
 
-Status: source prepared; focused workflow validation, independent review and
-actual Windows CI evidence remain pending. Native Windows product support
-remains unqualified. The next implementation boundaries are Windows private
+The first native Windows run passed 33 tests with 3,069 assertions. The focused
+workflow contract passed one test with 30 assertions, and independent review
+confirmed that the existing required coverage remains unchanged. The initial
+complete `Required` run also passed. Final admission still requires applicable
+local workflow validation and passing CI on the final head and current base.
+Native Windows product support remains unqualified. The next implementation boundaries are Windows private
 state ownership, retained process identity, authenticated local IPC, console
 cancellation, installation and interrupted-update recovery. Preserve existing
 platform guards until their replacements have relevant native evidence.
