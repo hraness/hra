@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { opendir } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
-import type { Readable, Writable } from "node:stream";
 
 import { z } from "zod";
 
@@ -15,6 +14,7 @@ import { captureNativeClaudeMacosAdmission } from "./admission";
 import { QualificationCustody, QualificationCustodyError, type QualificationCustodySource, type QualificationDispatchScope } from "./custody";
 import { containsAsciiControl } from "./identity";
 import { NativeIdentityObserverError, observeNativePrivateClaudeIdentity, type NativeIdentityAuthorityScope } from "./native-observer";
+import { OwnerTerminalError, readOwnerTerminalResponse, type OwnerTerminalStreams } from "./owner-terminal";
 import { ClaudeMacosPreflightError, collectNativeClaudeMacosCapabilities, type ClaudeMacosCapabilities } from "./preflight";
 import { encodeNativeQualificationCheckpoint, encodeQualificationCheckpoint } from "./receipt";
 import { nativeQualificationBindingSchema, observeQualification, qualificationBindingSchema, QUALIFICATION_CLEANUP_ROOTS,
@@ -203,78 +203,13 @@ async function run(input: Input, mode: "native_process" | "credential_free_fixtu
   return Object.freeze(outcome);
 }
 
-type PromptStreams = Readonly<{ input: Readable; output: Writable; assertCurrent(): void }>;
-const retainedPromptWrites = new Set<Promise<void>>();
-async function writeOwnerPrompt(output: Writable, message: string): Promise<void> {
-  const completion = new Promise<void>((done, reject) => {
-    let finished = false;
-    const finish = (error?: Error): void => {
-      if (finished) return; finished = true;
-      output.off("error", failed); output.off("close", closed);
-      if (error === undefined) done(); else reject(new ClaudeMacosFirstLoginError("owner_refused"));
-    };
-    const failed = (): void => { finish(new Error("terminal_write_failed")); };
-    const closed = (): void => { failed(); };
-    output.once("error", failed); output.once("close", closed);
-    // Writable emits its error after the failed write callback. Keep the owned
-    // error/close listeners until that terminal event, rather than exposing it.
-    try { output.write(message, (error) => { if (!error) finish(); }); } catch { failed(); }
-  });
-  retainedPromptWrites.add(completion);
-  void completion.then(() => retainedPromptWrites.delete(completion), () => retainedPromptWrites.delete(completion));
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try { await Promise.race([completion, new Promise<never>((_done, reject) => {
-    timer = setTimeout(() => { reject(new ClaudeMacosFirstLoginError("owner_refused", "uncertain")); }, 1000);
-  })]); } finally { clearTimeout(timer); }
-}
-/** This reader owns only its listeners and temporary bytes, never the owner's descriptors. */
+type PromptStreams = OwnerTerminalStreams;
 async function promptOwner(streams: PromptStreams, signal: AbortSignal, scope: QualificationDispatchScope): Promise<void> {
-  const isAborted = (): boolean => signal.aborted;
-  streams.assertCurrent(); if (isAborted()) return refused("aborted");
-  const input = streams.input;
-  let outputFailed = false; let rejectResponse: (() => void) | null = null;
-  const unavailable = (): boolean => outputFailed || input.destroyed || input.readableEnded || streams.output.destroyed || streams.output.writableEnded;
-  if (unavailable() || input.readableEncoding !== null || input.readableFlowing === true
-    || input.readableLength !== 0 || input.listenerCount("data") !== 0 || input.listenerCount("readable") !== 0) return refused("owner_refused");
-  const expected = Buffer.from(`signed-in-A ${randomUUID()}\n`, "ascii");
-  const message = `Claude's A login child has joined. For run ${scope.runId}, attempt ${scope.attemptId}, confirm you signed in to your intended A account. Type exactly: ${expected.toString("ascii")}`;
-  const outputFailure = (): void => { outputFailed = true; rejectResponse?.(); };
-  streams.output.on("error", outputFailure); streams.output.on("close", outputFailure);
-  try {
-    await writeOwnerPrompt(streams.output, message);
-    streams.assertCurrent(); if (isAborted()) return refused("aborted");
-    if (unavailable()) return refused("owner_refused");
-    await new Promise<void>((done, reject) => {
-      const buffer = Buffer.alloc(128); let size = 0; let finished = false;
-      const finish = (error?: ClaudeMacosFirstLoginError): void => {
-        if (finished) return; finished = true;
-        input.pause(); input.off("data", data); input.off("end", ended); input.off("error", failed); input.off("close", ended);
-        rejectResponse = null;
-        signal.removeEventListener("abort", aborted); process.off("SIGINT", interrupted); process.off("SIGTERM", interrupted);
-        buffer.fill(0); if (error === undefined) done(); else reject(error);
-      };
-      const failed = (): void => { finish(new ClaudeMacosFirstLoginError("owner_refused")); };
-      rejectResponse = failed;
-      const ended = (): void => { failed(); };
-      const aborted = (): void => { finish(new ClaudeMacosFirstLoginError("aborted")); };
-      const interrupted = (): void => { aborted(); };
-      const data = (value: unknown): void => {
-        try {
-          streams.assertCurrent();
-          if (!(value instanceof Uint8Array) || value.byteLength > buffer.length - size || signal.aborted) { failed(); return; }
-          buffer.set(value, size); size += value.byteLength;
-          if (buffer.subarray(0, size).includes(10)) {
-            if (!buffer.subarray(0, size).equals(expected)) { failed(); return; }
-            streams.assertCurrent(); finish();
-          }
-        } catch { failed(); }
-        finally { if (value instanceof Uint8Array) value.fill(0); }
-      };
-      input.on("data", data); input.once("end", ended); input.once("error", failed); input.once("close", ended);
-      signal.addEventListener("abort", aborted, { once: true }); process.on("SIGINT", interrupted); process.on("SIGTERM", interrupted);
-      if (isAborted()) aborted(); else if (unavailable()) failed(); else input.resume();
-    });
-  } finally { streams.output.off("error", outputFailure); streams.output.off("close", outputFailure); expected.fill(0); }
+  try { await readOwnerTerminalResponse(streams, signal, { runId: scope.runId, attemptId: scope.attemptId, step: 1 }); }
+  catch (error: unknown) {
+    if (error instanceof OwnerTerminalError) throw new ClaudeMacosFirstLoginError(error.code === "order_refused" ? "authority_refused" : error.code, error.cleanup);
+    throw error;
+  }
 }
 
 let nativeActive = false;
