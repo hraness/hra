@@ -1,5 +1,6 @@
 # Contents
 
+- `darwin-daemon-restart-fixture.ts` and its gated native test run two credential-free Darwin daemon children against one short, isolated store. They fence new starts when cleanup begins, retain the original database identity, and compare pending transcript and queued-input evidence plus daemon-served recovery after exact stop and pipe joins. They retain their diagnostic roots and do not qualify provider authentication or managed macOS activation.
 - `windows-contract-workflow.test.ts` preserves the supplementary Windows portable contracts and requires the separate, credential-free directory-handle fixture.
 - `windows-directory-security/` contains a scripts-only Win32 owner/DACL, reparse and file-identity observer with fixed native fixtures. It does not enable product Windows installation or runtime behavior.
 - `owned-controller/` contains an experimental direct-child protocol, a macOS native helper and credential-free process fixtures. It is separate from the Linux authority supervisor and is not connected to the production daemon or package.
