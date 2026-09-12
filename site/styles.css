@@ -67,7 +67,7 @@ body {
 /* Keep the warm active plane concrete even when a host stylesheet supplies an
  * unresolved semantic surface token. */
 :root[data-hraness-material="lantern"] {
-  --hraness-material-warm-plane: color-mix(in oklch, #d49a54 12%, light-dark(#fffefa, #1d1a18));
+  --hraness-material-warm-plane: color-mix(in oklch, #d49a54 12%, var(--surface, #fffefa));
 }
 
 /* Compatibility with the installed 0.6.4 sealed descendants: these few fixed
