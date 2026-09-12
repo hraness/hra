@@ -6,7 +6,8 @@ if ($env:ImageVersion -notmatch '^[0-9.]{1,80}$' -or $env:RUNNER_TEMP -notmatch 
 $source = [IO.Path]::GetFullPath($PSScriptRoot)
 $output = Join-Path $env:RUNNER_TEMP 'oompa-windows-directory-build'
 if (Test-Path -LiteralPath $output) { throw 'WINDOWS_DIRECTORY_BUILD_ALREADY_EXISTS' }
-$vs = Join-Path ${env:ProgramFiles} 'Microsoft Visual Studio\2022\Enterprise'
+# Fixed VS2026 root from the observed Windows image inventory in contract.md.
+$vs = Join-Path ${env:ProgramFiles} 'Microsoft Visual Studio\18\Enterprise'
 $versionPath = Join-Path $vs 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt'
 $toolsVersion = ([IO.File]::ReadAllText($versionPath)).Trim()
 if ($toolsVersion -notmatch '^14\.[0-9.]{1,32}$') { throw 'WINDOWS_DIRECTORY_COMPILER_REFUSED' }
