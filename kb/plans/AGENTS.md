@@ -1,5 +1,6 @@
 # Contents
 
+- `windows-portable-contracts.md` tracks the separate native Windows run of pure protocol and help-parser contracts and its limits.
 - `cross-platform-daily-driver.md` tracks the owner's macOS-first daily-driver target and native macOS, Linux and Windows implementation and acceptance.
 - `memory-quota-upgrade.md` tracks the explicit additive migration from predecessor quota ledgers to the memory category and resource, preserving all prior accounting and independent capacity guards.
 - `wonka-marketing.md` tracks the homepage's restrained top-hat artwork, engraved story seals, rendering budget, and acceptance evidence.

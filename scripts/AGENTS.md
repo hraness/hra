@@ -1,5 +1,6 @@
 # Contents
 
+- `windows-contract-workflow.test.ts` keeps the supplementary Windows workflow limited to pinned, credential-free portable contract checks.
 - `owned-controller/` contains an experimental direct-child protocol, a macOS native helper and credential-free process fixtures. It is separate from the Linux authority supervisor and is not connected to the production daemon or package.
 - `claude-macos-auth-qualification/` contains account-isolation fixtures, private native checkpoints and guarded fresh preflight, first-login and complete account-sequence compositions. Its private exports have no product CLI command and do not admit managed macOS execution.
 - `claude-macos-auth-process/` contains qualification-only detached authentication process ports and explicit Darwin fixtures. It binds each child to its executable, environment and private directories, then joins the target, streams and process inspectors before admitting output.
