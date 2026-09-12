@@ -32,6 +32,8 @@ The complete `native-run.ts` composition now holds one fresh owner and the origi
 
 ## Qualification boundaries
 
+The separate [Darwin session qualification](../../scripts/claude-macos-session-qualification/contract.md) now has a fresh-owner source composition for the existing production runtime manager and process adapter. It prepares strict runtime/authentication admission, streaming and exact approval/denial/interrupt scenarios, joined close and same-thread resume through a new manager, followed by logout. Its own authenticated effect journal retains ambiguous results without replay. Independent source review found no remaining behavioral issue. All 18 driver/turn cases pass across focused runs, including the native source-root refusal; pure custody tests pass 10 cases with 357 assertions, and the combined native custody/owner suite passes 29 cases with 498 assertions. Focused types, lint and the unchanged 33-test workflow contract pass. Native fixtures use synthetic source and summaries, retain their roots and release their owners; they do not execute a provider. Exact integration and authenticated session acceptance remain pending. Real daemon restart and crash reconciliation remain separate work. This unit reuses no cleaned account-qualification profile and changes no platform guard.
+
 | Work | Required evidence and authority |
 | --- | --- |
 | Optional controller improvement | The native helper can strengthen pre-exec custody independently. Production adoption requires a reviewed adapter contract and its own integration evidence; it is not a prerequisite for qualifying the existing Darwin provider path. |
