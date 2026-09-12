@@ -20,7 +20,7 @@ static int close_owned(HANDLE *h) {
   *h = INVALID_HANDLE_VALUE; closed_handles++; return 1;
 }
 static HANDLE open_directory(const WCHAR *path) {
-  HANDLE h = CreateFileW(path, READ_CONTROL | FILE_READ_ATTRIBUTES | WRITE_DAC,
+  HANDLE h = CreateFileW(path, READ_CONTROL | FILE_READ_ATTRIBUTES | WRITE_DAC | DELETE,
     FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
     FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
   if (h != INVALID_HANDLE_VALUE) opened_handles++;
