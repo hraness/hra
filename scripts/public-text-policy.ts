@@ -1,4 +1,6 @@
+import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { lstat, readFile, readdir, realpath } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 
@@ -6,6 +8,7 @@ import {
   assertAuthoritySupervisorArtifactPublicFile,
   isAuthoritySupervisorArtifactRelativePath,
 } from "./authority-supervisor-artifact";
+import { snapshotMarketingPreset } from "./marketing-preset";
 
 const allowedPublicScopes = new Set([
   "agentclientprotocol",
@@ -142,6 +145,28 @@ const textFile = /(?:^|\/)(?:CODEOWNERS|LICENSE|\.bun-version|\.editorconfig|\.g
 const releasedStateSql = "scripts/fixtures/released-state/v0.5.0/control-plane.sql";
 const editorialWebp = /^site\/images\/editorial\/[a-z0-9]+(?:-[a-z0-9]+)*(?:-384|-768)?\.webp$/u;
 const webpChunkTypes = new Set(["VP8 ", "VP8L", "VP8X"]);
+const marketingDirectory = "site/vendor/marketing-preset";
+const marketingDeclaration = `${marketingDirectory}/check.d.mts`;
+const marketingFont = "fonts/instrument-serif/instrument-serif-latin-400.woff2";
+
+/** One reviewed licensed binary, inside the complete canonical source inventory.
+ * Neither its suffix nor caller-controlled provenance authorizes other bytes. */
+async function assertMarketingPublicSource(root: string, label: string): Promise<void> {
+  try {
+    const directory = join(await realpath(root), marketingDirectory);
+    assert.equal(await realpath(directory), directory);
+    const snapshot = await snapshotMarketingPreset(directory);
+    assert.equal(snapshot.sourceCommit, "898d80364085a41c858350f1b492ac28b5a0384b");
+    const bytes = snapshot.files.get(marketingFont);
+    assert.ok(bytes !== undefined && bytes.byteLength >= 48 && bytes.byteLength <= 50_000);
+    assert.equal(bytes.toString("ascii", 0, 4), "wOF2");
+    assert.equal(bytes.readUInt32BE(8), bytes.byteLength);
+    assert.equal(createHash("sha256").update(bytes).digest("hex"),
+      "60c06664b5a95c7de6cc3e00d1f9034d78bd1e40b564016b241674449a067d4d");
+  } catch {
+    throw new PublicTextPolicyError("UNREVIEWED_FILE_TYPE", label);
+  }
+}
 
 const assertEditorialWebp = async (path: string, label: string): Promise<void> => {
   const bytes = await readFile(path);
@@ -174,7 +199,10 @@ async function scanPublicTree(root: string, skipCheckoutTmp: boolean): Promise<v
         await assertAuthoritySupervisorArtifactPublicFile(root, label);
       } else if (entry.isFile() && editorialWebp.test(label)) {
         await assertEditorialWebp(child, label);
-      } else if (entry.isFile() && (textFile.test(child) || label === releasedStateSql)) {
+      } else if (entry.isFile() && label === `${marketingDirectory}/${marketingFont}`) {
+        await assertMarketingPublicSource(root, label);
+      } else if (entry.isFile() && (textFile.test(child) || label === releasedStateSql || label === marketingDeclaration)) {
+        if (label === marketingDeclaration) await assertMarketingPublicSource(root, label);
         const value = await readFile(child, "utf8");
         if (entry.name === "bun.lock") assertPublicSensitiveText(value, label);
         else assertPublicText(value, label);

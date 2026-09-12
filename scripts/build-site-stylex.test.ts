@@ -19,13 +19,17 @@ const planSha256 = "a".repeat(64);
 const foundationCss = "assets/style-abcdefgh.css";
 const foundationEntry = "assets/foundation-abcdefgh.js";
 const foundationSource = "/fixture/site/foundation.ts";
-const snapshotSiteFoundation = (value: unknown, hashes: readonly string[]) => captureSiteFoundation(value, hashes, foundationSource);
+const images = ["grain", "cells"].map((name) => ({
+  fileName: `assets/${name}-abcdefgh.svg`, source: `<svg data-fixture="${name}"/>`, type: "asset",
+}));
+const imageHashes = images.map(({ source }) => hash(source));
+const snapshotSiteFoundation = (value: unknown, hashes: readonly string[]) => captureSiteFoundation(value, hashes, foundationSource, imageHashes);
 const capturedFinalCss = { path: "stylex.css", bytes: "stylex.css".length, sha256: hash("stylex.css") };
 const projectSiteArtifacts = (value: unknown, plan: string, foundation: ReturnType<typeof snapshotSiteFoundation>) =>
   projectCapturedSite(value, plan, foundation, capturedFinalCss);
 const makeFoundation = () => {
-  const fonts = Array.from({ length: 13 }, (_, index) => ({
-    fileName: `assets/${index === 12 ? "GeistMono[wght]" : `NebulaSans-${index}`}-abcdefgh.woff2`,
+  const fonts = Array.from({ length: 14 }, (_, index) => ({
+    fileName: `assets/${index === 12 ? "GeistMono[wght]" : index === 13 ? "InstrumentSerif" : `NebulaSans-${index}`}-abcdefgh.woff2`,
     source: new Uint8Array([0x77, 0x4f, 0x46, 0x32, index]),
     type: "asset",
   }));
@@ -34,7 +38,7 @@ const makeFoundation = () => {
     fileName: foundationEntry, imports: [], isDynamicEntry: false, isEntry: true,
     map: null, referencedFiles: [], type: "chunk",
   };
-  const output = [{ fileName: foundationCss, source: ":root{color:black}", type: "asset" }, ...fonts, entry];
+  const output = [{ fileName: foundationCss, source: ":root{color:black}", type: "asset" }, ...fonts, ...images, entry];
   return { output, hashes: fonts.map(({ source }) => hash(source)) };
 };
 
@@ -133,11 +137,11 @@ describe("static site compiler projection", () => {
     }
   });
 
-  test("snapshots actual RollupOutput bytes and thirteen exact font hashes", () => {
+  test("snapshots actual RollupOutput bytes and fourteen exact font hashes and two preset SVG hashes", () => {
     const { output, hashes } = makeFoundation();
     const result = snapshotSiteFoundation({ output }, hashes);
     expect(result.cssPath).toBe(`graphs/foundation/${foundationCss}`);
-    expect(result.artifacts).toHaveLength(15);
+    expect(result.artifacts).toHaveLength(18);
     expect(result.privateEntryPath).toBe(foundationEntry);
     expect(snapshotSiteFoundation([{ output }], [...hashes].reverse())).toEqual(result);
     expect(result.artifacts.find(({ path }) => path.includes("GeistMono[wght]"))?.sha256).toBe(hashes[12]);
@@ -158,6 +162,14 @@ describe("static site compiler projection", () => {
     expect(() => snapshotSiteFoundation({ output: output.map((item, index) => index === 1 ? { ...item, fileName: output[2]!.fileName } : item) }, hashes)).toThrow();
   });
 
+  test("rejects missing, substituted or unrelated preset SVG bytes", () => {
+    const { output, hashes } = makeFoundation();
+    expect(() => captureSiteFoundation({ output }, hashes, foundationSource, imageHashes.slice(1))).toThrow();
+    expect(() => captureSiteFoundation({ output }, hashes, foundationSource, [hash("foreign"), imageHashes[1]!])).toThrow();
+    expect(() => snapshotSiteFoundation({ output: output.map((item) => item.fileName.endsWith(".svg") ? { ...item, source: "<svg/>" } : item) }, hashes)).toThrow();
+    expect(() => snapshotSiteFoundation({ output: output.map((item) => item.fileName.endsWith(".svg") ? { ...item, fileName: "assets/foreign.png" } : item) }, hashes)).toThrow();
+  });
+
   test("rejects watcher/multi-output results, extra JavaScript, foreign types and unsafe paths", () => {
     const { output, hashes } = makeFoundation();
     for (const invalid of [null, {}, { close() {} }, [], [{ output }, { output }]]) {
@@ -175,7 +187,7 @@ describe("static site compiler projection", () => {
 
   test("requires the exact captured empty entry without executable code, imports or maps", () => {
     const { output, hashes } = makeFoundation();
-    expect(() => captureSiteFoundation({ output }, hashes, "site/foundation.ts")).toThrow();
+    expect(() => captureSiteFoundation({ output }, hashes, "site/foundation.ts", imageHashes)).toThrow();
     expect(() => snapshotSiteFoundation({ output: output.slice(0, -1) }, hashes)).toThrow();
     for (const mutation of [
       { code: "alert(1)" }, { code: "export {};" }, { code: "/* source provenance */" },
@@ -192,11 +204,11 @@ describe("static site compiler projection", () => {
     expect(empty.artifacts.find(({ path }) => path === foundationEntry)).toEqual({ path: foundationEntry, bytes: 0, sha256: hash("") });
   });
 
-  test("publishes only nine HTML routes, the final union, foundation and exact fonts", () => {
+  test("publishes only nine HTML routes, the final union, foundation, exact fonts and preset SVGs", () => {
     const { complete, foundation } = makeComplete();
     const projected = projectSiteArtifacts(complete, planSha256, foundation);
-    expect(projected).toHaveLength(24);
-    expect(projected.filter(({ path }) => path.endsWith(".woff2"))).toHaveLength(13);
+    expect(projected).toHaveLength(27);
+    expect(projected.filter(({ path }) => path.endsWith(".woff2"))).toHaveLength(14);
     expect(projected.filter(({ path }) => path.endsWith(".html")).map(({ path }) => path).sort()).toEqual([...htmlRoutes].sort());
     expect(projected.some(({ path }) => /\.(?:js|json|map|ts|tsx|otf)$/u.test(path))).toBe(false);
   });

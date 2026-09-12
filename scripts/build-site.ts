@@ -25,6 +25,7 @@ import { buildSiteStylex } from "./build-site-stylex.ts";
 import { buildProductPreview } from "./build-product-preview.ts";
 import { OOMPA_RELEASE_VERSION } from "./release-evidence";
 import { buildOompaAppearance } from "./build-appearance";
+import { snapshotMarketingPreset } from "./marketing-preset";
 
 interface BuildOptions {
   readonly check: boolean;
@@ -377,9 +378,15 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
   const analyticsProjectToken = resolveOompaAnalyticsProjectToken(environment);
   const fonts = await snapshotSiteFonts(dirname(designKitFontsStylesPath));
   const sourceRoot = await realpath(options.sourceRoot ?? options.repositoryRoot);
+  const marketingPreset = await snapshotMarketingPreset(join(sourceRoot, "site/vendor/marketing-preset"));
+  const presetFonts = [...marketingPreset.files].filter(([path]) => path.startsWith("fonts/"))
+    .map(([path, bytes]) => ({ path: path.slice("fonts/".length), bytes }));
+  const allFonts = [...fonts.inputs, ...presetFonts];
+  const presetImages = [...marketingPreset.files].filter(([path]) => path.endsWith(".svg"))
+    .map(([path, bytes]) => ({ path, bytes }));
   const compiled = await buildSiteStylex({
     sourceRoot,
-    environment, fonts: fonts.inputs,
+    environment, fonts: allFonts, images: presetImages,
   });
   // Retain failed/completed private receipts under the same ignored build root
   // as the static compiler. Only the builder's verified public projection moves.
@@ -405,9 +412,16 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
   }
   // Browser fonts are already hashed graph assets. Publish their attribution
   // beside the family names without a redundant second copy of every WOFF2.
-  for (const { path, bytes } of fonts.inputs.filter(({ path }) => !path.endsWith(".woff2"))) {
+  for (const { path, bytes } of allFonts.filter(({ path }) => !path.endsWith(".woff2"))) {
     const destination = join(options.repositoryRoot, "dist/site/fonts", path);
     await mkdir(dirname(destination), { recursive: true });
+    await writeFile(destination, bytes, { flag: "wx", mode: 0o644 });
+  }
+  for (const name of ["LICENSE", "marketing-assets/UPSTREAM.md"]) {
+    const destination = join(options.repositoryRoot, "dist/site/marketing-preset", name);
+    await mkdir(dirname(destination), { recursive: true });
+    const bytes = marketingPreset.files.get(name);
+    assert.ok(bytes !== undefined, "Canonical marketing attribution is missing");
     await writeFile(destination, bytes, { flag: "wx", mode: 0o644 });
   }
   const socialCardPng = renderSocialCardPng();
