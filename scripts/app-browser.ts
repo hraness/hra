@@ -909,10 +909,10 @@ export function assertSiteMaterialPaint(value: unknown, home: boolean, opaque: b
       assert.ok(string(wall.image).includes("radial-gradient("));
     }
     assert.equal(array(sample.selected).length, 1);
-    for (const actual of [...array(sample.selected), ...array(sample.disclosures)]) {
+    for (const [index, actual] of [...array(sample.selected), ...array(sample.disclosures)].entries()) {
       const paint = record(actual), choice = record(expected.choice);
-      assert.equal(paint.background, choice.background, "Selected control lost its warm/forced plane");
-      assert.equal(paint.ink, choice.ink, "Selected control lost its matched ink");
+      assert.equal(paint.background, choice.background, `${index === 0 ? "Preview selected control" : "FAQ disclosure"} lost its warm/forced plane: ${JSON.stringify(paint)}`);
+      assert.equal(paint.ink, choice.ink, index === 0 ? "Preview selected control lost its matched ink" : "FAQ disclosure lost its matched ink");
     }
     assert.equal(array(sample.disclosures).length, 1, "A real native FAQ must be observed open");
   } else assert.equal(sample.wall, null);
