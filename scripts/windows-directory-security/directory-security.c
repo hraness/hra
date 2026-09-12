@@ -135,7 +135,7 @@ static int same_id(const FILE_ID_INFO *a, const FILE_ID_INFO *b) {
 }
 static wd_status observe(HANDLE handle, FILE_ID_INFO *identity,
     unsigned char user[WD_SID_LIMIT], size_t *user_length) {
-  FILE_ID_INFO before, after;
+  FILE_ID_INFO before, after = { 0 };
   unsigned char descriptor_bytes[WD_DESCRIPTOR_LIMIT], second[WD_SID_LIMIT];
   size_t second_length = 0;
   DWORD needed = 0;
