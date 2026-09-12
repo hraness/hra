@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import fc from "fast-check";
 import { spawnSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { chmod, cp, mkdir, mkdtemp, readFile, realpath, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -14,6 +15,7 @@ import {
   PublicTextPolicyError,
 } from "./public-text-policy";
 import { authoritySupervisorArtifactManifest } from "./authority-supervisor-artifact";
+import { checkMarketingSnapshot } from "../site/vendor/marketing-preset/check.mjs";
 
 function fixtureGit(root: string, args: readonly string[]): void {
   const result = spawnSync("/usr/bin/git", [...args], {
@@ -380,6 +382,71 @@ describe("public text policy", () => {
     } finally {
       await rm(root, { force: true, recursive: true });
     }
+  });
+
+  test("admits only the complete canonical editorial font and scans its declaration as public text", async () => {
+    const source = join(import.meta.dir, "../site/vendor/marketing-preset");
+    const font = "fonts/instrument-serif/instrument-serif-latin-400.woff2";
+    const manifest = await checkMarketingSnapshot(source);
+    for (const mutation of ["none", "font", "forged-font-receipt", "symlink", "directory-symlink", "source", "missing", "font-sibling", "declaration-sibling", "declaration-secret"] as const) {
+      const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-public-marketing-")));
+      const directory = join(root, "site/vendor/marketing-preset");
+      try {
+        await mkdir(dirname(directory), { recursive: true });
+        await cp(source, directory, { recursive: true });
+        if (mutation === "font" || mutation === "forged-font-receipt") {
+          const bytes = await readFile(join(directory, font)); bytes[bytes.length - 1] = (bytes[bytes.length - 1] ?? 0) ^ 1;
+          await writeFile(join(directory, font), bytes);
+          if (mutation === "forged-font-receipt") {
+            await writeFile(join(directory, "provenance.json"), JSON.stringify({ ...manifest,
+              files: { ...manifest.files, [font]: { ...manifest.files[font], sha256: createHash("sha256").update(bytes).digest("hex") } } }));
+          }
+        }
+        if (mutation === "symlink") {
+          await unlink(join(directory, font)); await symlink(join(source, font), join(directory, font));
+        }
+        if (mutation === "directory-symlink") {
+          await rm(join(directory, "fonts"), { recursive: true }); await symlink(join(source, "fonts"), join(directory, "fonts"));
+        }
+        if (mutation === "source") {
+          await writeFile(join(directory, "provenance.json"), JSON.stringify({ ...manifest, source: { ...manifest.source, commit: "a".repeat(40) } }));
+        }
+        if (mutation === "missing") await unlink(join(directory, "fonts/instrument-serif/OFL.txt"));
+        if (mutation === "font-sibling") await cp(join(directory, font), join(root, "other.woff2"));
+        if (mutation === "declaration-sibling") await writeFile(join(root, "other.d.mts"), "export {};\n");
+        if (mutation === "declaration-secret") {
+          const declaration = "check.d.mts";
+          const text = `// ${["github", "pat", "abcdefghijklmnopqrstuvwxyz123456"].join("_")}\n`;
+          await writeFile(join(directory, declaration), text);
+          await writeFile(join(directory, "provenance.json"), JSON.stringify({ ...manifest,
+            files: { ...manifest.files, [declaration]: { ...manifest.files[declaration], sha256: createHash("sha256").update(text).digest("hex") } } }));
+        }
+        if (mutation === "none") await expect(assertPublicTree(root)).resolves.toBeUndefined();
+        else if (mutation === "declaration-secret") await expect(assertPublicTree(root)).rejects.toMatchObject({ code: "SECRET_SHAPE" });
+        else await expect(assertPublicTree(root)).rejects.toMatchObject({ code: "UNREVIEWED_FILE_TYPE" });
+      } finally { await rm(root, { recursive: true, force: true }); }
+    }
+  });
+
+  test("changed font bytes cannot gain public admission through a rewritten receipt", async () => {
+    const source = join(import.meta.dir, "../site/vendor/marketing-preset");
+    const font = "fonts/instrument-serif/instrument-serif-latin-400.woff2";
+    const original = await readFile(join(source, font));
+    const manifest = await checkMarketingSnapshot(source);
+    const root = await realpath(await mkdtemp(join(tmpdir(), "oompa-public-font-law-")));
+    const directory = join(root, "site/vendor/marketing-preset");
+    try {
+      await mkdir(dirname(directory), { recursive: true });
+      await cp(source, directory, { recursive: true });
+      await fc.assert(fc.asyncProperty(fc.integer({ min: 0, max: original.length - 1 }), fc.integer({ min: 1, max: 255 }),
+        async (offset, change) => {
+          const bytes = Buffer.from(original); bytes[offset] = (bytes[offset] ?? 0) ^ change;
+          await writeFile(join(directory, font), bytes);
+          await writeFile(join(directory, "provenance.json"), JSON.stringify({ ...manifest,
+            files: { ...manifest.files, [font]: { ...manifest.files[font], sha256: createHash("sha256").update(bytes).digest("hex") } } }));
+          await expect(assertPublicTree(root)).rejects.toMatchObject({ code: "UNREVIEWED_FILE_TYPE" });
+        }), { numRuns: 20, seed: 20_260_912 });
+    } finally { await rm(root, { recursive: true, force: true }); }
   });
 
   test("scans the exact GitHub CODEOWNERS control as public text", async () => {
