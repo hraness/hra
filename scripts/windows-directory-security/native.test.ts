@@ -34,6 +34,44 @@ function parseResult(input: unknown) {
     || !input.endsWith("\n") || input.slice(0, -1).includes("\n")) throw refusal();
   return resultSchema.parse(JSON.parse(input) as unknown);
 }
+const diagnosticCount = z.number().int().nonnegative().max(1_024);
+const failureSchema = z.object({
+  schema: z.literal(1), source: z.literal("credential_free_win32_fixture"),
+  cases: z.number().int().nonnegative().max(18), passed: z.literal(false),
+  cleanup: z.enum(["joined", "uncertain"]),
+  handlesOpened: diagnosticCount, handlesClosed: diagnosticCount,
+  tokensOpened: diagnosticCount, tokensClosed: diagnosticCount,
+  failureLine: z.number().int().nonnegative().max(5_000),
+}).strict();
+function parseFailure(input: unknown) {
+  if (typeof input !== "string" || input.length > 2_048 || Buffer.byteLength(input) > 2_048
+    || !input.endsWith("\n") || input.slice(0, -1).includes("\n")) return null;
+  try {
+    const parsed = failureSchema.safeParse(JSON.parse(input) as unknown);
+    return parsed.success ? parsed.data : null;
+  } catch { return null; }
+}
+type Collected = Readonly<{ eof: boolean; failed: boolean; text: string; bytes: number }>;
+type Ended = Readonly<{ code: number | null; signal: NodeJS.Signals | null }>;
+function projectFailure(ended: Ended, out: Collected, err: Collected,
+    state: Readonly<{ spawnError: boolean; stopAttempted: boolean; deadlineExceeded: boolean }>) {
+  const complete = !state.spawnError && !state.stopAttempted && !state.deadlineExceeded
+    && ended.signal === null && out.eof && !out.failed && err.eof && !err.failed
+    && out.bytes <= 2_048 && err.bytes <= 512 && err.text === "";
+  return {
+    evidence: "credential_free_windows_directory_failure",
+    exitCode: ended.code !== null && Number.isInteger(ended.code) && ended.code >= -2_147_483_648
+      && ended.code <= 2_147_483_647 ? ended.code : null,
+    signaled: ended.signal !== null, spawnError: state.spawnError,
+    stopAttempted: state.stopAttempted, deadlineExceeded: state.deadlineExceeded,
+    stdoutEof: out.eof, stdoutFailed: out.failed, stdoutBytesCapped: out.bytes,
+    stderrEof: err.eof, stderrFailed: err.failed, stderrBytesCapped: err.bytes,
+    // Only the fixture's ordinary failure exit and positively collected streams
+    // admit its closed diagnostic fields. This never feeds success admission.
+    fixture: complete && ended.code === 70 ? parseFailure(out.text) : null,
+    productWindowsQualified: false, providerEffectsQualified: false,
+  };
+}
 async function readBounded(path: string, maximumBytes: number): Promise<Buffer> {
   if (await realpath(path) !== path) throw refusal();
   const handle = await open(path, "r");
@@ -58,7 +96,7 @@ const digest = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest(
 function collect(stream: Readable, maximum: number, cancel: () => void) {
   let bytes = 0; let eof = false; let failed = false;
   const chunks: Buffer[] = [];
-  return new Promise<{ eof: boolean; failed: boolean; text: string }>((done) => {
+  return new Promise<Collected>((done) => {
     stream.on("data", (chunk: Buffer) => {
       bytes += chunk.length;
       if (bytes > maximum) { failed = true; cancel(); }
@@ -66,7 +104,8 @@ function collect(stream: Readable, maximum: number, cancel: () => void) {
     });
     stream.once("error", () => { failed = true; cancel(); });
     stream.once("end", () => { eof = true; });
-    stream.once("close", () => done({ eof, failed: failed || !eof, text: Buffer.concat(chunks).toString("utf8") }));
+    stream.once("close", () => done({ eof, failed: failed || !eof,
+      text: Buffer.concat(chunks).toString("utf8"), bytes: Math.min(bytes, maximum + 1) }));
   });
 }
 let closing = false;
@@ -110,6 +149,57 @@ test("counter mismatch and incomplete native case counts cannot pass by serializ
   }), { seed: 20260912, numRuns: 100 });
 });
 
+const negative = { ...positive, passed: false, cases: 2, handlesOpened: 0, handlesClosed: 0,
+  tokensOpened: 2, tokensClosed: 2, failureLine: 156 } as const;
+test("closed fixture failure diagnostics retain counts without admitting success", () => {
+  fc.assert(fc.property(fc.integer({ min: 0, max: 18 }), fc.integer({ min: 0, max: 1_024 }), (cases, handlesClosed) => {
+    const value = { ...negative, cases, handlesClosed };
+    const text = `${JSON.stringify(value)}\n`;
+    expect(parseFailure(text)).toEqual(value);
+    expect(() => parseResult(text)).toThrow();
+  }), { seed: 20260912, numRuns: 100 });
+  const uncertain = { ...negative, cleanup: "uncertain", failureLine: 0 } as const;
+  expect(parseFailure(`${JSON.stringify(uncertain)}\n`)).toEqual(uncertain);
+});
+test("failure diagnostics discard malformed, excess and foreign fields without forwarding text", () => {
+  const text = `${JSON.stringify(negative)}\n`;
+  for (const input of [null, {}, "", "{\n", text.trimEnd(), `${text}\n`, "x".repeat(2_049),
+    `${JSON.stringify(positive)}\n`, `${JSON.stringify({ ...negative, note: "private diagnostic" })}\n`,
+    ...[{ cases: -1 }, { cases: 19 }, { handlesOpened: 1_025 }, { tokensClosed: -1 },
+      { failureLine: 5_001 }, { failureLine: 1.5 }, { source: "foreign" }, { cleanup: "unknown" }]
+      .map((changed) => `${JSON.stringify({ ...negative, ...changed })}\n`)]) {
+    expect(parseFailure(input)).toBeNull();
+  }
+});
+test("uncertain child or stream outcomes retain unknown fixture diagnostics", () => {
+  const text = `${JSON.stringify(negative)}\n`;
+  const out = { eof: true, failed: false, text, bytes: Buffer.byteLength(text) };
+  const err = { eof: true, failed: false, text: "", bytes: 0 };
+  const ended = { code: 70, signal: null } as const;
+  const state = { spawnError: false, stopAttempted: false, deadlineExceeded: false };
+  expect(projectFailure(ended, out, err, state).fixture).toEqual(negative);
+  for (const changed of [{ spawnError: true }, { stopAttempted: true }, { deadlineExceeded: true }]) {
+    expect(projectFailure(ended, out, err, { ...state, ...changed }).fixture).toBeNull();
+  }
+  for (const changed of [{ eof: false }, { failed: true }, { bytes: 2_049 }]) {
+    expect(projectFailure(ended, { ...out, ...changed }, err, state).fixture).toBeNull();
+  }
+  for (const changed of [{ eof: false }, { failed: true }, { bytes: 513 }, { text: "private stderr" }]) {
+    const evidence = projectFailure(ended, out, { ...err, ...changed }, state);
+    expect(evidence.fixture).toBeNull();
+    expect(JSON.stringify(evidence)).not.toContain("private stderr");
+  }
+  for (const changed of [{ code: null }, { code: 0 }, { code: 71 }, { signal: "SIGTERM" as const }]) {
+    expect(projectFailure({ ...ended, ...changed }, out, err, state).fixture).toBeNull();
+  }
+  const foreign = `${JSON.stringify({ ...negative, sid: "private identity" })}\n`;
+  const evidence = projectFailure(ended, { ...out, text: foreign, bytes: Buffer.byteLength(foreign) }, err, state);
+  expect(evidence.fixture).toBeNull();
+  expect(JSON.stringify(evidence)).not.toContain("private identity");
+  expect(evidence.productWindowsQualified).toBe(false);
+  expect(evidence.providerEffectsQualified).toBe(false);
+});
+
 test.skipIf(process.env.OOMPA_WINDOWS_DIRECTORY_NATIVE !== "1")("actual Win32 directory handles enforce owner, DACL, reparse and lifetime policy", async () => {
   const deadline = Date.now() + 50_000;
   if (process.platform !== "win32" || process.arch !== "x64" || Bun.version !== "1.3.14"
@@ -142,7 +232,12 @@ test.skipIf(process.env.OOMPA_WINDOWS_DIRECTORY_NATIVE !== "1")("actual Win32 di
   joined = Promise.all([exit, stdout, stderr]);
   const [ended, out, err] = await bound(Promise.all([exit, stdout, stderr]), Math.min(25_000, deadline - Date.now()));
   if (childState.spawnError || stopAttempted || ended.code !== 0 || ended.signal !== null || !out.eof || out.failed
-    || !err.eof || err.failed || err.text !== "" || Date.now() >= deadline) throw refusal();
+    || !err.eof || err.failed || err.text !== "" || Date.now() >= deadline) {
+    console.info(JSON.stringify(projectFailure(ended, out, err, {
+      spawnError: childState.spawnError, stopAttempted, deadlineExceeded: Date.now() >= deadline,
+    })));
+    throw refusal();
+  }
   const result = parseResult(out.text);
   expect(digest(await readBounded(executable, 8 * 1_024 * 1_024))).toBe(build.executableSha256);
   expect(await readBounded(join(directory, "build.json"), 8_192)).toEqual(buildBytes);
