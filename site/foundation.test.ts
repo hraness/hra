@@ -63,15 +63,15 @@ const compatibilityCss = `
   color: var(--hraness-material-ink);
 }
 details.hraness-marketing-question[open] > summary.hraness-marketing-question__summary {
-  background-color: color-mix(in oklch, #d49a54 12%, light-dark(#fffefa, #1d1a18));
+  background-color: var(--hraness-material-warm-plane);
   color: var(--hraness-material-ink);
 }
 details.hraness-marketing-question[open] > summary {
-  background-color: color-mix(in oklch, #d49a54 12%, light-dark(#fffefa, #1d1a18));
+  background-color: var(--hraness-material-warm-plane);
   color: var(--hraness-material-ink);
 }
 :root[data-hraness-material="lantern"] .hraness-marketing-question[open] > summary {
-  background-color: color-mix(in oklch, #d49a54 12%, light-dark(#fffefa, #1d1a18));
+  background-color: var(--hraness-material-warm-plane);
   color: var(--hraness-material-ink);
 }
 :root[data-hraness-material="lantern"] :is(.hraness-material-choice[aria-pressed="true"], .hraness-marketing-question[open] > summary) {
