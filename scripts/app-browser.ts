@@ -940,7 +940,9 @@ async function readSiteMaterial(page: Page): Promise<unknown> {
       return { material: document.documentElement.getAttribute("data-hraness-material"), preset: document.documentElement.getAttribute("data-hraness-marketing-preset"),
         walls: walls.length, fields: actual(".hraness-marketing-field").length,
         header: paint(document.querySelector("header.hraness-material-chrome")),
-        panes: actual("figure[data-product-preview], [data-oompa-appearance] > div").map(paint),
+        // The appearance disclosure panel is closed during static-route checks;
+        // only the rendered product pane is an owned reading plane here.
+        panes: actual("figure[data-product-preview]").map(paint),
         wall: walls.length === 0 ? null : paint(walls[0] ?? null),
         selected: actual('.hraness-material-choice[aria-pressed="true"]').map(paint),
         disclosures: actual(".hraness-marketing-question[open] > summary").map(paint), references };
