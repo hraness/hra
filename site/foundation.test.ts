@@ -125,14 +125,16 @@ test("the stylesheet keeps six foundations and fourteen exact preset/material co
     },
   } } });
   const root = [[{ type: "pseudo-class", kind: "root" }]];
+  const materialRoot = [[{ type: "pseudo-class", kind: "root" }, { type: "attribute", name: "data-hraness-material", namespace: null,
+    operation: { caseSensitivity: "case-sensitive", operator: "equal", value: "lantern" } }]];
   const html = [[{ type: "type", name: "html" }]];
   expect(selectors).toEqual([
     root, [[{ type: "universal" }]], html, [[{ type: "type", name: "body" }]],
     [[{ type: "pseudo-class", kind: "where", selectors: [
       [{ type: "class", name: "hraness-marketing-page" }], [{ type: "class", name: "hraness-marketing-header" }],
-    ] }]], ...compatibilitySelectors.slice(0, 9), html, ...compatibilitySelectors.slice(9),
+    ] }]], ...compatibilitySelectors.slice(0, 2), materialRoot, ...compatibilitySelectors.slice(2, 9), html, ...compatibilitySelectors.slice(9),
   ]);
-  expect([...declarations.slice(5, 14), ...declarations.slice(15)]).toEqual(compatibilityDeclarations);
+  expect([...declarations.slice(5, 7), ...declarations.slice(8, 15), ...declarations.slice(16)]).toEqual(compatibilityDeclarations);
   expect(tokenBindings).toBe(1);
   expect(media).toEqual([
     ["pointer", "coarse"],
