@@ -140,15 +140,15 @@ body {
   color: var(--hraness-material-ink);
 }
 details.hraness-marketing-question[open] > summary.hraness-marketing-question__summary {
-  background-color: var(--hraness-material-warm-plane);
+  background-color: color-mix(in oklch, #d49a54 12%, light-dark(#fffefa, #1d1a18));
   color: var(--hraness-material-ink);
 }
 details.hraness-marketing-question[open] > summary {
-  background-color: var(--hraness-material-warm-plane);
+  background-color: color-mix(in oklch, #d49a54 12%, light-dark(#fffefa, #1d1a18));
   color: var(--hraness-material-ink);
 }
 :root[data-hraness-material="lantern"] .hraness-marketing-question[open] > summary {
-  background-color: var(--hraness-material-warm-plane);
+  background-color: color-mix(in oklch, #d49a54 12%, light-dark(#fffefa, #1d1a18));
   color: var(--hraness-material-ink);
 }
 @media (forced-colors: active) {
