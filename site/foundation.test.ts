@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { readFile } from "node:fs/promises";
-import { transform } from "lightningcss";
+import { transform, type StyleRule } from "lightningcss";
 
 // These sealed 0.6.4 descendants cannot receive public class overrides. Admit
 // only the reviewed preset bindings, in addition to the six original rules.
@@ -42,8 +42,8 @@ const compatibilityCss = `
 
 test("the stylesheet keeps six foundations and only nine exact preset compatibility rules", async () => {
   const css = await readFile(new URL("styles.css", import.meta.url));
-  const compatibilitySelectors: unknown[] = [];
-  const compatibilityDeclarations: unknown[] = [];
+  const compatibilitySelectors: StyleRule["selectors"][] = [];
+  const compatibilityDeclarations: StyleRule["declarations"][] = [];
   transform({ filename: "compatibility-contract.css", code: Buffer.from(compatibilityCss), visitor: { Rule: {
     style(rule) {
       compatibilitySelectors.push(rule.value.selectors);
@@ -79,7 +79,7 @@ test("the stylesheet keeps six foundations and only nine exact preset compatibil
         const target = rule.value.rules[0];
         expect(target?.type).toBe("style");
         if (target?.type !== "style") throw new Error("Coarse-pointer action rule is missing.");
-        expect(target.value.selectors).toEqual(compatibilitySelectors[8]);
+        expect(target.value.selectors).toEqual(compatibilitySelectors[8]!);
         expect(target.value.declarations).toEqual(compatibilityDeclarations[8]);
       }
     },
