@@ -841,8 +841,8 @@ describe("CLI entry point", () => {
     }
   });
 
-  test("startup refuses live or unknown Claude custody during a staged revocation", async () => {
-    for (const [index, liveness] of (["live", "unknown"] as const).entries()) {
+  for (const [index, liveness] of (["live", "unknown"] as const).entries()) {
+    test(`startup refuses ${liveness} Claude custody during a staged revocation`, async () => {
       const value = await stagedClaudeStartupRecoveryFixture(
         liveness,
         61_001 + index,
@@ -883,8 +883,8 @@ describe("CLI entry point", () => {
         value.store.close();
         await rm(value.runRoot, { force: true, recursive: true });
       }
-    }
-  });
+    });
+  }
 
   test("startup releases proven-dead Claude custody before advancing daemon generation", async () => {
     const value = await stagedClaudeStartupRecoveryFixture("not-live", 61_003);

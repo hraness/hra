@@ -65,8 +65,8 @@ type QuotaLimit = Readonly<{ logicalBytes: number; records: number }>;
 /**
  * Beta limits are logical, server-visible Convex document sizes. Ciphertext is
  * charged at its stored length. Convex's own value-size implementation counts
- * UTF-8 bytes and includes the deterministic `_id` and `_creationTime`
- * overhead for documents that have not been inserted yet.
+ * UTF-8 bytes and estimates missing system fields for documents that have
+ * not been inserted yet. Reservation writers charge their actual stored row.
  */
 /**
  * Open-beta free tier. One identity gets 200 MiB of server-visible logical
@@ -289,17 +289,7 @@ const validQuotaSchemaMarker = (row: Readonly<{
 }>): boolean => row.quotaSchemaVersion === undefined
   || (row.category === "identity" && row.quotaSchemaVersion === currentUserQuotaSchemaVersion);
 
-async function applyQuotaDelta(
-  ctx: MutationCtx,
-  userId: Id<"users">,
-  category: QuotaCategory,
-  delta: Readonly<{ identities?: number; logicalBytes: number; records: number }>,
-): Promise<void> {
-  if (
-    !safeDelta(delta.identities ?? 0)
-    || !safeDelta(delta.logicalBytes)
-    || !safeDelta(delta.records)
-  ) corrupt();
+async function loadQuotaAccounting(ctx: QueryCtx | MutationCtx, userId: Id<"users">) {
   const [serviceRows, userRows] = await Promise.all([
     ctx.db.query("storageUsageService")
       .withIndex("by_key", (builder) => builder.eq("key", "global"))
@@ -337,6 +327,106 @@ async function applyQuotaDelta(
     || service.userLogicalBytes < userLogicalBytes
     || service.userRecords < userRecords
   ) corrupt();
+  return { byCategory, service, userLogicalBytes, userRecords };
+}
+
+export const AUTHORITY_REDUCTION_QUOTA_CEILINGS = [
+  "identity", "job", "device", "security", "receipt", "userTotal", "serviceTotal",
+] as const;
+export type AuthorityReductionQuotaCeiling = typeof AUTHORITY_REDUCTION_QUOTA_CEILINGS[number];
+export type AuthorityReductionQuotaCounts = {
+  applicable: number;
+  bytesBlockedByLowerBound: number;
+  bytesUnknown: number;
+  recordsBlocked: number;
+};
+export type AuthorityReductionQuotaCeilings = Record<
+  AuthorityReductionQuotaCeiling, AuthorityReductionQuotaCounts
+>;
+
+export function emptyAuthorityReductionQuotaCeilings(): AuthorityReductionQuotaCeilings {
+  const empty = (): AuthorityReductionQuotaCounts => ({
+    applicable: 0, bytesBlockedByLowerBound: 0, bytesUnknown: 0, recordsBlocked: 0,
+  });
+  return {
+    device: empty(), identity: empty(), job: empty(), receipt: empty(),
+    security: empty(), serviceTotal: empty(), userTotal: empty(),
+  };
+}
+
+export function authorityReductionReservationDemand(accountPairs: number, deviceQuartets: number) {
+  if (
+    (accountPairs !== 0 && accountPairs !== 1)
+    || !Number.isSafeInteger(deviceQuartets) || deviceQuartets < 0 || deviceQuartets > 16
+  ) return corrupt();
+  const totalRecords = 2 * accountPairs + 4 * deviceQuartets;
+  return {
+    accountPairs, deviceQuartets,
+    paddingBytesLowerBound: totalRecords * authorityReductionCapacityReservation.length,
+    totalRecords,
+  };
+}
+
+// These counts describe one identity's missing reservation sets. Padding alone
+// can prove a byte refusal; the remaining document/system fields are unknown
+// until insertion. No prospective size estimate is treated as an exact fit.
+export async function inspectAuthorityReductionQuota(
+  ctx: QueryCtx | MutationCtx,
+  userId: Id<"users">,
+  accountPairs: number,
+  deviceQuartets: number,
+): Promise<Readonly<{ state: "authority_unknown" }> | Readonly<{
+  ceilings: AuthorityReductionQuotaCeilings;
+  state: "observed";
+}>> {
+  const demand = authorityReductionReservationDemand(accountPairs, deviceQuartets);
+  try {
+    const { byCategory, service, userLogicalBytes, userRecords } = await loadQuotaAccounting(ctx, userId);
+    const records = {
+      device: deviceQuartets, identity: accountPairs, job: accountPairs + deviceQuartets,
+      receipt: deviceQuartets, security: deviceQuartets,
+      serviceTotal: demand.totalRecords, userTotal: demand.totalRecords,
+    };
+    const ceilings = emptyAuthorityReductionQuotaCeilings();
+    for (const ceiling of AUTHORITY_REDUCTION_QUOTA_CEILINGS) {
+      const additional = records[ceiling];
+      if (additional === 0) continue;
+      const current = ceiling === "serviceTotal" ? service
+        : ceiling === "userTotal" ? { logicalBytes: userLogicalBytes, records: userRecords }
+        : byCategory.get(ceiling);
+      if (current === undefined) return corrupt();
+      const limit = ceiling === "serviceTotal" ? SERVICE_TOTAL_QUOTA
+        : ceiling === "userTotal" ? USER_TOTAL_QUOTA : CATEGORY_QUOTAS[ceiling];
+      const byteBlocked = current.logicalBytes
+        + additional * authorityReductionCapacityReservation.length > limit.logicalBytes;
+      ceilings[ceiling] = {
+        applicable: 1,
+        bytesBlockedByLowerBound: byteBlocked ? 1 : 0,
+        bytesUnknown: byteBlocked ? 0 : 1,
+        recordsBlocked: current.records + additional > limit.records ? 1 : 0,
+      };
+    }
+    return { ceilings, state: "observed" };
+  } catch (error: unknown) {
+    if (error instanceof Error && error.message === "QUOTA_AUTHORITY_CORRUPT") {
+      return { state: "authority_unknown" };
+    }
+    throw error;
+  }
+}
+
+async function applyQuotaDelta(
+  ctx: MutationCtx,
+  userId: Id<"users">,
+  category: QuotaCategory,
+  delta: Readonly<{ identities?: number; logicalBytes: number; records: number }>,
+): Promise<void> {
+  if (
+    !safeDelta(delta.identities ?? 0)
+    || !safeDelta(delta.logicalBytes)
+    || !safeDelta(delta.records)
+  ) corrupt();
+  const { byCategory, service, userLogicalBytes, userRecords } = await loadQuotaAccounting(ctx, userId);
   const categoryUsage = byCategory.get(category);
   if (categoryUsage === undefined) return corrupt();
 
