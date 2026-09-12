@@ -13,6 +13,8 @@ import { productIoModules } from "../app/fixtures/product/config";
 import { assertBrowserNode, browserDigest, browserExecutable, browserPublicArtifacts, publishBrowserJson, type BrowserExecutionAdmission } from "./app-browser-handoff.ts";
 import { serveBrowserAssets } from "./app-browser-server.ts";
 import { readRestoredStyleFramePair, settleExactStylesheet, StylesheetSettlementError, type StylesheetSettlementDiagnostics } from "./app-browser-settlement.ts";
+import { inspectSiteCssResources } from "./site-css-resources.ts";
+import { snapshotMarketingPreset } from "./marketing-preset.ts";
 
 type Artifact = Readonly<{ bytes: number; path: string; sha256: string }>;
 type Surface = Readonly<{ artifacts: readonly Artifact[]; bytes: ReadonlyMap<string, Buffer>; origin: string; stop: () => Promise<void> }>;
@@ -147,6 +149,7 @@ const digest = (bytes: Uint8Array | string) => createHash("sha256").update(bytes
 const bracketedFontPath = "fonts/geist-mono/GeistMono[wght].woff2";
 const fontProvenancePaths = new Set([
   "fonts/geist-mono/PROVENANCE.md", "fonts/nebula-sans/PROVENANCE.md",
+  "fonts/instrument-serif/UPSTREAM.md", "marketing-preset/LICENSE", "marketing-preset/marketing-assets/UPSTREAM.md",
 ]);
 const legacyFontPaths = new Set([bracketedFontPath]);
 const siteRoutes = [
@@ -163,16 +166,26 @@ const siteRoutes = [
 const siteMarkdownPaths = new Set(siteRoutes.filter(({ pathname }) => pathname.startsWith("/docs/")).map(({ path }) => path.replace(/\.html$/u, ".md")));
 const productPreviewCsp = "default-src 'none'; script-src 'self'; style-src 'self'; img-src data: blob:; font-src 'self'; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'; worker-src 'none'";
 const productAssetPath = /^examples\/app\/(?:index\.html|stylex\.css|graphs\/client\/assets\/[A-Za-z0-9_-][A-Za-z0-9_.-]*\.(?:js|css))$/u;
-const sitePublicFonts = [
+const siteInstalledPublicFonts = [
   ...["Light", "LightItalic", "Book", "BookItalic", "Medium", "MediumItalic", "Semibold", "SemiboldItalic", "Bold", "BoldItalic", "Black", "BlackItalic"]
     .map((cut) => `nebula-sans/NebulaSans-${cut}.woff2`),
   "geist-mono/GeistMono[wght].woff2",
 ];
+const sitePresetFont = "instrument-serif/instrument-serif-latin-400.woff2";
+const sitePublicFonts = [...siteInstalledPublicFonts, sitePresetFont];
+const sitePresetTextures = ["marketing-assets/grain.svg", "marketing-assets/cells.svg"] as const;
+const sitePresetAttributions = [
+  ["fonts/instrument-serif/OFL.txt", "fonts/instrument-serif/OFL.txt"],
+  ["fonts/instrument-serif/UPSTREAM.md", "fonts/instrument-serif/UPSTREAM.md"],
+  ["marketing-preset/LICENSE", "LICENSE"],
+  ["marketing-preset/marketing-assets/UPSTREAM.md", "marketing-assets/UPSTREAM.md"],
+] as const;
 const sitePublicSupport = [
   "analytics.js", "appearance.js", "site.js", "favicon.svg", "social-card.svg", "social-card.png", "robots.txt", "sitemap.xml", "llms.txt",
   ".well-known/security.txt", ".well-known/hra.json",
   "fonts/nebula-sans/LICENSE.txt", "fonts/nebula-sans/PROVENANCE.md",
   "fonts/geist-mono/OFL.txt", "fonts/geist-mono/PROVENANCE.md",
+  ...sitePresetAttributions.map(([path]) => path),
   ...siteMarkdownPaths,
 ];
 const diagnosticPath = (path: string) => JSON.stringify(path.slice(0, 160));
@@ -444,13 +457,14 @@ export function siteStylesheetPaths(documents: ReadonlyMap<string, Buffer>): rea
 
 /** Parse native CSS URLs and all font-face sources. A path becomes admissible
  * only because this captured foundation names it; escaping never broadens it. */
-export function siteFoundationFontPaths(path: string, bytes: Buffer): readonly string[] {
+export function siteFoundationResourcePaths(path: string, bytes: Buffer): Readonly<{ fonts: readonly string[]; textures: readonly string[] }> {
   assert.match(path, /^graphs\/foundation\/assets\/[A-Za-z0-9_.-]+\.css$/u);
   assert.ok(bytes.length > 0 && bytes.length <= 16 * 1024 * 1024);
   const faces: string[] = [];
-  // Dependency analysis also includes image-set string URLs, which the Url
-  // visitor alone omits. The transformed bytes are never served or published.
-  const parsed = transform({ filename: path, code: bytes, analyzeDependencies: true, visitor: {
+  // Inspect original AST URLs, including custom properties and literal
+  // image-set strings. Dependency relocation rejects valid relative token URLs.
+  const urls = inspectSiteCssResources(new TextDecoder("utf-8", { fatal: true }).decode(bytes), path);
+  const parsed = transform({ filename: path, code: bytes, visitor: {
     Rule: {
       import() { throw new Error("Static foundation contains an uncollected CSS import"); },
       "font-face"(rule) {
@@ -465,25 +479,27 @@ export function siteFoundationFontPaths(path: string, bytes: Buffer): readonly s
     },
   } });
   assert.equal(parsed.warnings.length, 0, "Static foundation CSS inspection emitted warnings");
-  assert.ok(parsed.dependencies !== undefined && parsed.dependencies.length <= 64,
-    "Static foundation has an invalid or excessive resource inventory");
-  const urls = parsed.dependencies.map((dependency) => {
-    assert.ok(dependency.type === "url", "Static foundation contains an uncollected CSS import or unsupported resource");
-    return dependency.url;
-  });
-  assert.equal(faces.length, 13, "Static foundation must declare all thirteen public font faces");
-  assert.deepEqual([...urls].sort(), [...faces].sort(), "Static foundation contains a non-font URL");
-  assert.equal(new Set(faces).size, 13, "Static foundation duplicates a font URL");
-  return faces.map((url) => {
+  assert.equal(faces.length, 14, "Static foundation must declare all fourteen public font faces");
+  assert.equal(new Set(faces).size, 14, "Static foundation duplicates a font URL");
+  const textures = urls.filter((url) => !faces.includes(url));
+  assert.equal(textures.length, 2, "Static foundation must contain exactly two non-font texture URLs");
+  assert.equal(new Set(textures).size, 2, "Static foundation duplicates a texture URL");
+  assert.deepEqual([...urls].sort(), [...faces, ...textures].sort(), "Static foundation repeats a font outside its face");
+  const resolveAsset = (url: string, kind: "woff2" | "svg") => {
     // Vite may preserve or sanitize brackets. Both must come from captured CSS,
     // stay in this asset directory, and later match a public input's full hash.
     const decoded = url.replace(/%5b/giu, "[").replace(/%5d/giu, "]");
-    assert.match(decoded, /^(?:\.\/)?[A-Za-z0-9_.[\]-]+\.woff2$/u, "Static font URL escaped its captured asset directory");
+    assert.match(decoded, kind === "woff2" ? /^(?:\.\/)?[A-Za-z0-9_.[\]-]+\.woff2$/u : /^(?:\.\/)?[A-Za-z0-9_.-]+\.svg$/u,
+      "Static resource URL escaped its captured asset directory");
     const resolved = new URL(decoded, `https://site.invalid/${path}`);
     assert.equal(resolved.origin, "https://site.invalid");
     assert.equal(resolved.search + resolved.hash, "");
     return resolved.pathname.slice(1);
-  }).sort();
+  };
+  return { fonts: faces.map((url) => resolveAsset(url, "woff2")).sort(), textures: textures.map((url) => resolveAsset(url, "svg")).sort() };
+}
+export function siteFoundationFontPaths(path: string, bytes: Buffer): readonly string[] {
+  return siteFoundationResourcePaths(path, bytes).fonts;
 }
 
 /** This is a distinct compiler generation, never an exception to the parent
@@ -550,7 +566,17 @@ export function snapshotProductPreview(files: ReadonlyMap<string, Buffer>) {
   return { paths, stylesheets, scripts: paths.filter((path) => path.endsWith(".js")) };
 }
 
-export function snapshotStaticSite(allFiles: ReadonlyMap<string, Buffer>, publicFonts: ReadonlyMap<string, Buffer>) {
+/** Revalidate each font against its original physical source. Older installed
+ * kits supply thirteen faces; the editorial face belongs to the admitted vendor. */
+export async function assertSitePublicFontsUnchanged(publicFontRoot: string, presetRoot: string, fonts: ReadonlyMap<string, Buffer>): Promise<void> {
+  assert.deepEqual([...fonts.keys()].sort(), [...sitePublicFonts].sort());
+  for (const [path, bytes] of fonts) {
+    const root = path === sitePresetFont ? presetRoot : publicFontRoot;
+    assert.deepEqual(await ordinary(join(root, "fonts", path)), bytes, "Public font input changed during browser acceptance");
+  }
+}
+
+export function snapshotStaticSite(allFiles: ReadonlyMap<string, Buffer>, publicFonts: ReadonlyMap<string, Buffer>, preset: ReadonlyMap<string, Buffer>) {
   const product = snapshotProductPreview(new Map([...allFiles].filter(([path]) => path.startsWith("examples/app/"))));
   const files = new Map([...allFiles].filter(([path]) => !path.startsWith("examples/app/")));
   assert.deepEqual([...files.keys()].filter((path) => path.endsWith(".html")).sort(), siteRoutes.map(({ path }) => path).sort());
@@ -559,11 +585,11 @@ export function snapshotStaticSite(allFiles: ReadonlyMap<string, Buffer>, public
   const foundation = files.get(stylesheets[0]);
   const union = files.get(stylesheets[1]);
   assert.ok(foundation !== undefined && union !== undefined && union.length > 0);
-  const fonts = siteFoundationFontPaths(stylesheets[0], foundation);
-  assert.deepEqual([...files.keys()].sort(), [...siteRoutes.map(({ path }) => path), ...stylesheets, ...fonts, ...sitePublicSupport].sort(), "Static publication contains a missing or unapproved public artifact");
+  const { fonts, textures } = siteFoundationResourcePaths(stylesheets[0], foundation);
+  assert.deepEqual([...files.keys()].sort(), [...siteRoutes.map(({ path }) => path), ...stylesheets, ...fonts, ...textures, ...sitePublicSupport].sort(), "Static publication contains a missing or unapproved public artifact");
   assert.deepEqual([...files.keys()].filter((path) => /\.woff2?$/u.test(path)).sort(), fonts, "Static font publication is incomplete or redundant");
-  assert.deepEqual([...files.keys()].filter((path) => path.startsWith("graphs/")).sort(), [stylesheets[0], ...fonts].sort(), "Private graph artifacts escaped publication");
-  assert.equal(publicFonts.size, 13);
+  assert.deepEqual([...files.keys()].filter((path) => path.startsWith("graphs/")).sort(), [stylesheets[0], ...fonts, ...textures].sort(), "Private graph artifacts escaped publication");
+  assert.equal(publicFonts.size, 14);
   assert.deepEqual([...publicFonts.keys()].sort(), [...sitePublicFonts].sort());
   const emitted = fonts.map((path) => {
     const bytes = files.get(path);
@@ -571,13 +597,26 @@ export function snapshotStaticSite(allFiles: ReadonlyMap<string, Buffer>, public
     return digest(bytes);
   }).sort();
   assert.deepEqual(emitted, [...publicFonts.values()].map(digest).sort(), "Published fonts differ from the installed public inputs");
+  const presetFont = preset.get(`fonts/${sitePresetFont}`);
+  assert.ok(presetFont !== undefined && presetFont.length > 0);
+  assert.deepEqual(publicFonts.get(sitePresetFont), presetFont, "Editorial font differs from the admitted snapshot");
+  const sourceTextures = sitePresetTextures.map((path) => {
+    const bytes = preset.get(path); assert.ok(bytes !== undefined && bytes.length > 0 && bytes.length <= 2 * 1024 * 1024); return digest(bytes);
+  }).sort();
+  assert.equal(new Set(sourceTextures).size, 2, "Canonical texture identities must be distinct");
+  assert.deepEqual(textures.map((path) => { const bytes = files.get(path); assert.ok(bytes !== undefined && bytes.length > 0 && bytes.length <= 2 * 1024 * 1024); return digest(bytes); }).sort(),
+    sourceTextures, "Published textures differ from the admitted snapshot");
+  for (const [publicPath, sourcePath] of sitePresetAttributions) {
+    const bytes = preset.get(sourcePath); assert.ok(bytes !== undefined && bytes.length > 0);
+    assert.deepEqual(files.get(publicPath), bytes, "Published attribution differs from the admitted snapshot");
+  }
   const parsedUnion = transform({ filename: "stylex.css", code: union, analyzeDependencies: true, visitor: {
     Rule: { import() { throw new Error("Final union contains an uncollected CSS import"); } },
   } });
   assert.equal(parsedUnion.warnings.length, 0, "Final union CSS inspection emitted warnings");
   assert.ok(parsedUnion.dependencies !== undefined);
   assert.equal(parsedUnion.dependencies.length, 0, "Final union contains an unexpected asset URL");
-  return { routes: siteRoutes, stylesheets, fonts, product };
+  return { routes: siteRoutes, stylesheets, fonts, textures, product };
 }
 
 export function assetContentType(key: string): string {
@@ -1512,8 +1551,11 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
   for (const [path, bytes] of siteDocuments) assert.deepEqual(siteFiles.get(path), bytes, "Site document changed during graph admission");
   assert.deepEqual(siteFiles.get(foundationPath), foundationBytes, "Site foundation changed during graph admission");
   const publicFontRoot = await realpath(dirname(fileURLToPath(import.meta.resolve("@hraness/design-kit/fonts.css"))));
-  const publicFonts = new Map(await Promise.all(sitePublicFonts.map(async (path) => [path, await ordinary(join(publicFontRoot, "fonts", path))] as const)));
-  const siteGraph = snapshotStaticSite(siteFiles, publicFonts);
+  const preset = await snapshotMarketingPreset(join(root, "site/vendor/marketing-preset"));
+  const publicFonts = new Map(await Promise.all(siteInstalledPublicFonts.map(async (path) => [path, await ordinary(join(publicFontRoot, "fonts", path))] as const)));
+  const presetFont = preset.files.get(`fonts/${sitePresetFont}`); assert.ok(presetFont !== undefined);
+  publicFonts.set(sitePresetFont, presetFont);
+  const siteGraph = snapshotStaticSite(siteFiles, publicFonts, preset.files);
   const appCsp = productionCsp(JSON.parse((await ordinary(join(root, "app/vercel.json"))).toString("utf8")) as unknown, "/(.*)");
   const siteConfiguration: unknown = JSON.parse((await ordinary(join(root, "vercel.json"))).toString("utf8"));
   const { siteCsp, previewCsp, productPreviewCsp } = siteProductionCsp(siteConfiguration);
@@ -1783,7 +1825,8 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
               else responseOverflow = true;
               return;
             }
-            if (new URL(response.url()).origin !== site.origin || !["stylesheet", "font"].includes(response.request().resourceType())) return;
+            const resourceUrl = new URL(response.url());
+            if (resourceUrl.origin !== site.origin || (!["stylesheet", "font"].includes(response.request().resourceType()) && !siteGraph.textures.includes(resourceUrl.pathname.slice(1)))) return;
             if (responses.length < 64) responses.push({ response, body: captureBrowserResponseBody(response) });
             else responseOverflow = true;
           };
@@ -1812,7 +1855,7 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
             mark(`static-site:${routeLabel}:font-load`);
             const fonts = await page.evaluate(async () => {
               const faces = [...document.fonts];
-              if (faces.length !== 13) throw new Error("Native font-face inventory is incomplete");
+              if (faces.length !== 14) throw new Error("Native font-face inventory is incomplete");
               await Promise.all(faces.map((face) => face.load()));
               return faces.map((face) => ({ family: face.family, style: face.style, weight: face.weight, status: face.status }));
             });
@@ -1882,7 +1925,8 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
               assert.deepEqual(bytes, siteFiles.get(key), "Native resource differs from its retained output identity");
               return { path: key, bytes: bytes.length, sha256: digest(bytes) };
             }));
-            assert.deepEqual(delivered.map(({ path }) => path).sort(), [...siteGraph.stylesheets, ...siteGraph.fonts].sort(), "Native CSS/font linkage was incomplete or redundant");
+            const expectedTextures = route.pathname === "/" && !profile.forced ? siteGraph.textures : [];
+            assert.deepEqual(delivered.map(({ path }) => path).sort(), [...siteGraph.stylesheets, ...siteGraph.fonts, ...expectedTextures].sort(), "Native CSS/font/texture linkage was incomplete or redundant");
             for (const request of productRequests) {
               const url = new URL(request.url()), key = url.pathname.slice(1);
               assert.equal(url.origin, site.origin, "A product frame requested an external resource");
@@ -1967,7 +2011,7 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
     }
     assert.deepEqual(artifacts(await inventory(join(root, "app/dist"))), artifacts(appFiles));
     assert.deepEqual(artifacts(await inventory(siteRoot, siteFontPaths)), artifacts(siteFiles));
-    for (const [path, bytes] of publicFonts) assert.deepEqual(await ordinary(join(publicFontRoot, "fonts", path)), bytes, "Public font input changed during browser acceptance");
+    await assertSitePublicFontsUnchanged(publicFontRoot, join(root, "site/vendor/marketing-preset"), publicFonts);
     assert.deepEqual(await ordinary(join(root, "package.json")), packageBytes);
     assert.deepEqual(await ordinary(join(root, "bun.lock")), lockBytes);
     assert.deepEqual(await admission.verify(admission, root, run), handoff, "Browser preparation changed during acceptance");
@@ -1997,6 +2041,7 @@ export async function runAppBrowser(rootDirectory: string, runDirectory: string,
         app: artifacts(appFiles), site: artifacts(siteFiles), fixture: fixtureArtifacts,
         appCspSha256: digest(appCsp), siteCspSha256: digest(siteCsp), previewCspSha256: digest(previewCsp), productPreviewCspSha256: digest(productPreviewCsp),
         sitePublicFonts: artifacts(publicFonts),
+        siteMarketingPreset: { sourceCommit: preset.sourceCommit, inputs: artifacts(preset.files), textures: siteGraph.textures },
         fixtureIoAliases: ["@convex-dev/auth/react", ...browserIoModules], productIoAliases: ["@convex-dev/auth/react", ...productIoModules], evidence,
         profileDiagnostics, ...(failure === undefined ? {} : { failure: browserFailureDetails(failure) }),
       };
