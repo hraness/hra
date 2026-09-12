@@ -133,7 +133,7 @@ body {
   background-color: var(--hraness-material-warm-plane);
   color: var(--hraness-material-ink);
 }
-.hraness-marketing-page details.hraness-marketing-question[open] > summary.hraness-marketing-question__summary {
+details.hraness-marketing-question[open] > summary.hraness-marketing-question__summary {
   background-color: var(--hraness-material-warm-plane);
   color: var(--hraness-material-ink);
 }
