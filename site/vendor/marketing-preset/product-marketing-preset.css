@@ -24,6 +24,7 @@
     --hraness-marketing-hero-space: 3.5rem 4rem;
     --hraness-marketing-story-space: 5rem;
     --hraness-marketing-summary-leading: 1.6;
+    --hraness-marketing-header-action-height: 2.625rem;
     --hraness-marketing-field-ink: light-dark(#242a2f, #eceee9);
     --hraness-marketing-field-muted: light-dark(#515d68, #c2c9ce);
     --hraness-marketing-link: light-dark(#345474, #c2d3e4);
@@ -121,12 +122,15 @@
     border-radius: var(--hraness-marketing-radius);
   }
   @media (pointer: coarse) {
+    :where([data-hraness-marketing-preset="editorial"], [data-hraness-marketing-preset="minimal"]) {
+      --hraness-marketing-header-action-height: 3rem;
+    }
     :is([data-hraness-marketing-preset="editorial"], [data-hraness-marketing-preset="minimal"]) .hraness-marketing-action {
       min-block-size: 3rem;
     }
   }
 
-  :is([data-hraness-marketing-preset="editorial"], [data-hraness-marketing-preset="minimal"]) .hraness-marketing-field > :where(.hraness-marketing-hero, .hraness-marketing-section) {
+  :is([data-hraness-marketing-preset="editorial"], [data-hraness-marketing-preset="minimal"]) .hraness-marketing-field > :where(.hraness-marketing-hero, .hraness-marketing-section, .hraness-marketing-pillars, .hraness-marketing-primitives, .hraness-marketing-stats, .hraness-marketing-interfaces, .hraness-marketing-trust, .hraness-marketing-quotes, .hraness-marketing-pricing, .hraness-marketing-questions, .hraness-marketing-maker, .hraness-marketing-cta) {
     padding-inline: var(--hraness-marketing-gutter);
   }
 
@@ -139,9 +143,9 @@
     color: var(--hraness-marketing-field-ink);
     position: relative;
   }
-  :is([data-hraness-marketing-preset="editorial"], [data-hraness-marketing-preset="minimal"]).hraness-marketing-field,
-  :is([data-hraness-marketing-preset="editorial"], [data-hraness-marketing-preset="minimal"]) .hraness-marketing-field:where(.hraness-marketing-hero, .hraness-marketing-section),
-  :is([data-hraness-marketing-preset="editorial"], [data-hraness-marketing-preset="minimal"]) .hraness-marketing-field :where(.hraness-marketing-hero, .hraness-marketing-section) {
+  :is([data-hraness-marketing-preset="editorial"], [data-hraness-marketing-preset="minimal"]).hraness-marketing-field:not([data-tone="accent"]),
+  :is([data-hraness-marketing-preset="editorial"], [data-hraness-marketing-preset="minimal"]) .hraness-marketing-field:where(.hraness-marketing-page, .hraness-marketing-header, .hraness-marketing-hero, .hraness-marketing-pillars, .hraness-marketing-install, .hraness-marketing-section, .hraness-marketing-primitives, .hraness-marketing-stats, .hraness-marketing-interfaces, .hraness-marketing-trust, .hraness-marketing-quotes, .hraness-marketing-pricing, .hraness-marketing-questions, .hraness-marketing-maker, .hraness-marketing-cta, .hraness-marketing-proof-frame):not([data-tone="accent"]),
+  :is([data-hraness-marketing-preset="editorial"], [data-hraness-marketing-preset="minimal"]) .hraness-marketing-field :where(.hraness-marketing-page, .hraness-marketing-header, .hraness-marketing-hero, .hraness-marketing-pillars, .hraness-marketing-install, .hraness-marketing-section, .hraness-marketing-primitives, .hraness-marketing-stats, .hraness-marketing-interfaces, .hraness-marketing-trust, .hraness-marketing-quotes, .hraness-marketing-pricing, .hraness-marketing-questions, .hraness-marketing-maker, .hraness-marketing-cta, .hraness-marketing-proof-frame):not([data-tone="accent"]) {
     --hraness-marketing-ink: var(--hraness-marketing-field-ink);
     --hraness-marketing-muted: var(--hraness-marketing-field-muted);
   }
@@ -160,6 +164,7 @@
   }
 
   /* Paint-only hook: no header position, dimensions, or navigation layout. */
+  .hraness-marketing-header-surface,
   :is([data-hraness-marketing-preset="editorial"], [data-hraness-marketing-preset="minimal"]):where(.hraness-marketing-header, .hraness-marketing-header-surface),
     :is([data-hraness-marketing-preset="editorial"], [data-hraness-marketing-preset="minimal"]) :where(.hraness-marketing-header, .hraness-marketing-header-surface) {
     --hraness-marketing-header-background: var(--background, Canvas);
@@ -167,6 +172,7 @@
     background-color: var(--hraness-marketing-header-background);
   }
   @supports (-webkit-backdrop-filter: blur(1px)) {
+    .hraness-marketing-header-surface,
     :is([data-hraness-marketing-preset="editorial"], [data-hraness-marketing-preset="minimal"]):where(.hraness-marketing-header, .hraness-marketing-header-surface),
     :is([data-hraness-marketing-preset="editorial"], [data-hraness-marketing-preset="minimal"]) :where(.hraness-marketing-header, .hraness-marketing-header-surface) {
       --hraness-marketing-header-background: color-mix(in oklch, var(--background, Canvas) 82%, transparent);
@@ -175,6 +181,7 @@
     }
   }
   @supports (backdrop-filter: blur(1px)) {
+    .hraness-marketing-header-surface,
     :is([data-hraness-marketing-preset="editorial"], [data-hraness-marketing-preset="minimal"]):where(.hraness-marketing-header, .hraness-marketing-header-surface),
     :is([data-hraness-marketing-preset="editorial"], [data-hraness-marketing-preset="minimal"]) :where(.hraness-marketing-header, .hraness-marketing-header-surface) {
       --hraness-marketing-header-background: color-mix(in oklch, var(--background, Canvas) 82%, transparent);
@@ -183,6 +190,7 @@
     }
   }
   @media (prefers-reduced-transparency: reduce), (forced-colors: active) {
+    .hraness-marketing-header-surface,
     :is([data-hraness-marketing-preset="editorial"], [data-hraness-marketing-preset="minimal"]):where(.hraness-marketing-header, .hraness-marketing-header-surface),
     :is([data-hraness-marketing-preset="editorial"], [data-hraness-marketing-preset="minimal"]) :where(.hraness-marketing-header, .hraness-marketing-header-surface) {
       --hraness-marketing-header-background: var(--background, Canvas);
