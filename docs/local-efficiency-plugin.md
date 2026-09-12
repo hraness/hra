@@ -59,6 +59,25 @@ The weighted coordinator is strict FIFO for overlapping claims. Queue `exclusive
 
 For non-interactive macOS and Linux runs, the wrapper gives the command its own process group, forwards `HUP`, `INT`, `QUIT`, and `TERM` to that complete group, and terminates residual descendants when the command leader exits. Residual processes receive a bounded graceful interval before forced cleanup. An interactive TTY keeps its controlling terminal and receives best-effort leader signaling. This keeps interrupted package runners and browser suites from continuing outside their scheduler lease without breaking an intentional 2FA prompt; an uncatchable host-level kill still requires operating-system recovery and diagnosis.
 
+Plugin 0.4.5 adds explicit `--tty-signal-owner=child` for a reviewed interactive
+child that owns terminal Ctrl-C. The default is `parent`, preserving prior
+behavior. Child ownership refuses before lease or subprocess work unless all
+three standard descriptors are actual POSIX terminals, and rechecks them before
+spawn. SIGINT still cancels while waiting for admission or before a child exists.
+After that exact child starts, the wrapper does not forward another SIGINT into
+its shared terminal group or prematurely record its local interruption as a
+canceled command. The wrapped child determines its exit outcome; its actual
+collection still precedes lease release. The mode has a distinct command digest.
+
+A signal sent directly to only the wrapper as SIGINT is not a supported
+post-start cancellation in this opt-in mode: JavaScript signal listeners cannot
+distinguish it from terminal delivery. Use SIGTERM for external cancellation.
+HUP, QUIT and TERM forwarding, default parent ownership and noninteractive
+process-group cleanup remain unchanged. The caller must still own its exact
+child and distinguish any deliberately local Ctrl-C from a stop. Do not use a
+timing grace to infer a signal's origin. The option neither establishes owner
+terminal accessibility nor authorizes authentication or another provider effect.
+
 Each top-level scheduler attempt records one bounded event when telemetry storage is available; pre-admission scheduler failures and cancellations have no admitted timestamp or run duration. A catchable cancellation is recorded as `canceled` with its conventional signal exit code before the wrapper releases its waiting claim. Daily files are mode `0600` below a mode-`0700` directory, are capped at 4 MiB, and retain fourteen UTC days. Records include safe labels, digests, timings, lane, mode, permits, and outcome. They exclude raw argv, paths, environment values, process identities, transcripts, reasoning, and tool output. Telemetry is best effort and never changes the wrapped command's result.
 
 Review the first seven days of available local measurements with:

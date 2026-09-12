@@ -42,6 +42,15 @@ preserving sandbox, provider, repository, and release gates.
   --lane=compute|browser-auth|mac-native --label=LABEL -- COMMAND ...` through
   reviewed host access. Keep the complete wrapper and child argv visible to
   Codex.
+- **Run a reviewed interactive child that owns Ctrl-C:** opt in with
+  `--tty-signal-owner=child` only when descriptors 0, 1 and 2 are actual POSIX
+  terminals. Before the exact child starts, SIGINT still cancels admission.
+  While it runs, terminal SIGINT reaches the foreground child directly; the
+  wrapper neither duplicates it nor records cancellation before the child
+  settles. Direct SIGINT sent only to the wrapper is not a supported post-start
+  stop in this mode; use SIGTERM for external cancellation. HUP, QUIT and TERM,
+  existing noninteractive group cleanup, default parent ownership and lease
+  collection remain unchanged. This option grants no interactive/auth authority.
 - **Record or reuse deterministic focused validation:** use `oompa-validate`.
   Reuse is opt-in and is never valid for a required final integration,
   merge-queue, deployment, release, authenticated-browser, or network-sensitive
