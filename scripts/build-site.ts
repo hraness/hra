@@ -420,7 +420,9 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
   for (const name of ["LICENSE", "marketing-assets/UPSTREAM.md"]) {
     const destination = join(options.repositoryRoot, "dist/site/marketing-preset", name);
     await mkdir(dirname(destination), { recursive: true });
-    await writeFile(destination, marketingPreset.files.get(name)!, { flag: "wx", mode: 0o644 });
+    const bytes = marketingPreset.files.get(name);
+    assert.ok(bytes !== undefined, "Canonical marketing attribution is missing");
+    await writeFile(destination, bytes, { flag: "wx", mode: 0o644 });
   }
   const socialCardPng = renderSocialCardPng();
   const socialCardDimensions = readPngDimensions(socialCardPng);
