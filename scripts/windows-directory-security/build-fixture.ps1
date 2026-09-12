@@ -34,6 +34,37 @@ function Get-ToolIdentity {
     compilerSha256 = (Get-FileHash -LiteralPath $compiler -Algorithm SHA256).Hash.ToLowerInvariant();
     sdkHeaderSha256 = (Get-FileHash -LiteralPath (Join-Path $sdkRoot "Include\$sdkVersion\um\winnt.h") -Algorithm SHA256).Hash.ToLowerInvariant() }
 }
+function Get-CompilerDiagnostics([IO.MemoryStream[]] $captured) {
+  $diagnostics = [Collections.Generic.List[object]]::new()
+  # Raw diagnostics never leave memory. Only these public source names and
+  # bounded numeric locations/codes may enter a failed-build summary.
+  foreach ($stream in $captured) {
+    foreach ($line in ([Text.Encoding]::UTF8.GetString($stream.ToArray()) -split "`n")) {
+      foreach ($name in @('directory-security.h', 'directory-security.c', 'directory-security.fixture.c')) {
+        $location = '(?:' + [regex]::Escape((Join-Path $source $name)) + '|' + [regex]::Escape($name) + ')'
+        $pattern = '^' + $location + '\(([1-9][0-9]{0,5})(?:,([1-9][0-9]{0,5}))?\)[ \t]{0,8}:[ \t]{0,8}(fatal error|error|warning)[ \t]{1,8}((?:C|D|LNK)[0-9]{4})[ \t]{0,8}:'
+        if ($line -cmatch $pattern) {
+          $diagnostics.Add([ordered]@{ tool = 'cl'; source = $name; line = [int]$Matches[1];
+            column = if ($Matches.ContainsKey(2)) { [int]$Matches[2] } else { $null };
+            severity = $Matches[3]; code = $Matches[4] })
+          if ($diagnostics.Count -ge 32) { return $diagnostics.ToArray() }
+          break
+        }
+      }
+      if ($line -cmatch '^(cl|LINK)[ \t]{0,8}:[ \t]{0,8}(Command line error|Command line warning|fatal error|error|warning)[ \t]{1,8}((?:C|D|LNK)[0-9]{4})[ \t]{0,8}:') {
+        $severity = switch -CaseSensitive ($Matches[2]) {
+          'Command line error' { 'error' }
+          'Command line warning' { 'warning' }
+          default { $Matches[2] }
+        }
+        $diagnostics.Add([ordered]@{ tool = $Matches[1]; source = $null; line = $null; column = $null;
+          severity = $severity; code = $Matches[3] })
+        if ($diagnostics.Count -ge 32) { return $diagnostics.ToArray() }
+      }
+    }
+  }
+  return $diagnostics.ToArray()
+}
 $before = Get-Inputs
 $toolBefore = Get-ToolIdentity
 $include = @((Join-Path $tools 'include')) + @('ucrt','shared','um','winrt' | ForEach-Object { Join-Path $sdkRoot "Include\$sdkVersion\$_" })
@@ -65,6 +96,7 @@ $child.StartInfo = $start
 $started = $false
 $joined = $false
 $bytes = 0
+$captured = @([IO.MemoryStream]::new(), [IO.MemoryStream]::new())
 $clock = [Diagnostics.Stopwatch]::StartNew()
 try {
   $started = $child.Start()
@@ -81,13 +113,21 @@ try {
         $bytes += $count
         if ($bytes -gt 131072) { throw 'WINDOWS_DIRECTORY_COMPILER_OUTPUT_LIMIT' }
         if ($count -eq 0) { $eof[$index] = $true }
-        else { $reads[$index] = $streams[$index].ReadAsync($buffers[$index], 0, 4096) }
+        else {
+          $captured[$index].Write($buffers[$index], 0, $count)
+          $reads[$index] = $streams[$index].ReadAsync($buffers[$index], 0, 4096)
+        }
       }
     }
     if (-not $child.HasExited -or -not ($eof[0] -and $eof[1])) { Start-Sleep -Milliseconds 10 }
   }
   $joined = $true
-  if ($child.ExitCode -ne 0) { throw 'WINDOWS_DIRECTORY_COMPILER_FAILED' }
+  if ($child.ExitCode -ne 0) {
+    [ordered]@{ schema = 1; source = 'credential_free_win32_compile_failure';
+      compilerExit = $child.ExitCode; compilerStdoutEof = $true; compilerStderrEof = $true;
+      outputBytes = $bytes; diagnostics = @(Get-CompilerDiagnostics $captured) } | ConvertTo-Json -Depth 5 -Compress
+    throw 'WINDOWS_DIRECTORY_COMPILER_FAILED'
+  }
   $after = Get-Inputs
   if (($before | ConvertTo-Json -Compress) -cne ($after | ConvertTo-Json -Compress)) { throw 'WINDOWS_DIRECTORY_SOURCE_CHANGED' }
   $toolAfter = Get-ToolIdentity
@@ -108,4 +148,5 @@ try {
     if (-not $child.WaitForExit(5000)) { throw 'WINDOWS_DIRECTORY_COMPILER_CLEANUP_UNCERTAIN' }
   }
   $child.Dispose()
+  foreach ($stream in $captured) { $stream.Dispose() }
 }
