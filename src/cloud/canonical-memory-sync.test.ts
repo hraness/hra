@@ -845,31 +845,37 @@ describe("OompaCanonicalMemorySynchronizer", () => {
     expect(remote.server.createAttempts).toBe(1);
   });
 
-  test("never reserves a portable create or attach authority over an existing canonical database", async () => {
+  test("never reserves a portable create authority over an existing canonical database", () => ownedMemoryCase(async (
+    { createDevice: createOwnedDevice, request },
+  ) => {
     const emptyRemote = createEmptyRemote();
-    const createDeviceFixture = await createDevice("legacy-create-preflight", emptyRemote.source);
-    await seedLegacyCanonicalDatabase(createDeviceFixture, "legacy-create-record");
+    const createDeviceFixture = await createOwnedDevice("legacy-create-preflight", emptyRemote.source);
+    await request(() => seedLegacyCanonicalDatabase(createDeviceFixture, "legacy-create-record"));
 
-    await expect(createDeviceFixture.sync.createHostedSpace({
+    await expect(request(() => createDeviceFixture.sync.createHostedSpace({
       idempotencyKey: "00000000-0000-4000-8000-000000000806",
       projectId: createDeviceFixture.projectId,
-    })).rejects.toThrow("CANONICAL_MEMORY_DATABASE_RECOVERY_REQUIRED");
+    }))).rejects.toThrow("CANONICAL_MEMORY_DATABASE_RECOVERY_REQUIRED");
     expect(createDeviceFixture.store.readProjectMemoryAuthority(createDeviceFixture.projectId))
       .toBeNull();
     expect(emptyRemote.server.createAttempts).toBe(0);
+  }));
 
-    const attachRemote = await createRemote();
-    const attachDevice = await createDevice("legacy-attach-preflight", attachRemote.source);
-    await seedLegacyCanonicalDatabase(attachDevice, "legacy-attach-record");
+  test("never reserves a portable attach authority over an existing canonical database", () => ownedMemoryCase(async (
+    { createDevice: createOwnedDevice, request },
+  ) => {
+    const attachRemote = await request(() => createRemote());
+    const attachDevice = await createOwnedDevice("legacy-attach-preflight", attachRemote.source);
+    await request(() => seedLegacyCanonicalDatabase(attachDevice, "legacy-attach-record"));
 
-    await expect(attachDevice.sync.attachHostedSpace({
+    await expect(request(() => attachDevice.sync.attachHostedSpace({
       hostedSpaceId: attachRemote.hostedSpaceId,
       projectId: attachDevice.projectId,
-    })).rejects.toThrow("CANONICAL_MEMORY_DATABASE_RECOVERY_REQUIRED");
+    }))).rejects.toThrow("CANONICAL_MEMORY_DATABASE_RECOVERY_REQUIRED");
     expect(attachDevice.store.readProjectMemoryAuthority(attachDevice.projectId)).toBeNull();
     expect(attachDevice.store.readCanonicalMemoryHostedAttachment(attachDevice.projectId))
       .toBeNull();
-  });
+  }));
 
   test("recovers an applied create with a lost response by comparing the exact winner", async () => {
     const remote = createEmptyRemote();

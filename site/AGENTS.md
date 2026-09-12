@@ -1,5 +1,6 @@
 # Contents
 
+- `vendor/marketing-preset/` is the immutable shared editorial CSS, licensed Instrument Serif, and field-texture snapshot. `scripts/marketing-preset.ts` admits its exact source paths and hashes before the existing compiler captures its assets.
 - `content.ts` owns the website's public content contract. Root `README.md` and the package description are independently authored package inputs, not website outputs.
 - `docs-content.ts` owns the task-oriented guide registry, canonical Markdown exports, detailed reference ownership, and individual editorial admission records.
 - `template.ts` renders the homepage, privacy page, and six documentation routes.
@@ -15,6 +16,8 @@
 
 # Guidelines
 
+- The homepage opts into the shared editorial preset on its document root and continuous field container. Keep typography tokens in the snapshot, local bindings in `styles.css`, and real app examples outside the marketing field's styling scope. Preserve product copy, availability limits, and preview behavior when refreshing the snapshot. The captured foundation includes exactly fourteen WOFF2 files and the snapshot's two verified SVG textures; no compiler or package upgrade is implied.
+- `styles.css` retains a narrow, explicitly unlayered compatibility bridge for the installed design-kit 0.6.4's sealed heading, summary and header descendants. It binds fixed leading, tracking, weight, header height, action height and header paint to the shared preset because this release has no public descendant class override. Keep the coarse header target at 3rem; preserve native states and the compiled graph. This adapter is retained CSS, not a converted component or permission to override other recipes.
 - Lead the homepage with the product and actual interface. Lead the installation guide with the real install command and the shortest safe first-run path. Keep startup restrictions adjacent to affected commands.
 - Never read or write root `README.md` as a website build input or output. Keep website release-limit and command coverage on the rendered site and its discovery documents; package admission separately checks package documentation and metadata.
 - Keep the site free of server runtime dependencies, responsive, keyboard-readable, and useful when its nonessential analytics JavaScript does not run.

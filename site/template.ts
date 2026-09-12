@@ -253,7 +253,7 @@ export const renderSiteHtml = (
   environment: Readonly<Record<string, string | undefined>> = emptySiteEnvironment,
 ): string => {
   return `<!doctype html>
-<html ${paletteAttributes} lang="en">
+<html ${paletteAttributes} data-hraness-marketing-preset="editorial" lang="en">
 <head>
 ${renderHead(content, {
   canonicalPath: "/",
@@ -264,7 +264,7 @@ ${renderHead(content, {
 <body>
 <a class="${classes("skip-link", "skipLink", "focusable")}" href="#content">Skip to content</a>
 ${renderMarketingHeader(content, "/")}
-<main id="content">
+<main class="hraness-marketing-field" id="content">
 ${renderMarketingPage(content)}
 <details class="${docsClasses("legacyLinks")}" id="reference"><summary>Looking for the former reference?</summary><p>The same command and safety reference now lives in the documentation.</p><nav aria-label="Moved reference sections">${content.sections.map((section) => `<p id="${escapeHtml(section.id)}"><a data-moved-section="${escapeHtml(section.id)}" href="${escapeHtml(docsPathForSection(section.id))}">${escapeHtml(section.heading)} →</a></p>`).join("")}</nav></details>
 </main>
