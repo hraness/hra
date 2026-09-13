@@ -2,6 +2,6 @@
 @import "@hraness/design-kit/fonts.css";
 @import "@hraness/site-footer/compiler-foundation.css";
 @import "@hraness/design-kit/paper-theme.css";
-@import "./styles.css";
 @import "./vendor/marketing-preset/product-marketing-preset.css";
 @import "./vendor/lantern-material/lantern-material.css";
+@import "./styles.css";
