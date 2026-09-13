@@ -919,10 +919,15 @@ export function assertSiteMaterialPaint(value: unknown, home: boolean, opaque: b
 }
 
 export async function readSiteMaterial(page: Page): Promise<unknown> {
-  // Native disclosure activation can start even the shared .01ms reduced-motion
-  // transition at progress zero. Observe rendered paint, after the existing
-  // bounded font/frame settlement; never change styles or relax the comparison.
-  await settle(page);
+  // Frames alone need not flush a native disclosure's pending style change.
+  // getAnimations flushes the actual sampled surfaces; await their real finish
+  // promises without changing playback, styles, or the strict paint comparison.
+  await boundedBrowserOperation(page.evaluate(async () => {
+    await document.fonts.ready;
+    await new Promise<void>((done) => { requestAnimationFrame(() => { requestAnimationFrame(() => { done(); }); }); });
+    const surfaces = document.querySelectorAll('header.hraness-material-chrome, figure[data-product-preview], .hraness-material-wall, .hraness-material-choice[aria-pressed="true"], .hraness-marketing-question[open] > summary');
+    await Promise.all([...surfaces].flatMap((element) => element.getAnimations().map((animation) => animation.finished)));
+  }), 15_000, "Browser material font/frame/transition settlement");
   return page.evaluate(() => {
     const nodes: HTMLElement[] = [];
     const paint = (element: Element | null) => {

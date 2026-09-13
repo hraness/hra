@@ -970,6 +970,56 @@ describe("native website Lantern material acceptance", () => {
       panes: [pane], wall: home ? wall : null, selected: home ? [choice] : [], disclosures: home ? [choice] : [],
       references: { chrome, pane, choice, wall } };
   };
+  test("native material waits for every real transition after frame settlement", async () => {
+    const first = Promise.withResolvers<undefined>(), last = Promise.withResolvers<undefined>();
+    const events: string[] = [], sample = fixture(true, false);
+    let evaluations = 0, frames = 0;
+    const page = { evaluate: (callback: () => unknown) => {
+      evaluations += 1;
+      if (evaluations > 1) { events.push("sample"); return Promise.resolve(sample); }
+      const result: unknown = runInNewContext(`(${callback.toString()})();`, {
+        document: { fonts: { ready: Promise.resolve() }, querySelectorAll: (selector: string) => {
+          expect(selector).toContain(".hraness-marketing-question[open] > summary");
+          return [first, last].map((transition, index) => ({ getAnimations: () => {
+            events.push(`flush-${index}`); return [{ finished: transition.promise }];
+          } }));
+        } },
+        requestAnimationFrame: (callback: () => void) => { frames += 1; queueMicrotask(callback); },
+      });
+      return result;
+    } } as unknown as Page;
+    const observation = readSiteMaterial(page);
+    await new Promise<void>((done) => { setImmediate(done); });
+    expect(frames).toBe(2);
+    expect(events).toEqual(["flush-0", "flush-1"]);
+    first.resolve(undefined);
+    await new Promise<void>((done) => { setImmediate(done); });
+    expect(events).not.toContain("sample");
+    last.resolve(undefined);
+    await expect(observation).resolves.toBe(sample);
+    expect(events).toEqual(["flush-0", "flush-1", "sample"]);
+  });
+  test("a cancelled native transition refuses the material sample", async () => {
+    const transition = Promise.withResolvers<undefined>(), failure = new Error("Native transition was cancelled");
+    let evaluations = 0;
+    const page = { evaluate: (callback: () => unknown) => {
+      evaluations += 1;
+      if (evaluations > 1) return Promise.resolve(fixture(true, false));
+      const result: unknown = runInNewContext(`(${callback.toString()})();`, {
+        document: { fonts: { ready: Promise.resolve() }, querySelectorAll: () => [
+          { getAnimations: () => [{ finished: transition.promise }] },
+        ] },
+        requestAnimationFrame: (callback: () => void) => { queueMicrotask(callback); },
+      });
+      return result;
+    } } as unknown as Page;
+    const observation = readSiteMaterial(page);
+    const rejected = observation.catch((error: unknown) => error);
+    await new Promise<void>((done) => { setImmediate(done); });
+    transition.reject(failure);
+    expect(await rejected).toBe(failure);
+    expect(evaluations).toBe(1);
+  });
   test("native material paint is read only after rendering settles", async () => {
     const rendered = Promise.withResolvers<undefined>();
     const sample = fixture(true, false);
