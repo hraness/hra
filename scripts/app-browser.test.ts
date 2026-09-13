@@ -996,7 +996,7 @@ describe("native website Lantern material acceptance", () => {
     for (const colorScheme of ["light", "dark"] as const) for (const reduced of [false, true]) for (const forced of [false, true]) {
       const detached = Promise.withResolvers<undefined>();
       const events: string[] = [];
-      const expected = { colorScheme, reducedMotion: reduced ? "reduce" : "no-preference", forcedColors: forced ? "active" : "none" };
+      const expected: Parameters<Page["emulateMedia"]>[0] = { colorScheme, reducedMotion: reduced ? "reduce" : "no-preference", forcedColors: forced ? "active" : "none" };
       let media: Parameters<Page["emulateMedia"]>[0] = { colorScheme: colorScheme === "dark" ? "light" : "dark" };
       const restored = restoreSiteMaterialMedia({ emulateMedia: async (options) => {
         events.push("restore"); media = options;
