@@ -74,6 +74,10 @@ details.hraness-marketing-question[open] > summary {
   background-color: var(--hraness-material-warm-plane);
   color: var(--hraness-material-ink);
 }
+html[data-hraness-material="lantern"] details.hraness-marketing-question[open] > summary {
+  background-color: var(--hraness-material-warm-plane);
+  color: var(--hraness-material-ink);
+}
 :root[data-hraness-material="lantern"] :is(.hraness-material-choice[aria-pressed="true"], .hraness-marketing-question[open] > summary) {
   background-color: Highlight;
   color: HighlightText;
@@ -90,7 +94,7 @@ test("the stylesheet keeps six foundations and fourteen exact preset/material co
       compatibilityDeclarations.push(rule.value.declarations);
     },
   } } });
-  expect(compatibilitySelectors).toHaveLength(18);
+  expect(compatibilitySelectors).toHaveLength(19);
   const selectors: unknown[] = [];
   const declarations: unknown[] = [];
   const media: unknown[] = [];
