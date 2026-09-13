@@ -64,12 +64,6 @@ body {
   --hraness-marketing-background: transparent;
 }
 
-/* Keep the warm active plane concrete even when a host stylesheet supplies an
- * unresolved semantic surface token. */
-:root[data-hraness-material="lantern"] {
-  --hraness-material-warm-plane: color-mix(in oklch, #d49a54 12%, var(--surface, #fffefa));
-}
-
 /* Compatibility with the installed 0.6.4 sealed descendants: these few fixed
  * declarations cannot receive className overrides through its public API.
  * The compiler graph remains authoritative for layout and native states. */
@@ -112,7 +106,6 @@ body {
 
 @media (prefers-reduced-motion: reduce) {
   html {
-    --hraness-material-warm-plane: color-mix(in oklch, #d49a54 12%, #1d1a18);
     scroll-behavior: auto;
   }
 }
@@ -128,31 +121,7 @@ body {
   background-color: var(--hraness-material-warm-plane);
   color: var(--hraness-material-ink);
 }
-:root[data-hraness-material="lantern"] .hraness-material-choice[aria-pressed="true"]:disabled {
-  background-color: var(--hraness-material-warm-plane);
-  color: var(--hraness-material-ink);
-}
-:root[data-hraness-material="lantern"] [data-preview-view][aria-pressed="true"][disabled] {
-  background-color: var(--hraness-material-warm-plane);
-  color: var(--hraness-material-ink);
-}
-.hraness-marketing-page figure[data-product-preview] button.hraness-material-choice[data-preview-view][aria-pressed="true"][disabled] {
-  background-color: var(--hraness-material-warm-plane);
-  color: var(--hraness-material-ink);
-}
-details.hraness-marketing-question[open] > summary.hraness-marketing-question__summary {
-  background-color: var(--hraness-material-warm-plane);
-  color: var(--hraness-material-ink);
-}
-details.hraness-marketing-question[open] > summary {
-  background-color: var(--hraness-material-warm-plane);
-  color: var(--hraness-material-ink);
-}
 :root[data-hraness-material="lantern"] .hraness-marketing-question[open] > summary {
-  background-color: var(--hraness-material-warm-plane);
-  color: var(--hraness-material-ink);
-}
-html[data-hraness-material="lantern"] details.hraness-marketing-question[open] > summary {
   background-color: var(--hraness-material-warm-plane);
   color: var(--hraness-material-ink);
 }

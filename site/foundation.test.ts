@@ -50,31 +50,7 @@ const compatibilityCss = `
   background-color: var(--hraness-material-warm-plane);
   color: var(--hraness-material-ink);
 }
-:root[data-hraness-material="lantern"] .hraness-material-choice[aria-pressed="true"]:disabled {
-  background-color: var(--hraness-material-warm-plane);
-  color: var(--hraness-material-ink);
-}
-:root[data-hraness-material="lantern"] [data-preview-view][aria-pressed="true"][disabled] {
-  background-color: var(--hraness-material-warm-plane);
-  color: var(--hraness-material-ink);
-}
-.hraness-marketing-page figure[data-product-preview] button.hraness-material-choice[data-preview-view][aria-pressed="true"][disabled] {
-  background-color: var(--hraness-material-warm-plane);
-  color: var(--hraness-material-ink);
-}
-details.hraness-marketing-question[open] > summary.hraness-marketing-question__summary {
-  background-color: var(--hraness-material-warm-plane);
-  color: var(--hraness-material-ink);
-}
-details.hraness-marketing-question[open] > summary {
-  background-color: var(--hraness-material-warm-plane);
-  color: var(--hraness-material-ink);
-}
 :root[data-hraness-material="lantern"] .hraness-marketing-question[open] > summary {
-  background-color: var(--hraness-material-warm-plane);
-  color: var(--hraness-material-ink);
-}
-html[data-hraness-material="lantern"] details.hraness-marketing-question[open] > summary {
   background-color: var(--hraness-material-warm-plane);
   color: var(--hraness-material-ink);
 }
@@ -84,7 +60,7 @@ html[data-hraness-material="lantern"] details.hraness-marketing-question[open] >
 }
 `;
 
-test("the stylesheet keeps six foundations and fourteen exact preset/material compatibility rules", async () => {
+test("the stylesheet keeps six foundations and thirteen exact preset/material compatibility rules", async () => {
   const css = await readFile(new URL("styles.css", import.meta.url));
   const compatibilitySelectors: StyleRule["selectors"][] = [];
   const compatibilityDeclarations: StyleRule["declarations"][] = [];
@@ -94,7 +70,7 @@ test("the stylesheet keeps six foundations and fourteen exact preset/material co
       compatibilityDeclarations.push(rule.value.declarations);
     },
   } } });
-  expect(compatibilitySelectors).toHaveLength(19);
+  expect(compatibilitySelectors).toHaveLength(13);
   const selectors: unknown[] = [];
   const declarations: unknown[] = [];
   const media: unknown[] = [];
@@ -129,16 +105,14 @@ test("the stylesheet keeps six foundations and fourteen exact preset/material co
     },
   } } });
   const root = [[{ type: "pseudo-class", kind: "root" }]];
-  const materialRoot = [[{ type: "pseudo-class", kind: "root" }, { type: "attribute", name: "data-hraness-material", namespace: null,
-    operation: { caseSensitivity: "case-sensitive", operator: "equal", value: "lantern" } }]];
   const html = [[{ type: "type", name: "html" }]];
   expect(selectors).toEqual([
     root, [[{ type: "universal" }]], html, [[{ type: "type", name: "body" }]],
     [[{ type: "pseudo-class", kind: "where", selectors: [
       [{ type: "class", name: "hraness-marketing-page" }], [{ type: "class", name: "hraness-marketing-header" }],
-    ] }]], ...compatibilitySelectors.slice(0, 2), materialRoot, ...compatibilitySelectors.slice(2, 9), html, ...compatibilitySelectors.slice(9),
+    ] }]], ...compatibilitySelectors.slice(0, 9), html, ...compatibilitySelectors.slice(9),
   ]);
-  expect([...declarations.slice(5, 7), ...declarations.slice(8, 15), ...declarations.slice(16)]).toEqual(compatibilityDeclarations);
+  expect([...declarations.slice(5, 14), ...declarations.slice(15)]).toEqual(compatibilityDeclarations);
   expect(tokenBindings).toBe(1);
   expect(media).toEqual([
     ["pointer", "coarse"],
@@ -157,9 +131,9 @@ test("the static entry joins compiler foundations and local fonts without legacy
     '@import "@hraness/design-kit/fonts.css";',
     '@import "@hraness/site-footer/compiler-foundation.css";',
     '@import "@hraness/design-kit/paper-theme.css";',
+    '@import "./styles.css";',
     '@import "./vendor/marketing-preset/product-marketing-preset.css";',
     '@import "./vendor/lantern-material/lantern-material.css";',
-    '@import "./styles.css";',
   ]);
   expect(imports).not.toMatch(/tailwind|components\.css|palettes\.css|@hraness\/[^"\n]+\/styles\.css|https?:/u);
 });

@@ -918,7 +918,11 @@ export function assertSiteMaterialPaint(value: unknown, home: boolean, opaque: b
   } else assert.equal(sample.wall, null);
 }
 
-async function readSiteMaterial(page: Page): Promise<unknown> {
+export async function readSiteMaterial(page: Page): Promise<unknown> {
+  // Native disclosure activation can start even the shared .01ms reduced-motion
+  // transition at progress zero. Observe rendered paint, after the existing
+  // bounded font/frame settlement; never change styles or relax the comparison.
+  await settle(page);
   return page.evaluate(() => {
     const nodes: HTMLElement[] = [];
     const paint = (element: Element | null) => {
@@ -966,6 +970,20 @@ async function verifySiteMaterial(page: Page, pathname: string, profile: Profile
     }
     const normal = await readSiteMaterial(page);
     assertSiteMaterialPaint(normal, home, profile.forced);
+    if (home) {
+      const selected = page.locator('.hraness-material-choice[aria-pressed="true"]');
+      const disabled = await selected.getAttribute("disabled");
+      try {
+        await selected.evaluate((element) => { element.setAttribute("disabled", ""); });
+        assertSiteMaterialPaint(await readSiteMaterial(page), true, profile.forced);
+      } finally {
+        await selected.evaluate((element, previous) => {
+          if (previous === null) element.removeAttribute("disabled");
+          else element.setAttribute("disabled", previous);
+        }, disabled);
+      }
+      assert.deepEqual(await readSiteMaterial(page), normal, "Disabled control restoration changed actual paint");
+    }
     if (home && profile.name === "desktop") {
       const cdp = await page.context().newCDPSession(page);
       const features = [

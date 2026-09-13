@@ -1,3 +1,4 @@
+import type { Page } from "playwright-core";
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
@@ -5,7 +6,7 @@ import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { runInNewContext } from "node:vm";
-import { assertSiteMaterialPaint, assertAppColorScheme, assertSitePublicFontsUnchanged, assertDefaultButtonPresentation, assertDefaultPalette, assertKeyboardFocusStrip, assertNativeModalFocus, assertProductPreviewObservation, assetContentType, assetPath, boundedBrowserOperation, browserExecutableSha256, browserFailureDetails, captureBrowserResponseBody, installBrowserServiceWorkerRefusal, inventory, loadedStylesheetControl, productionCsp, settleBrowserResponseBodies, siteFoundationFontPaths, siteProductionCsp, siteStylesheetPaths, snapshotProductPreview, snapshotStaticSite, waitForClosedProductPreview, withBrowserResourceCapture } from "./app-browser";
+import { readSiteMaterial, assertSiteMaterialPaint, assertAppColorScheme, assertSitePublicFontsUnchanged, assertDefaultButtonPresentation, assertDefaultPalette, assertKeyboardFocusStrip, assertNativeModalFocus, assertProductPreviewObservation, assetContentType, assetPath, boundedBrowserOperation, browserExecutableSha256, browserFailureDetails, captureBrowserResponseBody, installBrowserServiceWorkerRefusal, inventory, loadedStylesheetControl, productionCsp, settleBrowserResponseBodies, siteFoundationFontPaths, siteProductionCsp, siteStylesheetPaths, snapshotProductPreview, snapshotStaticSite, waitForClosedProductPreview, withBrowserResourceCapture } from "./app-browser";
 import { browserIoModules } from "../app/fixtures/browser/config";
 
 describe("browser response lifetime", () => {
@@ -969,6 +970,28 @@ describe("native website Lantern material acceptance", () => {
       panes: [pane], wall: home ? wall : null, selected: home ? [choice] : [], disclosures: home ? [choice] : [],
       references: { chrome, pane, choice, wall } };
   };
+  test("native material paint is read only after rendering settles", async () => {
+    const rendered = Promise.withResolvers<void>();
+    const sample = fixture(true, false);
+    let evaluations = 0;
+    const page = { evaluate: () => {
+      evaluations += 1;
+      return evaluations === 1 ? rendered.promise : Promise.resolve(sample);
+    } } as unknown as Page;
+    const observation = readSiteMaterial(page);
+    await Promise.resolve();
+    expect(evaluations).toBe(1);
+    rendered.resolve();
+    await expect(observation).resolves.toBe(sample);
+    expect(evaluations).toBe(2);
+  });
+  test("failed rendering settlement refuses the material sample", async () => {
+    const failure = new Error("Native rendering did not settle");
+    let evaluations = 0;
+    const page = { evaluate: () => { evaluations += 1; return Promise.reject(failure); } } as unknown as Page;
+    await expect(readSiteMaterial(page)).rejects.toBe(failure);
+    expect(evaluations).toBe(1);
+  });
   test("retains exact canonical surfaces in normal and opaque modes without applying editorial type to guides", () => {
     for (const home of [true, false]) for (const opaque of [true, false]) {
       expect(() => assertSiteMaterialPaint(fixture(home, opaque), home, opaque)).not.toThrow();
