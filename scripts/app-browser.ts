@@ -6,7 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseHTML } from "linkedom";
 import { transform } from "lightningcss";
-import type { BrowserContext, Locator, Page, Request as BrowserRequest, Response as BrowserResponse } from "playwright-core";
+import type { BrowserContext, CDPSession, Locator, Page, Request as BrowserRequest, Response as BrowserResponse } from "playwright-core";
 import type { DirectBrowserBridge } from "@hraness/direct/web";
 import { browserIoModules } from "../app/fixtures/browser/config";
 import { productIoModules } from "../app/fixtures/product/config";
@@ -954,6 +954,18 @@ export async function readSiteMaterial(page: Page): Promise<unknown> {
   });
 }
 
+/** A temporary CDP session can clear emulated features when it detaches.
+ * Restore through the owning Playwright page after detachment, including every
+ * original media feature, before observing restored paint. */
+export async function restoreSiteMaterialMedia(
+  page: Pick<Page, "emulateMedia">, session: Pick<CDPSession, "detach">,
+  profile: Readonly<{ colorScheme?: "light" | "dark"; reduced: boolean; forced: boolean }>,
+): Promise<void> {
+  await session.detach();
+  await page.emulateMedia({ colorScheme: profile.colorScheme ?? "dark",
+    reducedMotion: profile.reduced ? "reduce" : "no-preference", forcedColors: profile.forced ? "active" : "none" });
+}
+
 async function verifySiteMaterial(page: Page, pathname: string, profile: Profile): Promise<unknown> {
   if (pathname === "/preview/") {
     assert.equal(await page.locator('[data-hraness-material], .hraness-material-wall, .hraness-marketing-field').count(), 0);
@@ -999,7 +1011,7 @@ async function verifySiteMaterial(page: Page, pathname: string, profile: Profile
         try {
           await cdp.send("Emulation.setEmulatedMedia", { features: [...features, { name: "prefers-reduced-transparency", value: "no-preference" }] });
           await settle(page);
-        } finally { await cdp.detach(); }
+        } finally { await restoreSiteMaterialMedia(page, cdp, profile); }
       }
       assert.deepEqual(await readSiteMaterial(page), normal, "Material media restoration changed actual paint");
     }
