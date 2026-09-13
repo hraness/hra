@@ -51,6 +51,10 @@ function owner(): QueueOwner {
     capability: "reported-held", elapsedMilliseconds: 80, queueMilliseconds: 30, capabilityMilliseconds: 50, handoffRequests: 0 };
 }
 
+function privateEndpoint(registryRoot: string, ownerRunId: string, ownerPid = process.pid): string {
+  return join(registryRoot, `${ownerRunId}-${ownerPid}.sock`);
+}
+
 async function fakeOwner(registryRoot: string, respond: (socket: Socket) => void, ownerRunId = runId): Promise<string> {
   mkdirSync(registryRoot, { mode: 0o700, recursive: true });
   const sockets = new Set<Socket>();
@@ -60,7 +64,7 @@ async function fakeOwner(registryRoot: string, respond: (socket: Socket) => void
     socket.once("close", () => sockets.delete(socket));
     respond(socket);
   });
-  const path = join(registryRoot, `${ownerRunId}.sock`);
+  const path = privateEndpoint(registryRoot, ownerRunId);
   await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(path, resolve); });
   chmodSync(path, 0o600);
   cleanups.push(async () => {
@@ -70,30 +74,46 @@ async function fakeOwner(registryRoot: string, respond: (socket: Socket) => void
   return path;
 }
 
-async function staleEndpoints(registryRoot: string, ownerRunIds: readonly string[], age = queueLimits.staleMilliseconds * 2): Promise<string[]> {
+async function socketHolder(registryRoot: string, ownerRunIds: readonly string[]): Promise<{
+  paths: string[];
+  pause(): void;
+  stop(): Promise<void>;
+}> {
   mkdirSync(registryRoot, { mode: 0o700, recursive: true });
-  const paths = ownerRunIds.map(id => join(registryRoot, `${id}.sock`));
   // A bounded fixture opens every socket before its readiness acknowledgement.
   // Terminating and joining that exact child leaves genuine abandoned sockets.
-  const source = 'import { createServer } from "node:net"; const paths = JSON.parse(process.env.OOMPA_QUEUE_FIXTURE_SOCKETS); await Promise.all(paths.map(path => new Promise(resolve => createServer().listen(path, resolve)))); process.stdout.write("ready\\n");';
+  const source = 'import { createServer } from "node:net"; import { join } from "node:path"; const ids = JSON.parse(process.env.OOMPA_QUEUE_FIXTURE_IDS); const paths = ids.map(id => join(process.env.OOMPA_QUEUE_FIXTURE_ROOT, id + "-" + process.pid + ".sock")); await Promise.all(paths.map(path => new Promise(resolve => createServer().listen(path, 1, resolve)))); process.stdout.write("ready\\n");';
   const child = Bun.spawn([process.execPath, "-e", source], {
-    env: { OOMPA_QUEUE_FIXTURE_SOCKETS: JSON.stringify(paths) }, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+    env: { OOMPA_QUEUE_FIXTURE_ROOT: registryRoot, OOMPA_QUEUE_FIXTURE_IDS: JSON.stringify(ownerRunIds) }, stdin: "ignore", stdout: "pipe", stderr: "pipe",
   });
+  let joined: Promise<void> | undefined;
+  const stop = (): Promise<void> => {
+    joined ??= (async () => {
+      child.kill("SIGKILL");
+      await child.exited;
+      await new Response(child.stderr).text();
+    })();
+    return joined;
+  };
+  cleanups.push(stop);
   const reader = child.stdout.getReader();
   const deadline = setTimeout(() => child.kill("SIGKILL"), 2_000);
   try {
     const readiness = await reader.read();
     if (readiness.done || new TextDecoder().decode(readiness.value) !== "ready\n") throw new Error("stale socket fixture did not listen");
   } finally {
-    child.kill("SIGKILL");
-    await child.exited;
     clearTimeout(deadline);
     reader.releaseLock();
-    await new Response(child.stderr).text();
   }
+  return { paths: ownerRunIds.map(id => privateEndpoint(registryRoot, id, child.pid)), pause() { child.kill("SIGSTOP"); }, stop };
+}
+
+async function staleEndpoints(registryRoot: string, ownerRunIds: readonly string[], age = queueLimits.staleMilliseconds * 2): Promise<string[]> {
+  const holder = await socketHolder(registryRoot, ownerRunIds);
+  await holder.stop();
   const timestamp = new Date(Date.now() - age);
-  for (const path of paths) { chmodSync(path, 0o600); utimesSync(path, timestamp, timestamp); }
-  return paths;
+  for (const path of holder.paths) { chmodSync(path, 0o600); utimesSync(path, timestamp, timestamp); }
+  return holder.paths;
 }
 
 async function staleEndpoint(registryRoot: string, ownerRunId: string, age = queueLimits.staleMilliseconds * 2): Promise<string> {
@@ -112,6 +132,31 @@ async function rawExchange(path: string, send: (socket: Socket, onClose: (cleanu
     socket.once("connect", () => { send(socket, cleanup => { stop = cleanup; }); });
     socket.once("close", () => { clearTimeout(timer); if (typeof stop === "function") stop(); resolve(Buffer.concat(chunks).toString("utf8")); });
   });
+}
+
+async function probeAbandonedSocket(path: string): Promise<{
+  code: string | null;
+  errno: number | null;
+  connected: boolean;
+  expired: boolean;
+  events: Array<"connect" | "error" | "deadline" | "close">;
+}> {
+  const result: Awaited<ReturnType<typeof probeAbandonedSocket>> = { code: null, errno: null, connected: false, expired: false, events: [] };
+  await new Promise<void>(resolve => {
+    const socket = createConnection(path);
+    const deadline = setTimeout(() => { result.expired = true; result.events.push("deadline"); socket.destroy(); }, queueLimits.timeoutMilliseconds);
+    socket.once("connect", () => { result.connected = true; result.events.push("connect"); socket.destroy(); });
+    socket.once("error", (error: unknown) => {
+      result.events.push("error");
+      if (typeof error === "object" && error !== null) {
+        if ("code" in error && typeof error.code === "string" && /^[A-Z][A-Z0-9_]{0,63}$/u.test(error.code)) result.code = error.code;
+        if ("errno" in error && typeof error.errno === "number" && Number.isInteger(error.errno) && Math.abs(error.errno) <= 4_096) result.errno = error.errno;
+      }
+      socket.destroy();
+    });
+    socket.once("close", () => { clearTimeout(deadline); result.events.push("close"); resolve(); });
+  });
+  return result;
 }
 
 describe("queue observation protocol", () => {
@@ -222,27 +267,53 @@ describe("queue observation protocol", () => {
   });
 
   test("unreachable classification limits Bun's ENOENT mapping to the qualified platform and version", () => {
-    expect(isUnreachableQueueEndpoint({ code: "ENOENT", errno: -2, syscall: "connect" }, "darwin", "1.3.14")).toBe(true);
-    for (const platform of ["linux", "win32", "freebsd"] as const) {
+    for (const platform of ["darwin", "linux"] as const) {
+      expect(isUnreachableQueueEndpoint({ code: "ENOENT", errno: -2, syscall: "connect" }, platform, "1.3.14")).toBe(true);
+    }
+    for (const platform of ["win32", "freebsd"] as const) {
       expect(isUnreachableQueueEndpoint({ code: "ENOENT" }, platform, "1.3.14")).toBe(false);
     }
     fc.assert(fc.property(fc.string({ maxLength: 64 }).filter(value => value !== "1.3.14"), version => {
-      expect(isUnreachableQueueEndpoint({ code: "ENOENT" }, "darwin", version)).toBe(false);
+      for (const platform of ["darwin", "linux"] as const) {
+        expect(isUnreachableQueueEndpoint({ code: "ENOENT" }, platform, version)).toBe(false);
+      }
       for (const platform of ["darwin", "linux", "win32"] as const) {
         expect(isUnreachableQueueEndpoint({ code: "ECONNREFUSED" }, platform, version)).toBe(true);
       }
     }), propertyOptions);
     fc.assert(fc.property(fc.string({ maxLength: 64 }).filter(value => value !== "ENOENT" && value !== "ECONNREFUSED"), code => {
-      expect(isUnreachableQueueEndpoint({ code }, "darwin", "1.3.14")).toBe(false);
+      for (const platform of ["darwin", "linux"] as const) {
+        expect(isUnreachableQueueEndpoint({ code }, platform, "1.3.14")).toBe(false);
+      }
     }), propertyOptions);
     for (const error of [null, undefined, false, 61, "ECONNREFUSED", [], {}, { errno: 61 }, { code: null },
       { code: "EACCES", errno: 61 }, { code: "ETIMEDOUT" }, { code: "ECONNRESET" }, { code: "ERR_SOCKET_CLOSED" }]) {
-      expect(isUnreachableQueueEndpoint(error, "darwin", "1.3.14")).toBe(false);
+      for (const platform of ["darwin", "linux"] as const) {
+        expect(isUnreachableQueueEndpoint(error, platform, "1.3.14")).toBe(false);
+      }
     }
   });
 });
 
 describe("private queue observation sockets", () => {
+  test("pinned Bun reports its qualified error for a real abandoned Unix socket", async () => {
+    const { stateRoot, registryRoot } = fixture();
+    const path = await staleEndpoint(registryRoot, runId);
+    const before = lstatSync(path);
+    const probe = await probeAbandonedSocket(path);
+    const after = lstatSync(path);
+    const diagnostic = JSON.stringify({ platform: process.platform, bunVersion: Bun.version, probe,
+      socket: after.isSocket(), privateMode: (after.mode & 0o777) === 0o600,
+      sameIdentity: before.dev === after.dev && before.ino === after.ino && before.mtimeMs === after.mtimeMs,
+      oldEnough: Date.now() - after.mtimeMs >= queueLimits.staleMilliseconds });
+    expect(["darwin", "linux"], diagnostic).toContain(process.platform);
+    expect(Bun.version, diagnostic).toBe("1.3.14");
+    expect(probe, diagnostic).toEqual({ code: "ENOENT", errno: -2, connected: false, expired: false, events: ["error", "close"] });
+    expect(before.dev === after.dev && before.ino === after.ino && before.mtimeMs === after.mtimeMs, diagnostic).toBe(true);
+    expect(isUnreachableQueueEndpoint({ code: probe.code }), diagnostic).toBe(true);
+    expect(existsSync(stateRoot)).toBe(false);
+  });
+
   test("an absent read-only snapshot creates neither registry nor scheduler state", async () => {
     const { stateRoot, registryRoot } = fixture();
     expect(await readQueueSnapshot(stateRoot)).toEqual({ version: 1, coverage: "cooperating-wrappers-only", availability: "unknown", custody: "unknown",
@@ -326,7 +397,7 @@ describe("private queue observation sockets", () => {
         mkdirSync(registryRoot, { mode: 0o700 });
         if (unsafe === "permission") chmodSync(registryRoot, 0o755);
         if (unsafe === "foreign-entry") writeFileSync(join(registryRoot, "private-command.txt"), "do not read or delete");
-        if (unsafe === "too-many-owners") for (let index = 0; index <= queueLimits.owners; index += 1) writeFileSync(join(registryRoot, `${index.toString(16).padStart(32, "0")}.sock`), "");
+        if (unsafe === "too-many-owners") for (let index = 0; index <= queueLimits.owners; index += 1) writeFileSync(privateEndpoint(registryRoot, index.toString(16).padStart(32, "0")), "");
       }
       expect(await readQueueSnapshot(stateRoot)).toMatchObject({ registry: "unavailable", availability: "unknown", owners: [] });
       expect(existsSync(registryRoot)).toBe(true);
@@ -335,11 +406,31 @@ describe("private queue observation sockets", () => {
     }
   });
 
+  test("invalid private PID names and duplicate run IDs make the registry unavailable", async () => {
+    const invalidNames = [
+      `${runId}.sock`, `${runId}-0.sock`, `${runId}-01.sock`, `${runId}--1.sock`,
+      `${runId}-2147483648.sock`, `${runId}-99999999999.sock`, `${runId}-1e3.sock`,
+    ];
+    for (const names of [...invalidNames.map(name => [name]), [`${runId}-${process.pid}.sock`, `${runId}-${process.pid + 1}.sock`]]) {
+      const { stateRoot, registryRoot } = fixture();
+      mkdirSync(registryRoot, { mode: 0o700 });
+      for (const name of names) writeFileSync(join(registryRoot, name), "retain", { mode: 0o600 });
+      expect(await readQueueSnapshot(stateRoot)).toMatchObject({ registry: "unavailable", owners: [], availability: "unknown", custody: "unknown" });
+      await expect(pruneStaleQueueEndpoints(stateRoot)).rejects.toThrow();
+      expect(readdirSync(registryRoot).sort()).toEqual([...names].sort());
+      expect(existsSync(stateRoot)).toBe(false);
+    }
+    const { stateRoot, registryRoot } = fixture();
+    mkdirSync(registryRoot, { mode: 0o700 });
+    writeFileSync(privateEndpoint(registryRoot, runId, 2_147_483_647), "invalid socket", { mode: 0o600 });
+    expect(await readQueueSnapshot(stateRoot)).toMatchObject({ registry: "available", owners: [], unresponsiveOwners: 1 });
+  });
+
   test("stale, non-socket and unsafe endpoint metadata never imply available capacity", async () => {
     for (const unsafe of ["regular-file", "symlink", "permission", "stale"] as const) {
       const { stateRoot, registryRoot } = fixture();
       mkdirSync(registryRoot, { mode: 0o700 });
-      const path = join(registryRoot, `${runId}.sock`);
+      const path = privateEndpoint(registryRoot, runId);
       if (unsafe === "regular-file") writeFileSync(path, "private contents", { mode: 0o600 });
       else if (unsafe === "symlink") symlinkSync("/synthetic/missing-owner", path);
       else {
@@ -392,7 +483,7 @@ describe("private queue observation sockets", () => {
     const observer = await startQueueObserver({ stateRoot, label: "bounded-owner", lane: "browser-auth", mode: "shared", onHandoff: () => {} });
     cleanups.push(() => observer.close());
     const started = performance.now();
-    expect(await rawExchange(join(registryRoot, `${observer.runId}.sock`), (socket, onClose) => {
+    expect(await rawExchange(privateEndpoint(registryRoot, observer.runId), (socket, onClose) => {
       socket.write("{");
       const timer = setInterval(() => socket.write(" "), queueLimits.timeoutMilliseconds / 4);
       onClose(() => clearInterval(timer));
@@ -405,7 +496,7 @@ describe("private queue observation sockets", () => {
     const { stateRoot, registryRoot } = fixture();
     const observer = await startQueueObserver({ stateRoot, label: "connection-bound", lane: "browser-auth", mode: "shared", onHandoff: () => {} });
     cleanups.push(() => observer.close());
-    const path = join(registryRoot, `${observer.runId}.sock`);
+    const path = privateEndpoint(registryRoot, observer.runId);
     let connected = 0;
     let expired = 0;
     let ready: (() => void) | undefined;
@@ -434,7 +525,7 @@ describe("private queue observation sockets", () => {
     const observer = await startQueueObserver({ stateRoot, label: "closed-owner", lane: "browser-auth", mode: "shared", onHandoff: request => notices.push(request) });
     cleanups.push(() => observer.close());
     observer.capabilityAdmitted();
-    const path = join(registryRoot, `${observer.runId}.sock`);
+    const path = privateEndpoint(registryRoot, observer.runId);
     for (const message of ["x".repeat(queueLimits.bytes + 1), "{}\n{}\n", `${JSON.stringify(handoff())}\n`,
       `${JSON.stringify({ ...handoff(observer.runId), argv: ["private"] })}\n`]) {
       expect(await rawExchange(path, socket => { socket.write(message); })).toBe("");
@@ -461,9 +552,9 @@ describe("private queue observation sockets", () => {
     const malformed = await fakeOwner(registryRoot, socket => { socket.once("data", () => socket.end("not-json\n")); }, "4".repeat(32));
     const unsafe = await staleEndpoint(registryRoot, "5".repeat(32));
     chmodSync(unsafe, 0o666);
-    const regular = join(registryRoot, `${"6".repeat(32)}.sock`);
+    const regular = privateEndpoint(registryRoot, "6".repeat(32));
     writeFileSync(regular, "private placeholder", { mode: 0o600 });
-    const symlink = join(registryRoot, `${"7".repeat(32)}.sock`);
+    const symlink = privateEndpoint(registryRoot, "7".repeat(32));
     symlinkSync(removable, symlink);
     const timestamp = new Date(Date.now() - queueLimits.staleMilliseconds * 2);
     for (const path of [idle, malformed, regular]) utimesSync(path, timestamp, timestamp);
@@ -476,6 +567,45 @@ describe("private queue observation sockets", () => {
     expect(existsSync(removable)).toBe(false);
     for (const path of [recent, idle, malformed, unsafe, regular, symlink]) expect(lstatSync(path)).toBeDefined();
     expect(await pruneStaleQueueEndpoints(stateRoot)).toBe(0);
+    expect(existsSync(stateRoot)).toBe(false);
+  });
+
+  test("an old unreachable endpoint naming a live or reused PID remains intact", async () => {
+    const { stateRoot, registryRoot } = fixture();
+    const abandoned = await staleEndpoint(registryRoot, runId);
+    const path = privateEndpoint(registryRoot, runId);
+    renameSync(abandoned, path);
+    const before = lstatSync(path);
+    expect((await probeAbandonedSocket(path)).connected).toBe(false);
+    expect(await pruneStaleQueueEndpoints(stateRoot)).toBe(0);
+    expect(lstatSync(path).ino).toBe(before.ino);
+    expect(existsSync(stateRoot)).toBe(false);
+  });
+
+  test("an old paused live owner retains its endpoint with queued client connections", async () => {
+    const { stateRoot, registryRoot } = fixture();
+    const holder = await socketHolder(registryRoot, [runId]);
+    const path = holder.paths[0]!;
+    chmodSync(path, 0o600);
+    const timestamp = new Date(Date.now() - queueLimits.staleMilliseconds * 2);
+    utimesSync(path, timestamp, timestamp);
+    holder.pause();
+    const clients: Socket[] = [];
+    const closures: Array<Promise<void>> = [];
+    cleanups.push(async () => { for (const socket of clients) socket.destroy(); await Promise.all(closures); });
+    const connected = await Promise.all(Array.from({ length: queueLimits.connections }, () => new Promise<boolean>(resolve => {
+      const socket = createConnection(path);
+      clients.push(socket);
+      closures.push(new Promise<void>(resolveClosed => { socket.once("close", () => resolveClosed()); }));
+      const deadline = setTimeout(() => { socket.destroy(); resolve(false); }, queueLimits.timeoutMilliseconds);
+      socket.once("connect", () => { clearTimeout(deadline); resolve(true); });
+      socket.once("error", () => { clearTimeout(deadline); socket.destroy(); resolve(false); });
+      socket.once("close", () => { clearTimeout(deadline); resolve(false); });
+    })));
+    expect(connected).toContain(true);
+    expect(await readQueueSnapshot(stateRoot)).toMatchObject({ owners: [], unresponsiveOwners: 1, availability: "unknown", custody: "unknown" });
+    expect(await pruneStaleQueueEndpoints(stateRoot)).toBe(0);
+    expect(lstatSync(path).isSocket()).toBe(true);
     expect(existsSync(stateRoot)).toBe(false);
   });
 
@@ -505,6 +635,16 @@ describe("private queue observation sockets", () => {
     }
   });
 
+  test("a vanished endpoint cannot authorize pruning from its error code alone", async () => {
+    const { stateRoot, registryRoot } = fixture();
+    const path = await staleEndpoint(registryRoot, runId);
+    const pending = pruneStaleQueueEndpoints(stateRoot);
+    rmSync(path);
+    expect(await pending).toBe(0);
+    expect(readdirSync(registryRoot)).toEqual([]);
+    expect(existsSync(stateRoot)).toBe(false);
+  });
+
   test("registration prunes old refused endpoints only near its bounded registry limit", async () => {
     for (const count of [queueLimits.owners / 2 - 1, queueLimits.owners / 2]) {
       const { stateRoot, registryRoot } = fixture();
@@ -522,7 +662,7 @@ describe("private queue observation sockets", () => {
       if (kind !== "absent") {
         mkdirSync(registryRoot, { mode: 0o700 });
         if (kind === "foreign-entry") writeFileSync(join(registryRoot, "private-placeholder"), "retain");
-        else for (let index = 0; index <= queueLimits.owners; index += 1) writeFileSync(join(registryRoot, `${index.toString(16).padStart(32, "0")}.sock`), "retain");
+        else for (let index = 0; index <= queueLimits.owners; index += 1) writeFileSync(privateEndpoint(registryRoot, index.toString(16).padStart(32, "0")), "retain");
       }
       const before = existsSync(registryRoot) ? readdirSync(registryRoot).sort() : null;
       await expect(pruneStaleQueueEndpoints(stateRoot)).rejects.toThrow();

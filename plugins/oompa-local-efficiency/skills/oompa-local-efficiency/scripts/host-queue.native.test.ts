@@ -179,7 +179,7 @@ describe.skipIf(!enabled)("real scheduler queue observation", () => {
       await expect(requestQueueHandoff(f.stateRoot, { version: 1, operation: "request-handoff", runId: holderOwner.runId,
         requestId: "stale-owner", requesterLabel: "waiter" })).rejects.toThrow();
       const staleAt = new Date(Date.now() - 120_000);
-      utimesSync(join(queueRegistryRoot(f.stateRoot), `${holderOwner.runId}.sock`), staleAt, staleAt);
+      utimesSync(join(queueRegistryRoot(f.stateRoot), `${holderOwner.runId}-${holder.pid}.sock`), staleAt, staleAt);
       expect(await pruneStaleQueueEndpoints(f.stateRoot)).toBe(1);
       expect(await readQueueSnapshot(f.stateRoot)).toMatchObject({ availability: "unknown", custody: "unknown", unresponsiveOwners: 0 });
       // Multiple scheduler retries have run after wrapper death. Its child still

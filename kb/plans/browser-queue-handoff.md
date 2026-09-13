@@ -25,13 +25,23 @@ included. Observations never read or mutate admission ledgers or call
 `assertOwned`, whose implementation can remove stale markers.
 
 Registration and explicit `--prune-stale` repair only observation sockets: require
-private ownership, an unreachable connection, age of at least 60 seconds, and unchanged
+private ownership, an absent registered owner, an unreachable connection, age of at least 60 seconds, and unchanged
 device, inode and modification time before unlink. Status itself remains
 read-only. Unknown endpoints remain untouched; deleting a dead observation socket
 cannot release the separate scheduler lease.
 The refusal classifier admits `ECONNREFUSED`; only pinned Bun 1.3.14 on Darwin
-also admits its observed `ENOENT` mapping, with the same exact socket readback.
+and Linux also admits its `ENOENT` mapping, with the same exact socket readback.
 A timeout never becomes refusal evidence. Unreachability is not owner-death proof.
+
+The first CI candidate exposed retained stale sockets on Linux. The pinned
+[Bun Unix connection implementation](https://github.com/oven-sh/bun/blob/bun-v1.3.14/src/runtime/socket/Listener.zig#L865)
+maps synchronous failures to `ENOENT` on both operating systems, including busy
+listeners. The correction extends only the pinned Linux classifier and requires
+`ESRCH` from signal-zero checks before and after probing. The immutable private
+socket filename binds its random run ID to a bounded positive owner PID, which
+never enters public projections. Live or reused PIDs and unknown results retain
+the endpoint. All socket identity, age, timeout and privacy checks remain
+required. Both operating-system CI suites qualify it.
 
 Handoff is a bounded, idempotent notice addressed to an exact random run ID.
 The owner records intent before attempting the notice. It may finish and collect
@@ -42,15 +52,16 @@ observations cannot establish release because descendants may retain a lease.
 Local acceptance evidence:
 
 - Protocol/parser property laws, private socket bounds, deadlines, unknown/stale
-  metadata, notice deduplication and read-only status: 30 focused tests passed
-  with 6,859 assertions on Bun 1.3.14.
+  metadata, notice deduplication and read-only status: 35 focused tests passed
+  with 7,179 assertions on Bun 1.3.14. These include private PID identities,
+  live/reused owners, paused owners with queued clients, and disappearing sockets.
 - Real immutable runtime, isolated holder and ordered waiters, middle waiter
   cancellation, handoff notice, surviving descendant after wrapper death,
   observation failure preserving child exit: 3 local native tests passed with
   33 assertions. Removing an unreachable observation socket did not admit the
   waiting command while the descendant retained its real lease.
 - Existing wrapper/TTY, plugin/bootstrap, adoption and CI equivalence contracts:
-  155 plugin tests passed; the 6 opt-in skips comprise 2 unchanged-runtime upgrade
+  160 plugin tests passed; the 6 opt-in skips comprise 2 unchanged-runtime upgrade
   cases and the separately executed queue/TTY suites. All 13 native TTY cases
   passed with 174 assertions. TypeScript, focused ESLint and all 33 CI equivalence
   tests passed. Manifest and skill metadata validated. Managed repository policy

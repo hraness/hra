@@ -12,7 +12,7 @@ import { requireOperationLabel, sha256 } from "./shared";
 // wrapper and observation socket disappear.
 export const queueLimits = Object.freeze({ owners: 64, connections: 8, bytes: 2_048, timeoutMilliseconds: 400, notices: 32, staleMilliseconds: 60_000 });
 const runIdPattern = /^[0-9a-f]{32}$/u;
-const endpointPattern = /^([0-9a-f]{32})\.sock$/u;
+const endpointPattern = /^([0-9a-f]{32})-([1-9][0-9]{0,9})\.sock$/u;
 const stages = ["waiting-capability", "waiting-compute", "running", "settling"] as const;
 export type QueueStage = typeof stages[number];
 type CapabilityReport = "reported-held" | "waiting" | "none";
@@ -127,22 +127,34 @@ function privateDirectory(root: string): void {
   if (!metadata.isDirectory() || metadata.isSymbolicLink() || (metadata.mode & 0o777) !== 0o700
     || (process.getuid !== undefined && metadata.uid !== process.getuid())) throw new Error("queue registry is not private");
 }
+function endpointIdentity(name: string): { runId: string; ownerPid: number } {
+  const match = endpointPattern.exec(name);
+  const ownerPid = Number(match?.[2]);
+  if (match === null || !Number.isSafeInteger(ownerPid) || ownerPid > 2_147_483_647) throw new Error("invalid queue endpoint identity");
+  return { runId: requireQueueRunId(match[1]), ownerPid };
+}
 function endpoints(root: string): string[] {
   privateDirectory(root);
   const directory = opendirSync(root);
   const result: string[] = [];
+  const runIds = new Set<string>();
   try {
     for (let count = 0; ; count += 1) {
       const entry = directory.readSync();
       if (entry === null) return result;
-      if (count >= queueLimits.owners || !endpointPattern.test(entry.name)) throw new Error("queue registry bound or format exceeded");
+      if (count >= queueLimits.owners) throw new Error("queue registry bound exceeded");
+      const { runId } = endpointIdentity(entry.name);
+      if (runIds.has(runId)) throw new Error("duplicate queue endpoint identity");
+      runIds.add(runId);
       result.push(entry.name);
     }
   } finally { directory.closeSync(); }
 }
 function endpoint(root: string, runId: string): string {
-  privateDirectory(root);
-  const path = join(root, `${requireQueueRunId(runId)}.sock`);
+  requireQueueRunId(runId);
+  const name = endpoints(root).find(candidate => endpointIdentity(candidate).runId === runId);
+  if (name === undefined) throw new Error("queue endpoint unavailable");
+  const path = join(root, name);
   const metadata = lstatSync(path);
   if (!metadata.isSocket() || metadata.isSymbolicLink() || metadata.nlink !== 1 || (metadata.mode & 0o777) !== 0o600
     || (process.getuid !== undefined && metadata.uid !== process.getuid())) throw new Error("queue endpoint is not private");
@@ -189,12 +201,22 @@ async function exchange(root: string, request: StatusRequest | HandoffRequest): 
 export function isUnreachableQueueEndpoint(error: unknown, platform: NodeJS.Platform = process.platform,
   bunVersion: string | undefined = process.versions.bun): boolean {
   if (typeof error !== "object" || error === null || !("code" in error)) return false;
-  // A real abandoned socket on pinned Bun/Darwin reports ENOENT where POSIX
-  // reports ECONNREFUSED. This is only a candidate: prune must still prove the
-  // exact old private socket node exists unchanged after the failed connection.
+  // Pinned Bun maps synchronous Unix connect failures to ENOENT on Darwin and
+  // Linux. This is only a candidate: prune must still prove the
+  // exact old private socket node exists unchanged after the failed connection
+  // and its registered owner PID is absent. A busy listener can map to ENOENT.
   // It establishes endpoint unreachability, never owner death or lease release.
   return error.code === "ECONNREFUSED"
-    || (error.code === "ENOENT" && platform === "darwin" && bunVersion === "1.3.14");
+    || (error.code === "ENOENT" && (platform === "darwin" || platform === "linux") && bunVersion === "1.3.14");
+}
+
+function ownerAbsent(ownerPid: number): boolean {
+  // Signal zero only checks process existence. A live or reused PID, permission
+  // refusal and every unknown result retain the observation endpoint.
+  try { process.kill(ownerPid, 0); return false; }
+  catch (error: unknown) {
+    return typeof error === "object" && error !== null && "code" in error && error.code === "ESRCH";
+  }
 }
 
 async function connectionUnreachable(path: string): Promise<boolean> {
@@ -222,13 +244,15 @@ export async function pruneStaleQueueEndpoints(stateRoot: string): Promise<numbe
   for (let offset = 0; offset < names.length; offset += queueLimits.connections) {
     await Promise.all(names.slice(offset, offset + queueLimits.connections).map(async name => {
       try {
-        const runId = name.slice(0, -5);
+        const { runId, ownerPid } = endpointIdentity(name);
         const path = endpoint(root, runId);
+        if (path !== join(root, name)) return;
         const before = lstatSync(path);
-        if (Date.now() - before.mtimeMs < queueLimits.staleMilliseconds || !await connectionUnreachable(path)) return;
-        endpoint(root, runId);
+        if (Date.now() - before.mtimeMs < queueLimits.staleMilliseconds || !ownerAbsent(ownerPid)
+          || !await connectionUnreachable(path)) return;
+        if (endpoint(root, runId) !== path) return;
         const after = lstatSync(path);
-        if (after.dev !== before.dev || after.ino !== before.ino || after.mtimeMs !== before.mtimeMs) return;
+        if (after.dev !== before.dev || after.ino !== before.ino || after.mtimeMs !== before.mtimeMs || !ownerAbsent(ownerPid)) return;
         unlinkSync(path);
         removed += 1;
       } catch { /* Unknown, live, new or replaced endpoints are retained. */ }
@@ -309,7 +333,9 @@ export async function startQueueObserver(input: {
       }
     });
   });
-  const path = join(root, `${runId}.sock`);
+  // The private filename binds cleanup to this owner without disclosing its PID
+  // through status, handoff receipts or progress output.
+  const path = join(root, `${runId}-${process.pid}.sock`);
   await new Promise<void>((resolveListen, reject) => {
     server.once("error", reject);
     server.listen(path, () => { resolveListen(); });
@@ -345,7 +371,7 @@ export async function readQueueSnapshot(stateRoot: string, lane?: CapabilityLane
   // batches. Order is deliberately by run ID, never presented as FIFO position.
   for (let offset = 0; offset < names.length; offset += queueLimits.connections) {
     await Promise.all(names.slice(offset, offset + queueLimits.connections).map(async name => {
-      const runId = name.slice(0, -5);
+      const { runId } = endpointIdentity(name);
       try {
         const value = object(await exchange(root, { version: 1, operation: "status", runId }), ["version", "operation", "owner"]);
         if (value.version !== 1 || value.operation !== "status") throw new Error("invalid queue response");

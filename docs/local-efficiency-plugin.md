@@ -116,11 +116,16 @@ socket. Stale sockets count as unresponsive; unsafe or overfull registries repor
 unavailable. Status reads never delete or repair them. Registration attempts a
 bounded observation-only cleanup when at least 32 endpoints have accumulated;
 `oompa-host-queue --prune-stale --json` runs that same cleanup explicitly.
-It removes only an owner-private socket at least 60 seconds old whose connection
-is unreachable and whose device, inode and modification time remain unchanged.
-Ordinarily this requires `ECONNREFUSED`. Bun 1.3.14 on Darwin reports `ENOENT`
-for an abandoned socket; that exact runtime/platform combination also accepts
-this error only after proving the socket node still exists unchanged. Missing
+It removes only an owner-private socket at least 60 seconds old whose registered
+owner is absent, connection is unreachable, and device, inode and modification
+time remain unchanged. The private socket filename binds the random run ID to
+its owner PID; public status and notices never include that PID. Signal-zero
+existence checks must return `ESRCH` before and after probing. A live or reused
+PID, permission refusal, or unknown result retains the endpoint.
+Ordinarily this requires `ECONNREFUSED`. Bun 1.3.14 maps synchronous Unix
+connection failures to `ENOENT`; on Darwin and Linux that pinned runtime also
+accepts this error only with those owner and socket checks. A busy listener can
+produce the same error, so it cannot authorize cleanup by itself. Missing
 or replaced paths do not qualify. Reachable, young, timed-out and otherwise
 uncertain endpoints are retained. Endpoint unreachability never proves owner
 death. Removing an unreachable observation socket says nothing about an inherited scheduler
