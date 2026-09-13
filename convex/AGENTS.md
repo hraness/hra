@@ -3,6 +3,7 @@
 - `schema.ts` defines Oompa cloud identity, device, envelope, projection, lease, command, and retention state.
 - Auth modules implement verified-email login and device enrollment.
 - Sync and command modules authorize exact device and lease generations. Session commands are lease-fenced; device commands are addressed to a device and fenced by that daemon's boot authority instead.
+- `commandLifecycle.ts` exposes a bounded read-only authority-reduction quota diagnostic. It shares current ledger validation with quota accounting, emits aggregate ceiling counts and keeps unknown byte costs explicit.
 - Tests prove rate limits, transactions, encryption boundaries, recovery, and retention.
 
 # Guidelines

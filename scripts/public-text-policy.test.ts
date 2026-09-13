@@ -385,6 +385,38 @@ describe("public text policy", () => {
     }
   });
 
+  test("scans C, header and PowerShell sources through all public text checks", async () => {
+    const root = await mkdtemp(join(tmpdir(), "oompa-public-native-source-"));
+    const rejected = [
+      { value: ["github", "pat", "abcdefghijklmnopqrstuvwxyz123456"].join("_"), code: "SECRET_SHAPE" },
+      { value: syntheticPrivatePath(), code: "ABSOLUTE_USER_PATH" },
+      { value: `@${["private", "scope"].join("-")}/example`, code: "PRIVATE_SCOPE" },
+    ];
+    try {
+      for (const name of ["core.c", "core.h", "build.ps1"]) {
+        const path = join(root, name);
+        await writeFile(path, "/* Ordinary public source. */\n", "utf8");
+        await expect(assertPublicTree(root)).resolves.toBeUndefined();
+        for (const { value, code } of rejected) {
+          await writeFile(path, `/* ${value} */\n`, "utf8");
+          const error: unknown = await assertPublicTree(root).catch((failure: unknown) => failure);
+          expect(error).toBeInstanceOf(PublicTextPolicyError);
+          expect(error).toMatchObject({ code, label: name });
+          expect((error as Error).message).not.toContain(value);
+        }
+        await unlink(path);
+      }
+      for (const name of ["core.obj", "fixture.exe", "library.dll", "unknown.native"]) {
+        const path = join(root, name);
+        await writeFile(path, "ordinary bytes", "utf8");
+        await expect(assertPublicTree(root)).rejects.toMatchObject({ code: "UNREVIEWED_FILE_TYPE" });
+        await unlink(path);
+      }
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
   test("admits only the complete canonical editorial font and scans its declaration as public text", async () => {
     const source = join(import.meta.dir, "../site/vendor/marketing-preset");
     const font = "fonts/instrument-serif/instrument-serif-latin-400.woff2";
